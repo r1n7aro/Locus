@@ -170,6 +170,7 @@ namespace Locus
                 || assemblyName.StartsWith("__LocusSnippet_", StringComparison.Ordinal)
                 || assemblyName.StartsWith("__LocusView_", StringComparison.Ordinal)
                 || assemblyName.StartsWith("__LocusRunStates_", StringComparison.Ordinal)
+                || assemblyName.StartsWith("__LocusHotPatch_", StringComparison.Ordinal)
                 || IsInactiveSkillPackageAssemblyName(assemblyName)
                 || assemblyName == "Locus.Editor"
                 || assemblyName.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)

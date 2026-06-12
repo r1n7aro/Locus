@@ -1407,6 +1407,12 @@ namespace Locus
                     case "hot_reload_probe":
                         return await HandleHotReloadProbe(reqId);
 
+                    case "hot_patch_loaded":
+                        return await HandleHotPatchLoaded(reqId, msg.message);
+
+                    case "hot_patch_dispose":
+                        return await HandleHotPatchDispose(reqId, msg.message);
+
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);
 
