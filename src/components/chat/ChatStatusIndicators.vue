@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BookOpen, Box, CodeXml, Database, type IconNode } from "lucide";
+import { BookOpen, Box, CodeXml, Database, Zap, type IconNode } from "lucide";
 import { t } from "../../i18n";
 import { listAgentInjectedItems } from "../../services/agent";
 import {
@@ -8,6 +8,9 @@ import {
   csharpLspRestart,
   csharpLspSetEnabled,
   subscribeCsharpLspStatus,
+  subscribeUnitySidecarCompilerStatus,
+  unityHotReloadSetEnabled,
+  unitySidecarCompilerGetStatus,
 } from "../../services/csharpLsp";
 import { normalizeAppError } from "../../services/errors";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
@@ -18,6 +21,7 @@ import {
 } from "../../services/knowledge";
 import type {
   AssetDbScanEvent,
+  CsharpCompileStatus,
   CsharpLspStatus,
   EmbeddingStatus,
   InjectedPromptItem,
@@ -32,9 +36,9 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
-type StatusId = "assetDb" | "unity" | "knowledge" | "code";
-type StatusTone = "success" | "danger" | "accent" | "muted";
-type StatusIcon = "database" | "unity" | "knowledge" | "code";
+type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload";
+type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
+type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
@@ -64,6 +68,7 @@ const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   unity: Box,
   knowledge: BookOpen,
   code: CodeXml,
+  hotReload: Zap,
 };
 
 const props = defineProps<{
@@ -94,6 +99,11 @@ const csharpLsp = ref<CsharpLspStatus | null>(null);
 const csharpLspPending = ref(false);
 let csharpLspUnsubscribe: RuntimeUnsubscribe | null = null;
 let csharpLspDisposed = false;
+const hotReloadStatus = ref<CsharpCompileStatus | null>(null);
+const hotReloadPending = ref(false);
+const hotReloadActionError = ref("");
+let hotReloadUnsubscribe: RuntimeUnsubscribe | null = null;
+let hotReloadDisposed = false;
 const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
 const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
 const embeddingStatus = ref<EmbeddingStatus | null>(null);
@@ -855,6 +865,125 @@ const codeModeOptions = computed<SegmentedOption[]>(() => [
   },
 ]);
 
+const hotReloadReady = computed(() => hotReloadStatus.value != null);
+const hotReloadEnabled = computed(() => hotReloadStatus.value?.hotReloadEnabled ?? false);
+const hotReloadCanToggle = computed(() => {
+  const status = hotReloadStatus.value;
+  return !!status && status.platformSupported && status.serverAvailable;
+});
+
+const hotReloadSummary = computed(() => {
+  const status = hotReloadStatus.value;
+  if (!status) return t("chat.status.hotReload.loading");
+  if (!status.platformSupported) return t("chat.status.hotReload.unsupported");
+  if (!status.serverAvailable) return t("chat.status.hotReload.missing");
+  if (status.lastError) return t("chat.status.hotReload.error");
+  if (!status.enabled) return t("chat.status.hotReload.sidecarOff");
+  if (!status.hotReloadEnabled) return t("chat.status.hotReload.off");
+  if ((status.hotColdQueued ?? 0) > 0) {
+    return t("chat.status.hotReload.queued", formatCount(status.hotColdQueued ?? 0));
+  }
+  if ((status.hotPatchFailures ?? 0) > 0) return t("chat.status.hotReload.error");
+  if ((status.hotActivePatches ?? 0) > 0) {
+    return t("chat.status.hotReload.active", formatCount(status.hotActivePatches ?? 0));
+  }
+  return t("chat.status.hotReload.on");
+});
+
+const hotReloadTone = computed<StatusTone>(() => {
+  const status = hotReloadStatus.value;
+  if (!status || !status.platformSupported || !status.serverAvailable) return "muted";
+  if (status.lastError) return "danger";
+  if (!status.enabled || !status.hotReloadEnabled) return "muted";
+  if ((status.hotColdQueued ?? 0) > 0 || (status.hotPatchFailures ?? 0) > 0) return "warning";
+  return "success";
+});
+
+const hotReloadRows = computed<StatusDetailRow[]>(() => {
+  const rows: StatusDetailRow[] = [];
+  if (hotReloadActionError.value) {
+    rows.push({
+      label: t("chat.status.hotReload.rows.error"),
+      value: hotReloadActionError.value,
+      mono: true,
+    });
+  }
+  const status = hotReloadStatus.value;
+  if (!status) {
+    rows.push({ label: t("chat.status.detail.status"), value: t("chat.status.hotReload.loading") });
+    return rows;
+  }
+  rows.push({ label: t("chat.status.detail.status"), value: hotReloadSummary.value });
+  rows.push({
+    label: t("chat.status.hotReload.rows.sidecar"),
+    value: status.enabled ? t("chat.status.hotReload.rows.on") : t("chat.status.hotReload.rows.off"),
+  });
+  rows.push({
+    label: t("chat.status.hotReload.rows.enabled"),
+    value: status.hotReloadEnabled ? t("chat.status.hotReload.rows.on") : t("chat.status.hotReload.rows.off"),
+  });
+  rows.push({
+    label: t("chat.status.hotReload.rows.applied"),
+    value: formatCount(status.hotPatchesApplied ?? 0),
+  });
+  rows.push({
+    label: t("chat.status.hotReload.rows.active"),
+    value: formatCount(status.hotActivePatches ?? 0),
+  });
+  rows.push({
+    label: t("chat.status.hotReload.rows.queued"),
+    value: formatCount(status.hotColdQueued ?? 0),
+  });
+  rows.push({
+    label: t("chat.status.hotReload.rows.failures"),
+    value: formatCount(status.hotPatchFailures ?? 0),
+  });
+  if (status.lastError && status.lastError !== hotReloadActionError.value) {
+    rows.push({
+      label: t("chat.status.hotReload.rows.error"),
+      value: status.lastError,
+      mono: true,
+    });
+  }
+  return rows;
+});
+
+const hotReloadModeOptions = computed<SegmentedOption[]>(() => [
+  {
+    value: "off",
+    label: t("chat.status.hotReload.mode.off"),
+    hint: t("chat.status.hotReload.mode.offHint"),
+    disabled: hotReloadPending.value || !hotReloadCanToggle.value,
+  },
+  {
+    value: "on",
+    label: t("chat.status.hotReload.mode.on"),
+    hint: t("chat.status.hotReload.mode.onHint"),
+    disabled: hotReloadPending.value || !hotReloadCanToggle.value,
+  },
+]);
+
+function createUnavailableHotReloadStatus(error: string): CsharpCompileStatus {
+  return {
+    enabled: false,
+    platformSupported: false,
+    serverAvailable: false,
+    running: false,
+    roslynVersion: null,
+    dotnetSource: null,
+    uptimeSecs: null,
+    lastError: error,
+    sidecarCompiles: 0,
+    compileErrors: 0,
+    fallbacks: 0,
+    hotReloadEnabled: false,
+    hotPatchesApplied: 0,
+    hotPatchFailures: 0,
+    hotActivePatches: 0,
+    hotColdQueued: 0,
+  };
+}
+
 async function refreshCsharpLspStatus() {
   try {
     csharpLsp.value = await csharpLspGetStatus();
@@ -889,6 +1018,35 @@ async function restartCode() {
     await refreshCsharpLspStatus();
   } finally {
     csharpLspPending.value = false;
+  }
+}
+
+async function refreshHotReloadStatus() {
+  try {
+    hotReloadStatus.value = await unitySidecarCompilerGetStatus();
+    hotReloadActionError.value = "";
+  } catch (error) {
+    const message = normalizeAppError(error).message;
+    hotReloadActionError.value = message;
+    if (!hotReloadStatus.value) {
+      hotReloadStatus.value = createUnavailableHotReloadStatus(message);
+    }
+  }
+}
+
+async function setHotReloadEnabled(value: boolean) {
+  if (hotReloadPending.value) return;
+  if (hotReloadStatus.value && hotReloadStatus.value.hotReloadEnabled === value) return;
+  if (!hotReloadCanToggle.value) return;
+  hotReloadPending.value = true;
+  try {
+    hotReloadStatus.value = await unityHotReloadSetEnabled(value);
+    hotReloadActionError.value = "";
+  } catch (error) {
+    hotReloadActionError.value = normalizeAppError(error).message;
+    await refreshHotReloadStatus();
+  } finally {
+    hotReloadPending.value = false;
   }
 }
 
@@ -950,6 +1108,16 @@ const statusItems = computed<StatusItem[]>(() => [
     actionDisabled: csharpLspPending.value,
     actionVariant: "neutral",
   },
+  {
+    id: "hotReload",
+    icon: "hotReload",
+    title: t("chat.status.hotReload.title"),
+    summary: hotReloadSummary.value,
+    inlineLabel: hotReloadSummary.value,
+    tone: hotReloadTone.value,
+    rows: hotReloadRows.value,
+    modeOptions: hotReloadReady.value ? hotReloadModeOptions.value : undefined,
+  },
 ]);
 
 const activeItem = computed(() =>
@@ -968,11 +1136,15 @@ function togglePopover(id: StatusId) {
   if (activePopover.value === "code") {
     void refreshCsharpLspStatus();
   }
+  if (activePopover.value === "hotReload") {
+    void refreshHotReloadStatus();
+  }
 }
 
 function segmentedModelFor(id: StatusId): string {
   if (id === "knowledge") return knowledgeMode.value;
   if (id === "code") return codeEnabled.value ? "on" : "off";
+  if (id === "hotReload") return hotReloadEnabled.value ? "on" : "off";
   return "";
 }
 
@@ -981,6 +1153,8 @@ function applySegmentedMode(id: StatusId, mode: string) {
     setKnowledgeMode(mode);
   } else if (id === "code") {
     void setCodeEnabled(mode === "on");
+  } else if (id === "hotReload") {
+    void setHotReloadEnabled(mode === "on");
   }
 }
 
@@ -1084,7 +1258,9 @@ onMounted(() => {
   document.addEventListener("click", closePopover);
   document.addEventListener("keydown", onDocumentKeydown);
   csharpLspDisposed = false;
+  hotReloadDisposed = false;
   void refreshCsharpLspStatus();
+  void refreshHotReloadStatus();
   subscribeCsharpLspStatus((payload) => {
     csharpLsp.value = payload;
   })
@@ -1093,6 +1269,17 @@ onMounted(() => {
         unsubscribe();
       } else {
         csharpLspUnsubscribe = unsubscribe;
+      }
+    })
+    .catch(() => {});
+  subscribeUnitySidecarCompilerStatus((payload) => {
+    hotReloadStatus.value = payload;
+  })
+    .then((unsubscribe) => {
+      if (hotReloadDisposed) {
+        unsubscribe();
+      } else {
+        hotReloadUnsubscribe = unsubscribe;
       }
     })
     .catch(() => {});
@@ -1111,8 +1298,11 @@ onUnmounted(() => {
   document.removeEventListener("click", closePopover);
   document.removeEventListener("keydown", onDocumentKeydown);
   csharpLspDisposed = true;
+  hotReloadDisposed = true;
   csharpLspUnsubscribe?.();
   csharpLspUnsubscribe = null;
+  hotReloadUnsubscribe?.();
+  hotReloadUnsubscribe = null;
 });
 </script>
 
@@ -1129,7 +1319,8 @@ onUnmounted(() => {
           {
             active: activePopover === item.id,
             'is-scanning': (item.id === 'assetDb' && isScanning)
-              || (item.id === 'code' && codeTransitional),
+              || (item.id === 'code' && codeTransitional)
+              || (item.id === 'hotReload' && hotReloadPending),
           },
         ]"
         :aria-label="`${item.title}: ${item.summary}`"
@@ -1287,6 +1478,10 @@ onUnmounted(() => {
   color: var(--status-danger-fg);
 }
 
+.chat-status-icon-btn.tone-warning {
+  color: var(--status-warn-fg);
+}
+
 .chat-status-icon-btn.tone-accent {
   color: var(--accent-color);
 }
@@ -1347,6 +1542,10 @@ onUnmounted(() => {
 
 .chat-status-popover-summary.tone-danger {
   color: var(--status-danger-fg);
+}
+
+.chat-status-popover-summary.tone-warning {
+  color: var(--status-warn-fg);
 }
 
 .chat-status-popover-summary.tone-accent {
