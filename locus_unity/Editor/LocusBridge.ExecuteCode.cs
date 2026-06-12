@@ -195,6 +195,19 @@ namespace Locus
         }
 
         /// <summary>
+        /// Cached reference paths without building them — null when the
+        /// cache is cold. Safe to call from any thread; building the cache
+        /// (EnsureCompileReferencePaths) requires the main thread.
+        /// </summary>
+        private static List<string> TryGetCachedCompileReferencePaths()
+        {
+            lock (_compileCacheLock)
+            {
+                return _compileReferencePathsReady ? _cachedCompileReferencePaths : null;
+            }
+        }
+
+        /// <summary>
         /// Path-collection layer: the reference set as absolute file paths.
         /// Shared by the in-Unity compiler (materialized below) and the
         /// `get_compile_params` provider for the compile-server sidecar.

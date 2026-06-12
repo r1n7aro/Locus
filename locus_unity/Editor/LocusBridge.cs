@@ -1022,9 +1022,11 @@ namespace Locus
             }
             finally
             {
+                bool wasCurrentConnection;
                 lock (_connectionLock)
                 {
-                    if (ReferenceEquals(_currentServer, server))
+                    wasCurrentConnection = ReferenceEquals(_currentServer, server);
+                    if (wasCurrentConnection)
                     {
                         _currentWriter = null;
                         _currentServer = null;
@@ -1032,7 +1034,14 @@ namespace Locus
                     }
                 }
 
-                CancelActiveExecuteCode("pipe disconnected");
+                // Only the still-current connection may cancel the active
+                // execute. Mono can deliver this finally LATE — after the
+                // client already reconnected and submitted a new request on
+                // the next connection — and an unconditional cancel here
+                // kills that fresh request, which re-triggers the client's
+                // no-progress reconnect: a self-sustaining cancel loop.
+                if (wasCurrentConnection)
+                    CancelActiveExecuteCode("pipe disconnected");
                 Debug.Log("[Locus] Pipe client disconnected: " + PipeName);
             }
         }

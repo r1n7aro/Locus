@@ -2844,6 +2844,21 @@ pub async fn start_unity_monitor(
                     // Roslyn) so the first unity_execute does not pay the
                     // cold-start cost. No-op while the feature is off.
                     crate::csharp_compile::warm_up_in_background();
+                    // Also prefetch the compile params: the first collection
+                    // walks every reference assembly on the Unity main
+                    // thread — do it now, off the first tool call's path.
+                    if crate::csharp_compile::is_enabled() {
+                        let params_project = project_path.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                crate::csharp_compile::params::get_params(&params_project).await
+                            {
+                                eprintln!(
+                                    "[CsharpCompile] compile params prefetch skipped: {error}"
+                                );
+                            }
+                        });
+                    }
                 }
                 disconnected_attempts = 0;
             } else {

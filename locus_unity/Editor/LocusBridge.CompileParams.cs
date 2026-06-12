@@ -64,41 +64,65 @@ namespace Locus
                 }
             }
 
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
-            PostToMainThread(delegate
+            // The path collection needs Unity APIs (main thread) but is
+            // cached per domain; the per-request fingerprint hashing is pure
+            // file IO and runs here on the pipe worker so a busy editor main
+            // thread (e.g. right after a domain reload) does not stall the
+            // roundtrip.
+            List<string> paths = TryGetCachedCompileReferencePaths();
+            if (paths == null)
             {
+                var collect = new TaskCompletionSource<List<string>>();
+                PostToMainThread(delegate
+                {
+                    try
+                    {
+                        collect.SetResult(EnsureCompileReferencePaths());
+                    }
+                    catch (Exception ex)
+                    {
+                        collect.SetException(ex);
+                    }
+                });
+
                 try
                 {
-                    List<string> paths = EnsureCompileReferencePaths();
-                    string[] defines = SnippetPreprocessorSymbols;
-                    string fingerprint = ComputeCompileParamsFingerprint(paths, defines, CompileParamsLanguageVersion);
-
-                    var payload = new CompileParamsPayload
-                    {
-                        unchanged = false,
-                        fingerprint = fingerprint,
-                        domain_generation = _compileDomainGeneration,
-                        lang_version = CompileParamsLanguageVersion,
-                        defines = defines,
-                        reference_paths = paths.ToArray()
-                    };
-
-                    if (string.Equals(fingerprint, knownFingerprint, StringComparison.Ordinal))
-                    {
-                        payload.unchanged = true;
-                        payload.defines = Array.Empty<string>();
-                        payload.reference_paths = Array.Empty<string>();
-                    }
-
-                    tcs.SetResult(OkResponse(requestId, JsonUtility.ToJson(payload)));
+                    paths = await collect.Task;
                 }
                 catch (Exception ex)
                 {
-                    tcs.SetResult(ErrorResponse(requestId, "get_compile_params failed: " + ex.Message));
+                    return ErrorResponse(requestId, "get_compile_params failed: " + ex.Message);
                 }
-            });
+            }
 
-            return await tcs.Task;
+            try
+            {
+                string[] defines = SnippetPreprocessorSymbols;
+                string fingerprint = ComputeCompileParamsFingerprint(paths, defines, CompileParamsLanguageVersion);
+
+                var payload = new CompileParamsPayload
+                {
+                    unchanged = false,
+                    fingerprint = fingerprint,
+                    domain_generation = _compileDomainGeneration,
+                    lang_version = CompileParamsLanguageVersion,
+                    defines = defines,
+                    reference_paths = paths.ToArray()
+                };
+
+                if (string.Equals(fingerprint, knownFingerprint, StringComparison.Ordinal))
+                {
+                    payload.unchanged = true;
+                    payload.defines = Array.Empty<string>();
+                    payload.reference_paths = Array.Empty<string>();
+                }
+
+                return OkResponse(requestId, JsonUtility.ToJson(payload));
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "get_compile_params failed: " + ex.Message);
+            }
         }
 
         /// <summary>
