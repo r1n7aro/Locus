@@ -158,7 +158,7 @@ export function defaultCodeAnalysisToolsConfig(): CodeAnalysisToolsConfig {
     codeSymbolSearch: true,
     codeGotoDefinition: true,
     codeFindReferences: true,
-    codeDiagnostics: true,
+    codeDiagnostics: false,
     codeHover: false,
     unityCodeUsages: true,
     unityAnalyzers: true,

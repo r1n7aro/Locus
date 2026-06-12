@@ -144,7 +144,7 @@ impl Default for CodeAnalysisToolsConfig {
             code_symbol_search: true,
             code_goto_definition: true,
             code_find_references: true,
-            code_diagnostics: true,
+            code_diagnostics: false,
             code_hover: false,
             unity_code_usages: true,
             unity_analyzers: true,
@@ -765,6 +765,24 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(!config.unity_hot_reload_enabled());
+    }
+
+    #[test]
+    fn code_diagnostics_defaults_to_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.code_analysis_tools().code_diagnostics);
     }
 
     #[test]
