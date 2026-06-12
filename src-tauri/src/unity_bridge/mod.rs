@@ -3046,12 +3046,28 @@ pub async fn start_unity_monitor(
         let mut last_status: Option<bool> = None;
         let mut last_detected_editor_process: Option<UnityEditorProcessInfo> = None;
         let mut disconnected_attempts: u32 = 0;
+        let mut last_play_mode: Option<bool> = None;
 
         loop {
             let mut status = query_unity_connection_status(&project_path).await;
             let connected = status.connected;
             let disconnected_transition = last_status == Some(true) && !connected;
             let recompile_waiting = unity_recompile_waiting(&project_path);
+
+            // H6: a play-mode EXIT is a convergence point for hot reload —
+            // deferred/in-flight patch state turns into a silent recompile.
+            if connected {
+                let playing = is_play_mode_status(&status.editor_status);
+                if last_play_mode == Some(true) && !playing {
+                    let play_exit_project = project_path.clone();
+                    tokio::spawn(async move {
+                        crate::unity_hotreload::on_play_mode_exited(&play_exit_project).await;
+                    });
+                }
+                last_play_mode = Some(playing);
+            } else {
+                last_play_mode = None;
+            }
 
             if connected {
                 if last_status != Some(true) {

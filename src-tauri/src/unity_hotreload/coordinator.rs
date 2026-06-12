@@ -219,6 +219,27 @@ pub async fn pending_paths(project_path: &str) -> Vec<String> {
     }
 }
 
+/// Locate the plugin's Locus.HotReload.Runtime.dll (field-store runtime,
+/// M4) across the known install roots. Missing file → no extra reference;
+/// field-store patches then fail with a deterministic compile diagnostic
+/// that names the missing type, pointing at a plugin update.
+fn hotreload_runtime_references(project_path: &str) -> Vec<String> {
+    const INSTALL_DIRS: &[&str] = &[
+        "Packages/com.farlocus.locus",
+        "Assets/Locus",
+        "Assets/Plugins/Locus",
+    ];
+    for dir in INSTALL_DIRS {
+        let candidate = std::path::Path::new(project_path)
+            .join(dir)
+            .join("Editor/HotReload/Locus.HotReload.Runtime.dll");
+        if candidate.is_file() {
+            return vec![candidate.to_string_lossy().to_string()];
+        }
+    }
+    Vec::new()
+}
+
 // ── probe ────────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -390,8 +411,12 @@ pub async fn hot_reload(
         state.last_domain_generation = Some(params.domain_generation.clone());
     }
 
+    // M4: patch assemblies reference the field-store runtime shipped with
+    // the plugin (Unity's own reference set only carries script assemblies).
+    let extra_references = hotreload_runtime_references(project_path);
+
     let started = std::time::Instant::now();
-    let outcome = crate::csharp_compile::compile_hot_patch(&params, &files)
+    let outcome = crate::csharp_compile::compile_hot_patch(&params, &files, &extra_references)
         .await
         .map_err(|error| {
             super::record_patch_failure();
@@ -529,6 +554,8 @@ pub async fn hot_reload(
             };
 
             super::record_patch_applied();
+            // H6: arm the convergence scheduler (threshold / idle / play exit).
+            super::note_patch_applied(project_path);
 
             let engine = resp
                 .message

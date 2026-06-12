@@ -466,6 +466,267 @@ namespace ScanE2E
         Assert.Single(result["methods"]!.AsArray());
     }
 
+    /// <summary>Compile the REAL field-store runtime source (parity with the
+    /// shipped Locus.HotReload.Runtime.dll) into a referenceable DLL.</summary>
+    private string CompileFieldStoreRuntime(CompileService service)
+    {
+        string? dir = AppContext.BaseDirectory;
+        string? sourcePath = null;
+        for (int i = 0; i < 8 && dir != null; i++)
+        {
+            string candidate = Path.Combine(dir, "locus_hotreload_runtime", "LocusFieldStore.cs");
+            if (File.Exists(candidate))
+            {
+                sourcePath = candidate;
+                break;
+            }
+            dir = Path.GetDirectoryName(dir);
+        }
+        Assert.NotNull(sourcePath);
+
+        var request = new JsonObject
+        {
+            ["assemblyName"] = "Locus.HotReload.Runtime",
+            ["sources"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "LocusFieldStore.cs",
+                ["text"] = File.ReadAllText(sourcePath!),
+            }),
+            ["useHostBcl"] = true,
+        };
+        JsonNode result = service.HandleCompileRaw(request);
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        string path = Path.Combine(_tempDir, "Locus.HotReload.Runtime.dll");
+        File.WriteAllBytes(path, Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>()));
+        return path;
+    }
+
+    private const string CounterSource = @"
+namespace FieldE2E
+{
+    public class Counter
+    {
+        private int _seed = 3;
+        public int Tick() { return _seed; }
+    }
+}";
+
+    private static JsonNode HotPatchWithRuntime(
+        CompileService service,
+        JsonObject @params,
+        string runtimePath,
+        bool registerImage,
+        params (string Path, string Old, string New)[] files)
+    {
+        var request = new JsonObject
+        {
+            ["files"] = new JsonArray(files
+                .Select(f => (JsonNode)new JsonObject
+                {
+                    ["path"] = f.Path,
+                    ["oldText"] = f.Old,
+                    ["newText"] = f.New,
+                })
+                .ToArray()),
+            ["params"] = @params.DeepClone(),
+            ["registerImage"] = registerImage,
+            ["extraReferencePaths"] = new JsonArray(runtimePath),
+        };
+        return service.HandleCompileHotPatch(request);
+    }
+
+    [Fact]
+    public void Added_field_virtualizes_through_the_store()
+    {
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "FieldE2EOriginal", CounterSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newSource = CounterSource
+            .Replace("private int _seed = 3;", "private int _seed = 3;\n        private int _count = 10;")
+            .Replace("public int Tick() { return _seed; }",
+                     "public int Tick() { _count += 1; return _seed + _count; }");
+
+        JsonNode result = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: false,
+            ("Counter.cs", CounterSource, newSource));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // Tick redirects; the implicit ctor redirects (initializer).
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["name"]!.GetValue<string>())
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(new[] { ".ctor", "Tick" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+
+        var context = new AssemblyLoadContext("field-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "FieldE2EOriginal" => original,
+                "Locus.HotReload.Runtime" => runtime,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The patch type's REAL layout matches the original exactly:
+            // the added field is store-virtualized, not declared.
+            Type patchCounter = patch.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
+            Assert.Null(patchCounter.GetField("_count", BindingFlags.NonPublic | BindingFlags.Instance));
+            Assert.NotNull(patchCounter.GetField("_seed", BindingFlags.NonPublic | BindingFlags.Instance));
+
+            // New instance: ctor writes the initializer through the store.
+            object instance = Activator.CreateInstance(patchCounter)!;
+            Assert.Equal(3 + 11, patchCounter.GetMethod("Tick")!.Invoke(instance, null));
+            Assert.Equal(3 + 12, patchCounter.GetMethod("Tick")!.Invoke(instance, null));
+
+            // Pre-existing instances the store never saw read default(T).
+            Type storeHolder = patch.GetType("FieldE2E.__LocusFields_Counter", throwOnError: true)!;
+            object store = storeHolder.GetField("_count")!.GetValue(null)!;
+            object preExisting = Activator.CreateInstance(original.GetType("FieldE2E.Counter")!)!;
+            object? value = store.GetType().GetMethod("Ref")!.Invoke(store, new[] { preExisting });
+            Assert.Equal(0, value);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Removed_field_keeps_a_layout_placeholder()
+    {
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        const string source = @"
+namespace FieldE2E
+{
+    public class Holder
+    {
+        private int _a = 1;
+        private int _b = 2;
+        public int Sum() { return _a + _b; }
+    }
+}";
+        string originalPath = CompileOriginal(service, "FieldE2ERemoval", source);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newSource = source
+            .Replace("private int _b = 2;\n", "")
+            .Replace("public int Sum() { return _a + _b; }", "public int Sum() { return _a; }");
+
+        JsonNode result = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: false,
+            ("Holder.cs", source, newSource));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        var context = new AssemblyLoadContext("field-removal-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "FieldE2ERemoval" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The removed field stays as a placeholder: identical layout.
+            Type patchHolder = patch.GetType("FieldE2E.Holder__LocusPatch", throwOnError: true)!;
+            var fields = patchHolder.GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+                .Select(f => f.Name)
+                .ToArray();
+            Assert.Equal(new[] { "_a", "_b" }, fields);
+
+            object instance = Activator.CreateInstance(patchHolder)!;
+            Assert.Equal(1, patchHolder.GetMethod("Sum")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Reedited_field_binds_to_the_first_batch_store()
+    {
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "FieldE2EReuse", CounterSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        compileParams["domainGeneration"] = "field-reuse-gen";
+
+        string v1 = CounterSource
+            .Replace("private int _seed = 3;", "private int _seed = 3;\n        private int _count = 10;")
+            .Replace("return _seed;", "return _seed + _count;");
+        JsonNode result1 = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: true,
+            ("Counter.cs", CounterSource, v1));
+        Assert.True(result1["success"]!.GetValue<bool>(), result1["error"]?.GetValue<string>());
+
+        string v2 = CounterSource
+            .Replace("private int _seed = 3;", "private int _seed = 3;\n        private int _count = 10;")
+            .Replace("return _seed;", "return _seed + _count * 2;");
+        JsonNode result2 = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: true,
+            ("Counter.cs", CounterSource, v2));
+        Assert.True(result2["success"]!.GetValue<bool>(), result2["error"]?.GetValue<string>());
+
+        // The second patch binds to the FIRST batch's store instead of
+        // declaring its own (values must not split).
+        byte[] patch2Bytes = Convert.FromBase64String(result2["assemblyB64"]!.GetValue<string>());
+        byte[] patch1Bytes = Convert.FromBase64String(result1["assemblyB64"]!.GetValue<string>());
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        var context = new AssemblyLoadContext("field-reuse-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            Assembly patch1 = context.LoadFromStream(new MemoryStream(patch1Bytes));
+            context.Resolving += (_, name) =>
+            {
+                if (name.Name == "FieldE2EReuse")
+                    return original;
+                if (name.Name == "Locus.HotReload.Runtime")
+                    return runtime;
+                if (name.Name == patch1.GetName().Name)
+                    return patch1;
+                return null;
+            };
+            Assembly patch2 = context.LoadFromStream(new MemoryStream(patch2Bytes));
+
+            Assert.NotNull(patch1.GetType("FieldE2E.__LocusFields_Counter"));
+            Assert.Null(patch2.GetType("FieldE2E.__LocusFields_Counter"));
+
+            // Write through patch1's path, read through patch2's body.
+            Type patch1Counter = patch1.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
+            Type patch2Counter = patch2.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
+            object store = patch1.GetType("FieldE2E.__LocusFields_Counter", throwOnError: true)!
+                .GetField("_count")!.GetValue(null)!;
+
+            object instance2 = Activator.CreateInstance(patch2Counter)!;
+            // patch2 Tick: _seed(3) + _count(10 via shared store) * 2 = 23.
+            Assert.Equal(23, patch2Counter.GetMethod("Tick")!.Invoke(instance2, null));
+            _ = patch1Counter;
+            _ = store;
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
     [Fact]
     public void Removed_unity_message_method_detours_to_an_empty_stub()
     {
@@ -522,8 +783,9 @@ namespace StubE2E
         var service = new CompileService();
         JsonObject compileParams = ParamsFor();
 
-        const string oldText = "class A { void M() { } }";
-        const string newText = "class A { int _x; void M() { } }";
+        // Field REORDER stays cold (only add/remove/retype virtualizes).
+        const string oldText = "class A { int _a; int _b; void M() { } }";
+        const string newText = "class A { int _b; int _a; void M() { } }";
 
         JsonNode result = HotPatch(service, compileParams, ("A.cs", oldText, newText));
 

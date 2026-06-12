@@ -364,9 +364,13 @@ pub enum HotPatchOutcome {
 
 /// Diff + rewrite + compile edited files into a hot-patch assembly.
 /// `files` entries are (path, baselineText, currentText).
+/// `extra_reference_paths`: per-call references outside Unity's set (the
+/// plugin's Locus.HotReload.Runtime.dll for M4 field stores) — kept out of
+/// `params` so the fingerprint-keyed reference cache stays untouched.
 pub async fn compile_hot_patch(
     compile_params: &CompileParams,
     files: &[(String, String, String)],
+    extra_reference_paths: &[String],
 ) -> Result<HotPatchOutcome, String> {
     let request = json!({
         "files": files
@@ -380,6 +384,7 @@ pub async fn compile_hot_patch(
         "params": compile_params,
         "referenceSessionImages": true,
         "registerImage": false,
+        "extraReferencePaths": extra_reference_paths,
     });
 
     let client = manager::ensure_client().await?;

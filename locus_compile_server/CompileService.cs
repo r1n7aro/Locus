@@ -162,6 +162,12 @@ public sealed class CompileHotPatchRequestDto
 
     [JsonPropertyName("registerImage")]
     public bool RegisterImage { get; set; } = true;
+
+    /// <summary>Extra reference DLLs for THIS compile only (the plugin's
+    /// Locus.HotReload.Runtime.dll for field stores). Kept out of `params`
+    /// so the fingerprint-keyed reference cache stays untouched.</summary>
+    [JsonPropertyName("extraReferencePaths")]
+    public string[]? ExtraReferencePaths { get; set; }
 }
 
 // ── service ──────────────────────────────────────────────────────────
@@ -199,12 +205,13 @@ public sealed class CompileService
     private readonly ReferenceCache _referenceCache = new();
     private readonly ImageRegistry _imageRegistry = new();
     private readonly MemberSurfaceRegistry _memberSurfaceRegistry = new();
+    private readonly FieldStoreRegistry _fieldStoreRegistry = new();
 
-    // Shims of compiled-but-not-yet-accepted hot patches, keyed by assembly
-    // name; committed into the member registry when image/register confirms
-    // Unity loaded the patch.
+    // Registrations of compiled-but-not-yet-accepted hot patches, keyed by
+    // assembly name; committed into the registries when image/register
+    // confirms Unity loaded the patch.
     private readonly object _pendingShimLock = new();
-    private readonly Dictionary<string, (string Generation, List<ShimRegistration> Registrations)> _pendingShims =
+    private readonly Dictionary<string, (string Generation, List<ShimRegistration> Shims, List<FieldStoreRegistration> FieldStores)> _pendingShims =
         new(StringComparer.Ordinal);
 
     private int _assemblyCounter;
@@ -287,17 +294,18 @@ public sealed class CompileService
         _imageRegistry.Register(request.DomainGeneration!, request.AssemblyName!, bytes);
 
         // A hot patch registered after Unity acceptance: its new-surface
-        // shims become visible to later batches now.
-        (string Generation, List<ShimRegistration> Registrations) pending = default;
+        // shims and field stores become visible to later batches now.
+        (string Generation, List<ShimRegistration> Shims, List<FieldStoreRegistration> FieldStores) pending = default;
         lock (_pendingShimLock)
         {
             if (_pendingShims.TryGetValue(request.AssemblyName!, out pending!))
                 _pendingShims.Remove(request.AssemblyName!);
         }
-        if (pending.Registrations != null &&
+        if (pending.Shims != null &&
             string.Equals(pending.Generation, request.DomainGeneration, StringComparison.Ordinal))
         {
-            CommitShimRegistrations(pending.Generation, pending.Registrations);
+            CommitShimRegistrations(pending.Generation, pending.Shims);
+            CommitFieldStoreRegistrations(pending.Generation, pending.FieldStores);
         }
 
         return new JsonObject
@@ -527,6 +535,18 @@ public sealed class CompileService
             if (images.Count > 0)
                 references = references.AddRange(images);
         }
+        foreach (string extraPath in request.ExtraReferencePaths ?? Array.Empty<string>())
+        {
+            try
+            {
+                if (File.Exists(extraPath))
+                    references = references.Add(MetadataReference.CreateFromFile(extraPath));
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[LocusCompileServer] extra reference skipped: " + extraPath + ": " + ex.Message);
+            }
+        }
 
         var diffs = new List<(HotDiffFileDto File, HotDiffFileResult Diff)>(request.Files.Length);
         var syntaxErrors = new StringBuilder();
@@ -577,6 +597,7 @@ public sealed class CompileService
         var newTypes = new JsonArray();
         var accessAssemblies = new HashSet<string>(StringComparer.Ordinal);
         var shimRegistrations = new List<ShimRegistration>();
+        var fieldStoreRegistrations = new List<FieldStoreRegistration>();
 
         // M1: ONE binding compilation over the whole batch's un-renamed
         // trees, so cross-file references — including calls to members added
@@ -613,7 +634,9 @@ public sealed class CompileService
 
         string? generation = request.Params?.DomainGeneration;
         PatchBatchContext batch = PatchBatchContext.Build(
-            batchFiles, references, _memberSurfaceRegistry.SnapshotFor(generation));
+            batchFiles, references,
+            _memberSurfaceRegistry.SnapshotFor(generation),
+            _fieldStoreRegistry.SnapshotFor(generation));
 
         foreach (var (filePath, tree, diff) in batchFiles)
         {
@@ -646,6 +669,7 @@ public sealed class CompileService
             foreach (string assembly in rewrite.OriginalAssemblies)
                 accessAssemblies.Add(assembly);
             shimRegistrations.AddRange(rewrite.ShimRegistrations);
+            fieldStoreRegistrations.AddRange(rewrite.FieldStoreRegistrations);
 
             foreach (PatchMethodMap map in rewrite.Methods)
             {
@@ -678,6 +702,7 @@ public sealed class CompileService
         }
 
         if (methods.Count == 0 && newTypes.Count == 0 &&
+            fieldStoreRegistrations.Count == 0 &&
             shimRegistrations.All(r => r.Entry.Kind == "tombstone"))
         {
             // Nothing to detour and nothing new to load: pure deletions
@@ -744,23 +769,28 @@ public sealed class CompileService
 
         byte[] bytes = peStream.ToArray();
 
-        // New-surface bookkeeping (M2): shims become visible to later
-        // batches only after the patch is actually live in Unity — which is
-        // signaled by the image registration (the Rust side registers via
-        // image/register after Unity accepts; tests register inline).
+        // New-surface bookkeeping (M2/M4): shims and field stores become
+        // visible to later batches only after the patch is actually live in
+        // Unity — which is signaled by the image registration (the Rust
+        // side registers via image/register after Unity accepts; tests
+        // register inline).
         foreach (ShimRegistration registration in shimRegistrations)
             registration.Entry.ShimAssembly = assemblyName;
+        foreach (FieldStoreRegistration registration in fieldStoreRegistrations)
+            registration.Entry.StoreAssembly = assemblyName;
 
         if (request.RegisterImage && !string.IsNullOrEmpty(generation))
         {
             _imageRegistry.Register(generation!, assemblyName, bytes);
             CommitShimRegistrations(generation!, shimRegistrations);
+            CommitFieldStoreRegistrations(generation!, fieldStoreRegistrations);
         }
-        else if (shimRegistrations.Count > 0 && !string.IsNullOrEmpty(generation))
+        else if ((shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0) &&
+                 !string.IsNullOrEmpty(generation))
         {
             lock (_pendingShimLock)
             {
-                _pendingShims[assemblyName] = (generation!, shimRegistrations);
+                _pendingShims[assemblyName] = (generation!, shimRegistrations, fieldStoreRegistrations);
                 // Keep the pending map bounded: entries for other
                 // generations can never commit.
                 foreach (string stale in _pendingShims
@@ -919,6 +949,16 @@ public sealed class CompileService
             generation,
             registrations.Select(r =>
                 new KeyValuePair<string, MemberSurfaceRegistry.ShimEntry>(r.MemberKey, r.Entry)));
+    }
+
+    private void CommitFieldStoreRegistrations(string generation, List<FieldStoreRegistration>? registrations)
+    {
+        if (registrations == null || registrations.Count == 0)
+            return;
+        _fieldStoreRegistry.Commit(
+            generation,
+            registrations.Select(r =>
+                new KeyValuePair<string, FieldStoreRegistry.StoreEntry>(r.FieldKey, r.Entry)));
     }
 
     /// <summary>

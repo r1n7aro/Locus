@@ -45,6 +45,14 @@ public sealed class ShimRegistration
     public MemberSurfaceRegistry.ShimEntry Entry = new();
 }
 
+/// <summary>A field store/holder introduced by THIS patch (M4), committed
+/// into the FieldStoreRegistry once Unity accepts the assembly.</summary>
+public sealed class FieldStoreRegistration
+{
+    public string FieldKey = "";
+    public FieldStoreRegistry.StoreEntry Entry = new();
+}
+
 public sealed class PatchRewriteResult
 {
     /// <summary>Rewritten tree, ready for the patch compilation.</summary>
@@ -53,6 +61,7 @@ public sealed class PatchRewriteResult
     public List<PatchMethodMap> Methods = new();
     public List<PatchNewType> NewTypes = new();
     public List<ShimRegistration> ShimRegistrations = new();
+    public List<FieldStoreRegistration> FieldStoreRegistrations = new();
 
     /// <summary>Assemblies whose non-public members the patch may touch
     /// (the original assemblies of the patched types).</summary>
@@ -180,6 +189,38 @@ public static class PatchRewriter
             }
         }
 
+        // M4: field changes per type, with each added field bound to its
+        // store (an earlier batch's registered store, or a new one this
+        // patch declares).
+        var fieldChangesByType = diff.FieldChanges
+            .GroupBy(c => c.DeclaringType, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+        var addedFieldSymbols = new Dictionary<IFieldSymbol, AddedFieldInfo>(SymbolEqualityComparer.Default);
+        var addedFieldsByType = new Dictionary<string, List<AddedFieldInfo>>(StringComparer.Ordinal);
+
+        foreach (var pair in fieldChangesByType)
+        {
+            BaseTypeDeclarationSyntax? decl = localDecls
+                .FirstOrDefault(d => HotDiff.MetadataName(d) == pair.Key);
+            if (decl is not TypeDeclarationSyntax typeDecl)
+                continue;
+
+            foreach (HotDiffFieldChange change in pair.Value.Where(c => c.Kind == "added"))
+            {
+                VariableDeclaratorSyntax? declarator = FindFieldDeclarator(typeDecl, change.Name, change.IsStatic);
+                if (declarator == null)
+                    continue;
+                if (model.GetDeclaredSymbol(declarator) is not IFieldSymbol fieldSymbol)
+                    continue;
+
+                AddedFieldInfo info = BuildAddedFieldInfo(pair.Key, typeDecl, change, fieldSymbol, declarator, batch);
+                addedFieldSymbols[fieldSymbol] = info;
+                if (!addedFieldsByType.TryGetValue(pair.Key, out List<AddedFieldInfo>? list))
+                    addedFieldsByType[pair.Key] = list = new List<AddedFieldInfo>();
+                list.Add(info);
+            }
+        }
+
         // Layout guard + original assembly names for the patched types.
         foreach (string patchedType in diff.PatchedTypes)
         {
@@ -196,7 +237,13 @@ public static class PatchRewriter
                 result.ColdReason = "original type not found in references: " + patchedType;
                 return result;
             }
-            if (!InstanceFieldSequence(sourceSymbol).SequenceEqual(InstanceFieldSequence(original), StringComparer.Ordinal))
+
+            string? layoutError = fieldChangesByType.TryGetValue(patchedType, out List<HotDiffFieldChange>? typeChanges)
+                ? VerifyVirtualizedLayout(sourceSymbol, original, typeChanges)
+                : (InstanceFieldSequence(sourceSymbol).SequenceEqual(InstanceFieldSequence(original), StringComparer.Ordinal)
+                    ? null
+                    : "layout mismatch");
+            if (layoutError != null)
             {
                 result.ColdReason =
                     "original assembly field layout differs from the edited baseline for " + patchedType +
@@ -254,6 +301,16 @@ public static class PatchRewriter
             if (decl is not TypeDeclarationSyntax typeDecl)
                 continue;
 
+            // Added static fields keep their initializers through the
+            // rewrite: the (rewritten) expression moves into the holder
+            // class, and the declaration itself is stripped afterwards.
+            var addedStaticNames = new HashSet<string>(StringComparer.Ordinal);
+            if (addedFieldsByType.TryGetValue(HotDiff.MetadataName(typeDecl), out List<AddedFieldInfo>? typeAdded))
+            {
+                foreach (AddedFieldInfo info in typeAdded.Where(i => i.IsStatic))
+                    addedStaticNames.Add(info.Name);
+            }
+
             foreach (MemberDeclarationSyntax member in typeDecl.Members)
             {
                 switch (member)
@@ -289,6 +346,8 @@ public static class PatchRewriter
                         foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
                         {
                             if (declarator.Initializer == null)
+                                continue;
+                            if (addedStaticNames.Contains(declarator.Identifier.Text))
                                 continue;
                             nodeReplacements[declarator] = declarator
                                 .WithInitializer(null)
@@ -365,11 +424,55 @@ public static class PatchRewriter
             nodeReplacements[node] = replacement.WithTriviaFrom(node);
         }
 
+        // ── virtualized field accesses (M4) ─────────────────────────
+        // Every access to an ADDED field rewrites to its store: instance
+        // fields through `store.Ref(target)` (a ref-return, so reads,
+        // writes, compound assignments and ref-arguments all work), static
+        // fields through the holder's plain field.
+        if (addedFieldSymbols.Count > 0)
+        {
+            foreach (SyntaxNode node in root.DescendantNodes())
+            {
+                if (node is not (IdentifierNameSyntax or MemberAccessExpressionSyntax))
+                    continue;
+                if (InStrippedSpan(node) || nodeReplacements.ContainsKey(node) || dynamicReplacements.ContainsKey(node))
+                    continue;
+                if (node.Parent is MemberAccessExpressionSyntax parentAccess && parentAccess.Name == node)
+                    continue; // the whole member access handles it
+                if (node is IdentifierNameSyntax && IsDeclarationName(node))
+                    continue;
+
+                if (model.GetSymbolInfo(node).Symbol is not IFieldSymbol fieldSymbol ||
+                    !addedFieldSymbols.TryGetValue(fieldSymbol, out AddedFieldInfo? fieldInfo))
+                {
+                    continue;
+                }
+
+                // The declarator's own identifier is not a name node, but
+                // `nameof(x)` is — materialize the constant.
+                InvocationExpressionSyntax? nameofInvocation = FindEnclosingNameOf(node, model);
+                if (nameofInvocation != null)
+                {
+                    nodeReplacements[nameofInvocation] = SyntaxFactory.LiteralExpression(
+                            SyntaxKind.StringLiteralExpression,
+                            SyntaxFactory.Literal(fieldInfo.Name))
+                        .WithTriviaFrom(nameofInvocation);
+                    continue;
+                }
+
+                AddedFieldInfo capturedField = fieldInfo;
+                ShimTarget? enclosingAddedMember = EnclosingAddedTarget(node);
+                dynamicReplacements[node] = rewrittenNode =>
+                    BuildFieldStoreAccess(rewrittenNode, capturedField, enclosingAddedMember != null);
+            }
+        }
+
         // Unqualified static field/property/event reads of renamed types →
         // qualified back to the original type (single static state source).
         foreach (IdentifierNameSyntax identifier in root.DescendantNodes().OfType<IdentifierNameSyntax>())
         {
-            if (nodeReplacements.ContainsKey(identifier) || InStrippedSpan(identifier))
+            if (nodeReplacements.ContainsKey(identifier) || dynamicReplacements.ContainsKey(identifier) ||
+                InStrippedSpan(identifier))
                 continue;
             if (identifier.Parent is MemberAccessExpressionSyntax access && access.Name == identifier)
                 continue; // already qualified; the qualifier rewrite covers it
@@ -456,7 +559,8 @@ public static class PatchRewriter
             {
                 if (!InAddedMember(identifier))
                     continue;
-                if (nodeReplacements.ContainsKey(identifier) || InStrippedSpan(identifier))
+                if (nodeReplacements.ContainsKey(identifier) || dynamicReplacements.ContainsKey(identifier) ||
+                    InStrippedSpan(identifier))
                     continue;
                 if (identifier.Parent is MemberAccessExpressionSyntax accessParent && accessParent.Name == identifier)
                     continue;
@@ -681,12 +785,18 @@ public static class PatchRewriter
                 delegateDecl.Identifier.TrailingTrivia);
         }
 
-        // Record index paths of added members BEFORE the rewrite (replace
-        // operations preserve node counts and order), so the rewritten
-        // declarations can be located for extraction afterwards.
+        // Record index paths of added members and added-field initializers
+        // BEFORE the rewrite (replace operations preserve node counts and
+        // order), so the rewritten nodes can be located afterwards.
         var addedPaths = new List<(List<int> Path, ShimTarget Target)>();
         foreach (var pair in addedDecls)
             addedPaths.Add((IndexPath(pair.Key), pair.Value));
+        var initializerPaths = new List<(List<int> Path, AddedFieldInfo Field)>();
+        foreach (AddedFieldInfo info in addedFieldSymbols.Values)
+        {
+            if (info.InitializerValue != null)
+                initializerPaths.Add((IndexPath(info.InitializerValue), info));
+        }
 
         SyntaxNode rewritten = root.ReplaceSyntax(
             nodeReplacements.Keys.Concat(dynamicReplacements.Keys),
@@ -698,6 +808,14 @@ public static class PatchRewriter
             (original, _) => tokenReplacements[original],
             null,
             null);
+
+        // Fetch the REWRITTEN initializer expressions first — later surgery
+        // (member extraction, declaration stripping) invalidates the paths.
+        foreach (var (pathIndices, info) in initializerPaths)
+        {
+            if (NodeAtPath(rewritten, pathIndices) is ExpressionSyntax expression)
+                info.RewrittenInitializerText = expression.ToFullString();
+        }
 
         // ── extract added members into shim classes (M2) ─────────────
         if (addedPaths.Count > 0)
@@ -828,6 +946,27 @@ public static class PatchRewriter
             });
         }
 
+        // ── virtualized-field surgery (M4) ───────────────────────────
+        // Strip added field declarations, re-inject placeholders for the
+        // removed ones (the patch type's instance layout must equal the
+        // original exactly), materialize added-field initializers into the
+        // instance constructors, and declare the new stores/holders.
+        foreach (var pair in fieldChangesByType)
+        {
+            string declaringType = pair.Key;
+            List<HotDiffFieldChange> changes = pair.Value;
+            List<AddedFieldInfo> addedInfos = addedFieldsByType.TryGetValue(declaringType, out List<AddedFieldInfo>? list)
+                ? list
+                : new List<AddedFieldInfo>();
+
+            INamedTypeSymbol? original = FindOriginalType(binding, declaringType, out _);
+            if (original == null)
+                continue; // patched-type guard above already handled
+
+            rewritten = ApplyFieldSurgery(
+                (CompilationUnitSyntax)rewritten, declaringType, changes, addedInfos, original, result);
+        }
+
         result.Tree = CSharpSyntaxTree.Create(
             (CSharpSyntaxNode)rewritten,
             parseOptions,
@@ -851,6 +990,456 @@ public static class PatchRewriter
         }
 
         return result;
+    }
+
+    // ── virtualized fields (M4) ──────────────────────────────────────
+
+    private sealed class AddedFieldInfo
+    {
+        public string Name = "";
+        public string DeclaringType = "";
+        public string FieldTypeFqn = "";
+        public bool IsStatic;
+        public string StoreFqn = "";
+        public string StoreMetadataName = "";
+        public string StoreNamespace = "";
+
+        /// <summary>False when an earlier batch already declared the store —
+        /// accesses bind to it and no new declaration is generated.</summary>
+        public bool IsNewStore = true;
+
+        public ExpressionSyntax? InitializerValue;
+        public string? RewrittenInitializerText;
+    }
+
+    private static VariableDeclaratorSyntax? FindFieldDeclarator(TypeDeclarationSyntax type, string name, bool isStatic)
+    {
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            if (member is not FieldDeclarationSyntax field ||
+                field.Modifiers.Any(SyntaxKind.ConstKeyword) ||
+                field.Modifiers.Any(SyntaxKind.StaticKeyword) != isStatic)
+            {
+                continue;
+            }
+            foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+            {
+                if (declarator.Identifier.Text == name)
+                    return declarator;
+            }
+        }
+        return null;
+    }
+
+    private static AddedFieldInfo BuildAddedFieldInfo(
+        string declaringType,
+        TypeDeclarationSyntax typeDecl,
+        HotDiffFieldChange change,
+        IFieldSymbol fieldSymbol,
+        VariableDeclaratorSyntax declarator,
+        PatchBatchContext batch)
+    {
+        var info = new AddedFieldInfo
+        {
+            Name = change.Name,
+            DeclaringType = declaringType,
+            FieldTypeFqn = fieldSymbol.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            IsStatic = change.IsStatic,
+            InitializerValue = declarator.Initializer?.Value,
+        };
+
+        string fieldKey = FieldStoreRegistry.FieldKey(declaringType, change.Name);
+        if (batch.EarlierFieldStores.TryGetValue(fieldKey, out FieldStoreRegistry.StoreEntry? earlier))
+        {
+            info.StoreFqn = earlier.StoreTypeFqn;
+            info.StoreMetadataName = earlier.StoreTypeMetadataName;
+            info.IsNewStore = false;
+            return info;
+        }
+
+        // "Ns.Outer+Inner" → holder "__LocusFields_Outer_Inner" in Ns. The
+        // name stays inside the __LocusHotPatch_ assembly, so the type-index
+        // skip list covers it without a new prefix entry.
+        int dot = declaringType.LastIndexOf('.');
+        string ns = dot < 0 ? "" : declaringType[..dot];
+        string chain = (dot < 0 ? declaringType : declaringType[(dot + 1)..]).Replace('+', '_');
+        string storeName = "__LocusFields_" + chain;
+        info.StoreNamespace = ns;
+        info.StoreMetadataName = ns.Length == 0 ? storeName : ns + "." + storeName;
+        info.StoreFqn = "global::" + info.StoreMetadataName;
+        _ = typeDecl;
+        return info;
+    }
+
+    /// <summary>Constructive layout verification for a type with M4 field
+    /// changes: source fields minus ADDED must equal original fields minus
+    /// REMOVED (names and types, in order — auto-property backing fields
+    /// included). Returns an error string on mismatch (stale baseline).</summary>
+    private static string? VerifyVirtualizedLayout(
+        INamedTypeSymbol sourceSymbol,
+        INamedTypeSymbol original,
+        List<HotDiffFieldChange> changes)
+    {
+        var addedNames = new HashSet<string>(
+            changes.Where(c => c.Kind == "added" && !c.IsStatic).Select(c => c.Name),
+            StringComparer.Ordinal);
+        var removedNames = new HashSet<string>(
+            changes.Where(c => c.Kind == "removed" && !c.IsStatic).Select(c => c.Name),
+            StringComparer.Ordinal);
+
+        static string EntryName(string entry) => entry[..entry.IndexOf('|')];
+
+        List<string> source = InstanceFieldSequence(sourceSymbol)
+            .Where(e => !addedNames.Contains(EntryName(e)))
+            .ToList();
+        List<string> originalSeq = InstanceFieldSequence(original);
+        List<string> originalFiltered = originalSeq
+            .Where(e => !removedNames.Contains(EntryName(e)))
+            .ToList();
+
+        if (!source.SequenceEqual(originalFiltered, StringComparer.Ordinal))
+            return "constructed layout mismatch";
+        foreach (string removed in removedNames)
+        {
+            if (!originalSeq.Any(e => EntryName(e) == removed))
+                return "removed field not present in the original: " + removed;
+        }
+        return null;
+    }
+
+    /// <summary>Strip added-field declarations, inject placeholders for the
+    /// removed fields at their original positions, materialize added-field
+    /// initializers into instance constructors, and declare new
+    /// stores/holders. Operates purely syntactically on the rewritten unit.</summary>
+    private static CompilationUnitSyntax ApplyFieldSurgery(
+        CompilationUnitSyntax unit,
+        string declaringType,
+        List<HotDiffFieldChange> changes,
+        List<AddedFieldInfo> addedInfos,
+        INamedTypeSymbol original,
+        PatchRewriteResult result)
+    {
+        string renamedMetadataName = PatchTypeName(declaringType);
+
+        TypeDeclarationSyntax? Locate(CompilationUnitSyntax current) => current
+            .DescendantNodes()
+            .OfType<TypeDeclarationSyntax>()
+            .FirstOrDefault(t => HotDiff.MetadataName(t) == renamedMetadataName);
+
+        // 1. Strip added-field declarators (instance AND static).
+        TypeDeclarationSyntax? typeDecl = Locate(unit);
+        if (typeDecl == null)
+            return unit;
+
+        var addedNames = new HashSet<string>(addedInfos.Select(i => i.Name), StringComparer.Ordinal);
+        if (addedNames.Count > 0)
+        {
+            var removeDeclarations = new List<SyntaxNode>();
+            var declarationRewrites = new Dictionary<SyntaxNode, SyntaxNode>();
+            foreach (FieldDeclarationSyntax field in typeDecl.Members.OfType<FieldDeclarationSyntax>())
+            {
+                if (field.Modifiers.Any(SyntaxKind.ConstKeyword))
+                    continue;
+                var kept = field.Declaration.Variables
+                    .Where(v => !addedNames.Contains(v.Identifier.Text))
+                    .ToList();
+                if (kept.Count == field.Declaration.Variables.Count)
+                    continue;
+                if (kept.Count == 0)
+                    removeDeclarations.Add(field);
+                else
+                    declarationRewrites[field] = field.WithDeclaration(
+                        field.Declaration.WithVariables(SyntaxFactory.SeparatedList(kept)));
+            }
+
+            if (declarationRewrites.Count > 0)
+            {
+                unit = unit.ReplaceNodes(declarationRewrites.Keys, (orig, _) => declarationRewrites[orig]);
+                typeDecl = Locate(unit)!;
+                removeDeclarations = typeDecl.Members.OfType<FieldDeclarationSyntax>()
+                    .Where(f => !f.Modifiers.Any(SyntaxKind.ConstKeyword) &&
+                                f.Declaration.Variables.All(v => addedNames.Contains(v.Identifier.Text)))
+                    .Cast<SyntaxNode>()
+                    .ToList();
+            }
+            if (removeDeclarations.Count > 0)
+            {
+                unit = unit.RemoveNodes(removeDeclarations, SyntaxRemoveOptions.KeepNoTrivia)!;
+                typeDecl = Locate(unit);
+                if (typeDecl == null)
+                    return unit;
+            }
+        }
+
+        // 2. Placeholders for removed instance fields, at original order.
+        var removedInstance = changes
+            .Where(c => c.Kind == "removed" && !c.IsStatic)
+            .OrderBy(c => c.OldFieldIndex)
+            .ToList();
+        if (removedInstance.Count > 0)
+        {
+            List<(string Name, string TypeFqn)> originalFields = InstanceFieldSequence(original)
+                .Select(e =>
+                {
+                    int bar = e.IndexOf('|');
+                    return (e[..bar], e[(bar + 1)..]);
+                })
+                .ToList();
+
+            foreach (HotDiffFieldChange removed in removedInstance)
+            {
+                typeDecl = Locate(unit);
+                if (typeDecl == null)
+                    return unit;
+
+                int originalIndex = originalFields.FindIndex(f => f.Name == removed.Name);
+                if (originalIndex < 0)
+                    continue;
+                string typeFqn = originalFields[originalIndex].TypeFqn;
+
+                MemberDeclarationSyntax placeholder = SyntaxFactory.ParseMemberDeclaration(
+                        "private " + typeFqn + " " + removed.Name + ";")!
+                    .NormalizeWhitespace()
+                    .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+                // Anchor: the first original field AFTER this one that still
+                // exists in the patch type (backing fields anchor on their
+                // auto-property declaration).
+                MemberDeclarationSyntax? anchor = null;
+                for (int i = originalIndex + 1; i < originalFields.Count && anchor == null; i++)
+                {
+                    string nextName = originalFields[i].Name;
+                    if (removedInstance.Any(r => r.Name == nextName))
+                        continue;
+                    anchor = FindLayoutMember(typeDecl, nextName);
+                }
+
+                TypeDeclarationSyntax updated;
+                if (anchor != null)
+                {
+                    updated = typeDecl.WithMembers(typeDecl.Members.Insert(
+                        typeDecl.Members.IndexOf(anchor), placeholder));
+                }
+                else
+                {
+                    // No following field: append after the LAST layout
+                    // member (or at the top when none remain).
+                    int insertIndex = 0;
+                    for (int i = 0; i < typeDecl.Members.Count; i++)
+                    {
+                        MemberDeclarationSyntax member = typeDecl.Members[i];
+                        if (member is FieldDeclarationSyntax f && !f.Modifiers.Any(SyntaxKind.ConstKeyword) &&
+                            !f.Modifiers.Any(SyntaxKind.StaticKeyword))
+                        {
+                            insertIndex = i + 1;
+                        }
+                        else if (member is PropertyDeclarationSyntax p && HotDiff.IsAutoProperty(p) &&
+                                 !p.Modifiers.Any(SyntaxKind.StaticKeyword))
+                        {
+                            insertIndex = i + 1;
+                        }
+                        else if (member is EventFieldDeclarationSyntax)
+                        {
+                            insertIndex = i + 1;
+                        }
+                    }
+                    updated = typeDecl.WithMembers(typeDecl.Members.Insert(insertIndex, placeholder));
+                }
+                unit = unit.ReplaceNode(typeDecl, updated);
+            }
+        }
+
+        // 3. Materialize added-field initializers into the instance ctors.
+        var initialized = addedInfos
+            .Where(i => !i.IsStatic && i.RewrittenInitializerText != null)
+            .ToList();
+        if (initialized.Count > 0)
+        {
+            typeDecl = Locate(unit);
+            if (typeDecl == null)
+                return unit;
+
+            var statements = new List<StatementSyntax>();
+            foreach (AddedFieldInfo info in initialized)
+            {
+                statements.Add(SyntaxFactory.ParseStatement(
+                        info.StoreFqn + "." + info.Name + ".Ref(this) = " +
+                        info.RewrittenInitializerText!.Trim() + ";")
+                    .NormalizeWhitespace()
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed));
+            }
+
+            var ctors = typeDecl.Members.OfType<ConstructorDeclarationSyntax>()
+                .Where(c => !c.Modifiers.Any(SyntaxKind.StaticKeyword))
+                .ToList();
+            if (ctors.Count == 0)
+            {
+                // The original implicit default ctor is being detoured (the
+                // diff added .ctor): synthesize its patch-side counterpart.
+                ConstructorDeclarationSyntax synthesized = SyntaxFactory.ConstructorDeclaration(typeDecl.Identifier.Text)
+                    .WithModifiers(SyntaxFactory.TokenList(SyntaxFactory.Token(SyntaxKind.PublicKeyword)))
+                    .WithBody(SyntaxFactory.Block(statements))
+                    .NormalizeWhitespace()
+                    .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+                unit = unit.ReplaceNode(typeDecl, typeDecl.AddMembers(synthesized));
+            }
+            else
+            {
+                var ctorRewrites = new Dictionary<SyntaxNode, SyntaxNode>();
+                foreach (ConstructorDeclarationSyntax ctor in ctors)
+                {
+                    // Chained `: this(...)` ctors delegate initialization,
+                    // mirroring Roslyn's initializer emission.
+                    if (ctor.Initializer != null && ctor.Initializer.IsKind(SyntaxKind.ThisConstructorInitializer))
+                        continue;
+                    if (ctor.Body != null)
+                    {
+                        ctorRewrites[ctor] = ctor.WithBody(
+                            ctor.Body.WithStatements(ctor.Body.Statements.InsertRange(0, statements)));
+                    }
+                    else if (ctor.ExpressionBody != null)
+                    {
+                        var bodyStatements = new List<StatementSyntax>(statements)
+                        {
+                            SyntaxFactory.ExpressionStatement(ctor.ExpressionBody.Expression),
+                        };
+                        ctorRewrites[ctor] = ctor
+                            .WithExpressionBody(null)
+                            .WithSemicolonToken(default)
+                            .WithBody(SyntaxFactory.Block(bodyStatements));
+                    }
+                }
+                if (ctorRewrites.Count > 0)
+                    unit = unit.ReplaceNodes(ctorRewrites.Keys, (orig, _) => ctorRewrites[orig]);
+            }
+        }
+
+        // 4. Declare new stores/holders + registrations.
+        var newStores = addedInfos.Where(i => i.IsNewStore).ToList();
+        if (newStores.Count > 0)
+        {
+            var members = new List<MemberDeclarationSyntax>();
+            foreach (AddedFieldInfo info in newStores)
+            {
+                string declaration;
+                if (info.IsStatic)
+                {
+                    declaration = "public static " + info.FieldTypeFqn + " " + info.Name +
+                        (info.RewrittenInitializerText != null
+                            ? " = " + info.RewrittenInitializerText.Trim() + ";"
+                            : ";");
+                }
+                else
+                {
+                    declaration =
+                        "public static readonly global::Locus.HotReload.LocusFieldStore<" + info.FieldTypeFqn + "> " +
+                        info.Name + " = new global::Locus.HotReload.LocusFieldStore<" + info.FieldTypeFqn + ">();";
+                }
+                members.Add(SyntaxFactory.ParseMemberDeclaration(declaration)!);
+            }
+
+            AddedFieldInfo first = newStores[0];
+            string storeSimpleName = first.StoreMetadataName.Contains('.')
+                ? first.StoreMetadataName[(first.StoreMetadataName.LastIndexOf('.') + 1)..]
+                : first.StoreMetadataName;
+            ClassDeclarationSyntax storeClass = SyntaxFactory.ClassDeclaration(storeSimpleName)
+                .WithModifiers(SyntaxFactory.TokenList(
+                    SyntaxFactory.Token(SyntaxKind.PublicKeyword),
+                    SyntaxFactory.Token(SyntaxKind.StaticKeyword)))
+                .WithMembers(SyntaxFactory.List(members))
+                .NormalizeWhitespace()
+                .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+            unit = AppendTypeToNamespace(unit, storeClass, first.StoreNamespace);
+
+            foreach (AddedFieldInfo info in newStores)
+            {
+                result.FieldStoreRegistrations.Add(new FieldStoreRegistration
+                {
+                    FieldKey = FieldStoreRegistry.FieldKey(info.DeclaringType, info.Name),
+                    Entry = new FieldStoreRegistry.StoreEntry
+                    {
+                        StoreTypeMetadataName = info.StoreMetadataName,
+                        StoreTypeFqn = info.StoreFqn,
+                        MemberName = info.Name,
+                        IsStatic = info.IsStatic,
+                        FieldTypeFqn = info.FieldTypeFqn,
+                    },
+                });
+            }
+        }
+
+        return unit;
+    }
+
+    /// <summary>Find the member declaration that carries a layout entry by
+    /// field name ("&lt;X&gt;k__BackingField" anchors on auto-property X).</summary>
+    private static MemberDeclarationSyntax? FindLayoutMember(TypeDeclarationSyntax type, string fieldName)
+    {
+        string? propertyName = null;
+        if (fieldName.StartsWith("<", StringComparison.Ordinal))
+        {
+            int end = fieldName.IndexOf('>');
+            if (end > 1)
+                propertyName = fieldName[1..end];
+        }
+
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case FieldDeclarationSyntax field when propertyName == null:
+                    if (field.Declaration.Variables.Any(v => v.Identifier.Text == fieldName))
+                        return field;
+                    break;
+                case EventFieldDeclarationSyntax eventField when propertyName == null:
+                    if (eventField.Declaration.Variables.Any(v => v.Identifier.Text == fieldName))
+                        return eventField;
+                    break;
+                case PropertyDeclarationSyntax property when propertyName != null:
+                    if (property.Identifier.Text == propertyName)
+                        return property;
+                    break;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>`x` / `expr.x` → `Store.x.Ref(target)` (instance) or
+    /// `Holder.x` (static).</summary>
+    private static SyntaxNode BuildFieldStoreAccess(
+        SyntaxNode rewrittenNode,
+        AddedFieldInfo field,
+        bool inAddedMember)
+    {
+        if (field.IsStatic)
+        {
+            return SyntaxFactory.ParseExpression(field.StoreFqn + "." + field.Name)
+                .WithTriviaFrom(rewrittenNode);
+        }
+
+        ExpressionSyntax target;
+        if (rewrittenNode is MemberAccessExpressionSyntax memberAccess)
+        {
+            // `this.x` inside kept members keeps `this` (the store key is
+            // the object identity; the patch-typed reference converts to
+            // object implicitly). Inside added members `this` already became
+            // `self`.
+            target = memberAccess.Expression.WithoutTrivia();
+        }
+        else
+        {
+            target = inAddedMember
+                ? SyntaxFactory.IdentifierName("self")
+                : SyntaxFactory.ThisExpression();
+        }
+
+        return SyntaxFactory.InvocationExpression(
+                SyntaxFactory.ParseExpression(field.StoreFqn + "." + field.Name + ".Ref"),
+                SyntaxFactory.ArgumentList(SyntaxFactory.SingletonSeparatedList(SyntaxFactory.Argument(target))))
+            .WithTriviaFrom(rewrittenNode);
     }
 
     // ── shim construction ────────────────────────────────────────────

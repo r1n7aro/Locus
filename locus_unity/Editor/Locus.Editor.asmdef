@@ -11,7 +11,8 @@
     "precompiledReferences": [
         "Locus.Roslyn.dll",
         "Locus.Json.dll",
-        "Locus.Detour.dll"
+        "Locus.Detour.dll",
+        "Locus.HotReload.Runtime.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],

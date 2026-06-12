@@ -74,6 +74,99 @@ pub(crate) fn set_cold_queue_depth(depth: u64) {
 /// holds every hot-applied edit, so the real compile converges naturally.
 pub(crate) fn reset_active_patches() {
     ACTIVE_PATCHES.store(0, Ordering::Relaxed);
+    CONVERGENCE_PENDING.store(false, Ordering::Relaxed);
     crate::csharp_compile::emit_status_in_background();
+}
+
+// ── H6: automatic convergence ────────────────────────────────────────
+//
+// Field virtualization (M4) makes the hot/real state gap grow with every
+// patch — convergence stops being an optimization and becomes part of the
+// mechanism. A silent real recompile runs when any of:
+//   • active patches reach the threshold,
+//   • the session goes idle with patches live,
+//   • the editor leaves play mode with patches live (deferred triggers
+//     also land here: recompiling mid-play would kill the play session).
+
+const CONVERGE_ACTIVE_THRESHOLD: u64 = 8;
+const CONVERGE_IDLE_SECS: u64 = 10 * 60;
+
+/// Bumped on every hot-reload apply; an idle watchdog only fires if its
+/// generation is still current when it wakes.
+static CONVERGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// A trigger fired during play mode: converge on play-mode exit.
+static CONVERGENCE_PENDING: AtomicBool = AtomicBool::new(false);
+/// A convergence recompile is currently running.
+static CONVERGENCE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Called by the coordinator after each successful hot patch.
+pub(crate) fn note_patch_applied(project_path: &str) {
+    let generation = CONVERGE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let project = project_path.to_string();
+
+    if counters().active_patches >= CONVERGE_ACTIVE_THRESHOLD {
+        let threshold_project = project.clone();
+        tauri::async_runtime::spawn(async move {
+            try_converge(&threshold_project, "active patch threshold").await;
+        });
+    }
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(CONVERGE_IDLE_SECS)).await;
+        if CONVERGE_GENERATION.load(Ordering::Relaxed) != generation {
+            return; // newer activity rearmed the watchdog
+        }
+        if counters().active_patches == 0 {
+            return;
+        }
+        try_converge(&project, "idle session").await;
+    });
+}
+
+/// Called from the connection monitor on an editor play-mode transition.
+pub(crate) async fn on_play_mode_exited(project_path: &str) {
+    if !is_enabled() {
+        return;
+    }
+    let pending = CONVERGENCE_PENDING.swap(false, Ordering::Relaxed);
+    if !pending && counters().active_patches == 0 {
+        return;
+    }
+    try_converge(project_path, "left play mode").await;
+}
+
+/// Run the silent convergence recompile unless the editor is playing (then
+/// defer to the play-exit trigger). Reuses the unity_recompile pipeline, so
+/// the cold queue, pending baselines and type index all settle.
+async fn try_converge(project_path: &str, why: &str) {
+    if !is_enabled() || !crate::csharp_compile::is_enabled() {
+        return;
+    }
+    if counters().active_patches == 0 && counters().cold_queued == 0 {
+        return;
+    }
+    if CONVERGENCE_RUNNING.swap(true, Ordering::Relaxed) {
+        return; // one at a time
+    }
+
+    let result = async {
+        let (connected, status, _) = crate::unity_bridge::query_unity_status(project_path).await;
+        if !connected {
+            return Err("editor not connected".to_string());
+        }
+        if crate::unity_bridge::is_play_mode_status(status) {
+            CONVERGENCE_PENDING.store(true, Ordering::Relaxed);
+            return Err("editor in play mode; deferred to play-mode exit".to_string());
+        }
+        eprintln!("[HotReload] auto-convergence ({why}): running a silent recompile");
+        crate::unity_bridge::recompile_and_wait(project_path).await
+    }
+    .await;
+
+    CONVERGENCE_RUNNING.store(false, Ordering::Relaxed);
+    match result {
+        Ok(_) => eprintln!("[HotReload] auto-convergence completed ({why})"),
+        Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
+    }
 }
 

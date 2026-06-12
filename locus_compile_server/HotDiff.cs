@@ -68,6 +68,26 @@ public sealed class HotDiffRemovedMember
     public string? StubSource;
 }
 
+/// <summary>One virtualizable field change (M4): a plain instance/static
+/// field added or removed (a retype is a remove+add pair). Added instance
+/// fields live in a per-field LocusFieldStore keyed by the instance; added
+/// static fields live in a patch-local holder class; removed instance
+/// fields re-materialize as layout placeholders in the patch type.</summary>
+public sealed class HotDiffFieldChange
+{
+    public string DeclaringType = "";
+    public string Name = "";
+
+    /// <summary>"added" | "removed".</summary>
+    public string Kind = "";
+
+    public bool IsStatic;
+
+    /// <summary>Index among the OLD type's instance fields (removed
+    /// instance fields) — the placeholder re-injection position.</summary>
+    public int OldFieldIndex;
+}
+
 /// <summary>Hot/cold classification of one edited file.</summary>
 public sealed class HotDiffFileResult
 {
@@ -84,6 +104,9 @@ public sealed class HotDiffFileResult
 
     /// <summary>Members that exist only in the old text (M5).</summary>
     public List<HotDiffRemovedMember> RemovedMembers = new();
+
+    /// <summary>Virtualizable field additions/removals (M4).</summary>
+    public List<HotDiffFieldChange> FieldChanges = new();
 
     /// <summary>Deterministic agent-facing error: the new text does not even
     /// parse. Not a cold reason — recompiling would fail identically.</summary>
@@ -323,20 +346,19 @@ public static class HotDiff
         bool genericContext = IsGenericContext(newType);
         bool burstContext = HasBurstCompileAttribute(oldType) || HasBurstCompileAttribute(newType);
 
-        if (!LayoutSequence(oldType).SequenceEqual(LayoutSequence(newType), StringComparer.Ordinal))
-        {
-            result.Reasons.Add("field layout changed: " + metadataName);
+        // M4: plain field add/remove/retype virtualizes through stores;
+        // everything else layout-shaped stays cold.
+        int fieldChangesBefore = result.FieldChanges.Count;
+        if (!DiffFieldLayout(metadataName, oldType, newType, genericContext, result))
             return;
-        }
+        bool fieldsChanged = result.FieldChanges.Count > fieldChangesBefore;
 
         // Constants are inlined at every use site; a recompile is the only
         // way to update consumers. Static initializers ran with the original
         // domain's static constructor and would silently not re-run.
-        if (ConstAndStaticInitText(oldType) != ConstAndStaticInitText(newType))
-        {
-            result.Reasons.Add("const or static initializer changed: " + metadataName);
+        // Compared per-name so M4 static field additions/removals pass.
+        if (!DiffConstAndStaticInit(metadataName, oldType, newType, result))
             return;
-        }
 
         bool instanceInitChanged = InstanceInitText(oldType) != InstanceInitText(newType);
 
@@ -414,8 +436,322 @@ public static class HotDiff
             patched = true;
         }
 
+        patched |= fieldsChanged;
+
         if (patched)
             result.PatchedTypes.Add(metadataName);
+    }
+
+    // ── field-level layout diff (M4) ─────────────────────────────────
+
+    private sealed class FieldDeclaratorEntry
+    {
+        public string Name = "";
+        public string TypeText = "";
+        public string ModifiersText = "";
+        public string AttributesText = "";
+        public int Index;
+    }
+
+    /// <summary>Diff the layout-affecting members. Plain instance/static
+    /// FIELD additions, removals and retypes become FieldChanges (hot via
+    /// store virtualization); auto-property/event-field changes, kept-field
+    /// reorders, modifier/attribute changes, and any field change on a
+    /// struct or generic type stay cold. Returns false on cold.</summary>
+    private static bool DiffFieldLayout(
+        string metadataName,
+        TypeDeclarationSyntax oldType,
+        TypeDeclarationSyntax newType,
+        bool genericContext,
+        HotDiffFileResult result)
+    {
+        List<FieldDeclaratorEntry> oldFields = InstanceFieldEntries(oldType);
+        List<FieldDeclaratorEntry> newFields = InstanceFieldEntries(newType);
+
+        var oldByName = oldFields.ToDictionary(f => f.Name, StringComparer.Ordinal);
+        var newByName = newFields.ToDictionary(f => f.Name, StringComparer.Ordinal);
+
+        var added = new List<FieldDeclaratorEntry>();
+        var removed = new List<FieldDeclaratorEntry>();
+
+        foreach (FieldDeclaratorEntry field in newFields)
+        {
+            if (!oldByName.TryGetValue(field.Name, out FieldDeclaratorEntry? old))
+            {
+                added.Add(field);
+                continue;
+            }
+            if (old.TypeText != field.TypeText)
+            {
+                // Retype = remove (placeholder keeps the old slot) + add
+                // (new store slot); existing instances read default.
+                removed.Add(old);
+                added.Add(field);
+            }
+            else if (old.ModifiersText != field.ModifiersText || old.AttributesText != field.AttributesText)
+            {
+                result.Reasons.Add("field attributes or modifiers changed: " + metadataName + "." + field.Name +
+                    " (metadata is immutable; use unity_recompile)");
+                return false;
+            }
+        }
+        foreach (FieldDeclaratorEntry field in oldFields)
+        {
+            if (!newByName.ContainsKey(field.Name))
+                removed.Add(field);
+        }
+
+        // Kept fields, auto-properties and field-like events must keep
+        // their exact shape and relative order: the skeleton sequence
+        // (added/removed fields excluded) is compared verbatim.
+        var addedNames = new HashSet<string>(added.Select(f => f.Name), StringComparer.Ordinal);
+        var removedNames = new HashSet<string>(removed.Select(f => f.Name), StringComparer.Ordinal);
+        List<string> oldSkeleton = LayoutSkeleton(oldType, removedNames);
+        List<string> newSkeleton = LayoutSkeleton(newType, addedNames);
+        if (!oldSkeleton.SequenceEqual(newSkeleton, StringComparer.Ordinal))
+        {
+            result.Reasons.Add("field layout changed: " + metadataName +
+                " (only plain field additions/removals/retypes are hot-virtualizable)");
+            return false;
+        }
+
+        // Static (non-const) fields: per-name add/remove diff. Common-name
+        // changes are handled by DiffConstAndStaticInit.
+        var oldStatics = StaticFieldEntries(oldType);
+        var newStatics = StaticFieldEntries(newType);
+        var staticAdded = newStatics.Values.Where(f => !oldStatics.ContainsKey(f.Name)).ToList();
+        var staticRemoved = oldStatics.Values.Where(f => !newStatics.ContainsKey(f.Name)).ToList();
+
+        if (added.Count == 0 && removed.Count == 0 && staticAdded.Count == 0 && staticRemoved.Count == 0)
+            return true;
+
+        if (newType is StructDeclarationSyntax)
+        {
+            result.Reasons.Add("struct field layout changed: " + metadataName +
+                " (value-copy semantics cannot be store-virtualized; use unity_recompile)");
+            return false;
+        }
+        if (genericContext)
+        {
+            result.Reasons.Add("generic type field layout changed: " + metadataName);
+            return false;
+        }
+
+        foreach (FieldDeclaratorEntry field in added)
+        {
+            result.FieldChanges.Add(new HotDiffFieldChange
+            {
+                DeclaringType = metadataName,
+                Name = field.Name,
+                Kind = "added",
+                IsStatic = false,
+            });
+        }
+        foreach (FieldDeclaratorEntry field in removed)
+        {
+            result.FieldChanges.Add(new HotDiffFieldChange
+            {
+                DeclaringType = metadataName,
+                Name = field.Name,
+                Kind = "removed",
+                IsStatic = false,
+                OldFieldIndex = field.Index,
+            });
+        }
+        foreach (FieldDeclaratorEntry field in staticAdded)
+        {
+            result.FieldChanges.Add(new HotDiffFieldChange
+            {
+                DeclaringType = metadataName,
+                Name = field.Name,
+                Kind = "added",
+                IsStatic = true,
+            });
+        }
+        // Removed statics need no action: the original keeps holding the
+        // (now unreferenced) value until the convergence recompile.
+        foreach (FieldDeclaratorEntry field in staticRemoved)
+        {
+            result.FieldChanges.Add(new HotDiffFieldChange
+            {
+                DeclaringType = metadataName,
+                Name = field.Name,
+                Kind = "removed",
+                IsStatic = true,
+            });
+        }
+
+        return true;
+    }
+
+    private static List<FieldDeclaratorEntry> InstanceFieldEntries(TypeDeclarationSyntax type)
+    {
+        var entries = new List<FieldDeclaratorEntry>();
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            if (member is not FieldDeclarationSyntax field ||
+                field.Modifiers.Any(SyntaxKind.ConstKeyword) ||
+                field.Modifiers.Any(SyntaxKind.StaticKeyword))
+            {
+                continue;
+            }
+            foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+            {
+                entries.Add(new FieldDeclaratorEntry
+                {
+                    Name = declarator.Identifier.Text,
+                    TypeText = TokenText(field.Declaration.Type),
+                    ModifiersText = ModifiersText(field.Modifiers),
+                    AttributesText = AttributeListsText(field.AttributeLists),
+                    Index = entries.Count,
+                });
+            }
+        }
+        return entries;
+    }
+
+    private static Dictionary<string, FieldDeclaratorEntry> StaticFieldEntries(TypeDeclarationSyntax type)
+    {
+        var entries = new Dictionary<string, FieldDeclaratorEntry>(StringComparer.Ordinal);
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            if (member is not FieldDeclarationSyntax field ||
+                field.Modifiers.Any(SyntaxKind.ConstKeyword) ||
+                !field.Modifiers.Any(SyntaxKind.StaticKeyword))
+            {
+                continue;
+            }
+            foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+            {
+                entries[declarator.Identifier.Text] = new FieldDeclaratorEntry
+                {
+                    Name = declarator.Identifier.Text,
+                    TypeText = TokenText(field.Declaration.Type),
+                    ModifiersText = ModifiersText(field.Modifiers),
+                    AttributesText = AttributeListsText(field.AttributeLists),
+                };
+            }
+        }
+        return entries;
+    }
+
+    /// <summary>The layout sequence with added/removed plain fields
+    /// excluded: kept fields shrink to name markers (their shape equality is
+    /// checked separately), auto-properties and field-like events keep their
+    /// full shape text — so any change or reorder among them stays cold.</summary>
+    private static List<string> LayoutSkeleton(TypeDeclarationSyntax type, HashSet<string> excludedFieldNames)
+    {
+        var sequence = new List<string>();
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case FieldDeclarationSyntax field when
+                    !field.Modifiers.Any(SyntaxKind.ConstKeyword) &&
+                    !field.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                    {
+                        if (!excludedFieldNames.Contains(declarator.Identifier.Text))
+                            sequence.Add("F|" + declarator.Identifier.Text);
+                    }
+                    break;
+
+                case EventFieldDeclarationSyntax eventField:
+                    foreach (VariableDeclaratorSyntax declarator in eventField.Declaration.Variables)
+                    {
+                        sequence.Add(
+                            "eventfield|" + ModifiersText(eventField.Modifiers) + "|" +
+                            AttributeListsText(eventField.AttributeLists) + "|" +
+                            TokenText(eventField.Declaration.Type) + "|" + declarator.Identifier.Text);
+                    }
+                    break;
+
+                case PropertyDeclarationSyntax property when IsAutoProperty(property):
+                    sequence.Add(
+                        "autoprop|" + ModifiersText(property.Modifiers) + "|" +
+                        AttributeListsText(property.AttributeLists) + "|" +
+                        TokenText(property.Type) + "|" + property.Identifier.Text + "|" +
+                        string.Join(",", property.AccessorList!.Accessors.Select(a =>
+                            ModifiersText(a.Modifiers) + a.Keyword.Text + AttributeListsText(a.AttributeLists))));
+                    break;
+            }
+        }
+        return sequence;
+    }
+
+    /// <summary>Per-name comparison of consts and static initializers.
+    /// Common-name changes stay cold (inlined values / already-ran cctor);
+    /// ADDED consts and the add/remove of static fields pass (the latter
+    /// flow through DiffFieldLayout). Removed consts stay cold: their
+    /// inlined values leave no metadata trace to verify.</summary>
+    private static bool DiffConstAndStaticInit(
+        string metadataName,
+        TypeDeclarationSyntax oldType,
+        TypeDeclarationSyntax newType,
+        HotDiffFileResult result)
+    {
+        Dictionary<string, string> oldEntries = ConstAndStaticInitEntries(oldType);
+        Dictionary<string, string> newEntries = ConstAndStaticInitEntries(newType);
+
+        foreach (var pair in oldEntries)
+        {
+            if (!newEntries.TryGetValue(pair.Key, out string? newText))
+            {
+                if (pair.Value.StartsWith("const|", StringComparison.Ordinal))
+                {
+                    result.Reasons.Add("const removed: " + metadataName + "." + pair.Key +
+                        " (inlined values cannot be verified; use unity_recompile)");
+                    return false;
+                }
+                continue; // removed static field/initializer: DiffFieldLayout decides
+            }
+            if (pair.Value != newText)
+            {
+                result.Reasons.Add("const or static initializer changed: " + metadataName);
+                return false;
+            }
+        }
+        // Added consts are fine (the patch inlines them; no pre-existing
+        // call sites can reference them). Added static fields flow through
+        // DiffFieldLayout into holder classes.
+        return true;
+    }
+
+    private static Dictionary<string, string> ConstAndStaticInitEntries(TypeDeclarationSyntax type)
+    {
+        var entries = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.ConstKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                    {
+                        entries[declarator.Identifier.Text] =
+                            "const|" + ModifiersText(field.Modifiers) + "|" +
+                            TokenText(field.Declaration.Type) + "|" +
+                            (declarator.Initializer != null ? TokenText(declarator.Initializer) : "");
+                    }
+                    break;
+                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                    {
+                        entries[declarator.Identifier.Text] =
+                            "static|" + ModifiersText(field.Modifiers) + "|" +
+                            TokenText(field.Declaration.Type) + "|" +
+                            (declarator.Initializer != null ? TokenText(declarator.Initializer) : "");
+                    }
+                    break;
+                case PropertyDeclarationSyntax property when
+                    IsAutoProperty(property) &&
+                    property.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    entries["P:" + property.Identifier.Text] =
+                        "sprop|" + ModifiersText(property.Modifiers) + "|" + TokenText(property.Type) + "|" +
+                        (property.Initializer != null ? TokenText(property.Initializer) : "");
+                    break;
+            }
+        }
+        return entries;
     }
 
     private static bool IsGenericContext(TypeDeclarationSyntax type)
@@ -443,87 +779,11 @@ public static class HotDiff
 
     // ── layout & initializer text ────────────────────────────────────
 
-    /// <summary>
-    /// Ordered, layout-affecting member shapes: fields, field-like events,
-    /// and auto-properties (whose backing fields live in the type's layout).
-    /// Any difference in this sequence makes patched bodies read wrong
-    /// offsets through original `this` pointers.
-    /// </summary>
-    private static List<string> LayoutSequence(TypeDeclarationSyntax type)
-    {
-        var sequence = new List<string>();
-
-        foreach (MemberDeclarationSyntax member in type.Members)
-        {
-            switch (member)
-            {
-                case FieldDeclarationSyntax field when !field.Modifiers.Any(SyntaxKind.ConstKeyword):
-                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
-                    {
-                        sequence.Add(
-                            "field|" + ModifiersText(field.Modifiers) + "|" +
-                            AttributeListsText(field.AttributeLists) + "|" +
-                            TokenText(field.Declaration.Type) + "|" + declarator.Identifier.Text);
-                    }
-                    break;
-
-                case EventFieldDeclarationSyntax eventField:
-                    foreach (VariableDeclaratorSyntax declarator in eventField.Declaration.Variables)
-                    {
-                        sequence.Add(
-                            "eventfield|" + ModifiersText(eventField.Modifiers) + "|" +
-                            AttributeListsText(eventField.AttributeLists) + "|" +
-                            TokenText(eventField.Declaration.Type) + "|" + declarator.Identifier.Text);
-                    }
-                    break;
-
-                case PropertyDeclarationSyntax property when IsAutoProperty(property):
-                    sequence.Add(
-                        "autoprop|" + ModifiersText(property.Modifiers) + "|" +
-                        AttributeListsText(property.AttributeLists) + "|" +
-                        TokenText(property.Type) + "|" + property.Identifier.Text + "|" +
-                        string.Join(",", property.AccessorList!.Accessors.Select(a =>
-                            ModifiersText(a.Modifiers) + a.Keyword.Text + AttributeListsText(a.AttributeLists))));
-                    break;
-            }
-        }
-
-        return sequence;
-    }
-
     internal static bool IsAutoProperty(PropertyDeclarationSyntax property)
     {
         if (property.ExpressionBody != null || property.AccessorList == null)
             return false;
         return property.AccessorList.Accessors.All(a => a.Body == null && a.ExpressionBody == null);
-    }
-
-    private static string ConstAndStaticInitText(TypeDeclarationSyntax type)
-    {
-        var parts = new List<string>();
-        foreach (MemberDeclarationSyntax member in type.Members)
-        {
-            switch (member)
-            {
-                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.ConstKeyword):
-                    parts.Add("const|" + TokenText(field));
-                    break;
-                case FieldDeclarationSyntax field when field.Modifiers.Any(SyntaxKind.StaticKeyword):
-                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
-                    {
-                        if (declarator.Initializer != null)
-                            parts.Add("sinit|" + declarator.Identifier.Text + "|" + TokenText(declarator.Initializer));
-                    }
-                    break;
-                case PropertyDeclarationSyntax property when
-                    IsAutoProperty(property) &&
-                    property.Modifiers.Any(SyntaxKind.StaticKeyword) &&
-                    property.Initializer != null:
-                    parts.Add("sinit|" + property.Identifier.Text + "|" + TokenText(property.Initializer));
-                    break;
-            }
-        }
-        return string.Join("\n", parts);
     }
 
     private static string InstanceInitText(TypeDeclarationSyntax type)

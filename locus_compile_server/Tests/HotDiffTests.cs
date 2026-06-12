@@ -380,14 +380,114 @@ namespace Game
     // ── cold: layout / signature / type shape ────────────────────────
 
     [Fact]
-    public void Field_added_is_cold()
+    public void Field_added_is_hot_via_store()
     {
         var result = Analyze(
             PlayerOld,
             PlayerOld.Replace("private int _health = 100;", "private int _health = 100;\n        private int _mana;"));
 
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("added", change.Kind);
+        Assert.Equal("_mana", change.Name);
+        Assert.False(change.IsStatic);
+        Assert.Equal(new[] { "Game.Player" }, result.PatchedTypes);
+    }
+
+    [Fact]
+    public void Field_added_with_initializer_redirects_constructors()
+    {
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace("private int _health = 100;", "private int _health = 100;\n        private int _mana = 50;"));
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Single(result.FieldChanges, c => c.Kind == "added" && c.Name == "_mana");
+        Assert.Contains(result.ChangedMethods, m => m.IsCtor);
+    }
+
+    [Fact]
+    public void Field_removed_is_hot_with_placeholder_entry()
+    {
+        var result = Analyze(
+            "class A { int _a; int _b; void M() { } }",
+            "class A { int _a; void M() { } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("removed", change.Kind);
+        Assert.Equal("_b", change.Name);
+        Assert.Equal(1, change.OldFieldIndex);
+    }
+
+    [Fact]
+    public void Field_retype_decomposes_into_remove_plus_add()
+    {
+        var result = Analyze(
+            "class A { int _x; void M() { } }",
+            "class A { long _x; void M() { } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal(2, result.FieldChanges.Count);
+        Assert.Single(result.FieldChanges, c => c.Kind == "removed" && c.Name == "_x");
+        Assert.Single(result.FieldChanges, c => c.Kind == "added" && c.Name == "_x");
+    }
+
+    [Fact]
+    public void Static_field_added_is_hot_via_holder()
+    {
+        var result = Analyze(
+            "class A { void M() { } }",
+            "class A { static int S = 5; void M() { } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("added", change.Kind);
+        Assert.True(change.IsStatic);
+    }
+
+    [Fact]
+    public void Struct_field_added_is_cold()
+    {
+        var result = Analyze(
+            "struct S { int _a; }",
+            "struct S { int _a; int _b; }");
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+        Assert.Contains(result.Reasons, r => r.Contains("struct field layout changed"));
+    }
+
+    [Fact]
+    public void Generic_type_field_added_is_cold()
+    {
+        var result = Analyze(
+            "class A<T> { int _a; }",
+            "class A<T> { int _a; int _b; }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("generic type field layout changed"));
+    }
+
+    [Fact]
+    public void Const_added_is_hot()
+    {
+        var result = Analyze(
+            "class A { void M() { } }",
+            "class A { const int K = 1; void M() { } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Empty(result.FieldChanges);
+    }
+
+    [Fact]
+    public void Const_removed_is_cold()
+    {
+        var result = Analyze(
+            "class A { const int K = 1; void M() { } }",
+            "class A { void M() { } }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("const removed"));
     }
 
     [Fact]
@@ -625,7 +725,7 @@ class C
         var result = Analyze(oldText, newText);
 
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+        Assert.Contains(result.Reasons, r => r.Contains("field attributes or modifiers changed"));
     }
 
     [Fact]

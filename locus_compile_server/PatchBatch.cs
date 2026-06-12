@@ -57,6 +57,12 @@ public sealed class PatchBatchContext
     public IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> EarlierShims =
         new Dictionary<string, MemberSurfaceRegistry.ShimEntry>(StringComparer.Ordinal);
 
+    /// <summary>Field stores introduced by earlier accepted batches (M4),
+    /// keyed by declaringType|fieldName — re-edits bind to these instead of
+    /// regenerating (a new store would split the values).</summary>
+    public IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry> EarlierFieldStores =
+        new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal);
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -67,7 +73,8 @@ public sealed class PatchBatchContext
     public static PatchBatchContext Build(
         IReadOnlyList<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> files,
         System.Collections.Immutable.ImmutableArray<MetadataReference> references,
-        IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> earlierShims)
+        IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> earlierShims,
+        IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null)
     {
         var context = new PatchBatchContext
         {
@@ -81,6 +88,8 @@ public sealed class PatchBatchContext
                     metadataImportOptions: MetadataImportOptions.All,
                     assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default)),
             EarlierShims = earlierShims,
+            EarlierFieldStores = earlierFieldStores
+                ?? new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal),
         };
 
         foreach (var (_, tree, diff) in files)

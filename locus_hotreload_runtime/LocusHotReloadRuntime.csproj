@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Runtime support for hot-reload field virtualization (M4): patch
+       assemblies share per-field stores, so the DLL must be a single source
+       loaded once into the Unity Editor domain (shipped with the plugin as
+       Editor/HotReload/Locus.HotReload.Runtime.dll). netstandard2.0 keeps
+       the Unity Editor Mono profile happy without facade gymnastics. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Locus.HotReload.Runtime</AssemblyName>
+    <RootNamespace>Locus.HotReload</RootNamespace>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+    <DebugType>none</DebugType>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+</Project>

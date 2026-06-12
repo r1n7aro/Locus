@@ -29,6 +29,8 @@ const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "Editor/Roslyn/Locus.Roslyn.dll.meta",
     "Editor/Detour/Locus.Detour.dll",
     "Editor/Detour/Locus.Detour.dll.meta",
+    "Editor/HotReload/Locus.HotReload.Runtime.dll",
+    "Editor/HotReload/Locus.HotReload.Runtime.dll.meta",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +251,12 @@ fn should_skip_plugin_source_entry(source_dir: &Path, path: &Path) -> bool {
 
     if rel.starts_with("Editor/Detour/Locus.Detour.dll.")
         && rel != "Editor/Detour/Locus.Detour.dll.meta"
+    {
+        return true;
+    }
+
+    if rel.starts_with("Editor/HotReload/Locus.HotReload.Runtime.dll.")
+        && rel != "Editor/HotReload/Locus.HotReload.Runtime.dll.meta"
     {
         return true;
     }
@@ -605,6 +613,14 @@ mod tests {
         write_file(&source_root.join("Editor/Detour/Locus.Detour.dll"), b"dll");
         write_file(
             &source_root.join("Editor/Detour/Locus.Detour.dll.meta"),
+            b"meta",
+        );
+        write_file(
+            &source_root.join("Editor/HotReload/Locus.HotReload.Runtime.dll"),
+            b"dll",
+        );
+        write_file(
+            &source_root.join("Editor/HotReload/Locus.HotReload.Runtime.dll.meta"),
             b"meta",
         );
     }
