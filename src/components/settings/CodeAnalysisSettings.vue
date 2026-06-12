@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
+import { useCopyFeedback } from "../../composables/useCopyFeedback";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import {
   codeAnalysisToolsGetConfig,
@@ -180,6 +182,8 @@ async function toggleHotReloadEnabled() {
 const selfTestRunning = ref(false);
 const selfTestLog = ref<string[]>([]);
 const selfTestSummary = ref("");
+const selfTestLogText = computed(() => selfTestLog.value.join("\n"));
+const { copied: selfTestLogCopied, copyText: copySelfTestLogText } = useCopyFeedback();
 let unsubscribeSelfTest: RuntimeUnsubscribe | null = null;
 
 async function runHotReloadSelfTest() {
@@ -199,6 +203,15 @@ async function runHotReloadSelfTest() {
       replaceOperation: true,
     });
   }
+}
+
+async function copyHotReloadSelfTestLog() {
+  const copied = await copySelfTestLogText(selfTestLogText.value);
+  if (copied) return;
+  notificationStore.addNotice("warning", t("settings.codeAnalysis.hotReloadSelfTestCopyFailed"), {
+    operation: "copyHotReloadSelfTestLog",
+    replaceOperation: true,
+  });
 }
 
 type CodeToolKey = keyof CodeAnalysisToolsConfig;
@@ -323,7 +336,7 @@ onMounted(() => {
   void subscribeUnityHotReloadSelfTest((payload) => {
     selfTestRunning.value = payload.running && !payload.finished;
     if (payload.line) {
-      selfTestLog.value = [...selfTestLog.value.slice(-199), payload.line];
+      selfTestLog.value = [...selfTestLog.value, payload.line];
     }
     if (payload.finished) {
       selfTestSummary.value = t(
@@ -360,15 +373,14 @@ onUnmounted(() => {
           </span>
         </div>
         <div class="master-actions">
-          <button
+          <BaseButton
             v-if="lspEnabled"
-            class="action-btn"
             :disabled="restartBusy"
             :title="t('chat.status.code.restartTitle')"
             @click="restartLsp"
           >
             {{ t("chat.status.code.restart") }}
-          </button>
+          </BaseButton>
           <BaseSwitch
             v-if="lspReady"
             :model-value="lspEnabled"
@@ -433,8 +445,7 @@ onUnmounted(() => {
           <span v-if="selfTestSummary" class="tool-desc">{{ selfTestSummary }}</span>
         </div>
         <div class="master-actions">
-          <button
-            class="restart-btn"
+          <BaseButton
             :disabled="selfTestRunning || !sidecarEnabled"
             @click="runHotReloadSelfTest"
           >
@@ -443,12 +454,29 @@ onUnmounted(() => {
                 ? t("settings.codeAnalysis.hotReloadSelfTestRunning")
                 : t("settings.codeAnalysis.hotReloadSelfTestRun")
             }}
-          </button>
+          </BaseButton>
         </div>
       </div>
-      <div v-if="selfTestLog.length > 0" class="selftest-log" role="log">
-        <div v-for="(line, index) in selfTestLog" :key="index" class="selftest-log-line">
-          {{ line }}
+      <div v-if="selfTestLog.length > 0" class="selftest-log-panel">
+        <div class="selftest-log-header">
+          <span class="selftest-log-title">
+            {{ t("settings.codeAnalysis.hotReloadSelfTestLog") }}
+          </span>
+          <BaseButton
+            :disabled="!selfTestLogText"
+            @click="copyHotReloadSelfTestLog"
+          >
+            {{
+              selfTestLogCopied
+                ? t("common.copied")
+                : t("settings.codeAnalysis.hotReloadSelfTestCopy")
+            }}
+          </BaseButton>
+        </div>
+        <div class="selftest-log" role="log">
+          <div v-for="(line, index) in selfTestLog" :key="index" class="selftest-log-line">
+            {{ line }}
+          </div>
         </div>
       </div>
     </div>
@@ -569,22 +597,43 @@ onUnmounted(() => {
 .tools-note {
   margin-top: 10px;
 }
+.selftest-log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 12px 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}
+.selftest-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.selftest-log-title {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
 .selftest-log {
-  margin: 8px 12px 12px;
-  padding: 8px 10px;
+  padding: 9px 10px;
   max-height: 240px;
   overflow-y: auto;
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--input-bg) 88%, var(--hover-bg) 12%);
+  background: color-mix(in srgb, var(--input-bg) 90%, var(--panel-bg) 10%);
   font-family: var(--font-mono-identifier);
   font-size: 11px;
   line-height: 1.55;
+  color: var(--text-secondary);
 }
 .selftest-log-line {
   white-space: pre-wrap;
   word-break: break-word;
-  color: var(--text-secondary);
 }
 .selftest-log-line:first-letter {
   text-transform: none;
