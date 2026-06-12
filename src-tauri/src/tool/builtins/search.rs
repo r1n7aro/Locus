@@ -11,7 +11,7 @@ pub(super) fn grep() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
                     Some(p) => p.to_string(),
@@ -88,8 +88,18 @@ pub(super) fn grep() -> ToolDef {
 
                 let matches_arc = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Match>::new()));
 
-                let base_path = dunce::canonicalize(std::path::Path::new(&search_path))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&search_path));
+                // Strip output paths against the workspace root, not the search
+                // path, so results can be passed directly to read/edit. Files
+                // outside the strip base keep absolute paths via the per-file
+                // fallback below.
+                let base_path = ctx
+                    .working_dir
+                    .as_deref()
+                    .and_then(|wd| dunce::canonicalize(std::path::Path::new(wd)).ok())
+                    .unwrap_or_else(|| {
+                        dunce::canonicalize(std::path::Path::new(&search_path))
+                            .unwrap_or_else(|_| std::path::PathBuf::from(&search_path))
+                    });
                 let search_root = std::sync::Arc::new(std::path::PathBuf::from(&search_path));
 
                 let walker = builder.build_parallel();
@@ -340,5 +350,47 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.output.contains("CachedBindings.cs"));
+    }
+
+    #[test]
+    fn grep_outputs_workspace_relative_paths_when_searching_subdirectory() {
+        let root = tempdir().expect("temp dir");
+        std::fs::create_dir_all(root.path().join("Assets")).expect("create assets");
+        std::fs::write(
+            root.path().join("Assets/PlayerPlatformerController.cs"),
+            "public class PlayerPlatformerController : MonoBehaviour {}",
+        )
+        .expect("write script");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (grep().execute)(
+                    json!({
+                        "pattern": "MonoBehaviour",
+                        "path": root.path().join("Assets").to_string_lossy().to_string(),
+                        "include": "*.cs"
+                    }),
+                    ToolExecutionContext {
+                        working_dir: Some(root.path().to_string_lossy().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(!result.is_error);
+        assert!(
+            result
+                .output
+                .contains("Assets/PlayerPlatformerController.cs:"),
+            "grep output should be workspace-relative, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("\nPlayerPlatformerController.cs:"),
+            "grep output must not strip paths against the search path, got:\n{}",
+            result.output
+        );
     }
 }
