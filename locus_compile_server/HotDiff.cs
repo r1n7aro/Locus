@@ -877,10 +877,12 @@ public static class HotDiff
     // ── text helpers ─────────────────────────────────────────────────
 
     /// <summary>Token-level text: whitespace and comments do not count as
-    /// changes (they cannot affect IL).</summary>
+    /// changes (they cannot affect IL). Tokens are joined with an
+    /// explicit separator so adjacent tokens never merge into a different
+    /// token stream ("--x" vs "- -x").</summary>
     internal static string TokenText(SyntaxNode node)
     {
-        return string.Join("", node.DescendantTokens().Select(t => t.Text));
+        return string.Join("\u0001", node.DescendantTokens().Select(t => t.Text));
     }
 
     private static string BodyText(BlockSyntax? body, ArrowExpressionClauseSyntax? expressionBody)
