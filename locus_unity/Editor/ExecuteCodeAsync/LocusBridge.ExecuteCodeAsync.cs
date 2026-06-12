@@ -308,6 +308,16 @@ namespace Locus
             }
         }
 
+        private static void LogExecuteCodeDebug(string requestId, string message)
+        {
+            Debug.Log("[Locus] execute_code[" + (requestId ?? "?") + "] " + message);
+        }
+
+        private static void LogExecuteLoadedDebug(string requestId, string message)
+        {
+            Debug.Log("[Locus] execute_loaded[" + (requestId ?? "?") + "] " + message);
+        }
+
         private static PipeEnvelope HandleCancelExecuteCode(string requestId)
         {
             ExecuteCodeRequestState requestState;
@@ -392,7 +402,12 @@ namespace Locus
         private static async Task<PipeEnvelope> HandleExecuteLoaded(string requestId, string requestJson)
         {
             if (string.IsNullOrWhiteSpace(requestJson))
+            {
+                LogExecuteLoadedDebug(requestId, "empty request payload");
                 return ErrorResponse(requestId, "empty execute_loaded request");
+            }
+
+            LogExecuteLoadedDebug(requestId, "received payload chars=" + requestJson.Length);
 
             ExecuteLoadedRequest request;
             try
@@ -401,11 +416,15 @@ namespace Locus
             }
             catch (Exception ex)
             {
+                LogExecuteLoadedDebug(requestId, "parse failed: " + ex.Message);
                 return ErrorResponse(requestId, "execute_loaded request parse failed: " + ex.Message);
             }
 
             if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+            {
+                LogExecuteLoadedDebug(requestId, "missing assembly bytes");
                 return ErrorResponse(requestId, "execute_loaded request missing assembly bytes");
+            }
 
             byte[] assemblyBytes;
             try
@@ -414,18 +433,22 @@ namespace Locus
             }
             catch (Exception ex)
             {
+                LogExecuteLoadedDebug(requestId, "assembly decode failed: " + ex.Message);
                 return ErrorResponse(requestId, "execute_loaded assembly decode failed: " + ex.Message);
             }
 
             string entryTypeName = string.IsNullOrEmpty(request.entry_type)
                 ? "Locus.RuntimeSnippets.__LocusAsyncSnippetHost"
                 : request.entry_type;
+            LogExecuteLoadedDebug(
+                requestId,
+                "decoded assembly bytes=" + assemblyBytes.Length + ", entry=" + entryTypeName);
 
             return await ExecuteSnippetRequestAsync(
                 requestId,
                 prepareCompiler: false,
                 compileStage: "Loading compiled snippet",
-                compile: delegate { return LoadCompiledSnippet(assemblyBytes, entryTypeName); });
+                compile: delegate { return LoadCompiledSnippet(requestId, assemblyBytes, entryTypeName); });
         }
 
         /// <summary>
@@ -433,14 +456,26 @@ namespace Locus
         /// Error wording mirrors TryCompileAsyncSnippet so the agent-facing
         /// error shape stays identical across both compile paths.
         /// </summary>
-        private static CompiledAsyncSnippet LoadCompiledSnippet(byte[] assemblyBytes, string entryTypeName)
+        private static CompiledAsyncSnippet LoadCompiledSnippet(
+            string requestId,
+            byte[] assemblyBytes,
+            string entryTypeName)
         {
             Type hostType;
             MethodInfo executeMethod;
+            var loadStarted = System.Diagnostics.Stopwatch.StartNew();
             try
             {
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "Assembly.Load begin, bytes=" + (assemblyBytes == null ? 0 : assemblyBytes.Length));
                 Assembly assembly = Assembly.Load(assemblyBytes);
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "Assembly.Load complete in " + loadStarted.ElapsedMilliseconds + "ms: " +
+                    assembly.FullName);
                 hostType = assembly.GetType(entryTypeName, true);
+                LogExecuteLoadedDebug(requestId, "entry type resolved: " + hostType.FullName);
                 executeMethod = hostType.GetMethod(
                     "ExecuteAsync",
                     BindingFlags.Public | BindingFlags.Static
@@ -448,11 +483,20 @@ namespace Locus
             }
             catch (Exception ex)
             {
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "assembly load/bootstrap failed after " +
+                    loadStarted.ElapsedMilliseconds +
+                    "ms: " +
+                    ex.Message);
                 throw new Exception("assembly load/bootstrap failed: " + ex);
             }
 
             if (executeMethod == null)
+            {
+                LogExecuteLoadedDebug(requestId, "missing ExecuteAsync method on " + entryTypeName);
                 throw new Exception("compiled async snippet missing ExecuteAsync method");
+            }
 
             try
             {
@@ -463,10 +507,19 @@ namespace Locus
                             executeMethod
                         );
 
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "ExecuteAsync delegate bound in " + loadStarted.ElapsedMilliseconds + "ms");
                 return new CompiledAsyncSnippet(executor);
             }
             catch (Exception ex)
             {
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "delegate bind failed after " +
+                    loadStarted.ElapsedMilliseconds +
+                    "ms: " +
+                    ex.Message);
                 throw new Exception("assembly load/bootstrap failed: " + ex);
             }
         }
@@ -482,14 +535,25 @@ namespace Locus
             string compileStage,
             Func<CompiledAsyncSnippet> compile)
         {
+            var requestStarted = System.Diagnostics.Stopwatch.StartNew();
+            LogExecuteCodeDebug(
+                requestId,
+                "begin, prepareCompiler=" + prepareCompiler + ", acquireStage=" + compileStage);
+
             if (ActiveExecuteCodeRequest == null)
                 SetExecuteCodeStage("Waiting for Unity execute lock");
 
             bool lockTaken = false;
             try
             {
+                LogExecuteCodeDebug(requestId, "waiting for execute lock");
                 if (!await _executeCodeLock.WaitAsync(ExecuteCodeLockWaitTimeoutMs))
                 {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "execute lock wait timed out after " +
+                        (ExecuteCodeLockWaitTimeoutMs / 1000) +
+                        "s");
                     if (ActiveExecuteCodeRequest == null)
                         ResetExecuteCodeProgress();
                     return ErrorResponse(
@@ -500,9 +564,13 @@ namespace Locus
                 }
 
                 lockTaken = true;
+                LogExecuteCodeDebug(
+                    requestId,
+                    "execute lock acquired after " + requestStarted.ElapsedMilliseconds + "ms");
             }
             catch (ObjectDisposedException ex)
             {
+                LogExecuteCodeDebug(requestId, "execute lock unavailable: " + ex.Message);
                 if (ActiveExecuteCodeRequest == null)
                     ResetExecuteCodeProgress();
                 return ErrorResponse(requestId, "execute_code lock unavailable: " + ex.Message);
@@ -517,12 +585,14 @@ namespace Locus
                     _activeExecuteCodeRequest = requestState;
                 }
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
+                LogExecuteCodeDebug(requestId, "request state registered");
 
                 ResetExecuteCodeProgress();
 
                 if (prepareCompiler)
                 {
                     SetExecuteCodeStage("Checking compiler cache");
+                    LogExecuteCodeDebug(requestId, "checking Unity compiler cache");
 
                     string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
                         SetExecuteCodeStage,
@@ -531,10 +601,14 @@ namespace Locus
                     {
                         requestState.ThrowIfCancellationRequested();
                         SetExecuteCodeStage("Compiler preparation failed");
+                        LogExecuteCodeDebug(requestId, "compiler preparation failed: " + prepareError);
                         return ErrorResponse(requestId, prepareError);
                     }
 
                     requestState.ThrowIfCancellationRequested();
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "Unity compiler cache ready after " + requestStarted.ElapsedMilliseconds + "ms");
                 }
 
                 CompiledAsyncSnippet snippet;
@@ -542,35 +616,59 @@ namespace Locus
                 {
                     SetExecuteCodeStage(compileStage);
                     requestState.ThrowIfCancellationRequested();
+                    LogExecuteCodeDebug(requestId, "acquiring snippet: " + compileStage);
+                    long acquireStartedMs = requestStarted.ElapsedMilliseconds;
                     snippet = compile();
                     requestState.ThrowIfCancellationRequested();
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "snippet ready in " +
+                        (requestStarted.ElapsedMilliseconds - acquireStartedMs) +
+                        "ms");
                 }
                 catch (OperationCanceledException)
                 {
+                    LogExecuteCodeDebug(requestId, "canceled while acquiring snippet");
                     throw;
                 }
                 catch (Exception ex)
                 {
                     SetExecuteCodeStage("Compilation failed");
+                    LogExecuteCodeDebug(requestId, "snippet acquisition failed: " + ex.Message);
                     return ErrorResponse(requestId, "async snippet compilation exception: " + ex.Message);
                 }
 
                 SetExecuteCodeStage("Executing snippet");
+                LogExecuteCodeDebug(requestId, "queueing snippet on Unity main thread");
+                long executeStartedMs = requestStarted.ElapsedMilliseconds;
                 string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
+                LogExecuteCodeDebug(
+                    requestId,
+                    "main-thread execution returned in " +
+                    (requestStarted.ElapsedMilliseconds - executeStartedMs) +
+                    "ms, output chars=" +
+                    (resultText == null ? 0 : resultText.Length));
 
                 if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
                 {
                     requestState.ThrowIfCancellationRequested();
                     SetExecuteCodeStage("Execution failed");
+                    LogExecuteCodeDebug(requestId, "execution failed: " + resultText);
                     return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
                 }
 
                 requestState.ThrowIfCancellationRequested();
                 SetExecuteCodeStage("Execution complete");
+                LogExecuteCodeDebug(
+                    requestId,
+                    "complete after " + requestStarted.ElapsedMilliseconds + "ms");
                 return OkResponse(requestId, resultText);
             }
             catch (OperationCanceledException)
             {
+                LogExecuteCodeDebug(
+                    requestId,
+                    "canceled after " + requestStarted.ElapsedMilliseconds + "ms");
                 return ErrorResponse(requestId, "execute_code canceled");
             }
             finally
@@ -585,6 +683,9 @@ namespace Locus
                 ResetExecuteCodeProgress();
                 if (lockTaken)
                     _executeCodeLock.Release();
+                LogExecuteCodeDebug(
+                    requestId,
+                    "finished cleanup after " + requestStarted.ElapsedMilliseconds + "ms");
             }
         }
 

@@ -1094,10 +1094,43 @@ namespace Locus
                 return;
             }
 
+            bool traceExecuteLoaded = string.Equals(request.type, "execute_loaded", StringComparison.Ordinal);
+            if (traceExecuteLoaded)
+            {
+                Debug.Log(
+                    "[Locus] pipe received execute_loaded id=" +
+                    (request.id ?? "?") +
+                    ", line chars=" +
+                    json.Length);
+            }
+
             PipeEnvelope response = await HandleMessageAsync(request);
 
             if (response != null && !string.IsNullOrEmpty(response.reply_to))
-                await SendEnvelopeAsync(response);
+            {
+                if (traceExecuteLoaded)
+                {
+                    Debug.Log(
+                        "[Locus] pipe sending execute_loaded response id=" +
+                        response.reply_to +
+                        ", ok=" +
+                        response.ok +
+                        ", message chars=" +
+                        (response.message == null ? 0 : response.message.Length) +
+                        ", error chars=" +
+                        (response.error == null ? 0 : response.error.Length));
+                }
+
+                bool sent = await SendEnvelopeAsync(response);
+                if (traceExecuteLoaded)
+                {
+                    Debug.Log(
+                        "[Locus] pipe execute_loaded response sent id=" +
+                        response.reply_to +
+                        ", sent=" +
+                        sent);
+                }
+            }
         }
 
         // ───────────────── Outbound messaging ─────────────────
