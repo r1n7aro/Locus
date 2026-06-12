@@ -86,6 +86,9 @@ socket2 = "0.5"
 sys-locale = "0.3.2"
 tauri-plugin-notification = "2.3.3"
 rodio = "0.22.2"
+# Global allocator (see lib.rs). The Windows system heap scales poorly under
+# multi-threaded small-object churn; mimalloc is the standard replacement.
+mimalloc = "0.1"
 
 # Keep this pinned to rc.11 because fastembed 5.13.2 still depends on the same
 # ort/ort-sys pair upstream; rc.12 would create an unresolved onnxruntime links conflict.

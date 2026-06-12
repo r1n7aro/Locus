@@ -1,6 +1,14 @@
 #[macro_use]
 mod logging;
 
+// The Windows system heap degrades badly under multi-threaded small-object
+// churn — exactly the hot paths here (rayon asset scans, tantivy indexing,
+// tree-sitter parsing, serde_json streaming). mimalloc replaces it
+// process-wide; bundled SQLite and the dynamically loaded onnxruntime keep
+// their own internal allocators and are unaffected.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
