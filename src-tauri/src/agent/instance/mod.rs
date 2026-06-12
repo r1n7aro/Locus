@@ -3326,7 +3326,7 @@ impl AgentInstance {
         }
 
         let mut allowed_sorted: Vec<_> = allowed.into_iter().collect();
-        allowed_sorted.sort();
+        crate::tool::sort_tool_names_by_priority(&mut allowed_sorted);
         for name in allowed_sorted {
             let configured_load_mode = self.configured_tool_load_mode(&name, &direct_overrides);
             if active_skill_tool_names.contains(&name)
@@ -3410,7 +3410,7 @@ impl AgentInstance {
                     && self.configured_tool_load_mode(name, &direct_overrides) == ToolLoadMode::Lazy
             })
             .collect();
-        names.sort();
+        crate::tool::sort_tool_names_by_priority(&mut names);
         names
     }
 
@@ -3502,7 +3502,7 @@ impl AgentInstance {
         // so disabled tools stay visible and can be re-enabled from the UI.
         let configured_tool_set = self.configured_tool_set().await;
         let mut configured_tool_names: Vec<_> = configured_tool_set.iter().cloned().collect();
-        configured_tool_names.sort();
+        crate::tool::sort_tool_names_by_priority(&mut configured_tool_names);
         for name in configured_tool_names {
             push_unique_tool_name(&mut tool_names, &name);
         }

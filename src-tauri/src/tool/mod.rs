@@ -151,6 +151,111 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     }
 }
 
+/// Canonical tool ordering for LLM requests, the lazy-tool manifest and the
+/// agent inspection UI: high-frequency core tools first, low-frequency
+/// utilities last. Tools absent from this table (skill-package tools, future
+/// builtins) sort after every listed tool, alphabetically.
+const TOOL_PRIORITY_ORDER: &[&str] = &[
+    // Meta tools (the agent loop additionally pins these to the front).
+    "tool_load",
+    "tool_call",
+    // Core file & shell operations.
+    "read",
+    "edit",
+    "write",
+    "grep",
+    "list",
+    "bash",
+    // Planning, delegation & user interaction.
+    "todowrite",
+    "task",
+    "ask_user_question",
+    // Unity editor actions.
+    "unity_execute",
+    "unity_recompile",
+    "unity_hot_reload",
+    // Unity project search & inspection.
+    "unity_asset_search",
+    "unity_ref_search",
+    "unity_code_usages",
+    "unity_yaml_search",
+    "unity_yaml_read",
+    "unity_yaml_list",
+    // C# code intelligence.
+    "code_symbol_search",
+    "code_goto_definition",
+    "code_find_references",
+    "code_diagnostics",
+    "code_hover",
+    // Knowledge base.
+    "knowledge_query",
+    "knowledge_read",
+    "knowledge_list",
+    "knowledge_create",
+    "knowledge_edit",
+    // Low-frequency utilities (mostly lazy-loaded).
+    "web_fetch",
+    "unity_run_states",
+    "unity_capture_viewport",
+    "graph_view",
+    "sheet",
+    "knowledge_move",
+    "knowledge_delete",
+    "config_query",
+    // Skill & plugin management.
+    "skill_create",
+    "skill_list",
+    "skill_reload",
+    "plugin_list",
+    "plugin_search",
+    "plugin_install",
+    "plugin_set_enabled",
+    "plugin_uninstall",
+    "plugin_export",
+    // View authoring & automation.
+    "view_create",
+    "view_list",
+    "view_reload",
+    "view_run",
+    "view_compile_script",
+    "view_call_script",
+    "view_property_read",
+    "view_property_discover",
+    "view_property_write",
+    "view_property_apply",
+    "view_capture",
+    "view_snapshot",
+    "view_action",
+    "view_wait",
+    "view_console_read",
+    "view_debug_eval",
+];
+
+fn tool_priority_rank(name: &str) -> usize {
+    static RANKS: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+    let ranks = RANKS.get_or_init(|| {
+        TOOL_PRIORITY_ORDER
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, index))
+            .collect()
+    });
+    ranks
+        .get(normalize_tool_name_key(name).as_str())
+        .copied()
+        .unwrap_or(TOOL_PRIORITY_ORDER.len())
+}
+
+/// Sorts tool names by [`TOOL_PRIORITY_ORDER`]; unknown tools keep a stable
+/// alphabetical order after every known one.
+pub fn sort_tool_names_by_priority(names: &mut [String]) {
+    names.sort_by(|a, b| {
+        tool_priority_rank(a)
+            .cmp(&tool_priority_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         ToolRegistry {
@@ -338,9 +443,48 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolDef, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState,
+        sort_tool_names_by_priority, tool_priority_rank, ToolDef, ToolExecutionContext,
+        ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState, TOOL_PRIORITY_ORDER,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn priority_sort_puts_high_frequency_tools_first_and_unknown_tools_last() {
+        let mut names = vec![
+            "web_fetch".to_string(),
+            "zz_custom_skill_tool".to_string(),
+            "unity_execute".to_string(),
+            "knowledge_query".to_string(),
+            "a_custom_skill_tool".to_string(),
+            "edit".to_string(),
+            "read".to_string(),
+        ];
+        sort_tool_names_by_priority(&mut names);
+        assert_eq!(
+            names,
+            vec![
+                "read".to_string(),
+                "edit".to_string(),
+                "unity_execute".to_string(),
+                "knowledge_query".to_string(),
+                "web_fetch".to_string(),
+                "a_custom_skill_tool".to_string(),
+                "zz_custom_skill_tool".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_builtin_tool_has_an_explicit_priority_rank() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register_task_tool(&[]);
+        for key in &registry.built_in_tools {
+            assert!(
+                tool_priority_rank(key) < TOOL_PRIORITY_ORDER.len(),
+                "built-in tool `{key}` is missing from TOOL_PRIORITY_ORDER"
+            );
+        }
+    }
 
     #[test]
     fn registry_resolves_api_tools_with_canonical_name_case_insensitively() {
