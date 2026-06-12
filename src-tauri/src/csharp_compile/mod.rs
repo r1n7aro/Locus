@@ -117,10 +117,17 @@ pub struct CsharpCompileStatusPayload {
     pub sidecar_compiles: u64,
     pub compile_errors: u64,
     pub fallbacks: u64,
+    /// Hot reload (`unity_hotreload`): feature flag and session counters.
+    pub hot_reload_enabled: bool,
+    pub hot_patches_applied: u64,
+    pub hot_patch_failures: u64,
+    pub hot_active_patches: u64,
+    pub hot_cold_queued: u64,
 }
 
 pub async fn status() -> CsharpCompileStatusPayload {
     let running = manager::current_status().await;
+    let hot_reload = crate::unity_hotreload::counters();
     CsharpCompileStatusPayload {
         enabled: is_enabled(),
         platform_supported: crate::dotnet_runtime::is_platform_supported(),
@@ -133,6 +140,11 @@ pub async fn status() -> CsharpCompileStatusPayload {
         sidecar_compiles: SIDECAR_COMPILES.load(Ordering::Relaxed),
         compile_errors: SIDECAR_COMPILE_ERRORS.load(Ordering::Relaxed),
         fallbacks: SIDECAR_FALLBACKS.load(Ordering::Relaxed),
+        hot_reload_enabled: crate::unity_hotreload::is_enabled(),
+        hot_patches_applied: hot_reload.patches_applied,
+        hot_patch_failures: hot_reload.patch_failures,
+        hot_active_patches: hot_reload.active_patches,
+        hot_cold_queued: hot_reload.cold_queued,
     }
 }
 

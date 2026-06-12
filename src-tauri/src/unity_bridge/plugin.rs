@@ -27,6 +27,8 @@ const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "Editor/Json/Locus.Json.dll.meta",
     "Editor/Roslyn/Locus.Roslyn.dll",
     "Editor/Roslyn/Locus.Roslyn.dll.meta",
+    "Editor/Detour/Locus.Detour.dll",
+    "Editor/Detour/Locus.Detour.dll.meta",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +240,16 @@ fn should_skip_plugin_source_entry(source_dir: &Path, path: &Path) -> bool {
     }
 
     if rel.starts_with("Editor/Json/ILRepack-") {
+        return true;
+    }
+
+    if rel.starts_with("Editor/Detour/ILRepack-") {
+        return true;
+    }
+
+    if rel.starts_with("Editor/Detour/Locus.Detour.dll.")
+        && rel != "Editor/Detour/Locus.Detour.dll.meta"
+    {
         return true;
     }
 
@@ -588,6 +600,11 @@ mod tests {
         write_file(&source_root.join("Editor/Roslyn/Locus.Roslyn.dll"), b"dll");
         write_file(
             &source_root.join("Editor/Roslyn/Locus.Roslyn.dll.meta"),
+            b"meta",
+        );
+        write_file(&source_root.join("Editor/Detour/Locus.Detour.dll"), b"dll");
+        write_file(
+            &source_root.join("Editor/Detour/Locus.Detour.dll.meta"),
             b"meta",
         );
     }

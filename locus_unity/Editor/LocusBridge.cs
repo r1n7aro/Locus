@@ -1410,6 +1410,9 @@ namespace Locus
                     case "get_compile_params":
                         return await HandleGetCompileParams(reqId, msg.message);
 
+                    case "hot_reload_probe":
+                        return await HandleHotReloadProbe(reqId);
+
                     case "run_states":
                         return await HandleRunStates(reqId, msg.message);
 

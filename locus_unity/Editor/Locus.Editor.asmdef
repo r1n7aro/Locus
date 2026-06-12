@@ -10,7 +10,8 @@
     "overrideReferences": true,
     "precompiledReferences": [
         "Locus.Roslyn.dll",
-        "Locus.Json.dll"
+        "Locus.Json.dll",
+        "Locus.Detour.dll"
     ],
     "autoReferenced": false,
     "defineConstraints": [],

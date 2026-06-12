@@ -47,6 +47,19 @@ pub async fn unity_sidecar_compiler_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_hot_reload_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_hot_reload_enabled(value)
+        .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
+
+    crate::unity_hotreload::set_enabled(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<crate::config::CodeAnalysisToolsConfig, AppError> {

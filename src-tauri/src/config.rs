@@ -41,6 +41,10 @@ fn default_unity_sidecar_compiler() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
+fn default_unity_hot_reload() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AppCloseBehavior {
@@ -236,6 +240,11 @@ pub struct AppConfig {
     /// least one release cycle.
     #[serde(default = "default_unity_sidecar_compiler", with = "serde_atomic_bool")]
     pub unity_sidecar_compiler: Arc<AtomicBool>,
+    /// Hot-patch Unity C# method-body edits via the compile-server sidecar
+    /// (no Unity recompile / domain reload). Default off (phase H0 gate);
+    /// signature/field changes always go through `unity_recompile`.
+    #[serde(default = "default_unity_hot_reload", with = "serde_atomic_bool")]
+    pub unity_hot_reload: Arc<AtomicBool>,
     #[serde(
         default = "default_code_analysis_tools",
         with = "serde_code_analysis_tools"
@@ -285,6 +294,7 @@ impl AppConfig {
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
             unity_sidecar_compiler: default_unity_sidecar_compiler(),
+            unity_hot_reload: default_unity_hot_reload(),
             code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -454,6 +464,15 @@ impl AppConfig {
 
     pub fn set_unity_sidecar_compiler_enabled(&self, value: bool) -> Result<(), String> {
         self.unity_sidecar_compiler.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_hot_reload_enabled(&self) -> bool {
+        self.unity_hot_reload.load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_hot_reload_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_hot_reload.store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -728,6 +747,24 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(config.unity_sidecar_compiler_enabled());
+    }
+
+    #[test]
+    fn unity_hot_reload_defaults_to_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.unity_hot_reload_enabled());
     }
 
     #[test]

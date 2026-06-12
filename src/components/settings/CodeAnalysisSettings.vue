@@ -10,6 +10,7 @@ import {
   csharpLspSetEnabled,
   subscribeCsharpLspStatus,
   subscribeUnitySidecarCompilerStatus,
+  unityHotReloadSetEnabled,
   unitySidecarCompilerGetStatus,
   unitySidecarCompilerSetEnabled,
 } from "../../services/csharpLsp";
@@ -134,6 +135,41 @@ async function toggleSidecarEnabled() {
     await refreshSidecarStatus();
   } finally {
     sidecarBusy.value = false;
+  }
+}
+
+const hotReloadEnabled = computed(() => sidecarStatus.value?.hotReloadEnabled ?? false);
+const hotReloadBusy = ref(false);
+
+const hotReloadStatsLabel = computed(() => {
+  const status = sidecarStatus.value;
+  if (!status || !status.hotReloadEnabled) return "";
+  const total =
+    (status.hotPatchesApplied ?? 0) + (status.hotPatchFailures ?? 0) + (status.hotColdQueued ?? 0);
+  if (total === 0) return "";
+  return t(
+    "settings.codeAnalysis.hotReloadStats",
+    status.hotPatchesApplied ?? 0,
+    status.hotActivePatches ?? 0,
+    status.hotColdQueued ?? 0,
+  );
+});
+
+async function toggleHotReloadEnabled() {
+  if (!sidecarReady.value || hotReloadBusy.value) return;
+  hotReloadBusy.value = true;
+  try {
+    sidecarStatus.value = await unityHotReloadSetEnabled(!hotReloadEnabled.value);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnityHotReload",
+      replaceOperation: true,
+    });
+    await refreshSidecarStatus();
+  } finally {
+    hotReloadBusy.value = false;
   }
 }
 
@@ -324,6 +360,23 @@ onUnmounted(() => {
             "
             :aria-label="t('settings.codeAnalysis.sidecarLabel')"
             @update:model-value="toggleSidecarEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+      <div class="tool-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.codeAnalysis.hotReloadLabel") }}</span>
+          <span class="tool-desc">{{ t("settings.codeAnalysis.hotReloadDesc") }}</span>
+          <span v-if="hotReloadStatsLabel" class="tool-desc">{{ hotReloadStatsLabel }}</span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="sidecarReady"
+            :model-value="hotReloadEnabled"
+            :disabled="hotReloadBusy || !sidecarEnabled"
+            :aria-label="t('settings.codeAnalysis.hotReloadLabel')"
+            @update:model-value="toggleHotReloadEnabled"
           />
           <span v-else class="switch-placeholder" aria-hidden="true" />
         </div>

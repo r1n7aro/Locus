@@ -60,6 +60,14 @@ export function unitySidecarCompilerSetEnabled(value: boolean): Promise<CsharpCo
   );
 }
 
+export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+  return ipcInvoke<CsharpCompileStatus>(
+    "unity_hot_reload_set_enabled",
+    { value },
+    { operation: "unityHotReloadSetEnabled", notify: false, throwOnError: true },
+  );
+}
+
 export function subscribeCsharpLspStatus(
   handler: (payload: CsharpLspStatus) => void,
 ): Promise<RuntimeUnsubscribe> {

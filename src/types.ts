@@ -132,6 +132,12 @@ export interface CsharpCompileStatus {
   sidecarCompiles: number;
   compileErrors: number;
   fallbacks: number;
+  /** Hot reload: feature flag and session counters. */
+  hotReloadEnabled: boolean;
+  hotPatchesApplied: number;
+  hotPatchFailures: number;
+  hotActivePatches: number;
+  hotColdQueued: number;
 }
 
 /** Per-tool switches for the code-analysis tool family (camelCase mirror of

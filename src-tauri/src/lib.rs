@@ -42,6 +42,7 @@ mod tool;
 pub mod unity_bridge;
 pub mod unity_csharp;
 mod unity_docs;
+pub mod unity_hotreload;
 pub mod unity_serialized_property;
 pub mod unity_type_index;
 pub mod unity_yaml;
@@ -403,6 +404,7 @@ pub fn run() {
                 config.unity_sidecar_compiler_enabled(),
                 app.handle().clone(),
             );
+            unity_hotreload::initialize(config.unity_hot_reload_enabled());
             code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
 
@@ -1253,6 +1255,7 @@ pub fn run() {
             commands::csharp_lsp_restart,
             commands::unity_sidecar_compiler_get_status,
             commands::unity_sidecar_compiler_set_enabled,
+            commands::unity_hot_reload_set_enabled,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,
