@@ -203,6 +203,11 @@ namespace Locus
             public string[] param_type_names;
             public bool is_static;
             public bool is_ctor;
+
+            // When non-empty, the "original" method lives in this exact
+            // assembly — an earlier patch's shim being re-edited. Resolution
+            // then bypasses the usual skip of __LocusHotPatch_ assemblies.
+            public string original_assembly;
         }
 
         [Serializable]
@@ -534,13 +539,47 @@ namespace Locus
 
         private static MethodBase ResolveOriginalMethod(HotPatchMethodDto dto, out string error)
         {
-            Type type = ResolveHotPatchOriginalType(dto.declaring_type);
-            if (type == null)
+            Type type;
+            if (!string.IsNullOrEmpty(dto.original_assembly))
             {
-                error = "type not found in loaded assemblies";
-                return null;
+                // Targeted resolution (M2 re-edit): the "original" is an
+                // earlier patch's shim — search exactly that assembly,
+                // bypassing the usual __LocusHotPatch_ skip.
+                type = ResolveTypeInAssembly(dto.original_assembly, dto.declaring_type);
+                if (type == null)
+                {
+                    error = "type " + dto.declaring_type + " not found in assembly " + dto.original_assembly +
+                        " (earlier patch unloaded?)";
+                    return null;
+                }
+            }
+            else
+            {
+                type = ResolveHotPatchOriginalType(dto.declaring_type);
+                if (type == null)
+                {
+                    error = "type not found in loaded assemblies";
+                    return null;
+                }
             }
             return ResolveMethodOnType(type, dto, out error);
+        }
+
+        private static Type ResolveTypeInAssembly(string assemblyName, string metadataName)
+        {
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                Assembly asm = assemblies[i];
+                if (asm == null || asm.IsDynamic)
+                    continue;
+                if (!string.Equals(SafeAssemblyName(asm), assemblyName, StringComparison.Ordinal))
+                    continue;
+                Type type = asm.GetType(metadataName, false);
+                if (type != null)
+                    return type;
+            }
+            return null;
         }
 
         private static MethodBase ResolvePatchMethod(Assembly patchAssembly, HotPatchMethodDto dto, out string error)

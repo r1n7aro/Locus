@@ -198,6 +198,14 @@ public sealed class CompileService
 
     private readonly ReferenceCache _referenceCache = new();
     private readonly ImageRegistry _imageRegistry = new();
+    private readonly MemberSurfaceRegistry _memberSurfaceRegistry = new();
+
+    // Shims of compiled-but-not-yet-accepted hot patches, keyed by assembly
+    // name; committed into the member registry when image/register confirms
+    // Unity loaded the patch.
+    private readonly object _pendingShimLock = new();
+    private readonly Dictionary<string, (string Generation, List<ShimRegistration> Registrations)> _pendingShims =
+        new(StringComparer.Ordinal);
 
     private int _assemblyCounter;
 
@@ -277,6 +285,21 @@ public sealed class CompileService
         }
 
         _imageRegistry.Register(request.DomainGeneration!, request.AssemblyName!, bytes);
+
+        // A hot patch registered after Unity acceptance: its new-surface
+        // shims become visible to later batches now.
+        (string Generation, List<ShimRegistration> Registrations) pending = default;
+        lock (_pendingShimLock)
+        {
+            if (_pendingShims.TryGetValue(request.AssemblyName!, out pending!))
+                _pendingShims.Remove(request.AssemblyName!);
+        }
+        if (pending.Registrations != null &&
+            string.Equals(pending.Generation, request.DomainGeneration, StringComparison.Ordinal))
+        {
+            CommitShimRegistrations(pending.Generation, pending.Registrations);
+        }
+
         return new JsonObject
         {
             ["success"] = true,
@@ -553,20 +576,40 @@ public sealed class CompileService
         var methods = new JsonArray();
         var newTypes = new JsonArray();
         var accessAssemblies = new HashSet<string>(StringComparer.Ordinal);
+        var shimRegistrations = new List<ShimRegistration>();
 
+        // M1: ONE binding compilation over the whole batch's un-renamed
+        // trees, so cross-file references — including calls to members added
+        // in another file of this batch — bind symbolically.
+        var batchFiles = new List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)>();
         foreach (var (file, diff) in diffs)
         {
             if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0)
                 continue; // formatting/comment-only edit: nothing to patch
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(file.NewText!, parseOptions, path: file.Path!);
+            batchFiles.Add((file.Path!, tree, diff));
+        }
 
+        string? generation = request.Params?.DomainGeneration;
+        PatchBatchContext batch = PatchBatchContext.Build(
+            batchFiles, references, _memberSurfaceRegistry.SnapshotFor(generation));
+
+        foreach (var (filePath, tree, diff) in batchFiles)
+        {
             PatchRewriteResult rewrite = PatchRewriter.Rewrite(
-                file.Path!, file.NewText!, diff, parseOptions, references);
+                filePath, tree, diff, parseOptions, batch);
 
+            if (rewrite.Error != null)
+            {
+                JsonNode failure = FailureResult(rewrite.Error, "rewrite", startedAt);
+                failure["hot"] = true;
+                return failure;
+            }
             if (rewrite.ColdReason != null)
             {
                 var fileJson = new JsonObject
                 {
-                    ["path"] = file.Path,
+                    ["path"] = filePath,
                     ["hot"] = false,
                     ["reasons"] = new JsonArray(rewrite.ColdReason),
                 };
@@ -581,10 +624,11 @@ public sealed class CompileService
             trees.Add(rewrite.Tree!);
             foreach (string assembly in rewrite.OriginalAssemblies)
                 accessAssemblies.Add(assembly);
+            shimRegistrations.AddRange(rewrite.ShimRegistrations);
 
             foreach (PatchMethodMap map in rewrite.Methods)
             {
-                methods.Add(new JsonObject
+                var method = new JsonObject
                 {
                     ["declaringType"] = map.DeclaringType,
                     ["patchDeclaringType"] = map.PatchDeclaringType,
@@ -592,7 +636,10 @@ public sealed class CompileService
                     ["paramTypeNames"] = new JsonArray(map.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
                     ["isStatic"] = map.IsStatic,
                     ["isCtor"] = map.IsCtor,
-                });
+                };
+                if (map.OriginalAssembly != null)
+                    method["originalAssembly"] = map.OriginalAssembly;
+                methods.Add(method);
             }
             foreach (PatchNewType newType in rewrite.NewTypes)
             {
@@ -659,14 +706,51 @@ public sealed class CompileService
         }
 
         byte[] bytes = peStream.ToArray();
-        if (request.RegisterImage && !string.IsNullOrEmpty(request.Params?.DomainGeneration))
-            _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
+
+        // New-surface bookkeeping (M2): shims become visible to later
+        // batches only after the patch is actually live in Unity — which is
+        // signaled by the image registration (the Rust side registers via
+        // image/register after Unity accepts; tests register inline).
+        foreach (ShimRegistration registration in shimRegistrations)
+            registration.Entry.ShimAssembly = assemblyName;
+
+        if (request.RegisterImage && !string.IsNullOrEmpty(generation))
+        {
+            _imageRegistry.Register(generation!, assemblyName, bytes);
+            CommitShimRegistrations(generation!, shimRegistrations);
+        }
+        else if (shimRegistrations.Count > 0 && !string.IsNullOrEmpty(generation))
+        {
+            lock (_pendingShimLock)
+            {
+                _pendingShims[assemblyName] = (generation!, shimRegistrations);
+                // Keep the pending map bounded: entries for other
+                // generations can never commit.
+                foreach (string stale in _pendingShims
+                             .Where(p => p.Value.Generation != generation)
+                             .Select(p => p.Key)
+                             .ToList())
+                {
+                    _pendingShims.Remove(stale);
+                }
+            }
+        }
 
         JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
         return result;
+    }
+
+    private void CommitShimRegistrations(string generation, List<ShimRegistration> registrations)
+    {
+        if (registrations.Count == 0)
+            return;
+        _memberSurfaceRegistry.Commit(
+            generation,
+            registrations.Select(r =>
+                new KeyValuePair<string, MemberSurfaceRegistry.ShimEntry>(r.MemberKey, r.Entry)));
     }
 
     /// <summary>

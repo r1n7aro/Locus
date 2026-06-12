@@ -312,6 +312,10 @@ pub struct HotPatchMethod {
     pub is_static: bool,
     #[serde(default)]
     pub is_ctor: bool,
+    /// When set, the "original" side of the detour lives in this specific
+    /// assembly (an earlier patch's shim being re-edited, M2).
+    #[serde(default)]
+    pub original_assembly: Option<String>,
 }
 
 /// A type that only exists in the edited text (TI-C / snippet visibility).

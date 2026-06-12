@@ -453,6 +453,10 @@ pub async fn hot_reload(
                     "param_type_names": m.param_type_names,
                     "is_static": m.is_static,
                     "is_ctor": m.is_ctor,
+                    // Older plugins ignore the unknown field and then fail
+                    // resolution → whole-patch rollback + update hint (the
+                    // established compatibility discipline).
+                    "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
                 })).collect::<Vec<_>>(),
             })
             .to_string();

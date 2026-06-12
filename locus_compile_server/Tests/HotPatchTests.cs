@@ -188,6 +188,146 @@ namespace HotPatchE2E
         Assert.True(newType["isTopLevel"]!.GetValue<bool>());
     }
 
+    private const string ShimCalcSource = @"
+namespace ShimE2E
+{
+    public class Calc
+    {
+        private int _seed = 10;
+        private static int Bias = 5;
+        public int Value() { return _seed; }
+    }
+}";
+
+    private const string ShimCallerSource = @"
+namespace ShimE2E
+{
+    public class Caller
+    {
+        public static int Run() { return 1; }
+    }
+}";
+
+    [Fact]
+    public void Added_method_in_one_file_is_callable_from_another_via_shim()
+    {
+        var service = new CompileService();
+        string calcPath = CompileOriginal(service, "ShimE2ECalc", ShimCalcSource);
+        string callerPath = CompileOriginal(service, "ShimE2ECaller", ShimCallerSource);
+        JsonObject compileParams = ParamsFor(calcPath, callerPath);
+
+        string newCalc = ShimCalcSource.Replace(
+            "public int Value() { return _seed; }",
+            "public int Value() { return _seed; }\n        public int Boost(int extra) { return _seed + Bias + extra; }");
+        string newCaller = ShimCallerSource.Replace(
+            "public static int Run() { return 1; }",
+            "public static int Run() { var c = new Calc(); return c.Boost(7); }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Calc.cs", ShimCalcSource, newCalc),
+            ("Caller.cs", ShimCallerSource, newCaller));
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // Only Caller.Run detours; the added Boost is shim-only (no detour
+        // on its first appearance).
+        var methods = result["methods"]!.AsArray();
+        var run = Assert.Single(methods)!;
+        Assert.Equal("ShimE2E.Caller", run["declaringType"]!.GetValue<string>());
+        Assert.Equal("Run", run["name"]!.GetValue<string>());
+
+        // Execute the patched Run: it must construct the ORIGINAL Calc and
+        // reach the shim, which reads the original private field + static.
+        byte[] calcBytes = File.ReadAllBytes(calcPath);
+        byte[] callerBytes = File.ReadAllBytes(callerPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+
+        var context = new AssemblyLoadContext("shim-e2e", isCollectible: true);
+        try
+        {
+            Assembly calcAssembly = context.LoadFromStream(new MemoryStream(calcBytes));
+            Assembly callerAssembly = context.LoadFromStream(new MemoryStream(callerBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "ShimE2ECalc" => calcAssembly,
+                "ShimE2ECaller" => callerAssembly,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchCaller = patch.GetType("ShimE2E.Caller__LocusPatch", throwOnError: true)!;
+            object? value = patchCaller.GetMethod("Run")!.Invoke(null, null);
+            Assert.Equal(10 + 5 + 7, value);
+
+            // The shim itself works against an original instance.
+            Type shims = patch.GetType("ShimE2E.Calc__LocusShims", throwOnError: true)!;
+            object original = Activator.CreateInstance(calcAssembly.GetType("ShimE2E.Calc")!)!;
+            object? boosted = shims.GetMethod("Boost")!.Invoke(null, new[] { original, (object)1 });
+            Assert.Equal(10 + 5 + 1, boosted);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Reedited_added_member_detours_the_previous_shim()
+    {
+        var service = new CompileService();
+        string calcPath = CompileOriginal(service, "ShimReeditCalc", ShimCalcSource);
+        JsonObject compileParams = ParamsFor(calcPath);
+        compileParams["domainGeneration"] = "reedit-gen";
+
+        string addedV1 = ShimCalcSource.Replace(
+            "public int Value() { return _seed; }",
+            "public int Value() { return _seed; }\n        public int Boost() { return 1; }");
+        var requestV1 = new JsonObject
+        {
+            ["files"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "Calc.cs",
+                ["oldText"] = ShimCalcSource,
+                ["newText"] = addedV1,
+            }),
+            ["params"] = compileParams.DeepClone(),
+            ["registerImage"] = true, // inline accept: commits shim registry
+        };
+        JsonNode resultV1 = service.HandleCompileHotPatch(requestV1);
+        Assert.True(resultV1["success"]!.GetValue<bool>(), resultV1["error"]?.GetValue<string>());
+        Assert.Empty(resultV1["methods"]!.AsArray());
+        string assemblyV1 = resultV1["assemblyName"]!.GetValue<string>();
+
+        string addedV2 = ShimCalcSource.Replace(
+            "public int Value() { return _seed; }",
+            "public int Value() { return _seed; }\n        public int Boost() { return 2; }");
+        var requestV2 = new JsonObject
+        {
+            ["files"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "Calc.cs",
+                ["oldText"] = ShimCalcSource,
+                ["newText"] = addedV2,
+            }),
+            ["params"] = compileParams.DeepClone(),
+            ["registerImage"] = true,
+        };
+        JsonNode resultV2 = service.HandleCompileHotPatch(requestV2);
+        Assert.True(resultV2["success"]!.GetValue<bool>(), resultV2["error"]?.GetValue<string>());
+
+        // Re-edit continuity: the old shim method detours to the new one so
+        // in-flight delegates pick up the new behavior.
+        var detour = Assert.Single(resultV2["methods"]!.AsArray())!;
+        Assert.Equal("ShimE2E.Calc__LocusShims", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("ShimE2E.Calc__LocusShims", detour["patchDeclaringType"]!.GetValue<string>());
+        Assert.Equal("Boost", detour["name"]!.GetValue<string>());
+        Assert.True(detour["isStatic"]!.GetValue<bool>());
+        Assert.Equal(assemblyV1, detour["originalAssembly"]!.GetValue<string>());
+        Assert.Equal(new[] { "Calc" }, detour["paramTypeNames"]!.AsArray().Select(p => p!.GetValue<string>()));
+    }
+
     [Fact]
     public void Cold_change_reports_hot_false_with_reasons()
     {
@@ -394,6 +534,49 @@ public class PatchRewriterGoldenTests : IDisposable
         Assert.Equal("Game.Player__LocusPatch", method.PatchDeclaringType);
         Assert.Equal("Tick", method.Name);
         Assert.Equal(new[] { "GoldenPlayer" }, result.OriginalAssemblies);
+    }
+
+    [Fact]
+    public void Added_member_shim_rewrite_is_verbatim_stable()
+    {
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        private int _mp = 3;
+        public int Tick() { return 1; }
+    }
+}";
+        string newText = oldText
+            .Replace(
+                "public int Tick() { return 1; }",
+                "public int Tick() { return Mana(); }\n        public int Mana() { return _mp; }");
+
+        var (result, text) = RewriteWithOriginal("GoldenShim", oldText, newText);
+
+        const string expected = @"namespace Game
+{
+    public class Player__LocusPatch
+    {
+        private int _mp = 3;
+        public int Tick() { return global::Game.Player__LocusShims.Mana(((global::Game.Player)(object)this)); }
+    }
+
+public static class Player__LocusShims
+{
+    public static int Mana(this global::Game.Player self)
+    {
+        return self._mp;
+    }
+}}";
+        Assert.Equal(expected.ReplaceLineEndings("\n"), text.ReplaceLineEndings("\n"));
+
+        var method = Assert.Single(result.Methods);
+        Assert.Equal("Tick", method.Name);
+        var registration = Assert.Single(result.ShimRegistrations);
+        Assert.Equal("Game.Player__LocusShims", registration.Entry.ShimTypeMetadataName);
+        Assert.Equal("Mana", registration.Entry.ShimMethod);
+        Assert.True(registration.Entry.HasSelf);
     }
 
     [Fact]

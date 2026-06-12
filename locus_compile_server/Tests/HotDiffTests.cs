@@ -265,7 +265,7 @@ namespace Game
     }
 
     [Fact]
-    public void Added_private_method_without_changed_caller_is_cold()
+    public void Orphan_added_private_method_is_hot_and_not_detoured()
     {
         var result = Analyze(
             PlayerOld,
@@ -273,8 +273,11 @@ namespace Game
                 "private void Helper(string name) { Debug.Log(name); }",
                 "private void Helper(string name) { Debug.Log(name); }\n        private int Compute(System.Collections.Generic.List<int> xs) { return xs.Count; }"));
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("added helper methods require"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.True(method.Added);
+        Assert.Equal("Compute", method.Name);
+        Assert.Equal(new[] { "Game.Player" }, result.PatchedTypes);
     }
 
     [Fact]
@@ -584,15 +587,55 @@ class C
     }
 
     [Fact]
-    public void Non_private_method_added_is_cold()
+    public void Added_public_method_is_hot_via_shim()
     {
         const string oldText = "class A { void M() { } }";
         const string newText = "class A { void M() { } public void N() { } }";
 
         var result = Analyze(oldText, newText);
 
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.True(method.Added);
+        Assert.Equal("N", method.Name);
+    }
+
+    [Fact]
+    public void Added_method_on_generic_type_is_hot_via_shim()
+    {
+        const string oldText = "class A<T> { void M() { } }";
+        const string newText = "class A<T> { void M() { } public int Count() { return 1; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.True(method.Added);
+        Assert.Equal("Count", method.Name);
+    }
+
+    [Fact]
+    public void Added_virtual_method_is_cold()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public virtual void N() { } }";
+
+        var result = Analyze(oldText, newText);
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("non-private method added"));
+        Assert.Contains(result.Reasons, r => r.Contains("virtual member added"));
+    }
+
+    [Fact]
+    public void Added_method_using_base_access_is_cold()
+    {
+        const string oldText = "class A { public override string ToString() { return \"a\"; } }";
+        const string newText = "class A { public override string ToString() { return \"a\"; } public string Both() { return base.ToString() + \"!\"; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("base access"));
     }
 
     [Fact]

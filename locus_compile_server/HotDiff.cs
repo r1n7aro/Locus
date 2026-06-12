@@ -182,16 +182,6 @@ public static class HotDiff
             }
         }
 
-        if (result.ChangedMethods.Count > 0 &&
-            result.ChangedMethods.All(m => m.Added) &&
-            result.NewTypes.Count == 0)
-        {
-            result.ChangedMethods.Clear();
-            result.PatchedTypes.Clear();
-            result.Reasons.Add("added helper methods require a changed original method");
-            return result;
-        }
-
         result.NewTypes.Sort(StringComparer.Ordinal);
         result.PatchedTypes = result.PatchedTypes.Distinct().OrderBy(t => t, StringComparer.Ordinal).ToList();
         result.Hot = true;
@@ -842,7 +832,11 @@ public static class HotDiff
     }
 
     /// <summary>Classify a member that only exists in the new text. Returns
-    /// false (with a reason) when it forces the cold path.</summary>
+    /// false (with a reason) when it forces the cold path. Added METHODS of
+    /// any accessibility are hot: they materialize as static shims
+    /// (`__LocusShims`) in the patch assembly, batch call sites rewrite to
+    /// direct shim calls, and no detour is needed (M2) — so even members of
+    /// generic types are fine (the shim is just a generic static method).</summary>
     private static bool ClassifyAddedMember(
         string metadataName,
         MemberDeclarationSyntax member,
@@ -850,18 +844,13 @@ public static class HotDiff
         bool burstContext,
         HotDiffFileResult result)
     {
-        if (genericContext)
-        {
-            result.Reasons.Add("member added to generic type: " + metadataName);
-            return false;
-        }
-
         switch (member)
         {
             case ConstructorDeclarationSyntax:
                 // `new Foo(...)` in patched bodies binds to the *original*
                 // type, which does not have the new overload.
-                result.Reasons.Add("constructor added: " + metadataName);
+                result.Reasons.Add("constructor added: " + metadataName +
+                    " (constructor surface cannot be hot-added; use unity_recompile)");
                 return false;
 
             case DestructorDeclarationSyntax:
@@ -879,21 +868,39 @@ public static class HotDiff
                     result.Reasons.Add("explicit interface implementation added: " + metadataName);
                     return false;
                 }
-                if (!IsPrivateOrImplicitPrivate(method.Modifiers))
-                {
-                    result.Reasons.Add("non-private method added: " + metadataName + "." + method.Identifier.Text);
-                    return false;
-                }
                 if (UnityMagicMethods.Contains(method.Identifier.Text))
                 {
                     // Unity discovered the original type's message set at
                     // load; a new message method would never be called.
-                    result.Reasons.Add("new Unity message method: " + metadataName + "." + method.Identifier.Text);
+                    result.Reasons.Add("new Unity message method: " + metadataName + "." + method.Identifier.Text +
+                        " (Unity only discovers message methods at a real compile; use unity_recompile)");
                     return false;
                 }
                 if ((method.TypeParameterList?.Parameters.Count ?? 0) > 0)
                 {
+                    // A generic shim would work for direct calls but its
+                    // re-edit continuity needs a generic-method detour —
+                    // exactly the unreliable case. Keep cold.
                     result.Reasons.Add("generic method added: " + metadataName + "." + method.Identifier.Text);
+                    return false;
+                }
+                if (method.Modifiers.Any(m =>
+                    m.IsKind(SyntaxKind.VirtualKeyword) || m.IsKind(SyntaxKind.OverrideKeyword) ||
+                    m.IsKind(SyntaxKind.AbstractKeyword) || m.IsKind(SyntaxKind.SealedKeyword)))
+                {
+                    // Shims are static dispatch; a new virtual slot (or an
+                    // override of one) cannot be reproduced without a real
+                    // compile.
+                    result.Reasons.Add("virtual member added: " + metadataName + "." + method.Identifier.Text +
+                        " (virtual dispatch needs a real compile; use unity_recompile)");
+                    return false;
+                }
+                if (method.DescendantNodes().OfType<BaseExpressionSyntax>().Any())
+                {
+                    // A static shim cannot express a non-virtual `base.X`
+                    // call on behalf of the instance.
+                    result.Reasons.Add("added member uses base access: " + metadataName + "." + method.Identifier.Text +
+                        " (base calls cannot be expressed by a shim; use unity_recompile)");
                     return false;
                 }
                 AddMethod(
