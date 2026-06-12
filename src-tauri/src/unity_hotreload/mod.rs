@@ -9,6 +9,7 @@
 //! `unity_recompile` path instead. See `unity-hotreload-plan.md`.
 
 pub mod coordinator;
+pub mod selftest;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

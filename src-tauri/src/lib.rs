@@ -1256,6 +1256,7 @@ pub fn run() {
             commands::unity_sidecar_compiler_get_status,
             commands::unity_sidecar_compiler_set_enabled,
             commands::unity_hot_reload_set_enabled,
+            commands::unity_hot_reload_selftest_run,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

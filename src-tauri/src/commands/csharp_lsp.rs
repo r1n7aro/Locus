@@ -27,7 +27,7 @@ pub async fn csharp_lsp_set_enabled(
 #[tauri::command]
 pub async fn unity_sidecar_compiler_get_status(
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    Ok(crate::csharp_compile::status().await)
+    Ok(crate::csharp_compile::refresh_status().await)
 }
 
 #[tauri::command]
@@ -57,6 +57,17 @@ pub async fn unity_hot_reload_set_enabled(
 
     crate::unity_hotreload::set_enabled(value);
     Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
+pub async fn unity_hot_reload_selftest_run(
+    app: tauri::AppHandle,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<(), AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_hotreload::selftest::run(app, cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.selftest_failed", error))
 }
 
 #[tauri::command]

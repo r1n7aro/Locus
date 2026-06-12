@@ -68,6 +68,28 @@ export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileS
   );
 }
 
+export interface HotReloadSelfTestEvent {
+  running: boolean;
+  finished: boolean;
+  line?: string | null;
+  passed: number;
+  failed: number;
+}
+
+export function unityHotReloadSelfTestRun(): Promise<void> {
+  return ipcInvoke<void>("unity_hot_reload_selftest_run", undefined, {
+    operation: "unityHotReloadSelfTestRun",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function subscribeUnityHotReloadSelfTest(
+  handler: (payload: HotReloadSelfTestEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>("unity-hotreload-selftest", handler);
+}
+
 export function subscribeCsharpLspStatus(
   handler: (payload: CsharpLspStatus) => void,
 ): Promise<RuntimeUnsubscribe> {

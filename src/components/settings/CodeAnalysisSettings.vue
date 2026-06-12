@@ -9,7 +9,9 @@ import {
   csharpLspRestart,
   csharpLspSetEnabled,
   subscribeCsharpLspStatus,
+  subscribeUnityHotReloadSelfTest,
   subscribeUnitySidecarCompilerStatus,
+  unityHotReloadSelfTestRun,
   unityHotReloadSetEnabled,
   unitySidecarCompilerGetStatus,
   unitySidecarCompilerSetEnabled,
@@ -173,6 +175,32 @@ async function toggleHotReloadEnabled() {
   }
 }
 
+// ── hot reload self-test ─────────────────────────────────────────────
+
+const selfTestRunning = ref(false);
+const selfTestLog = ref<string[]>([]);
+const selfTestSummary = ref("");
+let unsubscribeSelfTest: RuntimeUnsubscribe | null = null;
+
+async function runHotReloadSelfTest() {
+  if (selfTestRunning.value) return;
+  selfTestRunning.value = true;
+  selfTestLog.value = [];
+  selfTestSummary.value = "";
+  try {
+    await unityHotReloadSelfTestRun();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    selfTestRunning.value = false;
+    selfTestLog.value = [...selfTestLog.value, err.message];
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "unityHotReloadSelfTest",
+      replaceOperation: true,
+    });
+  }
+}
+
 type CodeToolKey = keyof CodeAnalysisToolsConfig;
 
 interface CodeToolItem {
@@ -292,6 +320,21 @@ onMounted(() => {
   }).then((unsubscribe) => {
     unsubscribeSidecarStatus = unsubscribe;
   });
+  void subscribeUnityHotReloadSelfTest((payload) => {
+    selfTestRunning.value = payload.running && !payload.finished;
+    if (payload.line) {
+      selfTestLog.value = [...selfTestLog.value.slice(-199), payload.line];
+    }
+    if (payload.finished) {
+      selfTestSummary.value = t(
+        "settings.codeAnalysis.hotReloadSelfTestSummary",
+        payload.passed,
+        payload.failed,
+      );
+    }
+  }).then((unsubscribe) => {
+    unsubscribeSelfTest = unsubscribe;
+  });
 });
 
 onUnmounted(() => {
@@ -299,6 +342,8 @@ onUnmounted(() => {
   unsubscribeStatus = null;
   unsubscribeSidecarStatus?.();
   unsubscribeSidecarStatus = null;
+  unsubscribeSelfTest?.();
+  unsubscribeSelfTest = null;
 });
 </script>
 
@@ -379,6 +424,31 @@ onUnmounted(() => {
             @update:model-value="toggleHotReloadEnabled"
           />
           <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+      <div v-if="hotReloadEnabled" class="tool-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.codeAnalysis.hotReloadSelfTestLabel") }}</span>
+          <span class="tool-desc">{{ t("settings.codeAnalysis.hotReloadSelfTestDesc") }}</span>
+          <span v-if="selfTestSummary" class="tool-desc">{{ selfTestSummary }}</span>
+        </div>
+        <div class="master-actions">
+          <button
+            class="restart-btn"
+            :disabled="selfTestRunning || !sidecarEnabled"
+            @click="runHotReloadSelfTest"
+          >
+            {{
+              selfTestRunning
+                ? t("settings.codeAnalysis.hotReloadSelfTestRunning")
+                : t("settings.codeAnalysis.hotReloadSelfTestRun")
+            }}
+          </button>
+        </div>
+      </div>
+      <div v-if="selfTestLog.length > 0" class="selftest-log" role="log">
+        <div v-for="(line, index) in selfTestLog" :key="index" class="selftest-log-line">
+          {{ line }}
         </div>
       </div>
     </div>
@@ -498,5 +568,25 @@ onUnmounted(() => {
 }
 .tools-note {
   margin-top: 10px;
+}
+.selftest-log {
+  margin: 8px 12px 12px;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--input-bg) 88%, var(--hover-bg) 12%);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.selftest-log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+}
+.selftest-log-line:first-letter {
+  text-transform: none;
 }
 </style>
