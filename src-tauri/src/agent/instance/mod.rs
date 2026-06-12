@@ -8353,9 +8353,14 @@ impl AgentInstance {
                 }
 
                 let has_unity_recompile = prepared.iter().any(|(tc, _)| tc.name == "unity_recompile");
-                let results = if has_unity_recompile {
+                // unity_hot_reload reads the just-edited files from disk;
+                // running it concurrently with the same round's write/edit
+                // calls would race them, so it shares the sequential barrier.
+                let has_unity_compile_barrier = has_unity_recompile
+                    || prepared.iter().any(|(tc, _)| tc.name == "unity_hot_reload");
+                let results = if has_unity_compile_barrier {
                     eprintln!(
-                        "[Agent {}] executing tool round sequentially because unity_recompile is a barrier",
+                        "[Agent {}] executing tool round sequentially because a Unity compile tool is a barrier",
                         self.id
                     );
                     let mut results = Vec::with_capacity(prepared.len());
@@ -8430,7 +8435,7 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
-                if !has_unity_recompile {
+                if !has_unity_compile_barrier {
                     let queued_asset_paths: Vec<String> = prepared
                         .iter()
                         .zip(results.iter())

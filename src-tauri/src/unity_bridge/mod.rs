@@ -2807,6 +2807,8 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                 Ok(resp) if resp.ok => {
                     eprintln!("[Locus] Unity reconnected after domain reload");
                     crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+                    crate::unity_hotreload::coordinator::on_recompile_converged(project_path)
+                        .await;
                     if let Err(error) =
                         wait_for_unity_bridge_ready_after_recompile(project_path).await
                     {
@@ -2837,6 +2839,10 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                         "ok" => {
                             crate::unity_type_index::invalidate_cached_type_index(project_path)
                                 .await;
+                            crate::unity_hotreload::coordinator::on_recompile_converged(
+                                project_path,
+                            )
+                            .await;
                             if let Err(error) =
                                 wait_for_unity_bridge_ready_after_recompile(project_path).await
                             {

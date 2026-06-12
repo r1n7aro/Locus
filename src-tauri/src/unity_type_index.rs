@@ -346,6 +346,43 @@ pub async fn persist_skill_package_type_index_delta(
     Ok(Some(index))
 }
 
+/// TI-C: layer hot-patch new types into the cached index so auto-usings
+/// resolve them immediately. The cache fingerprint is untouched on purpose:
+/// Unity's own export fingerprint skips `__LocusHotPatch_` assemblies, so
+/// the cache stays "current" with these extra rows; any domain reload
+/// changes the Unity fingerprint and the next full refresh drops them.
+pub async fn append_hot_patch_types(
+    project_path: &str,
+    assembly_id: &str,
+    types: Vec<UnityTypeIndexEntry>,
+) -> Result<(), String> {
+    if types.is_empty() {
+        return Ok(());
+    }
+    let Some(mut cache) = read_type_index_cache_file(project_path)? else {
+        // No base index yet — the next full export will not include patch
+        // types (Unity skips the assemblies), but resolving names through
+        // an index that does not exist is moot; skip quietly.
+        return Ok(());
+    };
+
+    // Re-patching the same new type supersedes the previous patch's row.
+    cache
+        .types
+        .retain(|entry| !types.iter().any(|t| t.full_name == entry.full_name));
+    for mut entry in types {
+        if entry.assembly.trim().is_empty() {
+            entry.assembly = assembly_id.to_string();
+        }
+        cache.types.push(entry);
+    }
+    cache.exported_at_unix_ms = now_unix_ms();
+
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index).await;
+    Ok(())
+}
+
 fn read_type_index_cache_file(
     project_path: &str,
 ) -> Result<Option<UnityTypeIndexCacheFile>, String> {

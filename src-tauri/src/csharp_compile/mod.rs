@@ -274,10 +274,168 @@ pub async fn compile_view_script(
     outcome
 }
 
-/// Compile an arbitrary source set. Reserved as the future hot-reload
-/// compile entry (see plan §8); today it backs tests and the warm-up.
+/// Compile an arbitrary source set (tests and the warm-up).
 pub async fn compile_raw(request: Value) -> Result<CompileOutcome, String> {
     request_compile("compile/raw", request).await
+}
+
+// ── hot patch (unity_hot_reload) ─────────────────────────────────────
+
+/// One original→patch method redirection from `compile/hotPatch`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotPatchMethod {
+    pub declaring_type: String,
+    #[serde(default)]
+    pub patch_declaring_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub param_type_names: Vec<String>,
+    #[serde(default)]
+    pub is_static: bool,
+    #[serde(default)]
+    pub is_ctor: bool,
+}
+
+/// A type that only exists in the edited text (TI-C / snippet visibility).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotPatchNewType {
+    #[serde(default)]
+    pub metadata_name: String,
+    #[serde(default)]
+    pub ns: String,
+    #[serde(default)]
+    pub simple_name: String,
+    #[serde(default)]
+    pub is_public: bool,
+    #[serde(default)]
+    pub is_top_level: bool,
+}
+
+/// Parsed `compile/hotPatch` response. Transport failures stay `Err(String)`
+/// at the call site (no legacy fallback exists for hot patches — the
+/// recompile path is the recovery).
+#[derive(Debug, Clone)]
+pub enum HotPatchOutcome {
+    /// At least one file needs a real compile; per-file reasons.
+    Cold { files: Vec<(String, Vec<String>)> },
+    /// Only comments/formatting changed.
+    Noop,
+    /// Deterministic compiler diagnostics for the agent.
+    CompileError(String),
+    Compiled {
+        assembly_name: String,
+        assembly_b64: String,
+        methods: Vec<HotPatchMethod>,
+        new_types: Vec<HotPatchNewType>,
+    },
+}
+
+/// Diff + rewrite + compile edited files into a hot-patch assembly.
+/// `files` entries are (path, baselineText, currentText).
+pub async fn compile_hot_patch(
+    compile_params: &CompileParams,
+    files: &[(String, String, String)],
+) -> Result<HotPatchOutcome, String> {
+    let request = json!({
+        "files": files
+            .iter()
+            .map(|(path, old_text, new_text)| json!({
+                "path": path,
+                "oldText": old_text,
+                "newText": new_text,
+            }))
+            .collect::<Vec<_>>(),
+        "params": compile_params,
+        "referenceSessionImages": true,
+        "registerImage": true,
+    });
+
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout("compile/hotPatch", request, client::COMPILE_REQUEST_TIMEOUT)
+        .await?;
+    parse_hot_patch_result(value)
+}
+
+fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
+    let hot = value
+        .get("hot")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "malformed compile server response (missing hot)".to_string())?;
+
+    if !hot {
+        let mut files = Vec::new();
+        if let Some(entries) = value.get("files").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let path = entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reasons = entry
+                    .get("reasons")
+                    .and_then(|v| v.as_array())
+                    .map(|reasons| {
+                        reasons
+                            .iter()
+                            .filter_map(|r| r.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                files.push((path, reasons));
+            }
+        }
+        return Ok(HotPatchOutcome::Cold { files });
+    }
+
+    if value.get("noop").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(HotPatchOutcome::Noop);
+    }
+
+    let success = value
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "malformed compile server response (missing success)".to_string())?;
+    if !success {
+        let message = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown compile failure")
+            .to_string();
+        return Ok(HotPatchOutcome::CompileError(message));
+    }
+
+    let assembly_b64 = value
+        .get("assemblyB64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "malformed compile server response (missing assemblyB64)".to_string())?
+        .to_string();
+    let assembly_name = value
+        .get("assemblyName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let methods: Vec<HotPatchMethod> =
+        serde_json::from_value(value.get("methods").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| format!("malformed hot patch methods: {e}"))?;
+    let new_types: Vec<HotPatchNewType> =
+        serde_json::from_value(value.get("newTypes").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| format!("malformed hot patch newTypes: {e}"))?;
+
+    Ok(HotPatchOutcome::Compiled {
+        assembly_name,
+        assembly_b64,
+        methods,
+        new_types,
+    })
+}
+
+/// Test-only flag control (`initialize` needs an AppHandle).
+#[cfg(test)]
+pub fn initialize_enabled_for_tests(value: bool) {
+    ENABLED.store(value, Ordering::Relaxed);
 }
 
 async fn request_compile(method: &str, request: Value) -> Result<CompileOutcome, String> {
@@ -376,6 +534,90 @@ mod tests {
     #[test]
     fn parse_compile_result_malformed() {
         assert!(parse_compile_result(json!({ "bogus": true })).is_err());
+    }
+
+    #[test]
+    fn parse_hot_patch_result_cold() {
+        let value = json!({
+            "hot": false,
+            "files": [
+                { "path": "A.cs", "hot": false, "reasons": ["field layout changed: A"] }
+            ],
+        });
+        match parse_hot_patch_result(value).expect("parse") {
+            HotPatchOutcome::Cold { files } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].0, "A.cs");
+                assert_eq!(files[0].1, vec!["field layout changed: A".to_string()]);
+            }
+            other => panic!("expected Cold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hot_patch_result_noop_and_error() {
+        match parse_hot_patch_result(json!({ "hot": true, "success": true, "noop": true })).expect("parse") {
+            HotPatchOutcome::Noop => {}
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        match parse_hot_patch_result(json!({
+            "hot": true,
+            "success": false,
+            "error": "compilation failed:\n  CS0103 at 1:1: nope\n",
+            "errorStage": "compile",
+        }))
+        .expect("parse")
+        {
+            HotPatchOutcome::CompileError(message) => {
+                assert!(message.starts_with("compilation failed:"));
+            }
+            other => panic!("expected CompileError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hot_patch_result_compiled() {
+        let value = json!({
+            "hot": true,
+            "success": true,
+            "assemblyName": "__LocusHotPatch_00000000_00000001",
+            "assemblyB64": "TVo=",
+            "methods": [{
+                "declaringType": "Game.Player",
+                "patchDeclaringType": "Game.Player__LocusPatch",
+                "name": "Update",
+                "paramTypeNames": [],
+                "isStatic": false,
+                "isCtor": false,
+            }],
+            "newTypes": [{
+                "metadataName": "Game.Spawner",
+                "ns": "Game",
+                "simpleName": "Spawner",
+                "isPublic": true,
+                "isTopLevel": true,
+            }],
+        });
+        match parse_hot_patch_result(value).expect("parse") {
+            HotPatchOutcome::Compiled {
+                assembly_name,
+                assembly_b64,
+                methods,
+                new_types,
+            } => {
+                assert_eq!(assembly_name, "__LocusHotPatch_00000000_00000001");
+                assert_eq!(assembly_b64, "TVo=");
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].declaring_type, "Game.Player");
+                assert_eq!(methods[0].patch_declaring_type, "Game.Player__LocusPatch");
+                assert_eq!(methods[0].name, "Update");
+                assert!(!methods[0].is_static);
+                assert_eq!(new_types.len(), 1);
+                assert!(new_types[0].is_public && new_types[0].is_top_level);
+                assert_eq!(new_types[0].ns, "Game");
+            }
+            other => panic!("expected Compiled, got {other:?}"),
+        }
     }
 
     #[test]

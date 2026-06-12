@@ -8,6 +8,8 @@
 //! hot-safe — signature/field/type-shape changes — queues for the existing
 //! `unity_recompile` path instead. See `unity-hotreload-plan.md`.
 
+pub mod coordinator;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -50,5 +52,28 @@ pub fn counters() -> HotReloadCounters {
         active_patches: ACTIVE_PATCHES.load(Ordering::Relaxed),
         cold_queued: COLD_QUEUED.load(Ordering::Relaxed),
     }
+}
+
+pub(crate) fn record_patch_applied() {
+    PATCHES_APPLIED.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PATCHES.fetch_add(1, Ordering::Relaxed);
+    crate::csharp_compile::emit_status_in_background();
+}
+
+pub(crate) fn record_patch_failure() {
+    PATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
+    crate::csharp_compile::emit_status_in_background();
+}
+
+pub(crate) fn set_cold_queue_depth(depth: u64) {
+    COLD_QUEUED.store(depth, Ordering::Relaxed);
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// All detours die with the AppDomain (recompile / reload); the disk already
+/// holds every hot-applied edit, so the real compile converges naturally.
+pub(crate) fn reset_active_patches() {
+    ACTIVE_PATCHES.store(0, Ordering::Relaxed);
+    crate::csharp_compile::emit_status_in_background();
 }
 

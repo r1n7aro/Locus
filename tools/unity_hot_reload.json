@@ -1,0 +1,14 @@
+{
+  "description": "Apply pending C# edits to the running Unity Editor in ~1-2 seconds via method hot-patching — no script recompile, no domain reload, no state loss. Works in Edit Mode and Play Mode; ideal for the edit→observe loop while playing.\n\nUse after editing .cs files with the write/edit tools. Edits are classified automatically:\n- Hot (applied live): method/property/indexer/constructor BODY changes, new private methods, new types, new .cs files.\n- Cold (needs a real compile): signature/field/base-type/attribute changes, generics, partial types, new Unity message methods (Update/Awake/...), const or static-initializer changes, deletions. The tool reports the exact reasons and queues the files — then call unity_recompile.\n\nDeterministic compile errors are returned directly; fix the code and call again. Hot patches persist until the next domain reload, and the edited files are already on disk, so a later unity_recompile (or any reload) converges to identical code permanently — call unity_recompile once you finish a burst of hot edits, before relying on serialization/Inspector changes, or whenever the tool tells you to.\n\nRequires: Unity hot reload + sidecar compiler enabled in settings, an up-to-date Locus Unity plugin, and Editor Code Optimization = Debug.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "paths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional .cs paths (absolute or project-relative) to hot reload. Default: every .cs file edited since the last recompile."
+      }
+    },
+    "required": []
+  }
+}

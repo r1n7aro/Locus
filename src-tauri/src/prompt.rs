@@ -28,6 +28,7 @@ pub mod tools {
     pub const UNITY_YAML_SEARCH: &str = include_str!("../../tools/unity_yaml_search.json");
     pub const UNITY_YAML_READ: &str = include_str!("../../tools/unity_yaml_read.json");
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
+    pub const UNITY_HOT_RELOAD: &str = include_str!("../../tools/unity_hot_reload.json");
     pub const CODE_FIND_REFERENCES: &str = include_str!("../../tools/code_find_references.json");
     pub const CODE_GOTO_DEFINITION: &str = include_str!("../../tools/code_goto_definition.json");
     pub const CODE_SYMBOL_SEARCH: &str = include_str!("../../tools/code_symbol_search.json");
@@ -128,6 +129,7 @@ mod tests {
             ("unity_yaml_search", tools::UNITY_YAML_SEARCH),
             ("unity_yaml_read", tools::UNITY_YAML_READ),
             ("unity_recompile", tools::UNITY_RECOMPILE),
+            ("unity_hot_reload", tools::UNITY_HOT_RELOAD),
             ("code_find_references", tools::CODE_FIND_REFERENCES),
             ("code_goto_definition", tools::CODE_GOTO_DEFINITION),
             ("code_symbol_search", tools::CODE_SYMBOL_SEARCH),

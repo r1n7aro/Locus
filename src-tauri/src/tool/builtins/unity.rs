@@ -286,6 +286,61 @@ pub(super) fn unity_yaml_read() -> ToolDef {
     intercepted_unity_yaml_tool("unity_yaml_read", crate::prompt::tools::UNITY_YAML_READ)
 }
 
+// ─── unity_hot_reload ────────────────────────────────────────────────────────
+
+pub(super) fn unity_hot_reload() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_HOT_RELOAD);
+    ToolDef {
+        name: "unity_hot_reload".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        // Redirects methods in the running editor; tracked files already
+        // changed through write/edit.
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_hot_reload' requires a selected Unity project working directory.".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let (connected, _status, _scene) =
+                    crate::unity_bridge::query_unity_status(&project_path).await;
+                if !connected {
+                    return ToolResult {
+                        output: "Unity Editor not connected".to_string(),
+                        is_error: true,
+                    };
+                }
+
+                let paths = args.get("paths").and_then(|value| value.as_array()).map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                });
+
+                match crate::unity_hotreload::coordinator::hot_reload(&project_path, paths).await {
+                    Ok(output) => ToolResult {
+                        output,
+                        is_error: false,
+                    },
+                    Err(error) => ToolResult {
+                        output: error,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
 // ─── unity_recompile ─────────────────────────────────────────────────────────
 
 pub(super) fn unity_recompile() -> ToolDef {

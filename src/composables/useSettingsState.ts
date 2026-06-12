@@ -786,6 +786,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
+    { name: "unity_hot_reload",   label: "unity_hot_reload",   desc: t("tool.desc.unity_hot_reload"),   defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
     { name: "code_find_references", label: "code_find_references", desc: t("tool.desc.code_find_references"), defaultMode: "auto" as const },
     { name: "code_goto_definition", label: "code_goto_definition", desc: t("tool.desc.code_goto_definition"), defaultMode: "auto" as const },

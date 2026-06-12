@@ -1535,6 +1535,7 @@
   "tool.desc.unity_run_states": "Run Unity states",
   "tool.desc.unity_capture_viewport": "Capture Unity viewport",
   "tool.desc.unity_recompile": "Unity recompile",
+  "tool.desc.unity_hot_reload": "Unity hot reload (method patches)",
   "tool.desc.unity_ref_search": "Unity ref search",
   "tool.desc.code_find_references": "C# find references",
   "tool.desc.code_goto_definition": "C# go to definition",

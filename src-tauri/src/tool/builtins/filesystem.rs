@@ -207,7 +207,7 @@ pub(super) fn write() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: true,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
                     Some(p) => p.to_string(),
@@ -262,10 +262,23 @@ pub(super) fn write() -> ToolDef {
                 }
 
                 match tokio::fs::write(&file_path, &content).await {
-                    Ok(()) => ToolResult {
-                        output: format!("Created {}", file_path),
-                        is_error: false,
-                    },
+                    Ok(()) => {
+                        // Hot reload tracks the pre-edit baseline of every
+                        // touched .cs source; a brand-new file's baseline is
+                        // empty (all of it is "new types").
+                        if let Some(project) = ctx.working_dir.as_deref() {
+                            crate::unity_hotreload::coordinator::note_cs_written(
+                                project,
+                                &file_path,
+                                String::new(),
+                            )
+                            .await;
+                        }
+                        ToolResult {
+                            output: format!("Created {}", file_path),
+                            is_error: false,
+                        }
+                    }
                     Err(e) => ToolResult {
                         output: format!("Failed to write file '{}': {}", file_path, e),
                         is_error: true,
@@ -429,6 +442,14 @@ pub(super) fn edit() -> ToolDef {
                         let rewritten = apply_line_ending(&op.new_string, file_eol);
                         match tokio::fs::write(&file_path, rewritten).await {
                             Ok(()) => {
+                                if let Some(project) = ctx.working_dir.as_deref() {
+                                    crate::unity_hotreload::coordinator::note_cs_written(
+                                        project,
+                                        &file_path,
+                                        content.clone(),
+                                    )
+                                    .await;
+                                }
                                 return ToolResult {
                                     output: format!("Created {}", file_path),
                                     is_error: false,
@@ -472,6 +493,17 @@ pub(super) fn edit() -> ToolDef {
                 let rewritten = apply_line_ending(&current_content, file_eol);
                 match tokio::fs::write(&file_path, rewritten).await {
                     Ok(()) => {
+                        // Baseline for hot reload = the file as it was when
+                        // the loaded assemblies were compiled (first edit's
+                        // pre-content wins inside the coordinator).
+                        if let Some(project) = ctx.working_dir.as_deref() {
+                            crate::unity_hotreload::coordinator::note_cs_written(
+                                project,
+                                &file_path,
+                                content.clone(),
+                            )
+                            .await;
+                        }
                         let lines_info = if !start_lines.is_empty() {
                             let nums: Vec<String> =
                                 start_lines.iter().map(|n| n.to_string()).collect();
