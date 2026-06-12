@@ -134,6 +134,42 @@ struct ParseFailureEntry {
     detail: String,
 }
 
+/// Per-step timings + row counts produced by the `DbWrite` transaction
+/// closure inside `full_scan_with_cancel`, so the timing report can be
+/// printed after the report thread has been joined.
+struct DbWriteOutcome {
+    nodes_added: u64,
+    objects_added: u64,
+    edges_added: u64,
+    t_tx_begin: std::time::Duration,
+    t_clear: std::time::Duration,
+    t_idx_drop: std::time::Duration,
+    t_assets: std::time::Duration,
+    t_objects: std::time::Duration,
+    t_files: std::time::Duration,
+    t_metrics: std::time::Duration,
+    t_linked_roots: std::time::Duration,
+    t_edges: std::time::Duration,
+    t_idx_create: std::time::Duration,
+    t_commit: std::time::Duration,
+}
+
+impl DbWriteOutcome {
+    fn total(&self) -> std::time::Duration {
+        self.t_tx_begin
+            + self.t_clear
+            + self.t_idx_drop
+            + self.t_assets
+            + self.t_objects
+            + self.t_files
+            + self.t_metrics
+            + self.t_linked_roots
+            + self.t_edges
+            + self.t_idx_create
+            + self.t_commit
+    }
+}
+
 /// On-disk probe of a meta's sibling content file, captured inside the
 /// parallel meta-parse phase so the materialize loop stays stat-free.
 ///
@@ -164,6 +200,103 @@ fn probe_content_file(meta_abs_path: &Path) -> ContentProbe {
         },
         Err(_) => ContentProbe::default(),
     }
+}
+
+/// Resolve a meta's sibling content file from the scanner's walk-time probe
+/// table instead of issuing one `stat` per asset. Falls back to a real disk
+/// probe only when the walk didn't record the path (content file deleted
+/// mid-scan, or skipped as an ignored name) so the rare cases keep the old
+/// semantics exactly.
+fn probe_for_meta(
+    entry_probes: &HashMap<String, scanner::EntryProbe>,
+    meta_rel_path: &str,
+    meta_abs_path: &Path,
+) -> ContentProbe {
+    let Some(content_rel) = meta_rel_path.strip_suffix(".meta") else {
+        return probe_content_file(meta_abs_path);
+    };
+    match entry_probes.get(content_rel) {
+        Some(probe) if probe.is_file => ContentProbe {
+            exists: true,
+            mtime_ns: probe.mtime_ns,
+            size: probe.size,
+        },
+        // Directories (folder assets) report exists with zero mtime/size,
+        // matching `probe_content_file`'s non-file branch.
+        Some(_) => ContentProbe {
+            exists: true,
+            mtime_ns: 0,
+            size: 0,
+        },
+        None => probe_content_file(meta_abs_path),
+    }
+}
+
+type YamlParseOk = (
+    scanner::FileEntry,
+    Guid,
+    Vec<ExtractedRef>,
+    Vec<crate::unity_yaml::YamlDoc>,
+    [u8; 16],
+    Option<Guid>,
+);
+
+/// Read + parse one yaml asset for the full-scan pipeline. Pure function of
+/// the file and the meta-phase lookup tables, so `full_scan` can run it from
+/// inside `rayon::join` while the script index builds concurrently.
+fn parse_yaml_asset_entry(
+    entry: &scanner::FileEntry,
+    cancel: &AtomicBool,
+    path_to_guid: &HashMap<String, Guid>,
+    guid_to_path: &HashMap<Guid, String>,
+) -> Result<YamlParseOk, ParseFailureEntry> {
+    ensure_scan_not_cancelled(cancel).map_err(|detail| ParseFailureEntry {
+        kind: ParseFailureKind::ReadFailed,
+        path: entry.rel_path.clone(),
+        detail,
+    })?;
+    let src_guid = match path_to_guid.get(&entry.rel_path) {
+        Some(g) => *g,
+        None => {
+            return Err(ParseFailureEntry {
+                kind: ParseFailureKind::MissingMeta,
+                path: entry.rel_path.clone(),
+                detail: format!("Asset has no matching .meta: {}", entry.rel_path),
+            });
+        }
+    };
+
+    let content = match std::fs::read(&entry.abs_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(ParseFailureEntry {
+                kind: ParseFailureKind::ReadFailed,
+                path: entry.rel_path.clone(),
+                detail: format!("Failed to read {}: {}", entry.rel_path, e),
+            });
+        }
+    };
+
+    // Single pass: docs and raw refs come from one line scan, then the refs
+    // are resolved against the docs in place.
+    let (docs, raw_refs) = crate::unity_yaml::parse_yaml_docs_with_refs(&content);
+    let refs = crate::unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(guid_to_path));
+    let content_hash = hash128(&content);
+    let main_script_guid = if entry.ext.eq_ignore_ascii_case("asset") {
+        docs.iter()
+            .find(|doc| doc.doc_index == 0 && doc.class_id == 114)
+            .and_then(|doc| doc.m_script_guid)
+    } else {
+        None
+    };
+    Ok((
+        entry.clone(),
+        src_guid,
+        refs,
+        docs,
+        content_hash,
+        main_script_guid,
+    ))
 }
 
 impl AssetDb {
@@ -388,7 +521,8 @@ impl AssetDb {
                     };
                     let meta_hash = hash128(&content);
                     let importer_subassets = object_index::parse_importer_subassets(&content);
-                    let content_probe = probe_content_file(&entry.abs_path);
+                    let content_probe =
+                        probe_for_meta(&snapshot.entry_probes, &entry.rel_path, &entry.abs_path);
                     Ok((entry.clone(), guid, meta_hash, importer_subassets, content_probe))
                 })();
                 let completed = meta_progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -519,9 +653,46 @@ impl AssetDb {
             .map(|(path, guid)| (*guid, path.clone()))
             .collect();
 
-        let script_metadata_by_guid =
-            script_parser::build_script_metadata_index(&self.project_root, &path_to_guid);
-        let t_script_index = phase_start.elapsed();
+        // The script index (read + parse every .cs) and the yaml parse only
+        // share read-only inputs (`path_to_guid` / `guid_to_path`); script
+        // metadata is consumed by the *backfill* below, not by the yaml
+        // parse itself. rayon::join overlaps the two heaviest parse phases
+        // on the same work-stealing pool, so the wall clock pays roughly
+        // max() instead of sum() of the two.
+        let yaml_total = stats.yaml_assets_found;
+        let yaml_progress = AtomicU64::new(0);
+        let yaml_progress_emitted = AtomicU64::new(0);
+        let ((script_metadata_by_guid, t_script_index), (yaml_outcomes, t_yaml_par)) = rayon::join(
+            || {
+                let started = std::time::Instant::now();
+                let index =
+                    script_parser::build_script_metadata_index(&self.project_root, &path_to_guid);
+                (index, started.elapsed())
+            },
+            || {
+                let started = std::time::Instant::now();
+                let outcomes: Vec<_> = snapshot
+                    .yaml_asset_files
+                    .par_iter()
+                    .map(|entry| {
+                        let outcome =
+                            parse_yaml_asset_entry(entry, cancel, &path_to_guid, &guid_to_path);
+                        let completed = yaml_progress.fetch_add(1, Ordering::Relaxed) + 1;
+                        maybe_emit_scan_progress(
+                            &on_progress,
+                            &yaml_progress_emitted,
+                            yaml_total,
+                            completed,
+                            |completed, total| ScanPhase::YamlParse { total, completed },
+                        );
+                        outcome
+                    })
+                    .collect();
+                (outcomes, started.elapsed())
+            },
+        );
+        let t_parse_join = phase_start.elapsed();
+        ensure_scan_not_cancelled(cancel)?;
 
         phase_start = std::time::Instant::now();
         let guid_to_node_idx: HashMap<Guid, usize> = asset_nodes
@@ -547,82 +718,14 @@ impl AssetDb {
         }
         let t_script_backfill = phase_start.elapsed();
         eprintln!(
-            "[AssetDb][timing] script_index={}ms script_backfill={}ms ({} script metas)",
+            "[AssetDb][timing] parse_join={}ms (script_index={}ms || yaml_par={}ms) script_backfill={}ms ({} script metas)",
+            t_parse_join.as_millis(),
             t_script_index.as_millis(),
+            t_yaml_par.as_millis(),
             t_script_backfill.as_millis(),
             script_metadata_by_guid.len()
         );
 
-        phase_start = std::time::Instant::now();
-        let yaml_progress = AtomicU64::new(0);
-        let yaml_progress_emitted = AtomicU64::new(0);
-        let yaml_outcomes: Vec<_> = snapshot
-            .yaml_asset_files
-            .par_iter()
-            .map(|entry| {
-                let outcome = (|| {
-                    ensure_scan_not_cancelled(cancel).map_err(|detail| ParseFailureEntry {
-                        kind: ParseFailureKind::ReadFailed,
-                        path: entry.rel_path.clone(),
-                        detail,
-                    })?;
-                    let src_guid = match path_to_guid.get(&entry.rel_path) {
-                        Some(g) => *g,
-                        None => {
-                            return Err(ParseFailureEntry {
-                                kind: ParseFailureKind::MissingMeta,
-                                path: entry.rel_path.clone(),
-                                detail: format!("Asset has no matching .meta: {}", entry.rel_path),
-                            });
-                        }
-                    };
-
-                    let content = match std::fs::read(&entry.abs_path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return Err(ParseFailureEntry {
-                                kind: ParseFailureKind::ReadFailed,
-                                path: entry.rel_path.clone(),
-                                detail: format!("Failed to read {}: {}", entry.rel_path, e),
-                            });
-                        }
-                    };
-
-                    // Single pass: docs and raw refs come from one line scan,
-                    // then the refs are resolved against the docs in place.
-                    let (docs, raw_refs) = crate::unity_yaml::parse_yaml_docs_with_refs(&content);
-                    let refs =
-                        crate::unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(&guid_to_path));
-                    let content_hash = hash128(&content);
-                    let main_script_guid = if entry.ext.eq_ignore_ascii_case("asset") {
-                        docs.iter()
-                            .find(|doc| doc.doc_index == 0 && doc.class_id == 114)
-                            .and_then(|doc| doc.m_script_guid)
-                    } else {
-                        None
-                    };
-                    Ok((
-                        entry.clone(),
-                        src_guid,
-                        refs,
-                        docs,
-                        content_hash,
-                        main_script_guid,
-                    ))
-                })();
-                let completed = yaml_progress.fetch_add(1, Ordering::Relaxed) + 1;
-                maybe_emit_scan_progress(
-                    &on_progress,
-                    &yaml_progress_emitted,
-                    stats.yaml_assets_found,
-                    completed,
-                    |completed, total| ScanPhase::YamlParse { total, completed },
-                );
-                outcome
-            })
-            .collect();
-        ensure_scan_not_cancelled(cancel)?;
-        let t_yaml_par = phase_start.elapsed();
         let mut yaml_results = Vec::with_capacity(yaml_outcomes.len());
         for outcome in yaml_outcomes {
             match outcome {
@@ -787,14 +890,12 @@ impl AssetDb {
         );
 
         phase_start = std::time::Instant::now();
-        // H5: Sort edges by (src_guid, dst_guid) before batch insert. This
-        // gives `idx_edges_src` near-sequential page writes (the index is
-        // the dominant write-amp source for ~232k edges). The cost is one
-        // ~50ms sort in exchange for hundreds of ms of B-tree page locality.
-        // Sorting on (src, dst) instead of just src also makes the insert
-        // order deterministic and lets a future composite index inherit
-        // it for free.
-        edges.sort_unstable_by(|a, b| {
+        // Sort edges by (src_guid, dst_guid) before insert. The adjacent-
+        // duplicate dedupe below depends on it, the insert order stays
+        // deterministic, and the edge indexes — rebuilt *after* the bulk
+        // insert by `create_secondary_indexes` — sort faster over
+        // pre-ordered input. Parallel sort: ~232k edges in single-digit ms.
+        edges.par_sort_unstable_by(|a, b| {
             a.src_guid
                 .cmp(&b.src_guid)
                 .then_with(|| a.dst_guid.cmp(&b.dst_guid))
@@ -837,61 +938,126 @@ impl AssetDb {
         phase_start = std::time::Instant::now();
         ensure_scan_not_cancelled(cancel)?;
         on_progress(&ScanPhase::DbWrite);
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-        let t_tx_begin = phase_start.elapsed();
 
-        // Wipe + reinsert in the same transaction so a mid-write crash leaves
-        // the previous state intact rather than an empty DB.
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        db::clear_all_in_tx(&tx)?;
-        let t_clear = t0.elapsed();
+        // The risk reports only consume in-memory scan results (plus their
+        // own file reads for duplicate hashing), so they render on a helper
+        // thread while the same wall-clock window pays for the DB write.
+        // Field borrows are split up front: the report thread gets
+        // `project_root`, the write closure keeps `conn` and `stats`.
+        let project_root: &Path = &self.project_root;
+        let conn = &mut self.conn;
+        let duplicate_guids_overview = stats.duplicate_guids.clone();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        stats.nodes_added = db::batch_insert_assets(&tx, &asset_nodes)?;
-        let t_assets = t0.elapsed();
+        let (write_result, report_results) = std::thread::scope(|scope| {
+            let report_handle = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                let duplicate_guid_report = sync_duplicate_guid_report(
+                    project_root,
+                    &meta_results,
+                    &duplicate_guids_overview,
+                );
+                let parse_failure_report = sync_parse_failure_report(project_root, &parse_failures);
+                (duplicate_guid_report, parse_failure_report, started.elapsed())
+            });
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        let objects_added = db::batch_insert_asset_objects(&tx, &asset_objects)?;
-        let t_objects = t0.elapsed();
+            let write_result = (|| -> Result<DbWriteOutcome, String> {
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+                let t_tx_begin = phase_start.elapsed();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        db::batch_insert_files(&tx, &file_records)?;
-        let t_files = t0.elapsed();
+                // Wipe + reinsert in the same transaction so a mid-write
+                // crash leaves the previous state intact rather than an
+                // empty DB.
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::clear_all_in_tx(&tx)?;
+                let t_clear = t0.elapsed();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        db::set_scan_metrics(&tx, &stats.duplicate_guids, stats.parse_failures)?;
-        let t_metrics = t0.elapsed();
+                // Bulk-load pattern: drop every secondary index, insert into
+                // bare tables, then rebuild each index with one sort-based
+                // CREATE INDEX. Row-by-row B-tree maintenance across ~20
+                // indexes was the dominant write-amplification source.
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::drop_secondary_indexes(&tx)?;
+                let t_idx_drop = t0.elapsed();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        db::replace_linked_asset_roots(&tx, &snapshot.linked_asset_roots)?;
-        let t_linked_roots = t0.elapsed();
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                let nodes_added = db::batch_insert_assets(&tx, &asset_nodes)?;
+                let t_assets = t0.elapsed();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        stats.edges_added = db::batch_insert_edges(&tx, &edges)?;
-        let t_edges = t0.elapsed();
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                let objects_added = db::batch_insert_asset_objects(&tx, &asset_objects)?;
+                let t_objects = t0.elapsed();
 
-        ensure_scan_not_cancelled(cancel)?;
-        let t0 = std::time::Instant::now();
-        tx.commit()
-            .map_err(|e| format!("Failed to commit: {}", e))?;
-        let t_commit = t0.elapsed();
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::batch_insert_files(&tx, &file_records)?;
+                let t_files = t0.elapsed();
 
-        let t0 = std::time::Instant::now();
-        let duplicate_guid_report_path = match sync_duplicate_guid_report(
-            &self.project_root,
-            &meta_results,
-            &stats.duplicate_guids,
-        ) {
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::set_scan_metrics(&tx, &duplicate_guids_overview, parse_failures.len() as u64)?;
+                let t_metrics = t0.elapsed();
+
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::replace_linked_asset_roots(&tx, &snapshot.linked_asset_roots)?;
+                let t_linked_roots = t0.elapsed();
+
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                let edges_added = db::batch_insert_edges(&tx, &edges)?;
+                let t_edges = t0.elapsed();
+
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                db::create_secondary_indexes(&tx)?;
+                let t_idx_create = t0.elapsed();
+
+                ensure_scan_not_cancelled(cancel)?;
+                let t0 = std::time::Instant::now();
+                tx.commit()
+                    .map_err(|e| format!("Failed to commit: {}", e))?;
+                let t_commit = t0.elapsed();
+
+                Ok(DbWriteOutcome {
+                    nodes_added,
+                    objects_added,
+                    edges_added,
+                    t_tx_begin,
+                    t_clear,
+                    t_idx_drop,
+                    t_assets,
+                    t_objects,
+                    t_files,
+                    t_metrics,
+                    t_linked_roots,
+                    t_edges,
+                    t_idx_create,
+                    t_commit,
+                })
+            })();
+
+            let report_results = report_handle.join().unwrap_or_else(|_| {
+                (
+                    Err("duplicate GUID report thread panicked".to_string()),
+                    Err("parse failure report thread panicked".to_string()),
+                    std::time::Duration::ZERO,
+                )
+            });
+            (write_result, report_results)
+        });
+
+        let write_outcome = write_result?;
+        stats.nodes_added = write_outcome.nodes_added;
+        stats.edges_added = write_outcome.edges_added;
+
+        let (duplicate_guid_report, parse_failure_report, t_risk_reports) = report_results;
+        let duplicate_guid_report_path = match duplicate_guid_report {
             Ok(path) => path,
             Err(err) => {
                 eprintln!(
@@ -901,35 +1067,35 @@ impl AssetDb {
                 None
             }
         };
-        let parse_failure_report_path =
-            match sync_parse_failure_report(&self.project_root, &parse_failures) {
-                Ok(path) => path,
-                Err(err) => {
-                    eprintln!(
-                        "[AssetDb] warning: failed to update parse failure report: {}",
-                        err
-                    );
-                    None
-                }
-            };
-        let t_risk_reports = t0.elapsed();
+        let parse_failure_report_path = match parse_failure_report {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!(
+                    "[AssetDb] warning: failed to update parse failure report: {}",
+                    err
+                );
+                None
+            }
+        };
 
         eprintln!(
-            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms assets={}ms ({} rows) objects={}ms ({} sub rows) files={}ms ({} rows) metrics={}ms linked_roots={}ms ({} rows) edges={}ms ({} rows) commit={}ms",
-            t_tx_begin.as_millis(),
-            t_clear.as_millis(),
-            t_assets.as_millis(),
+            "[AssetDb][timing] db_write: tx_begin={}ms clear={}ms idx_drop={}ms assets={}ms ({} rows) objects={}ms ({} sub rows) files={}ms ({} rows) metrics={}ms linked_roots={}ms ({} rows) edges={}ms ({} rows) idx_create={}ms commit={}ms",
+            write_outcome.t_tx_begin.as_millis(),
+            write_outcome.t_clear.as_millis(),
+            write_outcome.t_idx_drop.as_millis(),
+            write_outcome.t_assets.as_millis(),
             stats.nodes_added,
-            t_objects.as_millis(),
-            objects_added,
-            t_files.as_millis(),
+            write_outcome.t_objects.as_millis(),
+            write_outcome.objects_added,
+            write_outcome.t_files.as_millis(),
             file_records.len(),
-            t_metrics.as_millis(),
-            t_linked_roots.as_millis(),
+            write_outcome.t_metrics.as_millis(),
+            write_outcome.t_linked_roots.as_millis(),
             snapshot.linked_asset_roots.len(),
-            t_edges.as_millis(),
+            write_outcome.t_edges.as_millis(),
             stats.edges_added,
-            t_commit.as_millis()
+            write_outcome.t_idx_create.as_millis(),
+            write_outcome.t_commit.as_millis()
         );
 
         if let Some(report_path) = &duplicate_guid_report_path {
@@ -952,17 +1118,18 @@ impl AssetDb {
             stats.nodes_added, stats.edges_added, stats.elapsed_ms
         );
         eprintln!(
-            "[AssetDb][timing] TOTAL={}ms (dir_scan={}ms meta_par={}ms meta_mat={}ms script_idx={}ms script_bf={}ms yaml_par={}ms yaml_bf={}ms edge_prep={}ms db_write={}ms risk_reports={}ms)",
+            "[AssetDb][timing] TOTAL={}ms (dir_scan={}ms meta_par={}ms meta_mat={}ms parse_join={}ms [script_idx={}ms || yaml_par={}ms] script_bf={}ms yaml_bf={}ms edge_prep={}ms db_write={}ms risk_reports={}ms)",
             stats.elapsed_ms,
             t_dir_scan.as_millis(),
             t_meta_par.as_millis(),
             t_meta_materialize.as_millis(),
+            t_parse_join.as_millis(),
             t_script_index.as_millis(),
-            t_script_backfill.as_millis(),
             t_yaml_par.as_millis(),
+            t_script_backfill.as_millis(),
             t_yaml_backfill.as_millis(),
             t_edge_prep.as_millis(),
-            (t_clear + t_assets + t_objects + t_files + t_edges + t_commit + t_tx_begin).as_millis(),
+            write_outcome.total().as_millis(),
             t_risk_reports.as_millis()
         );
 
@@ -2152,9 +2319,7 @@ mod tests {
                 "SELECT COUNT(*) FROM asset_search_fts f
                  WHERE NOT EXISTS (
                      SELECT 1 FROM asset_objects o
-                     WHERE o.rowid = f.rowid
-                       AND o.object_key = f.object_key
-                       AND o.searchable = 1
+                     WHERE o.rowid = f.rowid AND o.searchable = 1
                  )",
                 [],
                 |row| row.get(0),
@@ -2162,11 +2327,15 @@ mod tests {
             .expect("count misaligned fts rows");
         assert_eq!(misaligned, 0);
 
+        // The FTS table is contentless, so the main object's row is located
+        // through the asset_objects rowid it mirrors.
         let guid = parse_guid_hex(guid_hex).unwrap();
         let main_fts_rows: i64 = graph
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM asset_search_fts WHERE object_key = ?1",
+                "SELECT COUNT(*) FROM asset_search_fts f
+                 JOIN asset_objects o ON o.rowid = f.rowid
+                 WHERE o.object_key = ?1",
                 rusqlite::params![guid_to_hex(&guid)],
                 |row| row.get(0),
             )

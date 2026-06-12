@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use rusqlite::{params, Connection, Transaction};
 
 use super::object_index;
@@ -13,11 +14,12 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// at `open_db` time triggers a full DB delete + rebuild — `locus.db` is a
 /// pure cache and we never migrate it.
 ///
-/// v10: scene/prefab YAML sub-docs are no longer persisted to `asset_objects`,
-/// and `asset_search_fts` rowids are now aligned with their `asset_objects`
-/// rows (deletes run by rowid). Old DBs hold both the dead sub-doc rows and
-/// FTS rowids with no alignment guarantee, so they must be rebuilt.
-pub const ASSET_DB_VERSION: u32 = 10;
+/// v11: `asset_search_fts` migrated to a contentless table
+/// (`content=''` + `contentless_delete=1`). Row content lives only in
+/// `asset_objects`; the FTS table stores just the trigram index keyed by the
+/// shared rowid, full-scan wipes use the O(1) `'delete-all'` command, and
+/// the readable `object_key` column is gone — old DBs must be rebuilt.
+pub const ASSET_DB_VERSION: u32 = 11;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -40,15 +42,24 @@ pub(crate) fn configure_connection(conn: &Connection) -> Result<(), String> {
     // WAL + reduced fsync as before, plus tuning for the big DbWrite
     // transaction path: temp_store=MEMORY keeps sort/hash spills off disk,
     // cache_size bumps the page cache to 64 MB (negative = KB), mmap_size
-    // lets SQLite mmap 256 MB of the DB file to skip a layer of syscalls.
-    // All five are per-connection and reversible.
+    // lets SQLite mmap 256 MB of the DB file to skip a layer of syscalls,
+    // and threads=4 lets the sort inside the bulk-rebuild CREATE INDEX
+    // statements use worker threads. All are per-connection and reversible.
+    //
+    // optimize=0x10002 is the sqlite.org-recommended open-time form for
+    // long-lived connections: re-ANALYZE any table with stale planner stats
+    // (0x02), examining all tables not just ones this connection touched
+    // (0x10000). ANALYZE runs under the built-in analysis_limit, so it stays
+    // cheap even on big DBs; on a fresh/empty DB it is a no-op.
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA busy_timeout=5000;
          PRAGMA synchronous=NORMAL;
          PRAGMA temp_store=MEMORY;
          PRAGMA cache_size=-65536;
-         PRAGMA mmap_size=268435456;",
+         PRAGMA mmap_size=268435456;
+         PRAGMA threads=4;
+         PRAGMA optimize=0x10002;",
     )
     .map_err(|e| format!("Failed to set pragmas: {}", e))
 }
@@ -188,53 +199,150 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY(term, script_guid)
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_path ON assets(path);
-        CREATE INDEX IF NOT EXISTS idx_assets_kind_stem
-            ON assets(exists_on_disk, kind, stem_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_root_stem
-            ON assets(exists_on_disk, root, stem_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_root_pathlower
-            ON assets(exists_on_disk, root, path_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_pathlower
-            ON assets(exists_on_disk, path_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_script_class
-            ON assets(exists_on_disk, kind, script_class_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_script_full_name
-            ON assets(exists_on_disk, kind, script_full_name_lower);
-        CREATE INDEX IF NOT EXISTS idx_assets_script_ns_class
-            ON assets(exists_on_disk, kind, script_namespace_lower, script_class_lower);
-        CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_guid);
-        CREATE INDEX IF NOT EXISTS idx_edges_src_object ON edges(src_guid, src_file_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_guid);
-        CREATE INDEX IF NOT EXISTS idx_edges_dst_object ON edges(dst_guid, dst_file_id);
-        CREATE INDEX IF NOT EXISTS idx_asset_objects_guid ON asset_objects(asset_guid);
-        CREATE INDEX IF NOT EXISTS idx_asset_objects_file
-            ON asset_objects(asset_guid, file_id);
-        CREATE INDEX IF NOT EXISTS idx_asset_objects_root_name
-            ON asset_objects(searchable, root, name_lower);
-        CREATE INDEX IF NOT EXISTS idx_asset_objects_kind_name
-            ON asset_objects(searchable, kind, name_lower);
-        CREATE INDEX IF NOT EXISTS idx_asset_objects_pathlower
-            ON asset_objects(searchable, path_lower);
-        CREATE INDEX IF NOT EXISTS idx_asset_object_type_terms_object
-            ON asset_object_type_terms(object_key);
-        CREATE INDEX IF NOT EXISTS idx_files_owner_guid ON files(owner_guid);
-        CREATE INDEX IF NOT EXISTS idx_script_inheritance_terms_guid
-            ON script_inheritance_terms(script_guid);
-
         -- FTS5 trigram virtual table. Only consumed by
         -- `search_assets_for_command` (the asset-page free-text path).
+        -- Contentless: row text lives in `asset_objects`; this table holds
+        -- only the trigram index keyed by the shared rowid.
+        -- `contentless_delete=1` keeps `DELETE ... WHERE rowid = ?` working
+        -- as a point lookup, and full-scan wipes use the O(1) 'delete-all'
+        -- command.
         CREATE VIRTUAL TABLE IF NOT EXISTS asset_search_fts USING fts5(
-            object_key UNINDEXED,
             name,
             path,
             type_search,
-            tokenize = 'trigram'
+            tokenize = 'trigram',
+            content = '',
+            contentless_delete = 1
         );",
     )
     .map_err(|e| format!("Failed to create tables: {}", e))?;
 
+    create_secondary_indexes(conn)?;
+
     ensure_aux_tables(conn)
+}
+
+/// Every secondary index on the bulk-rebuilt tables, in `(name, DDL)` form.
+/// Single source of truth: `create_tables` builds them at open time and the
+/// full-scan rebuild drops + recreates them around the wipe/reinsert so the
+/// bulk insert writes bare tables and each index is built once with a
+/// sort-based CREATE INDEX instead of row-by-row B-tree maintenance.
+const SECONDARY_INDEX_DDL: &[(&str, &str)] = &[
+    (
+        "idx_assets_path",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_path ON assets(path)",
+    ),
+    (
+        "idx_assets_kind_stem",
+        "CREATE INDEX IF NOT EXISTS idx_assets_kind_stem
+            ON assets(exists_on_disk, kind, stem_lower)",
+    ),
+    (
+        "idx_assets_root_stem",
+        "CREATE INDEX IF NOT EXISTS idx_assets_root_stem
+            ON assets(exists_on_disk, root, stem_lower)",
+    ),
+    (
+        "idx_assets_root_pathlower",
+        "CREATE INDEX IF NOT EXISTS idx_assets_root_pathlower
+            ON assets(exists_on_disk, root, path_lower)",
+    ),
+    (
+        "idx_assets_pathlower",
+        "CREATE INDEX IF NOT EXISTS idx_assets_pathlower
+            ON assets(exists_on_disk, path_lower)",
+    ),
+    (
+        "idx_assets_script_class",
+        "CREATE INDEX IF NOT EXISTS idx_assets_script_class
+            ON assets(exists_on_disk, kind, script_class_lower)",
+    ),
+    (
+        "idx_assets_script_full_name",
+        "CREATE INDEX IF NOT EXISTS idx_assets_script_full_name
+            ON assets(exists_on_disk, kind, script_full_name_lower)",
+    ),
+    (
+        "idx_assets_script_ns_class",
+        "CREATE INDEX IF NOT EXISTS idx_assets_script_ns_class
+            ON assets(exists_on_disk, kind, script_namespace_lower, script_class_lower)",
+    ),
+    (
+        "idx_edges_src",
+        "CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_guid)",
+    ),
+    (
+        "idx_edges_src_object",
+        "CREATE INDEX IF NOT EXISTS idx_edges_src_object ON edges(src_guid, src_file_id)",
+    ),
+    (
+        "idx_edges_dst",
+        "CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_guid)",
+    ),
+    (
+        "idx_edges_dst_object",
+        "CREATE INDEX IF NOT EXISTS idx_edges_dst_object ON edges(dst_guid, dst_file_id)",
+    ),
+    (
+        "idx_asset_objects_guid",
+        "CREATE INDEX IF NOT EXISTS idx_asset_objects_guid ON asset_objects(asset_guid)",
+    ),
+    (
+        "idx_asset_objects_file",
+        "CREATE INDEX IF NOT EXISTS idx_asset_objects_file
+            ON asset_objects(asset_guid, file_id)",
+    ),
+    (
+        "idx_asset_objects_root_name",
+        "CREATE INDEX IF NOT EXISTS idx_asset_objects_root_name
+            ON asset_objects(searchable, root, name_lower)",
+    ),
+    (
+        "idx_asset_objects_kind_name",
+        "CREATE INDEX IF NOT EXISTS idx_asset_objects_kind_name
+            ON asset_objects(searchable, kind, name_lower)",
+    ),
+    (
+        "idx_asset_objects_pathlower",
+        "CREATE INDEX IF NOT EXISTS idx_asset_objects_pathlower
+            ON asset_objects(searchable, path_lower)",
+    ),
+    (
+        "idx_asset_object_type_terms_object",
+        "CREATE INDEX IF NOT EXISTS idx_asset_object_type_terms_object
+            ON asset_object_type_terms(object_key)",
+    ),
+    (
+        "idx_files_owner_guid",
+        "CREATE INDEX IF NOT EXISTS idx_files_owner_guid ON files(owner_guid)",
+    ),
+    (
+        "idx_script_inheritance_terms_guid",
+        "CREATE INDEX IF NOT EXISTS idx_script_inheritance_terms_guid
+            ON script_inheritance_terms(script_guid)",
+    ),
+];
+
+/// Drop every secondary index ahead of a full-scan bulk insert. The tables'
+/// integral PRIMARY KEYs stay (they're the row storage itself), so REPLACE /
+/// IGNORE conflict semantics on those keys are unaffected.
+pub fn drop_secondary_indexes(tx: &Transaction) -> Result<(), String> {
+    for (name, _) in SECONDARY_INDEX_DDL {
+        tx.execute_batch(&format!("DROP INDEX IF EXISTS {}", name))
+            .map_err(|e| format!("Failed to drop index {}: {}", name, e))?;
+    }
+    Ok(())
+}
+
+/// Recreate the secondary indexes after a full-scan bulk insert. Each CREATE
+/// INDEX bulk-sorts its keys (multi-threaded when `PRAGMA threads` allows),
+/// which beats maintaining the same B-trees row by row during the insert.
+pub fn create_secondary_indexes(conn: &Connection) -> Result<(), String> {
+    for (name, ddl) in SECONDARY_INDEX_DDL {
+        conn.execute_batch(ddl)
+            .map_err(|e| format!("Failed to create index {}: {}", name, e))?;
+    }
+    Ok(())
 }
 
 /// Compute the four derived search columns for a workspace-relative path.
@@ -257,37 +365,75 @@ pub(crate) fn derive_search_cols(path: &str) -> (i32, String, String, String) {
 /// (or `clear_all_in_tx`) so the trigram index stays consistent. Centralising
 /// the writes here means watcher.rs never has to know FTS5 exists.
 ///
-/// Every FTS row is inserted with an explicit rowid: the rowid of the
-/// `asset_objects` row it mirrors. All FTS columns are either trigram-indexed
-/// text or `UNINDEXED` (`object_key`), so the shared rowid is the only handle
-/// that lets deletes run as indexed point lookups. Deleting by `object_key`
-/// instead is a full virtual-table scan per statement — on a large Unity
-/// scene that meant 35k scans over a 518k-row FTS table inside one watcher
-/// transaction, stalling the whole queue (issue #89).
+/// The table is contentless (`content=''` + `contentless_delete=1`): every
+/// row is inserted with an explicit rowid — the rowid of the `asset_objects`
+/// row it mirrors — and that shared rowid is the only readable handle. Reads
+/// must join `asset_objects` on rowid; deletes run as indexed point lookups
+/// by rowid (deleting by a text column was a full virtual-table scan per
+/// statement — on a large Unity scene that meant 35k scans over a 518k-row
+/// FTS table inside one watcher transaction, stalling the queue, issue #89).
 pub(crate) mod asset_fts {
     use rusqlite::{params, Transaction};
+
+    /// One pending FTS row: `(asset_objects rowid, name_lower, path_lower,
+    /// type_search)`. Borrowed strings — callers batch straight out of their
+    /// `AssetObject`s.
+    pub type PendingRow<'a> = (i64, &'a str, &'a str, &'a str);
+
+    /// Rows per multi-row INSERT statement (4 bind params each).
+    const INSERT_CHUNK_ROWS: usize = 64;
 
     pub fn insert_row(
         tx: &Transaction,
         rowid: i64,
-        object_key: &str,
         name_lower: &str,
         path_lower: &str,
         type_search: &str,
     ) -> Result<(), String> {
         tx.prepare_cached(
-            "INSERT INTO asset_search_fts (rowid, object_key, name, path, type_search)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO asset_search_fts (rowid, name, path, type_search)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .map_err(|e| format!("Failed to prepare asset_search_fts insert: {}", e))?
-        .execute(params![
-            rowid,
-            object_key,
-            name_lower,
-            path_lower,
-            type_search
-        ])
+        .execute(params![rowid, name_lower, path_lower, type_search])
         .map_err(|e| format!("Failed to insert asset_search_fts row: {}", e))?;
+        Ok(())
+    }
+
+    /// Bulk insert for the full-scan rebuild: multi-row VALUES batches cut
+    /// the per-statement VDBE overhead; the trigram tokenizer cost stays.
+    pub fn batch_insert_rows(tx: &Transaction, rows: &[PendingRow<'_>]) -> Result<(), String> {
+        let mut chunks = rows.chunks_exact(INSERT_CHUNK_ROWS);
+        if rows.len() >= INSERT_CHUNK_ROWS {
+            let row_values = std::iter::repeat("(?, ?, ?, ?)")
+                .take(INSERT_CHUNK_ROWS)
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "INSERT INTO asset_search_fts (rowid, name, path, type_search) VALUES {}",
+                row_values
+            );
+            let mut stmt = tx
+                .prepare_cached(&sql)
+                .map_err(|e| format!("Failed to prepare asset_search_fts batch insert: {}", e))?;
+            for chunk in chunks.by_ref() {
+                for (i, (rowid, name_lower, path_lower, type_search)) in chunk.iter().enumerate() {
+                    let base = i * 4;
+                    stmt.raw_bind_parameter(base + 1, rowid)
+                        .and_then(|_| stmt.raw_bind_parameter(base + 2, name_lower))
+                        .and_then(|_| stmt.raw_bind_parameter(base + 3, path_lower))
+                        .and_then(|_| stmt.raw_bind_parameter(base + 4, type_search))
+                        .map_err(|e| {
+                            format!("Failed to bind asset_search_fts batch insert: {}", e)
+                        })?;
+                }
+                stmt.raw_execute()
+                    .map_err(|e| format!("Failed to insert asset_search_fts batch: {}", e))?;
+            }
+        }
+        for (rowid, name_lower, path_lower, type_search) in chunks.remainder() {
+            insert_row(tx, *rowid, name_lower, path_lower, type_search)?;
+        }
         Ok(())
     }
 
@@ -323,14 +469,13 @@ pub(crate) mod asset_fts {
     }
 
     pub fn clear_all(tx: &Transaction) -> Result<(), String> {
-        // NOTE: FTS5's `'delete-all'` fast-wipe command is only valid on
-        // contentless or external-content tables. `asset_search_fts` stores
-        // its own content (`name`, `path`, `type_search`), so we have to
-        // fall back to a plain `DELETE FROM`. If full-scan clear latency
-        // ever becomes a problem, the fix is to migrate the schema to
-        // `content=''` rather than reintroduce `'delete-all'` here.
-        tx.execute("DELETE FROM asset_search_fts", [])
-            .map_err(|e| format!("Failed to clear asset_search_fts: {}", e))?;
+        // Contentless tables support FTS5's 'delete-all' fast wipe: O(1)
+        // versus the row-by-row DELETE the old content-bearing table needed.
+        tx.execute(
+            "INSERT INTO asset_search_fts(asset_search_fts) VALUES('delete-all')",
+            [],
+        )
+        .map_err(|e| format!("Failed to clear asset_search_fts: {}", e))?;
         Ok(())
     }
 }
@@ -513,7 +658,6 @@ fn insert_asset_object(tx: &Transaction, object: &AssetObject) -> Result<(), Str
         asset_fts::insert_row(
             tx,
             object_rowid,
-            object.object_key.as_str(),
             object.name_lower.as_str(),
             object.path_lower.as_str(),
             object.type_search.as_str(),
@@ -816,6 +960,11 @@ pub fn get_missing_reference_rows(
     Ok(out)
 }
 
+/// Assets (and their derived main objects / inheritance terms) processed per
+/// precompute-then-insert round, bounding the transient memory the parallel
+/// precompute keeps alive at once.
+const ASSET_INSERT_CHUNK: usize = 8192;
+
 /// Bulk insert asset rows + their FTS5 search index entries.
 ///
 /// **CALLER CONTRACT**: this function does NOT pre-delete existing FTS rows
@@ -829,116 +978,362 @@ pub fn get_missing_reference_rows(
 /// Incremental writes (single asset add/update) live in `atomic_update_asset`
 /// and DO perform the FTS delete first.
 pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64, String> {
-    let mut count = 0u64;
-    {
-        let mut asset_stmt = tx
-            .prepare(
-                "INSERT OR REPLACE INTO assets
-                 (guid, path, ext, kind, exists_on_disk, mtime_ns, size,
-                   content_hash, meta_hash, parser_version,
-                   root, path_lower, file_name_lower, stem_lower,
-                   script_class_name, script_class_lower, script_namespace_lower,
-                   script_full_name_lower, script_type_search, script_inheritance_search)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                         ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-            )
-            .map_err(|e| format!("Failed to prepare asset insert: {}", e))?;
-        for a in assets {
-            let (root, path_lower, file_name_lower, stem_lower) = derive_search_cols(&a.path);
-            asset_stmt
-                .execute(params![
-                    a.guid.as_slice(),
-                    a.path,
-                    a.ext,
-                    a.kind as i32,
-                    a.exists_on_disk as i32,
-                    a.mtime_ns as i64,
-                    a.size as i64,
-                    a.content_hash.as_slice(),
-                    a.meta_hash.as_slice(),
-                    a.parser_version as i32,
-                    root,
-                    path_lower,
-                    file_name_lower,
-                    stem_lower,
-                    a.script_class_name.as_deref().unwrap_or(""),
-                    a.script_class_lower.as_str(),
-                    a.script_namespace_lower.as_str(),
-                    a.script_full_name_lower.as_str(),
-                    a.script_type_search.as_str(),
-                    a.script_inheritance_search.as_str(),
-                ])
-                .map_err(|e| format!("Failed to insert asset: {}", e))?;
-            let main_object = object_index::main_asset_object(a);
-            insert_asset_object(tx, &main_object)?;
-            insert_script_inheritance_terms(tx, a)?;
-            count += 1;
+    for chunk in assets.chunks(ASSET_INSERT_CHUNK) {
+        // String-heavy derivation work runs on the rayon pool; the writer
+        // thread below only binds parameters and steps statements.
+        let derived: Vec<(i32, String, String, String)> = chunk
+            .par_iter()
+            .map(|a| derive_search_cols(&a.path))
+            .collect();
+        let main_objects: Vec<AssetObject> =
+            chunk.par_iter().map(object_index::main_asset_object).collect();
+        let inheritance_rows: Vec<(String, Guid)> = chunk
+            .par_iter()
+            .flat_map_iter(|asset| {
+                script_inheritance_terms(asset)
+                    .into_iter()
+                    .map(|term| (term, asset.guid))
+            })
+            .collect();
+
+        {
+            let mut asset_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO assets
+                     (guid, path, ext, kind, exists_on_disk, mtime_ns, size,
+                       content_hash, meta_hash, parser_version,
+                       root, path_lower, file_name_lower, stem_lower,
+                       script_class_name, script_class_lower, script_namespace_lower,
+                       script_full_name_lower, script_type_search, script_inheritance_search)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                )
+                .map_err(|e| format!("Failed to prepare asset insert: {}", e))?;
+            for (a, (root, path_lower, file_name_lower, stem_lower)) in
+                chunk.iter().zip(&derived)
+            {
+                asset_stmt
+                    .execute(params![
+                        a.guid.as_slice(),
+                        a.path,
+                        a.ext,
+                        a.kind as i32,
+                        a.exists_on_disk as i32,
+                        a.mtime_ns as i64,
+                        a.size as i64,
+                        a.content_hash.as_slice(),
+                        a.meta_hash.as_slice(),
+                        a.parser_version as i32,
+                        root,
+                        path_lower,
+                        file_name_lower,
+                        stem_lower,
+                        a.script_class_name.as_deref().unwrap_or(""),
+                        a.script_class_lower.as_str(),
+                        a.script_namespace_lower.as_str(),
+                        a.script_full_name_lower.as_str(),
+                        a.script_type_search.as_str(),
+                        a.script_inheritance_search.as_str(),
+                    ])
+                    .map_err(|e| format!("Failed to insert asset: {}", e))?;
+            }
+        }
+
+        batch_insert_script_inheritance_rows(tx, &inheritance_rows)?;
+        batch_insert_asset_objects(tx, &main_objects)?;
+    }
+    Ok(assets.len() as u64)
+}
+
+/// Multi-row insert for `(term, script_guid)` pairs (2 bind params per row).
+const TERM_INSERT_CHUNK_ROWS: usize = 256;
+
+fn batch_insert_script_inheritance_rows(
+    tx: &Transaction,
+    rows: &[(String, Guid)],
+) -> Result<(), String> {
+    let mut chunks = rows.chunks_exact(TERM_INSERT_CHUNK_ROWS);
+    if rows.len() >= TERM_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?)")
+            .take(TERM_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT OR IGNORE INTO script_inheritance_terms (term, script_guid) VALUES {}",
+            row_values
+        );
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare inheritance term batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, (term, guid)) in chunk.iter().enumerate() {
+                let base = i * 2;
+                stmt.raw_bind_parameter(base + 1, term)
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, guid.as_slice()))
+                    .map_err(|e| format!("Failed to bind inheritance term batch: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert inheritance term batch: {}", e))?;
         }
     }
-    Ok(count)
+    if !chunks.remainder().is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO script_inheritance_terms (term, script_guid)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|e| format!("Failed to prepare script inheritance term insert: {}", e))?;
+        for (term, guid) in chunks.remainder() {
+            stmt.execute(params![term, guid.as_slice()])
+                .map_err(|e| format!("Failed to insert script inheritance term: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Multi-row insert for `(term, object_key)` pairs (2 bind params per row).
+fn batch_insert_object_type_term_rows(
+    tx: &Transaction,
+    rows: &[(String, &str)],
+) -> Result<(), String> {
+    let mut chunks = rows.chunks_exact(TERM_INSERT_CHUNK_ROWS);
+    if rows.len() >= TERM_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?)")
+            .take(TERM_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT OR IGNORE INTO asset_object_type_terms (term, object_key) VALUES {}",
+            row_values
+        );
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare type term batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, (term, object_key)) in chunk.iter().enumerate() {
+                let base = i * 2;
+                stmt.raw_bind_parameter(base + 1, term)
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, object_key))
+                    .map_err(|e| format!("Failed to bind type term batch: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert type term batch: {}", e))?;
+        }
+    }
+    if !chunks.remainder().is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO asset_object_type_terms (term, object_key)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|e| format!("Failed to prepare asset object type term insert: {}", e))?;
+        for (term, object_key) in chunks.remainder() {
+            stmt.execute(params![term, object_key])
+                .map_err(|e| format!("Failed to insert asset object type term: {}", e))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn batch_insert_asset_objects(
     tx: &Transaction,
     objects: &[AssetObject],
 ) -> Result<u64, String> {
-    let mut count = 0u64;
-    for object in objects {
-        insert_asset_object(tx, object)?;
-        count += 1;
+    for chunk in objects.chunks(ASSET_INSERT_CHUNK) {
+        // Search-term derivation is pure string work — precompute on the
+        // rayon pool so the writer thread only binds and steps.
+        let term_lists: Vec<Vec<String>> = chunk.par_iter().map(object_type_terms).collect();
+
+        let mut fts_rows: Vec<asset_fts::PendingRow<'_>> = Vec::with_capacity(chunk.len());
+        {
+            let mut object_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO asset_objects
+                     (object_key, asset_guid, file_id, path, kind, root,
+                      path_lower, file_name_lower, name, name_lower,
+                      type_name, type_lower, type_search,
+                      script_class_name, script_class_lower,
+                      is_main, is_sub_asset, searchable, target_id, sort_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                             ?7, ?8, ?9, ?10,
+                             ?11, ?12, ?13,
+                             ?14, ?15,
+                             ?16, ?17, ?18, ?19, ?20)",
+                )
+                .map_err(|e| format!("Failed to prepare asset object insert: {}", e))?;
+            for object in chunk {
+                object_stmt
+                    .execute(params![
+                        object.object_key.as_str(),
+                        object.asset_guid.as_slice(),
+                        object.file_id,
+                        object.path.as_str(),
+                        object.kind as i32,
+                        object.root as i32,
+                        object.path_lower.as_str(),
+                        object.file_name_lower.as_str(),
+                        object.name.as_str(),
+                        object.name_lower.as_str(),
+                        object.type_name.as_str(),
+                        object.type_lower.as_str(),
+                        object.type_search.as_str(),
+                        object.script_class_name.as_deref().unwrap_or(""),
+                        object.script_class_lower.as_str(),
+                        object.is_main as i32,
+                        object.is_sub_asset as i32,
+                        object.searchable as i32,
+                        object.target_id.as_deref().unwrap_or(""),
+                        object.sort_index,
+                    ])
+                    .map_err(|e| format!("Failed to insert asset object: {}", e))?;
+                if object.searchable {
+                    fts_rows.push((
+                        tx.last_insert_rowid(),
+                        object.name_lower.as_str(),
+                        object.path_lower.as_str(),
+                        object.type_search.as_str(),
+                    ));
+                }
+            }
+        }
+
+        let term_rows: Vec<(String, &str)> = term_lists
+            .into_iter()
+            .zip(chunk)
+            .flat_map(|(terms, object)| {
+                terms
+                    .into_iter()
+                    .map(move |term| (term, object.object_key.as_str()))
+            })
+            .collect();
+        batch_insert_object_type_term_rows(tx, &term_rows)?;
+        asset_fts::batch_insert_rows(tx, &fts_rows)?;
     }
-    Ok(count)
+    Ok(objects.len() as u64)
 }
+
+/// Multi-row insert chunk for `files` (6 bind params per row).
+const FILE_INSERT_CHUNK_ROWS: usize = 64;
 
 pub fn batch_insert_files(
     tx: &Transaction,
     files: &[(String, FileRole, u64, u64, [u8; 16], Option<Guid>)],
 ) -> Result<(), String> {
-    let mut stmt = tx
-        .prepare_cached(
+    let mut chunks = files.chunks_exact(FILE_INSERT_CHUNK_ROWS);
+    if files.len() >= FILE_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?, ?, ?, ?, ?)")
+            .take(FILE_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
             "INSERT OR REPLACE INTO files (path, file_role, mtime_ns, size, hash128, owner_guid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .map_err(|e| format!("Failed to prepare file insert: {}", e))?;
-
-    for (path, role, mtime, size, hash, owner) in files {
-        let owner_slice: Option<&[u8]> = owner.as_ref().map(|g| g.as_slice());
-        stmt.execute(params![
-            path,
-            *role as i32,
-            *mtime as i64,
-            *size as i64,
-            hash.as_slice(),
-            owner_slice,
-        ])
-        .map_err(|e| format!("Failed to insert file: {}", e))?;
+             VALUES {}",
+            row_values
+        );
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare file batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, (path, role, mtime, size, hash, owner)) in chunk.iter().enumerate() {
+                let base = i * 6;
+                let owner_slice: Option<&[u8]> = owner.as_ref().map(|g| g.as_slice());
+                stmt.raw_bind_parameter(base + 1, path)
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, *role as i32))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 3, *mtime as i64))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 4, *size as i64))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 5, hash.as_slice()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 6, owner_slice))
+                    .map_err(|e| format!("Failed to bind file batch insert: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert file batch: {}", e))?;
+        }
+    }
+    if !chunks.remainder().is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR REPLACE INTO files (path, file_role, mtime_ns, size, hash128, owner_guid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .map_err(|e| format!("Failed to prepare file insert: {}", e))?;
+        for (path, role, mtime, size, hash, owner) in chunks.remainder() {
+            let owner_slice: Option<&[u8]> = owner.as_ref().map(|g| g.as_slice());
+            stmt.execute(params![
+                path,
+                *role as i32,
+                *mtime as i64,
+                *size as i64,
+                hash.as_slice(),
+                owner_slice,
+            ])
+            .map_err(|e| format!("Failed to insert file: {}", e))?;
+        }
     }
     Ok(())
 }
 
+/// Multi-row insert chunk for `edges` (7 bind params per row).
+const EDGE_INSERT_CHUNK_ROWS: usize = 64;
+
 pub fn batch_insert_edges(tx: &Transaction, edges: &[RefEdge]) -> Result<u64, String> {
-    let mut stmt = tx
-        .prepare_cached(
+    // The dedupe pass in `full_scan` already removed exact duplicates and
+    // `edges` has no UNIQUE constraint, so OR IGNORE never fires and every
+    // row counts as inserted.
+    let mut chunks = edges.chunks_exact(EDGE_INSERT_CHUNK_ROWS);
+    if edges.len() >= EDGE_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?, ?, ?, ?, ?, ?)")
+            .take(EDGE_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
             "INSERT OR IGNORE INTO edges
              (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )
-        .map_err(|e| format!("Failed to prepare edge insert: {}", e))?;
+             VALUES {}",
+            row_values
+        );
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare edge batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, e) in chunk.iter().enumerate() {
+                let base = i * 7;
+                stmt.raw_bind_parameter(base + 1, e.src_guid.as_slice())
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, e.src_file_id))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 3, e.dst_guid.as_slice()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 4, e.dst_file_id))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 5, e.class_id_hint))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 6, e.field_hint.as_deref()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 7, e.ref_path.as_deref()))
+                    .map_err(|e| format!("Failed to bind edge batch insert: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert edge batch: {}", e))?;
+        }
+    }
 
-    let mut count = 0u64;
-    for e in edges {
-        let rows = stmt
-            .execute(params![
-                e.src_guid.as_slice(),
-                e.src_file_id,
-                e.dst_guid.as_slice(),
-                e.dst_file_id,
-                e.class_id_hint,
-                e.field_hint,
-                e.ref_path,
-            ])
-            .map_err(|e| format!("Failed to insert edge: {}", e))?;
-        count += rows as u64;
+    let mut count = (edges.len() - chunks.remainder().len()) as u64;
+    if !chunks.remainder().is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO edges
+                 (src_guid, src_file_id, dst_guid, dst_file_id, class_id_hint, field_hint, ref_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(|e| format!("Failed to prepare edge insert: {}", e))?;
+        for e in chunks.remainder() {
+            let rows = stmt
+                .execute(params![
+                    e.src_guid.as_slice(),
+                    e.src_file_id,
+                    e.dst_guid.as_slice(),
+                    e.dst_file_id,
+                    e.class_id_hint,
+                    e.field_hint,
+                    e.ref_path,
+                ])
+                .map_err(|e| format!("Failed to insert edge: {}", e))?;
+            count += rows as u64;
+        }
     }
     Ok(count)
 }
@@ -2085,39 +2480,40 @@ pub fn search_assets_for_command(
     // Splitting lets us pass guids as plain BLOB params and hit the PK
     // autoindex.
     //
-    // Step 1 — query FTS for object keys (small, capped above the UI limit).
+    // Step 1 — query FTS for matching rowids (small, capped above the UI
+    // limit). The FTS table is contentless: the rowid — shared with the
+    // mirrored `asset_objects` row by construction — is its only readable
+    // column.
     let fts_buffer = (limit as i64).saturating_mul(8).max(80);
     let mut fts_stmt = conn
         .prepare(
-            "SELECT object_key FROM asset_search_fts
+            "SELECT rowid FROM asset_search_fts
              WHERE asset_search_fts MATCH ?1 LIMIT ?2",
         )
         .map_err(|e| format!("Prepare fts query failed: {}", e))?;
     let key_rows = fts_stmt
-        .query_map(params![match_term, fts_buffer], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(params![match_term, fts_buffer], |row| row.get::<_, i64>(0))
         .map_err(|e| format!("FTS query failed: {}", e))?;
-    let mut object_keys: Vec<String> = Vec::new();
+    let mut object_rowids: Vec<i64> = Vec::new();
     for row in key_rows {
-        object_keys.push(row.map_err(|e| format!("FTS row read failed: {}", e))?);
+        object_rowids.push(row.map_err(|e| format!("FTS row read failed: {}", e))?);
     }
     drop(fts_stmt);
 
-    if object_keys.is_empty() {
+    if object_rowids.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Step 2 — fetch full rows by object_key IN (...) with the rest of the
+    // Step 2 — fetch full rows by rowid IN (...) with the rest of the
     // structured WHERE clauses applied.
-    let placeholders: Vec<&str> = object_keys.iter().map(|_| "?").collect();
-    let object_key_in = placeholders.join(",");
+    let placeholders: Vec<&str> = object_rowids.iter().map(|_| "?").collect();
+    let rowid_in = placeholders.join(",");
 
-    // Bind order: object_key IN params, then structured / bare-term params, then
+    // Bind order: rowid IN params, then structured / bare-term params, then
     // ranking params, then LIMIT.
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    for key in object_keys {
-        params_vec.push(Box::new(key));
+    for rowid in object_rowids {
+        params_vec.push(Box::new(rowid));
     }
     params_vec.extend(struct_params);
     params_vec.extend(bare_params);
@@ -2126,10 +2522,10 @@ pub fn search_assets_for_command(
     let sql = format!(
         "SELECT {}
          FROM asset_objects
-         WHERE object_key IN ({}) AND searchable = 1 AND {} AND {}
+         WHERE rowid IN ({}) AND searchable = 1 AND {} AND {}
          ORDER BY {}
          LIMIT ?",
-        ASSET_OBJECT_SELECT_COLUMNS, object_key_in, struct_where, bare_where, score_order
+        ASSET_OBJECT_SELECT_COLUMNS, rowid_in, struct_where, bare_where, score_order
     );
 
     run_select(conn, &sql, params_vec, limit_i)
@@ -3333,14 +3729,21 @@ mod tests {
         assert_eq!(same_path_rows.len(), 1);
         assert_eq!(same_path_rows[0].mtime_ns, 20);
 
-        let old_fts_count: i64 = conn
+        // The FTS table is contentless, so stale rows can only be detected
+        // through the shared rowid: every surviving FTS row must mirror a
+        // live searchable asset_objects row.
+        let misaligned: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM asset_search_fts WHERE object_key = ?1",
-                rusqlite::params![guid_to_hex(&old_guid)],
+                "SELECT COUNT(*) FROM asset_search_fts f
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM asset_objects o
+                     WHERE o.rowid = f.rowid AND o.searchable = 1
+                 )",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(old_fts_count, 0);
+        assert_eq!(misaligned, 0);
     }
 
     #[test]
@@ -3397,9 +3800,7 @@ mod tests {
                 "SELECT COUNT(*) FROM asset_search_fts f
                  WHERE NOT EXISTS (
                      SELECT 1 FROM asset_objects o
-                     WHERE o.rowid = f.rowid
-                       AND o.object_key = f.object_key
-                       AND o.searchable = 1
+                     WHERE o.rowid = f.rowid AND o.searchable = 1
                  )",
                 [],
                 |row| row.get(0),

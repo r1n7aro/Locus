@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use notify::event::ModifyKind;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use serde::Serialize;
 
 use super::db;
@@ -51,8 +52,6 @@ const RECENT_ENQUEUE_RETENTION_MS: u64 = 5 * 60_000;
 const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
-const RECONCILE_PROGRESS_TARGET_EVENTS: u64 = 96;
-const RECONCILE_PROGRESS_MIN_STEP: u64 = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct MtimeScanOptions {
@@ -92,22 +91,6 @@ impl StartupReconcileProgress {
 }
 
 type ReconcileProgressCallback<'a> = Option<&'a dyn Fn(&StartupReconcileProgress)>;
-
-fn reconcile_progress_emit_step(total: u64) -> u64 {
-    if total == 0 {
-        1
-    } else {
-        (total / RECONCILE_PROGRESS_TARGET_EVENTS).max(RECONCILE_PROGRESS_MIN_STEP)
-    }
-}
-
-fn should_emit_reconcile_progress(completed: u64, total: u64) -> bool {
-    if total == 0 {
-        return completed == 0;
-    }
-    let step = reconcile_progress_emit_step(total);
-    completed == 0 || completed == 1 || completed == total || completed % step == 0
-}
 
 fn emit_reconcile_progress(
     on_progress: ReconcileProgressCallback<'_>,
@@ -668,31 +651,6 @@ fn sort_linked_asset_roots(mut roots: Vec<LinkedAssetRoot>) -> Vec<LinkedAssetRo
             .then_with(|| left.link_rel_path.cmp(&right.link_rel_path))
     });
     roots
-}
-
-fn record_linked_asset_root(
-    project_root: &Path,
-    entry: &walkdir::DirEntry,
-    linked_asset_roots: &mut Vec<LinkedAssetRoot>,
-    linked_asset_rel_paths: &mut HashSet<String>,
-) {
-    if !entry.path_is_symlink() || !entry.file_type().is_dir() {
-        return;
-    }
-
-    let Ok(rel) = entry.path().strip_prefix(project_root) else {
-        return;
-    };
-    let link_rel_path = rel.to_string_lossy().replace('\\', "/");
-    if !linked_asset_rel_paths.insert(link_rel_path.clone()) {
-        return;
-    }
-    let target_path =
-        dunce::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
-    linked_asset_roots.push(LinkedAssetRoot {
-        link_rel_path,
-        target_path,
-    });
 }
 
 fn cached_linked_asset_roots(graph_state: &Arc<Mutex<Option<AssetDb>>>) -> Vec<LinkedAssetRoot> {
@@ -1397,6 +1355,89 @@ fn file_hash128(path: &Path) -> Option<[u8; 16]> {
     std::fs::read(path).ok().map(|content| hash128(&content))
 }
 
+/// Records per parallel mtime-scan round. Each chunk fans its stat (+
+/// optional hash) probes out on the rayon pool; enqueueing and progress
+/// emission happen between chunks on the scanning thread.
+const MTIME_SCAN_PAR_CHUNK: usize = 2048;
+
+/// One read-only dirtiness probe for an indexed asset row. A single
+/// `fs::metadata` per path replaces the old `is_file` + `file_mtime_ns` +
+/// `metadata().len()` triple, and the function runs from the parallel mtime
+/// scan, so it must stay free of queue/db access.
+fn asset_record_is_dirty(
+    project_root: &Path,
+    record: &db::AssetMtimeRecord,
+    verify_hashes: bool,
+) -> bool {
+    let meta_path = project_root.join(format!("{}.meta", record.path));
+    let content_path = project_root.join(&record.path);
+
+    let meta_file = std::fs::metadata(&meta_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let meta_exists = meta_file.is_some();
+    let meta_mtime = meta_file.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
+
+    let content_file = std::fs::metadata(&content_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let content_exists = content_file.is_some();
+    let content_mtime = content_file
+        .as_ref()
+        .map(scanner::get_mtime_ns)
+        .unwrap_or(0);
+
+    let disk_mtime = meta_mtime.max(content_mtime);
+    let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
+    let content_missing = content_should_exist && !content_exists;
+    let content_size_changed = content_should_exist
+        && content_file
+            .as_ref()
+            .map(|metadata| metadata.len() != record.size)
+            .unwrap_or(false);
+    let content_hash_changed = verify_hashes
+        && content_should_exist
+        && content_exists
+        && should_hash_asset_content(record.kind)
+        && !content_size_changed
+        && file_hash128(&content_path)
+            .map(|hash| hash != record.content_hash)
+            .unwrap_or(false);
+
+    !meta_exists
+        || content_missing
+        || disk_mtime > record.mtime_ns
+        || content_size_changed
+        || content_hash_changed
+}
+
+/// Read-only dirtiness probe for one `files` bookkeeping row; parallel-safe
+/// like [`asset_record_is_dirty`].
+fn file_record_is_dirty(
+    project_root: &Path,
+    record: &db::FileMtimeRecord,
+    verify_hashes: bool,
+) -> bool {
+    let abs_path = project_root.join(&record.path);
+    let file = std::fs::metadata(&abs_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let file_exists = file.is_some();
+    let file_mtime = file.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
+    let file_size_changed = file
+        .as_ref()
+        .map(|metadata| metadata.len() != record.size)
+        .unwrap_or(false);
+    let file_hash_changed = verify_hashes
+        && file_exists
+        && !file_size_changed
+        && file_hash128(&abs_path)
+            .map(|hash| hash != record.hash128)
+            .unwrap_or(false);
+
+    !file_exists || file_mtime > record.mtime_ns || file_size_changed || file_hash_changed
+}
+
 fn event_receiver_loop(
     rx: std::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
     queue: Arc<DirtyQueue>,
@@ -1615,49 +1656,20 @@ fn mtime_scan_once_with_options(
         },
     );
 
-    for record in &asset_records {
+    // Both record sweeps below are read-only stat (+ optional hash) probes,
+    // so each chunk fans out on the rayon pool — with `verify_hashes` this
+    // also spreads the content hashing that used to run on one core.
+    // Enqueueing and progress emission stay on this thread between chunks.
+    for chunk in asset_records.chunks(MTIME_SCAN_PAR_CHUNK) {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let meta_path = project_root.join(format!("{}.meta", record.path));
-        let content_path = project_root.join(&record.path);
-
-        let meta_exists = meta_path.is_file();
-        let content_exists = content_path.is_file();
-        let meta_mtime = if meta_exists {
-            file_mtime_ns(&meta_path)
-        } else {
-            0
-        };
-        let content_mtime = if content_exists {
-            file_mtime_ns(&content_path)
-        } else {
-            0
-        };
-        let disk_mtime = meta_mtime.max(content_mtime);
-        let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
-        let content_missing = content_should_exist && !content_exists;
-        let content_size_changed = content_should_exist
-            && content_exists
-            && std::fs::metadata(&content_path)
-                .map(|metadata| metadata.len() != record.size)
-                .unwrap_or(false);
-        let content_hash_changed = options.verify_hashes
-            && content_should_exist
-            && content_exists
-            && should_hash_asset_content(record.kind)
-            && !content_size_changed
-            && file_hash128(&content_path)
-                .map(|hash| hash != record.content_hash)
-                .unwrap_or(false);
-
-        if !meta_exists
-            || content_missing
-            || disk_mtime > record.mtime_ns
-            || content_size_changed
-            || content_hash_changed
-        {
+        let dirty: Vec<&db::AssetMtimeRecord> = chunk
+            .par_iter()
+            .filter(|record| asset_record_is_dirty(project_root, record, options.verify_hashes))
+            .collect();
+        for record in dirty {
             enqueue_with_activity(
                 queue,
                 activity,
@@ -1667,79 +1679,69 @@ fn mtime_scan_once_with_options(
             );
         }
 
-        scan_completed += 1;
-        if should_emit_reconcile_progress(scan_completed, scan_total) {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "scanning",
-                    total: Some(scan_total),
-                    completed: Some(scan_completed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(0),
-                },
-            );
-        }
+        scan_completed += chunk.len() as u64;
+        emit_reconcile_progress(
+            on_progress,
+            StartupReconcileProgress {
+                verify_hashes: options.verify_hashes,
+                stage: "scanning",
+                total: Some(scan_total),
+                completed: Some(scan_completed),
+                queued: Some(queue.len() as u64),
+                failed: Some(0),
+            },
+        );
     }
 
     let mut indexed_meta_paths = HashSet::new();
     for record in &file_records {
+        if record.file_role == FileRole::Meta {
+            indexed_meta_paths.insert(
+                record
+                    .path
+                    .strip_suffix(".meta")
+                    .unwrap_or(&record.path)
+                    .to_string(),
+            );
+        }
+    }
+
+    for chunk in file_records.chunks(MTIME_SCAN_PAR_CHUNK) {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let asset_path = record
-            .path
-            .strip_suffix(".meta")
-            .unwrap_or(&record.path)
-            .to_string();
-        if record.file_role == FileRole::Meta {
-            indexed_meta_paths.insert(asset_path.clone());
-        }
-
-        let abs_path = project_root.join(&record.path);
-        let file_exists = abs_path.is_file();
-        let file_mtime = if file_exists {
-            file_mtime_ns(&abs_path)
-        } else {
-            0
-        };
-        let file_size_changed = file_exists
-            && std::fs::metadata(&abs_path)
-                .map(|metadata| metadata.len() != record.size)
-                .unwrap_or(false);
-        let file_hash_changed = options.verify_hashes
-            && file_exists
-            && !file_size_changed
-            && file_hash128(&abs_path)
-                .map(|hash| hash != record.hash128)
-                .unwrap_or(false);
-
-        if !file_exists || file_mtime > record.mtime_ns || file_size_changed || file_hash_changed {
+        let dirty: Vec<&db::FileMtimeRecord> = chunk
+            .par_iter()
+            .filter(|record| file_record_is_dirty(project_root, record, options.verify_hashes))
+            .collect();
+        for record in dirty {
+            let asset_path = record
+                .path
+                .strip_suffix(".meta")
+                .unwrap_or(&record.path)
+                .to_string();
             enqueue_with_activity(
                 queue,
                 activity,
-                asset_path.clone(),
+                asset_path,
                 QueueEnqueueReason::MtimeResync,
                 None,
             );
         }
 
-        scan_completed += 1;
-        if should_emit_reconcile_progress(scan_completed, scan_total) {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "scanning",
-                    total: Some(scan_total),
-                    completed: Some(scan_completed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(0),
-                },
-            );
-        }
+        scan_completed += chunk.len() as u64;
+        emit_reconcile_progress(
+            on_progress,
+            StartupReconcileProgress {
+                verify_hashes: options.verify_hashes,
+                stage: "scanning",
+                total: Some(scan_total),
+                completed: Some(scan_completed),
+                queued: Some(queue.len() as u64),
+                failed: Some(0),
+            },
+        );
     }
 
     if !options.discover_new_meta {
@@ -1758,76 +1760,39 @@ fn mtime_scan_once_with_options(
         },
     );
 
-    let scan_roots = ["Assets", "Packages"];
-    let mut linked_asset_roots = Vec::new();
-    let mut linked_asset_rel_paths = HashSet::new();
-    for root_name in &scan_roots {
+    // One parallel scanner pass replaces the old serial walkdir sweep: it
+    // yields exactly what this phase needs (meta files + linked roots) and
+    // skips the per-file probe table it doesn't.
+    let discover_snapshot = scanner::scan_directory_with_options(project_root, stop, false);
+
+    for entry in &discover_snapshot.meta_files {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let root_path = project_root.join(root_name);
-        if !root_path.is_dir() {
-            continue;
-        }
-
-        let walker = walkdir::WalkDir::new(&root_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                !scanner::is_ignored_name(&name)
-            });
-
-        for entry in walker.filter_map(|e| e.ok()) {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-
-            record_linked_asset_root(
-                project_root,
-                &entry,
-                &mut linked_asset_roots,
-                &mut linked_asset_rel_paths,
+        let asset_path = entry
+            .rel_path
+            .strip_suffix(".meta")
+            .unwrap_or(&entry.rel_path)
+            .to_string();
+        if !indexed_meta_paths.contains(&asset_path) {
+            enqueue_with_activity(
+                queue,
+                activity,
+                asset_path,
+                QueueEnqueueReason::NewMetaDiscovered,
+                None,
             );
-
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let abs_path = entry.path();
-            let ext = abs_path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-
-            if ext != "meta" {
-                continue;
-            }
-
-            let rel = abs_path
-                .strip_prefix(project_root)
-                .unwrap_or(abs_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let asset_path = rel.strip_suffix(".meta").unwrap_or(&rel).to_string();
-
-            if !indexed_meta_paths.contains(&asset_path) {
-                enqueue_with_activity(
-                    queue,
-                    activity,
-                    asset_path,
-                    QueueEnqueueReason::NewMetaDiscovered,
-                    None,
-                );
-            }
         }
     }
 
     if stop.load(Ordering::Relaxed) {
         return;
     }
-    refresh_linked_asset_roots(state, linked_watch_state, linked_asset_roots);
+    refresh_linked_asset_roots(
+        state,
+        linked_watch_state,
+        discover_snapshot.linked_asset_roots,
+    );
 }
 
 fn queue_summary_logger_loop(
@@ -2100,52 +2065,126 @@ fn reconcile_graph_state_with_options(
         },
     );
 
-    while let Some(rel_path) = queue.try_dequeue() {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
+    // Concurrent drain: `process_dirty_asset` is the same thread-safe unit
+    // the live watcher workers run (file IO + parse outside the db lock, a
+    // short transaction inside), so the startup backlog fans out across a
+    // scoped worker pool. Cascade enqueues feed back into the same queue;
+    // a worker only exits once the queue is empty AND no peer is mid-item,
+    // because an in-flight peer can still repopulate the queue.
+    let processed = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let queued_total = AtomicU64::new(stats.queued);
+    let in_flight = AtomicUsize::new(0);
 
-        stats.processed += 1;
-        match process_dirty_asset(&rel_path, project_root, &state, stop) {
-            Ok(cascade_paths) => {
-                for request in cascade_paths {
-                    if enqueue_with_activity(
-                        &queue,
-                        &activity,
-                        request.rel_path,
-                        request.reason,
-                        request.source_path,
-                    ) {
-                        stats.queued += 1;
+    let worker_count = startup_reconcile_worker_count(stats.queued);
+    if worker_count > 0 {
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                workers.push(scope.spawn(|| loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                }
+                    // Increment BEFORE the dequeue attempt so a peer that
+                    // sees an empty queue can't conclude "all idle" while
+                    // this worker is between dequeue and processing.
+                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    let Some(rel_path) = queue.try_dequeue() else {
+                        let remaining = in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
+                        if remaining == 0 && queue.len() == 0 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+
+                    match process_dirty_asset(&rel_path, project_root, &state, stop) {
+                        Ok(cascade_paths) => {
+                            for request in cascade_paths {
+                                if enqueue_with_activity(
+                                    &queue,
+                                    &activity,
+                                    request.rel_path,
+                                    request.reason,
+                                    request.source_path,
+                                ) {
+                                    queued_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[AssetDb Watcher] startup reconcile failed for {}: {}",
+                                rel_path, error
+                            );
+                        }
+                    }
+                    processed.fetch_add(1, Ordering::Relaxed);
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                }));
             }
-            Err(error) => {
-                stats.failed += 1;
-                eprintln!(
-                    "[AssetDb Watcher] startup reconcile failed for {}: {}",
-                    rel_path, error
+
+            // The progress callback isn't Sync, so emission stays on this
+            // thread while the workers run; 50ms cadence + change detection
+            // keeps the event volume close to the old per-item throttle.
+            let mut last_emitted = u64::MAX;
+            while workers.iter().any(|worker| !worker.is_finished()) {
+                std::thread::sleep(Duration::from_millis(50));
+                let done = processed.load(Ordering::Relaxed);
+                if done == last_emitted {
+                    continue;
+                }
+                last_emitted = done;
+                emit_reconcile_progress(
+                    on_progress,
+                    StartupReconcileProgress {
+                        verify_hashes: options.verify_hashes,
+                        stage: "processing",
+                        total: Some(queued_total.load(Ordering::Relaxed).max(done)),
+                        completed: Some(done),
+                        queued: Some(queue.len() as u64),
+                        failed: Some(failed.load(Ordering::Relaxed)),
+                    },
                 );
             }
-        }
-
-        let total = stats.queued.max(stats.processed);
-        if should_emit_reconcile_progress(stats.processed, total) || queue.len() == 0 {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "processing",
-                    total: Some(total),
-                    completed: Some(stats.processed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(stats.failed),
-                },
-            );
-        }
+        });
     }
 
+    stats.processed = processed.load(Ordering::Relaxed);
+    stats.failed = failed.load(Ordering::Relaxed);
+    stats.queued = queued_total.load(Ordering::Relaxed);
+
+    emit_reconcile_progress(
+        on_progress,
+        StartupReconcileProgress {
+            verify_hashes: options.verify_hashes,
+            stage: "processing",
+            total: Some(stats.queued.max(stats.processed)),
+            completed: Some(stats.processed),
+            queued: Some(queue.len() as u64),
+            failed: Some(stats.failed),
+        },
+    );
+
     Ok(stats)
+}
+
+/// Worker pool size for the startup reconcile drain. The backlog is a burst
+/// (often thousands of items after a branch switch or an out-of-app edit
+/// session), so it gets more hands than the steady-state live watcher
+/// default — still bounded by [`MAX_WORKER_THREADS`] and the backlog size.
+fn startup_reconcile_worker_count(queued: u64) -> usize {
+    if queued == 0 {
+        return 0;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores
+        .saturating_sub(1)
+        .clamp(1, MAX_WORKER_THREADS)
+        .min(queued as usize)
 }
 
 pub struct AssetDbWatcher {
