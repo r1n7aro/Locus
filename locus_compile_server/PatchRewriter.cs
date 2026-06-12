@@ -288,6 +288,23 @@ public static class PatchRewriter
             return null;
         }
 
+        // Mono reality check: shims run OUTSIDE the original type and the
+        // Unity runtime enforces accessibility at JIT time (it does not
+        // honor IgnoresAccessChecksTo for project assemblies). An added
+        // member may only reference surface that is public all the way down
+        // — or surface this very patch materializes. Anything else fails
+        // the file closed with the exact offending reference.
+        foreach (var addedPair in addedDecls)
+        {
+            string? accessViolation = FindShimAccessViolation(
+                addedPair.Key, model, batch, addedFieldSymbols, renamedSymbols);
+            if (accessViolation != null)
+            {
+                result.ColdReason = accessViolation;
+                return result;
+            }
+        }
+
         // ── collect rewrites ─────────────────────────────────────────
 
         // Strip targets first: nodes inside them are excluded from
@@ -380,6 +397,62 @@ public static class PatchRewriter
             return false;
         }
 
+        // ── operators / conversions in renamed types ─────────────────
+        // C# requires a binary operator parameter (and a conversion's
+        // source or target) to BE the containing type — which the patch
+        // copy renames. UNCHANGED operator/conversion declarations are
+        // stripped from the copy (static surface, no layout impact; patch
+        // bodies keep binding the ORIGINAL type's operators). CHANGED ones
+        // stay: their containing-type parameter references rename with the
+        // type (token-level for top-level declarations) and are excluded
+        // from the original-name reference rewrite, so they bind to the
+        // patch type and satisfy CS0563/CS0556.
+        var operatorSelfRefs = new HashSet<SyntaxNode>();
+        var operatorSelfRenameTokens = new List<SyntaxToken>();
+        var strippedOperatorDecls = new List<BaseMethodDeclarationSyntax>();
+        foreach (BaseTypeDeclarationSyntax hostDecl in localDecls)
+        {
+            if (hostDecl is not TypeDeclarationSyntax opHost)
+                continue;
+            string hostMetadataName = HotDiff.MetadataName(opHost);
+            if (model.GetDeclaredSymbol(opHost) is not INamedTypeSymbol hostSymbol)
+                continue;
+
+            foreach (MemberDeclarationSyntax member in opHost.Members)
+            {
+                if (member is not OperatorDeclarationSyntax && member is not ConversionOperatorDeclarationSyntax)
+                    continue;
+                var operatorDecl = (BaseMethodDeclarationSyntax)member;
+
+                bool changed = diff.ChangedMethods.Any(m =>
+                    !m.Added &&
+                    m.DeclaringType == hostMetadataName &&
+                    m.Name.StartsWith("op_", StringComparison.Ordinal) &&
+                    m.ParamTypeNames.SequenceEqual(
+                        HotDiff.ParamTypeNames(operatorDecl.ParameterList), StringComparer.Ordinal));
+                if (!changed)
+                {
+                    strippedOperatorDecls.Add(operatorDecl);
+                    strippedSpans.Add(operatorDecl.FullSpan);
+                    continue;
+                }
+
+                foreach (IdentifierNameSyntax selfRef in operatorDecl.ParameterList.DescendantNodes().OfType<IdentifierNameSyntax>())
+                {
+                    if (model.GetSymbolInfo(selfRef).Symbol is not INamedTypeSymbol refType)
+                        continue;
+                    if (!SymbolEqualityComparer.Default.Equals(refType.OriginalDefinition, hostSymbol.OriginalDefinition))
+                        continue; // other-type references rewrite normally
+                    operatorSelfRefs.Add(selfRef);
+                    // Only top-level declarations rename their identifier; a
+                    // nested patch type keeps its simple name, and lexical
+                    // lookup resolves it once the rewrite is suppressed.
+                    if (hostSymbol.ContainingType == null)
+                        operatorSelfRenameTokens.Add(selfRef.Identifier);
+                }
+            }
+        }
+
         // Types tombstoned by earlier batches (deleted files): a reference
         // binding to the still-loaded metadata type is a deterministic
         // error, not a silent half-alive call.
@@ -404,7 +477,7 @@ public static class PatchRewriter
             {
                 continue;
             }
-            if (IsDeclarationName(node) || InStrippedSpan(node))
+            if (IsDeclarationName(node) || InStrippedSpan(node) || operatorSelfRefs.Contains(node))
                 continue;
 
             ISymbol? symbol = model.GetSymbolInfo(node).Symbol;
@@ -851,13 +924,26 @@ public static class PatchRewriter
                 delegateDecl.Identifier.Text + TypeNameSuffix,
                 delegateDecl.Identifier.TrailingTrivia);
         }
+        // Containing-type parameter references of CHANGED operators rename
+        // together with their (top-level) type declaration.
+        foreach (SyntaxToken selfRefToken in operatorSelfRenameTokens)
+        {
+            tokenReplacements[selfRefToken] = SyntaxFactory.Identifier(
+                selfRefToken.LeadingTrivia,
+                selfRefToken.Text + TypeNameSuffix,
+                selfRefToken.TrailingTrivia);
+        }
 
-        // Record index paths of added members and added-field initializers
-        // BEFORE the rewrite (replace operations preserve node counts and
-        // order), so the rewritten nodes can be located afterwards.
+        // Record index paths of added members, stripped operators and
+        // added-field initializers BEFORE the rewrite (replace operations
+        // preserve node counts and order), so the rewritten nodes can be
+        // located afterwards.
         var addedPaths = new List<(List<int> Path, ShimTarget Target)>();
         foreach (var pair in addedDecls)
             addedPaths.Add((IndexPath(pair.Key), pair.Value));
+        var strippedOperatorPaths = new List<List<int>>();
+        foreach (BaseMethodDeclarationSyntax operatorDecl in strippedOperatorDecls)
+            strippedOperatorPaths.Add(IndexPath(operatorDecl));
         var initializerPaths = new List<(List<int> Path, AddedFieldInfo Field)>();
         foreach (AddedFieldInfo info in addedFieldSymbols.Values)
         {
@@ -884,8 +970,8 @@ public static class PatchRewriter
                 info.RewrittenInitializerText = expression.ToFullString();
         }
 
-        // ── extract added members into shim classes (M2) ─────────────
-        if (addedPaths.Count > 0)
+        // ── extract added members into shim classes (M2) and drop the
+        // unchanged operator/conversion copies in one removal pass ───────
         {
             var extracted = new List<(MethodDeclarationSyntax Decl, ShimTarget Target)>();
             foreach (var (pathIndices, target) in addedPaths)
@@ -893,10 +979,17 @@ public static class PatchRewriter
                 if (NodeAtPath(rewritten, pathIndices) is MethodDeclarationSyntax method)
                     extracted.Add((method, target));
             }
+            var removableNodes = new List<SyntaxNode>(extracted.Select(e => (SyntaxNode)e.Decl));
+            foreach (List<int> pathIndices in strippedOperatorPaths)
+            {
+                if (NodeAtPath(rewritten, pathIndices) is BaseMethodDeclarationSyntax strippedOperator)
+                    removableNodes.Add(strippedOperator);
+            }
 
-            rewritten = rewritten.RemoveNodes(
-                extracted.Select(e => (SyntaxNode)e.Decl),
-                SyntaxRemoveOptions.KeepNoTrivia)!;
+            if (removableNodes.Count > 0)
+            {
+                rewritten = rewritten.RemoveNodes(removableNodes, SyntaxRemoveOptions.KeepNoTrivia)!;
+            }
 
             // One shim class per top-level type, grouped by namespace.
             foreach (var group in extracted.GroupBy(e => e.Target.ShimTypeMetadataName, StringComparer.Ordinal))
@@ -1189,6 +1282,144 @@ public static class PatchRewriter
         info.StoreFqn = "global::" + info.StoreMetadataName;
         _ = typeDecl;
         return info;
+    }
+
+    /// <summary>Mono-reality check for ADDED members (M2): the generated
+    /// shim runs OUTSIDE the original type and Unity's Mono enforces
+    /// accessibility at JIT time (IgnoresAccessChecksTo is not honored for
+    /// project assemblies — a violating shim throws FieldAccessException /
+    /// MethodAccessException when first jitted). Returns a cold reason when
+    /// the member's signature or body references surface that is neither
+    /// public-all-the-way-down nor materialized by this patch (added
+    /// members/fields, appended enum members, new types).</summary>
+    private static string? FindShimAccessViolation(
+        MethodDeclarationSyntax decl,
+        SemanticModel model,
+        PatchBatchContext batch,
+        Dictionary<IFieldSymbol, AddedFieldInfo> addedFieldSymbols,
+        HashSet<INamedTypeSymbol> renamedSymbols)
+    {
+        if (model.GetDeclaredSymbol(decl) is not IMethodSymbol declared)
+            return null;
+
+        string memberDisplay = SymbolMetadataName(declared.ContainingType) + "." + declared.Name;
+
+        string Violation(ISymbol symbol) =>
+            "added member references non-public surface: " + memberDisplay + " uses " +
+            symbol.ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat) +
+            " (the shim runs outside the type and the Unity runtime blocks non-public access; " +
+            "make the referenced surface public or use unity_recompile)";
+
+        bool IsPatchLocal(ISymbol symbol)
+        {
+            switch (symbol)
+            {
+                case IMethodSymbol method when batch.AddedMembers.ContainsKey(method.OriginalDefinition):
+                    return true;
+                case IFieldSymbol field when
+                    addedFieldSymbols.ContainsKey(field) || batch.AddedEnumMembers.ContainsKey(field):
+                    return true;
+            }
+            // Declared in batch source but NOT a renamed pre-existing type:
+            // a NEW type whose code compiles into the patch assembly itself
+            // (same-assembly access never hits the runtime checks).
+            if (symbol.Locations.Any(location => location.IsInSource))
+            {
+                INamedTypeSymbol? top = symbol as INamedTypeSymbol ?? symbol.ContainingType;
+                while (top?.ContainingType != null)
+                    top = top.ContainingType;
+                if (top != null && !IsRenamedTypeSymbol(top, renamedSymbols))
+                    return true;
+            }
+            return false;
+        }
+
+        static bool IsAccessiblePublicly(ISymbol? symbol)
+        {
+            for (ISymbol? current = symbol;
+                current is not null and not INamespaceSymbol;
+                current = current.ContainingType)
+            {
+                if (current.DeclaredAccessibility is not Accessibility.Public
+                    and not Accessibility.NotApplicable)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        string? CheckType(ITypeSymbol? type)
+        {
+            switch (type)
+            {
+                case IArrayTypeSymbol array:
+                    return CheckType(array.ElementType);
+                case IPointerTypeSymbol pointer:
+                    return CheckType(pointer.PointedAtType);
+                case INamedTypeSymbol named:
+                {
+                    if (IsPatchLocal(named))
+                        return null;
+                    if (!IsAccessiblePublicly(named))
+                        return Violation(named);
+                    foreach (ITypeSymbol argument in named.TypeArguments)
+                    {
+                        string? nested = CheckType(argument);
+                        if (nested != null)
+                            return nested;
+                    }
+                    return null;
+                }
+                default:
+                    return null; // type parameters, dynamic, null
+            }
+        }
+
+        // Signature surface first: the (public) shim must be able to NAME
+        // these types in its own declaration.
+        if (!declared.IsStatic && !IsAccessiblePublicly(declared.ContainingType))
+        {
+            return "added instance member on a non-public type: " + memberDisplay +
+                " (the shim cannot name the declaring type; use unity_recompile)";
+        }
+        string? signatureViolation = CheckType(declared.ReturnType);
+        if (signatureViolation != null)
+            return signatureViolation;
+        foreach (IParameterSymbol parameter in declared.Parameters)
+        {
+            signatureViolation = CheckType(parameter.Type);
+            if (signatureViolation != null)
+                return signatureViolation;
+        }
+
+        // Body references: every bound member/type the shim would touch.
+        foreach (SyntaxNode node in decl.DescendantNodes())
+        {
+            if (node is not SimpleNameSyntax name)
+                continue;
+            ISymbol? symbol = model.GetSymbolInfo(name).Symbol;
+            if (symbol == null)
+                continue;
+            if (symbol.Kind is not SymbolKind.Method and not SymbolKind.Property
+                and not SymbolKind.Field and not SymbolKind.Event and not SymbolKind.NamedType)
+            {
+                continue;
+            }
+            if (IsPatchLocal(symbol))
+                continue;
+            if (symbol is INamedTypeSymbol typeRef)
+            {
+                string? typeViolation = CheckType(typeRef);
+                if (typeViolation != null)
+                    return typeViolation;
+                continue;
+            }
+            if (!IsAccessiblePublicly(symbol))
+                return Violation(symbol);
+        }
+
+        return null;
     }
 
     /// <summary>Constructive layout verification for a type with M4 field

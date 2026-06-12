@@ -384,6 +384,19 @@ namespace Locus
                         ? entry.Engine
                         : "mixed";
                 }
+
+                // Fail closed on shim JIT-ability: shims are direct-called
+                // (no detour pre-JITs them), so an access-check violation
+                // the compiler waved through would otherwise surface as a
+                // runtime exception at the first call — long after this
+                // patch reported success. Force-JIT every shim now and roll
+                // the whole batch back on failure.
+                string shimError = PrepareHotPatchShims(patchAssembly);
+                if (shimError != null)
+                {
+                    RollbackHotPatch(applied);
+                    return ErrorResponse(requestId, "shim verification failed: " + shimError);
+                }
             }
 
             var response = new HotPatchLoadedResponse
@@ -394,6 +407,59 @@ namespace Locus
             };
             Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId);
             return OkResponse(requestId, JsonUtility.ToJson(response));
+        }
+
+        /// <summary>Force-JIT every method of the patch's shim/store classes
+        /// so Mono's accessibility checks run NOW (returns the first failure,
+        /// or null). Generic shim methods are skipped: they JIT per
+        /// instantiation and direct call sites surface errors deterministically.</summary>
+        private static string PrepareHotPatchShims(Assembly patchAssembly)
+        {
+            Type[] types;
+            try
+            {
+                types = patchAssembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                types = ex.Types ?? new Type[0];
+            }
+
+            foreach (Type type in types)
+            {
+                if (type == null)
+                    continue;
+                string name = type.Name;
+                if (!name.Contains("__LocusShims") && !name.Contains("__LocusFields_"))
+                    continue;
+
+                MethodInfo[] methods;
+                try
+                {
+                    methods = type.GetMethods(
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly);
+                }
+                catch (Exception ex)
+                {
+                    return type.FullName + ": " + ex.Message;
+                }
+
+                foreach (MethodInfo method in methods)
+                {
+                    if (method.IsGenericMethodDefinition || method.ContainsGenericParameters)
+                        continue;
+                    try
+                    {
+                        RuntimeHelpers.PrepareMethod(method.MethodHandle);
+                    }
+                    catch (Exception ex)
+                    {
+                        Exception detail = ex.InnerException ?? ex;
+                        return type.Name + "." + method.Name + ": " + detail.Message;
+                    }
+                }
+            }
+            return null;
         }
 
         private static void RollbackHotPatch(List<HotPatchApplyChange> applied)
@@ -513,8 +579,18 @@ namespace Locus
                 }
                 return true;
             }
-            return string.Equals(left.FullName, right.FullName, StringComparison.Ordinal) &&
-                string.Equals(SafeAssemblyName(left.Assembly), SafeAssemblyName(right.Assembly), StringComparison.Ordinal);
+            if (string.Equals(left.FullName, right.FullName, StringComparison.Ordinal) &&
+                string.Equals(SafeAssemblyName(left.Assembly), SafeAssemblyName(right.Assembly), StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            // Original type vs its layout-identical patch copy: self-typed
+            // operator/conversion parameters carry the rename. The copy is
+            // ABI-compatible by construction (same field sequence), so the
+            // detour is safe.
+            return string.Equals(
+                StripPatchTypeSuffix(left.FullName), StripPatchTypeSuffix(right.FullName), StringComparison.Ordinal);
         }
 
         private static string DisplayType(Type type)
@@ -653,7 +729,12 @@ namespace Locus
                 bool paramsMatch = true;
                 for (int p = 0; p < parameters.Length; p++)
                 {
-                    if (!string.Equals(parameters[p].ParameterType.Name, wanted[p], StringComparison.Ordinal))
+                    // Patch copies rename self-typed operator/conversion
+                    // parameters ("Foo__LocusPatch"): match against the
+                    // original-name identity the desktop sent.
+                    string parameterName = StripPatchTypeSuffix(parameters[p].ParameterType.Name);
+                    if (!string.Equals(parameterName, wanted[p], StringComparison.Ordinal) &&
+                        !string.Equals(parameters[p].ParameterType.Name, wanted[p], StringComparison.Ordinal))
                     {
                         paramsMatch = false;
                         break;
@@ -673,6 +754,16 @@ namespace Locus
             if (match == null)
                 error = "no matching overload";
             return match;
+        }
+
+        /// <summary>"Foo__LocusPatch" → "Foo", "Outer__LocusPatch+Inner" →
+        /// "Outer+Inner" (patch copies rename the top-level type; the marker
+        /// never appears in legitimate user type names).</summary>
+        private static string StripPatchTypeSuffix(string typeName)
+        {
+            if (string.IsNullOrEmpty(typeName))
+                return typeName;
+            return typeName.Replace("__LocusPatch", "");
         }
 
         // ───────────────── hot_patch_dispose ─────────────────

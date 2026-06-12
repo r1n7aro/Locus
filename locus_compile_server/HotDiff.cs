@@ -1864,6 +1864,16 @@ public static class HotDiff
                     result.Reasons.Add("generic type conversion changed: " + metadataName);
                     return false;
                 }
+                if (SimpleTypeName(newConv.Type) == SimpleNameOfMetadata(metadataName))
+                {
+                    // The patch copy renames the type, and a conversion that
+                    // RETURNS the declaring type would have to construct the
+                    // patch type — semantically a different object. Only
+                    // conversions FROM the declaring type stay hot.
+                    result.Reasons.Add("conversion to the declaring type changed: " + metadataName +
+                        " (the patch copy cannot re-declare it; use unity_recompile)");
+                    return false;
+                }
                 string convName = newConv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword)
                     ? "op_Implicit"
                     : "op_Explicit";
@@ -2391,6 +2401,16 @@ public static class HotDiff
     {
         TypeSyntax parsed = SyntaxFactory.ParseTypeName(typeText);
         return SimpleTypeName(parsed);
+    }
+
+    /// <summary>Simple (arity-stripped) name of a metadata type name's last
+    /// segment: "Ns.Outer+Inner`1" → "Inner".</summary>
+    private static string SimpleNameOfMetadata(string metadataName)
+    {
+        int separator = Math.Max(metadataName.LastIndexOf('.'), metadataName.LastIndexOf('+'));
+        string simple = separator < 0 ? metadataName : metadataName[(separator + 1)..];
+        int backtick = simple.IndexOf('`');
+        return backtick < 0 ? simple : simple[..backtick];
     }
 
     private static string PredefinedName(string keyword)

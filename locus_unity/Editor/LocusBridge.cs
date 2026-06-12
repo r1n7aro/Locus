@@ -626,12 +626,25 @@ namespace Locus
             string[] pendingPaths = new string[_pendingChangedAssetPaths.Count];
             _pendingChangedAssetPaths.CopyTo(pendingPaths);
             _pendingChangedAssetPaths.Clear();
+            // Parents sort before their children, so a brand-new folder is in
+            // the database before its files import.
+            Array.Sort(pendingPaths, StringComparer.Ordinal);
 
             int importedCount = 0;
+            bool needsRefresh = false;
             foreach (string assetPath in pendingPaths)
             {
                 try
                 {
+                    if (!File.Exists(assetPath) && !Directory.Exists(assetPath))
+                    {
+                        // Deleted on disk. ImportAsset cannot drop a stale
+                        // database entry; a Refresh pass below picks the
+                        // removal up (leaving it would fail the next compile
+                        // with a missing source file).
+                        needsRefresh = true;
+                        continue;
+                    }
                     AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
                     importedCount++;
                 }
@@ -641,8 +654,21 @@ namespace Locus
                 }
             }
 
-            if (importedCount > 0)
-                Debug.Log("[Locus] Flushed changed asset imports before compile: " + importedCount);
+            if (needsRefresh)
+            {
+                try
+                {
+                    AssetDatabase.Refresh();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError("[Locus] AssetDatabase.Refresh for deleted assets failed: " + ex);
+                }
+            }
+
+            if (importedCount > 0 || needsRefresh)
+                Debug.Log("[Locus] Flushed changed asset imports before compile: " + importedCount
+                    + (needsRefresh ? " (+refresh for deletions)" : ""));
 
             return importedCount;
         }
@@ -1454,6 +1480,12 @@ namespace Locus
 
                     case "request_recompile":
                     {
+                        // Hot-reload sessions write/delete files without telling
+                        // the AssetDatabase; the desktop forwards every tracked
+                        // dirty path here so created files import and deleted
+                        // ones refresh away before the compile. Older callers
+                        // send an empty message — unchanged behavior.
+                        string changedPathsRaw = msg.message ?? "";
                         PostToMainThread(delegate
                         {
                             ReleaseAllEditSessions();
@@ -1463,6 +1495,8 @@ namespace Locus
                             _recompileRequested = true;
 
                             SessionState.SetBool(SessionKey_RecompileInProgress, true);
+                            if (changedPathsRaw.Length > 0)
+                                QueueChangedAssets(changedPathsRaw.Split('\n'));
                             FlushQueuedAssetImports();
                             _domainReloadCheckFrames = -1;
                             CompilationPipeline.RequestScriptCompilation();

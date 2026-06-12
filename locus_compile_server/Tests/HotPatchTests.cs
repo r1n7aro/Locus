@@ -188,14 +188,17 @@ namespace HotPatchE2E
         Assert.True(newType["isTopLevel"]!.GetValue<bool>());
     }
 
+    // Public state only: Mono enforces accessibility when the shim jits, so
+    // added members may not touch non-public surface (cold otherwise — see
+    // Added_member_touching_private_state_is_cold).
     private const string ShimCalcSource = @"
 namespace ShimE2E
 {
     public class Calc
     {
-        private int _seed = 10;
-        private static int Bias = 5;
-        public int Value() { return _seed; }
+        public int Seed = 10;
+        public static int Bias = 5;
+        public int Value() { return Seed; }
     }
 }";
 
@@ -217,8 +220,8 @@ namespace ShimE2E
         JsonObject compileParams = ParamsFor(calcPath, callerPath);
 
         string newCalc = ShimCalcSource.Replace(
-            "public int Value() { return _seed; }",
-            "public int Value() { return _seed; }\n        public int Boost(int extra) { return _seed + Bias + extra; }");
+            "public int Value() { return Seed; }",
+            "public int Value() { return Seed; }\n        public int Boost(int extra) { return Seed + Bias + extra; }");
         string newCaller = ShimCallerSource.Replace(
             "public static int Run() { return 1; }",
             "public static int Run() { var c = new Calc(); return c.Boost(7); }");
@@ -282,8 +285,8 @@ namespace ShimE2E
         compileParams["domainGeneration"] = "reedit-gen";
 
         string addedV1 = ShimCalcSource.Replace(
-            "public int Value() { return _seed; }",
-            "public int Value() { return _seed; }\n        public int Boost() { return 1; }");
+            "public int Value() { return Seed; }",
+            "public int Value() { return Seed; }\n        public int Boost() { return 1; }");
         var requestV1 = new JsonObject
         {
             ["files"] = new JsonArray(new JsonObject
@@ -301,8 +304,8 @@ namespace ShimE2E
         string assemblyV1 = resultV1["assemblyName"]!.GetValue<string>();
 
         string addedV2 = ShimCalcSource.Replace(
-            "public int Value() { return _seed; }",
-            "public int Value() { return _seed; }\n        public int Boost() { return 2; }");
+            "public int Value() { return Seed; }",
+            "public int Value() { return Seed; }\n        public int Boost() { return 2; }");
         var requestV2 = new JsonObject
         {
             ["files"] = new JsonArray(new JsonObject
@@ -326,6 +329,105 @@ namespace ShimE2E
         Assert.True(detour["isStatic"]!.GetValue<bool>());
         Assert.Equal(assemblyV1, detour["originalAssembly"]!.GetValue<string>());
         Assert.Equal(new[] { "Calc" }, detour["paramTypeNames"]!.AsArray().Select(p => p!.GetValue<string>()));
+    }
+
+    // Operators force CS0563/CS0556 in renamed patch copies: unchanged
+    // declarations strip, changed ones rename their self-typed parameters.
+    private const string OperatorStructSource = @"
+public struct Vec
+{
+    public int Value;
+
+    public int Get() { return 1; }
+
+    public static Vec operator +(Vec a, Vec b)
+    {
+        var r = new Vec();
+        r.Value = a.Value + b.Value;
+        return r;
+    }
+
+    public static implicit operator int(Vec v) { return v.Value; }
+}";
+
+    [Fact]
+    public void Unchanged_operators_are_stripped_so_other_edits_stay_hot()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "OpStrip", OperatorStructSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = OperatorStructSource.Replace(
+            "public int Get() { return 1; }",
+            "public int Get() { return 6446; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Vec.cs", OperatorStructSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("Get", method["name"]!.GetValue<string>());
+
+        // The copies are gone from the patch type: CS0563/CS0556 never trip
+        // and the original's operators keep serving every call site.
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("op-strip", isCollectible: true);
+        try
+        {
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("Vec__LocusPatch", throwOnError: true)!;
+            Assert.DoesNotContain(
+                patchType.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly),
+                m => m.Name.StartsWith("op_", StringComparison.Ordinal));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Changed_operator_parameters_rename_to_the_patch_type()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "OpRename", OperatorStructSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = OperatorStructSource.Replace(
+            "r.Value = a.Value + b.Value;",
+            "r.Value = a.Value + b.Value + 7337;");
+
+        JsonNode result = HotPatch(service, compileParams, ("Vec.cs", OperatorStructSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("op_Addition", method["name"]!.GetValue<string>());
+        Assert.Equal("Vec", method["declaringType"]!.GetValue<string>());
+        Assert.Equal(
+            new[] { "Vec", "Vec" },
+            method["paramTypeNames"]!.AsArray().Select(p => p!.GetValue<string>()));
+
+        // The patch declaration satisfies CS0563 by naming ITS containing
+        // type; the Unity side maps it back by stripping the suffix.
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("op-rename", isCollectible: true);
+        try
+        {
+            Assembly originalAssembly = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "OpRename" ? originalAssembly : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("Vec__LocusPatch", throwOnError: true)!;
+            MethodInfo op = patchType
+                .GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                .Single(m => m.Name == "op_Addition");
+            Assert.All(op.GetParameters(), p => Assert.Equal("Vec__LocusPatch", p.ParameterType.Name));
+        }
+        finally
+        {
+            context.Unload();
+        }
     }
 
     /// <summary>Compile an "original" into Library/ScriptAssemblies so the
@@ -1130,14 +1232,14 @@ public class PatchRewriterGoldenTests : IDisposable
 {
     public class Player
     {
-        private int _mp = 3;
+        public int Mp = 3;
         public int Tick() { return 1; }
     }
 }";
         string newText = oldText
             .Replace(
                 "public int Tick() { return 1; }",
-                "public int Tick() { return Mana(); }\n        public int Mana() { return _mp; }");
+                "public int Tick() { return Mana(); }\n        public int Mana() { return Mp; }");
 
         var (result, text) = RewriteWithOriginal("GoldenShim", oldText, newText);
 
@@ -1145,7 +1247,7 @@ public class PatchRewriterGoldenTests : IDisposable
 {
     public class Player__LocusPatch
     {
-        private int _mp = 3;
+        public int Mp = 3;
         public int Tick() { return global::Game.Player__LocusShims.Mana(((global::Game.Player)(object)this)); }
     }
 
@@ -1153,7 +1255,7 @@ public static class Player__LocusShims
 {
     public static int Mana(this global::Game.Player self)
     {
-        return self._mp;
+        return self.Mp;
     }
 }}";
         Assert.Equal(expected.ReplaceLineEndings("\n"), text.ReplaceLineEndings("\n"));
@@ -1164,6 +1266,134 @@ public static class Player__LocusShims
         Assert.Equal("Game.Player__LocusShims", registration.Entry.ShimTypeMetadataName);
         Assert.Equal("Mana", registration.Entry.ShimMethod);
         Assert.True(registration.Entry.HasSelf);
+    }
+
+    private string RewriteExpectingCold(string assemblyName, string oldText, string newText)
+    {
+        var compilation = CSharpCompilation.Create(
+            assemblyName,
+            new[] { CSharpSyntaxTree.ParseText(oldText, ParseOptions) },
+            ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+                .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                .Where(File.Exists)
+                .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p)),
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+        string originalPath = Path.Combine(_tempDir, assemblyName + ".dll");
+        var emit = compilation.Emit(originalPath);
+        Assert.True(emit.Success, string.Join("\n", emit.Diagnostics));
+
+        var references = compilation.References
+            .Append(MetadataReference.CreateFromFile(originalPath))
+            .ToArray();
+
+        HotDiffFileResult diff = HotDiff.Analyze(oldText, newText, ParseOptions);
+        Assert.True(diff.Hot, string.Join("; ", diff.Reasons));
+
+        PatchRewriteResult result = PatchRewriter.Rewrite(
+            "Cold.cs", newText, diff,
+            ParseOptions,
+            System.Collections.Immutable.ImmutableArray.CreateRange(references));
+        Assert.NotNull(result.ColdReason);
+        return result.ColdReason!;
+    }
+
+    [Fact]
+    public void Added_member_touching_private_state_is_cold()
+    {
+        // Mono enforces accessibility at JIT time and ignores
+        // IgnoresAccessChecksTo for project assemblies: the shim would throw
+        // FieldAccessException at its first call.
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        private int _mp = 3;
+        public int Tick() { return _mp; }
+    }
+}";
+        string newText = oldText.Replace(
+            "public int Tick() { return _mp; }",
+            "public int Tick() { return _mp; }\n        public int Mana() { return _mp; }");
+
+        string reason = RewriteExpectingCold("ColdShimPrivate", oldText, newText);
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("_mp", reason);
+    }
+
+    [Fact]
+    public void Added_member_calling_private_method_is_cold()
+    {
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        private int Hidden() { return 3; }
+        public int Tick() { return Hidden(); }
+    }
+}";
+        string newText = oldText.Replace(
+            "public int Tick() { return Hidden(); }",
+            "public int Tick() { return Hidden(); }\n        public int Mana() { return Hidden(); }");
+
+        string reason = RewriteExpectingCold("ColdShimPrivateMethod", oldText, newText);
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("Hidden", reason);
+    }
+
+    [Fact]
+    public void Added_instance_member_on_internal_type_is_cold()
+    {
+        // The (public) shim could not even NAME the internal declaring type
+        // across assemblies on the Unity runtime.
+        const string oldText = @"namespace Game
+{
+    class Helper
+    {
+        public int Tick() { return 1; }
+    }
+}";
+        string newText = oldText.Replace(
+            "public int Tick() { return 1; }",
+            "public int Tick() { return 1; }\n        public int Mana() { return 2; }");
+
+        string reason = RewriteExpectingCold("ColdShimInternalType", oldText, newText);
+        Assert.Contains("non-public type", reason);
+    }
+
+    [Fact]
+    public void Conversion_to_the_declaring_type_change_is_cold()
+    {
+        const string oldText = @"
+public struct Wrap
+{
+    public int Value;
+    public static implicit operator Wrap(int v) { var r = new Wrap(); r.Value = v; return r; }
+}";
+        string newText = oldText.Replace("r.Value = v;", "r.Value = v + 1;");
+
+        HotDiffFileResult diff = HotDiff.Analyze(oldText, newText, ParseOptions);
+        Assert.False(diff.Hot);
+        Assert.Contains(diff.Reasons, r => r.Contains("conversion to the declaring type changed"));
+    }
+
+    [Fact]
+    public void Added_member_chain_to_other_added_member_stays_hot()
+    {
+        // Added→added calls route shim-to-shim inside the patch assembly:
+        // no original-surface access, so accessibility stays irrelevant.
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        public int Tick() { return 1; }
+    }
+}";
+        string newText = oldText.Replace(
+            "public int Tick() { return 1; }",
+            "public int Tick() { return 1; }\n        public int Boost() { return BoostCore() + 7000; }\n        public int BoostCore() { return 707; }");
+
+        var (result, _) = RewriteWithOriginal("HotShimChain", oldText, newText);
+        Assert.Equal(2, result.ShimRegistrations.Count);
     }
 
     [Fact]

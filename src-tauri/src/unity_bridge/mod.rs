@@ -2904,6 +2904,27 @@ async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<
 ///    - `ok`: compilation succeeded and the reloaded AppDomain reported completion.
 ///    - `error:*`: compilation failed; surface the compiler errors immediately.
 /// 4. If the pipe drops during reload, wait for Unity to reconnect as a fallback signal.
+/// Project-relative, forward-slash asset paths for absolute file paths under
+/// `project_path`. Windows paths reach the tracker with inconsistent drive or
+/// directory casing; the prefix match is case-insensitive but the returned
+/// remainder keeps the on-disk casing for Unity. Paths outside the project
+/// are dropped.
+fn relative_asset_paths(project_path: &str, absolute_paths: &[String]) -> Vec<String> {
+    let root = project_path.trim_end_matches(['/', '\\']).replace('\\', "/");
+    let root_lower = root.to_ascii_lowercase();
+    let mut rels: Vec<String> = Vec::new();
+    for path in absolute_paths {
+        let normalized = path.replace('\\', "/");
+        if normalized.to_ascii_lowercase().starts_with(&root_lower) {
+            let rel = normalized[root.len()..].trim_start_matches('/');
+            if !rel.is_empty() {
+                rels.push(rel.to_string());
+            }
+        }
+    }
+    rels
+}
+
 pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
@@ -2929,7 +2950,18 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
         );
     }
 
-    let resp = match send_message(project_path, "request_recompile", "").await {
+    // Hot-reload edits bypass the AssetDatabase entirely; forward every
+    // tracked dirty path so the plugin imports created files (and refreshes
+    // away deleted ones) before compiling. Without this, files created or
+    // deleted during a hot-reload session would be missing from (or stale
+    // in) the converged assembly. Older plugins ignore the message body.
+    let tracked_dirty_paths = relative_asset_paths(
+        project_path,
+        &crate::unity_hotreload::coordinator::pending_paths(project_path).await,
+    )
+    .join("\n");
+
+    let resp = match send_message(project_path, "request_recompile", &tracked_dirty_paths).await {
         Ok(resp) => resp,
         Err(error) => return finish(Err(error)),
     };
@@ -3194,7 +3226,7 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_project_unity_version, requested_run_states_editor_status,
+        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
         rewrite_run_states_output_for_size,
     };
     use serde_json::json;
@@ -3205,6 +3237,20 @@ mod tests {
             .find_map(|line| line.strip_prefix("result_file: "))
             .expect("result_file field")
             .to_string()
+    }
+
+    #[test]
+    fn relative_asset_paths_strip_root_case_insensitively_keeping_disk_casing() {
+        let rels = relative_asset_paths(
+            r"F:\Proj\Game",
+            &[
+                r"f:\proj\game\Assets\Scripts\Foo.cs".to_string(),
+                "F:/Proj/Game/Assets/Bar.cs".to_string(),
+                r"D:\Elsewhere\Assets\Baz.cs".to_string(),
+                r"F:\Proj\Game".to_string(),
+            ],
+        );
+        assert_eq!(rels, vec!["Assets/Scripts/Foo.cs", "Assets/Bar.cs"]);
     }
 
     #[test]
