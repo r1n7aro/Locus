@@ -15,8 +15,13 @@
 //!     (params / ref→out / static flip / rename) with call-site
 //!     verification, accessibility narrowing, using add/remove with
 //!     whole-file rehook, enum append, new files, new types in existing
-//!     files, struct method bodies, interface-impl bodies, deletions
-//!     (members, properties, Unity messages, whole files).
+//!     files (top-level and nested), struct method bodies, interface-impl
+//!     bodies, deletions (members, properties, Unity messages, whole
+//!     files); plus edit-mode reloading of EDITOR-assembly code, in-flight
+//!     delegates following detours, Unity message body edits, store-held
+//!     static persistence across patches, generic-typed and nested-type
+//!     field additions, #if-block edits, iterator→plain conversions,
+//!     extension-method additions and a five-file batch.
 //!   • negatives (must come back COLD with the precise reason): generic
 //!     method bodies (generic methods AND generic types), constructor/
 //!     finalizer surface and finalizer bodies, virtual members, struct
@@ -64,6 +69,8 @@ const STRUCT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestStruct.cs"
 const CTOR_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestCtor.cs";
 const IFACE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestIface.cs";
 const NEG_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestNegative.cs";
+const EDITOR_DIR: &str = "Assets/LocusHotReloadSelfTest/Editor";
+const EDITOR_FILE: &str = "Assets/LocusHotReloadSelfTest/Editor/LocusSelfTestEditorTool.cs";
 
 const ALL_FILES: &[&str] = &[
     SUBJECT_FILE,
@@ -74,6 +81,7 @@ const ALL_FILES: &[&str] = &[
     CTOR_FILE,
     IFACE_FILE,
     NEG_FILE,
+    EDITOR_FILE,
 ];
 
 const SUBJECT_BASELINE: &str = r#"using UnityEngine;
@@ -83,6 +91,8 @@ public class LocusSelfTestSubject : MonoBehaviour
 {
     public static LocusSelfTestSubject Instance;
     public static int EvtCount;
+    public static int UpdateBeats;
+    public static System.Func<int> Captured;
     private int _ticks = 0;
     private int _seed = 40;
     private int _legacy = 3;
@@ -106,6 +116,15 @@ public class LocusSelfTestSubject : MonoBehaviour
 
     public int Step() { return 1; }
     public int Mult() { return 1002; }
+    public int Snare() { return 5; }
+    public int Cond()
+    {
+#if UNITY_EDITOR
+        return 1;
+#else
+        return 2;
+#endif
+    }
     public int Probe() { return 0; }
     public int Seed() { return _seed; }
     public int Legacy() { return _legacy; }
@@ -129,6 +148,12 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public Task<int> Pulse() { return Task.FromResult(2001); }
     public System.Collections.IEnumerator Counting() { yield return 1; }
+}
+"#;
+
+const EDITOR_BASELINE: &str = r#"public static class LocusSelfTestEditorTool
+{
+    public static int Reading() { return 1; }
 }
 "#;
 
@@ -491,7 +516,7 @@ impl SelfTest {
     // ── phases ───────────────────────────────────────────────────────
 
     async fn initialize_corpus(&mut self) -> Result<(), String> {
-        self.log("Phase 1/6 — initializing the test corpus (edit mode)");
+        self.log("Phase 1/7 — initializing the test corpus (edit mode)");
 
         // Inside an edit session the imports queue instead of firing one by
         // one; the recompile below releases the session, flushes the queue
@@ -509,11 +534,14 @@ impl SelfTest {
         self.write_tracked(CTOR_FILE, CTOR_BASELINE).await?;
         self.write_tracked(IFACE_FILE, IFACE_BASELINE).await?;
         self.write_tracked(NEG_FILE, NEG_BASELINE).await?;
+        // Editor/ folder → Assembly-CSharp-Editor: edit-mode hot reload of
+        // editor tooling is its own phase.
+        self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await?;
 
         // The corpus was written behind Unity's back: the AssetDatabase must
         // import it or the compile would not include the new files at all
         // (the folder goes first so children import into an existing parent).
-        let mut imports: Vec<String> = vec![TEST_DIR.to_string()];
+        let mut imports: Vec<String> = vec![TEST_DIR.to_string(), EDITOR_DIR.to_string()];
         imports.extend(
             ALL_FILES
                 .iter()
@@ -550,8 +578,35 @@ impl SelfTest {
         Ok(())
     }
 
+    /// Edit-mode hot reload, BEFORE play mode: editor tooling (custom
+    /// editors, menu commands) lives in Assembly-CSharp-Editor and detours
+    /// exactly like player code. The patch dies with the play-mode domain
+    /// reload anyway, so the file reverts afterwards to keep the play-phase
+    /// batches clean.
+    async fn run_editmode_tests(&mut self) {
+        self.log("Phase 2/7 — edit-mode hot reload (editor assembly, no play mode)");
+        let name = "E01 editor-assembly body edit (edit mode)";
+        self.log(format!("— {name}"));
+        let edited = EDITOR_BASELINE.replace("return 1;", "return 8118;");
+        match self.write_tracked(EDITOR_FILE, &edited).await {
+            Ok(()) => match self.hot_reload(Some(vec![EDITOR_FILE.to_string()])).await {
+                Ok(summary) if summary.contains("Hot reload not applicable") => {
+                    self.fail(name, format!("unexpected cold verdict: {}", squash(&summary)));
+                }
+                Ok(_) => {
+                    self.expect_output(name, "return LocusSelfTestEditorTool.Reading();", "8118").await;
+                }
+                Err(error) => self.fail(name, squash(&error)),
+            },
+            Err(error) => self.fail(name, error),
+        }
+        if let Err(error) = self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await {
+            self.log(format!("  editor corpus revert failed: {error}"));
+        }
+    }
+
     async fn enter_play_mode(&mut self) -> Result<(), String> {
-        self.log("Phase 2/6 — entering play mode");
+        self.log("Phase 3/7 — entering play mode");
         self.execute("UnityEditor.EditorApplication.EnterPlaymode(); return \"entering\";")
             .await
             .map_err(|e| format!("EnterPlaymode failed: {e}"))?;
@@ -572,7 +627,7 @@ impl SelfTest {
     }
 
     async fn run_positive_tests(&mut self, subject: &mut String, helper: &mut String) {
-        self.log("Phase 3/6 — hot-reloading every supported change shape");
+        self.log("Phase 4/7 — hot-reloading every supported change shape");
 
         // P00 — the baseline really is what we wrote.
         self.expect_output(
@@ -581,6 +636,31 @@ impl SelfTest {
             "1002",
         )
         .await;
+
+        // P00b — a delegate captured BEFORE the edit follows the detour:
+        // the redirect is method-level, so in-flight delegates (and
+        // UnityEvents bound to the same method) pick up new behavior.
+        let name = "P00b in-flight delegate follows detour";
+        self.log(format!("— {name}"));
+        match self
+            .execute(
+                "LocusSelfTestSubject.Captured = LocusSelfTestSubject.Instance.Snare;\nreturn \"captured\";",
+            )
+            .await
+        {
+            Ok(_) => {
+                if self
+                    .step_file(name, SUBJECT_FILE, subject, |s| {
+                        swap(s, "public int Snare() { return 5; }", "public int Snare() { return 7667; }")
+                    })
+                    .await
+                    .is_some()
+                {
+                    self.expect_output(name, "return LocusSelfTestSubject.Captured();", "7667").await;
+                }
+            }
+            Err(error) => self.fail(name, format!("capture snippet failed: {error}")),
+        }
 
         // P01 — method body edit.
         if self
@@ -591,6 +671,28 @@ impl SelfTest {
             .is_some()
         {
             self.expect_output("P01 method body edit", "return LocusSelfTestSubject.Instance.Mult();", "4221").await;
+        }
+
+        // P01b — Unity message BODY edit (the engine drives the detoured
+        // Update every frame; D01 later deletes it).
+        if self
+            .step_file("P01b Unity message body edit", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "void Update() { _ticks += Step(); }",
+                    "void Update() { _ticks += Step(); UpdateBeats += 1; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            self.expect_output(
+                "P01b Unity message body edit",
+                "return LocusSelfTestSubject.UpdateBeats > 0 ? \"beating\" : \"still\";",
+                "beating",
+            )
+            .await;
         }
 
         // P02 — async↔sync conversion.
@@ -754,8 +856,35 @@ impl SelfTest {
             .await;
         }
 
-        // P06 — added static field through the holder class.
+        // P05c — added field with a GENERIC argument type (the store is a
+        // LocusFieldStore<List<int>>); a pre-existing instance reads
+        // default(null) for reference types.
         if self
+            .step_file("P05c generic-typed field added", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    private int _bonus = 5050;\n",
+                    "    private int _bonus = 5050;\n    private System.Collections.Generic.List<int> _list = new System.Collections.Generic.List<int> { 41, 1 };\n",
+                )?;
+                swap_line(
+                    s,
+                    "    public int Probe()",
+                    "    public int Probe() { return (_list == null ? 0 : _list.Count) + 4664; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P05c generic-typed field added",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "4664", // existing instance: null list + 4664
+            )
+            .await;
+        }
+
+        // P06 — added static field through the holder class.
+        let p06_ok = self
             .step_file("P06 added static field", SUBJECT_FILE, subject, |s| {
                 swap(
                     s,
@@ -765,13 +894,13 @@ impl SelfTest {
                 swap_line(s, "    public int Probe()", "    public int Probe() { s_total += 1; return s_total; }")
             })
             .await
-            .is_some()
-        {
+            .is_some();
+        if p06_ok {
             self.expect_output("P06 added static field", "return LocusSelfTestSubject.Instance.Probe();", "6601").await;
         }
 
         // P07 — using addition re-detours the whole file (M6).
-        if self
+        let p07_ok = self
             .step_file("P07 using added (file rehook)", SUBJECT_FILE, subject, |s| {
                 swap(s, "using UnityEngine;", "using UnityEngine;\nusing System.Text;")?;
                 swap(
@@ -781,9 +910,21 @@ impl SelfTest {
                 )
             })
             .await
-            .is_some()
-        {
+            .is_some();
+        if p07_ok {
             self.expect_output("P07 using added (file rehook)", "return LocusSelfTestSubject.Instance.Step();", "8802").await;
+        }
+
+        // P07b — store-held STATIC state survives later patches: the holder
+        // lives in the first batch's assembly and the whole-file rehook of
+        // P07 re-detoured Probe without resetting it.
+        if p06_ok && p07_ok {
+            self.expect_output(
+                "P07b store-held static persists across patches",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "6602", // second bump of the SAME s_total
+            )
+            .await;
         }
 
         // P08 — appended enum member materializes as a cast literal.
@@ -1003,6 +1144,22 @@ impl SelfTest {
             self.expect_output("P16 pattern matching edit", "return LocusSelfTestSubject.Instance.Match(6);", "6776").await;
         }
 
+        // P16b — edit inside an active #if block (defines parity with the
+        // project's compilation).
+        if self
+            .step_file("P16b #if-block body edit", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "#if UNITY_EDITOR\n        return 1;",
+                    "#if UNITY_EDITOR\n        return 8338;",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output("P16b #if-block body edit", "return LocusSelfTestSubject.Instance.Cond();", "8338").await;
+        }
+
         // P17 — nested type member body edit.
         if self
             .step_file("P17 nested type member edit", SUBJECT_FILE, subject, |s| {
@@ -1017,6 +1174,47 @@ impl SelfTest {
                 "5665",
             )
             .await;
+        }
+
+        // P17b — field added to a NESTED type (store chain naming +
+        // constructor redirect of the nested type; the snippet constructs a
+        // fresh instance so the initializer runs).
+        if self
+            .step_file("P17b nested type field added", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public class Inner\n    {\n",
+                    "    public class Inner\n    {\n        public int W = 9;\n",
+                )?;
+                swap(s, "public int Nine() { return 5665; }", "public int Nine() { return W + 5660; }")
+                    .or_else(|_| swap(s, "public int Nine() { return 1; }", "public int Nine() { return W + 5660; }"))
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P17b nested type field added",
+                "return new LocusSelfTestSubject.Inner().Nine();",
+                "5669", // 9 + 5660
+            )
+            .await;
+        }
+
+        // P17c — brand-new NESTED type inside an existing type, observed
+        // through Probe.
+        if self
+            .step_file("P17c nested type added", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public class Inner\n    {\n",
+                    "    public class Inner2 { public static int Forty() { return 4554; } }\n\n    public class Inner\n    {\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { return Inner2.Forty(); }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output("P17c nested type added", "return LocusSelfTestSubject.Instance.Probe();", "4554").await;
         }
 
         // P18 — iterator (coroutine) body: NEW enumerations get the patch.
@@ -1035,6 +1233,34 @@ impl SelfTest {
                 "P18 coroutine body edit",
                 "var e = LocusSelfTestSubject.Instance.Counting();\ne.MoveNext();\nreturn (int)e.Current;",
                 "4334",
+            )
+            .await;
+        }
+
+        // P18b — iterator → plain method conversion (same signature, the
+        // state machine disappears; the detour is method-level).
+        if self
+            .step_file("P18b iterator to plain conversion", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "public System.Collections.IEnumerator Counting() { yield return 4334; }",
+                    "public System.Collections.IEnumerator Counting() { return new int[] { 5225 }.GetEnumerator(); }",
+                )
+                .or_else(|_| {
+                    swap(
+                        s,
+                        "public System.Collections.IEnumerator Counting() { yield return 1; }",
+                        "public System.Collections.IEnumerator Counting() { return new int[] { 5225 }.GetEnumerator(); }",
+                    )
+                })
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P18b iterator to plain conversion",
+                "var e = LocusSelfTestSubject.Instance.Counting();\ne.MoveNext();\nreturn (int)e.Current;",
+                "5225",
             )
             .await;
         }
@@ -1224,6 +1450,51 @@ impl SelfTest {
             }
         }
 
+        // P27b — extension method ADDED to an existing static class; the
+        // extension-form call site in a kept member materializes as a
+        // direct shim call.
+        let name = "P27b extension method added";
+        self.log(format!("— {name}"));
+        let subject_snapshot = subject.clone();
+        let helper_snapshot = helper.clone();
+        let p27b = (|| -> Result<(), String> {
+            swap(
+                helper,
+                "    public static int Pick() { return 3113; }\n",
+                "    public static int Pick() { return 3113; }\n    public static int Tripled(this int v) { return v * 3; }\n",
+            )
+            .or_else(|_| {
+                swap(
+                    helper,
+                    "    public static int Pick() { return 1; }\n",
+                    "    public static int Pick() { return 1; }\n    public static int Tripled(this int v) { return v * 3; }\n",
+                )
+            })?;
+            swap_line(subject, "    public int Probe()", "    public int Probe() { return 1500.Tripled() + 12; }")
+        })();
+        match p27b {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(HELPER_FILE, helper.as_str()), (SUBJECT_FILE, subject.as_str())],
+                        &[(HELPER_FILE, helper_snapshot.as_str()), (SUBJECT_FILE, subject_snapshot.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(name, "return LocusSelfTestSubject.Instance.Probe();", "4512").await;
+                } else {
+                    *subject = subject_snapshot;
+                    *helper = helper_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                *subject = subject_snapshot;
+                *helper = helper_snapshot;
+            }
+        }
+
         // P28 — interface-IMPLEMENTATION body edit (the interface itself is
         // untouched; dispatch through the interface sees the patch).
         let mut iface_ledger = IFACE_BASELINE.to_string();
@@ -1292,6 +1563,70 @@ impl SelfTest {
             .await;
         }
 
+        // P32 — five files in ONE batch (subject, helper, struct, ctor,
+        // iface): batch binding, per-file rewrites and the single combined
+        // patch all hold together at width.
+        let name = "P32 five-file batch";
+        self.log(format!("— {name}"));
+        let subject_snapshot = subject.clone();
+        let helper_snapshot = helper.clone();
+        let struct_snapshot = struct_ledger.clone();
+        let ctor_snapshot = ctor_ledger.clone();
+        let iface_snapshot = iface_ledger.clone();
+        let p32 = (|| -> Result<(), String> {
+            swap(subject, "public int Gauge { get { return 7117; } }", "public int Gauge { get { return 7118; } }")?;
+            swap(helper, "public static int Pick() { return 3113; }", "public static int Pick() { return 3114; }")?;
+            swap(&mut struct_ledger, "public int Get() { return 6446; }", "public int Get() { return 6447; }")?;
+            swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 5775; }", "public LocusSelfTestCtor() { Seed = 5776; }")?;
+            swap(&mut iface_ledger, "public int Plan() { return 6996; }", "public int Plan() { return 6997; }")
+        })();
+        match p32 {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[
+                            (SUBJECT_FILE, subject.as_str()),
+                            (HELPER_FILE, helper.as_str()),
+                            (STRUCT_FILE, struct_ledger.as_str()),
+                            (CTOR_FILE, ctor_ledger.as_str()),
+                            (IFACE_FILE, iface_ledger.as_str()),
+                        ],
+                        &[
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                            (HELPER_FILE, helper_snapshot.as_str()),
+                            (STRUCT_FILE, struct_snapshot.as_str()),
+                            (CTOR_FILE, ctor_snapshot.as_str()),
+                            (IFACE_FILE, iface_snapshot.as_str()),
+                        ],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output("P32a five-file batch (subject)", "return LocusSelfTestSubject.Instance.Gauge;", "7118").await;
+                    self.expect_output(
+                        "P32b five-file batch (interface impl)",
+                        "ILocusSelfTestContract c = new LocusSelfTestContractImpl();\nreturn c.Plan();",
+                        "6997",
+                    )
+                    .await;
+                } else {
+                    *subject = subject_snapshot;
+                    *helper = helper_snapshot;
+                    struct_ledger = struct_snapshot;
+                    ctor_ledger = ctor_snapshot;
+                    iface_ledger = iface_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                *subject = subject_snapshot;
+                *helper = helper_snapshot;
+                struct_ledger = struct_snapshot;
+                ctor_ledger = ctor_snapshot;
+                iface_ledger = iface_snapshot;
+            }
+        }
+
         // Hand the per-file ledgers to the negative phase: it restores files
         // to exactly these texts after each cold probe.
         self.negative_ledgers = NegativeLedgers {
@@ -1302,7 +1637,7 @@ impl SelfTest {
     }
 
     async fn run_negative_tests(&mut self) {
-        self.log("Phase 4/6 — cold classifications must carry the precise reason");
+        self.log("Phase 5/7 — cold classifications must carry the precise reason");
 
         let neg = NEG_BASELINE.to_string();
 
@@ -1391,23 +1726,23 @@ impl SelfTest {
             self.expect_cold("N09 struct field added", STRUCT_FILE, &text, "struct field layout changed", &struct_text).await;
         }
 
-        // N10 — constructor surface.
+        // N10 — constructor surface. The anchor chain tolerates P19/P32
+        // having failed at any point.
         let ctor_text = self.negative_ledgers.ctor_text.clone();
         let mut text = ctor_text.clone();
-        let anchored = swap(
-            &mut text,
-            "    public LocusSelfTestCtor() { Seed = 5775; }\n",
-            "    public LocusSelfTestCtor() { Seed = 5775; }\n    public LocusSelfTestCtor(int seed) { Seed = seed; }\n",
-        )
-        .or_else(|_| {
-            // P19 failed and left the baseline body — anchor there instead.
+        let mut anchored = Err(String::new());
+        for body in ["Seed = 5776;", "Seed = 5775;", "Seed = 1;"] {
             text = ctor_text.clone();
-            swap(
+            let line = format!("    public LocusSelfTestCtor() {{ {body} }}\n");
+            anchored = swap(
                 &mut text,
-                "    public LocusSelfTestCtor() { Seed = 1; }\n",
-                "    public LocusSelfTestCtor() { Seed = 1; }\n    public LocusSelfTestCtor(int seed) { Seed = seed; }\n",
-            )
-        });
+                &line,
+                &format!("{line}    public LocusSelfTestCtor(int seed) {{ Seed = seed; }}\n"),
+            );
+            if anchored.is_ok() {
+                break;
+            }
+        }
         if anchored.is_ok() {
             self.expect_cold("N10 constructor added", CTOR_FILE, &text, "constructor added", &ctor_text).await;
         }
@@ -1556,14 +1891,16 @@ impl SelfTest {
     }
 
     async fn run_deletion_tests(&mut self, subject: &mut String, helper: &mut String) {
-        self.log("Phase 5/6 — deletions");
+        self.log("Phase 6/7 — deletions");
 
         // D01 — deleting a Unity message method stops its behavior NOW
-        // (empty-body stub detour).
+        // (empty-body stub detour). Anchor chain tolerates P01b's body edit
+        // having failed.
         let name = "D01 Unity message deletion";
         if self
             .step_file(name, SUBJECT_FILE, subject, |s| {
-                swap(s, "    void Update() { _ticks += Step(); }\n", "")
+                swap(s, "    void Update() { _ticks += Step(); UpdateBeats += 1; }\n", "")
+                    .or_else(|_| swap(s, "    void Update() { _ticks += Step(); }\n", ""))
             })
             .await
             .is_some()
@@ -1653,7 +1990,7 @@ impl SelfTest {
     }
 
     async fn finalize(&mut self) {
-        self.log("Phase 6/6 — leaving play mode and converging");
+        self.log("Phase 7/7 — leaving play mode and converging");
         if let Err(error) = crate::unity_bridge::exit_play_mode(&self.project).await {
             self.log(format!("exit_play_mode failed (continuing): {error}"));
         }
@@ -1738,6 +2075,7 @@ impl SelfTest {
             self.emit(None, true);
             return;
         }
+        self.run_editmode_tests().await;
         if let Err(error) = self.enter_play_mode().await {
             self.fail("enter play mode", error);
             self.finalize().await;
