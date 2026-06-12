@@ -380,6 +380,19 @@ public static class PatchRewriter
             return false;
         }
 
+        // Types tombstoned by earlier batches (deleted files): a reference
+        // binding to the still-loaded metadata type is a deterministic
+        // error, not a silent half-alive call.
+        var tombstonedTypes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var pair in batch.EarlierShims)
+        {
+            if (pair.Value.Kind != "tombstone")
+                continue;
+            string[] parts = pair.Key.Split('|');
+            if (parts.Length >= 2 && parts[1].Length == 0)
+                tombstonedTypes.Add(parts[0]);
+        }
+
         // Type references to renamed types → fully-qualified original names.
         // Candidates: name/member-access nodes whose symbol is a renamed
         // type; only the outermost such node is replaced.
@@ -395,8 +408,20 @@ public static class PatchRewriter
                 continue;
 
             ISymbol? symbol = model.GetSymbolInfo(node).Symbol;
-            if (symbol is INamedTypeSymbol named && IsRenamedTypeSymbol(named, renamedSymbols))
-                typeRefCandidates[node] = named;
+            if (symbol is INamedTypeSymbol named)
+            {
+                if (tombstonedTypes.Count > 0 &&
+                    !IsRenamedTypeSymbol(named, renamedSymbols) &&
+                    tombstonedTypes.Contains(SymbolMetadataName(named.OriginalDefinition)))
+                {
+                    result.Error =
+                        SymbolMetadataName(named.OriginalDefinition) +
+                        " was deleted by an earlier hot patch in this session; remove the reference or run unity_recompile";
+                    return result;
+                }
+                if (IsRenamedTypeSymbol(named, renamedSymbols))
+                    typeRefCandidates[node] = named;
+            }
         }
 
         foreach (var pair in typeRefCandidates)
@@ -422,6 +447,48 @@ public static class PatchRewriter
                 ? SyntaxFactory.ParseExpression(fqn)
                 : SyntaxFactory.ParseTypeName(fqn);
             nodeReplacements[node] = replacement.WithTriviaFrom(node);
+        }
+
+        // ── appended enum members (H7e) ──────────────────────────────
+        // `E.NewMember` cannot bind against the original metadata enum:
+        // materialize the resolved constant as a cast literal. Inside a
+        // switch case label the cast stays unparenthesized (a parenthesized
+        // pattern needs C# 9).
+        if (batch.AddedEnumMembers.Count > 0)
+        {
+            foreach (SyntaxNode node in root.DescendantNodes())
+            {
+                if (node is not (IdentifierNameSyntax or MemberAccessExpressionSyntax))
+                    continue;
+                if (InStrippedSpan(node) || nodeReplacements.ContainsKey(node) || dynamicReplacements.ContainsKey(node))
+                    continue;
+                if (node.Parent is MemberAccessExpressionSyntax parentAccess && parentAccess.Name == node)
+                    continue;
+                if (node.Ancestors().Any(a => a is EnumDeclarationSyntax))
+                    continue; // the declaration itself
+
+                if (model.GetSymbolInfo(node).Symbol is not IFieldSymbol enumField ||
+                    !batch.AddedEnumMembers.TryGetValue(enumField, out (string EnumFqn, long Value) enumTarget))
+                {
+                    continue;
+                }
+
+                InvocationExpressionSyntax? nameofInvocation = FindEnclosingNameOf(node, model);
+                if (nameofInvocation != null)
+                {
+                    nodeReplacements[nameofInvocation] = SyntaxFactory.LiteralExpression(
+                            SyntaxKind.StringLiteralExpression,
+                            SyntaxFactory.Literal(enumField.Name))
+                        .WithTriviaFrom(nameofInvocation);
+                    continue;
+                }
+
+                bool inCaseLabel = node.Parent is CaseSwitchLabelSyntax;
+                string cast = "(" + enumTarget.EnumFqn + ")" +
+                    (enumTarget.Value < 0 ? "(" + enumTarget.Value + ")" : enumTarget.Value.ToString());
+                string text = inCaseLabel ? cast : "(" + cast + ")";
+                nodeReplacements[node] = SyntaxFactory.ParseExpression(text).WithTriviaFrom(node);
+            }
         }
 
         // ── virtualized field accesses (M4) ─────────────────────────
@@ -944,6 +1011,59 @@ public static class PatchRewriter
                 IsCtor = false,
                 IsStub = true,
             });
+        }
+
+        // ── removed types (H7e: file deletion / type removal) ───────
+        // The loaded type stays (in-flight references are legitimate), but
+        // every Unity message method detours to an empty stub in a
+        // synthesized flat class — the engine stops driving scene instances
+        // immediately. The stub never touches instance state, so layout
+        // compatibility is irrelevant (NativeDetour jump).
+        foreach (HotDiffRemovedType removedType in diff.RemovedTypes)
+        {
+            result.ShimRegistrations.Add(new ShimRegistration
+            {
+                MemberKey = MemberSurfaceRegistry.MemberKey(
+                    removedType.MetadataName, "", Array.Empty<string>(), isStatic: false),
+                Entry = new MemberSurfaceRegistry.ShimEntry { Kind = "tombstone" },
+            });
+
+            if (removedType.StubSource == null)
+                continue;
+
+            CompilationUnitSyntax stubUnit;
+            try
+            {
+                stubUnit = (CompilationUnitSyntax)CSharpSyntaxTree
+                    .ParseText(removedType.StubSource, parseOptions)
+                    .GetRoot();
+            }
+            catch
+            {
+                continue;
+            }
+
+            var merged = (CompilationUnitSyntax)rewritten;
+            foreach (UsingDirectiveSyntax stubUsing in stubUnit.Usings)
+            {
+                if (!merged.Usings.Any(u => u.ToString() == stubUsing.ToString()))
+                    merged = merged.AddUsings(stubUsing);
+            }
+            rewritten = merged.AddMembers(stubUnit.Members.ToArray());
+
+            foreach (HotDiffRemovedMember magic in removedType.MagicMethods)
+            {
+                result.Methods.Add(new PatchMethodMap
+                {
+                    DeclaringType = removedType.MetadataName,
+                    PatchDeclaringType = removedType.StubTypeMetadataName,
+                    Name = magic.Name,
+                    ParamTypeNames = magic.ParamTypeNames,
+                    IsStatic = magic.IsStatic,
+                    IsCtor = false,
+                    IsStub = true,
+                });
+            }
         }
 
         // ── virtualized-field surgery (M4) ───────────────────────────

@@ -63,6 +63,11 @@ public sealed class PatchBatchContext
     public IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry> EarlierFieldStores =
         new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal);
 
+    /// <summary>Appended enum member symbols across the batch (H7e):
+    /// references materialize as `(EnumFqn)value` cast literals.</summary>
+    public Dictionary<IFieldSymbol, (string EnumFqn, long Value)> AddedEnumMembers =
+        new(SymbolEqualityComparer.Default);
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -125,6 +130,26 @@ public sealed class PatchBatchContext
 
                 ShimTarget target = BuildShimTarget(symbol, added);
                 context.AddedMembers[symbol.OriginalDefinition] = target;
+            }
+
+            foreach (HotDiffEnumAddition addition in diff.EnumAdditions)
+            {
+                foreach (EnumDeclarationSyntax enumDecl in root.DescendantNodes().OfType<EnumDeclarationSyntax>())
+                {
+                    if (HotDiff.MetadataName(enumDecl) != addition.EnumType)
+                        continue;
+                    foreach (EnumMemberDeclarationSyntax member in enumDecl.Members)
+                    {
+                        if (member.Identifier.Text != addition.MemberName)
+                            continue;
+                        if (model.GetDeclaredSymbol(member) is IFieldSymbol enumField)
+                        {
+                            string enumFqn = enumField.ContainingType
+                                .ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                            context.AddedEnumMembers[enumField] = (enumFqn, addition.Value);
+                        }
+                    }
+                }
             }
         }
 

@@ -838,6 +838,143 @@ namespace StubE2E
     }
 
     [Fact]
+    public void Appended_enum_member_materializes_as_cast_literal()
+    {
+        var service = new CompileService();
+        const string source = @"
+namespace EnumE2E
+{
+    public enum Mode { Idle = 0, Run = 1 }
+    public class Driver
+    {
+        public int Decide(Mode mode)
+        {
+            switch (mode)
+            {
+                case Mode.Run: return 10;
+                default: return 0;
+            }
+        }
+    }
+}";
+        string originalPath = CompileOriginal(service, "EnumE2EOriginal", source);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newSource = source
+            .Replace("public enum Mode { Idle = 0, Run = 1 }", "public enum Mode { Idle = 0, Run = 1, Fly = 7 }")
+            .Replace("case Mode.Run: return 10;", "case Mode.Run: return 10;\n                case Mode.Fly: return 77;");
+
+        JsonNode result = HotPatch(service, compileParams, ("Mode.cs", source, newSource));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("enum-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "EnumE2EOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchDriver = patch.GetType("EnumE2E.Driver__LocusPatch", throwOnError: true)!;
+            object driver = Activator.CreateInstance(patchDriver)!;
+            Type originalMode = original.GetType("EnumE2E.Mode")!;
+
+            // The new member's VALUE routes through the patched switch even
+            // though the ORIGINAL enum type has no such member.
+            object fly = Enum.ToObject(originalMode, 7);
+            Assert.Equal(77, patchDriver.GetMethod("Decide")!.Invoke(driver, new[] { fly }));
+            object run = Enum.ToObject(originalMode, 1);
+            Assert.Equal(10, patchDriver.GetMethod("Decide")!.Invoke(driver, new[] { run }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Deleted_file_produces_stub_class_for_magic_methods()
+    {
+        var service = new CompileService();
+        const string source = @"
+namespace DeleteE2E
+{
+    public class Spinner
+    {
+        private int _angle;
+        public void Update() { _angle += 1; }
+        public int Angle() { return _angle; }
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "DeleteE2ESpinner", ("Assets/Spinner.cs", source));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // Whole-file deletion: newText is empty.
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Spinner.cs", source, ""));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var stub = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("DeleteE2E.Spinner", stub["declaringType"]!.GetValue<string>());
+        Assert.Equal("DeleteE2E.Spinner__LocusStub", stub["patchDeclaringType"]!.GetValue<string>());
+        Assert.Equal("Update", stub["name"]!.GetValue<string>());
+        Assert.True(stub["isStub"]!.GetValue<bool>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("delete-e2e", isCollectible: true);
+        try
+        {
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type stubType = patch.GetType("DeleteE2E.Spinner__LocusStub", throwOnError: true)!;
+            object instance = Activator.CreateInstance(stubType)!;
+            stubType.GetMethod("Update", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(instance, null);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Deleted_type_with_uncovered_references_is_cold()
+    {
+        var service = new CompileService();
+        const string libSource = @"
+namespace DeleteScanE2E
+{
+    public class Tool
+    {
+        public int Use() { return 1; }
+    }
+}";
+        const string userSource = @"
+namespace DeleteScanE2E
+{
+    public class Workshop
+    {
+        public int Work() { return new Tool().Use(); }
+    }
+}";
+        string asmPath = CompileProjectAssembly(
+            service, "DeleteScanE2E",
+            ("Assets/Tool.cs", libSource),
+            ("Assets/Workshop.cs", userSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Tool.cs", libSource, ""));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("Assets/Workshop.cs", reason);
+    }
+
+    [Fact]
     public void Syntax_error_in_new_text_is_a_deterministic_compile_failure()
     {
         var service = new CompileService();

@@ -605,8 +605,12 @@ public sealed class CompileService
         var batchFiles = new List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)>();
         foreach (var (file, diff) in diffs)
         {
-            if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0 && diff.RemovedMembers.Count == 0)
+            if (diff.ChangedMethods.Count == 0 && diff.NewTypes.Count == 0 &&
+                diff.RemovedMembers.Count == 0 && diff.RemovedTypes.Count == 0 &&
+                diff.EnumAdditions.Count == 0 && diff.RequiresCallerCheck.Count == 0)
+            {
                 continue; // formatting/comment-only edit: nothing to patch
+            }
             SyntaxTree tree = CSharpSyntaxTree.ParseText(file.NewText!, parseOptions, path: file.Path!);
             batchFiles.Add((file.Path!, tree, diff));
         }

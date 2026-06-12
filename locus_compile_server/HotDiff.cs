@@ -88,6 +88,36 @@ public sealed class HotDiffFieldChange
     public int OldFieldIndex;
 }
 
+/// <summary>An enum member appended by the edit, with its resolved constant
+/// value (H7e). Batch references compile as cast literals; Enum.Parse /
+/// ToString only learn the name at the convergence recompile.</summary>
+public sealed class HotDiffEnumAddition
+{
+    public string EnumType = "";
+    public string MemberName = "";
+    public long Value;
+}
+
+/// <summary>A type that exists only in the OLD text (file deletion / type
+/// removal). The loaded type stays — in-flight references are legitimate —
+/// but its Unity message methods detour to empty stubs in a synthesized
+/// patch class so the engine stops driving it (M5/H7e).</summary>
+public sealed class HotDiffRemovedType
+{
+    public string MetadataName = "";
+
+    /// <summary>Ready-to-parse compilation-unit text declaring the stub
+    /// class (old file's usings + namespace + empty magic methods); null
+    /// when the type has no Unity message methods.</summary>
+    public string? StubSource;
+
+    /// <summary>Metadata name of the stub class declared by StubSource.</summary>
+    public string StubTypeMetadataName = "";
+
+    /// <summary>The magic methods stubbed by StubSource (detour mappings).</summary>
+    public List<HotDiffRemovedMember> MagicMethods = new();
+}
+
 /// <summary>Hot/cold classification of one edited file.</summary>
 public sealed class HotDiffFileResult
 {
@@ -107,6 +137,15 @@ public sealed class HotDiffFileResult
 
     /// <summary>Virtualizable field additions/removals (M4).</summary>
     public List<HotDiffFieldChange> FieldChanges = new();
+
+    /// <summary>Enum members appended by this edit (values resolved): batch
+    /// references materialize as `(EnumType)value` literals.</summary>
+    public List<HotDiffEnumAddition> EnumAdditions = new();
+
+    /// <summary>Whole types that exist only in the old text (file deletion
+    /// or type removal), kept hot via TypeRef-level caller scan + tombstone
+    /// + magic-method stub class.</summary>
+    public List<HotDiffRemovedType> RemovedTypes = new();
 
     /// <summary>Deterministic agent-facing error: the new text does not even
     /// parse. Not a cold reason — recompiling would fail identically.</summary>
@@ -181,10 +220,12 @@ public static class HotDiff
         if (result.Reasons.Count > 0)
             return result;
 
-        foreach (string removed in oldTypes.Keys.Where(k => !newTypes.ContainsKey(k)))
-            result.Reasons.Add("type removed: " + removed);
-        if (result.Reasons.Count > 0)
-            return result;
+        foreach (string removed in oldTypes.Keys.Where(k => !newTypes.ContainsKey(k)).OrderBy(k => k, StringComparer.Ordinal))
+        {
+            ClassifyRemovedType(removed, oldTypes[removed], oldRoot, result);
+            if (result.Reasons.Count > 0)
+                return result;
+        }
 
         foreach (var pair in newTypes)
         {
@@ -314,11 +355,15 @@ public static class HotDiff
             return;
         }
 
-        // Enum bodies are inlined constants; delegates are pure signatures.
+        // Enum values are inlined constants: changes/removals/reorders are
+        // unverifiable (no metadata trace) and stay cold. APPEND-ONLY
+        // additions are safe — existing code never references them — and
+        // batch references materialize as cast literals (H7e).
         if (oldDecl is EnumDeclarationSyntax || newDecl is EnumDeclarationSyntax)
         {
-            if (TokenText(oldDecl) != TokenText(newDecl))
-                result.Reasons.Add("enum changed: " + metadataName);
+            if (TokenText(oldDecl) == TokenText(newDecl))
+                return;
+            DiffEnum(metadataName, (EnumDeclarationSyntax)oldDecl, (EnumDeclarationSyntax)newDecl, result);
             return;
         }
 
@@ -440,6 +485,221 @@ public static class HotDiff
 
         if (patched)
             result.PatchedTypes.Add(metadataName);
+    }
+
+    // ── enum additions (H7e) ─────────────────────────────────────────
+
+    /// <summary>Allow strictly-appended enum members with resolvable,
+    /// non-conflicting values; anything else stays cold.</summary>
+    private static void DiffEnum(
+        string metadataName,
+        EnumDeclarationSyntax oldEnum,
+        EnumDeclarationSyntax newEnum,
+        HotDiffFileResult result)
+    {
+        // Header (attributes/modifiers/base) must be identical.
+        string OldHeader(EnumDeclarationSyntax e) => string.Join(
+            "|",
+            AttributeListsText(e.AttributeLists),
+            ModifiersText(e.Modifiers),
+            e.Identifier.Text,
+            e.BaseList != null ? TokenText(e.BaseList) : "");
+        if (OldHeader(oldEnum) != OldHeader(newEnum))
+        {
+            result.Reasons.Add("enum changed: " + metadataName);
+            return;
+        }
+
+        var oldMembers = oldEnum.Members.ToList();
+        var newMembers = newEnum.Members.ToList();
+        if (newMembers.Count <= oldMembers.Count)
+        {
+            result.Reasons.Add("enum changed: " + metadataName +
+                " (values are inlined; only appended members are hot)");
+            return;
+        }
+        for (int i = 0; i < oldMembers.Count; i++)
+        {
+            if (TokenText(oldMembers[i]) != TokenText(newMembers[i]))
+            {
+                result.Reasons.Add("enum changed: " + metadataName +
+                    " (values are inlined; only appended members are hot)");
+                return;
+            }
+        }
+
+        // Resolve every member's value (literal / +1 chains). Unresolvable
+        // EXISTING values only matter when an appended member's value
+        // depends on them or could collide with them.
+        long? current = null;
+        bool anyExistingUnresolvable = false;
+        var existingValues = new HashSet<long>();
+        var additions = new List<HotDiffEnumAddition>();
+        for (int i = 0; i < newMembers.Count; i++)
+        {
+            EnumMemberDeclarationSyntax member = newMembers[i];
+            long? value = member.EqualsValue != null
+                ? ResolveEnumLiteral(member.EqualsValue.Value)
+                : (i == 0 ? 0 : current + 1); // null propagates from an unresolvable predecessor
+            current = value;
+
+            if (i < oldMembers.Count)
+            {
+                if (value is { } existing)
+                    existingValues.Add(existing);
+                else
+                    anyExistingUnresolvable = true;
+                continue;
+            }
+
+            if (value is not { } added)
+            {
+                result.Reasons.Add("enum member value not resolvable: " + metadataName + "." +
+                    member.Identifier.Text + " (use an integer literal, or unity_recompile)");
+                return;
+            }
+            if (existingValues.Contains(added) || anyExistingUnresolvable)
+            {
+                result.Reasons.Add("enum member value conflicts with (or cannot be checked against) " +
+                    "an existing member: " + metadataName + "." + member.Identifier.Text);
+                return;
+            }
+            additions.Add(new HotDiffEnumAddition
+            {
+                EnumType = metadataName,
+                MemberName = member.Identifier.Text,
+                Value = added,
+            });
+        }
+
+        result.EnumAdditions.AddRange(additions);
+    }
+
+    private static long? ResolveEnumLiteral(ExpressionSyntax expression)
+    {
+        switch (expression)
+        {
+            case LiteralExpressionSyntax literal when literal.IsKind(SyntaxKind.NumericLiteralExpression):
+                return literal.Token.Value switch
+                {
+                    int i => i,
+                    long l => l,
+                    uint u => u,
+                    short s => s,
+                    ushort us => us,
+                    byte b => b,
+                    sbyte sb => sb,
+                    ulong ul when ul <= long.MaxValue => (long)ul,
+                    _ => null,
+                };
+            case PrefixUnaryExpressionSyntax unary when unary.IsKind(SyntaxKind.UnaryMinusExpression):
+                return -ResolveEnumLiteral(unary.Operand);
+            case ParenthesizedExpressionSyntax parens:
+                return ResolveEnumLiteral(parens.Expression);
+            default:
+                return null;
+        }
+    }
+
+    // ── removed types (H7e) ──────────────────────────────────────────
+
+    /// <summary>Classify a type that exists only in the old text. Hot path:
+    /// TypeRef-level caller check + tombstone + (for classes) empty stubs
+    /// for every Unity message method, so the engine stops driving scene
+    /// instances immediately. Enums stay cold (inlined values).</summary>
+    private static void ClassifyRemovedType(
+        string metadataName,
+        BaseTypeDeclarationSyntax oldDecl,
+        CompilationUnitSyntax oldRoot,
+        HotDiffFileResult result)
+    {
+        if (oldDecl is EnumDeclarationSyntax)
+        {
+            result.Reasons.Add("enum removed: " + metadataName +
+                " (enum values are inlined at use sites and cannot be verified; use unity_recompile)");
+            return;
+        }
+
+        var removedType = new HotDiffRemovedType { MetadataName = metadataName };
+
+        if (oldDecl is ClassDeclarationSyntax oldClass && !IsGenericContext(oldClass))
+        {
+            var stubs = new List<MethodDeclarationSyntax>();
+            foreach (MethodDeclarationSyntax method in oldClass.Members.OfType<MethodDeclarationSyntax>())
+            {
+                if (!UnityMagicMethods.Contains(method.Identifier.Text))
+                    continue;
+                if (method.Body == null && method.ExpressionBody == null)
+                    continue;
+                if ((method.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                    continue;
+
+                stubs.Add(method
+                    .WithAttributeLists(default)
+                    .WithBody(SyntaxFactory.Block())
+                    .WithExpressionBody(null)
+                    .WithSemicolonToken(default));
+                removedType.MagicMethods.Add(new HotDiffRemovedMember
+                {
+                    DeclaringType = metadataName,
+                    Name = method.Identifier.Text,
+                    ParamTypeNames = ParamTypeNames(method.ParameterList),
+                    IsStatic = method.Modifiers.Any(SyntaxKind.StaticKeyword),
+                    IsUnityMagic = true,
+                });
+            }
+
+            if (stubs.Count > 0)
+            {
+                removedType.StubSource = BuildRemovedTypeStubSource(
+                    metadataName, oldRoot, stubs, out string stubMetadataName);
+                removedType.StubTypeMetadataName = stubMetadataName;
+            }
+        }
+
+        result.RemovedTypes.Add(removedType);
+        result.RequiresCallerCheck.Add(new CallerCheckMember
+        {
+            DeclaringType = metadataName,
+            Name = "",
+            Kind = "type-removed",
+            Detail = "type removed: " + metadataName,
+            ScanMemberNames = Array.Empty<string>(),
+        });
+    }
+
+    /// <summary>Self-contained compilation unit declaring the stub class
+    /// (`T__LocusPatch` with empty magic methods), carrying the old file's
+    /// usings so Unity parameter types resolve.</summary>
+    private static string BuildRemovedTypeStubSource(
+        string metadataName,
+        CompilationUnitSyntax oldRoot,
+        List<MethodDeclarationSyntax> stubs,
+        out string stubMetadataName)
+    {
+        int plus = metadataName.IndexOf('+');
+        string topLevel = plus < 0 ? metadataName : metadataName[..plus];
+        int dot = topLevel.LastIndexOf('.');
+        string ns = dot < 0 ? "" : topLevel[..dot];
+        // Nested classes synthesize a FLAT stub class named after the full
+        // chain — the stub never interacts with the original's nesting.
+        string className = (plus < 0 ? topLevel[(dot + 1)..] : metadataName[(dot + 1)..].Replace('+', '_'))
+            + "__LocusStub";
+        stubMetadataName = ns.Length == 0 ? className : ns + "." + className;
+
+        var sb = new System.Text.StringBuilder();
+        foreach (UsingDirectiveSyntax usingDirective in oldRoot.Usings)
+            sb.AppendLine(usingDirective.NormalizeWhitespace().ToFullString().Trim());
+        if (ns.Length > 0)
+            sb.AppendLine("namespace " + ns + " {");
+        sb.AppendLine("internal sealed class " + className);
+        sb.AppendLine("{");
+        foreach (MethodDeclarationSyntax stub in stubs)
+            sb.AppendLine("    " + stub.NormalizeWhitespace().ToFullString().Trim());
+        sb.AppendLine("}");
+        if (ns.Length > 0)
+            sb.AppendLine("}");
+        return sb.ToString();
     }
 
     // ── field-level layout diff (M4) ─────────────────────────────────

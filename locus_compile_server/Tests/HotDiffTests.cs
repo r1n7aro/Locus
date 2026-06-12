@@ -889,15 +889,113 @@ class C
     }
 
     [Fact]
-    public void Type_removed_is_cold()
+    public void Type_removed_is_conditionally_hot_with_type_level_check()
     {
-        const string oldText = "class A { } class B { }";
+        const string oldText = "class A { } class B { void M() { } }";
         const string newText = "class A { }";
 
         var result = Analyze(oldText, newText);
 
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedTypes);
+        Assert.Equal("B", removed.MetadataName);
+        Assert.Null(removed.StubSource); // no Unity message methods
+        var check = Assert.Single(result.RequiresCallerCheck);
+        Assert.Equal("type-removed", check.Kind);
+        Assert.Empty(check.ScanMemberNames);
+    }
+
+    [Fact]
+    public void Removed_monobehaviour_type_produces_magic_stubs()
+    {
+        const string oldText = @"
+using UnityEngine;
+namespace Game
+{
+    public class Mover : MonoBehaviour
+    {
+        private int _t;
+        public void Update() { _t += 1; }
+        public void OnDisable() { _t = 0; }
+        public void Helper() { }
+    }
+}";
+        var result = Analyze(oldText, "");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedTypes);
+        Assert.Equal("Game.Mover", removed.MetadataName);
+        Assert.NotNull(removed.StubSource);
+        Assert.Equal("Game.Mover__LocusStub", removed.StubTypeMetadataName);
+        Assert.Equal(2, removed.MagicMethods.Count);
+        Assert.Contains(removed.MagicMethods, m => m.Name == "Update");
+        Assert.Contains(removed.MagicMethods, m => m.Name == "OnDisable");
+        Assert.Contains("using UnityEngine;", removed.StubSource);
+    }
+
+    [Fact]
+    public void Removed_enum_type_is_cold()
+    {
+        const string oldText = "enum E { A } class C { void M() { } }";
+        const string newText = "class C { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("type removed: B"));
+        Assert.Contains(result.Reasons, r => r.Contains("enum removed"));
+    }
+
+    // ── enum additions (H7e) ─────────────────────────────────────────
+
+    [Fact]
+    public void Enum_appended_member_is_hot_with_resolved_value()
+    {
+        const string oldText = "enum E { A = 1, B = 2 } class C { void M() { } }";
+        const string newText = "enum E { A = 1, B = 2, C = 5, D } class C { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal(2, result.EnumAdditions.Count);
+        Assert.Contains(result.EnumAdditions, a => a.MemberName == "C" && a.Value == 5);
+        Assert.Contains(result.EnumAdditions, a => a.MemberName == "D" && a.Value == 6);
+    }
+
+    [Fact]
+    public void Enum_appended_auto_value_continues_the_sequence()
+    {
+        const string oldText = "enum E { A, B } class C { void M() { } }";
+        const string newText = "enum E { A, B, C } class C { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var addition = Assert.Single(result.EnumAdditions);
+        Assert.Equal(2, addition.Value);
+    }
+
+    [Fact]
+    public void Enum_appended_conflicting_value_is_cold()
+    {
+        const string oldText = "enum E { A = 1, B = 2 }";
+        const string newText = "enum E { A = 1, B = 2, C = 1 }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("conflicts"));
+    }
+
+    [Fact]
+    public void Enum_appended_after_unresolvable_values_is_cold()
+    {
+        const string oldText = "enum E { A = 1 << 2 }";
+        const string newText = "enum E { A = 1 << 2, B = 9 }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("cannot be checked"));
     }
 
     [Fact]
