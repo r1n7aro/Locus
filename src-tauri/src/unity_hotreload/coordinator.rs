@@ -470,8 +470,15 @@ pub async fn hot_reload(
             caller_scan_note,
         } => {
             if methods.is_empty() && new_types.is_empty() {
+                // Compiled-but-nothing-detourable means the batch ONLY adds
+                // new surface (methods / enum members): the patch is not
+                // loaded, because nothing in the running domain can reach it
+                // yet. Comment-only edits never get here (sidecar noop).
                 return Ok(
-                    "No effective code change (comments/formatting only); nothing to hot reload."
+                    "No detourable change: the edit only adds new surface. It becomes live when \
+                     a later hot edit references it (edit a call site and hot reload again — the \
+                     batch re-sends the addition together with the caller), or at the next \
+                     unity_recompile."
                         .to_string(),
                 );
             }

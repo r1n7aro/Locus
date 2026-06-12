@@ -5,23 +5,28 @@
 //!
 //! Coverage maps to the public hot-reload feature matrix
 //! (hotreload.net/zh/documentation/features), positive and negative:
-//!   • positives: method/property/indexer/event/operator/conversion/ctor
-//!     body edits, lambda + closure, local functions, anonymous types,
-//!     pattern matching, nested types, iterator (coroutine) bodies,
-//!     async↔sync, added methods (shim→shim chains) + fields (instance and
-//!     static), instance-initializer edits, field deletion, signature
-//!     changes (params / ref→out / static flip / rename) with call-site
+//!   • positives: method/property(get+set)/indexer/event/operator/
+//!     conversion/ctor body edits, expression-bodied members, lambda +
+//!     closure (including NEW captures), local functions, anonymous types,
+//!     pattern matching, nested types, iterator (coroutine) bodies, async
+//!     body edits and async↔sync, added methods (shim→shim chains) +
+//!     fields (instance and static, across separate batches),
+//!     instance-initializer edits, field deletion, signature changes
+//!     (params / ref→out / static flip / rename) with call-site
 //!     verification, accessibility narrowing, using add/remove with
 //!     whole-file rehook, enum append, new files, new types in existing
 //!     files, struct method bodies, interface-impl bodies, deletions
 //!     (members, properties, Unity messages, whole files).
 //!   • negatives (must come back COLD with the precise reason): generic
-//!     method bodies, constructor/finalizer surface, virtual members,
-//!     struct field layout, enum value edits, attribute edits, const
-//!     edits, property additions, new Unity message names, interface
-//!     changes, conversions returning the declaring type, added members
-//!     touching non-public state (Mono JIT access checks), uncovered call
-//!     sites (named caller file).
+//!     method bodies (generic methods AND generic types), constructor/
+//!     finalizer surface and finalizer bodies, virtual members, struct
+//!     field layout, enum value edits, attribute edits, const edits,
+//!     property additions, new Unity message names, interface changes,
+//!     base-list changes, partial types, delegate signature changes,
+//!     conversions returning the declaring type, added members touching
+//!     non-public state (Mono JIT access checks), uncovered call sites
+//!     (named caller file); plus the shim-only "parked new surface"
+//!     verdict for caller-less additions.
 //!
 //! Flow: with the editor connected and NOT playing, it materializes a test
 //! corpus under Assets/LocusHotReloadSelfTest, imports + recompiles it as
@@ -85,6 +90,9 @@ public class LocusSelfTestSubject : MonoBehaviour
     public int Ticks { get { return _ticks; } }
     public int Gauge { get { return 17; } }
     public int Doomed { get { return 1; } }
+    public int Arrow => 12;
+    private int _stash = 8;
+    public int Stash { get { return _stash; } set { _stash = value; } }
     public int this[int i] { get { return i; } }
     public event System.Action Surge { add { EvtCount += 1; } remove { } }
 
@@ -181,6 +189,8 @@ public class LocusSelfTestContractImpl : ILocusSelfTestContract
 
 const NEG_BASELINE: &str = r#"public enum LocusSelfTestNegEnum { X = 1, Y = 2 }
 
+public delegate int LocusSelfTestNegDel(int x);
+
 public class LocusSelfTestNegative
 {
     public const int Limit = 3;
@@ -191,6 +201,16 @@ public class LocusSelfTestNegative
     public int Hidden() { return _hidden; }
     internal int Wide() { return 5; }
     public T Echo<T>(T value) { return value; }
+}
+
+public class LocusSelfTestNegGeneric<T>
+{
+    public int Val() { return 1; }
+}
+
+public class LocusSelfTestNegFin
+{
+    ~LocusSelfTestNegFin() { }
 }
 "#;
 
@@ -593,6 +613,26 @@ impl SelfTest {
             .await;
         }
 
+        // P02b — async method BODY edit (distinct from the conversion).
+        if self
+            .step_file("P02b async body edit", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "public async Task<int> Pulse() { await Task.Yield(); return 2002; }",
+                    "public async Task<int> Pulse() { await Task.Yield(); return 2112; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P02b async body edit",
+                "return await LocusSelfTestSubject.Instance.Pulse();",
+                "2112",
+            )
+            .await;
+        }
+
         // P03 — added methods (shim→shim chain). Only PUBLIC original
         // surface: Mono blocks non-public access from shims (N13 asserts
         // that exact verdict).
@@ -821,6 +861,37 @@ impl SelfTest {
             self.expect_output("P10 property getter edit", "return LocusSelfTestSubject.Instance.Gauge;", "7117").await;
         }
 
+        // P10b — property SETTER body edit.
+        if self
+            .step_file("P10b property setter edit", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "public int Stash { get { return _stash; } set { _stash = value; } }",
+                    "public int Stash { get { return _stash; } set { _stash = value + 4880; } }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P10b property setter edit",
+                "LocusSelfTestSubject.Instance.Stash = 8;\nreturn LocusSelfTestSubject.Instance.Stash;",
+                "4888",
+            )
+            .await;
+        }
+
+        // P10c — expression-bodied member edit.
+        if self
+            .step_file("P10c expression-bodied member edit", SUBJECT_FILE, subject, |s| {
+                swap(s, "public int Arrow => 12;", "public int Arrow => 7447;")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output("P10c expression-bodied member edit", "return LocusSelfTestSubject.Instance.Arrow;", "7447").await;
+        }
+
         // P11 — indexer body edit.
         if self
             .step_file("P11 indexer edit", SUBJECT_FILE, subject, |s| {
@@ -869,6 +940,22 @@ impl SelfTest {
             .is_some()
         {
             self.expect_output("P13 lambda + closure edit", "return LocusSelfTestSubject.Instance.Lambda();", "6061").await;
+        }
+
+        // P13b — the edited lambda captures a NEW external variable (closure
+        // display class fully rebuilds inside the patched body).
+        if self
+            .step_file("P13b lambda captures new variable", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "public int Lambda() { int basis = 6060; System.Func<int> f = () => basis + 1; return f(); }",
+                    "public int Lambda() { int basis = 6060; int extra = 1029; System.Func<int> f = () => basis + extra; return f(); }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output("P13b lambda captures new variable", "return LocusSelfTestSubject.Instance.Lambda();", "7089").await;
         }
 
         // P14 — local function body edit.
@@ -1360,6 +1447,90 @@ impl SelfTest {
             .await;
         }
 
+        // N15 — generic-TYPE method bodies stay cold too.
+        let mut text = neg.clone();
+        if swap(&mut text, "public int Val() { return 1; }", "public int Val() { return 2; }").is_ok() {
+            self.expect_cold("N15 generic type method body", NEG_FILE, &text, "generic method body changed", &neg).await;
+        }
+
+        // N16 — base-list change is type surface.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestNegative\n{",
+            "public class LocusSelfTestNegative : System.Object\n{",
+        )
+        .is_ok()
+        {
+            self.expect_cold("N16 base list changed", NEG_FILE, &text, "type declaration changed", &neg).await;
+        }
+
+        // N17 — partial types are out of scope entirely.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestNegFin",
+            "public partial class LocusSelfTestNegFin",
+        )
+        .is_ok()
+        {
+            self.expect_cold("N17 partial modifier added", NEG_FILE, &text, "partial type in file", &neg).await;
+        }
+
+        // N18 — delegate declaration changes alter compiled signatures.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "public delegate int LocusSelfTestNegDel(int x);",
+            "public delegate int LocusSelfTestNegDel(int x, int y);",
+        )
+        .is_ok()
+        {
+            self.expect_cold("N18 delegate signature changed", NEG_FILE, &text, "delegate declarations changed", &neg).await;
+        }
+
+        // N19 — finalizer BODY edits (finalizers never detour).
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    ~LocusSelfTestNegFin() { }",
+            "    ~LocusSelfTestNegFin() { System.GC.KeepAlive(this); }",
+        )
+        .is_ok()
+        {
+            self.expect_cold("N19 finalizer body changed", NEG_FILE, &text, "finalizer changed", &neg).await;
+        }
+
+        // N20 — an added member with NO reachable caller compiles to a shim
+        // but detours nothing: the verdict must say the addition is parked,
+        // not pretend nothing changed.
+        let name = "N20 shim-only addition verdict";
+        self.log(format!("— {name}"));
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { return 1; }\n    public int Lone() { return 6116; }\n",
+        )
+        .is_ok()
+        {
+            match self.write_tracked(NEG_FILE, &text).await {
+                Ok(()) => {
+                    match self.hot_reload(Some(vec![NEG_FILE.to_string()])).await {
+                        Ok(summary) if summary.contains("No detourable change") => {
+                            self.pass(name, "shim-only addition reported as parked new surface");
+                        }
+                        Ok(summary) => self.fail(name, format!("expected the shim-only verdict, got: {}", squash(&summary))),
+                        Err(error) => self.fail(name, squash(&error)),
+                    }
+                    if let Err(error) = self.write_tracked(NEG_FILE, &neg).await {
+                        self.fail(name, format!("restore failed: {error}"));
+                    }
+                }
+                Err(error) => self.fail(name, error),
+            }
+        }
+
         // N14 — accessibility WIDENING is a benign no-op (not cold, not a
         // patch): original metadata keeps working until a real compile.
         let name = "N14 accessibility widening (noop)";
@@ -1416,11 +1587,12 @@ impl SelfTest {
         }
 
         // D03 — plain member deletion (no callers): tombstone. The anchor
-        // tolerates P02 having failed (baseline sync body still in place).
+        // chain tolerates P02/P02b having failed at any point.
         let name = "D03 method deletion";
         if let Some(summary) = self
             .step_file(name, SUBJECT_FILE, subject, |s| {
-                swap(s, "    public async Task<int> Pulse() { await Task.Yield(); return 2002; }\n", "")
+                swap(s, "    public async Task<int> Pulse() { await Task.Yield(); return 2112; }\n", "")
+                    .or_else(|_| swap(s, "    public async Task<int> Pulse() { await Task.Yield(); return 2002; }\n", ""))
                     .or_else(|_| swap(s, "    public Task<int> Pulse() { return Task.FromResult(2001); }\n", ""))
             })
             .await

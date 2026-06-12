@@ -637,10 +637,18 @@ public sealed class CompileService
         }
 
         string? generation = request.Params?.DomainGeneration;
+        string assemblyName = NextAssemblyName("HotPatch", request.Params?.DomainGeneration);
+        // New field-store holders take the assembly's unique counter as a
+        // name suffix: a later batch adding fields to the SAME type must not
+        // declare a holder with the same name as an earlier batch's (its
+        // source declaration would shadow the metadata type that this
+        // batch's re-sent earlier fields still bind to — CS0117).
+        string storeDiscriminator = assemblyName[(assemblyName.LastIndexOf('_') + 1)..];
         PatchBatchContext batch = PatchBatchContext.Build(
             batchFiles, references,
             _memberSurfaceRegistry.SnapshotFor(generation),
-            _fieldStoreRegistry.SnapshotFor(generation));
+            _fieldStoreRegistry.SnapshotFor(generation),
+            storeDiscriminator);
 
         foreach (var (filePath, tree, diff) in batchFiles)
         {
@@ -737,8 +745,6 @@ public sealed class CompileService
         foreach (string name in ReferenceAssemblyNames(references))
             accessAssemblies.Add(name);
         trees.Add(BuildAccessChecksTree(accessAssemblies, parseOptions));
-
-        string assemblyName = NextAssemblyName("HotPatch", request.Params?.DomainGeneration);
 
         CSharpCompilationOptions options = SnippetCompilationOptions
             .WithMetadataImportOptions(MetadataImportOptions.All);

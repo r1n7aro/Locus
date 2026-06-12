@@ -68,6 +68,12 @@ public sealed class PatchBatchContext
     public Dictionary<IFieldSymbol, (string EnumFqn, long Value)> AddedEnumMembers =
         new(SymbolEqualityComparer.Default);
 
+    /// <summary>Batch-unique suffix for NEW field-store holder names. Two
+    /// batches adding fields to the SAME type would otherwise declare
+    /// same-named holders, and the later patch's source declaration would
+    /// shadow (CS0436) the earlier holder its re-sent fields still bind to.</summary>
+    public string StoreDiscriminator = "";
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -79,7 +85,8 @@ public sealed class PatchBatchContext
         IReadOnlyList<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> files,
         System.Collections.Immutable.ImmutableArray<MetadataReference> references,
         IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> earlierShims,
-        IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null)
+        IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null,
+        string storeDiscriminator = "")
     {
         var context = new PatchBatchContext
         {
@@ -95,6 +102,7 @@ public sealed class PatchBatchContext
             EarlierShims = earlierShims,
             EarlierFieldStores = earlierFieldStores
                 ?? new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal),
+            StoreDiscriminator = storeDiscriminator,
         };
 
         foreach (var (_, tree, diff) in files)

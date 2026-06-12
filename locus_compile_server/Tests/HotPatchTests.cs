@@ -613,6 +613,15 @@ namespace FieldE2E
     }
 }";
 
+    /// <summary>Store holders carry a batch-unique suffix
+    /// ("__LocusFields_Counter_0000000A"): locate by prefix.</summary>
+    private static Type? FindStoreType(Assembly assembly, string fullNamePrefix)
+    {
+        return assembly.GetTypes()
+            .SingleOrDefault(t => t.FullName != null &&
+                t.FullName.StartsWith(fullNamePrefix, StringComparison.Ordinal));
+    }
+
     private static JsonNode HotPatchWithRuntime(
         CompileService service,
         JsonObject @params,
@@ -693,7 +702,8 @@ namespace FieldE2E
             Assert.Equal(3 + 12, patchCounter.GetMethod("Tick")!.Invoke(instance, null));
 
             // Pre-existing instances the store never saw read default(T).
-            Type storeHolder = patch.GetType("FieldE2E.__LocusFields_Counter", throwOnError: true)!;
+            Type storeHolder = FindStoreType(patch, "FieldE2E.__LocusFields_Counter")!;
+            Assert.NotNull(storeHolder);
             object store = storeHolder.GetField("_count")!.GetValue(null)!;
             object preExisting = Activator.CreateInstance(original.GetType("FieldE2E.Counter")!)!;
             object? value = store.GetType().GetMethod("Ref")!.Invoke(store, new[] { preExisting });
@@ -808,13 +818,13 @@ namespace FieldE2E
             };
             Assembly patch2 = context.LoadFromStream(new MemoryStream(patch2Bytes));
 
-            Assert.NotNull(patch1.GetType("FieldE2E.__LocusFields_Counter"));
-            Assert.Null(patch2.GetType("FieldE2E.__LocusFields_Counter"));
+            Assert.NotNull(FindStoreType(patch1, "FieldE2E.__LocusFields_Counter"));
+            Assert.Null(FindStoreType(patch2, "FieldE2E.__LocusFields_Counter"));
 
             // Write through patch1's path, read through patch2's body.
             Type patch1Counter = patch1.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
             Type patch2Counter = patch2.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
-            object store = patch1.GetType("FieldE2E.__LocusFields_Counter", throwOnError: true)!
+            object store = FindStoreType(patch1, "FieldE2E.__LocusFields_Counter")!
                 .GetField("_count")!.GetValue(null)!;
 
             object instance2 = Activator.CreateInstance(patch2Counter)!;
@@ -822,6 +832,80 @@ namespace FieldE2E
             Assert.Equal(23, patch2Counter.GetMethod("Tick")!.Invoke(instance2, null));
             _ = patch1Counter;
             _ = store;
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Second_added_field_on_the_same_type_declares_a_distinct_store()
+    {
+        // Regression: batch 2 adding ANOTHER field to the same type used to
+        // declare a holder with the SAME name as batch 1's — the source
+        // declaration shadowed (CS0436) the earlier holder that the re-sent
+        // first field still binds to, failing with CS0117 on that field.
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "FieldE2ESecond", CounterSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        compileParams["domainGeneration"] = "field-second-gen";
+
+        string v1 = CounterSource
+            .Replace("private int _seed = 3;", "private int _seed = 3;\n        private int _count = 10;")
+            .Replace("return _seed;", "return _seed + _count;");
+        JsonNode result1 = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: true,
+            ("Counter.cs", CounterSource, v1));
+        Assert.True(result1["success"]!.GetValue<bool>(), result1["error"]?.GetValue<string>());
+
+        string v2 = v1
+            .Replace("private int _count = 10;", "private int _count = 10;\n        private static int s_total = 6600;")
+            .Replace("return _seed + _count;", "s_total += 1; return _seed + _count + s_total;");
+        JsonNode result2 = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: true,
+            ("Counter.cs", CounterSource, v2));
+        Assert.True(result2["success"]!.GetValue<bool>(), result2["error"]?.GetValue<string>());
+
+        byte[] patch1Bytes = Convert.FromBase64String(result1["assemblyB64"]!.GetValue<string>());
+        byte[] patch2Bytes = Convert.FromBase64String(result2["assemblyB64"]!.GetValue<string>());
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        var context = new AssemblyLoadContext("field-second-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            Assembly patch1 = context.LoadFromStream(new MemoryStream(patch1Bytes));
+            context.Resolving += (_, name) =>
+            {
+                if (name.Name == "FieldE2ESecond")
+                    return original;
+                if (name.Name == "Locus.HotReload.Runtime")
+                    return runtime;
+                if (name.Name == patch1.GetName().Name)
+                    return patch1;
+                return null;
+            };
+            Assembly patch2 = context.LoadFromStream(new MemoryStream(patch2Bytes));
+
+            // Distinct holder names: batch 2's own holder must not shadow
+            // batch 1's, and `_count` lives ONLY in batch 1's.
+            Type store1 = FindStoreType(patch1, "FieldE2E.__LocusFields_Counter")!;
+            Type store2 = FindStoreType(patch2, "FieldE2E.__LocusFields_Counter")!;
+            Assert.NotNull(store1);
+            Assert.NotNull(store2);
+            Assert.NotEqual(store1.FullName, store2.FullName);
+            Assert.NotNull(store1.GetField("_count"));
+            Assert.Null(store2.GetField("_count"));
+            Assert.NotNull(store2.GetField("s_total"));
+
+            // Execution: new instance through patch 2 — _seed(3) +
+            // _count(10, batch 1's store) + s_total(6601 after the bump).
+            Type patch2Counter = patch2.GetType("FieldE2E.Counter__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patch2Counter)!;
+            Assert.Equal(3 + 10 + 6601, patch2Counter.GetMethod("Tick")!.Invoke(instance, null));
         }
         finally
         {

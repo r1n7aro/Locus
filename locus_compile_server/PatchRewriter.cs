@@ -1270,13 +1270,17 @@ public static class PatchRewriter
             return info;
         }
 
-        // "Ns.Outer+Inner" → holder "__LocusFields_Outer_Inner" in Ns. The
-        // name stays inside the __LocusHotPatch_ assembly, so the type-index
-        // skip list covers it without a new prefix entry.
+        // "Ns.Outer+Inner" → holder "__LocusFields_Outer_Inner{_disc}" in Ns.
+        // The name stays inside the __LocusHotPatch_ assembly, so the
+        // type-index skip list covers it without a new prefix entry. The
+        // batch discriminator keeps a LATER batch's holder for the same type
+        // from shadowing the earlier batch's (re-sent fields bind to the
+        // earlier holder by its registered FQN).
         int dot = declaringType.LastIndexOf('.');
         string ns = dot < 0 ? "" : declaringType[..dot];
         string chain = (dot < 0 ? declaringType : declaringType[(dot + 1)..]).Replace('+', '_');
-        string storeName = "__LocusFields_" + chain;
+        string storeName = "__LocusFields_" + chain
+            + (batch.StoreDiscriminator.Length > 0 ? "_" + batch.StoreDiscriminator : "");
         info.StoreNamespace = ns;
         info.StoreMetadataName = ns.Length == 0 ? storeName : ns + "." + storeName;
         info.StoreFqn = "global::" + info.StoreMetadataName;
