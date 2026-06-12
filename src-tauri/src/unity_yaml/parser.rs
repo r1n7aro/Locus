@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::asset_db::types::{parse_guid_hex, Guid};
 
+use super::references;
 use super::tokenizer::{
     count_braces, extract_field_name, extract_field_name_ref, extract_internal_file_id,
     extract_plain_value, extract_value, find_closing_brace, parse_doc_header_full,
@@ -80,10 +81,28 @@ struct TransformWorldState {
 }
 
 pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
+    parse_yaml_docs_impl(content, false).0
+}
+
+/// Single-pass variant that additionally captures every guid-bearing flow map
+/// as a raw reference candidate. The ref-graph pipeline needs both the
+/// documents and the references for each yaml asset; producing them from one
+/// scan halves the parse cost compared to running `parse_yaml_docs` and a
+/// standalone reference extractor back to back (and keeps the two from ever
+/// disagreeing about document boundaries or field context).
+pub fn parse_yaml_docs_with_refs(content: &[u8]) -> (Vec<YamlDoc>, Vec<references::RawYamlRef>) {
+    parse_yaml_docs_impl(content, true)
+}
+
+fn parse_yaml_docs_impl(
+    content: &[u8],
+    collect_refs: bool,
+) -> (Vec<YamlDoc>, Vec<references::RawYamlRef>) {
     let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text.lines().collect();
 
     let mut docs: Vec<YamlDoc> = Vec::new();
+    let mut raw_refs: Vec<references::RawYamlRef> = Vec::new();
+    let mut raw_seen: references::RawRefSeen = HashSet::new();
     let mut cur_class_id: Option<i32> = None;
     let mut cur_file_id: i64 = 0;
     let mut cur_type_name: Option<String> = None;
@@ -191,7 +210,12 @@ pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
         };
     }
 
-    for (i, &line) in lines.iter().enumerate() {
+    // Stream the lines instead of collecting a Vec<&str>: scene files run to
+    // tens of thousands of lines and this loop is the hottest part of the
+    // full scan's yaml phase.
+    let mut line_count = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        line_count = i + 1;
         let trimmed = line.trim();
 
         if let Some(ref mut buf) = pending_line {
@@ -232,6 +256,16 @@ pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
                             }
                         }
                     }
+                }
+                if collect_refs && ct.contains("guid:") {
+                    references::extract_flow_maps_raw(
+                        ct,
+                        cur_class_id,
+                        &last_field,
+                        cur_file_id,
+                        &mut raw_refs,
+                        &mut raw_seen,
+                    );
                 }
                 pending_braces = 0;
             }
@@ -402,11 +436,21 @@ pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
                     &mut cur_source_prefab_guid,
                 );
             }
+            if collect_refs && trimmed.contains("guid:") {
+                references::extract_flow_maps_raw(
+                    trimmed,
+                    cur_class_id,
+                    &last_field,
+                    cur_file_id,
+                    &mut raw_refs,
+                    &mut raw_seen,
+                );
+            }
         }
     }
 
-    flush_doc!(lines.len());
-    docs
+    flush_doc!(line_count);
+    (docs, raw_refs)
 }
 
 pub fn build_world_transform_map(
