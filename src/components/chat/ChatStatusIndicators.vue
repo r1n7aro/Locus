@@ -735,6 +735,7 @@ const codeSummary = computed(() => {
     case "idle": return t("chat.status.code.idle");
     case "preparing": return t("chat.status.code.preparing");
     case "downloading": return t("chat.status.code.downloading", codeDownloadText(status));
+    case "generating": return t("chat.status.code.generating");
     case "starting": return t("chat.status.code.starting");
     case "loading": {
       const total = status.projectCount;

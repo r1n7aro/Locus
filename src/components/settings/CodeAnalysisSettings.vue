@@ -41,6 +41,8 @@ const lspStatusLabel = computed(() => {
       return t("chat.status.code.preparing");
     case "downloading":
       return t("chat.status.code.downloading", status.downloadComponent ?? "");
+    case "generating":
+      return t("chat.status.code.generating");
     case "starting":
       return t("chat.status.code.starting");
     case "loading":

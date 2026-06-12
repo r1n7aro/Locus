@@ -89,6 +89,7 @@ export type CsharpLspPhase =
   | "idle"
   | "preparing"
   | "downloading"
+  | "generating"
   | "starting"
   | "loading"
   | "ready"

@@ -13,6 +13,7 @@
 
 mod assets;
 mod client;
+mod unity_sync;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,9 @@ enum Phase {
         received: u64,
         total: Option<u64>,
     },
+    /// Asking Unity (connected editor or a headless batch run) to write the
+    /// missing `.sln`/`.csproj`.
+    GeneratingProjectFiles,
     Starting,
     Loading {
         completed: u32,
@@ -247,6 +251,7 @@ fn phase_progress_text(phase: &Phase) -> String {
             ),
             _ => format!("downloading {}", component.as_str()),
         },
+        Phase::GeneratingProjectFiles => "generating project files".to_string(),
         Phase::Starting => "starting server".to_string(),
         Phase::Loading { completed, total } => match total {
             Some(total) if *total > 0 => format!("loading projects {completed}/{total}"),
@@ -410,7 +415,7 @@ async fn orchestrate(server: &Arc<WorkspaceServer>) -> Result<(), String> {
         remove_analyzer_props(&server.workspace);
     }
 
-    let target = discover_project_target(&server.workspace).await?;
+    let target = discover_project_target(server).await?;
     if let Ok(mut guard) = server.project_file.lock() {
         *guard = Some(target.display());
     }
@@ -496,22 +501,6 @@ async fn orchestrate(server: &Arc<WorkspaceServer>) -> Result<(), String> {
 
 // ── project discovery ────────────────────────────────────────────────
 
-/// C# snippet that asks the Unity editor to (re)generate `.sln`/`.csproj`.
-/// Prefers the public `CodeEditor.CurrentEditor.SyncAll`, falling back to the
-/// internal-but-stable `UnityEditor.SyncVS.SyncSolution`.
-const UNITY_SYNC_SOLUTION_CODE: &str = r#"
-try {
-    Unity.CodeEditor.CodeEditor.CurrentEditor.SyncAll();
-    print("project files synced via CodeEditor");
-} catch (System.Exception e) {
-    var t = System.Type.GetType("UnityEditor.SyncVS,UnityEditor");
-    var m = t == null ? null : t.GetMethod("SyncSolution",
-        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-    if (m != null) { m.Invoke(null, null); print("project files synced via SyncVS"); }
-    else { print("sync failed: " + e.Message); }
-}
-"#;
-
 fn scan_project_target(root: &Path) -> Option<ProjectTarget> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut solutions: Vec<PathBuf> = Vec::new();
@@ -553,32 +542,53 @@ fn scan_project_target(root: &Path) -> Option<ProjectTarget> {
     None
 }
 
-async fn discover_project_target(root: &Path) -> Result<ProjectTarget, String> {
+async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<ProjectTarget, String> {
+    let root = &server.workspace;
     if let Some(target) = scan_project_target(root) {
         return Ok(target);
     }
 
-    // No project files yet — ask a connected Unity editor to generate them.
     let workspace = root.to_string_lossy().to_string();
-    if crate::unity_bridge::is_unity_project(&workspace) {
-        let (connected, _, _) = crate::unity_bridge::query_unity_status(&workspace).await;
-        if connected {
-            let _ = crate::unity_bridge::unity_execute_code(&workspace, UNITY_SYNC_SOLUTION_CODE)
-                .await;
-            for _ in 0..10 {
-                if let Some(target) = scan_project_target(root) {
-                    return Ok(target);
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    if !crate::unity_bridge::is_unity_project(&workspace) {
+        return Err("No .sln/.csproj found in the workspace".to_string());
+    }
+
+    // No project files yet — ask a connected Unity editor to generate them.
+    let (connected, _, _) = crate::unity_bridge::query_unity_status(&workspace).await;
+    if connected {
+        server.set_phase_unthrottled(Phase::GeneratingProjectFiles);
+        match crate::unity_bridge::unity_execute_code(&workspace, &unity_sync::editor_sync_snippet())
+            .await
+        {
+            Ok(output) => eprintln!(
+                "[CsharpLsp] editor project-file sync: {}",
+                output.replace('\n', " | ")
+            ),
+            Err(error) => eprintln!("[CsharpLsp] editor project-file sync failed: {error}"),
+        }
+        for _ in 0..10 {
+            if let Some(target) = scan_project_target(root) {
+                return Ok(target);
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         return Err(
-            "No .sln/.csproj found in the workspace. Open the Unity project (with an external \
-             script editor configured) so the project files can be generated, then retry."
+            "The connected Unity editor did not produce .sln/.csproj. In Unity, set an \
+             external script editor (Edit > Preferences > External Tools, e.g. Visual Studio \
+             or Rider) and click 'Regenerate project files', then retry."
                 .to_string(),
         );
     }
-    Err("No .sln/.csproj found in the workspace".to_string())
+
+    // No editor around — run the project's editor version headless once to
+    // write the files. Errors out of here are already actionable.
+    server.set_phase_unthrottled(Phase::GeneratingProjectFiles);
+    unity_sync::generate_headless(root).await?;
+    scan_project_target(root).ok_or_else(|| {
+        "Unity batch generation finished but no .sln/.csproj appeared in the workspace root. \
+         Open the project in Unity once with an external script editor configured, then retry."
+            .to_string()
+    })
 }
 
 // ── file watching ────────────────────────────────────────────────────
@@ -1561,6 +1571,7 @@ fn build_status(server: Option<&Arc<WorkspaceServer>>) -> CsharpLspStatusPayload
             payload.download_received = Some(received);
             payload.download_total = total;
         }
+        Phase::GeneratingProjectFiles => payload.phase = "generating".to_string(),
         Phase::Starting => payload.phase = "starting".to_string(),
         Phase::Loading { completed, total } => {
             payload.phase = "loading".to_string();

@@ -539,6 +539,7 @@
   "chat.status.code.idle": "Code analysis enabled",
   "chat.status.code.preparing": "Preparing components",
   "chat.status.code.downloading": "Downloading {0}",
+  "chat.status.code.generating": "Generating project files via Unity",
   "chat.status.code.starting": "Starting analysis server",
   "chat.status.code.loading": "Loading projects",
   "chat.status.code.loadingProgress": "Loading projects {0}/{1}",
