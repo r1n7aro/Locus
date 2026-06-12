@@ -326,7 +326,11 @@ public sealed class CompileService
     {
         string source = UnitySnippetSource.BuildAsyncSnippetSource(
             UnitySnippetSource.HostTypeName, leadingUsings, bodyCode, expressionMode);
-        string assemblyName = NextAssemblyName("Snippet", request.Params?.DomainGeneration);
+        // Keep the legacy "__LocusRuntimeAsync_" prefix: the Unity-side type
+        // index skips snippet assemblies by that prefix, and a different name
+        // would invalidate (and force a full re-export of) the type index
+        // after every executed snippet.
+        string assemblyName = NextAssemblyName("RuntimeAsync", request.Params?.DomainGeneration);
 
         var (bytes, error) = CompileWrappedSource(
             assemblyName,

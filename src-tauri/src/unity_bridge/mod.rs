@@ -1419,6 +1419,11 @@ pub async fn unity_run_states(
         }
     }
 
+    eprintln!(
+        "[Locus] unity_run_states sending {} ({} bytes)",
+        msg_type,
+        payload.len()
+    );
     let mut resp = send_message_without_timeout(project_path, msg_type, &payload).await?;
     if msg_type == "run_states_loaded" && unity_plugin_lacks_message(&resp) {
         crate::csharp_compile::note_fallback(
@@ -2120,10 +2125,21 @@ async fn unity_type_index_for_execute(
         Err(error) => eprintln!("[Locus] Unity type index cache ignored: {}", error),
     }
 
+    let refresh_started = std::time::Instant::now();
     match refresh_unity_type_index(project_path).await {
-        Ok(index) => Some(index),
+        Ok(index) => {
+            eprintln!(
+                "[Locus] Unity type index refreshed in {}ms",
+                refresh_started.elapsed().as_millis()
+            );
+            Some(index)
+        }
         Err(error) => {
-            eprintln!("[Locus] Unity type index export skipped: {}", error);
+            eprintln!(
+                "[Locus] Unity type index export skipped after {}ms: {}",
+                refresh_started.elapsed().as_millis(),
+                error
+            );
             None
         }
     }
@@ -2189,8 +2205,15 @@ async fn sidecar_compile_for_execute(
         Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
     };
 
+    let compile_started = std::time::Instant::now();
     match crate::csharp_compile::compile_snippet(&params, prepared_code, false, true).await {
         Ok(Ok(assembly)) => {
+            eprintln!(
+                "[CsharpCompile] snippet compiled in {}ms ({} KB, mode {})",
+                compile_started.elapsed().as_millis(),
+                assembly.assembly_b64.len() / 1024,
+                assembly.mode.as_deref().unwrap_or("?")
+            );
             let payload = serde_json::json!({
                 "assembly_b64": assembly.assembly_b64,
                 "entry_type": assembly
@@ -2200,10 +2223,17 @@ async fn sidecar_compile_for_execute(
             .to_string();
             SidecarCompileAttempt::Compiled { payload }
         }
-        Ok(Err(failure)) => SidecarCompileAttempt::CompileError(format!(
-            "async snippet compilation exception: {}",
-            failure.message
-        )),
+        Ok(Err(failure)) => {
+            eprintln!(
+                "[CsharpCompile] snippet compile diagnostics in {}ms (stage {})",
+                compile_started.elapsed().as_millis(),
+                failure.stage
+            );
+            SidecarCompileAttempt::CompileError(format!(
+                "async snippet compilation exception: {}",
+                failure.message
+            ))
+        }
         Err(error) => SidecarCompileAttempt::Unavailable(error),
     }
 }
@@ -2285,6 +2315,12 @@ where
         // Owned per-attempt copy: the pinned send future must not borrow
         // `execute_payload`, which the old-plugin fallback arm reassigns.
         let attempt_payload = execute_payload.clone();
+        eprintln!(
+            "[Locus] unity_execute sending {} ({} bytes, attempt {})",
+            execute_msg_type,
+            attempt_payload.len(),
+            send_attempt
+        );
         let execute =
             send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
         tokio::pin!(execute);
@@ -2304,6 +2340,12 @@ where
                     if let Some(snapshot) = query_unity_execute_progress(project_path).await {
                         progress_unavailable_since = None;
                         if snapshot.active {
+                            if !saw_unity_progress {
+                                eprintln!(
+                                    "[Locus] unity_execute first Unity progress after {}ms",
+                                    execute_started_at.elapsed().as_millis()
+                                );
+                            }
                             saw_unity_progress = true;
                         }
                         if snapshot.revision != last_progress_revision {
@@ -2331,6 +2373,10 @@ where
                         && execute_started_at.elapsed()
                             > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
                     {
+                        eprintln!(
+                            "[Locus] unity_execute saw no Unity progress within {}s after sending {}; resetting pipe",
+                            UNITY_EXECUTE_START_TIMEOUT_SECS, execute_msg_type
+                        );
                         break Err(format!(
                             "Unity execute did not leave the sending stage within {}s",
                             UNITY_EXECUTE_START_TIMEOUT_SECS
@@ -2473,6 +2519,12 @@ where
         // Owned per-attempt copy: the pinned send future must not borrow
         // `execute_payload`, which the old-plugin fallback arm reassigns.
         let attempt_payload = execute_payload.clone();
+        eprintln!(
+            "[Locus] unity_execute sending {} ({} bytes, attempt {})",
+            execute_msg_type,
+            attempt_payload.len(),
+            send_attempt
+        );
         let execute =
             send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
         tokio::pin!(execute);
@@ -2533,6 +2585,12 @@ where
                     if let Some(snapshot) = query_unity_execute_progress(project_path).await {
                         progress_unavailable_since = None;
                         if snapshot.active {
+                            if !saw_unity_progress {
+                                eprintln!(
+                                    "[Locus] unity_execute first Unity progress after {}ms",
+                                    execute_started_at.elapsed().as_millis()
+                                );
+                            }
                             saw_unity_progress = true;
                         }
                         if snapshot.revision != last_progress_revision {
@@ -2571,6 +2629,10 @@ where
                         && execute_started_at.elapsed()
                             > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
                     {
+                        eprintln!(
+                            "[Locus] unity_execute saw no Unity progress within {}s after sending {}; resetting pipe",
+                            UNITY_EXECUTE_START_TIMEOUT_SECS, execute_msg_type
+                        );
                         break Err(format!(
                             "Unity execute did not leave the sending stage within {}s",
                             UNITY_EXECUTE_START_TIMEOUT_SECS

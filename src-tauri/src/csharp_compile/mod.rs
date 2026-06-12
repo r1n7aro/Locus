@@ -331,7 +331,7 @@ mod tests {
     fn parse_compile_result_success() {
         let value = json!({
             "success": true,
-            "assemblyName": "__LocusSnippet_00000000_00000001",
+            "assemblyName": "__LocusRuntimeAsync_00000000_00000001",
             "assemblyB64": "TVo=",
             "entryType": "Locus.RuntimeSnippets.__LocusAsyncSnippetHost",
             "mode": "statements",
@@ -340,7 +340,7 @@ mod tests {
         let outcome = parse_compile_result(value).expect("parse");
         let assembly = outcome.expect("success");
         assert_eq!(assembly.assembly_b64, "TVo=");
-        assert_eq!(assembly.assembly_name, "__LocusSnippet_00000000_00000001");
+        assert_eq!(assembly.assembly_name, "__LocusRuntimeAsync_00000000_00000001");
         assert_eq!(
             assembly.entry_type.as_deref(),
             Some("Locus.RuntimeSnippets.__LocusAsyncSnippetHost")

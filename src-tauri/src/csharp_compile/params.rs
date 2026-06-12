@@ -65,6 +65,7 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
         .unwrap_or_default();
 
     let payload = serde_json::json!({ "known_fingerprint": known_fingerprint }).to_string();
+    let roundtrip_started = std::time::Instant::now();
     // Short timeout: when the editor is too busy to answer (domain reload,
     // import), fall back to the in-Unity compile path quickly instead of
     // stalling the tool call for the default pipe timeout.
@@ -116,6 +117,17 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
             defines: response.defines,
         }
     };
+
+    eprintln!(
+        "[CsharpCompile] compile params {} in {}ms ({} reference paths)",
+        if response.unchanged {
+            "unchanged"
+        } else {
+            "refreshed"
+        },
+        roundtrip_started.elapsed().as_millis(),
+        params.reference_paths.len()
+    );
 
     params_cache()
         .lock()

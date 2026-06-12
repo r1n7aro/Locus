@@ -1092,10 +1092,12 @@ namespace Locus
         private static async Task<bool> SendEnvelopeAsync(PipeEnvelope env)
         {
             StreamWriter writer;
+            NamedPipeServerStream server;
 
             lock (_connectionLock)
             {
                 writer = _currentWriter;
+                server = _currentServer;
             }
 
             if (writer == null)
@@ -1122,6 +1124,17 @@ namespace Locus
             catch (Exception ex)
             {
                 Debug.LogWarning("[Locus] Failed to write to pipe: " + ex.Message);
+
+                // A broken write means the client end is gone, but on Mono
+                // the pending ReadLineAsync of this connection may take
+                // seconds to notice — during which the single pipe instance
+                // stays occupied and reconnect attempts fail with
+                // ERROR_PIPE_BUSY. Dispose the dead server so its reader
+                // unwinds and the listen loop can accept again immediately.
+                if (server != null && (ex is IOException || ex is ObjectDisposedException))
+                {
+                    try { server.Dispose(); } catch { }
+                }
                 return false;
             }
             finally

@@ -167,6 +167,7 @@ namespace Locus
                 return true;
 
             return assemblyName.StartsWith("__LocusRuntimeAsync_", StringComparison.Ordinal)
+                || assemblyName.StartsWith("__LocusSnippet_", StringComparison.Ordinal)
                 || assemblyName.StartsWith("__LocusView_", StringComparison.Ordinal)
                 || assemblyName.StartsWith("__LocusRunStates_", StringComparison.Ordinal)
                 || IsInactiveSkillPackageAssemblyName(assemblyName)
