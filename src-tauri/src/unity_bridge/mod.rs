@@ -1947,6 +1947,21 @@ pub async fn cancel_unity_execute_code(project_path: &str) -> Result<String, Str
 pub async fn refresh_unity_type_index(
     project_path: &str,
 ) -> Result<Arc<crate::unity_type_index::UnityTypeIndex>, String> {
+    // TI-B: build the base index from reference metadata in the sidecar —
+    // no AppDomain reflection sweep, no multi-MB pipe payload. The Unity
+    // export below stays as the always-available degradation path (and the
+    // source that includes in-memory skill-package assemblies).
+    if crate::csharp_compile::is_enabled() {
+        match sidecar_type_index(project_path).await {
+            Ok(index) => return Ok(index),
+            Err(reason) => {
+                eprintln!(
+                    "[Locus] sidecar type index unavailable; using the Unity export: {reason}"
+                );
+            }
+        }
+    }
+
     let resp = send_message_with_timeout(
         project_path,
         "export_type_index",
@@ -1963,6 +1978,28 @@ pub async fn refresh_unity_type_index(
 
     let message = resp.message.unwrap_or_default();
     crate::unity_type_index::persist_exported_type_index(project_path, &message).await
+}
+
+/// TI-B path: sidecar-built entry set keyed by the Unity-side fingerprint
+/// (one cheap pipe roundtrip — TI-A moved it off the editor main thread).
+async fn sidecar_type_index(
+    project_path: &str,
+) -> Result<Arc<crate::unity_type_index::UnityTypeIndex>, String> {
+    let params = sidecar_compile_params(project_path).await?;
+    let fingerprint = current_unity_type_index_fingerprint(project_path).await?;
+    let types = crate::csharp_compile::index_types(&params).await?;
+
+    // A Unity project's reference set always carries thousands of public
+    // types (UnityEngine alone); a tiny result means a broken reference
+    // set — fail over to the Unity export rather than degrade auto-usings.
+    if types.len() < 100 {
+        return Err(format!(
+            "suspiciously small sidecar type index ({} entries)",
+            types.len()
+        ));
+    }
+
+    crate::unity_type_index::persist_sidecar_type_index(project_path, fingerprint, types).await
 }
 
 pub struct UnityTypeIndexUpdateResult {

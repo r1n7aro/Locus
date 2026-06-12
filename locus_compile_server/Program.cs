@@ -13,6 +13,7 @@
 //   compile/runStates -> wrap + compile a unity_run_states state machine
 //   analyze/hotDiff   -> classify edited files as hot-patchable or not
 //   compile/hotPatch  -> diff + rewrite + compile a hot-patch assembly
+//   index/types       -> Unity type index built from reference metadata
 
 using System.Globalization;
 using System.Text.Json;
@@ -102,6 +103,9 @@ while (true)
                 break;
             case "compile/hotPatch":
                 result = service.HandleCompileHotPatch(@params);
+                break;
+            case "index/types":
+                result = service.HandleIndexTypes(@params);
                 break;
             default:
                 error = RpcError(-32601, $"method not found: {method}");

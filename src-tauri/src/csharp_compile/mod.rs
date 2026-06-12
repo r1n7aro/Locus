@@ -432,6 +432,30 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     })
 }
 
+// ── type index (TI-B) ────────────────────────────────────────────────
+
+/// Build the Unity type index from reference metadata in the sidecar
+/// (`index/types`). Returns the parsed entry set; the caller pairs it with a
+/// Unity-side fingerprint. Transport errors route back to the Unity export.
+pub async fn index_types(
+    compile_params: &CompileParams,
+) -> Result<Vec<crate::unity_type_index::UnityTypeIndexEntry>, String> {
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout(
+            "index/types",
+            json!({ "params": compile_params }),
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await?;
+
+    let types = value
+        .get("types")
+        .cloned()
+        .ok_or_else(|| "malformed index/types response (missing types)".to_string())?;
+    serde_json::from_value(types).map_err(|e| format!("malformed index/types entries: {e}"))
+}
+
 /// Test-only flag control (`initialize` needs an AppHandle).
 #[cfg(test)]
 pub fn initialize_enabled_for_tests(value: bool) {

@@ -131,6 +131,12 @@ public sealed class AnalyzeHotDiffRequestDto
     public CompileParamsDto? Params { get; set; }
 }
 
+public sealed class IndexTypesRequestDto
+{
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+}
+
 public sealed class CompileHotPatchRequestDto
 {
     [JsonPropertyName("files")]
@@ -608,6 +614,26 @@ public sealed class CompileService
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
+        return result;
+    }
+
+    /// <summary>
+    /// TI-B: produce the Unity type index from reference metadata. The
+    /// fingerprint stays Unity-owned (the Rust side pairs this type set with
+    /// the cheap `export_type_index_fingerprint` roundtrip), so every cache
+    /// currency check and delta channel keeps a single fingerprint scheme.
+    /// </summary>
+    public JsonNode HandleIndexTypes(JsonNode? @params)
+    {
+        var request = Deserialize<IndexTypesRequestDto>(@params);
+        long startedAt = Environment.TickCount64;
+
+        ImmutableArray<MetadataReference> references = ResolveReferences(request.Params, useHostBcl: false);
+        List<TypeIndexSource.Entry> entries = TypeIndexSource.Build(
+            references.OfType<PortableExecutableReference>());
+
+        JsonObject result = TypeIndexSource.ToJson(entries);
+        result["durationMs"] = Environment.TickCount64 - startedAt;
         return result;
     }
 

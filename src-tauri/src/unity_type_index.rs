@@ -346,6 +346,30 @@ pub async fn persist_skill_package_type_index_delta(
     Ok(Some(index))
 }
 
+/// TI-B: persist a sidecar-built type index. The fingerprint is the
+/// Unity-side `export_type_index_fingerprint` value, so currency checks and
+/// the skill-package delta channel work identically for both sources.
+pub async fn persist_sidecar_type_index(
+    project_path: &str,
+    fingerprint: String,
+    types: Vec<UnityTypeIndexEntry>,
+) -> Result<Arc<UnityTypeIndex>, String> {
+    let fingerprint = fingerprint.trim().to_string();
+    if fingerprint.is_empty() {
+        return Err("sidecar type index is missing the Unity fingerprint".to_string());
+    }
+    let cache = UnityTypeIndexCacheFile {
+        version: CACHE_VERSION,
+        fingerprint,
+        exported_at_unix_ms: now_unix_ms(),
+        assemblies: BTreeMap::new(),
+        types,
+    };
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index.clone()).await;
+    Ok(index)
+}
+
 /// TI-C: layer hot-patch new types into the cached index so auto-usings
 /// resolve them immediately. The cache fingerprint is untouched on purpose:
 /// Unity's own export fingerprint skips `__LocusHotPatch_` assemblies, so
@@ -1326,6 +1350,58 @@ mod tests {
 
             assert!(cached_type_index(&project_path).await.is_none());
             assert!(!cache_path.exists());
+        });
+    }
+
+    #[test]
+    fn sidecar_type_index_persists_and_hot_patch_types_layer_on_top() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+
+            let index = persist_sidecar_type_index(
+                &project_path,
+                "unity-fp-1".to_string(),
+                vec![
+                    test_entry("ProjectType", "Game", "Assembly-CSharp"),
+                    test_entry("Widget", "Game.UI", "Assembly-CSharp"),
+                ],
+            )
+            .await
+            .expect("persist sidecar index");
+            assert_eq!(index.fingerprint, "unity-fp-1");
+            assert!(index.by_simple_name.contains_key("Widget"));
+            assert!(type_index_cache_path(&project_path).is_file());
+
+            // TI-C layering keeps the fingerprint (Unity's own fingerprint
+            // skips hot patch assemblies) and supersedes re-patched types.
+            append_hot_patch_types(
+                &project_path,
+                "__LocusHotPatch_00000000_00000001",
+                vec![test_entry("Spawner", "Game", "")],
+            )
+            .await
+            .expect("append hot patch types");
+
+            let layered = cached_type_index(&project_path).await.expect("cached");
+            assert_eq!(layered.fingerprint, "unity-fp-1");
+            assert!(layered.by_simple_name.contains_key("Spawner"));
+            let spawner = &layered.by_simple_name["Spawner"][0];
+            assert_eq!(spawner.assembly, "__LocusHotPatch_00000000_00000001");
+
+            append_hot_patch_types(
+                &project_path,
+                "__LocusHotPatch_00000000_00000002",
+                vec![test_entry("Spawner", "Game", "")],
+            )
+            .await
+            .expect("supersede hot patch types");
+
+            let layered = cached_type_index(&project_path).await.expect("cached");
+            let spawners = &layered.by_simple_name["Spawner"];
+            assert_eq!(spawners.len(), 1);
+            assert_eq!(spawners[0].assembly, "__LocusHotPatch_00000000_00000002");
         });
     }
 
