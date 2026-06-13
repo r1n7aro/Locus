@@ -119,7 +119,8 @@ impl ScanPartial {
         self.meta_files.append(&mut other.meta_files);
         self.yaml_asset_files.append(&mut other.yaml_asset_files);
         self.dirs_scanned += other.dirs_scanned;
-        self.linked_asset_roots.append(&mut other.linked_asset_roots);
+        self.linked_asset_roots
+            .append(&mut other.linked_asset_roots);
         self.entry_probes.append(&mut other.entry_probes);
         self
     }
@@ -192,8 +193,7 @@ pub(crate) fn scan_directory_with_options(
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
         if root_is_link {
-            let target_path =
-                dunce::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+            let target_path = dunce::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
             combined.linked_asset_roots.push(LinkedAssetRoot {
                 link_rel_path: (*root_name).to_string(),
                 target_path,
@@ -270,11 +270,7 @@ fn scan_tree(ctx: &ScanContext<'_>, dir_abs: PathBuf) -> ScanPartial {
                     link_rel_path: rel_path,
                     target_path: target_path.clone(),
                 });
-                let not_yet_walked = ctx
-                    .visited_link_targets
-                    .lock()
-                    .unwrap()
-                    .insert(target_path);
+                let not_yet_walked = ctx.visited_link_targets.lock().unwrap().insert(target_path);
                 if not_yet_walked {
                     child_dirs.push(abs_path);
                 }

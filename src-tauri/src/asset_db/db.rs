@@ -985,8 +985,10 @@ pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64
             .par_iter()
             .map(|a| derive_search_cols(&a.path))
             .collect();
-        let main_objects: Vec<AssetObject> =
-            chunk.par_iter().map(object_index::main_asset_object).collect();
+        let main_objects: Vec<AssetObject> = chunk
+            .par_iter()
+            .map(object_index::main_asset_object)
+            .collect();
         let inheritance_rows: Vec<(String, Guid)> = chunk
             .par_iter()
             .flat_map_iter(|asset| {
@@ -1009,9 +1011,7 @@ pub fn batch_insert_assets(tx: &Transaction, assets: &[AssetNode]) -> Result<u64
                              ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 )
                 .map_err(|e| format!("Failed to prepare asset insert: {}", e))?;
-            for (a, (root, path_lower, file_name_lower, stem_lower)) in
-                chunk.iter().zip(&derived)
-            {
+            for (a, (root, path_lower, file_name_lower, stem_lower)) in chunk.iter().zip(&derived) {
                 asset_stmt
                     .execute(params![
                         a.guid.as_slice(),

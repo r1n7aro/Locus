@@ -523,7 +523,13 @@ impl AssetDb {
                     let importer_subassets = object_index::parse_importer_subassets(&content);
                     let content_probe =
                         probe_for_meta(&snapshot.entry_probes, &entry.rel_path, &entry.abs_path);
-                    Ok((entry.clone(), guid, meta_hash, importer_subassets, content_probe))
+                    Ok((
+                        entry.clone(),
+                        guid,
+                        meta_hash,
+                        importer_subassets,
+                        content_probe,
+                    ))
                 })();
                 let completed = meta_progress.fetch_add(1, Ordering::Relaxed) + 1;
                 maybe_emit_scan_progress(
@@ -957,7 +963,11 @@ impl AssetDb {
                     &duplicate_guids_overview,
                 );
                 let parse_failure_report = sync_parse_failure_report(project_root, &parse_failures);
-                (duplicate_guid_report, parse_failure_report, started.elapsed())
+                (
+                    duplicate_guid_report,
+                    parse_failure_report,
+                    started.elapsed(),
+                )
             });
 
             let write_result = (|| -> Result<DbWriteOutcome, String> {

@@ -255,7 +255,10 @@ const IMPORTER_SUBASSET_MARKERS: &[&[u8]] = &[
 ];
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 pub(crate) fn parse_importer_subassets(content: &[u8]) -> Vec<ImporterSubAsset> {

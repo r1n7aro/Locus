@@ -564,7 +564,10 @@ fn to_asset_rel_paths_and_reasons(
 /// directories receive write events whenever a child changes, and walking the
 /// subtree on every file save would be pathological.
 fn is_structural_event(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_)))
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
 }
 
 /// Whether an absolute directory path maps into the scanned roots (directly
@@ -3299,13 +3302,8 @@ mod tests {
 
         let queue = DirtyQueue::new();
         let activity = RecentQueueActivityLog::new();
-        let queued = enqueue_dir_subtree_metas(
-            &root.join("Assets/NewStuff"),
-            &root,
-            &[],
-            &queue,
-            &activity,
-        );
+        let queued =
+            enqueue_dir_subtree_metas(&root.join("Assets/NewStuff"), &root, &[], &queue, &activity);
         assert_eq!(queued, 2);
 
         let mut paths = Vec::new();
