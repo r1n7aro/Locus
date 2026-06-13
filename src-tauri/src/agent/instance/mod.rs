@@ -2787,7 +2787,10 @@ impl AgentInstance {
                 .or_else(|| require_absolute_without_workspace("project_path")),
             // Code analysis tools read arbitrary files via `file_path`; hold
             // them to the same workspace boundary as read/write/edit.
-            "code_find_references" | "code_goto_definition" | "code_diagnostics" | "code_hover"
+            "code_find_references"
+            | "code_goto_definition"
+            | "code_diagnostics"
+            | "code_hover"
             | "unity_code_usages" => {
                 if !has_working_dir {
                     Some(format!(
@@ -3006,8 +3009,11 @@ impl AgentInstance {
                 // Semantic C# tools ride on the optional Roslyn language
                 // server; keep them out of the agent context entirely while
                 // the feature toggle (or the tool's own switch) is off.
-                "code_find_references" | "code_goto_definition" | "code_symbol_search"
-                | "code_diagnostics" | "code_hover" => {
+                "code_find_references"
+                | "code_goto_definition"
+                | "code_symbol_search"
+                | "code_diagnostics"
+                | "code_hover" => {
                     crate::csharp_lsp::is_enabled()
                         && crate::code_tools::tool_enabled(tool_name.as_str())
                 }

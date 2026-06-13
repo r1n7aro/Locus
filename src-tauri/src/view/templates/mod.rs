@@ -142,10 +142,7 @@ pub(super) fn template_files(id: &str, name: &str, template: &str) -> Vec<(&'sta
         "# {name}\n\nView Package `{id}` generated from `{template}`.\n\nEdit files under this directory and reload the View from Locus.\n"
     );
 
-    let mut files = vec![
-        ("README.md", readme),
-        ("src/main.ts", common::main_ts()),
-    ];
+    let mut files = vec![("README.md", readme), ("src/main.ts", common::main_ts())];
 
     match template {
         "inspector-form" => {
@@ -284,7 +281,10 @@ mod tests {
             "supported_view_templates() and the template enum in tools/view_create.json must list the same templates in the same order",
         );
         for id in &registry_ids {
-            assert!(is_supported_template(id), "registry template must be supported: {id}");
+            assert!(
+                is_supported_template(id),
+                "registry template must be supported: {id}"
+            );
         }
         assert!(!is_supported_template("unknown-template"));
 
@@ -323,7 +323,13 @@ mod tests {
         for template in supported_view_templates() {
             let files = template_files("test-view", "Test View", &template.id);
             let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
-            for required in ["README.md", "src/main.ts", "src/App.vue", "src/style.css", ".locus-view"] {
+            for required in [
+                "README.md",
+                "src/main.ts",
+                "src/App.vue",
+                "src/style.css",
+                ".locus-view",
+            ] {
                 assert!(
                     names.contains(&required),
                     "{} must generate {required}",

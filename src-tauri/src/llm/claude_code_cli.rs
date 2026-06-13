@@ -580,7 +580,12 @@ pub async fn run_turn<H: ClaudeCodeHost>(
                 .await?;
             }
             "stream_event" => {
-                handle_stream_event(&message, host, &options.server_name, &mut thinking_started_at);
+                handle_stream_event(
+                    &message,
+                    host,
+                    &options.server_name,
+                    &mut thinking_started_at,
+                );
             }
             "assistant" => {
                 if let Some(parsed) = parse_assistant_message(&message, &options.server_name) {

@@ -1193,8 +1193,9 @@ mod tests {
     fn append_paths_skips_existing_and_appends_new_entries() {
         use std::path::PathBuf;
 
-        let current = std::env::join_paths([PathBuf::from("/locus/bin"), PathBuf::from("/usr/bin")])
-            .expect("join test paths");
+        let current =
+            std::env::join_paths([PathBuf::from("/locus/bin"), PathBuf::from("/usr/bin")])
+                .expect("join test paths");
         let result = super::append_paths(
             Some(current),
             vec![PathBuf::from("/usr/bin"), PathBuf::from("/opt/new/bin")],

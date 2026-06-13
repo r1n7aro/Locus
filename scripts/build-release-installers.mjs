@@ -13,6 +13,18 @@ const withoutEmbedConfig = path.join(srcTauriDir, "tauri.without_embed_python_gi
 // the official release flow). Passing --compression=lzma layers this overlay on
 // top for a smaller but much slower-to-build installer.
 const nsisLzmaConfig = path.join(srcTauriDir, "tauri.nsis-lzma.conf.json");
+// `[profile.release] incremental = true` in src-tauri/Cargo.toml trades codegen
+// quality for fast warm rebuilds during development. Shipped installers should
+// not pay that tax: these cargo profile env overrides restore full optimization
+// (no incremental CGU splitting, thin LTO, single codegen unit) for this script
+// only. Installer builds get slower — no incremental reuse plus an LTO link —
+// and the next plain release build after one recompiles from scratch because
+// the profile fingerprint differs.
+const releaseCargoEnv = {
+  CARGO_PROFILE_RELEASE_INCREMENTAL: "false",
+  CARGO_PROFILE_RELEASE_LTO: "thin",
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1",
+};
 const compressions = new Set(["zlib", "lzma"]);
 const flavors = new Map([
   [
@@ -99,10 +111,10 @@ function parseArgs(rawArgs) {
   return { requestedFlavors, tauriArgs, compression };
 }
 
-function run(command, args) {
+function run(command, args, extraEnv) {
   const result = spawnSync(command, args, {
     cwd: repoRoot,
-    env: process.env,
+    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     stdio: "inherit",
   });
 
@@ -185,7 +197,7 @@ function buildFlavor(flavorName, compression, tauriArgs, baseName) {
   const compressionArgs =
     compression === "lzma" ? ["--config", path.relative(repoRoot, nsisLzmaConfig)] : [];
   console.log(`[locus] Building release installer flavor: ${flavorName} (nsis compression: ${compression})`);
-  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs]);
+  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], releaseCargoEnv);
   const finalPath = finalizeInstaller(flavor, baseName, startedAtMs);
 
   return {

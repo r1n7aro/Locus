@@ -1620,9 +1620,8 @@ fn apply_cache_control(messages: &mut [AnthropicMessage], ttl: Option<&'static s
     let start = if len >= 2 { len - 2 } else { 0 };
     for msg in &mut messages[start..] {
         if let Some(slot) = msg.content.iter_mut().rev().find_map(|block| match block {
-            HistoryContentBlock::Text { cache_control, .. } | HistoryContentBlock::Image { cache_control, .. } => {
-                Some(cache_control)
-            }
+            HistoryContentBlock::Text { cache_control, .. }
+            | HistoryContentBlock::Image { cache_control, .. } => Some(cache_control),
             _ => None,
         }) {
             *slot = Some(marker.clone());

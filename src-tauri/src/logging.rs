@@ -284,11 +284,21 @@ fn classify_print_level(message: &str, is_stderr: bool) -> Level {
     {
         return Level::DEBUG;
     }
-    if lower.contains("panic")
-        || lower.contains(" failed")
-        || lower.contains(" error")
-        || lower.contains("exception")
-    {
+    let benign_error_state = lower.contains("error=none")
+        || lower.contains("last_error=none")
+        || lower.contains("process_error=none")
+        || lower.contains("\"error\":null")
+        || lower.contains("error: none");
+    let benign_failure_count =
+        lower.contains("0 failed") || lower.contains("\"failed\":0") || lower.contains("failed=0");
+    let narrative_panic_reference =
+        lower.contains("panic/early-return") || lower.contains("residual risk");
+    let has_error_signal =
+        (lower.contains(" error") || lower.starts_with("error")) && !benign_error_state;
+    let has_failure_signal = lower.contains(" failed") && !benign_failure_count;
+    let has_panic_signal = lower.contains("panic") && !narrative_panic_reference;
+
+    if has_panic_signal || has_failure_signal || has_error_signal || lower.contains("exception") {
         return Level::ERROR;
     }
     if lower.contains("warning") || lower.contains("warn") {
@@ -404,6 +414,38 @@ mod tests {
         assert_eq!(
             classify_print_level("queued changed Unity assets", true),
             Level::INFO
+        );
+        assert_eq!(
+            classify_print_level("Finished: 14 passed, 0 failed", false),
+            Level::INFO
+        );
+        assert_eq!(
+            classify_print_level(
+                "DIAG process state=Running last_error=none process_error=none error=none",
+                false
+            ),
+            Level::INFO
+        );
+        assert_eq!(
+            classify_print_level(
+                "LOCUS_DRIVER_JSON {\"event\":\"suite_event\",\"payload\":{\"failed\":0,\"line\":\"Finished: 28 passed, 0 failed\"}}",
+                false
+            ),
+            Level::INFO
+        );
+        assert_eq!(
+            classify_print_level(
+                "Each suspend is RAII-guarded; a probe panic/early-return still resumes the thread. Residual risk is bounded.",
+                false
+            ),
+            Level::INFO
+        );
+        assert_eq!(
+            classify_print_level(
+                "unity_execute progress poll returned error after 18ms",
+                false
+            ),
+            Level::ERROR
         );
     }
 

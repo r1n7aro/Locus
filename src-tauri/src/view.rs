@@ -5195,7 +5195,12 @@ pub async fn detach_view_tab_window(
     view_windows_above_main: bool,
 ) -> Result<ViewRunResult, String> {
     if is_inspector_tab_id(&request.view_id) {
-        return detach_inspector_tab_window(app_handle, working_dir, request, view_windows_above_main);
+        return detach_inspector_tab_window(
+            app_handle,
+            working_dir,
+            request,
+            view_windows_above_main,
+        );
     }
     let detail = read_view_sync(working_dir, &request.view_id)?;
     let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;

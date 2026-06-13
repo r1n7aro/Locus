@@ -652,8 +652,9 @@ pub fn installed_inspector_drawer_packages(working_dir: &str) -> Vec<PluginDrawe
 fn load_drawer_package(source: &PluginComponentSource) -> Result<PluginDrawerPackage, String> {
     let manifest_path = source.root.join(PLUGIN_DRAWER_MANIFEST_FILE);
     let manifest: PluginDrawerManifest = if manifest_path.is_file() {
-        let raw = fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("failed to read {}: {}", PLUGIN_DRAWER_MANIFEST_FILE, error))?;
+        let raw = fs::read_to_string(&manifest_path).map_err(|error| {
+            format!("failed to read {}: {}", PLUGIN_DRAWER_MANIFEST_FILE, error)
+        })?;
         serde_json::from_str(&raw)
             .map_err(|error| format!("invalid {}: {}", PLUGIN_DRAWER_MANIFEST_FILE, error))?
     } else {
