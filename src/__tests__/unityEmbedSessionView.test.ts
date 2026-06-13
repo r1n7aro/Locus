@@ -138,8 +138,7 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;");
     expect(unityWindow).toContain("EditorApplication.quitting += OnEditorQuitting;");
     expect(unityWindow).toContain('private const string CloseReasonWindowDisabled = "windowDisabled";');
-    expect(unityWindow).toContain("string reason = GetDisableCloseReason();");
-    expect(unityWindow).toContain("SendClose(reason);");
+    expect(unityWindow).toContain("SendClose(GetDisableCloseReason());");
     expect(unityWindow).toContain("if (_assemblyReloadInProgress)");
     expect(unityWindow).toContain("return CloseReasonDomainReload;");
     expect(unityWindow).toContain("return CloseReasonWindowDisabled;");

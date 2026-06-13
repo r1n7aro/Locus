@@ -49,8 +49,9 @@ describe("chat status indicators", () => {
 
     expect(indicators).toContain('workingDir?: string;');
     expect(indicators).toContain('unityConnectionStatus?: UnityConnectionStatus | null;');
-    expect(indicators).toContain('function unityPipeNameForWorkingDir(workingDir: string)');
-    expect(indicators).toContain('return `\\\\\\\\.\\\\pipe\\\\locus_unity_${sanitized}`;');
+    expect(indicators).toContain('props.unityConnectionStatus?.pipeName || ""');
+    expect(indicators).not.toContain('unityPipeNameForWorkingDir');
+    expect(indicators).not.toContain('locus_unity_${sanitized}');
     expect(indicators).toContain('label: t("chat.status.unity.pipe")');
     expect(indicators).toContain('label: t("chat.status.unity.workingDir")');
     expect(indicators).toContain('label: t("chat.status.unity.process")');
@@ -85,7 +86,7 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('role="dialog"');
     expect(indicators).toContain("tone-danger");
     expect(indicators).toContain("var(--status-danger-fg)");
-    expect(indicators).toContain('return props.isUnityProject ? "danger" : "muted";');
+    expect(indicators).toContain('if (scanError.value) return "danger";');
   });
 
   it("marks the Unity icon as actionable when the Unity plugin needs attention", () => {
@@ -94,8 +95,9 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('unityPluginStatus?: UnityPluginNotice | null;');
     expect(indicators).toContain('if (props.unityPluginStatus === "outdated") return t("app.plugin.needUpdate");');
     expect(indicators).toContain('props.unityPluginStatus');
-    expect(indicators).toContain('? "danger"');
-    expect(indicators).toContain(': props.unityConnected');
+    expect(indicators).toContain('if (props.unityPluginStatus) return "danger";');
+    expect(indicators).toContain('if (unitySemanticState.value) {');
+    expect(indicators).toContain('UNITY_SEMANTIC_PHASE_TONES[unitySemanticPhase.value]');
     expect(indicators).toContain('props.unityPluginStatus === "missing"');
     expect(indicators).toContain('emit("installPlugin");');
     expect(indicators).toContain('emit("launchUnityProject");');
@@ -202,5 +204,24 @@ describe("chat status indicators", () => {
     expect(en).toContain('"chat.assetDb.scanning.reconcile.processing": "Syncing changes {0}..."');
     expect(en).toContain('"chat.status.assetDb.reconcileStage.scanning": "Verifying files"');
     expect(en).not.toContain('"chat.status.assetDb.currentFile"');
+  });
+
+  it("keeps status tones consistent across icons (blue = busy, idle = muted)", () => {
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+
+    // Unity play mode is a healthy steady state, not a transient highlight.
+    expect(indicators).toContain('playing: "success"');
+    expect(indicators).not.toContain('playing: "accent"');
+    // Domain reload is active work → blue + breathing, aligned with `transient`.
+    expect(indicators).toContain('reloading: "accent"');
+    // A quit editor is "not running", not an error.
+    expect(indicators).toContain('quit: "muted"');
+    // A disconnected or not-yet-built editor is idle, not an error.
+    expect(indicators).not.toContain('props.isUnityProject ? "danger" : "muted"');
+    // Read-only knowledge is a limited mode (warning), not busy (accent).
+    expect(indicators).toContain('? "warning" : "success"');
+    // Hot reload turns blue only while actively (re)compiling.
+    expect(indicators).toContain('const hotReloadBusy = computed');
+    expect(indicators).toContain('if (hotReloadBusy.value) return "accent";');
   });
 });

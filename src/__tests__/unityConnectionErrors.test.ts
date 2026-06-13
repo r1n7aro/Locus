@@ -13,7 +13,7 @@ function read(relPath: string) {
 describe("isUnityConnectionError", () => {
   it("detects Unity pipe connection failures", () => {
     expect(isUnityConnectionError(
-      "Failed to connect to Unity Editor (\\\\.\\pipe\\locus_unity_project): 系统找不到指定的文件。 (os error 2)",
+      "Failed to connect to Unity Editor (\\\\.\\pipe\\locus_unity_native_project): 系统找不到指定的文件。 (os error 2)",
     )).toBe(true);
   });
 
