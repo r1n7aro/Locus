@@ -10,7 +10,12 @@ import {
   subscribeCsharpLspStatus,
   subscribeUnitySidecarCompilerStatus,
   unityHotReloadSetEnabled,
+  unityNativeBrokerGetStatus,
+  unityRecompileRun,
+  unitySemanticStateGet,
   unitySidecarCompilerGetStatus,
+  unityStateProbeGetStatus,
+  type UnityStateProbeStatus,
 } from "../../services/csharpLsp";
 import { normalizeAppError } from "../../services/errors";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
@@ -31,6 +36,8 @@ import type {
   ScanStats,
   UnityConnectionStatus,
   UnityEditorProcessState,
+  UnityNativeBrokerStatus,
+  UnitySemanticState,
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
@@ -41,11 +48,14 @@ type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
 type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
+type UnitySemanticPhaseTone = Record<string, StatusTone>;
 
 interface StatusDetailRow {
   label: string;
   value: string;
   mono?: boolean;
+  /** primary = key facts (emphasized); diagnostic = collapsed troubleshooting rows. */
+  tier?: "primary" | "diagnostic";
 }
 
 interface StatusItem {
@@ -101,9 +111,17 @@ let csharpLspUnsubscribe: RuntimeUnsubscribe | null = null;
 let csharpLspDisposed = false;
 const hotReloadStatus = ref<CsharpCompileStatus | null>(null);
 const hotReloadPending = ref(false);
+const hotReloadRecompilePending = ref(false);
 const hotReloadActionError = ref("");
 let hotReloadUnsubscribe: RuntimeUnsubscribe | null = null;
 let hotReloadDisposed = false;
+const nativeBrokerStatus = ref<UnityNativeBrokerStatus | null>(null);
+const stateProbeStatus = ref<UnityStateProbeStatus | null>(null);
+const unitySemanticState = ref<UnitySemanticState | null>(null);
+const unitySemanticError = ref("");
+let unitySemanticPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+let unitySemanticSeq = 0;
+let unitySemanticDisposed = false;
 const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
 const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
 const embeddingStatus = ref<EmbeddingStatus | null>(null);
@@ -112,6 +130,21 @@ const knowledgeStatusLoading = ref(false);
 const knowledgeRetrievalError = ref("");
 const knowledgeContextError = ref("");
 let knowledgeStatusSeq = 0;
+const UNITY_SEMANTIC_STATUS_POLL_MS = 1200;
+const UNITY_SEMANTIC_PHASE_TONES: UnitySemanticPhaseTone = {
+  editing: "success",
+  // Play mode is a healthy, steady run state.
+  playing: "success",
+  paused: "warning",
+  // Domain reload is active work (transient) → blue + breathing.
+  reloading: "accent",
+  starting: "accent",
+  unresponsive: "danger",
+  crashed: "danger",
+  // The editor has exited: it is simply not running, not an error.
+  quit: "muted",
+  unknown: "warning",
+};
 
 function isAssetDbRunningPhase(phase: AssetDbScanEvent | null | undefined): boolean {
   return phase != null
@@ -152,19 +185,8 @@ const scanSummary = computed(() => {
 
 const unityWorkingDir = computed(() => props.workingDir?.trim() ?? "");
 
-function stripExtendedPathPrefix(path: string) {
-  return path.startsWith("\\\\?\\") ? path.slice(4) : path;
-}
-
-function unityPipeNameForWorkingDir(workingDir: string) {
-  const normalized = stripExtendedPathPrefix(workingDir).trim();
-  if (!normalized) return "";
-  const sanitized = normalized.replace(/[\\/: ]/g, "_");
-  return `\\\\.\\pipe\\locus_unity_${sanitized}`;
-}
-
 const unityPipeName = computed(() =>
-  props.unityConnectionStatus?.pipeName || unityPipeNameForWorkingDir(unityWorkingDir.value),
+  props.unityConnectionStatus?.pipeName || "",
 );
 
 const unityEditorStatus = computed(() =>
@@ -196,6 +218,33 @@ function unityBackgroundHookLabel(status: UnityConnectionStatus["backgroundHook"
   return label === key ? normalized : label;
 }
 
+function unitySemanticPhaseLabel(phase: string | null | undefined) {
+  const normalized = phase || "unknown";
+  const key = `chat.status.unity.semanticPhase.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
+function unitySemanticSummaryLabel(state: UnitySemanticState) {
+  const normalized = state.phase || "unknown";
+  const key = `chat.unity.semantic.${normalized}`;
+  const label = t(key);
+  return label === key ? unitySemanticPhaseLabel(normalized) : label;
+}
+
+function unitySemanticSafetyLabel(action: string | null | undefined) {
+  const normalized = action || "unknown";
+  const key = `chat.status.unity.safety.${normalized}`;
+  const label = t(key);
+  return label === key ? normalized : label;
+}
+
+function unitySemanticSourceLabel(source: string | null | undefined, confidence: string | null | undefined) {
+  const sourceText = source || "unknown";
+  const confidenceText = confidence || "unknown";
+  return `${sourceText} / ${confidenceText}`;
+}
+
 function formatTimestamp(ms: number | null | undefined) {
   if (!Number.isFinite(ms ?? Number.NaN) || !ms) return "";
   return new Date(ms).toLocaleTimeString();
@@ -205,6 +254,21 @@ const countFormatter = new Intl.NumberFormat("zh-CN");
 
 function formatCount(value: number): string {
   return countFormatter.format(Math.max(0, Math.round(value)));
+}
+
+function formatBytes(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "0 B";
+  const bytes = Math.max(0, Math.round(value));
+  if (bytes < 1024) return `${formatCount(bytes)} B`;
+  const units = ["KB", "MB", "GB"] as const;
+  let size = bytes / 1024;
+  for (const unit of units) {
+    if (size < 1024 || unit === "GB") {
+      return `${size.toFixed(size < 10 ? 1 : 0)} ${unit}`;
+    }
+    size /= 1024;
+  }
+  return `${formatCount(bytes)} B`;
 }
 
 function formatPercent(value: number | null | undefined): string {
@@ -310,7 +374,15 @@ const unityRecompileProcessStable = computed(() =>
   && unityEditorProcessState.value === "running",
 );
 
-const unitySummary = computed(() => {
+const unitySemanticPhase = computed(() => unitySemanticState.value?.phase || "");
+
+const unitySemanticBusy = computed(() => {
+  const state = unitySemanticState.value;
+  if (!state) return false;
+  return state.transient || state.phase === "starting" || state.phase === "reloading";
+});
+
+const unityConnectionFallbackSummary = computed(() => {
   if (unityPluginLabel.value) return unityPluginLabel.value;
   if (unityRecompileWaitingConnection.value) return t("chat.unity.waitingRecompileConnection");
   if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");
@@ -321,17 +393,30 @@ const unitySummary = computed(() => {
   return props.unityConnected ? t("chat.unity.connected") : t("chat.unity.disconnected");
 });
 
-const unityTone = computed<StatusTone>(() =>
-  props.unityPluginStatus
-    ? "danger"
-    : props.unityConnected || unityRecompileProcessStable.value
-      ? "success"
-      : unityEditorProcessState.value === "running"
-        || unityRecompileWaitingConnection.value
-        || effectiveUnityLaunchState.value !== "idle"
-        ? "accent"
-        : "danger",
+const unitySummary = computed(() => {
+  if (unityPluginLabel.value) return unityPluginLabel.value;
+  if (unitySemanticState.value) return unitySemanticSummaryLabel(unitySemanticState.value);
+  return unityConnectionFallbackSummary.value;
+});
+
+const unityFallbackTone = computed<StatusTone>(() =>
+  props.unityConnected || unityRecompileProcessStable.value
+    ? "success"
+    : unityEditorProcessState.value === "running"
+      || unityRecompileWaitingConnection.value
+      || effectiveUnityLaunchState.value !== "idle"
+      ? "accent"
+      // Editor not running and nothing in flight → idle (muted), not an error.
+      : "muted",
 );
+
+const unityTone = computed<StatusTone>(() => {
+  if (props.unityPluginStatus) return "danger";
+  if (unitySemanticState.value) {
+    return UNITY_SEMANTIC_PHASE_TONES[unitySemanticPhase.value] ?? "warning";
+  }
+  return unityFallbackTone.value;
+});
 
 const unityCanLaunch = computed(() =>
   !!props.isUnityProject
@@ -377,7 +462,8 @@ const assetTone = computed<StatusTone>(() => {
   if (scanError.value) return "danger";
   if (isScanning.value) return "accent";
   if (scanSummary.value) return "success";
-  return props.isUnityProject ? "danger" : "muted";
+  // Not built yet (or no workspace) is an idle state, not an error → muted.
+  return "muted";
 });
 
 const assetActionLabel = computed(() => {
@@ -464,27 +550,99 @@ const assetRows = computed<StatusDetailRow[]>(() => {
   return rows;
 });
 
+function unityNativeBridgeRowLabel(broker: UnityNativeBrokerStatus): string {
+  if (!broker.nativeAlive) return t("chat.status.unity.nativeBridge.missing");
+  if (broker.managedState === "ready") {
+    return t("chat.status.unity.nativeBridge.ready", broker.domainGeneration);
+  }
+  return t(
+    "chat.status.unity.nativeBridge.state",
+    broker.managedState || "-",
+    broker.domainGeneration,
+  );
+}
+
+function unityStateProbeRowLabel(probe: UnityStateProbeStatus): string {
+  if (!probe.supported) return t("chat.status.unity.stateProbe.unsupported");
+  if (!probe.enabled) return t("chat.status.unity.stateProbe.off");
+  switch (probe.tier) {
+    case "stack":
+      return t("chat.status.unity.stateProbe.stack");
+    case "passive":
+      return t("chat.status.unity.stateProbe.passive");
+    case "cpu_only":
+      return t("chat.status.unity.stateProbe.cpuOnly");
+    case "inference":
+      return t("chat.status.unity.stateProbe.inference");
+    default:
+      return t("chat.status.unity.stateProbe.inactive");
+  }
+}
+
+function hotReloadCompilerLabel(status: CsharpCompileStatus): string {
+  if (!status.platformSupported || !status.serverAvailable) {
+    return t("chat.status.hotReload.compiler.unavailable");
+  }
+  if (!status.enabled) return t("chat.status.hotReload.compiler.off");
+  if (status.lastError) return t("chat.status.hotReload.compiler.fallback");
+  if (status.running) return t("chat.status.hotReload.compiler.running");
+  return t("chat.status.hotReload.compiler.idle");
+}
+
+async function refreshNativeBrokerStatus() {
+  try {
+    nativeBrokerStatus.value = await unityNativeBrokerGetStatus();
+  } catch {
+    nativeBrokerStatus.value = null;
+  }
+}
+
+async function refreshStateProbeStatus() {
+  try {
+    stateProbeStatus.value = await unityStateProbeGetStatus();
+  } catch {
+    stateProbeStatus.value = null;
+  }
+}
+
 const unityRows = computed<StatusDetailRow[]>(() => {
   const rows: StatusDetailRow[] = [];
   const status = props.unityConnectionStatus ?? null;
+  const semantic = unitySemanticState.value;
+  const phaseLabel = semantic ? unitySemanticPhaseLabel(semantic.phase) : "";
+  const diagnostics: StatusDetailRow[] = [];
 
-  rows.push({
-    label: t("chat.status.detail.status"),
-    value: unityEditorStatusLabel(unityEditorStatus.value),
-  });
+  // --- Primary: what is happening, and whether it is safe to act on Unity. ---
+  if (semantic) {
+    rows.push({
+      label: t("chat.status.unity.semanticPhase"),
+      value: phaseLabel,
+      tier: "primary",
+    });
+    rows.push({
+      label: t("chat.status.unity.safety"),
+      value: unitySemanticSafetyLabel(semantic.safety.recommendedAction),
+      tier: "primary",
+    });
+  } else if (unitySemanticError.value) {
+    rows.push({
+      label: t("chat.status.unity.semanticPhase"),
+      value: unitySemanticError.value,
+      mono: true,
+      tier: "primary",
+    });
+  }
 
+  // --- Detail: the operational facts worth seeing at a glance. ---
+  const editorModeLabel = unityEditorStatusLabel(unityEditorStatus.value);
+  // Skip editor mode when it merely restates the semantic phase (the common case).
+  if (!semantic || editorModeLabel !== phaseLabel) {
+    rows.push({ label: t("chat.status.unity.editorMode"), value: editorModeLabel });
+  }
   rows.push({
     label: t("chat.status.unity.process"),
     value: unityEditorProcessStateLabel(unityEditorProcessState.value),
   });
-
-  if (typeof status?.editorProcessId === "number") {
-    rows.push({
-      label: t("chat.status.unity.processId"),
-      value: String(status.editorProcessId),
-    });
-  }
-
   if (status?.editorProjectPath) {
     rows.push({
       label: t("chat.status.unity.editorProjectPath"),
@@ -492,100 +650,122 @@ const unityRows = computed<StatusDetailRow[]>(() => {
       mono: true,
     });
   }
-
-  if (status?.editorProcessPath) {
-    rows.push({
-      label: t("chat.status.unity.editorProcessPath"),
-      value: status.editorProcessPath,
-      mono: true,
-    });
-  }
-
   if (status?.scenePath) {
-    rows.push({
-      label: t("chat.status.unity.scene"),
-      value: status.scenePath,
-      mono: true,
-    });
+    rows.push({ label: t("chat.status.unity.scene"), value: status.scenePath, mono: true });
   }
-
   if (typeof status?.latencyMs === "number") {
-    rows.push({
-      label: t("chat.status.unity.latency"),
-      value: formatElapsed(status.latencyMs),
-    });
+    rows.push({ label: t("chat.status.unity.latency"), value: formatElapsed(status.latencyMs) });
   }
-
   if (status?.backgroundHook) {
     rows.push({
       label: t("chat.status.unity.backgroundHook"),
       value: unityBackgroundHookLabel(status.backgroundHook),
     });
-    if (status.backgroundHook.error) {
-      rows.push({
-        label: t("chat.status.unity.backgroundHookError"),
-        value: status.backgroundHook.error,
-        mono: true,
-      });
-    }
   }
 
+  // --- Diagnostics: only needed when troubleshooting; collapsed by default. ---
+  if (semantic) {
+    diagnostics.push({
+      label: t("chat.status.unity.source"),
+      value: unitySemanticSourceLabel(semantic.source, semantic.confidence),
+    });
+    if (semantic.domain.phase && !["none", "unknown"].includes(semantic.domain.phase)) {
+      diagnostics.push({
+        label: t("chat.status.unity.domain"),
+        value: unitySemanticPhaseLabel(semantic.domain.phase),
+      });
+    }
+    if (semantic.channel.controlPipe && semantic.channel.controlPipe !== "not_checked") {
+      diagnostics.push({
+        label: t("chat.status.unity.controlPipe"),
+        value: semantic.channel.controlPipe,
+      });
+    }
+    if (semantic.detail) {
+      diagnostics.push({ label: t("chat.status.detail.detail"), value: semantic.detail });
+    }
+  }
+  if (typeof status?.editorProcessId === "number") {
+    diagnostics.push({
+      label: t("chat.status.unity.processId"),
+      value: String(status.editorProcessId),
+    });
+  }
+  if (status?.editorProcessPath) {
+    diagnostics.push({
+      label: t("chat.status.unity.editorProcessPath"),
+      value: status.editorProcessPath,
+      mono: true,
+    });
+  }
+  if (status?.backgroundHook?.error) {
+    diagnostics.push({
+      label: t("chat.status.unity.backgroundHookError"),
+      value: status.backgroundHook.error,
+      mono: true,
+    });
+  }
   if (status?.checkedAtMs) {
     const checkedAt = formatTimestamp(status.checkedAtMs);
-    if (checkedAt) {
-      rows.push({
-        label: t("chat.status.unity.checkedAt"),
-        value: checkedAt,
-      });
-    }
+    if (checkedAt) diagnostics.push({ label: t("chat.status.unity.checkedAt"), value: checkedAt });
   }
-
   if (status?.processCheckedAtMs) {
     const checkedAt = formatTimestamp(status.processCheckedAtMs);
     if (checkedAt) {
-      rows.push({
-        label: t("chat.status.unity.processCheckedAt"),
-        value: checkedAt,
-      });
+      diagnostics.push({ label: t("chat.status.unity.processCheckedAt"), value: checkedAt });
     }
   }
-
   if (!props.unityConnected && (status?.reconnectAttempts ?? 0) > 0) {
-    rows.push({
+    diagnostics.push({
       label: t("chat.status.unity.reconnectAttempts"),
       value: String(status?.reconnectAttempts ?? 0),
     });
   }
-
   if (status?.lastError) {
-    rows.push({
+    diagnostics.push({
       label: t("chat.status.unity.lastError"),
       value: status.lastError,
       mono: true,
     });
   }
-
   if (status?.processLastError) {
-    rows.push({
+    diagnostics.push({
       label: t("chat.status.unity.processLastError"),
       value: status.processLastError,
       mono: true,
     });
   }
-
   if (unityPipeName.value) {
-    rows.push({
+    diagnostics.push({
       label: t("chat.status.unity.pipe"),
       value: unityPipeName.value,
       mono: true,
     });
   }
   if (unityWorkingDir.value) {
-    rows.push({
+    diagnostics.push({
       label: t("chat.status.unity.workingDir"),
       value: unityWorkingDir.value,
       mono: true,
     });
+  }
+  const broker = nativeBrokerStatus.value;
+  if (broker) {
+    diagnostics.push({
+      label: t("chat.status.unity.nativeBridge"),
+      value: unityNativeBridgeRowLabel(broker),
+    });
+  }
+  const probe = stateProbeStatus.value;
+  if (probe) {
+    diagnostics.push({
+      label: t("chat.status.unity.stateProbe"),
+      value: unityStateProbeRowLabel(probe),
+    });
+  }
+
+  for (const row of diagnostics) {
+    rows.push({ ...row, tier: "diagnostic" });
   }
   return rows;
 });
@@ -621,7 +801,8 @@ const knowledgeModeSummary = computed(() => {
 
 const knowledgeTone = computed<StatusTone>(() => {
   if (!knowledgeHasWorkspace.value || knowledgeMode.value === "disabled") return "muted";
-  return knowledgeMode.value === "read_only" ? "accent" : "success";
+  // Read-only is a deliberately limited mode (warning), not a busy state.
+  return knowledgeMode.value === "read_only" ? "warning" : "success";
 });
 
 const knowledgeAgentId = computed(() => props.selectedAgentId?.trim() ?? "");
@@ -881,24 +1062,50 @@ const hotReloadSummary = computed(() => {
   if (status.lastError) return t("chat.status.hotReload.error");
   if (!status.enabled) return t("chat.status.hotReload.sidecarOff");
   if (!status.hotReloadEnabled) return t("chat.status.hotReload.off");
+  if ((status.hotUnappliedChanges ?? 0) > 0) {
+    return t("chat.status.hotReload.unapplied", formatCount(status.hotUnappliedChanges ?? 0));
+  }
   if ((status.hotColdQueued ?? 0) > 0) {
     return t("chat.status.hotReload.queued", formatCount(status.hotColdQueued ?? 0));
   }
   if ((status.hotPatchFailures ?? 0) > 0) return t("chat.status.hotReload.error");
-  if ((status.hotActivePatches ?? 0) > 0) {
-    return t("chat.status.hotReload.active", formatCount(status.hotActivePatches ?? 0));
+  if ((status.hotPatchedCodeCount ?? 0) > 0) {
+    return t("chat.status.hotReload.hotCode", formatCount(status.hotPatchedCodeCount ?? 0));
   }
   return t("chat.status.hotReload.on");
 });
 
+const hotReloadBusy = computed(() =>
+  hotReloadPending.value || hotReloadRecompilePending.value || !!props.unityRecompiling,
+);
+
 const hotReloadTone = computed<StatusTone>(() => {
   const status = hotReloadStatus.value;
   if (!status || !status.platformSupported || !status.serverAvailable) return "muted";
+  // Actively (re)compiling is the live signal → blue (busy), like the other icons.
+  if (hotReloadBusy.value) return "accent";
   if (status.lastError) return "danger";
   if (!status.enabled || !status.hotReloadEnabled) return "muted";
-  if ((status.hotColdQueued ?? 0) > 0 || (status.hotPatchFailures ?? 0) > 0) return "warning";
+  if (
+    (status.hotUnappliedChanges ?? 0) > 0
+    || (status.hotColdQueued ?? 0) > 0
+    || (status.hotPatchFailures ?? 0) > 0
+  ) return "warning";
   return "success";
 });
+
+const hotReloadActionLabel = computed(() =>
+  hotReloadRecompilePending.value || props.unityRecompiling
+    ? t("chat.status.hotReload.recompiling")
+    : t("chat.status.hotReload.recompile"),
+);
+
+const hotReloadCanRecompile = computed(() =>
+  !!props.isUnityProject
+  && !!props.unityConnected
+  && !props.unityRecompiling
+  && !hotReloadRecompilePending.value,
+);
 
 const hotReloadRows = computed<StatusDetailRow[]>(() => {
   const rows: StatusDetailRow[] = [];
@@ -916,20 +1123,20 @@ const hotReloadRows = computed<StatusDetailRow[]>(() => {
   }
   rows.push({ label: t("chat.status.detail.status"), value: hotReloadSummary.value });
   rows.push({
-    label: t("chat.status.hotReload.rows.sidecar"),
-    value: status.enabled ? t("chat.status.hotReload.rows.on") : t("chat.status.hotReload.rows.off"),
+    label: t("chat.status.hotReload.rows.compiler"),
+    value: hotReloadCompilerLabel(status),
   });
   rows.push({
-    label: t("chat.status.hotReload.rows.enabled"),
-    value: status.hotReloadEnabled ? t("chat.status.hotReload.rows.on") : t("chat.status.hotReload.rows.off"),
+    label: t("chat.status.hotReload.rows.unapplied"),
+    value: formatCount(status.hotUnappliedChanges ?? 0),
   });
   rows.push({
-    label: t("chat.status.hotReload.rows.applied"),
-    value: formatCount(status.hotPatchesApplied ?? 0),
+    label: t("chat.status.hotReload.rows.hotCode"),
+    value: formatCount(status.hotPatchedCodeCount ?? 0),
   });
   rows.push({
-    label: t("chat.status.hotReload.rows.active"),
-    value: formatCount(status.hotActivePatches ?? 0),
+    label: t("chat.status.hotReload.rows.leakedAssemblyMemory"),
+    value: formatBytes(status.hotLeakedAssemblyBytes ?? 0),
   });
   rows.push({
     label: t("chat.status.hotReload.rows.queued"),
@@ -981,8 +1188,49 @@ function createUnavailableHotReloadStatus(error: string): CsharpCompileStatus {
     hotPatchesApplied: 0,
     hotPatchFailures: 0,
     hotActivePatches: 0,
+    hotLeakedAssemblyBytes: 0,
+    hotPatchedCodeCount: 0,
+    hotUnappliedChanges: 0,
     hotColdQueued: 0,
   };
+}
+
+function clearUnitySemanticPoll() {
+  if (unitySemanticPollTimer) {
+    globalThis.clearTimeout(unitySemanticPollTimer);
+    unitySemanticPollTimer = null;
+  }
+}
+
+async function refreshUnitySemanticState() {
+  const seq = ++unitySemanticSeq;
+  if (!props.isUnityProject || !unityWorkingDir.value) {
+    unitySemanticState.value = null;
+    unitySemanticError.value = "";
+    return;
+  }
+
+  try {
+    const state = await unitySemanticStateGet();
+    if (unitySemanticDisposed || seq !== unitySemanticSeq) return;
+    unitySemanticState.value = state;
+    unitySemanticError.value = "";
+  } catch (error) {
+    if (unitySemanticDisposed || seq !== unitySemanticSeq) return;
+    unitySemanticError.value = normalizeAppError(error).message;
+    if (!unitySemanticState.value) {
+      unitySemanticState.value = null;
+    }
+  }
+}
+
+function scheduleUnitySemanticPoll(delayMs = UNITY_SEMANTIC_STATUS_POLL_MS) {
+  clearUnitySemanticPoll();
+  if (unitySemanticDisposed) return;
+  unitySemanticPollTimer = globalThis.setTimeout(() => {
+    unitySemanticPollTimer = null;
+    void refreshUnitySemanticState().finally(() => scheduleUnitySemanticPoll());
+  }, delayMs);
 }
 
 async function refreshCsharpLspStatus() {
@@ -1048,6 +1296,20 @@ async function setHotReloadEnabled(value: boolean) {
     await refreshHotReloadStatus();
   } finally {
     hotReloadPending.value = false;
+  }
+}
+
+async function runHotReloadRecompile() {
+  if (!hotReloadCanRecompile.value) return;
+  hotReloadRecompilePending.value = true;
+  try {
+    await unityRecompileRun();
+    hotReloadActionError.value = "";
+  } catch (error) {
+    hotReloadActionError.value = normalizeAppError(error).message;
+  } finally {
+    hotReloadRecompilePending.value = false;
+    await refreshHotReloadStatus();
   }
 }
 
@@ -1118,12 +1380,26 @@ const statusItems = computed<StatusItem[]>(() => [
     tone: hotReloadTone.value,
     rows: hotReloadRows.value,
     modeOptions: hotReloadReady.value ? hotReloadModeOptions.value : undefined,
+    actionLabel: hotReloadReady.value ? hotReloadActionLabel.value : "",
+    actionTitle: t("chat.status.hotReload.recompileTitle"),
+    actionDisabled: !hotReloadCanRecompile.value,
+    actionVariant: "neutral",
   },
 ]);
 
 const activeItem = computed(() =>
   statusItems.value.find((item) => item.id === activePopover.value) ?? null,
 );
+
+const activeMainRows = computed(() =>
+  (activeItem.value?.rows ?? []).filter((row) => row.tier !== "diagnostic"),
+);
+
+const activeDiagnosticRows = computed(() =>
+  (activeItem.value?.rows ?? []).filter((row) => row.tier === "diagnostic"),
+);
+
+const diagnosticsLabel = computed(() => t("chat.status.detail.diagnostics"));
 
 function statusIconNode(icon: StatusIcon) {
   return STATUS_ICONS[icon];
@@ -1139,6 +1415,9 @@ function togglePopover(id: StatusId) {
   }
   if (activePopover.value === "hotReload") {
     void refreshHotReloadStatus();
+  }
+  if (activePopover.value === "unity") {
+    void refreshUnitySemanticState();
   }
 }
 
@@ -1245,6 +1524,9 @@ function runStatusAction(item: StatusItem) {
   } else if (item.id === "code") {
     void restartCode();
     return;
+  } else if (item.id === "hotReload") {
+    void runHotReloadRecompile();
+    return;
   }
   closePopover();
 }
@@ -1260,8 +1542,13 @@ onMounted(() => {
   document.addEventListener("keydown", onDocumentKeydown);
   csharpLspDisposed = false;
   hotReloadDisposed = false;
+  unitySemanticDisposed = false;
+  void refreshUnitySemanticState();
+  scheduleUnitySemanticPoll();
   void refreshCsharpLspStatus();
   void refreshHotReloadStatus();
+  void refreshNativeBrokerStatus();
+  void refreshStateProbeStatus();
   subscribeCsharpLspStatus((payload) => {
     csharpLsp.value = payload;
   })
@@ -1295,11 +1582,26 @@ watch(
   },
 );
 
+watch(
+  () => [
+    props.workingDir ?? "",
+    String(props.isUnityProject ?? false),
+    String(props.unityConnected ?? false),
+    String(props.unityConnectionStatus?.checkedAtMs ?? 0),
+    String(props.unityRecompiling ?? false),
+  ].join("::"),
+  () => {
+    void refreshUnitySemanticState();
+  },
+);
+
 onUnmounted(() => {
   document.removeEventListener("click", closePopover);
   document.removeEventListener("keydown", onDocumentKeydown);
   csharpLspDisposed = true;
   hotReloadDisposed = true;
+  unitySemanticDisposed = true;
+  clearUnitySemanticPoll();
   csharpLspUnsubscribe?.();
   csharpLspUnsubscribe = null;
   hotReloadUnsubscribe?.();
@@ -1320,8 +1622,9 @@ onUnmounted(() => {
           {
             active: activePopover === item.id,
             'is-scanning': (item.id === 'assetDb' && isScanning)
+              || (item.id === 'unity' && unitySemanticBusy)
               || (item.id === 'code' && codeTransitional)
-              || (item.id === 'hotReload' && hotReloadPending),
+              || (item.id === 'hotReload' && hotReloadBusy),
           },
         ]"
         :aria-label="`${item.title}: ${item.summary}`"
@@ -1385,12 +1688,21 @@ onUnmounted(() => {
           :options="activeItem.modeOptions"
           @update:model-value="applySegmentedMode(activeItem.id, $event)"
         />
-        <dl v-if="activeItem.rows.length > 0" class="chat-status-detail-list">
-          <template v-for="row in activeItem.rows" :key="`${row.label}:${row.value}`">
-            <dt>{{ row.label }}</dt>
-            <dd :class="{ 'is-mono': row.mono }">{{ row.value }}</dd>
+        <dl v-if="activeMainRows.length > 0" class="chat-status-detail-list">
+          <template v-for="row in activeMainRows" :key="`${row.label}:${row.value}`">
+            <dt :class="{ 'is-primary': row.tier === 'primary' }">{{ row.label }}</dt>
+            <dd :class="{ 'is-mono': row.mono, 'is-primary': row.tier === 'primary' }">{{ row.value }}</dd>
           </template>
         </dl>
+        <details v-if="activeDiagnosticRows.length > 0" class="chat-status-diagnostics">
+          <summary>{{ diagnosticsLabel }}</summary>
+          <dl class="chat-status-detail-list">
+            <template v-for="row in activeDiagnosticRows" :key="`${row.label}:${row.value}`">
+              <dt>{{ row.label }}</dt>
+              <dd :class="{ 'is-mono': row.mono }">{{ row.value }}</dd>
+            </template>
+          </dl>
+        </details>
       </div>
     </Transition>
   </div>
@@ -1590,6 +1902,53 @@ onUnmounted(() => {
   font-family: var(--font-mono-identifier);
   font-size: 11px;
   line-height: 1.4;
+}
+
+.chat-status-detail-list dt.is-primary {
+  color: var(--text-color);
+}
+
+.chat-status-detail-list dd.is-primary {
+  font-weight: 600;
+}
+
+.chat-status-diagnostics {
+  margin-top: 8px;
+}
+
+.chat-status-diagnostics > summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.chat-status-diagnostics > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-status-diagnostics > summary::before {
+  content: "▸";
+  font-size: 9px;
+  transition: transform 0.12s ease;
+}
+
+.chat-status-diagnostics[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.chat-status-diagnostics .chat-status-detail-list {
+  margin-top: 6px;
+}
+
+.chat-status-diagnostics .chat-status-detail-list dt,
+.chat-status-diagnostics .chat-status-detail-list dd {
+  color: var(--text-secondary);
 }
 
 .chat-status-action {
