@@ -122,12 +122,16 @@ pub struct CsharpCompileStatusPayload {
     pub hot_patches_applied: u64,
     pub hot_patch_failures: u64,
     pub hot_active_patches: u64,
+    pub hot_leaked_assembly_bytes: u64,
+    pub hot_patched_code_count: u64,
+    pub hot_unapplied_changes: u64,
     pub hot_cold_queued: u64,
 }
 
 pub async fn status() -> CsharpCompileStatusPayload {
     let running = manager::current_status().await;
     let hot_reload = crate::unity_hotreload::counters();
+    let hot_unapplied_changes = crate::unity_hotreload::coordinator::unapplied_change_count().await;
     CsharpCompileStatusPayload {
         enabled: is_enabled(),
         platform_supported: crate::dotnet_runtime::is_platform_supported(),
@@ -144,6 +148,9 @@ pub async fn status() -> CsharpCompileStatusPayload {
         hot_patches_applied: hot_reload.patches_applied,
         hot_patch_failures: hot_reload.patch_failures,
         hot_active_patches: hot_reload.active_patches,
+        hot_leaked_assembly_bytes: hot_reload.active_patch_bytes,
+        hot_patched_code_count: hot_reload.active_patch_code,
+        hot_unapplied_changes,
         hot_cold_queued: hot_reload.cold_queued,
     }
 }
@@ -342,6 +349,28 @@ pub struct HotPatchNewType {
     pub is_top_level: bool,
 }
 
+/// C0 runtime capability matrix: how the running editor's Mono enforces
+/// accessibility at JIT time (per operation × visibility cell) and whether
+/// the three reflection/emit primitives the C2′ access thunks build on work
+/// there. Measured by `compile/accessProbe` + the plugin's
+/// `hot_reload_access_probe`; cached per domain generation by the hot-reload
+/// coordinator. `Default` (all false, empty cells) = conservative: every
+/// non-public access stays cold, which is today's behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessCaps {
+    #[serde(default)]
+    pub create_delegate_non_public: bool,
+    #[serde(default)]
+    pub dynamic_method_skip_visibility: bool,
+    #[serde(default)]
+    pub dynamic_method_byref_return: bool,
+    /// "{op}_{visibility}" (e.g. "ldfld_private") → the JIT access check
+    /// passed on the editor's Mono.
+    #[serde(default)]
+    pub cells: std::collections::BTreeMap<String, bool>,
+}
+
 /// Parsed `compile/hotPatch` response. Transport failures stay `Err(String)`
 /// at the call site (no legacy fallback exists for hot patches — the
 /// recompile path is the recovery).
@@ -366,17 +395,70 @@ pub enum HotPatchOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct HotDiffFileAnalysis {
+    pub path: String,
+    pub hot: bool,
+    pub reasons: Vec<String>,
+    pub syntax_error: Option<String>,
+    pub requires_caller_check: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct HotDiffAnalysis {
+    pub all_hot: bool,
+    pub files: Vec<HotDiffFileAnalysis>,
+}
+
+/// Classify edited files for the hot-reload path without compiling a patch.
+/// This mirrors the first phase of `compile/hotPatch`, so write/edit can
+/// report whether the current pending batch is hot-reloadable before the
+/// agent explicitly calls `unity_hot_reload`.
+pub async fn analyze_hot_diff(
+    compile_params: &CompileParams,
+    files: &[(String, String, String)],
+) -> Result<HotDiffAnalysis, String> {
+    let request = json!({
+        "files": files
+            .iter()
+            .map(|(path, old_text, new_text)| json!({
+                "path": path,
+                "oldText": old_text,
+                "newText": new_text,
+            }))
+            .collect::<Vec<_>>(),
+        "params": compile_params,
+    });
+
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout("analyze/hotDiff", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .await?;
+    parse_hot_diff_result(value)
+}
+
 /// Diff + rewrite + compile edited files into a hot-patch assembly.
 /// `files` entries are (path, baselineText, currentText).
+/// `baseline_siblings`: (path, currentText) candidates for the OTHER part
+/// files of partial types the batch declares (B6) — grep-grade candidates
+/// are fine, the sidecar parses each one and folds in only real matching
+/// parts as unchanged baselines. Empty slice omits the field (old sidecars
+/// ignore it; partial batches then fail closed through the sidecar's
+/// completeness gate).
 /// `extra_reference_paths`: per-call references outside Unity's set (the
 /// plugin's Locus.HotReload.Runtime.dll for M4 field stores) — kept out of
 /// `params` so the fingerprint-keyed reference cache stays untouched.
+/// `runtime_caps`: the C0 capability matrix for this domain generation;
+/// `None` omits the field (= sidecar's conservative default). C0 only
+/// echoes it in the verdict; C2′ starts gating classification on it.
 pub async fn compile_hot_patch(
     compile_params: &CompileParams,
     files: &[(String, String, String)],
+    baseline_siblings: &[(String, String)],
     extra_reference_paths: &[String],
+    runtime_caps: Option<&AccessCaps>,
 ) -> Result<HotPatchOutcome, String> {
-    let request = json!({
+    let mut request = json!({
         "files": files
             .iter()
             .map(|(path, old_text, new_text)| json!({
@@ -390,6 +472,18 @@ pub async fn compile_hot_patch(
         "registerImage": false,
         "extraReferencePaths": extra_reference_paths,
     });
+    if !baseline_siblings.is_empty() {
+        request["baselineSiblings"] = serde_json::Value::Array(
+            baseline_siblings
+                .iter()
+                .map(|(path, text)| json!({ "path": path, "text": text }))
+                .collect(),
+        );
+    }
+    if let Some(caps) = runtime_caps {
+        request["runtimeCaps"] = serde_json::to_value(caps)
+            .map_err(|error| format!("runtimeCaps serialization failed: {error}"))?;
+    }
 
     let client = manager::ensure_client().await?;
     let value = client
@@ -427,6 +521,52 @@ pub async fn register_session_image(
     } else {
         Err("compile server rejected image/register".to_string())
     }
+}
+
+/// C0: compile the fixed access-probe source against the project's
+/// reference set (`compile/accessProbe`). Returns the probe assembly
+/// (base64) plus the cell manifest `[{method, op, visibility}]` the Unity
+/// side force-JITs. Compile failures (e.g. an old plugin whose Locus.Editor
+/// lacks LocusAccessProbeTarget) come back as `Err` like transport failures:
+/// the caller falls back to conservative caps either way.
+pub async fn compile_access_probe(
+    compile_params: &CompileParams,
+) -> Result<(String, Vec<Value>), String> {
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout(
+            "compile/accessProbe",
+            json!({ "params": compile_params }),
+            client::COMPILE_REQUEST_TIMEOUT,
+        )
+        .await?;
+
+    let success = value
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "malformed compile/accessProbe response (missing success)".to_string())?;
+    if !success {
+        let message = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown compile failure");
+        return Err(format!("access probe compile failed: {message}"));
+    }
+
+    let assembly_b64 = value
+        .get("assemblyB64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "malformed compile/accessProbe response (missing assemblyB64)".to_string())?
+        .to_string();
+    let cells = value
+        .get("cells")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if cells.is_empty() {
+        return Err("malformed compile/accessProbe response (missing cells)".to_string());
+    }
+    Ok((assembly_b64, cells))
 }
 
 fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
@@ -513,6 +653,53 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+fn parse_hot_diff_result(value: Value) -> Result<HotDiffAnalysis, String> {
+    let all_hot = value
+        .get("hot")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "malformed analyze/hotDiff response (missing hot)".to_string())?;
+
+    let mut files = Vec::new();
+    if let Some(entries) = value.get("files").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let hot = entry.get("hot").and_then(|v| v.as_bool()).unwrap_or(false);
+            let reasons = entry
+                .get("reasons")
+                .and_then(|v| v.as_array())
+                .map(|reasons| {
+                    reasons
+                        .iter()
+                        .filter_map(|reason| reason.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let syntax_error = entry
+                .get("syntaxError")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let requires_caller_check = entry
+                .get("requiresCallerCheck")
+                .and_then(|v| v.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            files.push(HotDiffFileAnalysis {
+                path,
+                hot,
+                reasons,
+                syntax_error,
+                requires_caller_check,
+            });
+        }
+    }
+
+    Ok(HotDiffAnalysis { all_hot, files })
 }
 
 // ── type index (TI-B) ────────────────────────────────────────────────
@@ -669,7 +856,9 @@ mod tests {
         match parse_hot_patch_result(json!({ "hot": true, "success": true, "noop": true }))
             .expect("parse")
         {
-            HotPatchOutcome::Noop { deletions_noted, .. } => {
+            HotPatchOutcome::Noop {
+                deletions_noted, ..
+            } => {
                 assert_eq!(deletions_noted, 0);
             }
             other => panic!("expected Noop, got {other:?}"),
@@ -733,6 +922,31 @@ mod tests {
             }
             other => panic!("expected Compiled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn access_caps_serialize_camel_case_and_default_conservative() {
+        let caps = AccessCaps::default();
+        assert!(!caps.create_delegate_non_public);
+        assert!(!caps.dynamic_method_skip_visibility);
+        assert!(!caps.dynamic_method_byref_return);
+        assert!(caps.cells.is_empty());
+
+        let mut caps = AccessCaps {
+            create_delegate_non_public: true,
+            dynamic_method_byref_return: true,
+            ..AccessCaps::default()
+        };
+        caps.cells.insert("ldfld_private".to_string(), true);
+        let value = serde_json::to_value(&caps).expect("serialize");
+        assert_eq!(value["createDelegateNonPublic"], true);
+        assert_eq!(value["dynamicMethodSkipVisibility"], false);
+        assert_eq!(value["dynamicMethodByrefReturn"], true);
+        assert_eq!(value["cells"]["ldfld_private"], true);
+
+        // Round-trips through the sidecar's RuntimeCapsDto field names.
+        let parsed: AccessCaps = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, caps);
     }
 
     #[test]

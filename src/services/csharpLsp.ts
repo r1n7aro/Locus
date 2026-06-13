@@ -1,4 +1,10 @@
-import type { CodeAnalysisToolsConfig, CsharpCompileStatus, CsharpLspStatus } from "../types";
+import type {
+  CodeAnalysisToolsConfig,
+  CsharpCompileStatus,
+  CsharpLspStatus,
+  UnityNativeBrokerStatus,
+  UnitySemanticState,
+} from "../types";
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 
@@ -68,6 +74,14 @@ export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileS
   );
 }
 
+export function unityRecompileRun(): Promise<string> {
+  return ipcInvoke<string>("unity_recompile_run", undefined, {
+    operation: "unityRecompileRun",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
 export interface HotReloadSelfTestEvent {
   running: boolean;
   finished: boolean;
@@ -88,6 +102,106 @@ export function subscribeUnityHotReloadSelfTest(
   handler: (payload: HotReloadSelfTestEvent) => void,
 ): Promise<RuntimeUnsubscribe> {
   return getLocusRuntime().subscribe<HotReloadSelfTestEvent>("unity-hotreload-selftest", handler);
+}
+
+export type UnityStateProbeTier =
+  | "disabled"
+  | "inactive"
+  | "passive"
+  | "stack"
+  | "cpu_only"
+  | "inference"
+  | "unsupported";
+
+export interface UnityStateProbeStatus {
+  enabled: boolean;
+  supported: boolean;
+  tier: UnityStateProbeTier;
+  processId?: number | null;
+  reloadSymbols: number;
+  totalSymbols: number;
+  lastPhase?: string | null;
+  error?: string | null;
+  updatedAtMs: number;
+}
+
+export function unityStateProbeGetStatus(): Promise<UnityStateProbeStatus> {
+  return ipcInvoke<UnityStateProbeStatus>("get_unity_state_probe_status", undefined, {
+    operation: "unityStateProbeGetStatus",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function unityStateProbeSetEnabled(value: boolean): Promise<UnityStateProbeStatus> {
+  return ipcInvoke<UnityStateProbeStatus>(
+    "set_unity_state_probe_enabled",
+    { value },
+    { operation: "unityStateProbeSetEnabled", notify: false, throwOnError: true },
+  );
+}
+
+export function unityStateProbeSelfTestRun(): Promise<void> {
+  return ipcInvoke<void>("unity_state_probe_selftest_run", undefined, {
+    operation: "unityStateProbeSelfTestRun",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function unitySemanticStateGet(): Promise<UnitySemanticState> {
+  return ipcInvoke<UnitySemanticState>("get_unity_semantic_state", undefined, {
+    operation: "unitySemanticStateGet",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function subscribeUnityStateProbeSelfTest(
+  handler: (payload: HotReloadSelfTestEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>("unity-state-probe-selftest", handler);
+}
+
+export function unityNativeBridgeGetEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_unity_native_bridge_enabled", undefined, {
+    operation: "unityNativeBridgeGetEnabled",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function unityNativeBridgeSetEnabled(value: boolean): Promise<boolean> {
+  return ipcInvoke<boolean>(
+    "set_unity_native_bridge_enabled",
+    { value },
+    { operation: "unityNativeBridgeSetEnabled", notify: false, throwOnError: true },
+  );
+}
+
+export function unityNativeBrokerGetStatus(): Promise<UnityNativeBrokerStatus | null> {
+  return ipcInvoke<UnityNativeBrokerStatus | null>("get_unity_native_broker_status", undefined, {
+    operation: "unityNativeBrokerGetStatus",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function unityNativeBridgeSelfTestRun(): Promise<void> {
+  return ipcInvoke<void>("unity_native_bridge_selftest_run", undefined, {
+    operation: "unityNativeBridgeSelfTestRun",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export function subscribeUnityNativeBridgeSelfTest(
+  handler: (payload: HotReloadSelfTestEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>(
+    "unity-native-bridge-selftest",
+    handler,
+  );
 }
 
 export function subscribeCsharpLspStatus(

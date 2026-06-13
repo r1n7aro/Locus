@@ -102,7 +102,8 @@ async fn ensure_server_installed(rid: &str, progress: &ProgressFn) -> Result<Pat
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create server dir: {e}"))?;
 
     let nupkg = dir.join("server.nupkg");
-    let component_progress = move |received, total| progress(AssetComponent::Server, received, total);
+    let component_progress =
+        move |received, total| progress(AssetComponent::Server, received, total);
     download_to_file(&server_download_url(rid), &nupkg, &component_progress).await?;
 
     let extract_dir = dir.clone();
@@ -114,7 +115,9 @@ async fn ensure_server_installed(rid: &str, progress: &ProgressFn) -> Result<Pat
     let _ = std::fs::remove_file(&nupkg);
 
     if !dll.is_file() {
-        return Err("Server archive did not contain Microsoft.CodeAnalysis.LanguageServer.dll".to_string());
+        return Err(
+            "Server archive did not contain Microsoft.CodeAnalysis.LanguageServer.dll".to_string(),
+        );
     }
     mark_complete(&dir)?;
     Ok(dll)

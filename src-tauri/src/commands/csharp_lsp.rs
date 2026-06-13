@@ -70,6 +70,28 @@ pub async fn unity_hot_reload_selftest_run(
         .map_err(|error| AppError::new("unity_hotreload.selftest_failed", error))
 }
 
+/// C0 diagnostic: run (or return the cached) runtime access-capability probe
+/// against the connected Unity editor and return the full matrix JSON
+/// (`{cached, domainGeneration, caps, matrix}`). Needs the sidecar compiler
+/// and a connected editor with a current plugin; independent of the
+/// `unity_hot_reload` feature flag so it can be used to qualify an editor
+/// before enabling hot reload.
+#[tauri::command]
+pub async fn unity_hot_reload_access_probe_run(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<serde_json::Value, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    crate::unity_hotreload::coordinator::access_probe_run(&cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.access_probe_failed", error))
+}
+
 #[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,

@@ -132,10 +132,7 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
         params.reference_paths.len()
     );
 
-    params_cache()
-        .lock()
-        .await
-        .insert(key, params.clone());
+    params_cache().lock().await.insert(key, params.clone());
     Ok(params)
 }
 

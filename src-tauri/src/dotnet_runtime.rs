@@ -208,12 +208,13 @@ pub fn extract_zip(
 /// otherwise race on remove_dir_all + extract in the shared install dir.
 static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn ensure_dotnet_installed(
-    rid: &str,
-    progress: &ProgressFn<'_>,
-) -> Result<PathBuf, String> {
+async fn ensure_dotnet_installed(rid: &str, progress: &ProgressFn<'_>) -> Result<PathBuf, String> {
     let dir = dotnet_dir(rid)?;
-    let exe = dir.join(if cfg!(windows) { "dotnet.exe" } else { "dotnet" });
+    let exe = dir.join(if cfg!(windows) {
+        "dotnet.exe"
+    } else {
+        "dotnet"
+    });
     if is_complete(&dir) && exe.is_file() {
         return Ok(exe);
     }
@@ -255,7 +256,11 @@ pub async fn try_resolve_cached_dotnet() -> Option<ResolvedDotnet> {
     }
 
     let dir = dotnet_dir(rid).ok()?;
-    let exe = dir.join(if cfg!(windows) { "dotnet.exe" } else { "dotnet" });
+    let exe = dir.join(if cfg!(windows) {
+        "dotnet.exe"
+    } else {
+        "dotnet"
+    });
     if !is_complete(&dir) || !exe.is_file() {
         return None;
     }

@@ -118,7 +118,9 @@ impl LspClient {
 
         let reader_client = std::sync::Arc::clone(&client);
         tokio::spawn(async move {
-            reader_client.read_loop(stdout, loaded_tx, progress_tx).await;
+            reader_client
+                .read_loop(stdout, loaded_tx, progress_tx)
+                .await;
             let _ = exited_tx.send(true);
             // The server has been observed dying without writing anything to
             // stderr or its log directory; its last window/logMessage error
@@ -733,5 +735,8 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     if parsed.scheme() != "file" {
         return None;
     }
-    parsed.to_file_path().ok().map(|p| dunce::simplified(&p).to_path_buf())
+    parsed
+        .to_file_path()
+        .ok()
+        .map(|p| dunce::simplified(&p).to_path_buf())
 }

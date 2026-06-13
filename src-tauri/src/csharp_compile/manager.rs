@@ -111,7 +111,9 @@ fn pick_newest_dll(candidates: impl Iterator<Item = PathBuf>) -> Option<PathBuf>
 }
 
 fn dll_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 fn logs_dir() -> Result<PathBuf, String> {

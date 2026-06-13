@@ -199,7 +199,10 @@ fn write_temp_package(dir: &Path) -> Result<(), String> {
              \"autoReferenced\": false\n}}\n"
         ),
     )?;
-    write(&format!("{TEMP_ASSEMBLY_NAME}.cs"), batch_entry_point_source())
+    write(
+        &format!("{TEMP_ASSEMBLY_NAME}.cs"),
+        batch_entry_point_source(),
+    )
 }
 
 fn remove_temp_package(dir: &Path) {
@@ -326,8 +329,11 @@ fn log_tail(path: &Path) -> String {
 /// Map a failed batch run to an actionable message using the editor log.
 fn batch_failure_message(exit_code: Option<i32>, tail: &str) -> String {
     let lowered = tail.to_lowercase();
-    if lowered.contains("license") && (lowered.contains("invalid") || lowered.contains("no valid")
-        || lowered.contains("not activated") || lowered.contains("expired"))
+    if lowered.contains("license")
+        && (lowered.contains("invalid")
+            || lowered.contains("no valid")
+            || lowered.contains("not activated")
+            || lowered.contains("expired"))
     {
         return "Unity batch mode could not run because no active Unity license was found. \
                 Sign in via Unity Hub (or activate a license), then retry."
@@ -522,8 +528,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&package_json).unwrap();
         assert_eq!(parsed["name"], TEMP_PACKAGE_FOLDER);
 
-        let asmdef = std::fs::read_to_string(dir.join(format!("{TEMP_ASSEMBLY_NAME}.asmdef")))
-            .unwrap();
+        let asmdef =
+            std::fs::read_to_string(dir.join(format!("{TEMP_ASSEMBLY_NAME}.asmdef"))).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&asmdef).unwrap();
         assert_eq!(parsed["name"], TEMP_ASSEMBLY_NAME);
         assert_eq!(parsed["includePlatforms"][0], "Editor");

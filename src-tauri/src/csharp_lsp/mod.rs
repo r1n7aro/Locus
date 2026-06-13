@@ -221,8 +221,7 @@ fn write_analyzer_props(workspace: &Path, dll: &Path) -> Result<(), String> {
     if existing.as_deref() == Some(content.as_str()) {
         return Ok(());
     }
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Remove the marker-tagged props file; user-owned files are left alone.
@@ -452,13 +451,9 @@ async fn orchestrate(server: &Arc<WorkspaceServer>) -> Result<(), String> {
         logs.to_string_lossy().to_string(),
         "--stdio".to_string(),
     ];
-    let lsp = client::LspClient::spawn(
-        &resolved.dotnet_program,
-        &args,
-        &resolved.envs,
-        &stderr_log,
-    )
-    .await?;
+    let lsp =
+        client::LspClient::spawn(&resolved.dotnet_program, &args, &resolved.envs, &stderr_log)
+            .await?;
     server
         .client
         .set(Arc::clone(&lsp))
@@ -557,8 +552,11 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
     let (connected, _, _) = crate::unity_bridge::query_unity_status(&workspace).await;
     if connected {
         server.set_phase_unthrottled(Phase::GeneratingProjectFiles);
-        match crate::unity_bridge::unity_execute_code(&workspace, &unity_sync::editor_sync_snippet())
-            .await
+        match crate::unity_bridge::unity_execute_code(
+            &workspace,
+            &unity_sync::editor_sync_snippet(),
+        )
+        .await
         {
             Ok(output) => eprintln!(
                 "[CsharpLsp] editor project-file sync: {}",
@@ -740,7 +738,9 @@ where
 {
     match make().await {
         Err(error) if is_server_exit_error(&error) => {
-            eprintln!("[CsharpLsp] query hit a dead server; restarting and retrying once ({error})");
+            eprintln!(
+                "[CsharpLsp] query hit a dead server; restarting and retrying once ({error})"
+            );
             make().await
         }
         result => result,
@@ -959,10 +959,7 @@ fn relative_to(base: &Path, path: &Path) -> Option<PathBuf> {
 
 /// Convert raw LSP locations into display entries with line text, grouped and
 /// capped for tool output.
-fn collect_locations(
-    workspace: &Path,
-    raw: &[serde_json::Value],
-) -> (Vec<CodeLocation>, bool) {
+fn collect_locations(workspace: &Path, raw: &[serde_json::Value]) -> (Vec<CodeLocation>, bool) {
     let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     let mut locations = Vec::new();
@@ -980,7 +977,11 @@ fn collect_locations(
             Some(path) => {
                 let lines = file_cache.entry(path.clone()).or_insert_with(|| {
                     client::read_text_lossy(&path)
-                        .map(|t| t.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect())
+                        .map(|t| {
+                            t.split('\n')
+                                .map(|l| l.trim_end_matches('\r').to_string())
+                                .collect()
+                        })
                         .unwrap_or_default()
                 });
                 let text = lines
@@ -1064,8 +1065,7 @@ pub async fn goto_definition(
     line: Option<u32>,
     symbol: &str,
 ) -> Result<(Vec<CodeLocation>, SymbolAnchor), String> {
-    retry_once_on_server_exit(|| goto_definition_attempt(workspace, file_path, line, symbol))
-        .await
+    retry_once_on_server_exit(|| goto_definition_attempt(workspace, file_path, line, symbol)).await
 }
 
 async fn goto_definition_attempt(
@@ -1149,10 +1149,7 @@ async fn workspace_symbols_attempt(
 ) -> Result<Vec<CodeSymbol>, String> {
     let (server, lsp) = ready_client(workspace).await?;
     let result = lsp
-        .request(
-            "workspace/symbol",
-            serde_json::json!({ "query": query }),
-        )
+        .request("workspace/symbol", serde_json::json!({ "query": query }))
         .await?;
     let items = result.as_array().cloned().unwrap_or_default();
     let mut symbols = Vec::new();
