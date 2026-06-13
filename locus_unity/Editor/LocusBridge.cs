@@ -8,7 +8,6 @@ using UnityEditor.SceneManagement;
 using System;
 using System.Globalization;
 using System.IO;
-using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -24,44 +23,19 @@ namespace Locus
     {
         // ───────────────── Connection state ─────────────────
 
-        private static string _pipeName;
-        private static string PipeName
-        {
-            get
-            {
-                if (_pipeName == null)
-                    _pipeName = GeneratePipeName();
-                return _pipeName;
-            }
-        }
-
-        private static CancellationTokenSource _cts;
-        private static Task _serverTask;
-
-        private static readonly object _connectionLock = new object();
-        private static readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
         private static readonly SemaphoreSlim _executeCodeLock = new SemaphoreSlim(1, 1);
         private static readonly SemaphoreSlim _runStatesLock = new SemaphoreSlim(1, 1);
 
-        private static NamedPipeServerStream _currentServer;
-        private static StreamWriter _currentWriter;
-        private static volatile bool _desktopPipeConnected;
         private static readonly int _editorProcessId = ResolveCurrentProcessId();
         private static readonly string _editorProcessPath = ResolveCurrentProcessPath();
+        private static readonly bool _isUnityWorkerProcess = DetectUnityWorkerProcess();
 
         private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
         // ───────────────── Constants ─────────────────
 
         private const int ExecuteTimeoutMs = 30000;
-        private const int PipeBufferSize = 64 * 1024;
-        private const int TextReaderWriterBufferSize = 16 * 1024;
         private const int MaxMainThreadActionsPerUpdate = 32;
-#if UNITY_2020
-        private const PipeOptions ServerPipeOptions = PipeOptions.None;
-#else
-        private const PipeOptions ServerPipeOptions = PipeOptions.Asynchronous;
-#endif
 
         // ───────────────── Main-thread dispatcher ─────────────────
 
@@ -75,7 +49,7 @@ namespace Locus
         private static volatile string _activeScenePath = "";
         private static int _editorUpdateEventSequence;
         private static double _lastEditorUpdateEventAt = -1.0;
-        private static string _lastEditorUpdateSelectionKey = "";
+        private static int _lastEditorUpdateSelectionInstanceId = int.MinValue;
         private const double EditorUpdateEventIntervalSeconds = 0.25;
 
         // ───────────────── Runtime compilation cache ─────────────────
@@ -307,11 +281,20 @@ namespace Locus
 
         static LocusBridge()
         {
+            if (_isUnityWorkerProcess)
+            {
+                NativeShutdownInWorkerProcess();
+                return;
+            }
+
             // Keep the bridge alive across edit sessions. Auto Refresh is only suppressed while a session is active.
+            RefreshCachedEditorState();
             EditorApplication.update += PumpMainThreadQueue;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+            EditorApplication.pauseStateChanged += OnPauseStateChanged;
             EditorApplication.delayCall += Start;
             EditorApplication.quitting += OnQuitting;
-            AssemblyReloadEvents.beforeAssemblyReload += Stop;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
@@ -320,19 +303,27 @@ namespace Locus
         private static void OnQuitting()
         {
             ReleaseAllEditSessions();
+            NativeOnQuitting();
             Stop();
         }
 
-        private static string GeneratePipeName()
+        private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            string projectPath = Directory.GetParent(Application.dataPath).FullName;
-            string sanitized = projectPath
-                .Replace('\\', '_')
-                .Replace('/', '_')
-                .Replace(':', '_')
-                .Replace(' ', '_');
+            RefreshCachedEditorState();
+            NativePublishEditorStatusNow();
+        }
 
-            return "locus_unity_" + sanitized;
+        private static void OnPauseStateChanged(PauseState state)
+        {
+            RefreshCachedEditorState();
+            NativePublishEditorStatusNow();
+        }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            RefreshCachedEditorState();
+            NativeOnBeforeReload();
+            Stop();
         }
 
         private static int ResolveCurrentProcessId()
@@ -381,6 +372,24 @@ namespace Locus
             }
         }
 
+        private static bool DetectUnityWorkerProcess()
+        {
+            try
+            {
+                string[] args = Environment.GetCommandLineArgs();
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string arg = args[i] ?? "";
+                    if (arg.IndexOf("AssetImportWorker", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
         private static bool IsProjectAssetPath(string path)
         {
             if (string.IsNullOrEmpty(path))
@@ -421,79 +430,22 @@ namespace Locus
 
         public static void Start()
         {
-            if (_serverTask != null && !_serverTask.IsCompleted)
+            if (_isUnityWorkerProcess)
                 return;
 
-            try
-            {
-                _cts = new CancellationTokenSource();
-
-                _serverTask = Task.Factory
-                    .StartNew(
-                        () => ServerLoop(_cts.Token),
-                        _cts.Token,
-                        TaskCreationOptions.LongRunning,
-                        TaskScheduler.Default)
-                    .Unwrap();
-
-                Debug.Log("[Locus] Bridge started, listening on pipe: " + PipeName);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError("[Locus] Bridge failed to start: " + ex);
-            }
+            NativeStartIfEnabled();
+            if (!IsNativeBridgeActive)
+                Debug.LogError("[Locus] Native broker bridge is required but did not start.");
         }
 
         public static void Stop()
         {
             CancelActiveExecuteCode("bridge stopped");
 
-            var cts = _cts;
-            var task = _serverTask;
-
-            _cts = null;
-            _serverTask = null;
-
-            try
-            {
-                lock (_connectionLock)
-                {
-                    try { if (_currentWriter != null) _currentWriter.Dispose(); } catch { }
-                    try { if (_currentServer != null) _currentServer.Dispose(); } catch { }
-
-                    _currentWriter = null;
-                    _currentServer = null;
-                    _desktopPipeConnected = false;
-                }
-            }
-            catch
-            {
-            }
-
-            if (cts != null)
-            {
-                try
-                {
-                    cts.Cancel();
-
-                    if (task != null && !task.IsCompleted)
-                        task.Wait(1000);
-                }
-                catch
-                {
-                }
-                finally
-                {
-                    cts.Dispose();
-                }
-            }
-
             lock (_mainThreadQueueLock)
             {
                 _mainThreadQueue.Clear();
             }
-
-            Debug.Log("[Locus] Bridge stopped.");
         }
 
         // ───────────────── Compilation events ─────────────────
@@ -553,6 +505,9 @@ namespace Locus
 
         private static void OnAfterAssemblyReload()
         {
+            RefreshCachedEditorState();
+            NativeOnAfterReload();
+
             // afterAssemblyReload is the authoritative completion point for a successful recompile.
             if (!SessionState.GetBool(SessionKey_RecompileInProgress, false))
                 return;
@@ -742,9 +697,11 @@ namespace Locus
 
         private static void PumpMainThreadQueue()
         {
-            bool desktopConnected = HasDesktopPipeConnection();
+            NativePump();
+
+            bool desktopConnected = HasAnyDesktopConnection();
             bool hasRuntimeWork = HasMainThreadRuntimeWork();
-            if (desktopConnected || hasRuntimeWork)
+            if (hasRuntimeWork)
                 RefreshCachedEditorState();
 
             if (_activeRunStatesSession != null)
@@ -810,9 +767,9 @@ namespace Locus
             }
         }
 
-        private static bool HasDesktopPipeConnection()
+        private static bool HasAnyDesktopConnection()
         {
-            return _desktopPipeConnected;
+            return IsNativeBridgeActive;
         }
 
         private static bool HasMainThreadRuntimeWork()
@@ -839,12 +796,14 @@ namespace Locus
         {
             double now = EditorApplication.timeSinceStartup;
             UnityEngine.Object selection = Selection.activeObject;
-            string selectionKey = selection != null ? selection.GetInstanceID().ToString() : "none";
-            bool selectionChanged = !string.Equals(selectionKey, _lastEditorUpdateSelectionKey, StringComparison.Ordinal);
+            int selectionInstanceId = selection != null ? selection.GetInstanceID() : 0;
+            bool selectionChanged = selectionInstanceId != _lastEditorUpdateSelectionInstanceId;
             if (!selectionChanged && _lastEditorUpdateEventAt >= 0 && now - _lastEditorUpdateEventAt < EditorUpdateEventIntervalSeconds)
                 return;
 
-            _lastEditorUpdateSelectionKey = selectionKey;
+            RefreshCachedEditorState();
+
+            _lastEditorUpdateSelectionInstanceId = selectionInstanceId;
             _lastEditorUpdateEventAt = now;
             _editorUpdateEventSequence++;
 
@@ -855,12 +814,12 @@ namespace Locus
                 isPlaying = _isPlaying,
                 isPaused = _isPaused,
                 activeScenePath = _activeScenePath,
-                selection = BuildEditorSelectionSnapshot(selection)
+                selection = BuildEditorSelectionSnapshot(selection, selectionInstanceId)
             };
             SendEventToRust("unity-editor-update", JsonUtility.ToJson(payload));
         }
 
-        private static EditorSelectionSnapshot BuildEditorSelectionSnapshot(UnityEngine.Object selection)
+        private static EditorSelectionSnapshot BuildEditorSelectionSnapshot(UnityEngine.Object selection, int instanceId)
         {
             if (selection == null)
             {
@@ -881,7 +840,7 @@ namespace Locus
                 name = selection.name ?? "",
                 type = selection.GetType().FullName ?? selection.GetType().Name,
                 path = path,
-                instanceId = selection.GetInstanceID()
+                instanceId = instanceId
             };
         }
 
@@ -898,313 +857,13 @@ namespace Locus
             return "object";
         }
 
-        // ───────────────── Pipe server loop ─────────────────
-
-        /// <summary>
-        /// </summary>
-        private static async Task ServerLoop(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                NamedPipeServerStream server = null;
-
-                try
-                {
-                    server = new NamedPipeServerStream(
-                        PipeName,
-                        PipeDirection.InOut,
-                        1,
-                        PipeTransmissionMode.Byte,
-                        ServerPipeOptions,
-                        PipeBufferSize,
-                        PipeBufferSize
-                    );
-
-#if UNITY_2020
-                    WaitForConnectionCompat(server, ct);
-#else
-                    await server.WaitForConnectionAsync(ct);
-#endif
-                    Debug.Log("[Locus] Pipe client connected: " + PipeName);
-
-                    await HandleConnectionAsync(server, ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    try { if (server != null) server.Dispose(); } catch { }
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    try { if (server != null) server.Dispose(); } catch { }
-                    Debug.LogError("[Locus] Bridge error: " + ex);
-
-                    try
-                    {
-                        await Task.Delay(500, ct);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Unity 2020's Mono runtime exposes WaitForConnectionAsync(CancellationToken) but throws NotImplementedException.
-#if UNITY_2020
-        private static void WaitForConnectionCompat(NamedPipeServerStream server, CancellationToken ct)
-        {
-            if (ct.IsCancellationRequested)
-                throw new OperationCanceledException(ct);
-
-            using (ct.Register(delegate
-            {
-                try { server.Dispose(); } catch { }
-            }))
-            {
-                try
-                {
-                    server.WaitForConnection();
-                }
-                catch (ObjectDisposedException)
-                {
-                    if (ct.IsCancellationRequested)
-                        throw new OperationCanceledException(ct);
-                    throw;
-                }
-                catch (IOException)
-                {
-                    if (ct.IsCancellationRequested)
-                        throw new OperationCanceledException(ct);
-                    throw;
-                }
-            }
-
-            if (ct.IsCancellationRequested)
-                throw new OperationCanceledException(ct);
-        }
-#endif
-
-        // ───────────────── Connection handling ─────────────────
-
-        /// <summary>
-        /// </summary>
-        private static async Task HandleConnectionAsync(NamedPipeServerStream server, CancellationToken ct)
-        {
-            try
-            {
-                using (server)
-                using (var reader = new StreamReader(server, Utf8NoBom, false, TextReaderWriterBufferSize, true))
-                using (var writer = new StreamWriter(server, Utf8NoBom, TextReaderWriterBufferSize, true) { AutoFlush = false })
-                {
-                    lock (_connectionLock)
-                    {
-                        _currentServer = server;
-                        _currentWriter = writer;
-                    }
-
-                    await SendEnvelopeAsync(new PipeEnvelope
-                    {
-                        type = "unity_connected",
-                        message = "connected",
-                        processId = _editorProcessId,
-                        processPath = _editorProcessPath
-                    });
-
-                    lock (_connectionLock)
-                    {
-                        if (ReferenceEquals(_currentServer, server))
-                            _desktopPipeConnected = true;
-                    }
-
-                    while (!ct.IsCancellationRequested)
-                    {
-                        string line = await reader.ReadLineAsync();
-                        if (line == null)
-                            break;
-
-                        if (string.IsNullOrWhiteSpace(line))
-                            continue;
-
-                        string captured = line;
-                        _ = ProcessIncomingLineAsync(captured);
-                    }
-
-                    lock (_connectionLock)
-                    {
-                        _currentWriter = null;
-                        _currentServer = null;
-                        _desktopPipeConnected = false;
-                    }
-                    await _writeLock.WaitAsync();
-                    _writeLock.Release();
-                }
-            }
-            catch (IOException)
-            {
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError("[Locus] Bridge connection error: " + ex);
-            }
-            finally
-            {
-                bool wasCurrentConnection;
-                lock (_connectionLock)
-                {
-                    wasCurrentConnection = ReferenceEquals(_currentServer, server);
-                    if (wasCurrentConnection)
-                    {
-                        _currentWriter = null;
-                        _currentServer = null;
-                        _desktopPipeConnected = false;
-                    }
-                }
-
-                // Only the still-current connection may cancel the active
-                // execute. Mono can deliver this finally LATE — after the
-                // client already reconnected and submitted a new request on
-                // the next connection — and an unconditional cancel here
-                // kills that fresh request, which re-triggers the client's
-                // no-progress reconnect: a self-sustaining cancel loop.
-                if (wasCurrentConnection)
-                    CancelActiveExecuteCode("pipe disconnected");
-                Debug.Log("[Locus] Pipe client disconnected: " + PipeName);
-            }
-        }
-
-        private static async Task ProcessIncomingLineAsync(string json)
-        {
-            PipeEnvelope request = null;
-
-            try
-            {
-                request = JsonUtility.FromJson<PipeEnvelope>(json);
-            }
-            catch (Exception ex)
-            {
-                string msg = "[Locus] Invalid JSON from client: " + ex.Message + " | raw=" + json;
-                PostToMainThread(delegate { Debug.LogWarning(msg); });
-                return;
-            }
-
-            if (request == null || string.IsNullOrEmpty(request.type))
-            {
-                string msg = "[Locus] Invalid message envelope: " + json;
-                PostToMainThread(delegate { Debug.LogWarning(msg); });
-                return;
-            }
-
-            bool traceExecuteLoaded = string.Equals(request.type, "execute_loaded", StringComparison.Ordinal);
-            if (traceExecuteLoaded)
-            {
-                Debug.Log(
-                    "[Locus] pipe received execute_loaded id=" +
-                    (request.id ?? "?") +
-                    ", line chars=" +
-                    json.Length);
-            }
-
-            PipeEnvelope response = await HandleMessageAsync(request);
-
-            if (response != null && !string.IsNullOrEmpty(response.reply_to))
-            {
-                if (traceExecuteLoaded)
-                {
-                    Debug.Log(
-                        "[Locus] pipe sending execute_loaded response id=" +
-                        response.reply_to +
-                        ", ok=" +
-                        response.ok +
-                        ", message chars=" +
-                        (response.message == null ? 0 : response.message.Length) +
-                        ", error chars=" +
-                        (response.error == null ? 0 : response.error.Length));
-                }
-
-                bool sent = await SendEnvelopeAsync(response);
-                if (traceExecuteLoaded)
-                {
-                    Debug.Log(
-                        "[Locus] pipe execute_loaded response sent id=" +
-                        response.reply_to +
-                        ", sent=" +
-                        sent);
-                }
-            }
-        }
-
         // ───────────────── Outbound messaging ─────────────────
 
         /// <summary>
         /// </summary>
         public static void SendEventToRust(string eventType, string message)
         {
-            _ = SendEnvelopeAsync(new PipeEnvelope
-            {
-                type = eventType,
-                message = message
-            });
-        }
-
-        /// <summary>
-        /// </summary>
-        private static async Task<bool> SendEnvelopeAsync(PipeEnvelope env)
-        {
-            StreamWriter writer;
-            NamedPipeServerStream server;
-
-            lock (_connectionLock)
-            {
-                writer = _currentWriter;
-                server = _currentServer;
-            }
-
-            if (writer == null)
-                return false;
-
-            string json;
-            try
-            {
-                json = JsonUtility.ToJson(env);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError("[Locus] Failed to serialize envelope: " + ex);
-                return false;
-            }
-
-            await _writeLock.WaitAsync();
-            try
-            {
-                await writer.WriteLineAsync(json);
-                await writer.FlushAsync();
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[Locus] Failed to write to pipe: " + ex.Message);
-
-                // A broken write means the client end is gone, but on Mono
-                // the pending ReadLineAsync of this connection may take
-                // seconds to notice — during which the single pipe instance
-                // stays occupied and reconnect attempts fail with
-                // ERROR_PIPE_BUSY. Dispose the dead server so its reader
-                // unwinds and the listen loop can accept again immediately.
-                if (server != null && (ex is IOException || ex is ObjectDisposedException))
-                {
-                    try { server.Dispose(); } catch { }
-                }
-                return false;
-            }
-            finally
-            {
-                _writeLock.Release();
-            }
+            NativeEmitEvent(eventType, message);
         }
 
         // ───────────────── Response helpers ─────────────────
@@ -1388,8 +1047,11 @@ namespace Locus
                     case "ping":
                         return OkResponse(reqId, "pong");
 
+                    case "bridge_capabilities":
+                        return OkResponse(reqId, "managed_executor_v1,status_cached,set_editor_status_async");
+
                     case "status":
-                        return await HandleStatus(reqId);
+                        return HandleStatus(reqId);
 
                     case "get_console_text":
                     {
@@ -1405,7 +1067,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "exit_play_mode":
@@ -1422,13 +1084,13 @@ namespace Locus
                     }
 
                     case "set_editor_status":
-                        return await HandleSetEditorStatus(reqId, msg.message);
+                        return HandleSetEditorStatus(reqId, msg.message);
 
                     case "execute_code":
-                        return await HandleExecuteCode(reqId, msg.message);
+                        return await HandleExecuteCode(reqId, msg.message).ConfigureAwait(false);
 
                     case "execute_loaded":
-                        return await HandleExecuteLoaded(reqId, msg.message);
+                        return await HandleExecuteLoaded(reqId, msg.message).ConfigureAwait(false);
 
                     case "cancel_execute_code":
                         return HandleCancelExecuteCode(reqId);
@@ -1466,55 +1128,58 @@ namespace Locus
                     }
 
                     case "get_compile_params":
-                        return await HandleGetCompileParams(reqId, msg.message);
+                        return await HandleGetCompileParams(reqId, msg.message).ConfigureAwait(false);
 
                     case "hot_reload_probe":
-                        return await HandleHotReloadProbe(reqId);
+                        return await HandleHotReloadProbe(reqId).ConfigureAwait(false);
+
+                    case "hot_reload_access_probe":
+                        return await HandleHotReloadAccessProbe(reqId, msg.message).ConfigureAwait(false);
 
                     case "hot_patch_loaded":
-                        return await HandleHotPatchLoaded(reqId, msg.message);
+                        return await HandleHotPatchLoaded(reqId, msg.message).ConfigureAwait(false);
 
                     case "hot_patch_dispose":
-                        return await HandleHotPatchDispose(reqId, msg.message);
+                        return await HandleHotPatchDispose(reqId, msg.message).ConfigureAwait(false);
 
                     case "run_states":
-                        return await HandleRunStates(reqId, msg.message);
+                        return await HandleRunStates(reqId, msg.message).ConfigureAwait(false);
 
                     case "run_states_loaded":
-                        return await HandleRunStatesLoaded(reqId, msg.message);
+                        return await HandleRunStatesLoaded(reqId, msg.message).ConfigureAwait(false);
 
                     case "compile_run_states":
-                        return await HandleCompileRunStates(reqId, msg.message);
+                        return await HandleCompileRunStates(reqId, msg.message).ConfigureAwait(false);
 
                     case "compile_named":
-                        return await HandleCompileNamed(reqId, msg.message);
+                        return await HandleCompileNamed(reqId, msg.message).ConfigureAwait(false);
 
                     case "compile_skill_package":
-                        return await HandleCompileSkillPackage(reqId, msg.message);
+                        return await HandleCompileSkillPackage(reqId, msg.message).ConfigureAwait(false);
 
                     case "invoke_skill_package":
-                        return await HandleInvokeSkillPackage(reqId, msg.message);
+                        return await HandleInvokeSkillPackage(reqId, msg.message).ConfigureAwait(false);
 
                     case "invoke_named":
-                        return await HandleInvokeNamed(reqId, msg.message);
+                        return await HandleInvokeNamed(reqId, msg.message).ConfigureAwait(false);
 
                     case "invoke_named_cached":
-                        return await HandleInvokeNamedCached(reqId, msg.message);
+                        return await HandleInvokeNamedCached(reqId, msg.message).ConfigureAwait(false);
 
                     case "view_binding_read":
-                        return await HandleViewBindingRead(reqId, msg.message);
+                        return await HandleViewBindingRead(reqId, msg.message).ConfigureAwait(false);
 
                     case "view_binding_write":
-                        return await HandleViewBindingWrite(reqId, msg.message);
+                        return await HandleViewBindingWrite(reqId, msg.message).ConfigureAwait(false);
 
                     case "view_binding_apply":
-                        return await HandleViewBindingApply(reqId, msg.message);
+                        return await HandleViewBindingApply(reqId, msg.message).ConfigureAwait(false);
 
                     case "view_binding_discover":
-                        return await HandleViewBindingDiscover(reqId, msg.message);
+                        return await HandleViewBindingDiscover(reqId, msg.message).ConfigureAwait(false);
 
                     case "capture_viewport":
-                        return await HandleCaptureViewport(reqId, msg.message);
+                        return await HandleCaptureViewport(reqId, msg.message).ConfigureAwait(false);
 
                     case "request_recompile":
                     {
@@ -1536,6 +1201,14 @@ namespace Locus
                             if (changedPathsRaw.Length > 0)
                                 QueueChangedAssets(changedPathsRaw.Split('\n'));
                             FlushQueuedAssetImports();
+                            // Catch out-of-band file changes the AssetDatabase
+                            // never saw — chiefly a Locus plugin push, which
+                            // copies new/changed .cs straight into Packages
+                            // without going through ImportAsset. Without this a
+                            // newly added plugin file (no .meta yet) is absent
+                            // from the next compilation and any reference to it
+                            // fails to compile. Refresh imports them first.
+                            AssetDatabase.Refresh();
                             _domainReloadCheckFrames = -1;
                             CompilationPipeline.RequestScriptCompilation();
 
@@ -1560,7 +1233,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "end_edit_session":
@@ -1578,7 +1251,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "import_assets":
@@ -1602,7 +1275,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "get_compile_result":
@@ -1633,7 +1306,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "select_asset":
@@ -1671,14 +1344,14 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "asset_thumbnail":
-                        return await HandleAssetThumbnail(reqId, msg.message);
+                        return await HandleAssetThumbnail(reqId, msg.message).ConfigureAwait(false);
 
                     case "asset_preview_render":
-                        return await HandleAssetPreviewRender(reqId, msg.message);
+                        return await HandleAssetPreviewRender(reqId, msg.message).ConfigureAwait(false);
 
                     case "select_scene_object":
                     {
@@ -1696,7 +1369,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "open_scene_object_inspector":
@@ -1715,7 +1388,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "start_asset_drag":
@@ -1737,7 +1410,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "cancel_asset_drag":
@@ -1755,7 +1428,7 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "open_frontend_window":
@@ -1773,17 +1446,17 @@ namespace Locus
                                 tcs.SetResult(ErrorResponse(reqId, ex.Message));
                             }
                         });
-                        return await tcs.Task;
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "list_yaml":
-                        return await HandleListYaml(reqId, msg.message);
+                        return await HandleListYaml(reqId, msg.message).ConfigureAwait(false);
 
                     case "search_yaml":
-                        return await HandleSearchYaml(reqId, msg.message);
+                        return await HandleSearchYaml(reqId, msg.message).ConfigureAwait(false);
 
                     case "read_yaml":
-                        return await HandleReadYaml(reqId, msg.message);
+                        return await HandleReadYaml(reqId, msg.message).ConfigureAwait(false);
 
                     case "reload_open_scenes":
                     {
@@ -1809,7 +1482,7 @@ namespace Locus
                                 tcs.TrySetResult("error:" + ex.Message);
                             }
                         });
-                        string result = await tcs.Task;
+                        string result = await tcs.Task.ConfigureAwait(false);
                         return OkResponse(reqId, result);
                     }
 
@@ -1824,22 +1497,9 @@ namespace Locus
             }
         }
 
-        private static async Task<PipeEnvelope> HandleStatus(string requestId)
+        private static PipeEnvelope HandleStatus(string requestId)
         {
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
-            PostToMainThread(delegate
-            {
-                try
-                {
-                    RefreshCachedEditorState();
-                    tcs.SetResult(OkStatusResponse(requestId));
-                }
-                catch (Exception ex)
-                {
-                    tcs.SetResult(ErrorResponse(requestId, ex.ToString()));
-                }
-            });
-            return await tcs.Task;
+            return OkStatusResponse(requestId);
         }
 
         private static string BuildCachedEditorStatusMessage()

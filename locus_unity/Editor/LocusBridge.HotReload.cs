@@ -411,8 +411,16 @@ namespace Locus
 
         /// <summary>Force-JIT every method of the patch's shim/store classes
         /// so Mono's accessibility checks run NOW (returns the first failure,
-        /// or null). Generic shim methods are skipped: they JIT per
-        /// instantiation and direct call sites surface errors deterministically.</summary>
+        /// or null). Matching is on FullName so the compiler-generated NESTED
+        /// types of shim bodies — async/iterator state machines and lambda
+        /// display classes, whose own Name is "&lt;M&gt;d__0" — are covered too:
+        /// their MoveNext/lambda methods carry the same violating IL but are
+        /// instance methods that no detour pre-JITs (C2′b). Store holders
+        /// additionally get their CCTOR prepared (compiled, NOT run): an
+        /// added static field's initializer reads original surface there on
+        /// first touch, long after apply. Generic shim methods (and nested
+        /// types of generic shims) are skipped: they JIT per instantiation
+        /// and direct call sites surface errors deterministically.</summary>
         private static string PrepareHotPatchShims(Assembly patchAssembly)
         {
             Type[] types;
@@ -429,7 +437,7 @@ namespace Locus
             {
                 if (type == null)
                     continue;
-                string name = type.Name;
+                string name = type.FullName ?? type.Name;
                 if (!name.Contains("__LocusShims") && !name.Contains("__LocusFields_"))
                     continue;
 
@@ -437,7 +445,8 @@ namespace Locus
                 try
                 {
                     methods = type.GetMethods(
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly);
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly);
                 }
                 catch (Exception ex)
                 {
@@ -456,6 +465,23 @@ namespace Locus
                     {
                         Exception detail = ex.InnerException ?? ex;
                         return type.Name + "." + method.Name + ": " + detail.Message;
+                    }
+                }
+
+                if (!type.ContainsGenericParameters)
+                {
+                    ConstructorInfo cctor = type.TypeInitializer;
+                    if (cctor != null)
+                    {
+                        try
+                        {
+                            RuntimeHelpers.PrepareMethod(cctor.MethodHandle);
+                        }
+                        catch (Exception ex)
+                        {
+                            Exception detail = ex.InnerException ?? ex;
+                            return type.Name + "..cctor: " + detail.Message;
+                        }
                     }
                 }
             }

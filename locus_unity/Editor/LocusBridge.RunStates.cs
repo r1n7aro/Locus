@@ -84,13 +84,17 @@ namespace Locus
 
         private sealed class RunStatesControlException : Exception
         {
-            public readonly RunStatesControlKind Kind;
-            public readonly string Target;
-            public readonly string MessageText;
-            public readonly int SleepFrames;
+            public RunStatesControlKind Kind;
+            public string Target;
+            public string MessageText;
+            public int SleepFrames;
 
-            public RunStatesControlException(RunStatesControlKind kind, string target, string message, int sleepFrames)
-                : base(kind.ToString())
+            public RunStatesControlException()
+                : base("run_states_control")
+            {
+            }
+
+            public void Reset(RunStatesControlKind kind, string target, string message, int sleepFrames)
             {
                 Kind = kind;
                 Target = target;
@@ -1484,17 +1488,17 @@ namespace Locus
                 int normalized = Math.Max(0, frames);
                 if (normalized <= 0)
                     return;
-                throw new RunStatesControlException(RunStatesControlKind.Sleep, null, null, normalized);
+                throw _session.Control(RunStatesControlKind.Sleep, null, null, normalized);
             }
 
             public void Goto(string stateName)
             {
-                throw new RunStatesControlException(RunStatesControlKind.Goto, stateName, null, 0);
+                throw _session.Control(RunStatesControlKind.Goto, stateName, null, 0);
             }
 
             public void Done(string message)
             {
-                throw new RunStatesControlException(RunStatesControlKind.Done, null, message, 0);
+                throw _session.Control(RunStatesControlKind.Done, null, message, 0);
             }
 
             public void Done()
@@ -1504,7 +1508,7 @@ namespace Locus
 
             public void Fail(string message)
             {
-                throw new RunStatesControlException(RunStatesControlKind.Fail, null, message, 0);
+                throw _session.Control(RunStatesControlKind.Fail, null, message, 0);
             }
 
             public void PromptUser(string token, string message)
@@ -1677,6 +1681,8 @@ namespace Locus
             private readonly Dictionary<string, RuntimeProfilerSession> _profilers =
                 new Dictionary<string, RuntimeProfilerSession>(StringComparer.Ordinal);
             private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+            private readonly RuntimeCtx _runtimeCtx;
+            private readonly RunStatesControlException _control = new RunStatesControlException();
 
             private string _currentStateName;
             private bool _needsStart = true;
@@ -1697,6 +1703,7 @@ namespace Locus
                 _definition = definition;
                 _currentStateName = initialState;
                 _completion = completion;
+                _runtimeCtx = new RuntimeCtx(this);
                 _stateStartFrame = 0;
                 _stateStartSeconds = 0;
             }
@@ -1707,6 +1714,12 @@ namespace Locus
             public int ElapsedFramesInState { get { return Math.Max(0, TotalFrames - _stateStartFrame); } }
             public double TotalSeconds { get { return _stopwatch.Elapsed.TotalSeconds; } }
             public double ElapsedSecondsInState { get { return Math.Max(0, TotalSeconds - _stateStartSeconds); } }
+
+            internal RunStatesControlException Control(RunStatesControlKind kind, string target, string message, int sleepFrames)
+            {
+                _control.Reset(kind, target, message, sleepFrames);
+                return _control;
+            }
 
             public void Tick()
             {
@@ -1764,7 +1777,7 @@ namespace Locus
                         "too large: print output exceeded hard limit of "
                             + RunStatesPrintHardLimitTokens
                             + " estimated tokens; result was not saved."));
-                    throw new RunStatesControlException(RunStatesControlKind.Fail, null, "too large", 0);
+                    throw Control(RunStatesControlKind.Fail, null, "too large", 0);
                 }
 
                 _printBytes = nextBytes;
@@ -2089,7 +2102,7 @@ namespace Locus
 
                 try
                 {
-                    handler(new RuntimeCtx(this));
+                    handler(_runtimeCtx);
                     return !_completed;
                 }
                 catch (RunStatesControlException control)
@@ -2202,7 +2215,7 @@ namespace Locus
                 _runningEnd = true;
                 try
                 {
-                    state.End(new RuntimeCtx(this));
+                    state.End(_runtimeCtx);
                 }
                 catch (RunStatesControlException control)
                 {
@@ -2282,48 +2295,72 @@ namespace Locus
             }
         }
 
-        private static async Task<PipeEnvelope> HandleSetEditorStatus(string requestId, string desiredStatus)
+        private static PipeEnvelope HandleSetEditorStatus(string requestId, string desiredStatus)
         {
             string normalized = (desiredStatus ?? "").Trim();
             if (string.IsNullOrEmpty(normalized))
                 return ErrorResponse(requestId, "empty requested editor status");
 
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
-            PostToMainThread(delegate
+            switch (normalized)
             {
-                try
-                {
-                    switch (normalized)
+                case "editing":
+                    _isPaused = false;
+                    _isPlaying = false;
+                    NativePublishEditorStatusNow();
+                    PostToMainThread(delegate
                     {
-                        case "editing":
+                        try
+                        {
                             EditorApplication.isPaused = false;
                             EditorApplication.isPlaying = false;
-                            tcs.TrySetResult(OkResponse(requestId, "editing_requested"));
-                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            UnityEngine.Debug.LogError("[Locus] set_editor_status(editing) failed: " + ex);
+                        }
+                    });
+                    return OkResponse(requestId, "editing_requested");
 
-                        case "playing":
+                case "playing":
+                    _isPaused = false;
+                    _isPlaying = true;
+                    NativePublishEditorStatusNow();
+                    PostToMainThread(delegate
+                    {
+                        try
+                        {
                             EditorApplication.isPaused = false;
                             EditorApplication.isPlaying = true;
-                            tcs.TrySetResult(OkResponse(requestId, "playing_requested"));
-                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            UnityEngine.Debug.LogError("[Locus] set_editor_status(playing) failed: " + ex);
+                        }
+                    });
+                    return OkResponse(requestId, "playing_requested");
 
-                        case "playing_paused":
+                case "playing_paused":
+                    _isPaused = true;
+                    _isPlaying = true;
+                    NativePublishEditorStatusNow();
+                    PostToMainThread(delegate
+                    {
+                        try
+                        {
+                            if (!EditorApplication.isPlaying)
+                                EditorApplication.isPlaying = true;
                             EditorApplication.isPaused = true;
-                            EditorApplication.isPlaying = true;
-                            tcs.TrySetResult(OkResponse(requestId, "playing_paused_requested"));
-                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            UnityEngine.Debug.LogError("[Locus] set_editor_status(playing_paused) failed: " + ex);
+                        }
+                    });
+                    return OkResponse(requestId, "playing_paused_requested");
 
-                        default:
-                            tcs.TrySetResult(ErrorResponse(requestId, "unsupported editor status: " + normalized));
-                            break;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    tcs.TrySetResult(ErrorResponse(requestId, ex.ToString()));
-                }
-            });
-            return await tcs.Task;
+                default:
+                    return ErrorResponse(requestId, "unsupported editor status: " + normalized);
+            }
         }
 
         private static async Task<PipeEnvelope> HandleCompileRunStates(string requestId, string requestJson)

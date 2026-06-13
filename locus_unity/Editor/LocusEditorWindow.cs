@@ -5,7 +5,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,7 +26,6 @@ namespace Locus
         private const double AssetDragStateRefreshSeconds = 0.35d;
         private const double HeartbeatIntervalSeconds = 2d;
         private const double DesktopProbeIntervalSeconds = 2d;
-        private const int PipeConnectTimeoutMs = 500;
         private const string CloseReasonWindowClosed = "windowClosed";
         private const string CloseReasonWindowDisabled = "windowDisabled";
         private const string CloseReasonEditorQuit = "editorQuit";
@@ -37,7 +35,6 @@ namespace Locus
         private const string TargetKindSession = "session";
         private const string TargetKindView = "view";
 
-        private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static Texture2D _titleIcon;
         private static bool _lifecycleHooksRegistered;
         private static bool _assemblyReloadInProgress;
@@ -67,9 +64,6 @@ namespace Locus
         private volatile bool _sentOpen;
         private volatile int _failedSends;
         private string _statusMessage = "Waiting for Locus desktop.";
-        private readonly object _pipeLock = new object();
-        private NamedPipeClientStream _pipeClient;
-        private StreamWriter _pipeWriter;
         private bool _hasScreenRect;
         private int _screenX;
         private int _screenY;
@@ -92,7 +86,6 @@ namespace Locus
         private volatile bool _desktopProbeInFlight;
         private volatile bool _desktopLaunchInFlight;
         private volatile bool _assetDragStateSendInFlight;
-        private string _connectedPipeName = "";
         [SerializeField] private string _windowId = DefaultWindowId;
         [SerializeField] private string _targetKind = DefaultTargetKind;
         [SerializeField] private string _targetId = "";
@@ -118,6 +111,9 @@ namespace Locus
             public long parentHwnd;
             public string reason;
             public DroppedAssetRef[] assetRefs;
+            // Set to "reloading" while the managed domain reloads so the Tauri
+            // server retains the overlay (the native client keeps the pipe up).
+            public string managedOverlayState;
         }
 
         [Serializable]
@@ -484,12 +480,38 @@ namespace Locus
         {
             if (OverlaySyncEnabled)
             {
-                string reason = GetDisableCloseReason();
                 EditorApplication.update -= SyncOverlay;
                 if (_frontendWindowConfigured)
-                    SendClose(reason);
+                {
+                    // During a domain reload the native overlay client keeps the
+                    // connection alive, so signal "reloading" (the Tauri server
+                    // retains the overlay) instead of closing it and flickering.
+                    if (_assemblyReloadInProgress && LocusBridge.IsNativeBridgeActive)
+                        SendOverlayReloading();
+                    else
+                        SendClose(GetDisableCloseReason());
+                }
             }
             DisconnectPipe();
+        }
+
+        private void SendOverlayReloading()
+        {
+            try
+            {
+                EmbedControlMessage message = BuildMessage("update", true);
+                message.managedOverlayState = "reloading";
+                string json = JsonUtility.ToJson(message);
+                string pipeName = GetControlPipeName();
+                // Push synchronously through the native client — a Task.Run send
+                // may not finish before the domain unloads.
+                if (LocusBridge.NativeOverlayConnect(pipeName))
+                    LocusBridge.NativeOverlayPush(json);
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("[Locus] Overlay reloading signal failed: " + ex.Message);
+            }
         }
 
         private void OnDestroy()
@@ -1151,66 +1173,22 @@ namespace Locus
 
         private void WritePipeLine(string pipeName, string json)
         {
-            lock (_pipeLock)
-            {
-                EnsurePipeConnected(pipeName);
-                _pipeWriter.WriteLine(json);
-                _pipeWriter.Flush();
-            }
+            if (LocusBridge.NativeOverlayConnect(pipeName) && LocusBridge.NativeOverlayPush(json))
+                return;
+
+            throw new IOException("Native overlay client is unavailable.");
         }
 
         private static void WritePipeLineOnce(string pipeName, string json)
         {
-            using (NamedPipeClientStream client = new NamedPipeClientStream(
-                ".",
-                pipeName,
-                PipeDirection.Out,
-                PipeOptions.Asynchronous))
-            {
-                client.Connect(PipeConnectTimeoutMs);
-                using (StreamWriter writer = new StreamWriter(client, Utf8NoBom, 4096))
-                {
-                    writer.NewLine = "\n";
-                    writer.AutoFlush = true;
-                    writer.WriteLine(json);
-                    writer.Flush();
-                }
-            }
-        }
-
-        private void EnsurePipeConnected(string pipeName)
-        {
-            if (_pipeClient != null
-                && _pipeClient.IsConnected
-                && _pipeWriter != null
-                && string.Equals(_connectedPipeName, pipeName, StringComparison.Ordinal))
+            if (LocusBridge.NativeOverlayConnect(pipeName) && LocusBridge.NativeOverlayPush(json))
                 return;
 
-            DisconnectPipe();
-            _pipeClient = new NamedPipeClientStream(
-                ".",
-                pipeName,
-                PipeDirection.Out,
-                PipeOptions.Asynchronous);
-            _pipeClient.Connect(PipeConnectTimeoutMs);
-            _connectedPipeName = pipeName;
-            _pipeWriter = new StreamWriter(_pipeClient, Utf8NoBom, 4096)
-            {
-                NewLine = "\n",
-                AutoFlush = true
-            };
+            throw new IOException("Native overlay client is unavailable.");
         }
 
         private void DisconnectPipe()
         {
-            lock (_pipeLock)
-            {
-                try { if (_pipeWriter != null) _pipeWriter.Dispose(); } catch { }
-                try { if (_pipeClient != null) _pipeClient.Dispose(); } catch { }
-                _pipeWriter = null;
-                _pipeClient = null;
-                _connectedPipeName = "";
-            }
         }
 
         private void DrawPlaceholder()
