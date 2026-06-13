@@ -601,6 +601,15 @@ mod windows_impl {
         }
     }
 
+    pub(super) fn engine_module_bounds(process_id: u32) -> Result<(u64, u64, String), String> {
+        let module = find_unity_engine_module(process_id)?;
+        Ok((
+            module.base,
+            module.base.saturating_add(module.size as u64),
+            module.path,
+        ))
+    }
+
     fn resolve_symbol(
         image_path: &Path,
         symbol_path: &Path,
@@ -755,4 +764,21 @@ fn patch_process(process_id: u32, editor_process_path: &str) -> Result<ProcessPa
 #[cfg(target_os = "windows")]
 fn restore_process_patch(process_patch: &ProcessPatch) -> Result<(), String> {
     windows_impl::restore_process_patch(process_patch)
+}
+
+/// Engine module bounds (base, end, path) for a Unity process. Reused by the
+/// state probe so it does not duplicate the Toolhelp module-snapshot bindings
+/// (avoids clashing `Module32FirstW`/`Module32NextW` extern declarations).
+#[cfg(target_os = "windows")]
+pub(in crate::unity_bridge) fn engine_module_bounds(
+    process_id: u32,
+) -> Result<(u64, u64, String), String> {
+    windows_impl::engine_module_bounds(process_id)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(in crate::unity_bridge) fn engine_module_bounds(
+    _process_id: u32,
+) -> Result<(u64, u64, String), String> {
+    Err("engine module lookup is only supported on Windows".to_string())
 }

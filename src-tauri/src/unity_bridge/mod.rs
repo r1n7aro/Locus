@@ -1,30 +1,38 @@
 mod background_hook;
 mod capture;
 mod focus;
+mod native_selftest;
 mod plugin;
 mod process;
+mod state_probe;
 mod transport;
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 pub use background_hook::{UnityBackgroundHookState, UnityBackgroundHookStatus};
 pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
-    check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
-    plugin_install_root, plugin_skills_root, PluginStatus,
+    check_plugin_install_plan, check_plugin_status, emit_plugin_status, find_plugin_source_dir,
+    install_or_update_plugin, install_or_update_plugin_with_force_close, plugin_install_root,
+    plugin_skills_root, PluginInstallPlan, PluginStatus,
 };
 pub use process::{
     query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
 };
+pub use state_probe::{SemanticState, UnityStateProbeStatus, UnityStateProbeTier};
 pub use transport::{
     send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
 };
@@ -45,6 +53,549 @@ pub fn restore_background_hook_runtime() -> Result<(), String> {
     background_hook::restore_runtime_patches()
 }
 
+pub fn initialize_state_probe(enabled: bool) {
+    state_probe::initialize(enabled);
+}
+
+pub fn set_state_probe_enabled(value: bool) -> UnityStateProbeStatus {
+    state_probe::set_enabled(value)
+}
+
+pub fn state_probe_status() -> UnityStateProbeStatus {
+    state_probe::status()
+}
+
+pub fn start_unity_semantic_state_observer(project_path: &str) {
+    state_probe::start_observer(project_path);
+}
+
+pub fn stop_unity_semantic_state_observers() {
+    state_probe::stop_all_observers();
+}
+
+/// Fuse pipe + process + native signals into one semantic editor state.
+pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
+    state_probe::semantic_state_for_project(project_path).await
+}
+
+pub async fn run_state_probe_selftest(
+    app: tauri::AppHandle,
+    project: String,
+) -> Result<(), String> {
+    state_probe::selftest::run(app, project).await
+}
+
+pub async fn run_native_bridge_selftest(
+    app: tauri::AppHandle,
+    project: String,
+) -> Result<(), String> {
+    native_selftest::run(app, project).await
+}
+
+// ── Native broker bridge ─────────────────────────────────────────────
+//
+// When enabled, the Tauri↔Unity command channel is served by the native
+// broker DLL (`locus_native`) loaded inside the Unity process. The broker's
+// pipe outlives domain reloads, so the connection no longer drops every time
+// the editor recompiles. The toggle is global (a config flag) but takes effect
+// per project via a marker file the Unity plugin checks before loading the DLL;
+// the native broker is the required Unity command transport.
+
+static NATIVE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn initialize_native_bridge(enabled: bool) {
+    NATIVE_BRIDGE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_native_bridge_enabled(value: bool) {
+    NATIVE_BRIDGE_ENABLED.store(value, Ordering::Relaxed);
+}
+
+pub fn native_bridge_enabled() -> bool {
+    NATIVE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Broker status as published by the native plugin's shared-memory state
+/// plane. `None` means the native bridge is disabled or the broker has not
+/// created the state plane for this project.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeBrokerStatus {
+    #[serde(default)]
+    pub native_alive: bool,
+    #[serde(default)]
+    pub observed_at_ms: i64,
+    #[serde(default)]
+    pub managed_state: String,
+    #[serde(default)]
+    pub domain_generation: i64,
+    #[serde(default)]
+    pub editor_status: String,
+    #[serde(default)]
+    pub last_managed_heartbeat_ms: i64,
+    #[serde(default)]
+    pub pending_requests: u32,
+    #[serde(default)]
+    pub inflight_requests: u32,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub broker_capabilities: Vec<String>,
+    #[serde(default)]
+    pub managed_capabilities: Vec<String>,
+    #[serde(default)]
+    pub protocol_version: i32,
+    #[serde(default)]
+    pub pending_bytes: u32,
+    #[serde(default)]
+    pub queue_limit: u32,
+    #[serde(default)]
+    pub inflight_limit: u32,
+    #[serde(default)]
+    pub payload_limit_bytes: u32,
+    #[serde(default)]
+    pub pending_byte_limit: u32,
+    #[serde(default)]
+    pub writer_queue_limit: u32,
+    #[serde(default)]
+    pub request_deadline_ms: u32,
+    /// The broker patched Unity's `IsApplicationActive` symbols in-process
+    /// (migration Phase 6). When true the cross-process background hook stands
+    /// down — the in-process patch already keeps the editor ticking and it
+    /// survives domain reloads without a re-sync.
+    #[serde(default)]
+    pub background_patched: bool,
+    #[serde(default)]
+    pub background_symbols: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeBrokerEvent {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub domain_generation: i64,
+    #[serde(default)]
+    pub editor_status: String,
+    #[serde(default)]
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeBrokerObservation {
+    pub current: NativeBrokerStatus,
+    pub events: Vec<NativeBrokerEvent>,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NativeBrokerStatusPayload {
+    #[serde(flatten)]
+    status: NativeBrokerStatus,
+    #[serde(default)]
+    events: Vec<NativeBrokerEvent>,
+    #[serde(default)]
+    cursor: u64,
+}
+
+const NATIVE_BROKER_STATE_MMF_MAGIC: u32 = 0x424e_434c; // "LCNB" little-endian.
+const NATIVE_BROKER_STATE_MMF_VERSION: u16 = 1;
+const NATIVE_BROKER_STATE_MMF_HEADER_SIZE: usize = 64;
+const NATIVE_BROKER_STATE_MMF_SLOT_COUNT: usize = 8;
+const NATIVE_BROKER_STATE_MMF_SLOT_SIZE: usize = 128 * 1024;
+
+fn native_broker_state_mmf_name(project_path: &str) -> String {
+    format!(
+        r"Local\LocusNativeBrokerState_{}",
+        project_state_plane_key(project_path)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn read_native_broker_status_payload_from_shared_memory(
+    project_path: &str,
+) -> Option<NativeBrokerStatusPayload> {
+    native_state_plane_imp::read_native_broker_status_payload(&native_broker_state_mmf_name(
+        project_path,
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_native_broker_status_payload_from_shared_memory(
+    _project_path: &str,
+) -> Option<NativeBrokerStatusPayload> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+mod native_state_plane_imp {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    use super::{
+        NativeBrokerStatusPayload, NATIVE_BROKER_STATE_MMF_HEADER_SIZE,
+        NATIVE_BROKER_STATE_MMF_MAGIC, NATIVE_BROKER_STATE_MMF_SLOT_COUNT,
+        NATIVE_BROKER_STATE_MMF_SLOT_SIZE, NATIVE_BROKER_STATE_MMF_VERSION,
+    };
+
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+
+    const FALSE: Bool = 0;
+    const FILE_MAP_READ: Dword = 0x0004;
+
+    unsafe extern "system" {
+        fn OpenFileMappingW(
+            dwDesiredAccess: Dword,
+            bInheritHandle: Bool,
+            lpName: *const u16,
+        ) -> Handle;
+        fn MapViewOfFile(
+            hFileMappingObject: Handle,
+            dwDesiredAccess: Dword,
+            dwFileOffsetHigh: Dword,
+            dwFileOffsetLow: Dword,
+            dwNumberOfBytesToMap: usize,
+        ) -> *mut c_void;
+        fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> Bool;
+        fn CloseHandle(hObject: Handle) -> Bool;
+    }
+
+    struct OwnedHandle(Handle);
+
+    impl OwnedHandle {
+        fn new(handle: Handle) -> Option<Self> {
+            if handle.is_null() {
+                None
+            } else {
+                Some(Self(handle))
+            }
+        }
+
+        fn raw(&self) -> Handle {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct MappedView(*mut c_void);
+
+    impl MappedView {
+        fn new(handle: Handle, size: usize) -> Option<Self> {
+            let ptr = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, size) };
+            if ptr.is_null() {
+                None
+            } else {
+                Some(Self(ptr))
+            }
+        }
+
+        fn bytes(&self, len: usize) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.0 as *const u8, len) }
+        }
+    }
+
+    impl Drop for MappedView {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = UnmapViewOfFile(self.0);
+            }
+        }
+    }
+
+    pub(super) fn read_native_broker_status_payload(
+        mapping_name: &str,
+    ) -> Option<NativeBrokerStatusPayload> {
+        let total_size = NATIVE_BROKER_STATE_MMF_HEADER_SIZE.saturating_add(
+            NATIVE_BROKER_STATE_MMF_SLOT_COUNT.saturating_mul(NATIVE_BROKER_STATE_MMF_SLOT_SIZE),
+        );
+        let name = wide_null(mapping_name);
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, FALSE, name.as_ptr()) };
+        let handle = OwnedHandle::new(handle)?;
+        let view = MappedView::new(handle.raw(), total_size)?;
+        let bytes = view.bytes(total_size);
+
+        let magic = read_u32(bytes, 0)?;
+        let version = read_u16(bytes, 4)?;
+        let slot_count = read_u16(bytes, 6)? as usize;
+        let slot_size = read_u32(bytes, 8)? as usize;
+        let writer_seq = read_u64(bytes, 16)?;
+        if magic != NATIVE_BROKER_STATE_MMF_MAGIC
+            || version != NATIVE_BROKER_STATE_MMF_VERSION
+            || slot_count == 0
+            || slot_count > NATIVE_BROKER_STATE_MMF_SLOT_COUNT
+            || slot_size < 64
+            || slot_size > NATIVE_BROKER_STATE_MMF_SLOT_SIZE
+            || writer_seq == 0
+        {
+            return None;
+        }
+
+        let slot_index = ((writer_seq - 1) as usize) % slot_count;
+        let slot_offset =
+            NATIVE_BROKER_STATE_MMF_HEADER_SIZE.checked_add(slot_index.checked_mul(slot_size)?)?;
+        let slot_end = slot_offset.checked_add(slot_size)?;
+        if slot_end > bytes.len() {
+            return None;
+        }
+        let slot = &bytes[slot_offset..slot_end];
+        let slot_seq_before = read_u64(slot, 0)?;
+        if slot_seq_before != writer_seq {
+            return None;
+        }
+        let observed_at_ms = read_u64(slot, 8)?;
+        let payload_len = read_u32(slot, 20)? as usize;
+        let payload_offset = 24;
+        if payload_len == 0 || payload_len > slot_size.saturating_sub(payload_offset) {
+            return None;
+        }
+        let payload_bytes = slot
+            .get(payload_offset..payload_offset + payload_len)?
+            .to_vec();
+        let slot_seq_after = read_u64(slot, 0)?;
+        let writer_seq_after = read_u64(bytes, 16)?;
+        if slot_seq_after != slot_seq_before || writer_seq_after != writer_seq {
+            return None;
+        }
+        let payload = std::str::from_utf8(&payload_bytes).ok()?;
+        let mut parsed = serde_json::from_str::<NativeBrokerStatusPayload>(payload).ok()?;
+        if parsed.status.observed_at_ms <= 0 {
+            parsed.status.observed_at_ms = observed_at_ms.min(i64::MAX as u64) as i64;
+        }
+        Some(parsed)
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+}
+
+fn native_broker_event_cursors() -> &'static StdMutex<HashMap<String, u64>> {
+    static CURSORS: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    CURSORS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn native_broker_event_consumer_key(project_path: &str, consumer: &str) -> String {
+    format!("{}\n{}", project_runtime_key(project_path), consumer.trim())
+}
+
+fn native_broker_consumer_cursor(project_path: &str, consumer: &str) -> Option<u64> {
+    native_broker_event_cursors()
+        .lock()
+        .ok()
+        .and_then(|cursors| {
+            cursors
+                .get(&native_broker_event_consumer_key(project_path, consumer))
+                .copied()
+        })
+}
+
+fn update_native_broker_consumer_cursor(project_path: &str, consumer: &str, cursor: u64) {
+    if let Ok(mut cursors) = native_broker_event_cursors().lock() {
+        cursors.insert(
+            native_broker_event_consumer_key(project_path, consumer),
+            cursor,
+        );
+    }
+}
+
+/// Ask the native broker for its status. Best-effort, short-timeout, and a
+/// no-op (returns `None`) when the native bridge is disabled or the broker is
+/// not running for this project.
+pub async fn query_native_broker_status(project_path: &str) -> Option<NativeBrokerStatus> {
+    query_native_broker_status_payload(project_path, None)
+        .await
+        .map(|payload| payload.status)
+}
+
+async fn query_native_broker_status_payload(
+    project_path: &str,
+    cursor: Option<u64>,
+) -> Option<NativeBrokerStatusPayload> {
+    if !native_bridge_enabled() {
+        return None;
+    }
+    let mut payload = read_native_broker_status_payload_from_shared_memory(project_path)?;
+    if let Some(cursor) = cursor {
+        payload.events.retain(|event| event.seq > cursor);
+    } else {
+        payload.events.clear();
+    }
+    Some(payload)
+}
+
+pub(crate) async fn query_native_broker_observation(
+    project_path: &str,
+    consumer: &str,
+) -> Option<NativeBrokerObservation> {
+    let cursor = native_broker_consumer_cursor(project_path, consumer);
+    let mut payload = query_native_broker_status_payload(project_path, cursor).await?;
+    let events = if cursor.is_some() {
+        std::mem::take(&mut payload.events)
+    } else {
+        Vec::new()
+    };
+    let next_cursor = events
+        .iter()
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(payload.cursor)
+        .max(payload.cursor);
+    update_native_broker_consumer_cursor(project_path, consumer, next_cursor);
+    Some(NativeBrokerObservation {
+        current: payload.status,
+        events,
+        cursor: next_cursor,
+    })
+}
+
+/// Reconcile the per-project marker the Unity plugin checks before loading the
+/// native DLL. Writing it records the exact pipe name the broker should serve;
+/// removing it disables the required native command transport for that project.
+pub fn sync_native_bridge_marker(project_path: &str, enabled: bool) -> Result<(), String> {
+    let path = native_bridge_marker_path(project_path);
+    if enabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create native-bridge marker dir '{}': {}",
+                    parent.display(),
+                    error
+                )
+            })?;
+        }
+        let body = format!("{}\n", get_native_pipe_name(project_path));
+        std::fs::write(&path, body).map_err(|error| {
+            format!(
+                "Failed to write native-bridge marker '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
+    } else if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Failed to remove native-bridge marker '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn native_bridge_marker_path(project_path: &str) -> PathBuf {
+    Path::new(strip_extended_path_prefix(project_path))
+        .join("Library")
+        .join("Locus")
+        .join("NativeBridge.enabled")
+}
+
+/// Reconcile the per-project marker the Unity plugin checks before asking the
+/// native broker to patch the engine's background-activity symbols in-process
+/// (migration Phase 6). Present means "apply the in-process hook"; absent means
+/// the managed side leaves it to the cross-process Tauri patch. Only meaningful
+/// when the native bridge is enabled (the managed hook code only runs then).
+pub fn sync_background_hook_marker(project_path: &str, enabled: bool) -> Result<(), String> {
+    let path = background_hook_marker_path(project_path);
+    if enabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create background-hook marker dir '{}': {}",
+                    parent.display(),
+                    error
+                )
+            })?;
+        }
+        std::fs::write(&path, "enabled\n").map_err(|error| {
+            format!(
+                "Failed to write background-hook marker '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
+    } else if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Failed to remove background-hook marker '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn background_hook_marker_path(project_path: &str) -> PathBuf {
+    Path::new(strip_extended_path_prefix(project_path))
+        .join("Library")
+        .join("Locus")
+        .join("BackgroundHook.enabled")
+}
+
+/// Transient native-broker errors meaning "the managed executor is briefly
+/// unavailable (mid domain reload) — retry" rather than a real failure. Flows
+/// that intentionally span a reload (e.g. recompile) treat a broker `ok:false`
+/// with one of these codes as "keep waiting": the native pipe stays up and
+/// answers with the code while the managed executor is re-registering.
+pub(crate) fn is_transient_broker_error(error: &str) -> bool {
+    matches!(
+        error.trim(),
+        "managed_reloading" | "managed_not_ready" | "domain_reload_interrupted"
+    )
+}
+
+fn is_reload_boundary_broker_error(error: &str) -> bool {
+    matches!(
+        error.trim(),
+        "managed_reloading" | "domain_reload_interrupted"
+    )
+}
+
+fn pipe_response_transient_broker_error(response: &PipeResponse) -> bool {
+    !response.ok
+        && response
+            .error
+            .as_deref()
+            .map(is_transient_broker_error)
+            .unwrap_or(false)
+}
+
 pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
 pub const UNITY_EDITOR_STATUS_DISCONNECTED: &str = "disconnected";
@@ -52,6 +603,9 @@ pub const UNITY_EDITOR_STATUS_EDITING: &str = "editing";
 pub const UNITY_EDITOR_STATUS_PLAYING: &str = "playing";
 pub const UNITY_EDITOR_STATUS_PLAYING_PAUSED: &str = "playing_paused";
 pub const UNITY_EDITOR_STATUS_SCHEMA: &str = "disconnected | editing | playing | playing_paused";
+const UNITY_STATUS_POLL_TIMEOUT: Duration = Duration::from_millis(800);
+const UNITY_PROCESS_STATUS_TIMEOUT: Duration = Duration::from_millis(1_000);
+const UNITY_CONNECTION_STATUS_STALE_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipeResponse {
@@ -86,6 +640,7 @@ pub struct UnityLaunchResult {
 pub struct UnityConnectionStatus {
     pub connected: bool,
     pub editor_status: String,
+    pub control_channel_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_path: Option<String>,
     pub editor_process_state: UnityEditorProcessState,
@@ -192,8 +747,33 @@ fn unity_recompile_waits() -> &'static StdMutex<HashMap<String, u32>> {
     WAITS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn unity_connection_status_cache() -> &'static StdMutex<HashMap<String, UnityConnectionStatus>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, UnityConnectionStatus>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
 fn project_runtime_key(project_path: &str) -> String {
     strip_extended_path_prefix(project_path).trim().to_string()
+}
+
+fn normalize_project_path_for_state_plane(project_path: &str) -> String {
+    let trimmed = strip_extended_path_prefix(project_path).trim();
+    let mut value = trimmed.replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
+}
+
+pub(crate) fn project_state_plane_key(project_path: &str) -> String {
+    let normalized = normalize_project_path_for_state_plane(project_path);
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 struct UnityRecompileWaitGuard {
@@ -245,14 +825,18 @@ fn strip_extended_path_prefix(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
-fn get_pipe_name(project_path: &str) -> String {
-    let path = strip_extended_path_prefix(project_path);
-    let sanitized = path
-        .replace('\\', "_")
-        .replace('/', "_")
-        .replace(':', "_")
-        .replace(' ', "_");
-    format!(r"\\.\pipe\locus_unity_{}", sanitized)
+/// Pipe name part (without the `\\.\pipe\` prefix) the native broker serves.
+/// Mirrors `LocusBridge.GenerateNativePipeName` on the Unity side.
+fn native_pipe_name_part(project_path: &str) -> String {
+    format!(
+        "locus_unity_native_{}",
+        project_state_plane_key(project_path)
+    )
+}
+
+/// Full client path of the native broker pipe for this project.
+pub(crate) fn get_native_pipe_name(project_path: &str) -> String {
+    format!(r"\\.\pipe\{}", native_pipe_name_part(project_path))
 }
 
 pub fn is_unity_project(path: &str) -> bool {
@@ -620,6 +1204,74 @@ fn unity_process_info_from_status(
     })
 }
 
+fn cache_unity_connection_status(project_path: &str, status: &UnityConnectionStatus) {
+    if let Ok(mut cache) = unity_connection_status_cache().lock() {
+        cache.insert(project_runtime_key(project_path), status.clone());
+    }
+}
+
+fn cached_running_connection_status_for_transient_failure(
+    project_path: &str,
+    checked_at_ms: u64,
+    error: impl Into<String>,
+) -> Option<UnityConnectionStatus> {
+    let error = error.into();
+    let mut status = unity_connection_status_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&project_runtime_key(project_path)).cloned())?;
+    if !matches!(
+        status.editor_process_state,
+        UnityEditorProcessState::Running
+    ) {
+        return None;
+    }
+    if checked_at_ms.saturating_sub(status.checked_at_ms) > UNITY_CONNECTION_STATUS_STALE_MS {
+        return None;
+    }
+    let pid_created_at_ms = status
+        .editor_process_id
+        .and_then(process::process_created_at_unix_ms);
+    if let Some(fallback_status) = state_probe::fallback_editor_status_for_project(
+        project_path,
+        status.editor_process_id,
+        pid_created_at_ms,
+    ) {
+        status.editor_status = fallback_status;
+    }
+    status.connected = false;
+    status.control_channel_state = if error.contains("busy") {
+        "busy".to_string()
+    } else if error.contains("timed out") {
+        "timeout".to_string()
+    } else {
+        "error".to_string()
+    };
+    status.checked_at_ms = checked_at_ms;
+    status.latency_ms = None;
+    status.last_error = Some(error);
+    Some(status)
+}
+
+fn apply_observed_editor_status_fallback(project_path: &str, status: &mut UnityConnectionStatus) {
+    if !matches!(
+        status.editor_process_state,
+        UnityEditorProcessState::Running
+    ) {
+        return;
+    }
+    let pid_created_at_ms = status
+        .editor_process_id
+        .and_then(process::process_created_at_unix_ms);
+    if let Some(fallback_status) = state_probe::fallback_editor_status_for_project(
+        project_path,
+        status.editor_process_id,
+        pid_created_at_ms,
+    ) {
+        status.editor_status = fallback_status;
+    }
+}
+
 fn process_hint_from_response(
     resp: &PipeResponse,
     project_path: &str,
@@ -641,7 +1293,13 @@ fn process_hint_from_response(
     })
 }
 
-async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus) {
+async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, project_path: &str) {
+    // The in-process native hook (when active) owns the patch and survives
+    // domain reloads; the cross-process path then stands down.
+    if let Some(native) = native_owned_background_hook(project_path).await {
+        status.background_hook = native;
+        return;
+    }
     let Some(process_id) = status.editor_process_id else {
         let current = background_hook::status();
         if matches!(
@@ -765,20 +1423,68 @@ async fn query_process_info_for_connection_status(
     }
 }
 
-pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
-    let pipe_name = get_pipe_name(project_path);
-    let checked_at_ms = unix_now_ms();
-    let started_at = std::time::Instant::now();
+async fn query_process_info_for_connection_status_bounded(
+    project_path: &str,
+    connected: bool,
+    process_hint: Option<UnityEditorProcessInfo>,
+) -> UnityEditorProcessInfo {
+    let fallback_hint = process_hint.clone();
+    match tokio::time::timeout(
+        UNITY_PROCESS_STATUS_TIMEOUT,
+        query_process_info_for_connection_status(project_path, connected, process_hint),
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(_) => {
+            let checked_at_ms = unix_now_ms();
+            if let Some(mut hint) = fallback_hint {
+                hint.checked_at_ms = checked_at_ms;
+                hint.last_error = Some("Unity process probe timed out".to_string());
+                return hint;
+            }
+            UnityEditorProcessInfo {
+                state: UnityEditorProcessState::Unknown,
+                process_id: None,
+                executable_path: None,
+                project_path: None,
+                checked_at_ms,
+                last_error: Some("Unity process probe timed out".to_string()),
+            }
+        }
+    }
+}
 
-    match send_message(project_path, "status", "").await {
-        Ok(resp) if resp.ok => {
-            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+async fn query_unity_status_response_with_timeout(
+    project_path: &str,
+    timeout: Duration,
+) -> Result<Option<(PipeResponse, u64)>, String> {
+    let started_at = std::time::Instant::now();
+    let response =
+        transport::send_message_if_writer_free(project_path, "status", "", timeout).await?;
+    let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(response.map(|resp| (resp, latency_ms)))
+}
+
+pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
+    let pipe_name = get_native_pipe_name(project_path);
+    let checked_at_ms = unix_now_ms();
+
+    match query_unity_status_response_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await {
+        Ok(Some((resp, latency_ms))) if resp.ok => {
             let process_hint = process_hint_from_response(&resp, project_path, checked_at_ms);
             let message = resp.message.unwrap_or_default();
             let (editor_status, scene_path) = parse_unity_status_message(&message);
+            state_probe::note_pipe_editor_status(
+                project_path,
+                editor_status,
+                resp.process_id,
+                checked_at_ms,
+            );
             let mut status = UnityConnectionStatus {
                 connected: true,
                 editor_status: editor_status.to_string(),
+                control_channel_state: "ready".to_string(),
                 scene_path,
                 editor_process_state: UnityEditorProcessState::Running,
                 editor_process_id: None,
@@ -794,16 +1500,30 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 checked_at_ms,
             };
             let process_info =
-                query_process_info_for_connection_status(project_path, true, process_hint).await;
+                query_process_info_for_connection_status_bounded(project_path, true, process_hint)
+                    .await;
             apply_unity_process_info(&mut status, process_info);
-            sync_background_hook_for_status(&mut status).await;
+            sync_background_hook_for_status(&mut status, project_path).await;
+            cache_unity_connection_status(project_path, &status);
             status
         }
-        Ok(resp) => {
-            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        Ok(Some((resp, latency_ms))) => {
+            let error = resp
+                .error
+                .unwrap_or_else(|| "Unity status returned ok=false".to_string());
+            let control_channel_state = if is_transient_broker_error(&error) {
+                if error == "managed_reloading" || error == "domain_reload_interrupted" {
+                    "reloading".to_string()
+                } else {
+                    "starting".to_string()
+                }
+            } else {
+                "error".to_string()
+            };
             let mut status = UnityConnectionStatus {
                 connected: false,
                 editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                control_channel_state,
                 scene_path: None,
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
@@ -814,23 +1534,31 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 pipe_name,
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
-                last_error: Some(
-                    resp.error
-                        .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
-                ),
+                last_error: Some(error),
                 background_hook: background_hook::status(),
                 checked_at_ms,
             };
             let process_info =
-                query_process_info_for_connection_status(project_path, false, None).await;
+                query_process_info_for_connection_status_bounded(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
-            sync_background_hook_for_status(&mut status).await;
+            apply_observed_editor_status_fallback(project_path, &mut status);
+            sync_background_hook_for_status(&mut status, project_path).await;
+            cache_unity_connection_status(project_path, &status);
             status
         }
-        Err(error) => {
+        Ok(None) => {
+            let error = "Unity status poll skipped because the pipe writer is busy".to_string();
+            if let Some(status) = cached_running_connection_status_for_transient_failure(
+                project_path,
+                checked_at_ms,
+                error.clone(),
+            ) {
+                return status;
+            }
             let mut status = UnityConnectionStatus {
                 connected: false,
                 editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                control_channel_state: "busy".to_string(),
                 scene_path: None,
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
@@ -846,12 +1574,78 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 checked_at_ms,
             };
             let process_info =
-                query_process_info_for_connection_status(project_path, false, None).await;
+                query_process_info_for_connection_status_bounded(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
-            sync_background_hook_for_status(&mut status).await;
+            apply_observed_editor_status_fallback(project_path, &mut status);
+            sync_background_hook_for_status(&mut status, project_path).await;
+            cache_unity_connection_status(project_path, &status);
+            status
+        }
+        Err(error) => {
+            if let Some(status) = cached_running_connection_status_for_transient_failure(
+                project_path,
+                checked_at_ms,
+                error.clone(),
+            ) {
+                return status;
+            }
+            let mut status = UnityConnectionStatus {
+                connected: false,
+                editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                control_channel_state: if error.contains("timed out") {
+                    "timeout".to_string()
+                } else {
+                    "disconnected".to_string()
+                },
+                scene_path: None,
+                editor_process_state: UnityEditorProcessState::Unknown,
+                editor_process_id: None,
+                editor_process_path: None,
+                editor_project_path: None,
+                process_checked_at_ms: None,
+                process_last_error: None,
+                pipe_name,
+                latency_ms: None,
+                reconnect_attempts: 0,
+                last_error: Some(error),
+                background_hook: background_hook::status(),
+                checked_at_ms,
+            };
+            let process_info =
+                query_process_info_for_connection_status_bounded(project_path, false, None).await;
+            apply_unity_process_info(&mut status, process_info);
+            apply_observed_editor_status_fallback(project_path, &mut status);
+            sync_background_hook_for_status(&mut status, project_path).await;
+            cache_unity_connection_status(project_path, &status);
             status
         }
     }
+}
+
+/// When the native broker has patched the background symbols in-process
+/// (migration Phase 6), returns a synthesized "patched" status so the
+/// cross-process Tauri hook stands down. `None` means the native path is
+/// inactive (bridge off, broker absent, or it did not patch) and the caller
+/// should fall back to the cross-process patch — this gating fails open.
+async fn native_owned_background_hook(project_path: &str) -> Option<UnityBackgroundHookStatus> {
+    if !native_bridge_enabled() {
+        return None;
+    }
+    let status = query_native_broker_status(project_path).await?;
+    if !status.background_patched {
+        return None;
+    }
+    Some(UnityBackgroundHookStatus {
+        enabled: true,
+        supported: cfg!(target_os = "windows"),
+        state: UnityBackgroundHookState::Patched,
+        patched: true,
+        process_id: None,
+        editor_process_path: None,
+        symbol_count: status.background_symbols,
+        error: None,
+        updated_at_ms: unix_now_ms(),
+    })
 }
 
 pub async fn ensure_background_hook_for_project(
@@ -859,6 +1653,9 @@ pub async fn ensure_background_hook_for_project(
 ) -> Result<UnityBackgroundHookStatus, String> {
     if !background_hook::enabled() {
         return Ok(background_hook::status());
+    }
+    if let Some(native) = native_owned_background_hook(project_path).await {
+        return Ok(native);
     }
     let process_info = query_current_project_editor_process(project_path).await;
     let process_id = process_info.process_id.ok_or_else(|| {
@@ -1085,10 +1882,27 @@ pub async fn open_frontend_window(project_path: &str, payload: &str) -> Result<(
 
 /// Canonical status values: "disconnected" | "editing" | "playing" | "playing_paused"
 pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Option<String>) {
-    match send_message(project_path, "status", "").await {
-        Ok(resp) if resp.ok => {
+    query_unity_status_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await
+}
+
+/// Like `query_unity_status` but with an explicit (short) timeout, so a wedged
+/// editor or a half-open pipe cannot stall the caller for the default 35s. A
+/// timeout reads as disconnected — the out-of-process native probe is then the
+/// authority for what the editor is actually doing.
+pub async fn query_unity_status_with_timeout(
+    project_path: &str,
+    timeout: Duration,
+) -> (bool, &'static str, Option<String>) {
+    match query_unity_status_response_with_timeout(project_path, timeout).await {
+        Ok(Some((resp, _))) if resp.ok => {
             let msg = resp.message.unwrap_or_default();
             let (status, scene_part) = parse_unity_status_message(&msg);
+            state_probe::note_pipe_editor_status(
+                project_path,
+                status,
+                resp.process_id,
+                unix_now_ms(),
+            );
             (true, status, scene_part)
         }
         _ => (false, UNITY_EDITOR_STATUS_DISCONNECTED, None),
@@ -1130,8 +1944,19 @@ pub async fn set_editor_status(project_path: &str, desired_status: &str) -> Resu
         ));
     }
 
-    let resp = send_message(project_path, "set_editor_status", desired_status).await?;
+    state_probe::note_editor_status_intent(project_path, desired_status);
+    let resp = match send_message(project_path, "set_editor_status", desired_status).await {
+        Ok(resp) => {
+            state_probe::note_editor_status_intent_acked(project_path);
+            resp
+        }
+        Err(error) => {
+            state_probe::clear_editor_status_intent(project_path);
+            return Err(error);
+        }
+    };
     if !resp.ok {
+        state_probe::clear_editor_status_intent(project_path);
         return Err(resp
             .error
             .unwrap_or_else(|| "set_editor_status failed".to_string()));
@@ -1149,6 +1974,7 @@ pub async fn set_editor_status(project_path: &str, desired_status: &str) -> Resu
         tokio::time::sleep(Duration::from_millis(250)).await;
         let (_connected, status, _) = query_unity_status(project_path).await;
         if status == desired_status {
+            state_probe::clear_editor_status_intent(project_path);
             return Ok(());
         }
     }
@@ -1904,16 +2730,25 @@ async fn wait_for_unity_bridge_ready(
     let start = std::time::Instant::now();
 
     loop {
-        let detail =
-            match send_message_with_timeout(project_path, "status", "", Duration::from_secs(5))
-                .await
-            {
-                Ok(resp) if resp.ok => return Ok(()),
-                Ok(resp) => resp
-                    .error
-                    .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
-                Err(error) => error,
-            };
+        let mut detail = "Unity bridge status poll returned disconnected".to_string();
+        let mut native_managed_not_ready = false;
+        if native_bridge_enabled() {
+            if let Some(status) = query_native_broker_status(project_path).await {
+                if status.native_alive && status.managed_state == "ready" {
+                    return Ok(());
+                }
+                native_managed_not_ready = true;
+                detail = format!("Native broker managed state is '{}'", status.managed_state);
+            }
+        }
+
+        if !native_managed_not_ready {
+            let (connected, _, _) =
+                query_unity_status_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await;
+            if connected {
+                return Ok(());
+            }
+        }
 
         if start.elapsed() > max_wait {
             return Err(format!(
@@ -2510,6 +3345,30 @@ where
                 execute_msg_type = "execute_code";
                 execute_payload = prepared.code.clone();
             }
+            Ok(resp)
+                if pipe_response_transient_broker_error(&resp)
+                    && !saw_unity_progress
+                    && send_attempt == 1 =>
+            {
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| "native broker managed executor unavailable".to_string());
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting Unity pipe",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                if let Err(reconnect_error) =
+                    reconnect_unity_pipe_for_execute(project_path, &error).await
+                {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                send_attempt += 1;
+            }
             Ok(resp) => break resp,
             Err(error) if !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
@@ -2803,6 +3662,42 @@ where
                 execute_msg_type = "execute_code";
                 execute_payload = prepared.code.clone();
             }
+            Ok(resp)
+                if pipe_response_transient_broker_error(&resp)
+                    && !saw_unity_progress
+                    && send_attempt == 1 =>
+            {
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| "native broker managed executor unavailable".to_string());
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting Unity pipe",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                let reconnect = reconnect_unity_pipe_for_execute_cancellable(
+                    project_path,
+                    &error,
+                    &mut cancel_rx,
+                )
+                .await;
+                if reconnect
+                    .as_ref()
+                    .err()
+                    .map(|error| error == UNITY_EXECUTE_CANCELLED)
+                    .unwrap_or(false)
+                {
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                }
+                if let Err(reconnect_error) = reconnect {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                send_attempt += 1;
+            }
             Ok(resp) => break resp,
             Err(error) if !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
@@ -2910,7 +3805,9 @@ async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<
 /// remainder keeps the on-disk casing for Unity. Paths outside the project
 /// are dropped.
 fn relative_asset_paths(project_path: &str, absolute_paths: &[String]) -> Vec<String> {
-    let root = project_path.trim_end_matches(['/', '\\']).replace('\\', "/");
+    let root = project_path
+        .trim_end_matches(['/', '\\'])
+        .replace('\\', "/");
     let root_lower = root.to_ascii_lowercase();
     let mut rels: Vec<String> = Vec::new();
     for path in absolute_paths {
@@ -2965,17 +3862,28 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
         Ok(resp) => resp,
         Err(error) => return finish(Err(error)),
     };
+    let mut request_recompile_reloading = false;
     if !resp.ok {
-        return finish(Err(resp
+        let error = resp
             .error
-            .unwrap_or_else(|| "request_recompile failed".to_string())));
+            .unwrap_or_else(|| "request_recompile failed".to_string());
+        if is_reload_boundary_broker_error(&error) {
+            request_recompile_reloading = true;
+            transport::disconnect(project_path).await;
+            eprintln!(
+                "[Locus] request_recompile hit native reload boundary, waiting for reconnect: {}",
+                error
+            );
+        } else {
+            return finish(Err(error));
+        }
     }
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let max_wait = Duration::from_secs(120);
     let start = std::time::Instant::now();
-    let mut disconnected = false;
+    let mut disconnected = request_recompile_reloading;
 
     loop {
         if start.elapsed() > max_wait {
@@ -3046,9 +3954,16 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                         }
                     }
                 } else {
-                    return finish(Err(resp
+                    let error = resp
                         .error
-                        .unwrap_or_else(|| "Compilation failed (unknown error)".to_string())));
+                        .unwrap_or_else(|| "Compilation failed (unknown error)".to_string());
+                    // Native broker is up but the managed executor is mid
+                    // domain reload: keep polling — the result resolves once the
+                    // new domain re-registers.
+                    if is_transient_broker_error(&error) {
+                        continue;
+                    }
+                    return finish(Err(error));
                 }
             }
             Err(_) => {
@@ -3068,11 +3983,12 @@ pub async fn start_unity_monitor(
     stop_unity_monitor(monitor).await;
     set_event_app_handle(app_handle.clone());
 
-    let pipe_name = get_pipe_name(&project_path);
+    let pipe_name = get_native_pipe_name(&project_path);
     eprintln!(
         "[Locus] Unity project detected, starting connection monitor (pipe: {})",
         pipe_name
     );
+    state_probe::start_observer(&project_path);
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
@@ -3169,7 +4085,7 @@ pub async fn start_unity_monitor(
                     .filter(|info| info.process_id.is_some())
                 {
                     apply_unity_process_info(&mut status, process_info);
-                    sync_background_hook_for_status(&mut status).await;
+                    sync_background_hook_for_status(&mut status, &project_path).await;
                 }
             } else if disconnected_transition {
                 if let Some(process_info) = process::refresh_known_project_editor_process_liveness(
@@ -3182,7 +4098,7 @@ pub async fn start_unity_monitor(
                         matches!(process_info.state, UnityEditorProcessState::NotRunning);
                     apply_unity_process_info(&mut status, process_info);
                     if process_not_running {
-                        sync_background_hook_for_status(&mut status).await;
+                        sync_background_hook_for_status(&mut status, &project_path).await;
                     }
                 }
             }
@@ -3221,13 +4137,16 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
         handle.abort();
         eprintln!("[Locus] Unity connection monitor stopped");
     }
+    state_probe::stop_all_observers();
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
+        cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
         read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
-        rewrite_run_states_output_for_size,
+        rewrite_run_states_output_for_size, UnityBackgroundHookState, UnityBackgroundHookStatus,
+        UnityConnectionStatus, UnityEditorProcessState,
     };
     use serde_json::json;
 
@@ -3237,6 +4156,64 @@ mod tests {
             .find_map(|line| line.strip_prefix("result_file: "))
             .expect("result_file field")
             .to_string()
+    }
+
+    fn test_connection_status(project_path: &str, checked_at_ms: u64) -> UnityConnectionStatus {
+        UnityConnectionStatus {
+            connected: true,
+            editor_status: super::UNITY_EDITOR_STATUS_PLAYING.to_string(),
+            control_channel_state: "ready".to_string(),
+            scene_path: Some("Assets/Scenes/Main.unity".to_string()),
+            editor_process_state: UnityEditorProcessState::Running,
+            editor_process_id: Some(42),
+            editor_process_path: Some("C:/Unity/Unity.exe".to_string()),
+            editor_project_path: Some(project_path.to_string()),
+            process_checked_at_ms: Some(checked_at_ms),
+            process_last_error: None,
+            pipe_name: "test-pipe".to_string(),
+            latency_ms: Some(12),
+            reconnect_attempts: 0,
+            last_error: None,
+            background_hook: UnityBackgroundHookStatus {
+                enabled: false,
+                supported: true,
+                state: UnityBackgroundHookState::Disabled,
+                patched: false,
+                process_id: None,
+                editor_process_path: None,
+                symbol_count: 0,
+                error: None,
+                updated_at_ms: checked_at_ms,
+            },
+            checked_at_ms,
+        }
+    }
+
+    #[test]
+    fn transient_status_failure_reuses_recent_running_status() {
+        let project_path = format!("F:/Proj/Game/cache-test-{}", std::process::id());
+        let status = test_connection_status(&project_path, 1_000);
+        cache_unity_connection_status(&project_path, &status);
+
+        let cached = cached_running_connection_status_for_transient_failure(
+            &project_path,
+            1_500,
+            "writer busy",
+        )
+        .expect("recent running status should be reused");
+
+        assert!(!cached.connected);
+        assert_eq!(cached.control_channel_state, "busy");
+        assert_eq!(cached.editor_status, super::UNITY_EDITOR_STATUS_PLAYING);
+        assert_eq!(cached.checked_at_ms, 1_500);
+        assert_eq!(cached.latency_ms, None);
+        assert_eq!(cached.last_error.as_deref(), Some("writer busy"));
+        assert!(cached_running_connection_status_for_transient_failure(
+            &project_path,
+            20_000,
+            "stale",
+        )
+        .is_none());
     }
 
     #[test]

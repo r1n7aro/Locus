@@ -27,6 +27,12 @@ pub struct UnityEditorProcessInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct UnityProjectProcessCloseResult {
+    pub process_ids: Vec<u32>,
+    pub forced_process_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
 struct Win32UnityProcess {
     process_id: u32,
     executable_path: Option<String>,
@@ -93,6 +99,39 @@ impl UnityEditorProcessInfo {
             last_error: None,
         }
     }
+}
+
+pub async fn close_current_project_unity_processes(
+    project_path: &str,
+    timeout: Duration,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    close_current_project_unity_processes_inner(project_path, timeout, false).await
+}
+
+pub async fn force_close_current_project_unity_processes(
+    project_path: &str,
+    timeout: Duration,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    close_current_project_unity_processes_inner(project_path, timeout, true).await
+}
+
+async fn close_current_project_unity_processes_inner(
+    project_path: &str,
+    timeout: Duration,
+    force_first: bool,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    let project_path = project_path.to_string();
+    let project_path_for_task = project_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        close_current_project_unity_processes_sync(&project_path_for_task, timeout, force_first)
+    })
+    .await
+    .map_err(|error| format!("Unity process close task failed: {error}"))??;
+
+    let key = process_cache_key(project_path.as_str());
+    let mut cache = unity_process_probe_cache().lock().await;
+    cache.remove(&key);
+    Ok(result)
 }
 
 pub(super) async fn refresh_known_project_editor_process_liveness(
@@ -215,6 +254,21 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     probe
 }
 
+/// Process creation time (ms since the Unix epoch) for `process_id`, used to
+/// detect PID reuse across editor restarts and to derive "recently launched".
+/// `None` when it cannot be read (process gone, access denied, non-Windows).
+#[cfg(windows)]
+pub(crate) fn process_created_at_unix_ms(process_id: u32) -> Option<u64> {
+    probe_native::query_process_facts(process_id)
+        .ok()
+        .and_then(|facts| facts.created_at_unix_ms)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn process_created_at_unix_ms(_process_id: u32) -> Option<u64> {
+    None
+}
+
 pub(super) async fn cached_project_editor_process(
     project_path: &str,
 ) -> Option<UnityEditorProcessInfo> {
@@ -277,6 +331,9 @@ fn query_current_project_editor_process_uncached(project_path: String) -> UnityE
 
         readable_command_lines += 1;
         let args = split_windows_command_line(command_line);
+        if unity_process_args_are_worker(&args) {
+            continue;
+        }
         let Some(project_arg) = project_path_from_args(&args) else {
             continue;
         };
@@ -301,6 +358,92 @@ fn query_current_project_editor_process_uncached(project_path: String) -> UnityE
     }
 
     UnityEditorProcessInfo::not_running(checked_at_ms)
+}
+
+#[cfg(windows)]
+fn close_current_project_unity_processes_sync(
+    project_path: &str,
+    timeout: Duration,
+    force_first: bool,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    let processes = query_project_unity_processes(project_path)?;
+    let process_ids = processes
+        .iter()
+        .map(|process| process.process_id)
+        .collect::<Vec<_>>();
+    if process_ids.is_empty() {
+        return Ok(UnityProjectProcessCloseResult {
+            process_ids,
+            forced_process_ids: Vec::new(),
+        });
+    }
+
+    if force_first {
+        for process_id in &process_ids {
+            let _ = request_taskkill(*process_id, true);
+        }
+        let remaining = wait_for_process_exit(&process_ids, timeout);
+        if !remaining.is_empty() {
+            return Err(format!(
+                "Unity process(es) did not exit before plugin install: {}",
+                remaining
+                    .iter()
+                    .map(|process_id| process_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(UnityProjectProcessCloseResult {
+            process_ids: process_ids.clone(),
+            forced_process_ids: process_ids,
+        });
+    }
+
+    for process_id in &process_ids {
+        let _ = request_taskkill(*process_id, false);
+    }
+
+    let graceful_timeout = timeout.min(Duration::from_secs(20));
+    let mut remaining = wait_for_process_exit(&process_ids, graceful_timeout);
+    let mut forced_process_ids = Vec::new();
+    if !remaining.is_empty() {
+        forced_process_ids = remaining.clone();
+        for process_id in &remaining {
+            let _ = request_taskkill(*process_id, true);
+        }
+        let forced_timeout = timeout
+            .saturating_sub(graceful_timeout)
+            .max(Duration::from_secs(5));
+        remaining = wait_for_process_exit(&remaining, forced_timeout);
+    }
+
+    if !remaining.is_empty() {
+        return Err(format!(
+            "Unity process(es) did not exit before plugin install: {}",
+            remaining
+                .iter()
+                .map(|process_id| process_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Ok(UnityProjectProcessCloseResult {
+        process_ids,
+        forced_process_ids,
+    })
+}
+
+#[cfg(not(windows))]
+fn close_current_project_unity_processes_sync(
+    _project_path: &str,
+    _timeout: Duration,
+    _force_first: bool,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    Ok(UnityProjectProcessCloseResult {
+        process_ids: Vec::new(),
+        forced_process_ids: Vec::new(),
+    })
 }
 
 #[cfg(not(windows))]
@@ -423,6 +566,99 @@ fn query_unity_processes() -> Result<Vec<Win32UnityProcess>, String> {
         });
     }
     Ok(records)
+}
+
+#[cfg(windows)]
+fn query_project_unity_processes(project_path: &str) -> Result<Vec<Win32UnityProcess>, String> {
+    let target = normalize_project_identity(project_path)
+        .ok_or_else(|| "Current workspace path is empty".to_string())?;
+    let mut records = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    if let Some(info) = probe_editor_instance_manifest(project_path, unix_now_ms()) {
+        if let Some(process_id) = info.process_id {
+            if seen.insert(process_id) {
+                records.push(Win32UnityProcess {
+                    process_id,
+                    executable_path: info.executable_path,
+                    command_line: None,
+                });
+            }
+        }
+    }
+
+    for process in query_unity_processes()? {
+        let Some(command_line) = process.command_line.as_deref() else {
+            continue;
+        };
+        let args = split_windows_command_line(command_line);
+        let Some(project_arg) = project_path_from_args(&args) else {
+            continue;
+        };
+        let Some(candidate) = normalize_project_identity(project_arg) else {
+            continue;
+        };
+        if candidate == target && seen.insert(process.process_id) {
+            records.push(process);
+        }
+    }
+
+    records.sort_by_key(|process| {
+        let worker = process
+            .command_line
+            .as_deref()
+            .map(|line| unity_process_args_are_worker(&split_windows_command_line(line)))
+            .unwrap_or(false);
+        if worker {
+            0
+        } else {
+            1
+        }
+    });
+    Ok(records)
+}
+
+#[cfg(windows)]
+fn request_taskkill(process_id: u32, force: bool) -> Result<(), String> {
+    let mut command = std::process::Command::new("taskkill");
+    command
+        .arg("/PID")
+        .arg(process_id.to_string())
+        .arg("/T")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if force {
+        command.arg("/F");
+    }
+
+    let status = command.status().map_err(|error| {
+        format!(
+            "Failed to request Unity process {} close via taskkill: {}",
+            process_id, error
+        )
+    })?;
+    if status.success() || !is_process_alive(process_id).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(format!(
+            "taskkill returned {} for Unity process {}",
+            status, process_id
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(process_ids: &[u32], timeout: Duration) -> Vec<u32> {
+    let started = std::time::Instant::now();
+    let mut remaining = process_ids.to_vec();
+    loop {
+        remaining.retain(|process_id| is_process_alive(*process_id).unwrap_or(true));
+        if remaining.is_empty() || started.elapsed() >= timeout {
+            return remaining;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Minimal hand-rolled Win32/NT bindings for the Unity process probe,
@@ -814,6 +1050,11 @@ fn project_path_from_args(args: &[String]) -> Option<&str> {
     None
 }
 
+fn unity_process_args_are_worker(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg.to_ascii_lowercase().contains("assetimportworker"))
+}
+
 fn split_windows_command_line(command_line: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -870,7 +1111,10 @@ fn split_windows_command_line(command_line: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_project_identity, project_path_from_args, split_windows_command_line};
+    use super::{
+        normalize_project_identity, project_path_from_args, split_windows_command_line,
+        unity_process_args_are_worker,
+    };
 
     #[test]
     fn parses_unity_hub_project_path_argument_case_insensitively() {
@@ -899,6 +1143,19 @@ mod tests {
             project_path_from_args(&args),
             Some(r#"C:\Projects\Game With Spaces"#)
         );
+    }
+
+    #[test]
+    fn detects_unity_asset_import_worker_processes() {
+        let worker_args = split_windows_command_line(
+            r#""E:\2022.3.47f1\Editor\Unity.exe" "-adb2" "-batchMode" "-noUpm" "-name" "AssetImportWorker1" "-projectPath" "C:/Projects/Game""#,
+        );
+        let editor_args = split_windows_command_line(
+            r#"E:\2022.3.47f1\Editor\Unity.exe -projectpath "C:\Projects\Game" -useHub -hubIPC"#,
+        );
+
+        assert!(unity_process_args_are_worker(&worker_args));
+        assert!(!unity_process_args_are_worker(&editor_args));
     }
 
     #[test]
