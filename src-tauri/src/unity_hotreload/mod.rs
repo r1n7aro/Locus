@@ -21,6 +21,8 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static PATCHES_APPLIED: AtomicU64 = AtomicU64::new(0);
 static PATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_PATCHES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PATCH_CODE: AtomicU64 = AtomicU64::new(0);
 static COLD_QUEUED: AtomicU64 = AtomicU64::new(0);
 
 /// Called once from app setup with the persisted flag.
@@ -43,6 +45,8 @@ pub struct HotReloadCounters {
     pub patches_applied: u64,
     pub patch_failures: u64,
     pub active_patches: u64,
+    pub active_patch_bytes: u64,
+    pub active_patch_code: u64,
     pub cold_queued: u64,
 }
 
@@ -51,13 +55,17 @@ pub fn counters() -> HotReloadCounters {
         patches_applied: PATCHES_APPLIED.load(Ordering::Relaxed),
         patch_failures: PATCH_FAILURES.load(Ordering::Relaxed),
         active_patches: ACTIVE_PATCHES.load(Ordering::Relaxed),
+        active_patch_bytes: ACTIVE_PATCH_BYTES.load(Ordering::Relaxed),
+        active_patch_code: ACTIVE_PATCH_CODE.load(Ordering::Relaxed),
         cold_queued: COLD_QUEUED.load(Ordering::Relaxed),
     }
 }
 
-pub(crate) fn record_patch_applied() {
+pub(crate) fn record_patch_applied(assembly_bytes: u64, code_entries: u64) {
     PATCHES_APPLIED.fetch_add(1, Ordering::Relaxed);
     ACTIVE_PATCHES.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_PATCH_BYTES.fetch_add(assembly_bytes, Ordering::Relaxed);
+    ACTIVE_PATCH_CODE.fetch_add(code_entries, Ordering::Relaxed);
     crate::csharp_compile::emit_status_in_background();
 }
 
@@ -75,6 +83,8 @@ pub(crate) fn set_cold_queue_depth(depth: u64) {
 /// holds every hot-applied edit, so the real compile converges naturally.
 pub(crate) fn reset_active_patches() {
     ACTIVE_PATCHES.store(0, Ordering::Relaxed);
+    ACTIVE_PATCH_BYTES.store(0, Ordering::Relaxed);
+    ACTIVE_PATCH_CODE.store(0, Ordering::Relaxed);
     CONVERGENCE_PENDING.store(false, Ordering::Relaxed);
     crate::csharp_compile::emit_status_in_background();
 }
@@ -170,4 +180,3 @@ async fn try_converge(project_path: &str, why: &str) {
         Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
     }
 }
-

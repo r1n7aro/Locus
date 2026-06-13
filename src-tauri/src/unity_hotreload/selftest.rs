@@ -23,20 +23,55 @@
 //!     field additions, #if-block edits, iterator→plain conversions,
 //!     extension-method additions (with the call site surviving LATER
 //!     batches where the accepted patch image is also in scope), a
-//!     five-file batch, and generic method bodies (generic methods AND
+//!     five-file batch, generic method bodies (generic methods AND
 //!     methods of generic types) via the B1 remove+add shim path with
-//!     their untouched callers re-detoured.
+//!     their untouched callers re-detoured, added members reaching the
+//!     original type's PRIVATE field/method/static through the C0-measured
+//!     access caps (C2′a), the same access from the compiler-generated
+//!     SUB-METHODS of added members — async state machines, capturing
+//!     lambdas, iterators (C2′b), an added member constructing through a
+//!     PRIVATE constructor (the newobj creation-node check), a kept
+//!     body touching a cross-file internal type (binding-model alignment
+//!     guard), the B2 accessor additions: a new PROPERTY
+//!     (write/compound-assign/read through get_/set_ shims), a new INDEXER
+//!     overload, a new accessor EVENT (subscribe/unsubscribe), and a new
+//!     AUTO-PROPERTY (store-backed: default for existing instances, value
+//!     persistent across calls, initializer on new instances, ++ across a
+//!     later batch), plus nameof(...) over an added auto-property; and the B3
+//!     cross-asmdef shapes against a SEPARATE assembly (Lib/ + .asmdef):
+//!     a lib method body edit observed through an Assembly-CSharp caller,
+//!     a lib signature change whose CROSS-ASSEMBLY caller must join the
+//!     batch (M3 names the Assembly-CSharp file first, then the covered
+//!     batch goes hot), and a lib added method called from Assembly-CSharp
+//!     through the cross-assembly shim, plus a lib added property through
+//!     cross-assembly accessor shims; and the B6 partial shapes: a type
+//!     split across TWO part files (both with private instance fields),
+//!     where editing one part's body pulls the never-edited sibling in as
+//!     a baseline, then editing both parts in one batch keeps the merged
+//!     patch copy complete. The Enter Play Mode Options matrix
+//!     (B5) is probed right before the play transition: the run logs
+//!     whether the play-enter domain reload is enabled, and the Phase-2
+//!     editor patch is deliberately carried across the transition — E02
+//!     asserts the mode-matched outcome (the detour survives with Reload
+//!     Domain disabled, it dies with the classic reload).
 //!   • negatives (must come back COLD with the precise reason): generic
 //!     bodies whose compiled caller is OUTSIDE the batch (named caller
 //!     file), generic-type constructor bodies, constructor/
-//!     finalizer surface and finalizer bodies, virtual members, struct
+//!     finalizer surface and finalizer bodies, virtual members (including
+//!     virtual PROPERTY additions — plain property/indexer/event additions
+//!     are hot since B2), field-like event additions, struct
 //!     field layout, enum value edits, attribute edits, const edits,
-//!     property additions, new Unity message names, interface changes,
-//!     base-list changes, partial types, delegate signature changes,
-//!     conversions returning the declaring type, added members touching
-//!     non-public state (Mono JIT access checks), uncovered call sites
-//!     (named caller file); plus the shim-only "parked new surface"
-//!     verdict for caller-less additions.
+//!     new Unity message names, interface changes,
+//!     base-list changes, partial-type FIELD layout changes (body edits
+//!     are hot since B6), delegate signature changes,
+//!     conversions returning the declaring type, added members whose
+//!     SIGNATURE names a non-public type (C2′a relaxes body access only),
+//!     uncovered call sites (named caller file); plus the shim-only
+//!     "parked new surface" verdict for caller-less additions and the
+//!     untracked-input verdict for .asmdef edits (assembly restructuring
+//!     always needs unity_recompile), along with B2's pointed cold guards:
+//!     full-property ++, ??= set-skip, auto-property ref/out, and compound
+//!     indexers with non-repeatable index expressions.
 //!
 //! Flow: with the editor connected and NOT playing, it materializes a test
 //! corpus under Assets/LocusHotReloadSelfTest, imports + recompiles it as
@@ -76,6 +111,17 @@ const IFACE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestIface.cs";
 const NEG_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestNegative.cs";
 const EDITOR_DIR: &str = "Assets/LocusHotReloadSelfTest/Editor";
 const EDITOR_FILE: &str = "Assets/LocusHotReloadSelfTest/Editor/LocusSelfTestEditorTool.cs";
+// B3: a corpus subdirectory with its own .asmdef — Unity compiles it into a
+// SEPARATE assembly (LocusSelfTestLib), so the cross-asmdef cases run against
+// a real two-assembly graph instead of everything living in Assembly-CSharp.
+const LIB_DIR: &str = "Assets/LocusHotReloadSelfTest/Lib";
+const LIB_ASMDEF_FILE: &str = "Assets/LocusHotReloadSelfTest/Lib/LocusSelfTestLib.asmdef";
+const LIB_FILE: &str = "Assets/LocusHotReloadSelfTest/Lib/LocusSelfTestLibType.cs";
+// B6: a hand-written partial type split across TWO files — both parts carry
+// instance fields, so the cross-part layout merge and the sibling-discovery
+// path are exercised against the real compiler's part ordering.
+const PARTIAL_A_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialA.cs";
+const PARTIAL_B_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialB.cs";
 
 const ALL_FILES: &[&str] = &[
     SUBJECT_FILE,
@@ -87,6 +133,13 @@ const ALL_FILES: &[&str] = &[
     IFACE_FILE,
     NEG_FILE,
     EDITOR_FILE,
+    PARTIAL_A_FILE,
+    PARTIAL_B_FILE,
+    // The .asmdef imports BEFORE the lib source so the assembly exists by
+    // the time its first script imports (both flush in one batch anyway —
+    // the compilation pipeline recomputes asmdef ownership per compile).
+    LIB_ASMDEF_FILE,
+    LIB_FILE,
 ];
 
 const SUBJECT_BASELINE: &str = r#"using UnityEngine;
@@ -98,6 +151,7 @@ public class LocusSelfTestSubject : MonoBehaviour
     public static int EvtCount;
     public static int UpdateBeats;
     public static System.Func<int> Captured;
+    private static int s_secret = 600;
     private int _ticks = 0;
     private int _seed = 40;
     private int _legacy = 3;
@@ -132,8 +186,12 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public int Probe() { return 0; }
     public int Spare() { return 1; }
+    private int SecretCore() { return 7000; }
+    public int Vaulted() { return SecretCore() + s_secret; }
     public int Relay() { return new LocusSelfTestNegative().Echo(20) + 1; }
     public int RelayVal() { return new LocusSelfTestNegGeneric<int>().Val(); }
+    public int LibRelay() { return new LocusSelfTestLibType().LibBody() + 3; }
+    public int LibSigRelay() { return new LocusSelfTestLibType().LibSig(10); }
     public int Seed() { return _seed; }
     public int Legacy() { return _legacy; }
     public int Lambda() { int basis = 1; System.Func<int> f = () => basis + 1; return f(); }
@@ -249,6 +307,71 @@ public class LocusSelfTestNegFin
 {
     ~LocusSelfTestNegFin() { }
 }
+
+internal class LocusSelfTestNegHidden
+{
+    public int V;
+}
+
+public class LocusSelfTestLocked
+{
+    public int Worth;
+
+    private LocusSelfTestLocked(int worth) { Worth = worth; }
+
+    public static int Spawn() { return 1; }
+}
+"#;
+
+// B3: assembly definition for the lib corpus. No platform restriction (it
+// compiles for the Editor too), autoReferenced so Assembly-CSharp picks it
+// up without an explicit reference (predefined assemblies auto-reference
+// every autoReferenced asmdef).
+const LIB_ASMDEF_BASELINE: &str = r#"{
+    "name": "LocusSelfTestLib",
+    "rootNamespace": "",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
+"#;
+
+// All-public surface on purpose: the cross-asmdef cases measure assembly
+// plumbing (original-type resolution, cross-assembly M3, cross-assembly
+// shims), not the access-caps machinery (P34-P37 cover that).
+const LIB_BASELINE: &str = r#"public class LocusSelfTestLibType
+{
+    public int LibSeed = 8;
+
+    public int LibBody() { return 5; }
+    public int LibSig(int x) { return x + 1; }
+}
+"#;
+
+// B6: both parts declare PRIVATE instance fields, so the patch copy must
+// merge the parts in the original assembly's field order (the layout guard
+// verifies) and the edited part-A body must reach part B's field and method.
+const PARTIAL_A_BASELINE: &str = r#"public partial class LocusSelfTestPartial
+{
+    private int _alpha = 30;
+
+    public int Combine() { return _alpha + Basis() + _beta; }
+}
+"#;
+
+const PARTIAL_B_BASELINE: &str = r#"public partial class LocusSelfTestPartial
+{
+    private int _beta = 400;
+
+    private int Basis() { return 5; }
+}
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +389,7 @@ struct NegativeLedgers {
     struct_text: String,
     ctor_text: String,
     iface_text: String,
+    partial_a_text: String,
 }
 
 struct SelfTest {
@@ -276,6 +400,19 @@ struct SelfTest {
     /// Per-file texts as the positive phase left them; the negative phase
     /// restores files to exactly these after each cold-classification probe.
     negative_ledgers: NegativeLedgers,
+    /// B5 — Enter Play Mode Options, probed in edit mode right before the
+    /// play transition: Some(true) on the classic reload-domain path,
+    /// Some(false) when Reload Domain is disabled, None when the probe
+    /// failed (mode-aware assertions then assume the classic path).
+    domain_reload_on_play: Option<bool>,
+    /// Enter Play Mode Options master switch: Some(true) when enabled (fast
+    /// play-enter, editor detours persist), Some(false) on the classic full
+    /// reload, None when the probe failed (assume classic).
+    epmo_enabled: Option<bool>,
+    /// E01 applied AND observed: the editor-assembly patch is deliberately
+    /// left live so Phase 3 can assert its fate across the play transition
+    /// (B5), reverting the file afterwards.
+    editor_patch_live: bool,
 }
 
 /// Replace exactly one occurrence, failing loudly when the anchor text is
@@ -297,10 +434,14 @@ fn swap_line(text: &mut String, line_prefix: &str, replacement: &str) -> Result<
         .filter(|(_, line)| line.starts_with(line_prefix))
         .map(|(index, _)| index);
     let Some(index) = indices.next() else {
-        return Err(format!("internal corpus error: no line starts with: {line_prefix}"));
+        return Err(format!(
+            "internal corpus error: no line starts with: {line_prefix}"
+        ));
     };
     if indices.next().is_some() {
-        return Err(format!("internal corpus error: multiple lines start with: {line_prefix}"));
+        return Err(format!(
+            "internal corpus error: multiple lines start with: {line_prefix}"
+        ));
     }
     let mut lines: Vec<&str> = text.lines().collect();
     lines[index] = replacement;
@@ -400,7 +541,10 @@ impl SelfTest {
                 if output.contains(expected) {
                     self.pass(name, format!("observed {expected}"));
                 } else {
-                    self.fail(name, format!("expected '{expected}' in output, got: {output}"));
+                    self.fail(
+                        name,
+                        format!("expected '{expected}' in output, got: {output}"),
+                    );
                 }
             }
             Err(error) => self.fail(name, format!("snippet failed: {error}")),
@@ -434,7 +578,10 @@ impl SelfTest {
         }
         match self.hot_reload(None).await {
             Ok(summary) if summary.contains("Hot reload not applicable") => {
-                self.fail(name, format!("unexpected cold verdict: {}", squash(&summary)));
+                self.fail(
+                    name,
+                    format!("unexpected cold verdict: {}", squash(&summary)),
+                );
                 self.revert_files(reverts).await;
                 None
             }
@@ -465,7 +612,11 @@ impl SelfTest {
             return None;
         }
         let outcome = self
-            .apply_texts(name, &[(relative, ledger.as_str())], &[(relative, snapshot.as_str())])
+            .apply_texts(
+                name,
+                &[(relative, ledger.as_str())],
+                &[(relative, snapshot.as_str())],
+            )
             .await;
         if outcome.is_none() {
             *ledger = snapshot;
@@ -499,7 +650,10 @@ impl SelfTest {
         } else {
             self.fail(
                 name,
-                format!("expected a cold verdict with reason \"{reason_fragment}\", got: {}", squash(&text)),
+                format!(
+                    "expected a cold verdict with reason \"{reason_fragment}\", got: {}",
+                    squash(&text)
+                ),
             );
         }
         if let Err(error) = self.write_tracked(relative, restore).await {
@@ -510,7 +664,8 @@ impl SelfTest {
     async fn wait_for_play_state(&self, playing: bool, timeout: Duration) -> Result<(), String> {
         let start = std::time::Instant::now();
         loop {
-            let (connected, status, _) = crate::unity_bridge::query_unity_status(&self.project).await;
+            let (connected, status, _) =
+                crate::unity_bridge::query_unity_status(&self.project).await;
             if connected && crate::unity_bridge::is_play_mode_status(status) == playing {
                 return Ok(());
             }
@@ -536,7 +691,9 @@ impl SelfTest {
         if let Err(error) =
             crate::unity_bridge::begin_edit_session(&self.project, "hotreload-selftest").await
         {
-            self.log(format!("note: edit session not started ({error}); continuing"));
+            self.log(format!(
+                "note: edit session not started ({error}); continuing"
+            ));
         }
 
         self.write_tracked(SUBJECT_FILE, SUBJECT_BASELINE).await?;
@@ -546,14 +703,30 @@ impl SelfTest {
         self.write_tracked(CTOR_FILE, CTOR_BASELINE).await?;
         self.write_tracked(IFACE_FILE, IFACE_BASELINE).await?;
         self.write_tracked(NEG_FILE, NEG_BASELINE).await?;
+        // B6: the two-part partial corpus (sibling discovery + layout merge).
+        self.write_tracked(PARTIAL_A_FILE, PARTIAL_A_BASELINE)
+            .await?;
+        self.write_tracked(PARTIAL_B_FILE, PARTIAL_B_BASELINE)
+            .await?;
         // Editor/ folder → Assembly-CSharp-Editor: edit-mode hot reload of
         // editor tooling is its own phase.
         self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await?;
+        // Lib/ folder + .asmdef → the separate LocusSelfTestLib assembly
+        // (B3 cross-asmdef coverage). The asmdef is plain JSON — tracking
+        // no-ops for non-.cs files, which is exactly right: asmdef changes
+        // are never hot-reload inputs.
+        self.write_tracked(LIB_ASMDEF_FILE, LIB_ASMDEF_BASELINE)
+            .await?;
+        self.write_tracked(LIB_FILE, LIB_BASELINE).await?;
 
         // The corpus was written behind Unity's back: the AssetDatabase must
         // import it or the compile would not include the new files at all
         // (the folder goes first so children import into an existing parent).
-        let mut imports: Vec<String> = vec![TEST_DIR.to_string(), EDITOR_DIR.to_string()];
+        let mut imports: Vec<String> = vec![
+            TEST_DIR.to_string(),
+            EDITOR_DIR.to_string(),
+            LIB_DIR.to_string(),
+        ];
         imports.extend(
             ALL_FILES
                 .iter()
@@ -586,15 +759,41 @@ impl SelfTest {
                     .to_string(),
             );
         }
-        self.log("Baseline compiled; corpus is the loaded truth.");
+
+        // Second gate (B3): the .asmdef must have produced its OWN assembly.
+        // If the lib type compiled but landed in Assembly-CSharp instead,
+        // every cross-asmdef case would silently degenerate to same-assembly
+        // coverage — fail loudly here with the precise shape.
+        let lib_check = self
+            .execute(
+                "var t = System.Type.GetType(\"LocusSelfTestLibType, LocusSelfTestLib\");\n\
+                 if (t != null) return \"lib-ok\";\n\
+                 var stray = System.Type.GetType(\"LocusSelfTestLibType, Assembly-CSharp\");\n\
+                 return stray != null ? \"lib-in-assembly-csharp\" : \"lib-missing\";",
+            )
+            .await
+            .map_err(|e| format!("lib corpus verification snippet failed: {e}"))?;
+        if !lib_check.contains("lib-ok") {
+            return Err(format!(
+                "the LocusSelfTestLib asmdef did not produce its own assembly (probe says: {}) — \
+                 the .asmdef import may not have taken effect before the baseline compile; check \
+                 the Unity console and Library/ScriptAssemblies for LocusSelfTestLib.dll",
+                squash(&lib_check)
+            ));
+        }
+        self.log("Baseline compiled; corpus is the loaded truth (lib assembly present).");
         Ok(())
     }
 
     /// Edit-mode hot reload, BEFORE play mode: editor tooling (custom
     /// editors, menu commands) lives in Assembly-CSharp-Editor and detours
-    /// exactly like player code. The patch dies with the play-mode domain
-    /// reload anyway, so the file reverts afterwards to keep the play-phase
-    /// batches clean.
+    /// exactly like player code. The patch is deliberately NOT reverted on
+    /// success: Phase 3 carries it across the play transition and asserts
+    /// the mode-matched outcome (B5 — it survives when Reload Domain is
+    /// disabled, it dies with the classic play-enter reload), then reverts
+    /// the file before the first play-phase batch so the cumulative ledgers
+    /// never see it. On any E01 failure the revert happens here and Phase 3
+    /// skips the carry-over assertion.
     async fn run_editmode_tests(&mut self) {
         self.log("Phase 2/7 — edit-mode hot reload (editor assembly, no play mode)");
         let name = "E01 editor-assembly body edit (edit mode)";
@@ -603,27 +802,76 @@ impl SelfTest {
         match self.write_tracked(EDITOR_FILE, &edited).await {
             Ok(()) => match self.hot_reload(Some(vec![EDITOR_FILE.to_string()])).await {
                 Ok(summary) if summary.contains("Hot reload not applicable") => {
-                    self.fail(name, format!("unexpected cold verdict: {}", squash(&summary)));
+                    self.fail(
+                        name,
+                        format!("unexpected cold verdict: {}", squash(&summary)),
+                    );
                 }
-                Ok(_) => {
-                    self.expect_output(name, "return LocusSelfTestEditorTool.Reading();", "8118").await;
-                }
+                Ok(_) => match self
+                    .execute("return LocusSelfTestEditorTool.Reading();")
+                    .await
+                {
+                    Ok(output) if output.contains("8118") => {
+                        self.pass(name, "observed 8118");
+                        self.editor_patch_live = true;
+                    }
+                    Ok(output) => {
+                        self.fail(name, format!("expected '8118' in output, got: {output}"));
+                    }
+                    Err(error) => self.fail(name, format!("snippet failed: {error}")),
+                },
                 Err(error) => self.fail(name, squash(&error)),
             },
             Err(error) => self.fail(name, error),
         }
-        if let Err(error) = self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await {
+        if self.editor_patch_live {
+            self.log("  editor patch held live across the play transition (B5 — E02 asserts, then reverts)");
+        } else if let Err(error) = self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await {
             self.log(format!("  editor corpus revert failed: {error}"));
+        }
+    }
+
+    /// B5 — probe the Enter Play Mode Options BEFORE the play transition and
+    /// log which matrix branch this run exercises. Best-effort: on a probe
+    /// failure the mode-aware assertions assume the classic reload path
+    /// (`enterPlayModeOptions` exists since 2019.3, well below the plugin
+    /// floor, so a failure here means the snippet machinery is broken and
+    /// E01 has already failed loudly).
+    async fn probe_play_mode_options(&mut self) {
+        let snippet = "var enabled = UnityEditor.EditorSettings.enterPlayModeOptionsEnabled;\n\
+                       var options = UnityEditor.EditorSettings.enterPlayModeOptions;\n\
+                       bool domainReload = !enabled || !options.HasFlag(UnityEditor.EnterPlayModeOptions.DisableDomainReload);\n\
+                       bool sceneReload = !enabled || !options.HasFlag(UnityEditor.EnterPlayModeOptions.DisableSceneReload);\n\
+                       return \"epmo-enabled=\" + enabled + \" domain-reload=\" + (domainReload ? \"on\" : \"off\") + \" scene-reload=\" + (sceneReload ? \"on\" : \"off\");";
+        match self.execute(snippet).await {
+            Ok(output) => {
+                let reload = !output.contains("domain-reload=off");
+                self.epmo_enabled = Some(output.contains("epmo-enabled=True"));
+                self.domain_reload_on_play = Some(reload);
+                self.log(format!(
+                    "Enter Play Mode Options: domain reload {} on play enter ({})",
+                    if reload { "ENABLED" } else { "DISABLED" },
+                    squash(&output)
+                ));
+            }
+            Err(error) => {
+                self.log(format!(
+                    "Enter Play Mode Options probe failed ({error}); assuming the classic domain-reload path"
+                ));
+            }
         }
     }
 
     async fn enter_play_mode(&mut self) -> Result<(), String> {
         self.log("Phase 3/7 — entering play mode");
+        self.probe_play_mode_options().await;
         self.execute("UnityEditor.EditorApplication.EnterPlaymode(); return \"entering\";")
             .await
             .map_err(|e| format!("EnterPlaymode failed: {e}"))?;
-        self.wait_for_play_state(true, Duration::from_secs(90)).await?;
-        // The play-mode domain reload settles behind the status flip.
+        self.wait_for_play_state(true, Duration::from_secs(90))
+            .await?;
+        // The play transition settles behind the status flip (classic mode:
+        // the play-mode domain reload; no-reload mode: scene setup only).
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         self.execute(
@@ -635,6 +883,52 @@ impl SelfTest {
         .map_err(|e| format!("spawning the test component failed: {e}"))?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.log("Test component is live in play mode.");
+
+        // B5/E02 — the E01 editor patch crossed the play transition. With
+        // Enter Play Mode Options ENABLED (either sub-mode: DisableSceneReload
+        // only, or also DisableDomainReload) Unity takes the fast play-enter
+        // path and the editor-assembly detour stays live — MEASURED on
+        // 2022.3.47f1: the patch survives even when the DisableDomainReload
+        // flag is not set, because already-loaded editor assemblies are not
+        // re-JITed on play-enter, so the NativeDetour on the native entry
+        // point persists. (A full domain reload — EPMO disabled entirely —
+        // would drop it; that mode is outside B5's no-reload focus.) So with
+        // EPMO enabled the edit-mode patch must keep reading 8118 in play.
+        // Either way the file reverts right here, BEFORE the first Phase-4
+        // batch: disk returns to the recorded baseline, so hot_reload(None)
+        // skips the editor file from then on.
+        if self.editor_patch_live {
+            if self.epmo_enabled == Some(false) {
+                // Classic full reload (EPMO master switch off): the play-enter
+                // reload re-JITs the loaded baseline (the 8118 text was never
+                // imported, so ScriptAssemblies on disk still says 1).
+                self.expect_output(
+                    "E02 edit-mode patch dies with the play-enter domain reload",
+                    "return LocusSelfTestEditorTool.Reading() == 1 ? \"editor-tool-baseline\" : \"editor-tool-patched\";",
+                    "editor-tool-baseline",
+                )
+                .await;
+            } else {
+                self.expect_output(
+                    "E02 edit-mode patch survives play-enter (Enter Play Mode Options enabled)",
+                    "return LocusSelfTestEditorTool.Reading();",
+                    "8118",
+                )
+                .await;
+                self.log(format!(
+                    "  coordinator continuity: {} active patch(es) carried across play-enter ({})",
+                    super::counters().active_patches,
+                    if self.domain_reload_on_play == Some(false) {
+                        "domain reload disabled"
+                    } else {
+                        "fast enter-play, editor detour persists"
+                    }
+                ));
+            }
+            if let Err(error) = self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await {
+                self.log(format!("  editor corpus revert failed: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -677,12 +971,21 @@ impl SelfTest {
         // P01 — method body edit.
         if self
             .step_file("P01 method body edit", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Mult() { return 1002; }", "public int Mult() { return 4221; }")
+                swap(
+                    s,
+                    "public int Mult() { return 1002; }",
+                    "public int Mult() { return 4221; }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P01 method body edit", "return LocusSelfTestSubject.Instance.Mult();", "4221").await;
+            self.expect_output(
+                "P01 method body edit",
+                "return LocusSelfTestSubject.Instance.Mult();",
+                "4221",
+            )
+            .await;
         }
 
         // P01b — Unity message BODY edit (the engine drives the detoured
@@ -747,9 +1050,9 @@ impl SelfTest {
             .await;
         }
 
-        // P03 — added methods (shim→shim chain). Only PUBLIC original
-        // surface: Mono blocks non-public access from shims (N13 asserts
-        // that exact verdict).
+        // P03 — added methods (shim→shim chain) over PUBLIC original
+        // surface (P34 covers the caps-gated private-surface form; N12'
+        // keeps the signature-level cold verdict).
         if self
             .step_file("P03 added methods (shim chain)", SUBJECT_FILE, subject, |s| {
                 swap(
@@ -788,7 +1091,13 @@ impl SelfTest {
                     if text.contains("LocusSelfTestSubject.cs") {
                         self.pass(name, "cold verdict names the caller file");
                     } else {
-                        self.fail(name, format!("expected the caller file in the verdict, got: {}", squash(&text)));
+                        self.fail(
+                            name,
+                            format!(
+                                "expected the caller file in the verdict, got: {}",
+                                squash(&text)
+                            ),
+                        );
                     }
 
                     // P04b — same change goes hot with the caller co-edited.
@@ -845,7 +1154,11 @@ impl SelfTest {
                     "    private int _legacy = 3;\n",
                     "    private int _legacy = 3;\n    private int _bonus = 5050;\n",
                 )?;
-                swap_line(s, "    public int Probe()", "    public int Probe() { return _bonus + 9090; }")
+                swap_line(
+                    s,
+                    "    public int Probe()",
+                    "    public int Probe() { return _bonus + 9090; }",
+                )
             })
             .await
             .is_some()
@@ -903,28 +1216,51 @@ impl SelfTest {
                     "    public static int EvtCount;\n",
                     "    public static int EvtCount;\n    private static int s_total = 6600;\n",
                 )?;
-                swap_line(s, "    public int Probe()", "    public int Probe() { s_total += 1; return s_total; }")
-            })
-            .await
-            .is_some();
-        if p06_ok {
-            self.expect_output("P06 added static field", "return LocusSelfTestSubject.Instance.Probe();", "6601").await;
-        }
-
-        // P07 — using addition re-detours the whole file (M6).
-        let p07_ok = self
-            .step_file("P07 using added (file rehook)", SUBJECT_FILE, subject, |s| {
-                swap(s, "using UnityEngine;", "using UnityEngine;\nusing System.Text;")?;
-                swap(
+                swap_line(
                     s,
-                    "public int Step() { return 1; }",
-                    "public int Step() { return 8800 + new StringBuilder(\"ab\").Length; }",
+                    "    public int Probe()",
+                    "    public int Probe() { s_total += 1; return s_total; }",
                 )
             })
             .await
             .is_some();
+        if p06_ok {
+            self.expect_output(
+                "P06 added static field",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "6601",
+            )
+            .await;
+        }
+
+        // P07 — using addition re-detours the whole file (M6).
+        let p07_ok = self
+            .step_file(
+                "P07 using added (file rehook)",
+                SUBJECT_FILE,
+                subject,
+                |s| {
+                    swap(
+                        s,
+                        "using UnityEngine;",
+                        "using UnityEngine;\nusing System.Text;",
+                    )?;
+                    swap(
+                        s,
+                        "public int Step() { return 1; }",
+                        "public int Step() { return 8800 + new StringBuilder(\"ab\").Length; }",
+                    )
+                },
+            )
+            .await
+            .is_some();
         if p07_ok {
-            self.expect_output("P07 using added (file rehook)", "return LocusSelfTestSubject.Instance.Step();", "8802").await;
+            self.expect_output(
+                "P07 using added (file rehook)",
+                "return LocusSelfTestSubject.Instance.Step();",
+                "8802",
+            )
+            .await;
         }
 
         // P07b — store-held STATIC state survives later patches: the holder
@@ -957,8 +1293,14 @@ impl SelfTest {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(MODE_FILE, mode_v2.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(MODE_FILE, MODE_BASELINE), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (MODE_FILE, mode_v2.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (MODE_FILE, MODE_BASELINE),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
@@ -981,7 +1323,11 @@ impl SelfTest {
         self.log(format!("— {name}"));
         let subject_snapshot = subject.clone();
         let fresh = "public static class LocusSelfTestFresh { public static int Ping() { return 4242; } }\n";
-        let p09 = swap_line(subject, "    public int Probe()", "    public int Probe() { return LocusSelfTestFresh.Ping(); }");
+        let p09 = swap_line(
+            subject,
+            "    public int Probe()",
+            "    public int Probe() { return LocusSelfTestFresh.Ping(); }",
+        );
         match p09 {
             Ok(()) => {
                 let applied = self
@@ -995,7 +1341,12 @@ impl SelfTest {
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output(name, "return LocusSelfTestSubject.Instance.Probe();", "4242").await;
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.Probe();",
+                        "4242",
+                    )
+                    .await;
                 } else {
                     *subject = subject_snapshot;
                 }
@@ -1006,12 +1357,21 @@ impl SelfTest {
         // P10 — property getter body edit.
         if self
             .step_file("P10 property getter edit", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Gauge { get { return 17; } }", "public int Gauge { get { return 7117; } }")
+                swap(
+                    s,
+                    "public int Gauge { get { return 17; } }",
+                    "public int Gauge { get { return 7117; } }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P10 property getter edit", "return LocusSelfTestSubject.Instance.Gauge;", "7117").await;
+            self.expect_output(
+                "P10 property getter edit",
+                "return LocusSelfTestSubject.Instance.Gauge;",
+                "7117",
+            )
+            .await;
         }
 
         // P10b — property SETTER body edit.
@@ -1036,13 +1396,21 @@ impl SelfTest {
 
         // P10c — expression-bodied member edit.
         if self
-            .step_file("P10c expression-bodied member edit", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Arrow => 12;", "public int Arrow => 7447;")
-            })
+            .step_file(
+                "P10c expression-bodied member edit",
+                SUBJECT_FILE,
+                subject,
+                |s| swap(s, "public int Arrow => 12;", "public int Arrow => 7447;"),
+            )
             .await
             .is_some()
         {
-            self.expect_output("P10c expression-bodied member edit", "return LocusSelfTestSubject.Instance.Arrow;", "7447").await;
+            self.expect_output(
+                "P10c expression-bodied member edit",
+                "return LocusSelfTestSubject.Instance.Arrow;",
+                "7447",
+            )
+            .await;
         }
 
         // P11 — indexer body edit.
@@ -1057,7 +1425,12 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output("P11 indexer edit", "return LocusSelfTestSubject.Instance[2];", "5007").await;
+            self.expect_output(
+                "P11 indexer edit",
+                "return LocusSelfTestSubject.Instance[2];",
+                "5007",
+            )
+            .await;
         }
 
         // P12 — event accessor body edit.
@@ -1123,7 +1496,12 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output("P14 local function edit", "return LocusSelfTestSubject.Instance.Local();", "9119").await;
+            self.expect_output(
+                "P14 local function edit",
+                "return LocusSelfTestSubject.Instance.Local();",
+                "9119",
+            )
+            .await;
         }
 
         // P15 — anonymous types inside an edited body.
@@ -1138,7 +1516,12 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output("P15 anonymous type edit", "return LocusSelfTestSubject.Instance.Anon();", "7997").await;
+            self.expect_output(
+                "P15 anonymous type edit",
+                "return LocusSelfTestSubject.Instance.Anon();",
+                "7997",
+            )
+            .await;
         }
 
         // P16 — pattern matching in an edited body (modern syntax).
@@ -1153,7 +1536,12 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output("P16 pattern matching edit", "return LocusSelfTestSubject.Instance.Match(6);", "6776").await;
+            self.expect_output(
+                "P16 pattern matching edit",
+                "return LocusSelfTestSubject.Instance.Match(6);",
+                "6776",
+            )
+            .await;
         }
 
         // P16b — edit inside an active #if block (defines parity with the
@@ -1169,13 +1557,22 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output("P16b #if-block body edit", "return LocusSelfTestSubject.Instance.Cond();", "8338").await;
+            self.expect_output(
+                "P16b #if-block body edit",
+                "return LocusSelfTestSubject.Instance.Cond();",
+                "8338",
+            )
+            .await;
         }
 
         // P17 — nested type member body edit.
         if self
             .step_file("P17 nested type member edit", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Nine() { return 1; }", "public int Nine() { return 5665; }")
+                swap(
+                    s,
+                    "public int Nine() { return 1; }",
+                    "public int Nine() { return 5665; }",
+                )
             })
             .await
             .is_some()
@@ -1198,8 +1595,18 @@ impl SelfTest {
                     "    public class Inner\n    {\n",
                     "    public class Inner\n    {\n        public int W = 9;\n",
                 )?;
-                swap(s, "public int Nine() { return 5665; }", "public int Nine() { return W + 5660; }")
-                    .or_else(|_| swap(s, "public int Nine() { return 1; }", "public int Nine() { return W + 5660; }"))
+                swap(
+                    s,
+                    "public int Nine() { return 5665; }",
+                    "public int Nine() { return W + 5660; }",
+                )
+                .or_else(|_| {
+                    swap(
+                        s,
+                        "public int Nine() { return 1; }",
+                        "public int Nine() { return W + 5660; }",
+                    )
+                })
             })
             .await
             .is_some()
@@ -1281,13 +1688,27 @@ impl SelfTest {
         // the new body.
         let mut ctor_ledger = CTOR_BASELINE.to_string();
         if self
-            .step_file("P19 constructor body edit", CTOR_FILE, &mut ctor_ledger, |s| {
-                swap(s, "public LocusSelfTestCtor() { Seed = 1; }", "public LocusSelfTestCtor() { Seed = 5775; }")
-            })
+            .step_file(
+                "P19 constructor body edit",
+                CTOR_FILE,
+                &mut ctor_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "public LocusSelfTestCtor() { Seed = 1; }",
+                        "public LocusSelfTestCtor() { Seed = 5775; }",
+                    )
+                },
+            )
             .await
             .is_some()
         {
-            self.expect_output("P19 constructor body edit", "return new LocusSelfTestCtor().Seed;", "5775").await;
+            self.expect_output(
+                "P19 constructor body edit",
+                "return new LocusSelfTestCtor().Seed;",
+                "5775",
+            )
+            .await;
         }
 
         // P20 — instance field initializer edit: existing instances keep
@@ -1321,12 +1742,21 @@ impl SelfTest {
         if self
             .step_file("P21 field deletion", SUBJECT_FILE, subject, |s| {
                 swap(s, "    private int _legacy = 3;\n", "")?;
-                swap(s, "public int Legacy() { return _legacy; }", "public int Legacy() { return 8448; }")
+                swap(
+                    s,
+                    "public int Legacy() { return _legacy; }",
+                    "public int Legacy() { return 8448; }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P21 field deletion", "return LocusSelfTestSubject.Instance.Legacy();", "8448").await;
+            self.expect_output(
+                "P21 field deletion",
+                "return LocusSelfTestSubject.Instance.Legacy();",
+                "8448",
+            )
+            .await;
         }
 
         // P22 — method rename with the caller co-edited in the batch.
@@ -1335,7 +1765,11 @@ impl SelfTest {
         let subject_snapshot = subject.clone();
         let helper_snapshot = helper.clone();
         let p22 = (|| -> Result<(), String> {
-            swap(helper, "public static int Renamed() { return 21; }", "public static int Thrice() { return 7227; }")?;
+            swap(
+                helper,
+                "public static int Renamed() { return 21; }",
+                "public static int Thrice() { return 7227; }",
+            )?;
             swap(
                 subject,
                 "public int CallRenamed() { return LocusSelfTestHelper.Renamed(); }",
@@ -1347,12 +1781,23 @@ impl SelfTest {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(HELPER_FILE, helper.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(HELPER_FILE, helper_snapshot.as_str()), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (HELPER_FILE, helper.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (HELPER_FILE, helper_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output(name, "return LocusSelfTestSubject.Instance.CallRenamed();", "7227").await;
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.CallRenamed();",
+                        "7227",
+                    )
+                    .await;
                 } else {
                     *subject = subject_snapshot;
                     *helper = helper_snapshot;
@@ -1383,12 +1828,23 @@ impl SelfTest {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(HELPER_FILE, helper.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(HELPER_FILE, helper_snapshot.as_str()), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (HELPER_FILE, helper.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (HELPER_FILE, helper_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output(name, "return LocusSelfTestSubject.Instance.CallBump();", "9229").await;
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.CallBump();",
+                        "9229",
+                    )
+                    .await;
                 } else {
                     *subject = subject_snapshot;
                     *helper = helper_snapshot;
@@ -1401,36 +1857,71 @@ impl SelfTest {
         // observed through Probe.
         if self
             .step_file("P24 static keyword flip", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Flip() { return 3; }", "public static int Flip() { return 6336; }")?;
-                swap_line(s, "    public int Probe()", "    public int Probe() { return Flip(); }")
+                swap(
+                    s,
+                    "public int Flip() { return 3; }",
+                    "public static int Flip() { return 6336; }",
+                )?;
+                swap_line(
+                    s,
+                    "    public int Probe()",
+                    "    public int Probe() { return Flip(); }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P24 static keyword flip", "return LocusSelfTestSubject.Instance.Probe();", "6336").await;
+            self.expect_output(
+                "P24 static keyword flip",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "6336",
+            )
+            .await;
         }
 
         // P25 — accessibility narrowing (public→private, no outside callers).
         if self
             .step_file("P25 accessibility narrowing", SUBJECT_FILE, subject, |s| {
-                swap(s, "public int Shrink() { return 2; }", "private int Shrink() { return 4884; }")?;
-                swap_line(s, "    public int Probe()", "    public int Probe() { return Shrink(); }")
+                swap(
+                    s,
+                    "public int Shrink() { return 2; }",
+                    "private int Shrink() { return 4884; }",
+                )?;
+                swap_line(
+                    s,
+                    "    public int Probe()",
+                    "    public int Probe() { return Shrink(); }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P25 accessibility narrowing", "return LocusSelfTestSubject.Instance.Probe();", "4884").await;
+            self.expect_output(
+                "P25 accessibility narrowing",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "4884",
+            )
+            .await;
         }
 
         // P26 — static class method body edit.
         if self
             .step_file("P26 static class body edit", HELPER_FILE, helper, |s| {
-                swap(s, "public static int Pick() { return 1; }", "public static int Pick() { return 3113; }")
+                swap(
+                    s,
+                    "public static int Pick() { return 1; }",
+                    "public static int Pick() { return 3113; }",
+                )
             })
             .await
             .is_some()
         {
-            self.expect_output("P26 static class body edit", "return LocusSelfTestHelper.Pick();", "3113").await;
+            self.expect_output(
+                "P26 static class body edit",
+                "return LocusSelfTestHelper.Pick();",
+                "3113",
+            )
+            .await;
         }
 
         // P27 — new type appended to an EXISTING file, observed via Probe.
@@ -1439,18 +1930,33 @@ impl SelfTest {
         let subject_snapshot = subject.clone();
         let helper_snapshot = helper.clone();
         helper.push_str("\npublic class LocusSelfTestExtra\n{\n    public static int Nine() { return 9559; }\n}\n");
-        let p27 = swap_line(subject, "    public int Probe()", "    public int Probe() { return LocusSelfTestExtra.Nine(); }");
+        let p27 = swap_line(
+            subject,
+            "    public int Probe()",
+            "    public int Probe() { return LocusSelfTestExtra.Nine(); }",
+        );
         match p27 {
             Ok(()) => {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(HELPER_FILE, helper.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(HELPER_FILE, helper_snapshot.as_str()), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (HELPER_FILE, helper.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (HELPER_FILE, helper_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output(name, "return LocusSelfTestSubject.Instance.Probe();", "9559").await;
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.Probe();",
+                        "9559",
+                    )
+                    .await;
                 } else {
                     *subject = subject_snapshot;
                     *helper = helper_snapshot;
@@ -1482,19 +1988,34 @@ impl SelfTest {
                     "    public static int Pick() { return 1; }\n    public static int Tripled(this int v) { return v * 3; }\n",
                 )
             })?;
-            swap_line(subject, "    public int Probe()", "    public int Probe() { return 1500.Tripled() + 12; }")
+            swap_line(
+                subject,
+                "    public int Probe()",
+                "    public int Probe() { return 1500.Tripled() + 12; }",
+            )
         })();
         match p27b {
             Ok(()) => {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(HELPER_FILE, helper.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(HELPER_FILE, helper_snapshot.as_str()), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (HELPER_FILE, helper.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (HELPER_FILE, helper_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output(name, "return LocusSelfTestSubject.Instance.Probe();", "4512").await;
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.Probe();",
+                        "4512",
+                    )
+                    .await;
                 } else {
                     *subject = subject_snapshot;
                     *helper = helper_snapshot;
@@ -1548,9 +2069,18 @@ impl SelfTest {
         // untouched; dispatch through the interface sees the patch).
         let mut iface_ledger = IFACE_BASELINE.to_string();
         if self
-            .step_file("P28 interface impl body edit", IFACE_FILE, &mut iface_ledger, |s| {
-                swap(s, "public int Plan() { return 1; }", "public int Plan() { return 6996; }")
-            })
+            .step_file(
+                "P28 interface impl body edit",
+                IFACE_FILE,
+                &mut iface_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "public int Plan() { return 1; }",
+                        "public int Plan() { return 6996; }",
+                    )
+                },
+            )
             .await
             .is_some()
         {
@@ -1565,21 +2095,44 @@ impl SelfTest {
         // P29 — struct method body edit.
         let mut struct_ledger = STRUCT_BASELINE.to_string();
         if self
-            .step_file("P29 struct method body edit", STRUCT_FILE, &mut struct_ledger, |s| {
-                swap(s, "public int Get() { return 1; }", "public int Get() { return 6446; }")
-            })
+            .step_file(
+                "P29 struct method body edit",
+                STRUCT_FILE,
+                &mut struct_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "public int Get() { return 1; }",
+                        "public int Get() { return 6446; }",
+                    )
+                },
+            )
             .await
             .is_some()
         {
-            self.expect_output("P29 struct method body edit", "return new LocusSelfTestStruct().Get();", "6446").await;
+            self.expect_output(
+                "P29 struct method body edit",
+                "return new LocusSelfTestStruct().Get();",
+                "6446",
+            )
+            .await;
         }
 
         // P30 — operator body edit (the patch copy renames the self-typed
         // parameters; unchanged operators strip from the copy).
         if self
-            .step_file("P30 operator body edit", STRUCT_FILE, &mut struct_ledger, |s| {
-                swap(s, "r.Value = a.Value + b.Value;", "r.Value = a.Value + b.Value + 7337;")
-            })
+            .step_file(
+                "P30 operator body edit",
+                STRUCT_FILE,
+                &mut struct_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "r.Value = a.Value + b.Value;",
+                        "r.Value = a.Value + b.Value + 7337;",
+                    )
+                },
+            )
             .await
             .is_some()
         {
@@ -1625,16 +2178,66 @@ impl SelfTest {
         // Anchors tolerate any of P10/P26/P29/P19/P28 having failed (their
         // edits revert, so the baseline form is the fallback).
         let p32 = (|| -> Result<(), String> {
-            swap(subject, "public int Gauge { get { return 7117; } }", "public int Gauge { get { return 7118; } }")
-                .or_else(|_| swap(subject, "public int Gauge { get { return 17; } }", "public int Gauge { get { return 7118; } }"))?;
-            swap(helper, "public static int Pick() { return 3113; }", "public static int Pick() { return 3114; }")
-                .or_else(|_| swap(helper, "public static int Pick() { return 1; }", "public static int Pick() { return 3114; }"))?;
-            swap(&mut struct_ledger, "public int Get() { return 6446; }", "public int Get() { return 6447; }")
-                .or_else(|_| swap(&mut struct_ledger, "public int Get() { return 1; }", "public int Get() { return 6447; }"))?;
-            swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 5775; }", "public LocusSelfTestCtor() { Seed = 5776; }")
-                .or_else(|_| swap(&mut ctor_ledger, "public LocusSelfTestCtor() { Seed = 1; }", "public LocusSelfTestCtor() { Seed = 5776; }"))?;
-            swap(&mut iface_ledger, "public int Plan() { return 6996; }", "public int Plan() { return 6997; }")
-                .or_else(|_| swap(&mut iface_ledger, "public int Plan() { return 1; }", "public int Plan() { return 6997; }"))
+            swap(
+                subject,
+                "public int Gauge { get { return 7117; } }",
+                "public int Gauge { get { return 7118; } }",
+            )
+            .or_else(|_| {
+                swap(
+                    subject,
+                    "public int Gauge { get { return 17; } }",
+                    "public int Gauge { get { return 7118; } }",
+                )
+            })?;
+            swap(
+                helper,
+                "public static int Pick() { return 3113; }",
+                "public static int Pick() { return 3114; }",
+            )
+            .or_else(|_| {
+                swap(
+                    helper,
+                    "public static int Pick() { return 1; }",
+                    "public static int Pick() { return 3114; }",
+                )
+            })?;
+            swap(
+                &mut struct_ledger,
+                "public int Get() { return 6446; }",
+                "public int Get() { return 6447; }",
+            )
+            .or_else(|_| {
+                swap(
+                    &mut struct_ledger,
+                    "public int Get() { return 1; }",
+                    "public int Get() { return 6447; }",
+                )
+            })?;
+            swap(
+                &mut ctor_ledger,
+                "public LocusSelfTestCtor() { Seed = 5775; }",
+                "public LocusSelfTestCtor() { Seed = 5776; }",
+            )
+            .or_else(|_| {
+                swap(
+                    &mut ctor_ledger,
+                    "public LocusSelfTestCtor() { Seed = 1; }",
+                    "public LocusSelfTestCtor() { Seed = 5776; }",
+                )
+            })?;
+            swap(
+                &mut iface_ledger,
+                "public int Plan() { return 6996; }",
+                "public int Plan() { return 6997; }",
+            )
+            .or_else(|_| {
+                swap(
+                    &mut iface_ledger,
+                    "public int Plan() { return 1; }",
+                    "public int Plan() { return 6997; }",
+                )
+            })
         })();
         match p32 {
             Ok(()) => {
@@ -1658,7 +2261,12 @@ impl SelfTest {
                     )
                     .await;
                 if applied.is_some() {
-                    self.expect_output("P32a five-file batch (subject)", "return LocusSelfTestSubject.Instance.Gauge;", "7118").await;
+                    self.expect_output(
+                        "P32a five-file batch (subject)",
+                        "return LocusSelfTestSubject.Instance.Gauge;",
+                        "7118",
+                    )
+                    .await;
                     self.expect_output(
                         "P32b five-file batch (interface impl)",
                         "ILocusSelfTestContract c = new LocusSelfTestContractImpl();\nreturn c.Plan();",
@@ -1690,6 +2298,10 @@ impl SelfTest {
         // kept callers must re-detour for the shims to take effect.
         let name = "P33 generic body via shim";
         self.log(format!("— {name}"));
+        // The NEG ledger lives on past P33: P37 builds on whatever text is
+        // actually on disk (re-sending a baseline-derived text would also
+        // revert Echo/Val — generic bodies whose callers are outside that
+        // batch — and fail closed on the M3 caller scan).
         let mut neg_ledger = NEG_BASELINE.to_string();
         let subject_snapshot = subject.clone();
         let p33 = (|| -> Result<(), String> {
@@ -1698,16 +2310,30 @@ impl SelfTest {
                 "public T Echo<T>(T value) { return value; }",
                 "public T Echo<T>(T value) { return (T)(object)(((int)(object)value) + 7000); }",
             )?;
-            swap(&mut neg_ledger, "public int Val() { return 1; }", "public int Val() { return 4334; }")?;
-            swap(subject, "public int Spare() { return 1; }", "public int Spare() { return 2; }")
+            swap(
+                &mut neg_ledger,
+                "public int Val() { return 1; }",
+                "public int Val() { return 4334; }",
+            )?;
+            swap(
+                subject,
+                "public int Spare() { return 1; }",
+                "public int Spare() { return 2; }",
+            )
         })();
         match p33 {
             Ok(()) => {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(NEG_FILE, neg_ledger.as_str()), (SUBJECT_FILE, subject.as_str())],
-                        &[(NEG_FILE, NEG_BASELINE), (SUBJECT_FILE, subject_snapshot.as_str())],
+                        &[
+                            (NEG_FILE, neg_ledger.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (NEG_FILE, NEG_BASELINE),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
                     )
                     .await;
                 if applied.is_some() {
@@ -1725,11 +2351,645 @@ impl SelfTest {
                     .await;
                 } else {
                     *subject = subject_snapshot;
+                    neg_ledger = NEG_BASELINE.to_string();
                 }
             }
             Err(error) => {
                 self.fail(name, error);
                 *subject = subject_snapshot;
+                neg_ledger = NEG_BASELINE.to_string();
+            }
+        }
+
+        // P34 — added member touching PRIVATE state (C2′a): with the C0
+        // probe matrix green on this editor, the added member's shim reads a
+        // private instance field, calls a private method and reads a private
+        // static of the ORIGINAL type through IgnoresAccessChecksTo — the
+        // real-machine arbiter that IACT holds for the actual corpus
+        // assembly, not just the synthetic probe target.
+        if self
+            .step_file("P34 added member touches private state", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public int Vault() { return _seed + SecretCore() + s_secret; }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { return Vault(); }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P34 added member touches private state",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "7640", // live instance _seed(40) + SecretCore(7000) + s_secret(600)
+            )
+            .await;
+        }
+
+        // P35 — compiler-generated SUB-METHODS of added members carry the
+        // non-public access (C2′b): the violating IL lives in the async
+        // state machine's MoveNext, the lambda's display-class method and
+        // the iterator's MoveNext — nested types of the shim class, not the
+        // shim method itself. These are the real-machine arbiters that
+        // Mono's IACT acceptance covers state machines and closures too.
+        //
+        // P35a — added ASYNC method body touches private state (the await
+        // completes synchronously, so the kept Probe can block on .Result).
+        if self
+            .step_file("P35a added async member touches private state", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public async Task<int> VaultAsync() { await Task.CompletedTask; return _seed + SecretCore() + s_secret + 1; }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { return VaultAsync().Result; }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P35a added async member touches private state",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "7641", // _seed(40) + SecretCore(7000) + s_secret(600) + 1
+            )
+            .await;
+        }
+
+        // P35b — added method whose LAMBDA captures a local and `this`,
+        // touching the private field and private static inside the closure.
+        if self
+            .step_file("P35b added member lambda captures private state", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public int VaultLambda() { int basis = 2; System.Func<int> f = () => basis + _seed + s_secret; return f(); }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { return VaultLambda(); }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P35b added member lambda captures private state",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "642", // basis(2) + _seed(40) + s_secret(600)
+            )
+            .await;
+        }
+
+        // P35c — added ITERATOR (coroutine-shaped) body touches private
+        // state inside MoveNext.
+        if self
+            .step_file("P35c added iterator member touches private state", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public System.Collections.IEnumerator VaultIter() { yield return SecretCore() + s_secret + 3; }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { var e = VaultIter(); e.MoveNext(); return (int)e.Current; }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P35c added iterator member touches private state",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "7603", // SecretCore(7000) + s_secret(600) + 3
+            )
+            .await;
+        }
+
+        // P36 — KEPT body touches a cross-file internal type (guard test):
+        // the reference is pure metadata to the batch binding (the patch is
+        // its own assembly), and with this editor's green caps it must keep
+        // flowing hot through IgnoresAccessChecksTo after the C2′b scan
+        // landed (the scan only ever runs on measured-red runtimes).
+        if self
+            .step_file("P36 kept body touches cross-file internal", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "public int Vaulted() { return SecretCore() + s_secret; }",
+                    "public int Vaulted() { return SecretCore() + s_secret + new LocusSelfTestNegHidden().V + 44; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P36 kept body touches cross-file internal",
+                "return LocusSelfTestSubject.Instance.Vaulted();",
+                "7644", // SecretCore(7000) + s_secret(600) + V(0) + 44
+            )
+            .await;
+        }
+
+        // P37 — added member constructs its own type through a PRIVATE
+        // constructor (factory pattern): the ctor symbol hangs on the `new`
+        // expression, not the type name, so this exercises the C2′b
+        // creation-node check (newobj_private — green on this editor). The
+        // kept Spawn body routes the observation.
+        let name = "P37 added member uses private ctor";
+        self.log(format!("— {name}"));
+        let neg_snapshot = neg_ledger.clone();
+        let p37 = swap(
+            &mut neg_ledger,
+            "    public static int Spawn() { return 1; }\n",
+            "    public static int Spawn() { return Forge(); }\n    public static int Forge() { return new LocusSelfTestLocked(4100).Worth; }\n",
+        );
+        match p37 {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(NEG_FILE, neg_ledger.as_str())],
+                        &[(NEG_FILE, neg_snapshot.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(name, "return LocusSelfTestLocked.Spawn();", "4100")
+                        .await;
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+
+        // P38 — added PROPERTY (B2): write, compound assignment and read
+        // all materialize as direct accessor-shim calls (get_/set_ pair).
+        // The same batch also ADDS the _tally field, so the accessor bodies
+        // route through an M4 store (composition of B2 + M4).
+        if self
+            .step_file("P38 added property write/compound/read", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    private int _tally;\n    public int Level { get { return _tally + 7; } set { _tally = value; } }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { Level = 4000; Level += 2; return Level; }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P38 added property write/compound/read",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "4016", // set(4000): _tally=4000; compound: get=4007, set(4009); read=4016
+            )
+            .await;
+        }
+
+        // P39a — added INDEXER overload (the corpus already has this[int]):
+        // read/write/compound through get_Item/set_Item shims with a `this`
+        // receiver (repeated by the compound expansion — receiver is pure).
+        if self
+            .step_file("P39a added indexer read/write/compound", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public int this[int a, int b] { get { return a + b + _stash; } set { _stash = value; } }\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { this[1, 2] = 7000; this[1, 2] += 4; return this[1, 2]; }")
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P39a added indexer read/write/compound",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "7010", // set: _stash=7000; compound: get=7003, set(7007); read=1+2+7007
+            )
+            .await;
+        }
+
+        // P39b — added accessor EVENT: += routes through add_Pump, -=
+        // through remove_Pump (delta-asserted: EvtCount accumulates from
+        // earlier Surge steps).
+        if self
+            .step_file("P39b added event subscribe/unsubscribe", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public event System.Action Pump { add { EvtCount += 100; } remove { EvtCount += 10; } }\n",
+                )?;
+                swap_line(
+                    s,
+                    "    public int Probe()",
+                    "    public int Probe() { int before = EvtCount; System.Action h = () => { }; Pump += h; Pump -= h; return EvtCount - before + 8200; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P39b added event subscribe/unsubscribe",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "8310", // add(+100) + remove(+10) + 8200
+            )
+            .await;
+        }
+
+        // P40 — added AUTO-PROPERTY: accessor shims over an M4 backing
+        // store. Existing instances read default(int); the store value
+        // persists across calls; NEW instances run the initializer through
+        // the redirected (implicit) constructor.
+        let p40_ok = self
+            .step_file("P40 added auto-property (store-backed)", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Seed() { return _seed; }\n",
+                    "    public int Seed() { return _seed; }\n    public int Cargo { get; set; } = 30;\n",
+                )?;
+                swap_line(s, "    public int Probe()", "    public int Probe() { Cargo += 5; return Cargo + 9000; }")
+            })
+            .await
+            .is_some();
+        if p40_ok {
+            self.expect_output(
+                "P40a existing instance reads default",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "9005", // default(0) + 5 + 9000
+            )
+            .await;
+            self.expect_output(
+                "P40b store value persists across calls",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "9010", // second bump of the SAME store slot
+            )
+            .await;
+            self.expect_output(
+                "P40c new instance runs the initializer",
+                "var go = new UnityEngine.GameObject(\"LocusSelfTestAutoProbe\");\n\
+                 var probe = go.AddComponent<LocusSelfTestSubject>();\n\
+                 var value = probe.Probe();\n\
+                 UnityEngine.Object.Destroy(go);\n\
+                 return value;",
+                "9035", // initializer(30) + 5 + 9000
+            )
+            .await;
+        }
+
+        // P40d — re-edit after the AUTO-PROPERTY landed: ++ must still
+        // route through the SAME backing store slot from the earlier batch.
+        if p40_ok
+            && self
+                .step_file(
+                    "P40d auto-property increment after re-edit",
+                    SUBJECT_FILE,
+                    subject,
+                    |s| {
+                        swap_line(
+                            s,
+                            "    public int Probe()",
+                            "    public int Probe() { Cargo++; return Cargo + 9000; }",
+                        )
+                    },
+                )
+                .await
+                .is_some()
+        {
+            self.expect_output(
+                "P40d auto-property increment after re-edit",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "9011", // P40a/P40b left the live instance's Cargo store at 10, then ++
+            )
+            .await;
+        }
+
+        // P40e — nameof(...) over an added auto-property materializes as a
+        // constant; no runtime metadata for Cargo exists in the original
+        // assembly.
+        if p40_ok
+            && self
+                .step_file(
+                    "P40e nameof added auto-property",
+                    SUBJECT_FILE,
+                    subject,
+                    |s| {
+                        swap_line(
+                            s,
+                            "    public int Probe()",
+                            "    public int Probe() { return nameof(Cargo).Length + 9100; }",
+                        )
+                    },
+                )
+                .await
+                .is_some()
+        {
+            self.expect_output(
+                "P40e nameof added auto-property",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "9105", // "Cargo".Length(5) + 9100
+            )
+            .await;
+        }
+
+        // ── B3: cross-asmdef batches (the lib corpus compiles into its own
+        // LocusSelfTestLib assembly; the callers live in Assembly-CSharp) ──
+        let mut lib_ledger = LIB_BASELINE.to_string();
+
+        // P41 — lib method BODY edit: the detour targets the LIB assembly's
+        // type (original-type resolution is cross-assembly by name), and the
+        // pre-existing Assembly-CSharp caller — compiled IL in ANOTHER
+        // assembly, untouched by this batch — observes the new behavior.
+        if self
+            .step_file(
+                "P41 lib body edit (cross-asmdef)",
+                LIB_FILE,
+                &mut lib_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "public int LibBody() { return 5; }",
+                        "public int LibBody() { return 6100; }",
+                    )
+                },
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P41 lib body edit (cross-asmdef)",
+                "return LocusSelfTestSubject.Instance.LibRelay();",
+                "6103", // LibBody(6100) + 3, read through the Assembly-CSharp caller
+            )
+            .await;
+        }
+
+        // P42 — lib method SIGNATURE change with the caller in ANOTHER
+        // assembly: the M3 scan must walk Assembly-CSharp's IL and name the
+        // Assembly-CSharp file first (P42a); the same change goes hot once
+        // that caller joins the batch (P42b). Mirrors P04 across the
+        // assembly boundary.
+        let name = "P42a lib signature change names cross-assembly caller";
+        self.log(format!("— {name}"));
+        let lib_snapshot = lib_ledger.clone();
+        let subject_snapshot = subject.clone();
+        let p42 = swap(
+            &mut lib_ledger,
+            "public int LibSig(int x) { return x + 1; }",
+            "public int LibSig(int x, int bump) { return x + bump + 200; }",
+        );
+        match p42 {
+            Ok(()) => match self.write_tracked(LIB_FILE, &lib_ledger).await {
+                Ok(()) => {
+                    let verdict = self.hot_reload(Some(vec![LIB_FILE.to_string()])).await;
+                    let text = match &verdict {
+                        Ok(summary) => summary.clone(),
+                        Err(error) => error.clone(),
+                    };
+                    if text.contains("Hot reload not applicable")
+                        && text.contains("LocusSelfTestSubject.cs")
+                    {
+                        self.pass(name, "cold verdict names the Assembly-CSharp caller file");
+                    } else {
+                        self.fail(
+                            name,
+                            format!(
+                                "expected cold naming the cross-assembly caller, got: {}",
+                                squash(&text)
+                            ),
+                        );
+                    }
+
+                    // P42b — covered batch: the Assembly-CSharp caller
+                    // co-edits, the scan verifies, the rewritten call site
+                    // materializes as a direct cross-assembly shim call.
+                    let p42b = swap(
+                        subject,
+                        "public int LibSigRelay() { return new LocusSelfTestLibType().LibSig(10); }",
+                        "public int LibSigRelay() { return new LocusSelfTestLibType().LibSig(10, 7); }",
+                    );
+                    let applied = match p42b {
+                        Ok(()) => {
+                            self.log("— P42b lib signature change covered cross-assembly");
+                            self.apply_texts(
+                                "P42b lib signature change covered cross-assembly",
+                                &[(SUBJECT_FILE, subject.as_str())],
+                                &[
+                                    (SUBJECT_FILE, subject_snapshot.as_str()),
+                                    (LIB_FILE, lib_snapshot.as_str()),
+                                ],
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            self.fail("P42b lib signature change covered cross-assembly", error);
+                            None
+                        }
+                    };
+                    if applied.is_some() {
+                        self.expect_output(
+                            "P42b lib signature change covered cross-assembly",
+                            "return LocusSelfTestSubject.Instance.LibSigRelay();",
+                            "217", // 10 + 7 + 200
+                        )
+                        .await;
+                    } else {
+                        *subject = subject_snapshot;
+                        lib_ledger = lib_snapshot;
+                    }
+                }
+                Err(error) => {
+                    self.fail(name, error);
+                    lib_ledger = lib_snapshot;
+                }
+            },
+            Err(error) => self.fail(name, error),
+        }
+
+        // P43 — method ADDED to the lib type, called from Assembly-CSharp:
+        // the shim lives in the patch assembly while `self` is the LIB
+        // assembly's type, and the rewritten Assembly-CSharp call site must
+        // direct-call it across the boundary (the predicted B3 risk spot).
+        let name = "P43 lib added method called cross-assembly";
+        self.log(format!("— {name}"));
+        let lib_snapshot = lib_ledger.clone();
+        let subject_snapshot = subject.clone();
+        let p43 = (|| -> Result<(), String> {
+            swap(
+                &mut lib_ledger,
+                "    public int LibSeed = 8;\n",
+                "    public int LibSeed = 8;\n\n    public int LibBoost() { return LibSeed + 5800; }\n",
+            )?;
+            swap_line(
+                subject,
+                "    public int Probe()",
+                "    public int Probe() { return new LocusSelfTestLibType().LibBoost(); }",
+            )
+        })();
+        match p43 {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[
+                            (LIB_FILE, lib_ledger.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (LIB_FILE, lib_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.Probe();",
+                        "5808", // LibSeed(8) + 5800, through the cross-assembly shim
+                    )
+                    .await;
+                } else {
+                    // The next lib case starts from the actual disk shape.
+                    *subject = subject_snapshot;
+                    lib_ledger = lib_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                *subject = subject_snapshot;
+                lib_ledger = lib_snapshot;
+            }
+        }
+
+        // P43b — PROPERTY added to the lib type and consumed from the
+        // Assembly-CSharp caller: B2 accessor shims plus B3 cross-assembly
+        // self binding and call-site rewrite.
+        let name = "P43b lib added property called cross-assembly";
+        self.log(format!("— {name}"));
+        let lib_snapshot = lib_ledger.clone();
+        let subject_snapshot = subject.clone();
+        let p43b = (|| -> Result<(), String> {
+            swap(
+                &mut lib_ledger,
+                "    public int LibSeed = 8;\n",
+                "    public int LibSeed = 8;\n\n    public int LibScore { get { return LibSeed + 6200; } set { LibSeed = value; } }\n",
+            )?;
+            swap_line(
+                subject,
+                "    public int Probe()",
+                "    public int Probe() { var lib = new LocusSelfTestLibType(); lib.LibScore = 21; return lib.LibScore; }",
+            )
+        })();
+        match p43b {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[
+                            (LIB_FILE, lib_ledger.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
+                        &[
+                            (LIB_FILE, lib_snapshot.as_str()),
+                            (SUBJECT_FILE, subject_snapshot.as_str()),
+                        ],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(
+                        name,
+                        "return LocusSelfTestSubject.Instance.Probe();",
+                        "6221", // set LibSeed=21, then get LibSeed + 6200
+                    )
+                    .await;
+                } else {
+                    *subject = subject_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                *subject = subject_snapshot;
+            }
+        }
+
+        // P44 — partial type split across two files (B6): editing ONE
+        // part's method body goes hot. The coordinator discovers the
+        // never-edited sibling part on disk, the sidecar folds it into the
+        // batch as an unchanged baseline, and the complete two-part patch
+        // copy — fields merged in the original assembly's order — binds the
+        // OTHER part's private field (_beta) and private method (Basis).
+        let mut partial_a_ledger = PARTIAL_A_BASELINE.to_string();
+        let mut partial_b_ledger = PARTIAL_B_BASELINE.to_string();
+        if self
+            .step_file(
+                "P44 partial part body edit (sibling on disk)",
+                PARTIAL_A_FILE,
+                &mut partial_a_ledger,
+                |s| {
+                    swap(
+                        s,
+                        "public int Combine() { return _alpha + Basis() + _beta; }",
+                        "public int Combine() { return _alpha + Basis() + _beta + 7000; }",
+                    )
+                },
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P44 partial part body edit (sibling on disk)",
+                "return new LocusSelfTestPartial().Combine();",
+                "7435", // _alpha(30) + Basis(5) + _beta(400) + 7000
+            )
+            .await;
+        }
+
+        // P45 — both partial part files join the same batch: the sidecar
+        // should merge the two changed declarations directly, without
+        // relying on an unchanged sibling copy.
+        let name = "P45 partial two-part batch edit";
+        self.log(format!("— {name}"));
+        let partial_a_snapshot = partial_a_ledger.clone();
+        let partial_b_snapshot = partial_b_ledger.clone();
+        let p45 = (|| -> Result<(), String> {
+            swap(
+                &mut partial_a_ledger,
+                "public int Combine() { return _alpha + Basis() + _beta + 7000; }",
+                "public int Combine() { return _alpha + Basis() + _beta + 7100; }",
+            )
+            .or_else(|_| {
+                swap(
+                    &mut partial_a_ledger,
+                    "public int Combine() { return _alpha + Basis() + _beta; }",
+                    "public int Combine() { return _alpha + Basis() + _beta + 7100; }",
+                )
+            })?;
+            swap(
+                &mut partial_b_ledger,
+                "private int Basis() { return 5; }",
+                "private int Basis() { return 15; }",
+            )
+        })();
+        match p45 {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[
+                            (PARTIAL_A_FILE, partial_a_ledger.as_str()),
+                            (PARTIAL_B_FILE, partial_b_ledger.as_str()),
+                        ],
+                        &[
+                            (PARTIAL_A_FILE, partial_a_snapshot.as_str()),
+                            (PARTIAL_B_FILE, partial_b_snapshot.as_str()),
+                        ],
+                    )
+                    .await;
+                if applied.is_some() {
+                    self.expect_output(
+                        name,
+                        "return new LocusSelfTestPartial().Combine();",
+                        "7545", // _alpha(30) + Basis(15) + _beta(400) + 7100
+                    )
+                    .await;
+                } else {
+                    partial_a_ledger = partial_a_snapshot;
+                }
+            }
+            Err(error) => {
+                self.fail(name, error);
+                partial_a_ledger = partial_a_snapshot;
             }
         }
 
@@ -1739,6 +2999,7 @@ impl SelfTest {
             struct_text: struct_ledger,
             ctor_text: ctor_ledger,
             iface_text: iface_ledger,
+            partial_a_text: partial_a_ledger,
         };
     }
 
@@ -1775,7 +3036,10 @@ impl SelfTest {
                     } else {
                         self.fail(
                             name,
-                            format!("expected cold naming the caller file, got: {}", squash(&vtext)),
+                            format!(
+                                "expected cold naming the caller file, got: {}",
+                                squash(&vtext)
+                            ),
                         );
                     }
                     if let Err(error) = self.write_tracked(NEG_FILE, &neg).await {
@@ -1788,8 +3052,21 @@ impl SelfTest {
 
         // N02 — turning a method virtual is an added virtual slot.
         let mut text = neg.clone();
-        if swap(&mut text, "public int Solid() { return 1; }", "public virtual int Solid() { return 1; }").is_ok() {
-            self.expect_cold("N02 virtual keyword added", NEG_FILE, &text, "virtual member added", &neg).await;
+        if swap(
+            &mut text,
+            "public int Solid() { return 1; }",
+            "public virtual int Solid() { return 1; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N02 virtual keyword added",
+                NEG_FILE,
+                &text,
+                "virtual member added",
+                &neg,
+            )
+            .await;
         }
 
         // N03 — attribute edits are immutable metadata.
@@ -1801,25 +3078,47 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N03 attribute added", NEG_FILE, &text, "member declaration changed", &neg).await;
+            self.expect_cold(
+                "N03 attribute added",
+                NEG_FILE,
+                &text,
+                "member declaration changed",
+                &neg,
+            )
+            .await;
         }
 
         // N04 — consts are inlined at use sites.
         let mut text = neg.clone();
-        if swap(&mut text, "public const int Limit = 3;", "public const int Limit = 4;").is_ok() {
-            self.expect_cold("N04 const value changed", NEG_FILE, &text, "const or static initializer changed", &neg).await;
+        if swap(
+            &mut text,
+            "public const int Limit = 3;",
+            "public const int Limit = 4;",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N04 const value changed",
+                NEG_FILE,
+                &text,
+                "const or static initializer changed",
+                &neg,
+            )
+            .await;
         }
 
-        // N05 — property additions are metadata surface.
+        // N05 — VIRTUAL property additions stay cold (plain property/
+        // indexer/event additions are hot since B2 — P38/P39/P40 assert
+        // that): a new virtual slot cannot be reproduced by a static shim.
         let mut text = neg.clone();
         if swap(
             &mut text,
             "    public int Solid() { return 1; }\n",
-            "    public int Solid() { return 1; }\n    public int NewProp { get { return 1; } }\n",
+            "    public int Solid() { return 1; }\n    public virtual int NewProp { get { return 1; } }\n",
         )
         .is_ok()
         {
-            self.expect_cold("N05 property added", NEG_FILE, &text, "property added", &neg).await;
+            self.expect_cold("N05 virtual property added", NEG_FILE, &text, "virtual member added", &neg).await;
         }
 
         // N06 — finalizer surface.
@@ -1831,7 +3130,14 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N06 finalizer added", NEG_FILE, &text, "finalizer added", &neg).await;
+            self.expect_cold(
+                "N06 finalizer added",
+                NEG_FILE,
+                &text,
+                "finalizer added",
+                &neg,
+            )
+            .await;
         }
 
         // N07 — Unity message names are discovered at real compiles only.
@@ -1843,20 +3149,47 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N07 Unity message added", NEG_FILE, &text, "new Unity message method", &neg).await;
+            self.expect_cold(
+                "N07 Unity message added",
+                NEG_FILE,
+                &text,
+                "new Unity message method",
+                &neg,
+            )
+            .await;
         }
 
         // N08 — enum VALUE edits (only appends are hot).
         let mut text = neg.clone();
         if swap(&mut text, "Y = 2", "Y = 9").is_ok() {
-            self.expect_cold("N08 enum value changed", NEG_FILE, &text, "enum changed", &neg).await;
+            self.expect_cold(
+                "N08 enum value changed",
+                NEG_FILE,
+                &text,
+                "enum changed",
+                &neg,
+            )
+            .await;
         }
 
         // N09 — struct field layout.
         let struct_text = self.negative_ledgers.struct_text.clone();
         let mut text = struct_text.clone();
-        if swap(&mut text, "    public int Value;\n", "    public int Value;\n    public int Extra;\n").is_ok() {
-            self.expect_cold("N09 struct field added", STRUCT_FILE, &text, "struct field layout changed", &struct_text).await;
+        if swap(
+            &mut text,
+            "    public int Value;\n",
+            "    public int Value;\n    public int Extra;\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N09 struct field added",
+                STRUCT_FILE,
+                &text,
+                "struct field layout changed",
+                &struct_text,
+            )
+            .await;
         }
 
         // N10 — constructor surface. The anchor chain tolerates P19/P32
@@ -1877,28 +3210,57 @@ impl SelfTest {
             }
         }
         if anchored.is_ok() {
-            self.expect_cold("N10 constructor added", CTOR_FILE, &text, "constructor added", &ctor_text).await;
+            self.expect_cold(
+                "N10 constructor added",
+                CTOR_FILE,
+                &text,
+                "constructor added",
+                &ctor_text,
+            )
+            .await;
         }
 
         // N11 — any interface change.
         let iface_text = self.negative_ledgers.iface_text.clone();
         let mut text = iface_text.clone();
-        if swap(&mut text, "    int Plan();", "    int Plan();\n    int Extra();").is_ok() {
-            self.expect_cold("N11 interface member added", IFACE_FILE, &text, "interface changed", &iface_text).await;
+        if swap(
+            &mut text,
+            "    int Plan();",
+            "    int Plan();\n    int Extra();",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N11 interface member added",
+                IFACE_FILE,
+                &text,
+                "interface changed",
+                &iface_text,
+            )
+            .await;
         }
 
-        // N12 — added member touching PRIVATE state: the shim would fail
-        // Mono's JIT access checks, so the classification is cold with the
-        // exact reference named.
+        // N12' — added member whose SIGNATURE names a non-public type: C2′a
+        // relaxes BODY access only (the C0 matrix has no declaration-site
+        // cell yet), so the public shim still cannot carry the internal
+        // parameter type. (The old N12 — an added member touching private
+        // STATE — is the positive P34 now that caps gate the body.)
         let mut text = neg.clone();
         if swap(
             &mut text,
             "    public int Hidden() { return _hidden; }\n",
-            "    public int Hidden() { return _hidden; }\n    public int Leak() { return _hidden; }\n",
+            "    public int Hidden() { return _hidden; }\n    public int Leak(LocusSelfTestNegHidden arg) { return 1; }\n",
         )
         .is_ok()
         {
-            self.expect_cold("N12 added member touches private state", NEG_FILE, &text, "references non-public surface", &neg).await;
+            self.expect_cold(
+                "N12' added member with non-public signature",
+                NEG_FILE,
+                &text,
+                "signature-level non-public type",
+                &neg,
+            )
+            .await;
         }
 
         // N13 — conversion returning the declaring type.
@@ -1925,7 +3287,14 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N15 generic type ctor body", NEG_FILE, &text, "generic type constructor changed", &neg).await;
+            self.expect_cold(
+                "N15 generic type ctor body",
+                NEG_FILE,
+                &text,
+                "generic type constructor changed",
+                &neg,
+            )
+            .await;
         }
 
         // N16 — base-list change is type surface.
@@ -1937,19 +3306,37 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N16 base list changed", NEG_FILE, &text, "type declaration changed", &neg).await;
+            self.expect_cold(
+                "N16 base list changed",
+                NEG_FILE,
+                &text,
+                "type declaration changed",
+                &neg,
+            )
+            .await;
         }
 
-        // N17 — partial types are out of scope entirely.
-        let mut text = neg.clone();
+        // N17 — partial body edits are HOT since B6 (P44); the negative is
+        // the v1 boundary: FIELD layout changes on a partial type stay cold
+        // (initializers/ctors can live in other parts). The mutation builds
+        // on the P44 ledger so the cumulative model holds.
+        let partial_a_text = self.negative_ledgers.partial_a_text.clone();
+        let mut text = partial_a_text.clone();
         if swap(
             &mut text,
-            "public class LocusSelfTestNegFin",
-            "public partial class LocusSelfTestNegFin",
+            "    private int _alpha = 30;\n",
+            "    private int _alpha = 30;\n    private int _extraCold;\n",
         )
         .is_ok()
         {
-            self.expect_cold("N17 partial modifier added", NEG_FILE, &text, "partial type in file", &neg).await;
+            self.expect_cold(
+                "N17 partial type field added",
+                PARTIAL_A_FILE,
+                &text,
+                "partial type field layout changed",
+                &partial_a_text,
+            )
+            .await;
         }
 
         // N18 — delegate declaration changes alter compiled signatures.
@@ -1961,7 +3348,14 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N18 delegate signature changed", NEG_FILE, &text, "delegate declarations changed", &neg).await;
+            self.expect_cold(
+                "N18 delegate signature changed",
+                NEG_FILE,
+                &text,
+                "delegate declarations changed",
+                &neg,
+            )
+            .await;
         }
 
         // N19 — finalizer BODY edits (finalizers never detour).
@@ -1973,7 +3367,161 @@ impl SelfTest {
         )
         .is_ok()
         {
-            self.expect_cold("N19 finalizer body changed", NEG_FILE, &text, "finalizer changed", &neg).await;
+            self.expect_cold(
+                "N19 finalizer body changed",
+                NEG_FILE,
+                &text,
+                "finalizer changed",
+                &neg,
+            )
+            .await;
+        }
+
+        // N21 — field-like events need compiler-generated accessors plus a
+        // backing delegate field in the original layout (B2 covers
+        // accessor-style events only — P39b).
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { return 1; }\n    public event System.Action Overflow;\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N21 field-like event added",
+                NEG_FILE,
+                &text,
+                "field-like event added",
+                &neg,
+            )
+            .await;
+        }
+
+        // N22 — .asmdef edits are never hot-reload inputs: the coordinator
+        // tracks .cs sources only, so an asmdef change cannot enter a batch
+        // and the assembly-graph restructure needs unity_recompile. The
+        // verdict is the untracked-input guidance, not a patch attempt.
+        // (The file is restored without an import, so Unity never sees the
+        // transient text.)
+        let name = "N22 asmdef edit stays untracked";
+        self.log(format!("— {name}"));
+        let mut tweaked = LIB_ASMDEF_BASELINE.to_string();
+        if swap(
+            &mut tweaked,
+            "\"rootNamespace\": \"\"",
+            "\"rootNamespace\": \"LocusSelfTestTweak\"",
+        )
+        .is_ok()
+        {
+            match self.write_tracked(LIB_ASMDEF_FILE, &tweaked).await {
+                Ok(()) => {
+                    match self
+                        .hot_reload(Some(vec![LIB_ASMDEF_FILE.to_string()]))
+                        .await
+                    {
+                        Ok(summary) if summary.contains("No pending .cs edits") => {
+                            self.pass(
+                                name,
+                                "asmdef edit never enters a hot batch (unity_recompile path)",
+                            );
+                        }
+                        Ok(summary) => self.fail(
+                            name,
+                            format!("expected the untracked verdict, got: {}", squash(&summary)),
+                        ),
+                        Err(error) => self.fail(name, squash(&error)),
+                    }
+                    if let Err(error) = self
+                        .write_tracked(LIB_ASMDEF_FILE, LIB_ASMDEF_BASELINE)
+                        .await
+                    {
+                        self.fail(name, format!("restore failed: {error}"));
+                    }
+                }
+                Err(error) => self.fail(name, error),
+            }
+        }
+
+        // N23 — full added properties cannot preserve ++/-- through the
+        // accessor pair without changing final compile semantics.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { Level++; return _hidden; }\n    public int Level { get { return _hidden; } set { _hidden = value; } }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N23 full added property increment",
+                NEG_FILE,
+                &text,
+                "increment/decrement of an added property",
+                &neg,
+            )
+            .await;
+        }
+
+        // N24 — ??= needs set-skip semantics; the B2 accessor lowering keeps
+        // this shape cold instead of evaluating a setter when it should not.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { Tag ??= \"x\"; return _hidden; }\n    public string Tag { get { return null; } set { _hidden = value == null ? 0 : 1; } }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N24 added property coalesce assignment",
+                NEG_FILE,
+                &text,
+                "set-skip semantics",
+                &neg,
+            )
+            .await;
+        }
+
+        // N25 — even though an auto-property store is lvalue-shaped, ref/out
+        // to a property would fail after the real compile, so the hot path
+        // matches the eventual source semantics and stays cold.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { Bump(ref Cargo); return Cargo; }\n    public int Cargo { get; set; }\n    public static void Bump(ref int v) { v += 1; }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N25 added auto-property ref argument",
+                NEG_FILE,
+                &text,
+                "ref/out",
+                &neg,
+            )
+            .await;
+        }
+
+        // N26 — compound indexer lowering repeats index arguments; method
+        // calls are deliberately rejected because they would run twice.
+        let mut text = neg.clone();
+        if swap(
+            &mut text,
+            "    public int Solid() { return 1; }\n",
+            "    public int Solid() { this[Poke()] += 1; return _hidden; }\n    public int Poke() { return 1; }\n    public int this[int i] { get { return _hidden + i; } set { _hidden = value; } }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N26 added indexer non-repeatable compound",
+                NEG_FILE,
+                &text,
+                "non-trivial index arguments",
+                &neg,
+            )
+            .await;
         }
 
         // N20 — an added member with NO reachable caller compiles to a shim
@@ -1995,7 +3543,10 @@ impl SelfTest {
                         Ok(summary) if summary.contains("No detourable change") => {
                             self.pass(name, "shim-only addition reported as parked new surface");
                         }
-                        Ok(summary) => self.fail(name, format!("expected the shim-only verdict, got: {}", squash(&summary))),
+                        Ok(summary) => self.fail(
+                            name,
+                            format!("expected the shim-only verdict, got: {}", squash(&summary)),
+                        ),
                         Err(error) => self.fail(name, squash(&error)),
                     }
                     if let Err(error) = self.write_tracked(NEG_FILE, &neg).await {
@@ -2011,14 +3562,23 @@ impl SelfTest {
         let name = "N14 accessibility widening (noop)";
         self.log(format!("— {name}"));
         let mut text = neg.clone();
-        if swap(&mut text, "internal int Wide() { return 5; }", "public int Wide() { return 5; }").is_ok() {
+        if swap(
+            &mut text,
+            "internal int Wide() { return 5; }",
+            "public int Wide() { return 5; }",
+        )
+        .is_ok()
+        {
             match self.write_tracked(NEG_FILE, &text).await {
                 Ok(()) => {
                     match self.hot_reload(Some(vec![NEG_FILE.to_string()])).await {
                         Ok(summary) if summary.contains("No effective code change") => {
                             self.pass(name, "widening classified as a no-op");
                         }
-                        Ok(summary) => self.fail(name, format!("expected a no-op verdict, got: {}", squash(&summary))),
+                        Ok(summary) => self.fail(
+                            name,
+                            format!("expected a no-op verdict, got: {}", squash(&summary)),
+                        ),
                         Err(error) => self.fail(name, squash(&error)),
                     }
                     if let Err(error) = self.write_tracked(NEG_FILE, &neg).await {
@@ -2039,8 +3599,12 @@ impl SelfTest {
         let name = "D01 Unity message deletion";
         if self
             .step_file(name, SUBJECT_FILE, subject, |s| {
-                swap(s, "    void Update() { _ticks += Step(); UpdateBeats += 1; }\n", "")
-                    .or_else(|_| swap(s, "    void Update() { _ticks += Step(); }\n", ""))
+                swap(
+                    s,
+                    "    void Update() { _ticks += Step(); UpdateBeats += 1; }\n",
+                    "",
+                )
+                .or_else(|_| swap(s, "    void Update() { _ticks += Step(); }\n", ""))
             })
             .await
             .is_some()
@@ -2068,9 +3632,25 @@ impl SelfTest {
         let name = "D03 method deletion";
         if let Some(summary) = self
             .step_file(name, SUBJECT_FILE, subject, |s| {
-                swap(s, "    public async Task<int> Pulse() { await Task.Yield(); return 2112; }\n", "")
-                    .or_else(|_| swap(s, "    public async Task<int> Pulse() { await Task.Yield(); return 2002; }\n", ""))
-                    .or_else(|_| swap(s, "    public Task<int> Pulse() { return Task.FromResult(2001); }\n", ""))
+                swap(
+                    s,
+                    "    public async Task<int> Pulse() { await Task.Yield(); return 2112; }\n",
+                    "",
+                )
+                .or_else(|_| {
+                    swap(
+                        s,
+                        "    public async Task<int> Pulse() { await Task.Yield(); return 2002; }\n",
+                        "",
+                    )
+                })
+                .or_else(|_| {
+                    swap(
+                        s,
+                        "    public Task<int> Pulse() { return Task.FromResult(2001); }\n",
+                        "",
+                    )
+                })
             })
             .await
         {
@@ -2085,6 +3665,12 @@ impl SelfTest {
         if self
             .step_file(name, SUBJECT_FILE, subject, |s| {
                 swap(s, "using System.Threading.Tasks;\n", "")?;
+                // The added-member capability probes accumulate in the corpus;
+                // P35a's VaultAsync is a SECOND Task<> user (async, needs the
+                // directive). Drop it tolerantly so removing the using still
+                // leaves a compilable file, then handle a Pulse that survived
+                // D03 (the original lone Task user the cleanup was written for).
+                let _ = swap_line(s, "    public async Task<int> VaultAsync()", "");
                 if s.contains("Task<") {
                     swap_line(s, "    public async Task<int> Pulse()", "")
                         .or_else(|_| swap_line(s, "    public Task<int> Pulse()", ""))?;
@@ -2094,7 +3680,8 @@ impl SelfTest {
             .await
             .is_some()
         {
-            self.expect_output(name, "return LocusSelfTestSubject.Instance.Step();", "8802").await;
+            self.expect_output(name, "return LocusSelfTestSubject.Instance.Step();", "8802")
+                .await;
         }
 
         // D05 — whole-file deletion: first edit every compiled caller away
@@ -2102,12 +3689,33 @@ impl SelfTest {
         // the helper file (and the type appended to it) can go.
         let name = "D05 file deletion";
         let stripped = self
-            .step_file("D05a helper callers edited away", SUBJECT_FILE, subject, |s| {
-                swap_line(s, "    public int Sum(int a)", "    public int Sum(int a) { return a + a * 2 + 100; }")?;
-                swap_line(s, "    public int CallRenamed()", "    public int CallRenamed() { return 7227; }")?;
-                swap_line(s, "    public int CallBump()", "    public int CallBump() { return 9229; }")?;
-                swap_line(s, "    public int Probe()", "    public int Probe() { return 0; }")
-            })
+            .step_file(
+                "D05a helper callers edited away",
+                SUBJECT_FILE,
+                subject,
+                |s| {
+                    swap_line(
+                        s,
+                        "    public int Sum(int a)",
+                        "    public int Sum(int a) { return a + a * 2 + 100; }",
+                    )?;
+                    swap_line(
+                        s,
+                        "    public int CallRenamed()",
+                        "    public int CallRenamed() { return 7227; }",
+                    )?;
+                    swap_line(
+                        s,
+                        "    public int CallBump()",
+                        "    public int CallBump() { return 9229; }",
+                    )?;
+                    swap_line(
+                        s,
+                        "    public int Probe()",
+                        "    public int Probe() { return 0; }",
+                    )
+                },
+            )
             .await;
         if stripped.is_some() {
             match self.delete_tracked(HELPER_FILE).await {
@@ -2141,7 +3749,10 @@ impl SelfTest {
         if let Err(error) = crate::unity_bridge::exit_play_mode(&self.project).await {
             self.log(format!("exit_play_mode failed (continuing): {error}"));
         }
-        if let Err(error) = self.wait_for_play_state(false, Duration::from_secs(60)).await {
+        if let Err(error) = self
+            .wait_for_play_state(false, Duration::from_secs(60))
+            .await
+        {
             self.log(format!("warning: {error}"));
         }
 
@@ -2149,9 +3760,26 @@ impl SelfTest {
         // recompile to clear the active patches.
         let converged = self.wait_for_convergence(Duration::from_secs(180)).await;
         match converged {
-            Ok(()) => self.pass("F01 auto-convergence", "active patches cleared after leaving play mode"),
+            Ok(()) => {
+                self.pass(
+                    "F01 auto-convergence",
+                    "active patches cleared after leaving play mode",
+                );
+                if self.domain_reload_on_play == Some(false) {
+                    // B5 — the trigger chain is a play-STATUS transition in
+                    // the connection monitor plus a real recompile; neither
+                    // leg needs a play-transition domain reload, and this
+                    // run just demonstrated that in the no-reload branch.
+                    self.log(
+                        "  B5 note: convergence verified WITHOUT a play-transition domain reload \
+                         (trigger = play-state flip; convergence = real recompile, domain-generation driven)",
+                    );
+                }
+            }
             Err(error) => {
-                self.log(format!("auto-convergence not observed ({error}); converging explicitly"));
+                self.log(format!(
+                    "auto-convergence not observed ({error}); converging explicitly"
+                ));
                 match crate::unity_bridge::recompile_and_wait(&self.project).await {
                     Ok(_) => self.pass("F01 convergence (explicit)", "real recompile succeeded"),
                     Err(recompile_error) => self.fail("F01 convergence", recompile_error),
@@ -2200,7 +3828,10 @@ impl SelfTest {
 
         // Preconditions.
         if !super::is_enabled() || !crate::csharp_compile::is_enabled() {
-            self.fail("preconditions", "hot reload and the sidecar compiler must both be enabled");
+            self.fail(
+                "preconditions",
+                "hot reload and the sidecar compiler must both be enabled",
+            );
             self.emit(None, true);
             return;
         }
@@ -2211,11 +3842,17 @@ impl SelfTest {
             return;
         }
         if crate::unity_bridge::is_play_mode_status(status) {
-            self.fail("preconditions", "leave play mode first: the self-test initializes in edit mode");
+            self.fail(
+                "preconditions",
+                "leave play mode first: the self-test initializes in edit mode",
+            );
             self.emit(None, true);
             return;
         }
-        self.pass("preconditions", "editor connected in edit mode; features enabled");
+        self.pass(
+            "preconditions",
+            "editor connected in edit mode; features enabled",
+        );
 
         if let Err(error) = self.initialize_corpus().await {
             self.fail("initialize", error);
@@ -2276,6 +3913,9 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
             passed: 0,
             failed: 0,
             negative_ledgers: NegativeLedgers::default(),
+            domain_reload_on_play: None,
+            epmo_enabled: None,
+            editor_patch_live: false,
         };
         test.run().await;
         RUNNING.store(false, Ordering::SeqCst);
