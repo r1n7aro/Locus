@@ -86,11 +86,14 @@ pub(super) fn bash() -> ToolDef {
                     .get("interactive")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let timeout_ms = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(if interactive {
-                    INTERACTIVE_DEFAULT_TIMEOUT_MS
-                } else {
-                    DEFAULT_TIMEOUT_MS
-                });
+                let timeout_ms =
+                    args.get("timeout")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(if interactive {
+                            INTERACTIVE_DEFAULT_TIMEOUT_MS
+                        } else {
+                            DEFAULT_TIMEOUT_MS
+                        });
                 let workdir = args
                     .get("workdir")
                     .and_then(|v| v.as_str())
@@ -432,7 +435,10 @@ async fn wait_for_interactive_exit(
             };
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(INTERACTIVE_POLL_INTERVAL_MS)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            INTERACTIVE_POLL_INTERVAL_MS,
+        ))
+        .await;
     }
 }
 

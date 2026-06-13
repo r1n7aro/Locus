@@ -36,8 +36,7 @@ fn line_arg(args: &serde_json::Value) -> Result<Option<u32>, ToolResult> {
             Some(line) if line >= 1 => Ok(Some(line as u32)),
             Some(_) => Ok(None),
             None => Err(ToolResult {
-                output: "Invalid parameter: line (1-based integer, or 0 for no hint)"
-                    .to_string(),
+                output: "Invalid parameter: line (1-based integer, or 0 for no hint)".to_string(),
                 is_error: true,
             }),
         },
@@ -232,8 +231,8 @@ pub(super) fn code_goto_definition() -> ToolDef {
 fn push_project_refs_section(
     output: &mut String,
     report: &super::code_unity::ProjectRefsReport,
+    max_ref_problems: usize,
 ) {
-    const MAX_REF_PROBLEMS: usize = 50;
     let total_refs: usize = report.counts.iter().sum();
     if total_refs == 0 && report.problems.is_empty() {
         return;
@@ -247,7 +246,7 @@ fn push_project_refs_section(
             "\n\nProject string refs: all {total_refs} resolve ({counts_text})."
         ));
     } else {
-        let shown = report.problems.len().min(MAX_REF_PROBLEMS);
+        let shown = report.problems.len().min(max_ref_problems);
         output.push_str(&format!(
             "\n\nProject string refs: {} problem{}{} ({counts_text} checked)\n",
             report.problems.len(),
@@ -258,7 +257,7 @@ fn push_project_refs_section(
                 String::new()
             }
         ));
-        for problem in report.problems.iter().take(MAX_REF_PROBLEMS) {
+        for problem in report.problems.iter().take(max_ref_problems) {
             output.push_str(&format!(
                 "  {}:{} — {}\n",
                 problem.path, problem.line, problem.message
@@ -281,6 +280,108 @@ fn severity_rank(label: &str) -> Option<u8> {
         "hint" => Some(4),
         _ => None,
     }
+}
+
+fn format_code_diagnostic_output(
+    scope_label: &str,
+    min_severity: u8,
+    max_results: usize,
+    all: Vec<crate::csharp_lsp::CodeDiagnostic>,
+) -> String {
+    let below_threshold = all.iter().filter(|d| d.severity > min_severity).count();
+    let matching: Vec<_> = all
+        .into_iter()
+        .filter(|d| d.severity <= min_severity)
+        .collect();
+    if matching.is_empty() {
+        let mut output = format!(
+            "No {} diagnostics in {scope_label}.",
+            match min_severity {
+                1 => "error",
+                2 => "error/warning",
+                3 => "error/warning/info",
+                _ => "",
+            }
+        );
+        if below_threshold > 0 {
+            output.push_str(&format!(
+                " ({below_threshold} below the severity threshold.)"
+            ));
+        }
+        return output;
+    }
+
+    let errors = matching.iter().filter(|d| d.severity == 1).count();
+    let warnings = matching.iter().filter(|d| d.severity == 2).count();
+    let others = matching.len() - errors - warnings;
+    let shown = matching.len().min(max_results);
+    let mut output = format!(
+        "{} diagnostic{} in {scope_label}: {errors} error{}, {warnings} warning{}{}{}\n\n",
+        matching.len(),
+        if matching.len() == 1 { "" } else { "s" },
+        if errors == 1 { "" } else { "s" },
+        if warnings == 1 { "" } else { "s" },
+        if others > 0 {
+            format!(", {others} info/hint")
+        } else {
+            String::new()
+        },
+        if shown < matching.len() {
+            format!(" (showing first {shown})")
+        } else {
+            String::new()
+        }
+    );
+    let mut current_file = "";
+    for diagnostic in matching.iter().take(max_results) {
+        if diagnostic.path != current_file {
+            if !current_file.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&diagnostic.path);
+            output.push('\n');
+            current_file = &diagnostic.path;
+        }
+        output.push_str(&format!(
+            "  {}:{} {}{}: {}\n",
+            diagnostic.line,
+            diagnostic.column,
+            crate::csharp_lsp::severity_label(diagnostic.severity),
+            diagnostic
+                .code
+                .as_deref()
+                .map(|code| format!(" {code}"))
+                .unwrap_or_default(),
+            diagnostic.message.replace('\n', " ")
+        ));
+    }
+    output
+}
+
+pub(super) async fn file_diagnostics_output(
+    workspace: &str,
+    file_path: &str,
+    min_severity: u8,
+    max_results: usize,
+    max_project_ref_problems: usize,
+) -> Result<String, String> {
+    let all = crate::csharp_lsp::document_diagnostics(workspace, file_path).await?;
+    let mut output = format_code_diagnostic_output(file_path, min_severity, max_results, all);
+
+    // File scope also validates project string references
+    // (tags/layers/scenes/Resources/Input) — these compile fine and only fail
+    // at runtime, so they belong in the same post-edit verification pass.
+    let refs_workspace = workspace.to_string();
+    let refs_file_path = file_path.to_string();
+    let scanned = tokio::task::spawn_blocking(move || {
+        super::code_unity::scan_project_refs(&refs_workspace, Some(&refs_file_path))
+    })
+    .await;
+    if let Ok(Ok(report)) = scanned {
+        push_project_refs_section(&mut output, &report, max_project_ref_problems);
+    }
+
+    Ok(output)
 }
 
 pub(super) fn code_diagnostics() -> ToolDef {
@@ -351,7 +452,7 @@ pub(super) fn code_diagnostics() -> ToolDef {
                     .map(|v| v.clamp(1, 400) as usize)
                     .unwrap_or(100);
 
-                let queried = match scope {
+                let output = match scope {
                     "file" => {
                         let Some(file_path) = file_path.as_deref() else {
                             return ToolResult {
@@ -359,112 +460,42 @@ pub(super) fn code_diagnostics() -> ToolDef {
                                 is_error: true,
                             };
                         };
-                        crate::csharp_lsp::document_diagnostics(&workspace, file_path).await
-                    }
-                    _ => crate::csharp_lsp::workspace_diagnostics(&workspace).await,
-                };
-                let all = match queried {
-                    Ok(diagnostics) => diagnostics,
-                    Err(message) => {
-                        return ToolResult {
-                            output: message,
-                            is_error: true,
-                        };
-                    }
-                };
-
-                let below_threshold = all.iter().filter(|d| d.severity > min_severity).count();
-                let matching: Vec<_> = all
-                    .into_iter()
-                    .filter(|d| d.severity <= min_severity)
-                    .collect();
-                let scope_label = match scope {
-                    "file" => file_path.clone().unwrap_or_default(),
-                    _ => "workspace".to_string(),
-                };
-                let mut output = if matching.is_empty() {
-                    let mut output = format!(
-                        "No {} diagnostics in {scope_label}.",
-                        match min_severity {
-                            1 => "error",
-                            2 => "error/warning",
-                            3 => "error/warning/info",
-                            _ => "",
-                        }
-                    );
-                    if below_threshold > 0 {
-                        output.push_str(&format!(
-                            " ({below_threshold} below the severity threshold.)"
-                        ));
-                    }
-                    output
-                } else {
-                    let errors = matching.iter().filter(|d| d.severity == 1).count();
-                    let warnings = matching.iter().filter(|d| d.severity == 2).count();
-                    let others = matching.len() - errors - warnings;
-                    let shown = matching.len().min(max_results);
-                    let mut output = format!(
-                        "{} diagnostic{} in {scope_label}: {errors} error{}, {warnings} warning{}{}{}\n\n",
-                        matching.len(),
-                        if matching.len() == 1 { "" } else { "s" },
-                        if errors == 1 { "" } else { "s" },
-                        if warnings == 1 { "" } else { "s" },
-                        if others > 0 {
-                            format!(", {others} info/hint")
-                        } else {
-                            String::new()
-                        },
-                        if shown < matching.len() {
-                            format!(" (showing first {shown})")
-                        } else {
-                            String::new()
-                        }
-                    );
-                    let mut current_file = "";
-                    for diagnostic in matching.iter().take(max_results) {
-                        if diagnostic.path != current_file {
-                            if !current_file.is_empty() {
-                                output.push('\n');
+                        match file_diagnostics_output(
+                            &workspace,
+                            file_path,
+                            min_severity,
+                            max_results,
+                            50,
+                        )
+                        .await
+                        {
+                            Ok(output) => output,
+                            Err(message) => {
+                                return ToolResult {
+                                    output: message,
+                                    is_error: true,
+                                };
                             }
-                            output.push_str(&diagnostic.path);
-                            output.push('\n');
-                            current_file = &diagnostic.path;
                         }
-                        output.push_str(&format!(
-                            "  {}:{} {}{}: {}\n",
-                            diagnostic.line,
-                            diagnostic.column,
-                            crate::csharp_lsp::severity_label(diagnostic.severity),
-                            diagnostic
-                                .code
-                                .as_deref()
-                                .map(|code| format!(" {code}"))
-                                .unwrap_or_default(),
-                            diagnostic.message.replace('\n', " ")
-                        ));
                     }
-                    output
+                    _ => {
+                        let all = match crate::csharp_lsp::workspace_diagnostics(&workspace).await {
+                            Ok(diagnostics) => diagnostics,
+                            Err(message) => {
+                                return ToolResult {
+                                    output: message,
+                                    is_error: true,
+                                };
+                            }
+                        };
+                        format_code_diagnostic_output(
+                            "workspace",
+                            min_severity,
+                            max_results,
+                            all,
+                        )
+                    }
                 };
-
-                // File scope also validates project string references
-                // (tags/layers/scenes/Resources/Input) — these compile fine
-                // and only fail at runtime, so they belong in the same
-                // post-edit verification pass. Workspace scope skips this.
-                if scope == "file" {
-                    if let Some(file_path) = file_path.clone() {
-                        let refs_workspace = workspace.clone();
-                        let scanned = tokio::task::spawn_blocking(move || {
-                            super::code_unity::scan_project_refs(
-                                &refs_workspace,
-                                Some(&file_path),
-                            )
-                        })
-                        .await;
-                        if let Ok(Ok(report)) = scanned {
-                            push_project_refs_section(&mut output, &report);
-                        }
-                    }
-                }
 
                 ToolResult {
                     output,

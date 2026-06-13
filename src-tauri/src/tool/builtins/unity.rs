@@ -318,13 +318,16 @@ pub(super) fn unity_hot_reload() -> ToolDef {
                     };
                 }
 
-                let paths = args.get("paths").and_then(|value| value.as_array()).map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                });
+                let paths = args
+                    .get("paths")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    });
 
                 match crate::unity_hotreload::coordinator::hot_reload(&project_path, paths).await {
                     Ok(output) => ToolResult {

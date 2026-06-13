@@ -663,7 +663,9 @@ fn parse_tag_manager(root: &Path) -> (Vec<String>, Vec<String>) {
 
 /// (enabled scene paths in build order, disabled scene paths, file existed).
 fn parse_build_settings(root: &Path) -> (Vec<String>, Vec<String>, bool) {
-    let path = root.join("ProjectSettings").join("EditorBuildSettings.asset");
+    let path = root
+        .join("ProjectSettings")
+        .join("EditorBuildSettings.asset");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return (Vec::new(), Vec::new(), false);
     };
@@ -773,11 +775,7 @@ fn collect_resource_paths(root: &Path) -> HashMap<String, String> {
     resources
 }
 
-fn collect_resources_under(
-    resources_root: &Path,
-    dir: &Path,
-    out: &mut HashMap<String, String>,
-) {
+fn collect_resources_under(resources_root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -913,9 +911,10 @@ pub(super) fn scan_project_refs(
     let resources_re =
         regex::Regex::new(r#"Resources\.(?:Load|LoadAll|LoadAsync)(?:<[^>(]*>)?\s*\(\s*"([^"]*)""#)
             .unwrap();
-    let input_re =
-        regex::Regex::new(r#"Input\.(?:GetAxis|GetAxisRaw|GetButton|GetButtonDown|GetButtonUp)\s*\(\s*"([^"]*)""#)
-            .unwrap();
+    let input_re = regex::Regex::new(
+        r#"Input\.(?:GetAxis|GetAxisRaw|GetButton|GetButtonDown|GetButtonUp)\s*\(\s*"([^"]*)""#,
+    )
+    .unwrap();
 
     let mut problems: Vec<RefProblem> = Vec::new();
     let mut counts = [0usize; 5]; // tags, layers, scenes, resources, axes
@@ -1108,8 +1107,7 @@ pub(super) fn scan_project_refs(
                                         refs.resources
                                             .values()
                                             .find(|original| {
-                                                original.rsplit('/').next()
-                                                    == Some(stem.as_str())
+                                                original.rsplit('/').next() == Some(stem.as_str())
                                             })
                                             .cloned()
                                     })
@@ -1255,8 +1253,7 @@ fn check_scene_ref(
                     || path
                         .strip_suffix(".unity")
                         .map(|stripped| {
-                            stripped == normalized
-                                || stripped.ends_with(&format!("/{normalized}"))
+                            stripped == normalized || stripped.ends_with(&format!("/{normalized}"))
                         })
                         .unwrap_or(false)
             })

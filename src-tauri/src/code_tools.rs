@@ -50,6 +50,13 @@ pub fn tool_enabled(tool: &str) -> bool {
     }
 }
 
+/// Whether successful edit/write calls should append file-scope diagnostics for
+/// touched C# files. This is intentionally independent from exposing the
+/// standalone `code_diagnostics` tool to the agent.
+pub fn edit_write_diagnostics_enabled() -> bool {
+    current().edit_write_diagnostics
+}
+
 /// Whether Microsoft.Unity.Analyzers should be injected into the Roslyn
 /// language server workspace (see `csharp_lsp::analyzers`).
 pub fn unity_analyzers_enabled() -> bool {

@@ -1,5 +1,5 @@
 {
-  "description": "Creates a new file on the local filesystem and writes the provided content.\n\nUsage:\n- This tool only creates new files. It will reject any path that already exists.\n- Use the edit tool for any change to an existing file.\n- Parent directories will be created automatically if they don't exist.",
+  "description": "Creates a new file on the local filesystem and writes the provided content.\n\nUsage:\n- This tool only creates new files. It will reject any path that already exists.\n- Use the edit tool for any change to an existing file.\n- Parent directories will be created automatically if they don't exist.\n- When C# code analysis and edit/write diagnostics are enabled, successful .cs writes append capped file-scope diagnostics automatically.",
   "parameters": {
     "type": "object",
     "properties": {
