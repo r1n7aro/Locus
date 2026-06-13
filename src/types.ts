@@ -138,6 +138,9 @@ export interface CsharpCompileStatus {
   hotPatchesApplied: number;
   hotPatchFailures: number;
   hotActivePatches: number;
+  hotLeakedAssemblyBytes: number;
+  hotPatchedCodeCount: number;
+  hotUnappliedChanges: number;
   hotColdQueued: number;
 }
 
@@ -149,6 +152,7 @@ export interface CodeAnalysisToolsConfig {
   codeGotoDefinition: boolean;
   codeFindReferences: boolean;
   codeDiagnostics: boolean;
+  editWriteDiagnostics: boolean;
   codeHover: boolean;
   unityCodeUsages: boolean;
   unityAnalyzers: boolean;
@@ -160,6 +164,7 @@ export function defaultCodeAnalysisToolsConfig(): CodeAnalysisToolsConfig {
     codeGotoDefinition: true,
     codeFindReferences: true,
     codeDiagnostics: false,
+    editWriteDiagnostics: true,
     codeHover: false,
     unityCodeUsages: true,
     unityAnalyzers: true,
@@ -190,6 +195,7 @@ export interface UnityBackgroundHookStatus {
 export interface UnityConnectionStatus {
   connected: boolean;
   editorStatus: string;
+  controlChannelState: "ready" | "busy" | "timeout" | "disconnected" | "error" | "not_checked" | string;
   scenePath?: string | null;
   editorProcessState: UnityEditorProcessState;
   editorProcessId?: number | null;
@@ -203,6 +209,89 @@ export interface UnityConnectionStatus {
   lastError?: string | null;
   backgroundHook: UnityBackgroundHookStatus;
   checkedAtMs: number;
+}
+
+export interface UnityObservedProcessState {
+  state: "running" | "not_running" | "unknown" | string;
+  pid?: number | null;
+  pidCreatedAtMs?: number | null;
+  path?: string | null;
+}
+
+export interface UnityObservedChannelState {
+  controlPipe: "ready" | "busy" | "timeout" | "disconnected" | "error" | "not_checked" | string;
+  lastLatencyMs?: number | null;
+  lastError?: string | null;
+  staleMs?: number | null;
+}
+
+export interface UnityObservedDomainState {
+  phase: "none" | "reloading" | "compiling" | "importing" | "unknown" | string;
+  reloadSubPhase?: string | null;
+  source: string;
+  confidence: "high" | "medium" | "low" | string;
+}
+
+export interface UnityObservedEditorMode {
+  value: "editing" | "playing" | "paused" | "unknown" | string;
+  source: "pipe" | "native_broker" | "native_hook" | "last_known" | "intent" | "unknown" | string;
+  confidence: "high" | "medium" | "low" | string;
+  staleMs?: number | null;
+  detail?: string | null;
+}
+
+export interface UnityObservedMainThreadState {
+  state: "active" | "idle" | "stalled" | "hung" | "unknown" | string;
+  cpuActive: boolean;
+  quiescentForMs: number;
+  stackClass?: string | null;
+  suspendWindowUs?: number | null;
+}
+
+export interface UnityObservedSafetyState {
+  canCallUnityApi: boolean;
+  canModifyAssetsSafely: boolean;
+  recommendedAction: "proceed" | "wait_reload" | "avoid_unity_api" | "diagnose_hang" | "reconnect_control_pipe" | string;
+}
+
+export interface UnityObservedStatePlane {
+  observer: "cache" | "direct" | "on_demand" | string;
+  dataPlane: string;
+  nativeBroker: string;
+  nativeHook: string;
+  historySamples: number;
+  lastObservedAtMs?: number | null;
+}
+
+export interface UnitySemanticState {
+  phase: string;
+  reloadPhase?: string | null;
+  source: string;
+  confidence: "high" | "medium" | "low" | string;
+  transient: boolean;
+  needsUser: boolean;
+  detail?: string | null;
+  checkedAtMs: number;
+  process: UnityObservedProcessState;
+  channel: UnityObservedChannelState;
+  domain: UnityObservedDomainState;
+  editorMode: UnityObservedEditorMode;
+  mainThread: UnityObservedMainThreadState;
+  safety: UnityObservedSafetyState;
+  statePlane: UnityObservedStatePlane;
+}
+
+export interface UnityNativeBrokerStatus {
+  nativeAlive: boolean;
+  observedAtMs: number;
+  managedState: "initializing" | "ready" | "reloading" | "quitting" | string;
+  domainGeneration: number;
+  editorStatus: string;
+  lastManagedHeartbeatMs: number;
+  pendingRequests: number;
+  inflightRequests: number;
+  capabilities: string[];
+  protocolVersion: number;
 }
 
 export interface SkillIntentItem {
@@ -902,6 +991,13 @@ export type PluginStatus =
   | { status: "missing" }
   | { status: "outdated" }
   | { status: "upToDate" };
+
+export interface UnityPluginInstallPlan {
+  status: PluginStatus;
+  dllUpdateRequired: boolean;
+  unityRunning: boolean;
+  unityProcessIds: number[];
+}
 
 export interface PendingQuestion {
   questionId: string;

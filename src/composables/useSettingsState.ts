@@ -293,7 +293,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);

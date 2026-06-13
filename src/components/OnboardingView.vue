@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openPath } from "@tauri-apps/plugin-opener";
 import type { ApiFormat, CodexModelConfig, CustomEndpoint, GitProbeResult, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
@@ -18,7 +18,7 @@ import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
 import { setWorkingDir, getWorkingDir } from "../services/project";
-import { checkUnityPlugin, installUnityPlugin } from "../services/unity";
+import { checkUnityPlugin, checkUnityPluginInstallPlan, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
 import { assetDbScanStart } from "../services/asset";
 import BaseDropdown from "./ui/BaseDropdown.vue";
@@ -257,10 +257,28 @@ async function checkPlugin() {
 }
 
 async function installPlugin() {
-  pluginInstalling.value = true;
+  if (pluginInstalling.value) return;
   pluginError.value = "";
+  let forceCloseUnity = false;
   try {
-    await installUnityPlugin();
+    const plan = await checkUnityPluginInstallPlan();
+    if (plan.dllUpdateRequired && plan.unityRunning) {
+      const confirmed = await confirm(t("app.plugin.closeUnityConfirmMessage"), {
+        title: t("app.plugin.closeUnityConfirmTitle"),
+        kind: "warning",
+        okLabel: t("app.plugin.closeUnityConfirmAction"),
+        cancelLabel: t("common.cancel"),
+      });
+      if (!confirmed) return;
+      forceCloseUnity = true;
+    }
+  } catch (e) {
+    console.warn("check_unity_plugin_install_plan failed:", e);
+  }
+
+  pluginInstalling.value = true;
+  try {
+    await installUnityPlugin({ forceCloseUnity });
     pluginStatus.value = { status: "upToDate" };
   } catch (e) {
     pluginError.value = normalizeAppError(e).message;

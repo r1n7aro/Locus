@@ -1,6 +1,11 @@
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime } from "./locusRuntime";
-import type { AssetRefAttachment, PluginStatus, UnityConnectionStatus } from "../types";
+import type {
+  AssetRefAttachment,
+  PluginStatus,
+  UnityConnectionStatus,
+  UnityPluginInstallPlan,
+} from "../types";
 
 export interface AssetSearchResult {
   name: string;
@@ -22,8 +27,18 @@ export function checkUnityPlugin(): Promise<PluginStatus> {
   return ipcInvoke<PluginStatus>("check_unity_plugin");
 }
 
-export function installUnityPlugin(): Promise<string> {
-  return ipcInvoke<string>("install_unity_plugin");
+export function checkUnityPluginInstallPlan(): Promise<UnityPluginInstallPlan> {
+  return ipcInvoke<UnityPluginInstallPlan>("check_unity_plugin_install_plan");
+}
+
+export interface InstallUnityPluginOptions {
+  forceCloseUnity?: boolean;
+}
+
+export function installUnityPlugin(options: InstallUnityPluginOptions = {}): Promise<string> {
+  return ipcInvoke<string>("install_unity_plugin", {
+    forceCloseUnity: options.forceCloseUnity ?? false,
+  });
 }
 
 export interface UnityLaunchResult {

@@ -1,5 +1,6 @@
 import { ref, computed } from "vue";
 import { defineStore } from "pinia";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import * as projectService from "../services/project";
 import * as unityService from "../services/unity";
 import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
@@ -36,6 +37,7 @@ export const useProjectStore = defineStore("project", () => {
   let scanInFlight = false;
   let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   let unityLaunchWaitStartedAt = 0;
+  let unityConnectionCheckInFlight: Promise<void> | null = null;
 
   const isUnityProject = computed(() => workingDir.value.length > 0);
 
@@ -214,11 +216,17 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function checkUnityConnection() {
-    try {
-      setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
-    } catch {
-      setUnityConnected(false);
-    }
+    if (unityConnectionCheckInFlight) return unityConnectionCheckInFlight;
+    unityConnectionCheckInFlight = (async () => {
+      try {
+        setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
+      } catch {
+        setUnityConnected(false);
+      } finally {
+        unityConnectionCheckInFlight = null;
+      }
+    })();
+    return unityConnectionCheckInFlight;
   }
 
   async function checkUnityPlugin() {
@@ -231,9 +239,28 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function installPlugin() {
+    if (pluginInstalling.value) return;
+
+    let forceCloseUnity = false;
+    try {
+      const plan = await unityService.checkUnityPluginInstallPlan();
+      if (plan.dllUpdateRequired && plan.unityRunning) {
+        const confirmed = await confirm(t("app.plugin.closeUnityConfirmMessage"), {
+          title: t("app.plugin.closeUnityConfirmTitle"),
+          kind: "warning",
+          okLabel: t("app.plugin.closeUnityConfirmAction"),
+          cancelLabel: t("common.cancel"),
+        });
+        if (!confirmed) return;
+        forceCloseUnity = true;
+      }
+    } catch (e) {
+      console.warn("check_unity_plugin_install_plan failed:", e);
+    }
+
     pluginInstalling.value = true;
     try {
-      await unityService.installUnityPlugin();
+      await unityService.installUnityPlugin({ forceCloseUnity });
     } catch (e) {
       console.error("install_unity_plugin failed:", e);
     } finally {
@@ -313,6 +340,7 @@ export const useProjectStore = defineStore("project", () => {
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
+    unityConnectionCheckInFlight = null;
     setPluginToast(null);
     pluginInstalling.value = false;
     resetUnityLaunchState();
