@@ -48,6 +48,7 @@ src-tauri/gen/compile-server/
 .claude
 
 # Workspace-only directories
+plans/
 experiments/
 ref
 AGENTS.md
