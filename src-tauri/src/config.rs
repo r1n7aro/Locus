@@ -37,12 +37,22 @@ fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
+fn default_unity_state_probe_enabled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 fn default_unity_sidecar_compiler() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
 fn default_unity_hot_reload() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
+}
+
+fn default_unity_native_bridge_enabled() -> Arc<AtomicBool> {
+    // Default-on: the native command channel survives domain reloads and is the
+    // required Unity command transport.
+    Arc::new(AtomicBool::new(true))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +143,7 @@ pub struct CodeAnalysisToolsConfig {
     pub code_goto_definition: bool,
     pub code_find_references: bool,
     pub code_diagnostics: bool,
+    pub edit_write_diagnostics: bool,
     pub code_hover: bool,
     pub unity_code_usages: bool,
     pub unity_analyzers: bool,
@@ -145,6 +156,7 @@ impl Default for CodeAnalysisToolsConfig {
             code_goto_definition: true,
             code_find_references: true,
             code_diagnostics: false,
+            edit_write_diagnostics: true,
             code_hover: false,
             unity_code_usages: true,
             unity_analyzers: true,
@@ -231,6 +243,15 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub unity_background_hook_enabled: Arc<AtomicBool>,
+    /// Out-of-process native editor-state probe (stack/CPU classification) that
+    /// keeps reporting through domain reloads and editor hangs, when the named
+    /// pipe is silent. Default on; degrades to pipe+process inference when the
+    /// native tier is unavailable (no PDB / unsupported platform).
+    #[serde(
+        default = "default_unity_state_probe_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_state_probe_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub csharp_lsp_enabled: Arc<AtomicBool>,
     /// Compile unity_execute / unity_run_states / View Script snippets in
@@ -245,6 +266,15 @@ pub struct AppConfig {
     /// signature/field changes always go through `unity_recompile`.
     #[serde(default = "default_unity_hot_reload", with = "serde_atomic_bool")]
     pub unity_hot_reload: Arc<AtomicBool>,
+    /// Route the Tauri↔Unity command channel through the native broker DLL
+    /// (`locus_native`) loaded inside the Unity process, so the connection
+    /// survives domain reloads. Default on; disabling this disables the Unity
+    /// command transport for native-only builds.
+    #[serde(
+        default = "default_unity_native_bridge_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_native_bridge_enabled: Arc<AtomicBool>,
     #[serde(
         default = "default_code_analysis_tools",
         with = "serde_code_analysis_tools"
@@ -292,9 +322,11 @@ impl AppConfig {
             view_windows_above_main: default_view_windows_above_main(),
             view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
+            unity_state_probe_enabled: default_unity_state_probe_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
             unity_sidecar_compiler: default_unity_sidecar_compiler(),
             unity_hot_reload: default_unity_hot_reload(),
+            unity_native_bridge_enabled: default_unity_native_bridge_enabled(),
             code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -449,6 +481,16 @@ impl AppConfig {
         self.unity_background_hook_enabled.load(Ordering::Relaxed)
     }
 
+    pub fn unity_state_probe_enabled(&self) -> bool {
+        self.unity_state_probe_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_state_probe_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_state_probe_enabled
+            .store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
     pub fn csharp_lsp_enabled(&self) -> bool {
         self.csharp_lsp_enabled.load(Ordering::Relaxed)
     }
@@ -473,6 +515,16 @@ impl AppConfig {
 
     pub fn set_unity_hot_reload_enabled(&self, value: bool) -> Result<(), String> {
         self.unity_hot_reload.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_native_bridge_enabled(&self) -> bool {
+        self.unity_native_bridge_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_native_bridge_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_native_bridge_enabled
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -768,7 +820,45 @@ mod tests {
     }
 
     #[test]
-    fn code_diagnostics_defaults_to_disabled() {
+    fn unity_native_bridge_defaults_to_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        // The native command channel is the default transport; a legacy config
+        // that predates the flag opts in to the required broker path.
+        assert!(config.unity_native_bridge_enabled());
+    }
+
+    #[test]
+    fn unity_native_bridge_respects_explicit_opt_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "unity_native_bridge_enabled": false
+}"#,
+        )
+        .expect("opt-out config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.unity_native_bridge_enabled());
+    }
+
+    #[test]
+    fn code_analysis_diagnostics_defaults_are_split() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
         fs::write(
@@ -783,6 +873,7 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(!config.code_analysis_tools().code_diagnostics);
+        assert!(config.code_analysis_tools().edit_write_diagnostics);
     }
 
     #[test]

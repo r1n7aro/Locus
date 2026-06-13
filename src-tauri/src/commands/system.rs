@@ -180,12 +180,25 @@ pub async fn set_unity_background_hook_enabled(
             .operation("setUnityBackgroundHookEnabled")
     })?;
 
+    // Sync the per-project marker so the in-process native hook (when the native
+    // bridge is on) applies or relaxes the patch on its side; harmless when the
+    // native bridge is off, since the managed hook code only runs under it.
+    let cwd = workspace.path.read().await.clone();
+    let cwd_is_unity = !cwd.trim().is_empty() && crate::unity_bridge::is_unity_project(&cwd);
+    if cwd_is_unity {
+        if let Err(error) = crate::unity_bridge::sync_background_hook_marker(&cwd, value) {
+            eprintln!(
+                "[Locus] warning: failed to sync background hook marker: {}",
+                error
+            );
+        }
+    }
+
     if !value {
         return Ok(status);
     }
 
-    let cwd = workspace.path.read().await.clone();
-    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+    if !cwd_is_unity {
         return Ok(status);
     }
 
@@ -226,6 +239,118 @@ pub async fn set_unity_background_hook_enabled(
 pub fn get_unity_background_hook_status(
 ) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
     Ok(crate::unity_bridge::background_hook_status())
+}
+
+#[tauri::command]
+pub fn get_unity_state_probe_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.unity_state_probe_enabled())
+}
+
+#[tauri::command]
+pub fn set_unity_state_probe_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::unity_bridge::UnityStateProbeStatus, crate::error::AppError> {
+    config
+        .set_unity_state_probe_enabled(value)
+        .map_err(crate::error::AppError::from)?;
+    Ok(crate::unity_bridge::set_state_probe_enabled(value))
+}
+
+#[tauri::command]
+pub fn get_unity_state_probe_status(
+) -> Result<crate::unity_bridge::UnityStateProbeStatus, crate::error::AppError> {
+    Ok(crate::unity_bridge::state_probe_status())
+}
+
+#[tauri::command]
+pub fn get_unity_native_bridge_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.unity_native_bridge_enabled())
+}
+
+/// Toggle the native broker transport. Persists the config flag, flips the
+/// in-process transport switch, and writes/removes the per-project marker the
+/// Unity plugin checks before loading the native DLL. The change takes full
+/// effect after the editor's next domain reload (when the plugin re-reads the
+/// marker); disabling it leaves the native-only Unity command transport
+/// unavailable until the marker is restored.
+#[tauri::command]
+pub async fn set_unity_native_bridge_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<bool, crate::error::AppError> {
+    config
+        .set_unity_native_bridge_enabled(value)
+        .map_err(crate::error::AppError::from)?;
+    crate::unity_bridge::set_native_bridge_enabled(value);
+
+    let cwd = workspace.path.read().await.clone();
+    if !cwd.trim().is_empty() && crate::unity_bridge::is_unity_project(&cwd) {
+        crate::unity_bridge::sync_native_bridge_marker(&cwd, value).map_err(|error| {
+            crate::error::AppError::new("unity.native_bridge.marker_failed", error)
+                .operation("setUnityNativeBridgeEnabled")
+        })?;
+    }
+    Ok(value)
+}
+
+/// Best-effort native broker status for the current workspace. `None` when the
+/// bridge is disabled or no live broker is serving this project.
+#[tauri::command]
+pub async fn get_unity_native_broker_status(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<Option<crate::unity_bridge::NativeBrokerStatus>, crate::error::AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+        return Ok(None);
+    }
+    Ok(crate::unity_bridge::query_native_broker_status(&cwd).await)
+}
+
+/// Fused semantic editor state (pipe + process + native signals) for the
+/// current workspace. Returns `unknown` when no workspace is selected.
+#[tauri::command]
+pub async fn get_unity_semantic_state(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<crate::unity_bridge::SemanticState, crate::error::AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+        return Ok(crate::unity_bridge::unity_semantic_state("").await);
+    }
+    Ok(crate::unity_bridge::unity_semantic_state(&cwd).await)
+}
+
+#[tauri::command]
+pub async fn unity_state_probe_selftest_run(
+    app: AppHandle,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<(), crate::error::AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::run_state_probe_selftest(app, cwd)
+        .await
+        .map_err(|error| {
+            crate::error::AppError::new("unity.state_probe.selftest_failed", error)
+                .operation("unityStateProbeSelftestRun")
+        })
+}
+
+#[tauri::command]
+pub async fn unity_native_bridge_selftest_run(
+    app: AppHandle,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<(), crate::error::AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::run_native_bridge_selftest(app, cwd)
+        .await
+        .map_err(|error| {
+            crate::error::AppError::new("unity.native_bridge.selftest_failed", error)
+                .operation("unityNativeBridgeSelftestRun")
+        })
 }
 
 #[tauri::command]

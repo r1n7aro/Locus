@@ -332,6 +332,7 @@ pub async fn set_working_dir(
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     registry: State<'_, crate::AgentDefRegistryState>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let switch_started_at = Instant::now();
@@ -686,6 +687,24 @@ pub async fn set_working_dir(
     }
 
     if crate::unity_bridge::is_unity_project(&canonical) {
+        if let Err(error) = crate::unity_bridge::sync_native_bridge_marker(
+            &canonical,
+            config.unity_native_bridge_enabled(),
+        ) {
+            eprintln!(
+                "[Locus] warning: failed to sync native bridge marker for workspace: {}",
+                error
+            );
+        }
+        if let Err(error) = crate::unity_bridge::sync_background_hook_marker(
+            &canonical,
+            config.unity_background_hook_enabled(),
+        ) {
+            eprintln!(
+                "[Locus] warning: failed to sync background hook marker for workspace: {}",
+                error
+            );
+        }
         switch_timer.mark("unity_monitor_start_begin");
         crate::unity_bridge::start_unity_monitor(
             app_handle.clone(),
@@ -2308,9 +2327,28 @@ pub async fn check_unity_plugin(
 }
 
 #[tauri::command]
+pub async fn check_unity_plugin_install_plan(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<crate::unity_bridge::PluginInstallPlan, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if !crate::unity_bridge::is_unity_project(&cwd) {
+        return Ok(crate::unity_bridge::PluginInstallPlan {
+            status: crate::unity_bridge::PluginStatus::UpToDate,
+            dll_update_required: false,
+            unity_running: false,
+            unity_process_ids: Vec::new(),
+        });
+    }
+    crate::unity_bridge::check_plugin_install_plan(&cwd)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn install_unity_plugin(
     workspace: State<'_, Arc<Workspace>>,
     app_handle: AppHandle,
+    force_close_unity: Option<bool>,
 ) -> Result<String, AppError> {
     let cwd = workspace.path.read().await.clone();
     if !crate::unity_bridge::is_unity_project(&cwd) {
@@ -2318,7 +2356,11 @@ pub async fn install_unity_plugin(
             .to_string()
             .into());
     }
-    let hash = crate::unity_bridge::install_or_update_plugin(&cwd)?;
+    let hash = crate::unity_bridge::install_or_update_plugin_with_force_close(
+        &cwd,
+        force_close_unity.unwrap_or(false),
+    )
+    .await?;
     crate::unity_bridge::emit_plugin_status(&app_handle, &cwd);
     Ok(hash)
 }
@@ -2329,6 +2371,34 @@ pub async fn launch_unity_project(
 ) -> Result<crate::unity_bridge::UnityLaunchResult, AppError> {
     let cwd = workspace.path.read().await.clone();
     crate::unity_bridge::launch_project(&cwd).map_err(Into::into)
+}
+
+/// Drive a Unity recompile + domain reload and wait for it to settle. Thin
+/// wrapper over `recompile_and_wait` so plugin pushes and corpus changes can
+/// be converged deterministically from a host driver (the same flow the
+/// `unity_recompile` agent tool uses).
+#[tauri::command]
+pub async fn unity_recompile_run(workspace: State<'_, Arc<Workspace>>) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::recompile_and_wait(&cwd)
+        .await
+        .map_err(Into::into)
+}
+
+/// Run a one-off C# snippet in the connected Unity Editor and return its
+/// string result. Thin host-driver wrapper over `unity_execute_code` (the
+/// same path the `unity_execute` tool and the hot-reload self-test use) so a
+/// CDP driver can poke editor state — e.g. toggle `EditorSettings` for the
+/// no-domain-reload verification matrix.
+#[tauri::command]
+pub async fn unity_execute_snippet_run(
+    code: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::unity_execute_code(&cwd, &code)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

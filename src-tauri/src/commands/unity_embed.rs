@@ -69,6 +69,11 @@ struct UnityEmbedControlMessage {
     title: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    /// Set to `reloading` by the native overlay client while the managed domain
+    /// is reloading (Phase 5). The connection stays up (native owns it), so the
+    /// server retains the overlay as-is instead of treating the gap as a close.
+    #[serde(default)]
+    managed_overlay_state: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2112,6 +2117,14 @@ fn apply_control_message_on_main(
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
     let label = unity_embed_window_label_for_msg(&msg);
+    // While the managed domain is reloading, the native overlay client keeps
+    // the pipe alive and sends this marker. Retain the overlay exactly as-is
+    // (no geometry/visibility change, no teardown) so it does not flicker; the
+    // post-reload open/update resyncs it. Handled before the stale-revision
+    // gate so the marker is never dropped.
+    if msg.managed_overlay_state == "reloading" {
+        return Ok(());
+    }
     if should_ignore_stale_control_message(&label, &msg) {
         return Ok(());
     }

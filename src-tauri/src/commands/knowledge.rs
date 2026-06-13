@@ -904,10 +904,9 @@ pub(crate) fn execute_knowledge_read_request(
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
             if doc_type == KnowledgeType::Skill {
-                if let Some(result) = super::skill::read_skill_package_directory_sync(
-                    working_dir,
-                    &normalized_path,
-                )? {
+                if let Some(result) =
+                    super::skill::read_skill_package_directory_sync(working_dir, &normalized_path)?
+                {
                     return Ok(KnowledgeReadResponse {
                         kind: KnowledgeTargetKind::Directory,
                         document: None,

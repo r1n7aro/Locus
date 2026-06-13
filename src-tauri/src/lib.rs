@@ -22,6 +22,7 @@ mod agent;
 pub mod asset_db;
 mod auth;
 pub mod binary_cache;
+mod cli_driver;
 pub mod code_tools;
 mod commands;
 mod compact;
@@ -293,6 +294,14 @@ mod state_type_tests {
 pub fn run() {
     let startup_trace = StartupTrace::new();
     std::eprintln!("[startup] phase=run_enter total=0ms delta=0ms");
+    let cli_driver_config = match cli_driver::CliDriverConfig::from_env_args() {
+        Some(Ok(config)) => Some(config),
+        Some(Err(error)) => {
+            eprintln!("[Locus CLI] {error}");
+            std::process::exit(2);
+        }
+        None => None,
+    };
 
     let shared_debug_flag = Arc::new(AtomicBool::new(
         std::env::var("LOCUS_DEBUG")
@@ -308,6 +317,7 @@ pub fn run() {
     let log_store_for_setup = log_store.clone();
     let startup_for_page_load = startup_trace.clone();
     let startup_for_setup = startup_trace.clone();
+    let cli_driver_for_setup = cli_driver_config.clone();
 
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
@@ -407,6 +417,8 @@ pub fn run() {
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
+            unity_bridge::initialize_state_probe(config.unity_state_probe_enabled());
+            unity_bridge::initialize_native_bridge(config.unity_native_bridge_enabled());
             csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
             csharp_compile::initialize(
                 config.unity_sidecar_compiler_enabled(),
@@ -466,6 +478,28 @@ pub fn run() {
             } else {
                 None
             };
+            if !initial_working_dir.is_empty()
+                && unity_bridge::is_unity_project(&initial_working_dir)
+            {
+                if let Err(error) = unity_bridge::sync_native_bridge_marker(
+                    &initial_working_dir,
+                    config.unity_native_bridge_enabled(),
+                ) {
+                    eprintln!(
+                        "[Locus] warning: failed to sync native bridge marker on startup: {}",
+                        error
+                    );
+                }
+                if let Err(error) = unity_bridge::sync_background_hook_marker(
+                    &initial_working_dir,
+                    config.unity_background_hook_enabled(),
+                ) {
+                    eprintln!(
+                        "[Locus] warning: failed to sync background hook marker on startup: {}",
+                        error
+                    );
+                }
+            }
             println!("[Locus] workspace_id: {:?}", initial_workspace_id);
             startup_for_setup.mark("setup_workspace_ready");
 
@@ -885,6 +919,13 @@ pub fn run() {
             startup_for_setup.mark("setup_state_managed");
             startup_for_setup.mark("setup_backend_ready");
 
+            if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
+                cli_driver::spawn(app.handle().clone(), workspace.clone(), cli_driver_config);
+                startup_for_setup.mark("setup_cli_driver_scheduled");
+                startup_for_setup.mark("setup_done");
+                return Ok(());
+            }
+
             let main_window_config = app
                 .config()
                 .app
@@ -1038,8 +1079,11 @@ pub fn run() {
             commands::check_unity_connection_status,
             commands::get_unity_console_text,
             commands::check_unity_plugin,
+            commands::check_unity_plugin_install_plan,
             commands::install_unity_plugin,
             commands::launch_unity_project,
+            commands::unity_recompile_run,
+            commands::unity_execute_snippet_run,
             commands::send_unity_log,
             commands::select_unity_asset,
             commands::open_unity_asset_inspector,
@@ -1258,6 +1302,15 @@ pub fn run() {
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
+            commands::get_unity_state_probe_enabled,
+            commands::set_unity_state_probe_enabled,
+            commands::get_unity_state_probe_status,
+            commands::get_unity_native_bridge_enabled,
+            commands::set_unity_native_bridge_enabled,
+            commands::get_unity_native_broker_status,
+            commands::get_unity_semantic_state,
+            commands::unity_state_probe_selftest_run,
+            commands::unity_native_bridge_selftest_run,
             commands::csharp_lsp_get_status,
             commands::csharp_lsp_set_enabled,
             commands::csharp_lsp_restart,
@@ -1265,6 +1318,7 @@ pub fn run() {
             commands::unity_sidecar_compiler_set_enabled,
             commands::unity_hot_reload_set_enabled,
             commands::unity_hot_reload_selftest_run,
+            commands::unity_hot_reload_access_probe_run,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

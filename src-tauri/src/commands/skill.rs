@@ -5566,10 +5566,9 @@ Create a project skill.
         )
         .unwrap();
 
-        let record =
-            super::read_skill_package_directory_sync(&working_dir, "psd-tools/references")
-                .expect("package directory read should succeed")
-                .expect("package directory should resolve");
+        let record = super::read_skill_package_directory_sync(&working_dir, "psd-tools/references")
+            .expect("package directory read should succeed")
+            .expect("package directory should resolve");
         assert_eq!(record.path, "psd-tools/references");
         assert!(record.read_only);
         assert!(!record.exists);
@@ -5586,10 +5585,9 @@ Create a project skill.
             Some(crate::knowledge_store::KnowledgeSourceProvider::Package)
         );
 
-        let root_record =
-            super::read_skill_package_directory_sync(&working_dir, "skill/psd-tools")
-                .expect("package root read should succeed")
-                .expect("package root should resolve");
+        let root_record = super::read_skill_package_directory_sync(&working_dir, "skill/psd-tools")
+            .expect("package root read should succeed")
+            .expect("package root should resolve");
         assert_eq!(root_record.path, "psd-tools");
         assert!(root_record.read_only);
 
