@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -15,10 +15,22 @@ pub enum PluginStatus {
     UpToDate,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallPlan {
+    pub status: PluginStatus,
+    pub dll_update_required: bool,
+    pub unity_running: bool,
+    pub unity_process_ids: Vec<u32>,
+}
+
 const PLUGIN_DEFAULT_INSTALL_DIR: &str = "Packages/com.farlocus.locus";
 const PLUGIN_SKILLS_DIR: &str = "Editor/Skills";
 const PLUGIN_ASMDEF_NAME: &str = "Locus.Editor.asmdef";
 const PLUGIN_HASH_FILE: &str = ".locus_plugin_hash";
+const PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(45);
+const PLUGIN_INSTALL_LOCK_RELEASE_SETTLE: Duration = Duration::from_secs(2);
+const PLUGIN_INSTALL_RETRY_SETTLE: Duration = Duration::from_secs(3);
 const PLUGIN_LEGACY_ASSETS_INSTALL_DIRS: &[&str] = &["Assets/Locus", "Assets/Plugins/Locus"];
 const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "package.json",
@@ -31,6 +43,15 @@ const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "Editor/Detour/Locus.Detour.dll.meta",
     "Editor/HotReload/Locus.HotReload.Runtime.dll",
     "Editor/HotReload/Locus.HotReload.Runtime.dll.meta",
+    "Editor/Native/x86_64/locus_native.dll",
+    "Editor/Native/x86_64/locus_native.dll.meta",
+];
+const PLUGIN_REQUIRED_DLL_FILES: &[&str] = &[
+    "Editor/Json/Locus.Json.dll",
+    "Editor/Roslyn/Locus.Roslyn.dll",
+    "Editor/Detour/Locus.Detour.dll",
+    "Editor/HotReload/Locus.HotReload.Runtime.dll",
+    "Editor/Native/x86_64/locus_native.dll",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +224,12 @@ fn remove_plugin_dir(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn is_access_denied_error(error: &str) -> bool {
+    error.contains("os error 5")
+        || error.to_ascii_lowercase().contains("access is denied")
+        || error.contains("拒绝访问")
 }
 
 fn plugin_source_rel_key(source_dir: &Path, path: &Path) -> Result<String, String> {
@@ -451,6 +478,32 @@ fn check_plugin_status_with_source_dir(
     }
 }
 
+fn source_contains_required_dlls(source_dir: &Path) -> bool {
+    PLUGIN_REQUIRED_DLL_FILES
+        .iter()
+        .any(|rel| source_dir.join(rel).is_file())
+}
+
+fn install_plan_dll_update_required_with_source_dir(
+    source_dir: &Path,
+    project_path: &Path,
+    status: &PluginStatus,
+) -> bool {
+    if matches!(status, PluginStatus::UpToDate) {
+        return false;
+    }
+
+    // The installer replaces the Unity plugin package as one unit. Any install
+    // or update that includes editor-loaded DLLs may need Unity to release file
+    // locks before the package directory can be swapped.
+    source_contains_required_dlls(source_dir)
+        || find_installed_plugin_dirs(project_path).iter().any(|dir| {
+            PLUGIN_REQUIRED_DLL_FILES
+                .iter()
+                .any(|rel| dir.root.join(rel).is_file())
+        })
+}
+
 fn install_or_update_plugin_with_source_dir(
     source_dir: &Path,
     project_path: &Path,
@@ -553,12 +606,136 @@ pub fn check_plugin_status(project_path: &str) -> Result<PluginStatus, String> {
     check_plugin_status_with_source_dir(&source_dir, project)
 }
 
-pub fn install_or_update_plugin(project_path: &str) -> Result<String, String> {
+pub async fn check_plugin_install_plan(project_path: &str) -> Result<PluginInstallPlan, String> {
+    let source_dir = find_plugin_source_dir()
+        .ok_or_else(|| "locus_unity source directory not found".to_string())?;
+    validate_plugin_source_dir(&source_dir)?;
+
+    let project = Path::new(strip_extended_path_prefix(project_path));
+    let status = check_plugin_status_with_source_dir(&source_dir, project)?;
+    let dll_update_required =
+        install_plan_dll_update_required_with_source_dir(&source_dir, project, &status);
+    let editor_process = super::process::query_current_project_editor_process(project_path).await;
+    let unity_process_ids = match (editor_process.state, editor_process.process_id) {
+        (super::process::UnityEditorProcessState::Running, Some(process_id)) => vec![process_id],
+        _ => Vec::new(),
+    };
+    Ok(PluginInstallPlan {
+        status,
+        dll_update_required,
+        unity_running: !unity_process_ids.is_empty(),
+        unity_process_ids,
+    })
+}
+
+fn install_or_update_plugin_files(project_path: &str) -> Result<String, String> {
     let source_dir = find_plugin_source_dir()
         .ok_or_else(|| "locus_unity source directory not found".to_string())?;
 
     let project = Path::new(strip_extended_path_prefix(project_path));
     install_or_update_plugin_with_source_dir(&source_dir, project)
+}
+
+pub async fn install_or_update_plugin(project_path: &str) -> Result<String, String> {
+    install_or_update_plugin_with_force_close(project_path, false).await
+}
+
+pub async fn install_or_update_plugin_with_force_close(
+    project_path: &str,
+    force_close_unity: bool,
+) -> Result<String, String> {
+    super::transport::disconnect_with_reason(project_path, "Unity closed for plugin update").await;
+    let close_result = if force_close_unity {
+        super::process::force_close_current_project_unity_processes(
+            project_path,
+            PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT,
+        )
+        .await?
+    } else {
+        super::process::close_current_project_unity_processes(
+            project_path,
+            PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT,
+        )
+        .await?
+    };
+    let restart_after_install = !close_result.process_ids.is_empty();
+    if restart_after_install {
+        eprintln!(
+            "[Locus] closed Unity process(es) before plugin install: {}{}",
+            close_result
+                .process_ids
+                .iter()
+                .map(|process_id| process_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if close_result.forced_process_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (forced: {})",
+                    close_result
+                        .forced_process_ids
+                        .iter()
+                        .map(|process_id| process_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+        tokio::time::sleep(PLUGIN_INSTALL_LOCK_RELEASE_SETTLE).await;
+    }
+
+    let hash = match install_or_update_plugin_files(project_path) {
+        Ok(hash) => hash,
+        Err(error) if is_access_denied_error(&error) => {
+            eprintln!(
+                "[Locus] plugin install hit a locked file after Unity close; retrying after process cleanup: {}",
+                error
+            );
+            super::transport::disconnect_with_reason(
+                project_path,
+                "Unity closed for plugin update retry",
+            )
+            .await;
+            let retry_close = if force_close_unity {
+                super::process::force_close_current_project_unity_processes(
+                    project_path,
+                    PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT,
+                )
+                .await?
+            } else {
+                super::process::close_current_project_unity_processes(
+                    project_path,
+                    PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT,
+                )
+                .await?
+            };
+            if !retry_close.process_ids.is_empty() {
+                eprintln!(
+                    "[Locus] closed Unity process(es) before plugin install retry: {}",
+                    retry_close
+                        .process_ids
+                        .iter()
+                        .map(|process_id| process_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            tokio::time::sleep(PLUGIN_INSTALL_RETRY_SETTLE).await;
+            install_or_update_plugin_files(project_path)?
+        }
+        Err(error) => return Err(error),
+    };
+
+    if restart_after_install {
+        let launch = super::launch_project(project_path)?;
+        eprintln!(
+            "[Locus] relaunched Unity after plugin install: editor='{}', project='{}'",
+            launch.editor_path, launch.project_path
+        );
+    }
+
+    Ok(hash)
 }
 
 pub fn emit_plugin_status(app_handle: &AppHandle, project_path: &str) {
@@ -623,6 +800,54 @@ mod tests {
             &source_root.join("Editor/HotReload/Locus.HotReload.Runtime.dll.meta"),
             b"meta",
         );
+        write_file(
+            &source_root.join("Editor/Native/x86_64/locus_native.dll"),
+            b"dll",
+        );
+        write_file(
+            &source_root.join("Editor/Native/x86_64/locus_native.dll.meta"),
+            b"meta",
+        );
+    }
+
+    #[test]
+    fn install_plan_marks_dll_update_for_outdated_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+        create_minimal_plugin_source(source.path());
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        write_file(
+            &source.path().join("Editor/BridgeHost.cs"),
+            b"script update",
+        );
+        let status = check_plugin_status_with_source_dir(source.path(), temp.path()).unwrap();
+
+        assert!(matches!(status, PluginStatus::Outdated));
+        assert!(install_plan_dll_update_required_with_source_dir(
+            source.path(),
+            temp.path(),
+            &status
+        ));
+    }
+
+    #[test]
+    fn install_plan_skips_dll_update_for_current_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+        create_minimal_plugin_source(source.path());
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        let status = check_plugin_status_with_source_dir(source.path(), temp.path()).unwrap();
+
+        assert!(matches!(status, PluginStatus::UpToDate));
+        assert!(!install_plan_dll_update_required_with_source_dir(
+            source.path(),
+            temp.path(),
+            &status
+        ));
     }
 
     #[test]

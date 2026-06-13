@@ -1,0 +1,32 @@
+[package]
+name = "locus_native_plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "In-process Unity Editor broker for Locus (survives domain reload)"
+authors = ["FarLocus"]
+publish = false
+
+# Loaded into the Unity Editor process via P/Invoke. The lib name is the file
+# name the C# `DllImport("locus_native")` resolves, so it must be `locus_native`
+# (→ locus_native.dll on Windows), not the package name.
+[lib]
+name = "locus_native"
+crate-type = ["cdylib"]
+
+# Windows-only: the broker is a Win32 named-pipe server hosted on a background
+# tokio runtime. serde_json frames the envelope protocol shared with the
+# managed pipe. Non-Windows builds compile inert FFI stubs (see lib.rs).
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 2
+# A thin broker; keep release builds quick and the cdylib small. No LTO needed.
+
+# Declare this crate its own workspace root so it never gets absorbed into a
+# parent workspace and builds standalone via `--manifest-path`.
+[workspace]
