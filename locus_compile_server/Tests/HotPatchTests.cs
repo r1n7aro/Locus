@@ -76,6 +76,13 @@ public class HotPatchTests : IDisposable
     }
 
     private static JsonNode HotPatch(CompileService service, JsonObject @params, params (string Path, string Old, string New)[] files)
+        => HotPatchWithCaps(service, @params, runtimeCaps: null, files);
+
+    private static JsonNode HotPatchWithCaps(
+        CompileService service,
+        JsonObject @params,
+        JsonObject? runtimeCaps,
+        params (string Path, string Old, string New)[] files)
     {
         var request = new JsonObject
         {
@@ -89,6 +96,8 @@ public class HotPatchTests : IDisposable
                 .ToArray()),
             ["params"] = @params,
         };
+        if (runtimeCaps != null)
+            request["runtimeCaps"] = runtimeCaps;
         return service.HandleCompileHotPatch(request);
     }
 
@@ -188,9 +197,10 @@ namespace HotPatchE2E
         Assert.True(newType["isTopLevel"]!.GetValue<bool>());
     }
 
-    // Public state only: Mono enforces accessibility when the shim jits, so
-    // added members may not touch non-public surface (cold otherwise — see
-    // Added_member_touching_private_state_is_cold).
+    // Public state only: without measured runtime caps, added members may
+    // not touch non-public surface (cold otherwise — see
+    // Added_member_touching_private_state_is_cold; green C0 caps relax the
+    // body in the RelaxE2E tests).
     private const string ShimCalcSource = @"
 namespace ShimE2E
 {
@@ -453,6 +463,33 @@ public struct Vec
         return path;
     }
 
+    /// <summary>Same, but the baseline compile references OTHER project
+    /// assemblies too (the cross-asmdef shapes: a main assembly whose
+    /// baseline already calls into the lib assembly).</summary>
+    private string CompileProjectAssembly(
+        CompileService service,
+        string assemblyName,
+        string[] extraReferences,
+        params (string Path, string Text)[] sources)
+    {
+        var request = new JsonObject
+        {
+            ["assemblyName"] = assemblyName,
+            ["sources"] = new JsonArray(sources
+                .Select(s => (JsonNode)new JsonObject { ["path"] = s.Path, ["text"] = s.Text })
+                .ToArray()),
+            ["params"] = ParamsFor(extraReferences),
+        };
+        JsonNode result = service.HandleCompileRaw(request);
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        string dir = Path.Combine(_tempDir, "Library", "ScriptAssemblies");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, assemblyName + ".dll");
+        File.WriteAllBytes(path, Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>()));
+        return path;
+    }
+
     private const string ScanLibSource = @"
 namespace ScanE2E
 {
@@ -566,6 +603,177 @@ namespace ScanE2E
         // Not a noop overall (Use.Go detours), but the batch carries the
         // tombstone via the pending-shim flow.
         Assert.Single(result["methods"]!.AsArray());
+    }
+
+    // ── B3: cross-asmdef batches (two PROJECT assemblies) ────────────
+    // The selftest's Unity-side mirror: a lib type in its own assembly
+    // (asmdef), callers in the "main" assembly. In-proc this proves the
+    // sidecar half — cross-assembly M3 verdicts and the cross-assembly
+    // shim binding — on CoreCLR.
+
+    private const string CrossLibSource = @"
+public class XLibType
+{
+    public int LibSeed = 8;
+
+    public int LibSig(int x) { return x + 1; }
+}";
+
+    private const string CrossMainSource = @"
+public class XMain
+{
+    public static int Call() { return new XLibType().LibSig(10); }
+}";
+
+    [Fact]
+    public void Cross_assembly_signature_change_with_uncovered_caller_names_the_callers_file()
+    {
+        var service = new CompileService();
+        string libPath = CompileProjectAssembly(service, "XLibUncov", ("Assets/Lib/XLibType.cs", CrossLibSource));
+        string mainPath = CompileProjectAssembly(
+            service, "XMainUncov", new[] { libPath }, ("Assets/XMain.cs", CrossMainSource));
+        // Both assemblies sit in Library/ScriptAssemblies; the M3 scan must
+        // cross the assembly boundary (MemberRef→TypeRef resolution), find
+        // the caller in the OTHER assembly and name its source file.
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+
+        string newLib = CrossLibSource.Replace(
+            "public int LibSig(int x) { return x + 1; }",
+            "public int LibSig(int x, int bump) { return x + bump + 200; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Lib/XLibType.cs", CrossLibSource, newLib));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        Assert.Equal("Assets/Lib/XLibType.cs", file["path"]!.GetValue<string>());
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("Assets/XMain.cs", reason);
+        Assert.Contains("unity_recompile", reason);
+    }
+
+    [Fact]
+    public void Cross_assembly_signature_change_with_covered_caller_executes_via_lib_bound_shim()
+    {
+        var service = new CompileService();
+        string libPath = CompileProjectAssembly(service, "XLibCov", ("Assets/Lib/XLibType.cs", CrossLibSource));
+        string mainPath = CompileProjectAssembly(
+            service, "XMainCov", new[] { libPath }, ("Assets/XMain.cs", CrossMainSource));
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+
+        string newLib = CrossLibSource.Replace(
+            "public int LibSig(int x) { return x + 1; }",
+            "public int LibSig(int x, int bump) { return x + bump + 200; }");
+        string newMain = CrossMainSource.Replace("LibSig(10)", "LibSig(10, 7)");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib/XLibType.cs", CrossLibSource, newLib),
+            ("Assets/XMain.cs", CrossMainSource, newMain));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.Contains("verified", result["callerScan"]!.GetValue<string>());
+
+        // Only the main-assembly caller detours (the re-added LibSig is
+        // shim-only); the plain detour carries no originalAssembly — the
+        // Unity side resolves XMain by name across the domain.
+        var detour = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("XMain", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Call", detour["name"]!.GetValue<string>());
+        Assert.Null(detour["originalAssembly"]);
+
+        byte[] libBytes = File.ReadAllBytes(libPath);
+        byte[] mainBytes = File.ReadAllBytes(mainPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+
+        var context = new AssemblyLoadContext("cross-asmdef-e2e", isCollectible: true);
+        try
+        {
+            Assembly lib = context.LoadFromStream(new MemoryStream(libBytes));
+            Assembly main = context.LoadFromStream(new MemoryStream(mainBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "XLibCov" => lib,
+                "XMainCov" => main,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The shim's self parameter must bind to the LIB assembly's
+            // type — not the main assembly, not the renamed patch copy.
+            Type shims = patch.GetType("XLibType__LocusShims", throwOnError: true)!;
+            MethodInfo libSig = shims.GetMethod("LibSig")!;
+            Assert.Same(lib, libSig.GetParameters()[0].ParameterType.Assembly);
+
+            // The patched main caller constructs the ORIGINAL lib type and
+            // direct-calls the shim across the boundary.
+            Type patchMain = patch.GetType("XMain__LocusPatch", throwOnError: true)!;
+            Assert.Equal(10 + 7 + 200, patchMain.GetMethod("Call")!.Invoke(null, null));
+
+            // The shim also runs against a lib-born instance directly.
+            object instance = Activator.CreateInstance(lib.GetType("XLibType")!)!;
+            Assert.Equal(1 + 2 + 200, libSig.Invoke(null, new[] { instance, (object)1, (object)2 }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // Same metadata name in TWO referenced assemblies, different instance
+    // layouts: FindOriginalType has no source→assembly attribution and takes
+    // the FIRST reference containing the name (known B3 boundary — see the
+    // PatchRewriter doc comment). The pin: when the first match is the
+    // wrong home the layout guard fails CLOSED (cold), never a wrong-target
+    // patch; with the true home first, the same edit goes hot.
+    private const string DupNarrowSource = @"
+public class DupShared
+{
+    public int A = 1;
+
+    public int Val() { return 1; }
+}";
+
+    private const string DupWideSource = @"
+public class DupShared
+{
+    public int A = 1;
+    public int B = 2;
+
+    public int Val() { return 2; }
+}";
+
+    [Fact]
+    public void Same_name_type_in_two_assemblies_binds_first_and_fails_closed()
+    {
+        var service = new CompileService();
+        string narrowPath = CompileOriginal(service, "DupNarrow", DupNarrowSource);
+        string widePath = CompileOriginal(service, "DupWide", DupWideSource);
+
+        // The edited file is the WIDE shape (fields A + B).
+        string newText = DupWideSource.Replace(
+            "public int Val() { return 2; }",
+            "public int Val() { return 3; }");
+
+        // Narrow assembly first: first-match resolves the WRONG home and
+        // the layout guard rejects the batch (fail-closed).
+        JsonNode wrongFirst = HotPatch(
+            service, ParamsFor(narrowPath, widePath),
+            ("Assets/DupShared.cs", DupWideSource, newText));
+        Assert.False(wrongFirst["hot"]!.GetValue<bool>());
+        var file = Assert.Single(wrongFirst["files"]!.AsArray())!;
+        string reason = file["reasons"]!.AsArray().Single()!.GetValue<string>();
+        Assert.Contains("field layout differs", reason);
+
+        // True home first: the identical edit goes hot.
+        JsonNode homeFirst = HotPatch(
+            service, ParamsFor(widePath, narrowPath),
+            ("Assets/DupShared.cs", DupWideSource, newText));
+        Assert.True(homeFirst["hot"]!.GetValue<bool>(), homeFirst["files"]?.ToJsonString());
+        Assert.True(homeFirst["success"]!.GetValue<bool>(), homeFirst["error"]?.GetValue<string>());
+        var detour = Assert.Single(homeFirst["methods"]!.AsArray())!;
+        Assert.Equal("DupShared", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Val", detour["name"]!.GetValue<string>());
     }
 
     // ── B1: generic method bodies via remove+add shims ───────────────
@@ -1745,6 +1953,1288 @@ namespace DeleteScanE2E
             file["reasons"]!.AsArray(),
             r => r!.GetValue<string>().Contains("original type not found"));
     }
+
+    // ── C2′a: caps-gated non-public BODY access for added members ───────
+    // The C0 probe measured the running Mono's JIT access matrix; when every
+    // (operation × visibility) cell an added member's body needs is green,
+    // the shim goes hot through the IgnoresAccessChecksTo mechanism the
+    // patch already compiles with. Caps absent / red cells keep the cold
+    // verdict; non-public types in the shim's SIGNATURE always stay cold.
+
+    /// <summary>The matrix as a permissive Mono reports it: every cell
+    /// green. `overrides` re-colors single cells to model stricter
+    /// runtimes.</summary>
+    private static JsonObject GreenRuntimeCaps(params (string Cell, bool Ok)[] overrides)
+    {
+        var cells = new JsonObject();
+        foreach (string op in new[] { "ldfld", "stfld", "ldsfld", "stsfld", "call", "callvirt", "newobj", "castclass", "ldtoken" })
+        {
+            foreach (string visibility in new[] { "private", "internal" })
+                cells[op + "_" + visibility] = true;
+        }
+        foreach (var (cell, ok) in overrides)
+            cells[cell] = ok;
+        return new JsonObject
+        {
+            ["createDelegateNonPublic"] = true,
+            ["dynamicMethodSkipVisibility"] = true,
+            ["dynamicMethodByrefReturn"] = false,
+            ["cells"] = cells,
+        };
+    }
+
+    private const string PrivateSurfaceSource = @"
+namespace RelaxE2E
+{
+    public class Vault
+    {
+        private int _mana = 30;
+        private static int s_pool = 400;
+        private int Hidden() { return 7; }
+        public int Tick() { return _mana + s_pool + Hidden(); }
+    }
+}";
+
+    private const string InternalTypeSource = @"
+namespace RelaxE2E
+{
+    internal class Stash
+    {
+        public int Take() { return 55; }
+    }
+    public class Porter
+    {
+        public int Tick() { return new Stash().Take(); }
+    }
+}";
+
+    /// <summary>One added-member edit against PrivateSurfaceSource through
+    /// the full handler (caps == null omits runtimeCaps entirely).</summary>
+    private JsonNode HotPatchPrivateSurface(
+        string assemblyName, string addedMember, JsonObject? caps, out string originalPath)
+    {
+        var service = new CompileService();
+        originalPath = CompileOriginal(service, assemblyName, PrivateSurfaceSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = PrivateSurfaceSource.Replace(
+            "public int Tick() { return _mana + s_pool + Hidden(); }",
+            "public int Tick() { return _mana + s_pool + Hidden(); }\n        " + addedMember);
+        return HotPatchWithCaps(service, compileParams, caps, ("Vault.cs", PrivateSurfaceSource, newText));
+    }
+
+    /// <summary>Load original + patch into an isolated context and invoke a
+    /// shim method with an original-typed receiver instance.</summary>
+    private static object? InvokeShim(
+        string originalPath,
+        string originalAssemblyName,
+        JsonNode result,
+        string shimTypeName,
+        string shimMethodName,
+        string receiverTypeName)
+    {
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("relax-e2e-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(originalPath)));
+            context.Resolving += (_, name) => name.Name == originalAssemblyName ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type shims = patch.GetType(shimTypeName, throwOnError: true)!;
+            object receiver = Activator.CreateInstance(original.GetType(receiverTypeName, throwOnError: true)!)!;
+            return shims.GetMethod(shimMethodName)!.Invoke(null, new[] { receiver });
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_member_reading_private_field_goes_hot_with_green_caps()
+    {
+        JsonNode result = HotPatchPrivateSurface(
+            "RelaxFieldOriginal",
+            "public int Mana() { return _mana + 100; }",
+            GreenRuntimeCaps(),
+            out string originalPath);
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // CoreCLR honors IgnoresAccessChecksTo like the probed Mono: the
+        // shim really reads the ORIGINAL instance's private field.
+        object? value = InvokeShim(
+            originalPath, "RelaxFieldOriginal", result,
+            "RelaxE2E.Vault__LocusShims", "Mana", "RelaxE2E.Vault");
+        Assert.Equal(130, value);
+    }
+
+    [Fact]
+    public void Added_member_calling_private_method_and_static_goes_hot_with_green_caps()
+    {
+        JsonNode result = HotPatchPrivateSurface(
+            "RelaxCallOriginal",
+            "public int Surge() { return Hidden() + s_pool; }",
+            GreenRuntimeCaps(),
+            out string originalPath);
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        object? value = InvokeShim(
+            originalPath, "RelaxCallOriginal", result,
+            "RelaxE2E.Vault__LocusShims", "Surge", "RelaxE2E.Vault");
+        Assert.Equal(407, value); // Hidden(7) + s_pool(400)
+    }
+
+    [Fact]
+    public void Added_member_creating_internal_type_goes_hot_with_green_caps()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxInternalOriginal", InternalTypeSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = InternalTypeSource.Replace(
+            "public int Tick() { return new Stash().Take(); }",
+            "public int Tick() { return new Stash().Take(); }\n        public int Carry() { var s = new Stash(); return s.Take() + 1; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(),
+            ("Porter.cs", InternalTypeSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        object? value = InvokeShim(
+            originalPath, "RelaxInternalOriginal", result,
+            "RelaxE2E.Porter__LocusShims", "Carry", "RelaxE2E.Porter");
+        Assert.Equal(56, value);
+    }
+
+    [Fact]
+    public void Added_member_touching_private_state_without_caps_stays_cold()
+    {
+        // Backward compatibility lock: a request without runtimeCaps (old
+        // plugin) classifies exactly like before C2′a.
+        JsonNode result = HotPatchPrivateSurface(
+            "RelaxNoCapsOriginal",
+            "public int Mana() { return _mana; }",
+            caps: null,
+            out _);
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("_mana", reason);
+        Assert.Contains("runtime caps absent", reason);
+    }
+
+    [Fact]
+    public void Added_member_with_empty_caps_cells_stays_cold()
+    {
+        // The desktop side serializes a FAILED probe as all-false primitives
+        // with an empty cell map; that must gate exactly like absent caps.
+        JsonNode result = HotPatchPrivateSurface(
+            "RelaxEmptyCapsOriginal",
+            "public int Mana() { return _mana; }",
+            new JsonObject
+            {
+                ["createDelegateNonPublic"] = false,
+                ["dynamicMethodSkipVisibility"] = false,
+                ["dynamicMethodByrefReturn"] = false,
+                ["cells"] = new JsonObject(),
+            },
+            out _);
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("runtime caps absent", reason);
+    }
+
+    [Fact]
+    public void Added_member_with_red_cell_stays_cold_naming_the_cell()
+    {
+        // A strict Mono that fails private field loads: the verdict names
+        // the exact red probe cell.
+        JsonNode result = HotPatchPrivateSurface(
+            "RelaxRedCellOriginal",
+            "public int Mana() { return _mana; }",
+            GreenRuntimeCaps(("ldfld_private", false)),
+            out _);
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("ldfld_private", reason);
+        Assert.Contains("_mana", reason);
+    }
+
+    [Fact]
+    public void Added_member_with_non_public_signature_stays_cold_despite_green_caps()
+    {
+        // C2′a relaxes BODY references only: the public shim cannot NAME a
+        // non-public type in its own signature (no probe cell covers
+        // declaration-site loading yet).
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxSignatureOriginal", InternalTypeSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = InternalTypeSource.Replace(
+            "public int Tick() { return new Stash().Take(); }",
+            "public int Tick() { return new Stash().Take(); }\n        public int Weigh(Stash stash) { return 1; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(),
+            ("Porter.cs", InternalTypeSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("signature-level non-public type", reason);
+    }
+
+    // ── C2′b: binding-model alignment + kept/new-type/store gating ──────
+    // The batch BINDING compilation now carries the same IgnoreAccessibility
+    // flag the EMIT compilation always had, so non-public symbols from pure
+    // metadata (another assembly, or an unedited file of the project
+    // assembly) resolve in the semantic model and the access scan can gate
+    // them — previously GetSymbolInfo returned null and the reference
+    // slipped through hot, ungated. Kept bodies / new-type bodies / added-
+    // field initializers gate ASYMMETRICALLY: they have always shipped
+    // non-public references (through IgnoresAccessChecksTo), so caps absent
+    // keeps them hot, and only a POSITIVELY measured red cell turns them
+    // cold (added members keep the strict C2′a rule: absent ⇒ cold).
+
+    private const string DepotLibSource = @"
+namespace RelaxE2E
+{
+    public class Depot
+    {
+        internal static int Stock() { return 88; }
+    }
+}";
+
+    private const string HaulerMainSource = @"
+namespace RelaxE2E
+{
+    public class Hauler
+    {
+        public int Tick() { return 2; }
+    }
+}";
+
+    [Fact]
+    public void Added_member_calling_other_assembly_internal_without_caps_stays_cold()
+    {
+        // The internal member lives in ANOTHER assembly (pure metadata to
+        // the batch): without the binding-side IgnoreAccessibility it
+        // resolved to null and bypassed the caps gate entirely.
+        var service = new CompileService();
+        string libPath = CompileOriginal(service, "RelaxDepotLib", DepotLibSource);
+        string mainPath = CompileOriginal(service, "RelaxHaulerMain", HaulerMainSource);
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+        string newText = HaulerMainSource.Replace(
+            "public int Tick() { return 2; }",
+            "public int Tick() { return 2; }\n        public int Carry() { return Depot.Stock(); }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, runtimeCaps: null,
+            ("Hauler.cs", HaulerMainSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("Stock", reason);
+        Assert.Contains("runtime caps absent", reason);
+    }
+
+    [Fact]
+    public void Added_member_calling_other_assembly_internal_goes_hot_with_green_caps()
+    {
+        var service = new CompileService();
+        string libPath = CompileOriginal(service, "RelaxDepotLibGreen", DepotLibSource);
+        string mainPath = CompileOriginal(service, "RelaxHaulerMainGreen", HaulerMainSource);
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+        string newText = HaulerMainSource.Replace(
+            "public int Tick() { return 2; }",
+            "public int Tick() { return 2; }\n        public int Carry() { return Depot.Stock(); }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(),
+            ("Hauler.cs", HaulerMainSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // CoreCLR E2E: the shim really reaches the OTHER assembly's internal.
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("relax-xasm-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly lib = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(libPath)));
+            Assembly main = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(mainPath)));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "RelaxDepotLibGreen" => lib,
+                "RelaxHaulerMainGreen" => main,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type shims = patch.GetType("RelaxE2E.Hauler__LocusShims", throwOnError: true)!;
+            object receiver = Activator.CreateInstance(main.GetType("RelaxE2E.Hauler", throwOnError: true)!)!;
+            Assert.Equal(88, shims.GetMethod("Carry")!.Invoke(null, new[] { receiver }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string LockedCtorSource = @"
+namespace RelaxE2E
+{
+    public class Locked
+    {
+        public int Worth;
+        private Locked(int worth) { Worth = worth; }
+        public static int Spawn() { return 1; }
+    }
+}";
+
+    [Fact]
+    public void Added_member_using_private_ctor_of_public_type_gates_on_newobj_cell()
+    {
+        // `new Locked(7)` binds the CONSTRUCTOR symbol to the creation node
+        // (not to the type name), so a private ctor on a public type slipped
+        // past the name-only scan. Red newobj_private must now cold it.
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxLockedRed", LockedCtorSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = LockedCtorSource.Replace(
+            "public static int Spawn() { return 1; }",
+            "public static int Spawn() { return 1; }\n        public static int Forge() { return new Locked(7).Worth; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(("newobj_private", false)),
+            ("Locked.cs", LockedCtorSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("added member references non-public surface", reason);
+        Assert.Contains("newobj_private", reason);
+    }
+
+    [Fact]
+    public void Added_member_using_private_ctor_of_public_type_goes_hot_with_green_caps()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxLockedGreen", LockedCtorSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = LockedCtorSource.Replace(
+            "public static int Spawn() { return 1; }",
+            "public static int Spawn() { return 1; }\n        public static int Forge() { return new Locked(7).Worth; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(),
+            ("Locked.cs", LockedCtorSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("relax-ctor-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(originalPath)));
+            context.Resolving += (_, name) => name.Name == "RelaxLockedGreen" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type shims = patch.GetType("RelaxE2E.Locked__LocusShims", throwOnError: true)!;
+            Assert.Equal(7, shims.GetMethod("Forge")!.Invoke(null, Array.Empty<object>()));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Kept_body_reading_private_static_with_red_cell_stays_cold()
+    {
+        // Kept bodies re-qualify private STATICS to the original type
+        // (single static source) — on a runtime that measured ldsfld_private
+        // red, that token crashes at first JIT, so the scan must name it.
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxKeptRed", PrivateSurfaceSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = PrivateSurfaceSource.Replace(
+            "public int Tick() { return _mana + s_pool + Hidden(); }",
+            "public int Tick() { return _mana + s_pool + Hidden() + 1; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(("ldsfld_private", false)),
+            ("Vault.cs", PrivateSurfaceSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("patched body references non-public surface", reason);
+        Assert.Contains("s_pool", reason);
+        Assert.Contains("ldsfld_private", reason);
+    }
+
+    [Fact]
+    public void Kept_body_reading_private_static_stays_hot_with_green_caps()
+    {
+        // All cells green: the kept-surface scan short-circuits and the
+        // patched body executes against the original private state — the
+        // instance private field and private call ride the PATCH COPY's own
+        // tokens (no runtime check) either way.
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxKeptGreen", PrivateSurfaceSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = PrivateSurfaceSource.Replace(
+            "public int Tick() { return _mana + s_pool + Hidden(); }",
+            "public int Tick() { return _mana + s_pool + Hidden() + 1; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(),
+            ("Vault.cs", PrivateSurfaceSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("relax-kept-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(originalPath)));
+            context.Resolving += (_, name) => name.Name == "RelaxKeptGreen" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("RelaxE2E.Vault__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchType)!;
+            Assert.Equal(438, patchType.GetMethod("Tick")!.Invoke(instance, null)); // 30+400+7+1
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Kept_body_this_routed_private_access_stays_hot_despite_unrelated_red_cell()
+    {
+        // The scan RUNS here (a red cell exists), but `this.`-routed
+        // instance private access rides the patch copy's own same-assembly
+        // tokens — it must not be confused with re-qualified surface.
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxKeptExempt", PrivateSurfaceSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = PrivateSurfaceSource.Replace(
+            "public int Tick() { return _mana + s_pool + Hidden(); }",
+            "public int Tick() { return _mana + Hidden() + 2; }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(("newobj_private", false)),
+            ("Vault.cs", PrivateSurfaceSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("relax-exempt-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(originalPath)));
+            context.Resolving += (_, name) => name.Name == "RelaxKeptExempt" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("RelaxE2E.Vault__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchType)!;
+            Assert.Equal(39, patchType.GetMethod("Tick")!.Invoke(instance, null)); // 30+7+2
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string GateSource = @"
+namespace RelaxE2E
+{
+    public class Gate
+    {
+        internal static int Width() { return 9; }
+        public int T() { return 1; }
+    }
+}";
+
+    private const string NewReaderType = @"
+    public class Reader
+    {
+        public int Read() { return Gate.Width(); }
+    }";
+
+    [Fact]
+    public void New_type_body_calling_internal_member_with_red_cell_stays_cold()
+    {
+        // A brand-new type compiles INTO the patch assembly, so its calls to
+        // the original's internal surface hit the runtime checks like any
+        // shim — but new-type bodies were never scanned (C-X④).
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxNewTypeRed", GateSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = GateSource.Replace(
+            "    public class Gate",
+            NewReaderType + "\n    public class Gate");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(("call_internal", false)),
+            ("Gate.cs", GateSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("patched body references non-public surface", reason);
+        Assert.Contains("Width", reason);
+        Assert.Contains("call_internal", reason);
+    }
+
+    [Fact]
+    public void New_type_body_calling_internal_member_without_caps_stays_hot()
+    {
+        // Asymmetric rule: new-type bodies (like kept bodies) have ALWAYS
+        // shipped such references — absence of a probe must not regress
+        // them; only a measured red cell may.
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxNewTypeNoCaps", GateSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = GateSource.Replace(
+            "    public class Gate",
+            NewReaderType + "\n    public class Gate");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, runtimeCaps: null,
+            ("Gate.cs", GateSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void Added_static_field_initializer_with_red_cell_stays_cold()
+    {
+        // The added STATIC field's initializer moves into the __LocusFields_
+        // holder, whose cctor reads the re-qualified original private static
+        // on first store touch — gate it like any kept-surface reference.
+        // (A LONE static-field addition is a noop batch — the store only
+        // materializes once some other change ships it, so the edit also
+        // touches the body that uses the field, like a real edit would.)
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "RelaxStoreInitRed", PrivateSurfaceSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+        string newText = PrivateSurfaceSource
+            .Replace(
+                "private static int s_pool = 400;",
+                "private static int s_pool = 400;\n        private static int s_fresh = s_pool + 1;")
+            .Replace(
+                "public int Tick() { return _mana + s_pool + Hidden(); }",
+                "public int Tick() { return _mana + s_fresh + Hidden(); }");
+
+        JsonNode result = HotPatchWithCaps(
+            service, compileParams, GreenRuntimeCaps(("ldsfld_private", false)),
+            ("Vault.cs", PrivateSurfaceSource, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("patched body references non-public surface", reason);
+        Assert.Contains("s_pool", reason);
+        Assert.Contains("ldsfld_private", reason);
+    }
+
+    // ── B2: added property/indexer/event call-site materialization ───
+
+    private const string AccessorHostSource = @"
+namespace AccessorE2E
+{
+    public class Host
+    {
+        public int Slot = 3;
+        public int Subs;
+        public int Poke() { return 1; }
+        public static int Use() { var h = new Host(); return h.Slot; }
+    }
+}";
+
+    private (string Reason, JsonNode Result) ColdHotPatch(
+        CompileService service, JsonObject @params, params (string Path, string Old, string New)[] files)
+    {
+        JsonNode result = HotPatch(service, @params, files);
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        return (result["files"]![0]!["reasons"]![0]!.GetValue<string>(), result);
+    }
+
+    [Fact]
+    public void Added_property_read_write_compound_execute_end_to_end()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorE2EProp", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value + 2; } }\n" +
+            "        public static int Use() { var h = new Host(); h.Level = 100; h.Level += 10; return h.Level; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // Only Use detours; the accessors are shim-only.
+        var use = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("Use", use["name"]!.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-prop-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "AccessorE2EProp" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The patch copy does NOT re-declare the property.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Null(patchHost.GetProperty("Level"));
+
+            // set(100): Slot=102; compound: get=102, set(112): Slot=114; read=114.
+            object? value = patchHost.GetMethod("Use")!.Invoke(null, null);
+            Assert.Equal(114, value);
+
+            // The accessor shims work directly against an original instance.
+            Type shims = patch.GetType("AccessorE2E.Host__LocusShims", throwOnError: true)!;
+            object instance = Activator.CreateInstance(original.GetType("AccessorE2E.Host")!)!;
+            shims.GetMethod("set_Level")!.Invoke(null, new[] { instance, (object)40 });
+            Assert.Equal(42, shims.GetMethod("get_Level")!.Invoke(null, new[] { instance }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_indexer_read_write_compound_execute_end_to_end()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorE2EIndexer", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int this[int i] { get { return Slot + i; } set { Slot = value + i; } }\n" +
+            "        public static int Use() { var h = new Host(); h[5] = 20; h[1] += 7; return h[2]; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-indexer-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "AccessorE2EIndexer" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // set(5,20): Slot=25; compound: get(1)=26, set(1,33): Slot=34; read h[2]=36.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Equal(36, patchHost.GetMethod("Use")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_event_subscribe_unsubscribe_execute_end_to_end()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorE2EEvent", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public event System.Action Pump { add { Subs += 100; } remove { Subs += 10; } }\n" +
+            "        public static int Use() { var h = new Host(); System.Action a = () => { }; h.Pump += a; h.Pump -= a; return h.Subs; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-event-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "AccessorE2EEvent" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // add(+100) then remove(+10) → 110.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Equal(110, patchHost.GetMethod("Use")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_auto_property_persists_through_the_store()
+    {
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "AccessorE2EAuto", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public int Poke() { return 1; }",
+            "        public int Cargo { get; set; } = 30;\n" +
+            "        public int Poke() { Cargo += 5; return Cargo + 1000; }");
+
+        JsonNode result = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: false,
+            ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The initializer rides the ctor redirect; the KEPT Poke detours
+        // (its body now routes through the store).
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["name"]!.GetValue<string>())
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(new[] { ".ctor", "Poke" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-auto-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "AccessorE2EAuto" => original,
+                "Locus.HotReload.Runtime" => runtime,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // No re-declared property, no backing field: layout intact.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Null(patchHost.GetProperty("Cargo"));
+            Assert.DoesNotContain(
+                patchHost.GetFields(BindingFlags.NonPublic | BindingFlags.Instance),
+                f => f.Name.Contains("Cargo"));
+
+            // Shims exist for both accessors.
+            Type shims = patch.GetType("AccessorE2E.Host__LocusShims", throwOnError: true)!;
+            Assert.NotNull(shims.GetMethod("get_Cargo"));
+            Assert.NotNull(shims.GetMethod("set_Cargo"));
+
+            // A new (patch-constructed) instance runs the initializer through
+            // the store; the value persists ACROSS calls (the M4 store keys
+            // on the instance).
+            object instance = Activator.CreateInstance(patchHost)!;
+            MethodInfo poke = patchHost.GetMethod("Poke")!;
+            Assert.Equal(30 + 5 + 1000, poke.Invoke(instance, null));
+            Assert.Equal(30 + 10 + 1000, poke.Invoke(instance, null));
+
+            // The shims and the store agree: shims on an ORIGINAL instance
+            // start from default(int) (the store never saw it).
+            object preExisting = Activator.CreateInstance(original.GetType("AccessorE2E.Host")!)!;
+            Assert.Equal(0, shims.GetMethod("get_Cargo")!.Invoke(null, new[] { preExisting }));
+            shims.GetMethod("set_Cargo")!.Invoke(null, new[] { preExisting, (object)8 });
+            Assert.Equal(8, shims.GetMethod("get_Cargo")!.Invoke(null, new[] { preExisting }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_static_property_and_event_route_without_receiver()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorE2EStatic", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public static int Stash;\n" +
+            "        public static int Pool { get { return Stash; } set { Stash = value + 1; } }\n" +
+            "        public static int Use() { Pool = 5; Host.Pool += 3; return Pool; }");
+
+        // Adding the static FIELD Stash rides M4 (holder class), so the
+        // runtime reference set must include the store runtime.
+        string runtimePath = CompileFieldStoreRuntime(service);
+        JsonNode result = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: false,
+            ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-static-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "AccessorE2EStatic" => original,
+                "Locus.HotReload.Runtime" => runtime,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // set(5): Stash=6; compound: get=6, set(9): Stash=10; read=10.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Equal(10, patchHost.GetMethod("Use")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // ── B2 conservative list: pointed cold, never a wrong rewrite ────
+
+    [Fact]
+    public void Added_property_in_object_initializer_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdInit", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static int Use() { var h = new Host { Level = 4 }; return h.Slot; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("object initializer", reason);
+        Assert.Contains("Level", reason);
+    }
+
+    [Fact]
+    public void Added_property_increment_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdIncrement", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static int Use() { var h = new Host(); h.Level++; return h.Slot; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("increment/decrement of an added property", reason);
+    }
+
+    [Fact]
+    public void Added_property_assignment_used_as_value_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdValueUse", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static int Use() { var h = new Host(); int x = h.Level = 4; return x; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("used as a value", reason);
+    }
+
+    [Fact]
+    public void Added_property_compound_through_side_effect_receiver_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdReceiver", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static Host Make() { return new Host(); }\n" +
+            "        public static int Use() { Make().Level += 3; return 1; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("receiver with possible side effects", reason);
+    }
+
+    [Fact]
+    public void Added_property_conditional_access_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdConditional", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static int Use() { var h = new Host(); return h?.Level ?? 0; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("?.", reason);
+    }
+
+    [Fact]
+    public void Added_property_deconstruction_target_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdDeconstruct", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Level { get { return Slot; } set { Slot = value; } }\n" +
+            "        public static int Use() { var h = new Host(); int x; (h.Level, x) = (1, 2); return x; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("deconstruction", reason);
+    }
+
+    [Fact]
+    public void Coalesce_assignment_to_added_property_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdCoalesce", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public string Tag { get { return null; } set { Slot = value == null ? 0 : 1; } }\n" +
+            "        public static int Use() { var h = new Host(); h.Tag ??= \"x\"; return h.Slot; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("set-skip semantics", reason);
+    }
+
+    [Fact]
+    public void Added_event_outside_subscription_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdEventUse", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public event System.Action Pump { add { Subs += 1; } remove { Subs -= 1; } }\n" +
+            "        public static int Use() { var h = new Host(); return h.Slot + 1; }\n" +
+            "        public int Misuse() { Pump = null; return Subs; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("+= / -=", reason);
+    }
+
+    [Fact]
+    public void Added_auto_property_by_ref_argument_is_cold()
+    {
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "AccessorColdRefArg", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int Cargo { get; set; }\n" +
+            "        public static void Bump(ref int v) { v += 1; }\n" +
+            "        public static int Use() { var h = new Host(); Bump(ref h.Cargo); return h.Cargo; }");
+
+        JsonNode result = HotPatchWithRuntime(
+            service, ParamsFor(originalPath), runtimePath, registerImage: false,
+            ("Host.cs", AccessorHostSource, newText));
+        // The store COULD express it, but the eventual real compile cannot
+        // (CS0206 on a property) — diverging end states fail closed.
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        string reason = result["files"]![0]!["reasons"]![0]!.GetValue<string>();
+        Assert.Contains("ref/out", reason);
+    }
+
+    [Fact]
+    public void Added_virtual_property_stays_cold_at_diff_level()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdVirtual", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public virtual int Level { get { return Slot; } }\n" +
+            "        public static int Use() { var h = new Host(); return h.Slot; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("virtual member added", reason);
+    }
+
+    [Fact]
+    public void Added_two_parameter_indexer_compound_executes_end_to_end()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorE2EIndexer2", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        // Two index arguments: the compound expansion repeats BOTH (get,
+        // then set), so each must be a repeatable shape (literals here).
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int this[int i, int j] { get { return Slot + i + j; } set { Slot = value + i + j; } }\n" +
+            "        public static int Use() { var h = new Host(); h[5, 1] = 20; h[1, 2] += 7; return h[2, 3]; }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("accessor-indexer2-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "AccessorE2EIndexer2" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // set(5,1,20): Slot=26; compound get(1,2)=29, set(1,2,36): Slot=39;
+            // read h[2,3]=44.
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            Assert.Equal(44, patchHost.GetMethod("Use")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_indexer_compound_with_non_trivial_index_is_cold()
+    {
+        // The compound expansion would evaluate the index argument twice; a
+        // method-call index is not repeatable, so the indexer-specific guard
+        // fails the file closed (the property cold list has no indexer case).
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "AccessorColdIndexerIndex", AccessorHostSource);
+        string newText = AccessorHostSource.Replace(
+            "        public static int Use() { var h = new Host(); return h.Slot; }",
+            "        public int this[int i] { get { return Slot + i; } set { Slot = value + i; } }\n" +
+            "        public static int Use() { var h = new Host(); h[h.Poke()] += 7; return h.Slot; }");
+
+        var (reason, _) = ColdHotPatch(service, ParamsFor(originalPath), ("Host.cs", AccessorHostSource, newText));
+        Assert.Contains("non-trivial index arguments", reason);
+    }
+
+    [Fact]
+    public void Added_auto_property_increment_routes_through_the_store()
+    {
+        // Contrast with Added_property_increment_is_cold: a FULL property's
+        // ++ is cold, but an AUTO property's backing store is an lvalue, so
+        // ++/-- materialize for free through `store.Ref(this)`.
+        var service = new CompileService();
+        string runtimePath = CompileFieldStoreRuntime(service);
+        string originalPath = CompileOriginal(service, "AutoIncrementE2E", AccessorHostSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = AccessorHostSource.Replace(
+            "        public int Poke() { return 1; }",
+            "        public int Cargo { get; set; } = 30;\n" +
+            "        public int Poke() { Cargo++; return Cargo + 1000; }");
+
+        JsonNode result = HotPatchWithRuntime(
+            service, compileParams, runtimePath, registerImage: false,
+            ("Host.cs", AccessorHostSource, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] runtimeBytes = File.ReadAllBytes(runtimePath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("auto-increment-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            Assembly runtime = context.LoadFromStream(new MemoryStream(runtimeBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "AutoIncrementE2E" => original,
+                "Locus.HotReload.Runtime" => runtime,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // Initializer seeds 30 through the store; each Poke pre-increments
+            // the SAME store slot (the value persists across calls).
+            Type patchHost = patch.GetType("AccessorE2E.Host__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchHost)!;
+            MethodInfo poke = patchHost.GetMethod("Poke")!;
+            Assert.Equal(31 + 1000, poke.Invoke(instance, null));
+            Assert.Equal(32 + 1000, poke.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Nameof_of_added_members_materializes_as_constants_end_to_end()
+    {
+        const string source = @"
+namespace NameofE2E
+{
+    public class Host
+    {
+        public int Slot = 3;
+        public int Tick() { return Slot; }
+    }
+}";
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "NameofE2EHost", source);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        // The kept Tick references an added METHOD and an added PROPERTY only
+        // through nameof(...). Both extract to shims, but nameof binds to a
+        // compile-time constant — the patch copy never names them.
+        string newText = source.Replace(
+            "        public int Tick() { return Slot; }",
+            "        public int Tick() { return nameof(Mana).Length + nameof(Level).Length; }\n" +
+            "        public int Mana() { return Slot; }\n" +
+            "        public int Level { get { return Slot; } set { Slot = value; } }");
+
+        JsonNode result = HotPatch(service, compileParams, ("Host.cs", source, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(originalPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("nameof-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "NameofE2EHost" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // "Mana".Length (4) + "Level".Length (5) = 9 — neither added
+            // member was invoked; only their names materialized.
+            Type patchHost = patch.GetType("NameofE2E.Host__LocusPatch", throwOnError: true)!;
+            object instance = Activator.CreateInstance(patchHost)!;
+            Assert.Equal(9, patchHost.GetMethod("Tick")!.Invoke(instance, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Generic_body_change_with_anonymous_type_argument_falls_back_to_inference()
+    {
+        // B1: the kept caller passes an ANONYMOUS-typed value into the body-
+        // changed generic method. The type argument is unspeakable, so the
+        // shim call cannot materialize explicit <...> and must rely on
+        // inference from the argument — and still execute correctly.
+        const string libSource = @"
+namespace AnonGenE2E
+{
+    public class Lib
+    {
+        public T Echo<T>(T value) { return value; }
+    }
+}";
+        const string useSource = @"
+namespace AnonGenE2E
+{
+    public class Use
+    {
+        public static int Go() { var a = new { V = 41 }; return new Lib().Echo(a).V; }
+        public static int Other() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "AnonGenE2E",
+            ("Assets/Lib.cs", libSource),
+            ("Assets/Use.cs", useSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // Echo's body changes (remove+add); Use joins the batch through an
+        // unrelated edit so the kept caller Go is dragged into the detour set.
+        string newLib = libSource.Replace("{ return value; }", "{ var held = value; return held; }");
+        string newUse = useSource.Replace(
+            "public static int Other() { return 1; }", "public static int Other() { return 2; }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Assets/Lib.cs", libSource, newLib),
+            ("Assets/Use.cs", useSource, newUse));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("anon-generic-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "AnonGenE2E" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // Go's call site rewrote to an inferred shim call; the anonymous
+            // value round-trips through the new body and yields its field.
+            Type patchUse = patch.GetType("AnonGenE2E.Use__LocusPatch", throwOnError: true)!;
+            Assert.Equal(41, patchUse.GetMethod("Go")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Unsafe_stackalloc_body_edit_is_hot_when_params_allow_unsafe()
+    {
+        // B4 names "unsafe / stackalloc": the pointer test covers deref; this
+        // covers stackalloc, the other allow-unsafe-gated construct.
+        const string source = @"
+public class Span
+{
+    public unsafe int Total()
+    {
+        int* buf = stackalloc int[3];
+        buf[0] = 1; buf[1] = 2; buf[2] = 3;
+        return buf[0] + buf[1] + buf[2];
+    }
+}";
+        var service = new CompileService();
+        string originalPath = CompileUnsafeOriginal("UnsafeStackalloc", source);
+        JsonObject compileParams = ParamsFor(originalPath);
+        compileParams["allowUnsafe"] = true;
+
+        string newText = source.Replace("buf[2] = 3;", "buf[2] = 3 + 40;");
+        JsonNode result = HotPatch(service, compileParams, ("Span.cs", source, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("Total", method["name"]!.GetValue<string>());
+
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("unsafe-stackalloc-e2e", isCollectible: true);
+        try
+        {
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type patchType = patch.GetType("Span__LocusPatch", throwOnError: true)!;
+            object span = Activator.CreateInstance(patchType)!;
+            Assert.Equal(1 + 2 + 43, patchType.GetMethod("Total")!.Invoke(span, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
 }
 
 /// <summary>
@@ -1872,7 +3362,7 @@ public class PatchRewriterGoldenTests : IDisposable
         public int Tick() { return global::Game.Player__LocusShims.Mana(((global::Game.Player)(object)this)); }
     }
 
-public static class Player__LocusShims
+public static partial class Player__LocusShims
 {
     public static int Mana(this global::Game.Player self)
     {
@@ -1916,7 +3406,7 @@ public static class Player__LocusShims
         public int Tick() { return global::Game.Player__LocusShims.Echo<int>(((global::Game.Player)(object)this),7); }
     }
 
-public static class Player__LocusShims
+public static partial class Player__LocusShims
 {
     public static T Echo<T>(this global::Game.Player self, T value)
     {
@@ -2008,9 +3498,10 @@ public static class Player__LocusShims
     [Fact]
     public void Added_member_touching_private_state_is_cold()
     {
-        // Mono enforces accessibility at JIT time and ignores
-        // IgnoresAccessChecksTo for project assemblies: the shim would throw
-        // FieldAccessException at its first call.
+        // No runtime caps reach this single-file rewrite (the conservative
+        // default = old plugin / failed probe): non-public body access keeps
+        // today's cold verdict. C2′a relaxes it only when the C0 probe
+        // measured the cells green — see the RelaxE2E tests below.
         const string oldText = @"namespace Game
 {
     public class Player
@@ -2124,5 +3615,106 @@ public struct Wrap
         var method = Assert.Single(result.Methods);
         Assert.Equal("Game.Outer+Inner", method.DeclaringType);
         Assert.Equal("Game.Outer__LocusPatch+Inner", method.PatchDeclaringType);
+    }
+
+    [Fact]
+    public void Added_property_accessor_shim_rewrite_is_verbatim_stable()
+    {
+        // B2: the added property extracts into a get_/set_ shim pair; the
+        // KEPT caller's read/write/compound sites materialize as direct
+        // calls (the compound expansion repeats the implicit receiver and
+        // re-applies the property-type cast).
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        public int Mp = 3;
+        public int Tick() { return 1; }
+    }
+}";
+        string newText = oldText.Replace(
+            "public int Tick() { return 1; }",
+            "public int Tick() { Level = 4; Level += 2; return Level; }\n" +
+            "        public int Level { get { return Mp; } set { Mp = value; } }");
+
+        var (result, text) = RewriteWithOriginal("GoldenAccessorShim", oldText, newText);
+
+        const string expected = @"namespace Game
+{
+    public class Player__LocusPatch
+    {
+        public int Mp = 3;
+        public int Tick() { global::Game.Player__LocusShims.set_Level(((global::Game.Player)(object)this),4); global::Game.Player__LocusShims.set_Level(((global::Game.Player)(object)this),(int)(global::Game.Player__LocusShims.get_Level(((global::Game.Player)(object)this))+(2))); return global::Game.Player__LocusShims.get_Level(((global::Game.Player)(object)this)); }
+    }
+
+public static partial class Player__LocusShims
+{
+    public static int get_Level(this global::Game.Player self)
+    {
+        return self.Mp;
+    }
+
+    public static void set_Level(this global::Game.Player self, int value)
+    {
+        self.Mp = value;
+    }
+}}";
+        Assert.Equal(expected.ReplaceLineEndings("\n"), text.ReplaceLineEndings("\n"));
+
+        var method = Assert.Single(result.Methods);
+        Assert.Equal("Tick", method.Name);
+        Assert.Equal(2, result.ShimRegistrations.Count);
+        var getReg = result.ShimRegistrations.Single(r => r.Entry.ShimMethod == "get_Level");
+        Assert.Equal(new[] { "Player" }, getReg.Entry.ParamTypeNames);
+        Assert.True(getReg.Entry.HasSelf);
+        var setReg = result.ShimRegistrations.Single(r => r.Entry.ShimMethod == "set_Level");
+        Assert.Equal(new[] { "Player", "Int32" }, setReg.Entry.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Added_event_accessor_shim_rewrite_is_verbatim_stable()
+    {
+        const string oldText = @"namespace Game
+{
+    public class Player
+    {
+        public int Subs;
+        public void Hook(System.Action handler) { }
+    }
+}";
+        string newText = oldText.Replace(
+            "public void Hook(System.Action handler) { }",
+            "public void Hook(System.Action handler) { Pump += handler; Pump -= handler; }\n" +
+            "        public event System.Action Pump { add { Subs += 1; } remove { Subs -= 1; } }");
+
+        var (result, text) = RewriteWithOriginal("GoldenEventShim", oldText, newText);
+
+        const string expected = @"namespace Game
+{
+    public class Player__LocusPatch
+    {
+        public int Subs;
+        public void Hook(System.Action handler) { global::Game.Player__LocusShims.add_Pump(((global::Game.Player)(object)this),handler); global::Game.Player__LocusShims.remove_Pump(((global::Game.Player)(object)this),handler); }
+    }
+
+public static partial class Player__LocusShims
+{
+    public static void add_Pump(this global::Game.Player self, System.Action value)
+    {
+        self.Subs += 1;
+    }
+
+    public static void remove_Pump(this global::Game.Player self, System.Action value)
+    {
+        self.Subs -= 1;
+    }
+}}";
+        Assert.Equal(expected.ReplaceLineEndings("\n"), text.ReplaceLineEndings("\n"));
+
+        var method = Assert.Single(result.Methods);
+        Assert.Equal("Hook", method.Name);
+        Assert.Equal(2, result.ShimRegistrations.Count);
+        Assert.Contains(result.ShimRegistrations, r => r.Entry.ShimMethod == "add_Pump");
+        Assert.Contains(result.ShimRegistrations, r => r.Entry.ShimMethod == "remove_Pump");
     }
 }

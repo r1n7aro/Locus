@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
 
 namespace Locus.CompileServer;
@@ -174,6 +175,71 @@ public sealed class CompileHotPatchRequestDto
     /// so the fingerprint-keyed reference cache stays untouched.</summary>
     [JsonPropertyName("extraReferencePaths")]
     public string[]? ExtraReferencePaths { get; set; }
+
+    /// <summary>C0 runtime capability matrix, measured per domain generation
+    /// by the desktop coordinator. Absent = conservative (all false). Kept
+    /// out of `params` for the same fingerprint reason as the extra
+    /// references. Echoed back in the verdict (link proof); C2′a gates the
+    /// added-member non-public BODY access relaxation on the cell matrix
+    /// (PatchRewriter.FindShimAccessViolation).</summary>
+    [JsonPropertyName("runtimeCaps")]
+    public RuntimeCapsDto? RuntimeCaps { get; set; }
+
+    /// <summary>B6: candidate sibling part files for the partial types the
+    /// edited files declare, discovered by the desktop coordinator with
+    /// grep-grade matching. The sidecar parses each candidate and folds in
+    /// ONLY the files that really declare a matching partial type, as
+    /// UNCHANGED baselines (they complete the patch copies and the layout
+    /// merge; they never produce detours or new surface). Optional — an old
+    /// coordinator simply never sends it, and partial batches then fail
+    /// closed through the completeness gate.</summary>
+    [JsonPropertyName("baselineSiblings")]
+    public BaselineSiblingDto[]? BaselineSiblings { get; set; }
+}
+
+/// <summary>One candidate sibling part file (B6): current disk text only —
+/// by definition it carries no edit.</summary>
+public sealed class BaselineSiblingDto
+{
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    [JsonPropertyName("text")]
+    public string? Text { get; set; }
+}
+
+/// <summary>Unity Mono runtime capability matrix measured by the C0 access
+/// probe (`compile/accessProbe` + the plugin's `hot_reload_access_probe`
+/// message). Every field defaults to false = conservative: treat every
+/// non-public access as cold, which is today's behavior.</summary>
+public sealed class RuntimeCapsDto
+{
+    /// <summary>Delegate.CreateDelegate bound a non-public method AND the
+    /// invocation returned the right value.</summary>
+    [JsonPropertyName("createDelegateNonPublic")]
+    public bool CreateDelegateNonPublic { get; set; }
+
+    /// <summary>DynamicMethod(restrictedSkipVisibility: true) read a private
+    /// field of another type successfully.</summary>
+    [JsonPropertyName("dynamicMethodSkipVisibility")]
+    public bool DynamicMethodSkipVisibility { get; set; }
+
+    /// <summary>A byref-returning DynamicMethod (ldflda) round-tripped a
+    /// read/write through the returned reference.</summary>
+    [JsonPropertyName("dynamicMethodByrefReturn")]
+    public bool DynamicMethodByrefReturn { get; set; }
+
+    /// <summary>"{op}_{visibility}" (e.g. "ldfld_private") → the JIT-time
+    /// access check passed on the running editor's Mono.</summary>
+    [JsonPropertyName("cells")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, bool>? Cells { get; set; }
+}
+
+public sealed class CompileAccessProbeRequestDto
+{
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
 }
 
 // ── service ──────────────────────────────────────────────────────────
@@ -621,6 +687,18 @@ public sealed class CompileService
             batchFiles.Add((file.Path!, tree, diff));
         }
 
+        // B6: partial types. (1) fold the matching sibling part files in as
+        // unchanged baselines, so the patch re-declares the COMPLETE type;
+        // (2) order the trees so the multi-part field merge can reproduce
+        // the original assembly's layout (the rewriter's guard still
+        // verifies — this pass only avoids false colds).
+        {
+            JsonNode? siblingCold = IncludeBaselineSiblings(request, batchFiles, parseOptions, startedAt);
+            if (siblingCold != null)
+                return siblingCold;
+            OrderBatchFilesForPartialLayout(batchFiles, references);
+        }
+
         // M3: deletions / signature changes / accessibility narrowing are
         // hot ONLY when every compiled call site of the OLD surface lives in
         // this batch — scan the project assemblies' IL and fold the verdict
@@ -655,7 +733,18 @@ public sealed class CompileService
             _memberSurfaceRegistry.SnapshotFor(generation),
             _fieldStoreRegistry.SnapshotFor(generation),
             storeDiscriminator,
-            allowUnsafe: request.Params?.AllowUnsafe ?? false);
+            allowUnsafe: request.Params?.AllowUnsafe ?? false,
+            runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells));
+
+        // B6 fail-closed gate: every batch-declared partial type must
+        // account, across its disk parts, for every member the ORIGINAL
+        // assembly's type carries — a member with no source means a
+        // source-generator part or an undiscovered sibling file.
+        {
+            JsonNode? incompleteCold = VerifyPartialPartsComplete(batch, batchFiles, startedAt);
+            if (incompleteCold != null)
+                return incompleteCold;
+        }
 
         foreach (var (filePath, tree, diff) in batchFiles)
         {
@@ -743,6 +832,8 @@ public sealed class CompileService
                 verdict["deletionsNoted"] = shimRegistrations.Count;
             if (callerScanNote != null)
                 verdict["callerScan"] = callerScanNote;
+            if (request.RuntimeCaps != null)
+                verdict["runtimeCaps"] = JsonSerializer.SerializeToNode(request.RuntimeCaps);
             return verdict;
         }
 
@@ -827,6 +918,81 @@ public sealed class CompileService
         result["newTypes"] = newTypes;
         if (callerScanNote != null)
             result["callerScan"] = callerScanNote;
+        if (request.RuntimeCaps != null)
+            result["runtimeCaps"] = JsonSerializer.SerializeToNode(request.RuntimeCaps);
+        return result;
+    }
+
+    /// <summary>
+    /// C0: compile the fixed access-probe source (AccessProbeSource) against
+    /// the project's reference set, with the same accessibility suppression
+    /// as hot patches (IgnoreAccessibility + IgnoresAccessChecksTo tree +
+    /// MetadataImportOptions.All; allowUnsafe stays false). No diff/rewrite,
+    /// no session images, and NO image registration: the assembly is loaded
+    /// once on the Unity side, JIT-probed, and never referenced again. The
+    /// assembly name deliberately avoids the __LocusHotPatch_ prefix — it
+    /// must not be skipped by the Unity original-type resolution, and it
+    /// never enters the patch registries.
+    /// </summary>
+    public JsonNode HandleCompileAccessProbe(JsonNode? @params)
+    {
+        var request = Deserialize<CompileAccessProbeRequestDto>(@params);
+        long startedAt = Environment.TickCount64;
+
+        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
+        ImmutableArray<MetadataReference> references = ResolveReferences(request.Params, useHostBcl: false);
+
+        var trees = new List<SyntaxTree>
+        {
+            CSharpSyntaxTree.ParseText(
+                AccessProbeSource.BuildSource(),
+                parseOptions,
+                path: AccessProbeSource.SourcePath,
+                encoding: Utf8NoBom),
+            BuildAccessChecksTree(ReferenceAssemblyNames(references), parseOptions),
+        };
+
+        string assemblyName = NextAssemblyName("AccessProbe", request.Params?.DomainGeneration);
+
+        CSharpCompilationOptions options = SnippetCompilationOptions
+            .WithMetadataImportOptions(MetadataImportOptions.All);
+        ApplyIgnoreAccessibility(options);
+
+        CSharpCompilation compilation = CSharpCompilation.Create(
+            assemblyName: assemblyName,
+            syntaxTrees: trees,
+            references: references,
+            options: options);
+
+        using var peStream = new MemoryStream(64 * 1024);
+        EmitResult emitResult;
+        try
+        {
+            emitResult = compilation.Emit(peStream, options: SnippetEmitOptions);
+        }
+        catch (Exception ex)
+        {
+            return FailureResult("emit failed: " + ex, "compile", startedAt);
+        }
+
+        if (!emitResult.Success)
+        {
+            string? text = DiagnosticText.BuildDiagnosticErrorText(emitResult.Diagnostics);
+            return FailureResult(text ?? "unknown compilation failure", "compile", startedAt);
+        }
+
+        JsonNode result = SuccessResult(peStream.ToArray(), assemblyName, startedAt);
+        var cells = new JsonArray();
+        foreach (AccessProbeCell cell in AccessProbeSource.Cells)
+        {
+            cells.Add(new JsonObject
+            {
+                ["method"] = cell.Method,
+                ["op"] = cell.Op,
+                ["visibility"] = cell.Visibility,
+            });
+        }
+        result["cells"] = cells;
         return result;
     }
 
@@ -959,6 +1125,411 @@ public sealed class CompileService
         };
     }
 
+    // ── B6: partial types (sibling parts, layout order, completeness) ──
+
+    /// <summary>Fold the candidate sibling part files into the batch as
+    /// UNCHANGED baselines (empty diff: no detours, no new surface — they
+    /// only complete the patch copies and the member/layout merge). The
+    /// coordinator's candidates are grep-grade; only files that really
+    /// declare a partial type matching one the batch needs are kept, to a
+    /// fixpoint (a sibling can itself declare further partial types whose
+    /// parts must come along). A MATCHING sibling that does not parse fails
+    /// the batch closed: its part is needed and cannot be trusted.</summary>
+    private static JsonNode? IncludeBaselineSiblings(
+        CompileHotPatchRequestDto request,
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        CSharpParseOptions parseOptions,
+        long startedAt)
+    {
+        if (request.BaselineSiblings == null || request.BaselineSiblings.Length == 0 || batchFiles.Count == 0)
+            return null;
+
+        var needed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (_, tree, _) in batchFiles)
+            CollectPartialTypeNames((CompilationUnitSyntax)tree.GetRoot(), needed);
+        if (needed.Count == 0)
+            return null;
+
+        var inBatch = new HashSet<string>(
+            batchFiles.Select(f => NormalizePathKey(f.Path)), StringComparer.Ordinal);
+        var candidates = new List<(string Path, SyntaxTree Tree, HashSet<string> PartialNames)>();
+        foreach (BaselineSiblingDto sibling in request.BaselineSiblings)
+        {
+            if (string.IsNullOrEmpty(sibling.Path) || sibling.Text == null)
+                continue;
+            if (!inBatch.Add(NormalizePathKey(sibling.Path!)))
+                continue; // already an edited batch file (or a duplicate)
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(sibling.Text!, parseOptions, path: sibling.Path!);
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            CollectPartialTypeNames((CompilationUnitSyntax)tree.GetRoot(), names);
+            if (names.Count > 0)
+                candidates.Add((sibling.Path!, tree, names));
+        }
+
+        bool folded = true;
+        while (folded)
+        {
+            folded = false;
+            for (int i = candidates.Count - 1; i >= 0; i--)
+            {
+                var (path, tree, names) = candidates[i];
+                if (!names.Overlaps(needed))
+                    continue;
+                if (tree.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error))
+                {
+                    return ColdVerdict(
+                        path,
+                        "partial sibling part does not parse: " + path +
+                        " (fix the file or use unity_recompile)",
+                        startedAt);
+                }
+                batchFiles.Add((path, tree, new HotDiffFileResult { Hot = true }));
+                needed.UnionWith(names);
+                candidates.RemoveAt(i);
+                folded = true;
+            }
+        }
+        return null;
+    }
+
+    private static void CollectPartialTypeNames(CompilationUnitSyntax root, HashSet<string> names)
+    {
+        foreach (TypeDeclarationSyntax decl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+        {
+            if (decl.Modifiers.Any(SyntaxKind.PartialKeyword))
+                names.Add(HotDiff.MetadataName(decl));
+        }
+    }
+
+    private static string NormalizePathKey(string path) =>
+        path.Replace('\\', '/').ToLowerInvariant();
+
+    /// <summary>When a partial type's instance fields are split across
+    /// SEVERAL batch files, the patch type's field order is the source-merge
+    /// order — i.e. the tree order of the part files. Reorder the batch
+    /// (stable; constraints only between files contributing fields to the
+    /// same partial type, ranked by where their fields sit in the ORIGINAL
+    /// assembly's sequence) so the merge can match the original layout. The
+    /// rewriter's layout guard still VERIFIES the result and fails closed on
+    /// any mismatch — this pass exists purely to avoid false colds.
+    /// Conflicting or cyclic constraints keep the natural order (the guard
+    /// then decides).</summary>
+    private static void OrderBatchFilesForPartialLayout(
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        ImmutableArray<MetadataReference> references)
+    {
+        if (batchFiles.Count < 2)
+            return;
+
+        // type → the batch files declaring its instance fields (file index,
+        // field-ish names in that file's source order).
+        var fieldOwners = new Dictionary<string, List<(int FileIndex, List<string> Names)>>(StringComparer.Ordinal);
+        for (int i = 0; i < batchFiles.Count; i++)
+        {
+            var root = (CompilationUnitSyntax)batchFiles[i].Tree.GetRoot();
+            foreach (TypeDeclarationSyntax decl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                if (!decl.Modifiers.Any(SyntaxKind.PartialKeyword))
+                    continue;
+                List<string> names = InstanceFieldishNames(decl);
+                if (names.Count == 0)
+                    continue;
+                string metadataName = HotDiff.MetadataName(decl);
+                if (!fieldOwners.TryGetValue(metadataName, out var owners))
+                    fieldOwners[metadataName] = owners = new List<(int, List<string>)>();
+                int existing = owners.FindIndex(o => o.FileIndex == i);
+                if (existing >= 0)
+                    owners[existing].Names.AddRange(names); // same-file parts merge in source order
+                else
+                    owners.Add((i, names));
+            }
+        }
+        if (!fieldOwners.Any(p => p.Value.Count > 1))
+            return;
+
+        // Original field order per type — a metadata-only lookup compilation.
+        // MetadataImportOptions.All: the layout-relevant fields are private.
+        CSharpCompilation lookup = CSharpCompilation.Create(
+            "LocusPartialLayoutLookup",
+            references: references,
+            options: new CSharpCompilationOptions(
+                OutputKind.DynamicallyLinkedLibrary,
+                metadataImportOptions: MetadataImportOptions.All));
+        var edges = new HashSet<(int Before, int After)>();
+        foreach (var pair in fieldOwners.Where(p => p.Value.Count > 1))
+        {
+            INamedTypeSymbol? original = PatchRewriter.FindOriginalType(lookup, pair.Key, out _);
+            if (original == null)
+                continue; // the rewriter's guard reports it
+            var originalIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            int at = 0;
+            foreach (ISymbol member in original.GetMembers())
+            {
+                if (member is IFieldSymbol field && !field.IsStatic && !field.IsConst)
+                    originalIndex[field.Name] = at++;
+            }
+
+            var ranked = new List<(int FileIndex, int Rank)>();
+            foreach (var (fileIndex, names) in pair.Value)
+            {
+                int rank = int.MaxValue;
+                foreach (string name in names)
+                {
+                    if (originalIndex.TryGetValue(name, out int index))
+                        rank = Math.Min(rank, index);
+                }
+                if (rank != int.MaxValue)
+                    ranked.Add((fileIndex, rank));
+            }
+            ranked.Sort((a, b) => a.Rank.CompareTo(b.Rank));
+            for (int i = 0; i + 1 < ranked.Count; i++)
+            {
+                if (ranked[i].FileIndex != ranked[i + 1].FileIndex)
+                    edges.Add((ranked[i].FileIndex, ranked[i + 1].FileIndex));
+            }
+        }
+        if (edges.Count == 0)
+            return;
+
+        // Stable topological order; the original position breaks ties.
+        int count = batchFiles.Count;
+        var indegree = new int[count];
+        var adjacency = new List<int>?[count];
+        foreach (var (before, after) in edges)
+        {
+            (adjacency[before] ??= new List<int>()).Add(after);
+            indegree[after]++;
+        }
+        var ready = new SortedSet<int>();
+        for (int i = 0; i < count; i++)
+        {
+            if (indegree[i] == 0)
+                ready.Add(i);
+        }
+        var order = new List<int>(count);
+        while (ready.Count > 0)
+        {
+            int next = ready.Min;
+            ready.Remove(next);
+            order.Add(next);
+            foreach (int after in adjacency[next] ?? Enumerable.Empty<int>())
+            {
+                if (--indegree[after] == 0)
+                    ready.Add(after);
+            }
+        }
+        if (order.Count != count)
+            return; // cyclic constraints: keep the natural order
+
+        var reordered = order.Select(i => batchFiles[i]).ToList();
+        batchFiles.Clear();
+        batchFiles.AddRange(reordered);
+    }
+
+    /// <summary>The names a part contributes to the instance-field LAYOUT,
+    /// in source order: plain instance fields, auto-property backing fields,
+    /// field-like event backing fields (mirrors InstanceFieldSequence's
+    /// symbol view, syntax-side).</summary>
+    private static List<string> InstanceFieldishNames(TypeDeclarationSyntax type)
+    {
+        var names = new List<string>();
+        foreach (MemberDeclarationSyntax member in type.Members)
+        {
+            switch (member)
+            {
+                case FieldDeclarationSyntax field when
+                    !field.Modifiers.Any(SyntaxKind.ConstKeyword) &&
+                    !field.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in field.Declaration.Variables)
+                        names.Add(declarator.Identifier.Text);
+                    break;
+                case PropertyDeclarationSyntax property when
+                    HotDiff.IsAutoProperty(property) &&
+                    !property.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    names.Add(HotDiff.AutoPropertyBackingFieldName(property.Identifier.Text));
+                    break;
+                case EventFieldDeclarationSyntax eventField when
+                    !eventField.Modifiers.Any(SyntaxKind.StaticKeyword):
+                    foreach (VariableDeclaratorSyntax declarator in eventField.Declaration.Variables)
+                        names.Add(declarator.Identifier.Text);
+                    break;
+            }
+        }
+        return names;
+    }
+
+    /// <summary>B6 fail-closed completeness gate: for every partial type the
+    /// batch declares, every member the ORIGINAL assembly's type carries must
+    /// have a source declaration across the batch's disk parts (modulo the
+    /// members this batch deliberately REMOVES). A metadata member with no
+    /// source = a source-generator part (DOTS codegen, UI Toolkit, …) or an
+    /// undiscovered sibling file — the patch copy would re-declare the type
+    /// incompletely, so the batch stays cold with the member named.
+    ///
+    /// Instance-field layout equality is verified separately (and more
+    /// strictly, order included) by the rewriter's guard; this pass closes
+    /// the method/accessor/static-field dimension. Methods are matched by
+    /// name + arity + fully-qualified parameter types; removed members by
+    /// name + parameter COUNT (the diff carries reflection-style simple
+    /// names) — an over-match there can only skip the gate for a same-name
+    /// same-count overload, which then fails at compile time or is inert,
+    /// never a silent layout break. Compiler-generated (unspeakable) names
+    /// and cctors are out of scope: patches empty static constructors, and
+    /// lowering artifacts regenerate per compilation.</summary>
+    private static JsonNode? VerifyPartialPartsComplete(
+        PatchBatchContext batch,
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        long startedAt)
+    {
+        // Partial types declared anywhere in the batch → first declaring
+        // file (for the cold verdict), plus the batch's removed-member keys.
+        var partialTypes = new Dictionary<string, string>(StringComparer.Ordinal);
+        var newTypeNames = new HashSet<string>(StringComparer.Ordinal);
+        var removedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (path, tree, diff) in batchFiles)
+        {
+            foreach (string newType in diff.NewTypes)
+                newTypeNames.Add(newType);
+            foreach (HotDiffRemovedMember removed in diff.RemovedMembers)
+            {
+                removedKeys.Add(RemovedMemberKey(
+                    removed.DeclaringType, removed.Name, removed.ParamTypeNames.Length, removed.IsStatic));
+            }
+            var root = (CompilationUnitSyntax)tree.GetRoot();
+            foreach (TypeDeclarationSyntax decl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                if (!decl.Modifiers.Any(SyntaxKind.PartialKeyword))
+                    continue;
+                string metadataName = HotDiff.MetadataName(decl);
+                if (newTypeNames.Contains(metadataName))
+                    continue; // HotDiff already fails new partial types closed
+                if (!partialTypes.ContainsKey(metadataName))
+                    partialTypes[metadataName] = path;
+            }
+        }
+        if (partialTypes.Count == 0)
+            return null;
+
+        foreach (var pair in partialTypes)
+        {
+            // Any declaring tree's model resolves the symbol MERGED across
+            // every part in the batch (Roslyn merges partial declarations).
+            INamedTypeSymbol? sourceSymbol = null;
+            foreach (var (_, tree, _) in batchFiles)
+            {
+                var root = (CompilationUnitSyntax)tree.GetRoot();
+                TypeDeclarationSyntax? decl = root.DescendantNodes().OfType<TypeDeclarationSyntax>()
+                    .FirstOrDefault(d => HotDiff.MetadataName(d) == pair.Key);
+                if (decl == null)
+                    continue;
+                sourceSymbol = batch.ModelFor(tree).GetDeclaredSymbol(decl);
+                break;
+            }
+            if (sourceSymbol == null)
+                continue;
+
+            INamedTypeSymbol? original = PatchRewriter.FindOriginalType(batch.Binding, pair.Key, out _);
+            if (original == null)
+            {
+                return ColdVerdict(
+                    pair.Value,
+                    "original type not found in references: " + pair.Key,
+                    startedAt);
+            }
+
+            string? missing = FindMemberMissingFromParts(pair.Key, original, sourceSymbol, removedKeys);
+            if (missing != null)
+            {
+                return ColdVerdict(
+                    pair.Value,
+                    "partial type member has no source on disk: " + pair.Key + "." + missing +
+                    " (a source generator contributes a part, or a sibling part file was not found; " +
+                    "use unity_recompile)",
+                    startedAt);
+            }
+        }
+        return null;
+    }
+
+    private static string RemovedMemberKey(string declaringType, string name, int paramCount, bool isStatic) =>
+        declaringType + "|" + name + "|" + paramCount + (isStatic ? "|s" : "|i");
+
+    /// <summary>First original-assembly member (method/accessor/ctor/static
+    /// field) with no counterpart in the merged source parts, or null when
+    /// the disk parts are complete.</summary>
+    private static string? FindMemberMissingFromParts(
+        string metadataName,
+        INamedTypeSymbol original,
+        INamedTypeSymbol source,
+        HashSet<string> removedKeys)
+    {
+        static bool Speakable(string name) => !name.Contains('<');
+
+        static string MethodKey(IMethodSymbol method) =>
+            method.Name + "`" + method.Arity + "(" +
+            string.Join(",", method.Parameters.Select(p =>
+                (p.RefKind != RefKind.None ? "&" : "") +
+                p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))) +
+            ")" + (method.IsStatic ? "|s" : "|i");
+
+        var sourceMethods = new HashSet<string>(StringComparer.Ordinal);
+        var sourceStaticFields = new HashSet<string>(StringComparer.Ordinal);
+        foreach (ISymbol member in source.GetMembers())
+        {
+            switch (member)
+            {
+                case IMethodSymbol method:
+                    sourceMethods.Add(MethodKey(method));
+                    break;
+                case IPropertySymbol property:
+                    // Accessor symbols usually appear in GetMembers too;
+                    // adding them through the property is belt-and-braces.
+                    if (property.GetMethod != null)
+                        sourceMethods.Add(MethodKey(property.GetMethod));
+                    if (property.SetMethod != null)
+                        sourceMethods.Add(MethodKey(property.SetMethod));
+                    break;
+                case IEventSymbol @event:
+                    if (@event.AddMethod != null)
+                        sourceMethods.Add(MethodKey(@event.AddMethod));
+                    if (@event.RemoveMethod != null)
+                        sourceMethods.Add(MethodKey(@event.RemoveMethod));
+                    break;
+                case IFieldSymbol field when field.IsStatic:
+                    sourceStaticFields.Add(field.Name);
+                    break;
+            }
+        }
+
+        foreach (ISymbol member in original.GetMembers())
+        {
+            switch (member)
+            {
+                case IMethodSymbol method:
+                    if (!Speakable(method.Name))
+                        continue; // lowering artifact (local function, lambda cache, …)
+                    if (method.MethodKind == MethodKind.StaticConstructor)
+                        continue; // patches empty cctors; synthesis differs between source and metadata
+                    if (sourceMethods.Contains(MethodKey(method)))
+                        continue;
+                    if (removedKeys.Contains(RemovedMemberKey(
+                            metadataName, method.Name, method.Parameters.Length, method.IsStatic)))
+                        continue; // deliberately removed by this batch (M5)
+                    return method.Name;
+
+                case IFieldSymbol field when field.IsStatic && !field.IsConst:
+                    // Instance fields are the layout guard's job (order
+                    // included); generator consts are inlined anyway.
+                    if (!Speakable(field.Name))
+                        continue;
+                    if (sourceStaticFields.Contains(field.Name))
+                        continue;
+                    return field.Name;
+            }
+        }
+        return null;
+    }
+
     private void CommitShimRegistrations(string generation, List<ShimRegistration> registrations)
     {
         if (registrations.Count == 0)
@@ -1057,9 +1628,13 @@ namespace System.Runtime.CompilerServices
     /// IgnoresAccessChecksTo attribute for the runtime side. When the
     /// internal property disappears in a future Roslyn the compile falls
     /// back to normal accessibility and private access surfaces as a
-    /// deterministic diagnostic.
+    /// deterministic diagnostic. Internal: the batch BINDING compilation
+    /// (PatchBatchContext.Build) applies the same flag so the semantic
+    /// model resolves what the emit will actually bind — a non-public
+    /// metadata symbol that binds to null would otherwise slip past the
+    /// access scans while the emit happily compiles it (C2′b).
     /// </summary>
-    private static void ApplyIgnoreAccessibility(CSharpCompilationOptions options)
+    internal static void ApplyIgnoreAccessibility(CSharpCompilationOptions options)
     {
         try
         {

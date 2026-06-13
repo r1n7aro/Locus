@@ -216,7 +216,19 @@ public static class PatchRewriter
             {
                 VariableDeclaratorSyntax? declarator = FindFieldDeclarator(typeDecl, change.Name, change.IsStatic);
                 if (declarator == null)
+                {
+                    // B2: an added AUTO-PROPERTY's backing field has no
+                    // declarator — the store binds to the property
+                    // declaration, and the accessor shims read/write it.
+                    AddedFieldInfo? autoInfo = BuildAutoPropertyFieldInfo(pair.Key, typeDecl, change, model, batch);
+                    if (autoInfo != null)
+                    {
+                        if (!addedFieldsByType.TryGetValue(pair.Key, out List<AddedFieldInfo>? autoList))
+                            addedFieldsByType[pair.Key] = autoList = new List<AddedFieldInfo>();
+                        autoList.Add(autoInfo);
+                    }
                     continue;
+                }
                 if (model.GetDeclaredSymbol(declarator) is not IFieldSymbol fieldSymbol)
                     continue;
 
@@ -231,22 +243,68 @@ public static class PatchRewriter
         // ── locate ADDED members (M2) in this file ───────────────────
 
         var addedDecls = new Dictionary<MethodDeclarationSyntax, ShimTarget>();
+        var addedAccessors = new List<AddedAccessorInfo>();
         foreach (HotDiffMethod added in diff.ChangedMethods.Where(m => m.Added))
         {
             MethodDeclarationSyntax? decl = PatchBatchContext.FindAddedMethodDeclaration(root, added);
-            if (decl == null)
+            if (decl != null)
+            {
+                if (model.GetDeclaredSymbol(decl) is not IMethodSymbol symbol)
+                    continue;
+                if (batch.AddedMembers.TryGetValue(symbol.OriginalDefinition, out ShimTarget? target))
+                    addedDecls[decl] = target;
                 continue;
-            if (model.GetDeclaredSymbol(decl) is not IMethodSymbol symbol)
+            }
+
+            // B2: accessor-shaped additions (property/indexer/event).
+            IMethodSymbol? accessorSymbol = PatchBatchContext.FindAddedAccessorSymbol(
+                root, model, added, out BasePropertyDeclarationSyntax? container, out AccessorDeclarationSyntax? accessor);
+            if (accessorSymbol == null || container == null)
                 continue;
-            if (batch.AddedMembers.TryGetValue(symbol.OriginalDefinition, out ShimTarget? target))
-                addedDecls[decl] = target;
+            if (!batch.AddedMembers.TryGetValue(accessorSymbol.OriginalDefinition, out ShimTarget? accessorTarget))
+                continue;
+            addedAccessors.Add(new AddedAccessorInfo
+            {
+                Target = accessorTarget,
+                Symbol = accessorSymbol,
+                Container = container,
+                Accessor = accessor,
+                IsAuto = container is PropertyDeclarationSyntax autoCandidate && HotDiff.IsAutoProperty(autoCandidate),
+            });
         }
+
+        // Auto-property accessors read/write their M4 backing store (the
+        // FieldChange was recorded by HotDiff and materialized above).
+        foreach (AddedAccessorInfo accessorInfo in addedAccessors.Where(a => a.IsAuto))
+        {
+            string backingName = HotDiff.AutoPropertyBackingFieldName(
+                ((PropertyDeclarationSyntax)accessorInfo.Container).Identifier.Text);
+            if (addedFieldsByType.TryGetValue(accessorInfo.Target.DeclaringTypeMetadataName, out List<AddedFieldInfo>? stores))
+                accessorInfo.Store = stores.FirstOrDefault(i => i.RegistryFieldName == backingName);
+            if (accessorInfo.Store == null)
+            {
+                // Defensive: HotDiff guarantees the FieldChange; without the
+                // store the synthesized accessor body has nothing to touch.
+                result.ColdReason = "added auto-property has no backing store: " +
+                    accessorInfo.Target.DeclaringTypeMetadataName + "." + accessorInfo.Target.MethodName;
+                return result;
+            }
+        }
+
+        // Body spans of every added member (methods + accessor bodies): the
+        // rewrite passes route `this` → self and implicit member access
+        // through these.
+        var addedBodySpans = new List<(SyntaxNode Node, ShimTarget Target)>();
+        foreach (var addedPair in addedDecls)
+            addedBodySpans.Add((addedPair.Key, addedPair.Value));
+        foreach (AddedAccessorInfo accessorInfo in addedAccessors)
+            addedBodySpans.Add((AccessorBodyNode(accessorInfo), accessorInfo.Target));
 
         bool InAddedMember(SyntaxNode node)
         {
-            foreach (MethodDeclarationSyntax decl in addedDecls.Keys)
+            foreach (var (spanNode, _) in addedBodySpans)
             {
-                if (decl.FullSpan.Contains(node.Span))
+                if (spanNode.FullSpan.Contains(node.Span))
                     return true;
             }
             return false;
@@ -254,24 +312,40 @@ public static class PatchRewriter
 
         ShimTarget? EnclosingAddedTarget(SyntaxNode node)
         {
-            foreach (var pair in addedDecls)
+            foreach (var (spanNode, target) in addedBodySpans)
             {
-                if (pair.Key.FullSpan.Contains(node.Span))
-                    return pair.Value;
+                if (spanNode.FullSpan.Contains(node.Span))
+                    return target;
             }
             return null;
         }
 
         // Mono reality check: shims run OUTSIDE the original type and the
-        // Unity runtime enforces accessibility at JIT time (it does not
-        // honor IgnoresAccessChecksTo for project assemblies). An added
-        // member may only reference surface that is public all the way down
-        // — or surface this very patch materializes. Anything else fails
-        // the file closed with the exact offending reference.
+        // Unity runtime enforces accessibility at JIT time. Whether a given
+        // (operation × visibility) actually fails is MEASURED per runtime by
+        // the C0 access probe (batch.RuntimeCaps): an added member's BODY may
+        // reference non-public surface when every required cell is green
+        // (C2′a) — caps absent or a red cell keeps the conservative cold
+        // verdict, and non-public types in the shim's public SIGNATURE stay
+        // cold regardless. Patch-materialized surface is always exempt.
         foreach (var addedPair in addedDecls)
         {
+            if (model.GetDeclaredSymbol(addedPair.Key) is not IMethodSymbol addedSymbol)
+                continue;
             string? accessViolation = FindShimAccessViolation(
-                addedPair.Key, model, batch, addedFieldSymbols, renamedSymbols);
+                addedSymbol, addedPair.Key, model, batch, addedFieldSymbols, renamedSymbols);
+            if (accessViolation != null)
+            {
+                result.ColdReason = accessViolation;
+                return result;
+            }
+        }
+        foreach (AddedAccessorInfo accessorInfo in addedAccessors)
+        {
+            // Auto accessors have no body — the signature checks still run
+            // (the shim must NAME the property type in its declaration).
+            string? accessViolation = FindShimAccessViolation(
+                accessorInfo.Symbol, AccessorBodyNode(accessorInfo), model, batch, addedFieldSymbols, renamedSymbols);
             if (accessViolation != null)
             {
                 result.ColdReason = accessViolation;
@@ -290,7 +364,7 @@ public static class PatchRewriter
         if (batch.ReAddedMemberKeys.Count > 0)
         {
             string? ensureCold = EnsureReAddedCallerDetours(
-                root, model, batch, diff, addedDecls, newTypeNames, ensuredDetours);
+                root, model, batch, diff, addedBodySpans, newTypeNames, ensuredDetours);
             if (ensureCold != null)
             {
                 result.ColdReason = ensureCold;
@@ -410,6 +484,12 @@ public static class PatchRewriter
                         property.Modifiers.Any(SyntaxKind.StaticKeyword) &&
                         property.Initializer != null:
                     {
+                        // B2: an ADDED static auto-property keeps its
+                        // initializer through the rewrite — the expression
+                        // moves into the holder field, and the declaration
+                        // itself is removed with the accessor extraction.
+                        if (addedStaticNames.Contains(property.Identifier.Text))
+                            break;
                         nodeReplacements[property] = property
                             .WithInitializer(null)
                             .WithSemicolonToken(default);
@@ -483,6 +563,30 @@ public static class PatchRewriter
                     if (hostSymbol.ContainingType == null)
                         operatorSelfRenameTokens.Add(selfRef.Identifier);
                 }
+            }
+        }
+
+        // ── C2′b: kept-surface access gate (measured-red runtimes only) ──
+        // Added members are gated above (C2′a — conservative when caps are
+        // absent). Everything ELSE the patch compiles — kept bodies, new-
+        // type bodies, added-field initializers — has ALWAYS shipped
+        // non-public references through IgnoresAccessChecksTo, so a missing
+        // probe keeps today's hot verdicts; but when this runtime MEASURED a
+        // red cell, the original-token references those bodies emit would
+        // crash at first JIT (non-detoured kept copies JIT on calls from
+        // patched bodies, holder cctors on first store touch, new types on
+        // first use — none of which the apply-time nets fully cover), so
+        // name them cold up front. All cells green (the universal probe
+        // result so far) skips the scan entirely: zero cost, zero behavior
+        // change.
+        if (batch.RuntimeCaps != null && !batch.RuntimeCaps.CoversAllCells())
+        {
+            string? keptViolation = FindKeptSurfaceAccessViolation(
+                root, model, batch, addedFieldSymbols, renamedSymbols, InAddedMember, InStrippedSpan);
+            if (keptViolation != null)
+            {
+                result.ColdReason = keptViolation;
+                return result;
             }
         }
 
@@ -656,6 +760,30 @@ public static class PatchRewriter
             }
         }
 
+        // ── references to ADDED properties/indexers/events (B2) ─────
+        // Batch references bind to the added property/indexer/event symbol;
+        // reads, writes, compound assignments and event subscriptions
+        // materialize as direct accessor-shim calls (same-file auto-
+        // properties route straight to their lvalue-shaped backing store).
+        // Any form the matrix cannot express with IDENTICAL semantics fails
+        // the file closed with a pointed reason — never a wrong rewrite.
+        {
+            var autoStores = new Dictionary<IMethodSymbol, AddedFieldInfo>(SymbolEqualityComparer.Default);
+            foreach (AddedAccessorInfo accessorInfo in addedAccessors)
+            {
+                if (accessorInfo.IsAuto && accessorInfo.Store != null)
+                    autoStores[accessorInfo.Symbol.OriginalDefinition] = accessorInfo.Store;
+            }
+            string? matrixCold = RewriteAddedAccessorReferences(
+                root, model, batch, autoStores, EnclosingAddedTarget, InStrippedSpan,
+                nodeReplacements, dynamicReplacements);
+            if (matrixCold != null)
+            {
+                result.ColdReason = matrixCold;
+                return result;
+            }
+        }
+
         // Unqualified static field/property/event reads of renamed types →
         // qualified back to the original type (single static state source).
         foreach (IdentifierNameSyntax identifier in root.DescendantNodes().OfType<IdentifierNameSyntax>())
@@ -693,6 +821,8 @@ public static class PatchRewriter
             };
             if (!isStaticState || symbol!.ContainingType == null)
                 continue;
+            if (HasAddedAccessor(symbol, batch))
+                continue; // B2: the accessor matrix owns added properties/events
             if (!IsRenamedTypeSymbol(symbol.ContainingType, renamedSymbols))
                 continue;
 
@@ -741,8 +871,9 @@ public static class PatchRewriter
         // The shim body runs outside the type: implicit instance refs need
         // `self.`, implicit refs that stay implicit-static need the original
         // type qualifier (the static-state pass above only covers
-        // field/property/event of renamed types).
-        if (addedDecls.Count > 0)
+        // field/property/event of renamed types). Accessor bodies (B2) are
+        // added members too.
+        if (addedBodySpans.Count > 0)
         {
             foreach (IdentifierNameSyntax identifier in root.DescendantNodes().OfType<IdentifierNameSyntax>())
             {
@@ -779,6 +910,8 @@ public static class PatchRewriter
                 {
                     continue; // the shim-call rewrite owns these
                 }
+                if (HasAddedAccessor(symbol, batch))
+                    continue; // B2: the accessor matrix owns these
                 if (symbol.ContainingType == null)
                     continue;
                 if (symbol is IMethodSymbol { MethodKind: not MethodKind.Ordinary })
@@ -991,11 +1124,14 @@ public static class PatchRewriter
         var addedPaths = new List<(List<int> Path, ShimTarget Target)>();
         foreach (var pair in addedDecls)
             addedPaths.Add((IndexPath(pair.Key), pair.Value));
+        var addedAccessorPaths = new List<(List<int> ContainerPath, AddedAccessorInfo Info)>();
+        foreach (AddedAccessorInfo accessorInfo in addedAccessors)
+            addedAccessorPaths.Add((IndexPath(accessorInfo.Container), accessorInfo));
         var strippedOperatorPaths = new List<List<int>>();
         foreach (BaseMethodDeclarationSyntax operatorDecl in strippedOperatorDecls)
             strippedOperatorPaths.Add(IndexPath(operatorDecl));
         var initializerPaths = new List<(List<int> Path, AddedFieldInfo Field)>();
-        foreach (AddedFieldInfo info in addedFieldSymbols.Values)
+        foreach (AddedFieldInfo info in addedFieldsByType.Values.SelectMany(list => list))
         {
             if (info.InitializerValue != null)
                 initializerPaths.Add((IndexPath(info.InitializerValue), info));
@@ -1023,13 +1159,31 @@ public static class PatchRewriter
         // ── extract added members into shim classes (M2) and drop the
         // unchanged operator/conversion copies in one removal pass ───────
         {
-            var extracted = new List<(MethodDeclarationSyntax Decl, ShimTarget Target)>();
+            // Shim methods are built from the REWRITTEN declarations before
+            // the removal pass detaches them from the tree.
+            var extracted = new List<(MemberDeclarationSyntax Shim, ShimTarget Target)>();
+            var removableNodes = new List<SyntaxNode>();
             foreach (var (pathIndices, target) in addedPaths)
             {
-                if (NodeAtPath(rewritten, pathIndices) is MethodDeclarationSyntax method)
-                    extracted.Add((method, target));
+                if (NodeAtPath(rewritten, pathIndices) is not MethodDeclarationSyntax method)
+                    continue;
+                extracted.Add((BuildShimMethod(method, target, root), target));
+                removableNodes.Add(method);
             }
-            var removableNodes = new List<SyntaxNode>(extracted.Select(e => (SyntaxNode)e.Decl));
+            // B2: accessor shims — one per added accessor; the owning
+            // property/indexer/event declaration is removed ONCE (the patch
+            // copy must not re-declare the new surface: an auto backing
+            // field would break the layout guard, and the original metadata
+            // lacks the member anyway).
+            var removedContainers = new HashSet<SyntaxNode>();
+            foreach (var (containerPath, accessorInfo) in addedAccessorPaths)
+            {
+                if (NodeAtPath(rewritten, containerPath) is not BasePropertyDeclarationSyntax container)
+                    continue;
+                extracted.Add((BuildAccessorShimMethod(container, accessorInfo, root), accessorInfo.Target));
+                if (removedContainers.Add(container))
+                    removableNodes.Add(container);
+            }
             foreach (List<int> pathIndices in strippedOperatorPaths)
             {
                 if (NodeAtPath(rewritten, pathIndices) is BaseMethodDeclarationSyntax strippedOperator)
@@ -1046,17 +1200,21 @@ public static class PatchRewriter
             {
                 ShimTarget first = group.First().Target;
                 var shimMethods = new List<MemberDeclarationSyntax>();
-                foreach (var (decl, target) in group)
-                    shimMethods.Add(BuildShimMethod(decl, target, root));
+                foreach (var (shim, _) in group)
+                    shimMethods.Add(shim);
 
                 string shimSimpleName = first.ShimTypeMetadataName.Contains('.')
                     ? first.ShimTypeMetadataName[(first.ShimTypeMetadataName.LastIndexOf('.') + 1)..]
                     : first.ShimTypeMetadataName;
 
+                // `partial`: two files of a batch can both add members to the
+                // SAME (partial, B6) top-level type — each file's rewrite
+                // emits its own shim-class declaration and they must merge.
                 ClassDeclarationSyntax shimClass = SyntaxFactory.ClassDeclaration(shimSimpleName)
                     .WithModifiers(SyntaxFactory.TokenList(
                         SyntaxFactory.Token(SyntaxKind.PublicKeyword),
-                        SyntaxFactory.Token(SyntaxKind.StaticKeyword)))
+                        SyntaxFactory.Token(SyntaxKind.StaticKeyword),
+                        SyntaxFactory.Token(SyntaxKind.PartialKeyword)))
                     .WithMembers(SyntaxFactory.List(shimMethods))
                     .NormalizeWhitespace()
                     .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
@@ -1275,12 +1433,64 @@ public static class PatchRewriter
         public string StoreMetadataName = "";
         public string StoreNamespace = "";
 
+        /// <summary>Field name the store registers under across batches: the
+        /// metadata backing-field name for auto-properties (B2), the member
+        /// name itself for plain fields.</summary>
+        public string RegistryFieldName = "";
+
         /// <summary>False when an earlier batch already declared the store —
         /// accesses bind to it and no new declaration is generated.</summary>
         public bool IsNewStore = true;
 
         public ExpressionSyntax? InitializerValue;
         public string? RewrittenInitializerText;
+    }
+
+    /// <summary>One added property/indexer/event ACCESSOR of this file (B2):
+    /// its shim target, the body-owning syntax, and — for auto-property
+    /// accessors — the backing store the synthesized shim body reads/writes.</summary>
+    private sealed class AddedAccessorInfo
+    {
+        public ShimTarget Target = null!;
+        public IMethodSymbol Symbol = null!;
+        public BasePropertyDeclarationSyntax Container = null!;
+
+        /// <summary>Null for an expression-bodied property/indexer (the
+        /// implicit getter — the body is the container's arrow clause).</summary>
+        public AccessorDeclarationSyntax? Accessor;
+
+        public bool IsAuto;
+        public AddedFieldInfo? Store;
+    }
+
+    /// <summary>The syntax node that OWNS an added accessor's executable
+    /// body — the accessor declaration, or the container's arrow clause for
+    /// expression-bodied properties/indexers.</summary>
+    private static SyntaxNode AccessorBodyNode(AddedAccessorInfo info)
+    {
+        if (info.Accessor != null)
+            return info.Accessor;
+        return info.Container switch
+        {
+            PropertyDeclarationSyntax { ExpressionBody: { } arrow } => arrow,
+            IndexerDeclarationSyntax { ExpressionBody: { } arrow } => arrow,
+            _ => info.Container,
+        };
+    }
+
+    /// <summary>True when the symbol is a property/event whose accessor(s)
+    /// were ADDED by this batch — references rewrite to direct shim calls
+    /// (or store accesses), so every other pass must leave them alone.</summary>
+    private static bool HasAddedAccessor(ISymbol symbol, PatchBatchContext batch)
+    {
+        static bool Added(IMethodSymbol? accessor, PatchBatchContext batch) =>
+            accessor != null && batch.AddedMembers.ContainsKey(accessor.OriginalDefinition);
+        return symbol switch
+        {
+            IPropertySymbol property => Added(property.GetMethod, batch) || Added(property.SetMethod, batch),
+            IEventSymbol @event => Added(@event.AddMethod, batch) || Added(@event.RemoveMethod, batch),
+            _ => false,
+        };
     }
 
     private static VariableDeclaratorSyntax? FindFieldDeclarator(TypeDeclarationSyntax type, string name, bool isStatic)
@@ -1313,6 +1523,7 @@ public static class PatchRewriter
         var info = new AddedFieldInfo
         {
             Name = change.Name,
+            RegistryFieldName = change.Name,
             DeclaringType = declaringType,
             FieldTypeFqn = fieldSymbol.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
             IsStatic = change.IsStatic,
@@ -1346,31 +1557,144 @@ public static class PatchRewriter
         return info;
     }
 
+    /// <summary>B2: the backing store of an added AUTO-PROPERTY. The
+    /// FieldChange carries the metadata backing name ("&lt;P&gt;k__BackingField"
+    /// — the layout-verification identity and the cross-batch registry key);
+    /// the holder member is named after the property (a valid identifier).
+    /// The synthesized accessor shims and the kept-body access matrix both
+    /// route through this store.</summary>
+    private static AddedFieldInfo? BuildAutoPropertyFieldInfo(
+        string declaringType,
+        TypeDeclarationSyntax typeDecl,
+        HotDiffFieldChange change,
+        SemanticModel model,
+        PatchBatchContext batch)
+    {
+        if (!change.Name.StartsWith("<", StringComparison.Ordinal))
+            return null;
+        int end = change.Name.IndexOf('>');
+        if (end <= 1)
+            return null;
+        string propertyName = change.Name[1..end];
+
+        PropertyDeclarationSyntax? property = typeDecl.Members.OfType<PropertyDeclarationSyntax>()
+            .FirstOrDefault(p => p.Identifier.Text == propertyName && HotDiff.IsAutoProperty(p));
+        if (property == null)
+            return null;
+        if (model.GetDeclaredSymbol(property) is not IPropertySymbol propertySymbol)
+            return null;
+
+        var info = new AddedFieldInfo
+        {
+            Name = propertyName,
+            RegistryFieldName = change.Name,
+            DeclaringType = declaringType,
+            FieldTypeFqn = propertySymbol.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            IsStatic = change.IsStatic,
+            InitializerValue = property.Initializer?.Value,
+        };
+
+        string fieldKey = FieldStoreRegistry.FieldKey(declaringType, change.Name);
+        if (batch.EarlierFieldStores.TryGetValue(fieldKey, out FieldStoreRegistry.StoreEntry? earlier))
+        {
+            info.StoreFqn = earlier.StoreTypeFqn;
+            info.StoreMetadataName = earlier.StoreTypeMetadataName;
+            if (earlier.MemberName.Length > 0)
+                info.Name = earlier.MemberName;
+            info.IsNewStore = false;
+            return info;
+        }
+
+        int dot = declaringType.LastIndexOf('.');
+        string ns = dot < 0 ? "" : declaringType[..dot];
+        string chain = (dot < 0 ? declaringType : declaringType[(dot + 1)..]).Replace('+', '_');
+        string storeName = "__LocusFields_" + chain
+            + (batch.StoreDiscriminator.Length > 0 ? "_" + batch.StoreDiscriminator : "");
+        info.StoreNamespace = ns;
+        info.StoreMetadataName = ns.Length == 0 ? storeName : ns + "." + storeName;
+        info.StoreFqn = "global::" + info.StoreMetadataName;
+        return info;
+    }
+
+    // C2′a: probe columns (AccessProbeSource cell ops) required per body
+    // reference shape. Field reads and writes are hard to split exactly
+    // (compound assignment, ref receivers), so any field touch requires
+    // BOTH the load and the store column; calls require both call flavors.
+    private static readonly string[] InstanceFieldOps = { "ldfld", "stfld" };
+    private static readonly string[] StaticFieldOps = { "ldsfld", "stsfld" };
+    private static readonly string[] CallOps = { "call", "callvirt" };
+    private static readonly string[] CtorOps = { "newobj" };
+    private static readonly string[] TypeReferenceOps = { "castclass", "ldtoken" };
+    private static readonly string[] TypeCreationOps = { "castclass", "ldtoken", "newobj" };
+
+    /// <summary>True when `name` is (part of) the type of a `new T(...)`
+    /// expression — the JIT then also resolves T's constructor (newobj) on
+    /// top of the type token itself.</summary>
+    private static bool IsObjectCreationType(SimpleNameSyntax name)
+    {
+        SyntaxNode current = name;
+        while (true)
+        {
+            switch (current.Parent)
+            {
+                case QualifiedNameSyntax qualified when qualified.Right == current:
+                    current = qualified;
+                    continue;
+                case AliasQualifiedNameSyntax alias when alias.Name == current:
+                    current = alias;
+                    continue;
+            }
+            break;
+        }
+        return current.Parent is ObjectCreationExpressionSyntax creation && creation.Type == current;
+    }
+
     /// <summary>Mono-reality check for ADDED members (M2): the generated
     /// shim runs OUTSIDE the original type and Unity's Mono enforces
-    /// accessibility at JIT time (IgnoresAccessChecksTo is not honored for
-    /// project assemblies — a violating shim throws FieldAccessException /
-    /// MethodAccessException when first jitted). Returns a cold reason when
-    /// the member's signature or body references surface that is neither
-    /// public-all-the-way-down nor materialized by this patch (added
-    /// members/fields, appended enum members, new types).</summary>
+    /// accessibility at JIT time (a violating shim throws
+    /// FieldAccessException / MethodAccessException when first jitted).
+    ///
+    /// C2′a: whether a given (operation × visibility) actually fails is
+    /// MEASURED per runtime by the C0 access probe. A BODY reference to
+    /// non-public surface goes hot when every required probe cell is green —
+    /// it rides the IgnoresAccessChecksTo + IgnoreAccessibility mechanism
+    /// the patch already compiles with, and Unity's PrepareHotPatchShims
+    /// force-JITs every shim at apply time, so a runtime that rejects after
+    /// all rolls the whole batch back instead of poisoning it. Caps absent
+    /// (old plugin / failed probe) or any red cell keeps today's cold
+    /// verdict. Non-public types in the shim's public SIGNATURE (declaring
+    /// type, return/parameter types) stay cold regardless: the C0 matrix has
+    /// no cell for declaration-site type loading yet. Patch-materialized
+    /// surface (added members/fields, appended enum members, new types) is
+    /// always exempt.</summary>
     private static string? FindShimAccessViolation(
-        MethodDeclarationSyntax decl,
+        IMethodSymbol declared,
+        SyntaxNode bodyNode,
         SemanticModel model,
         PatchBatchContext batch,
         Dictionary<IFieldSymbol, AddedFieldInfo> addedFieldSymbols,
         HashSet<INamedTypeSymbol> renamedSymbols)
     {
-        if (model.GetDeclaredSymbol(decl) is not IMethodSymbol declared)
-            return null;
-
+        AccessCaps? caps = batch.RuntimeCaps;
         string memberDisplay = SymbolMetadataName(declared.ContainingType) + "." + declared.Name;
 
-        string Violation(ISymbol symbol) =>
+        string Violation(ISymbol symbol, string detail) =>
             "added member references non-public surface: " + memberDisplay + " uses " +
             symbol.ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat) +
-            " (the shim runs outside the type and the Unity runtime blocks non-public access; " +
-            "make the referenced surface public or use unity_recompile)";
+            " (" + detail + ")";
+
+        const string SignatureDetail =
+            "signature-level non-public type; not yet probed — the public shim must name it " +
+            "in its own declaration; make it public or use unity_recompile";
+
+        const string CapsAbsentDetail =
+            "the shim runs outside the type; runtime caps absent (old plugin or a failed " +
+            "access probe) — update the Locus plugin, or use unity_recompile";
+
+        string CellRedDetail(string operation, string bucket) =>
+            "this runtime's Mono blocks " + operation + " access to " + bucket +
+            " members (probe cell " + operation + "_" + bucket + " is red); make the " +
+            "referenced surface public or use unity_recompile";
 
         bool IsPatchLocal(ISymbol symbol)
         {
@@ -1380,6 +1704,10 @@ public static class PatchRewriter
                     return true;
                 case IFieldSymbol field when
                     addedFieldSymbols.ContainsKey(field) || batch.AddedEnumMembers.ContainsKey(field):
+                    return true;
+                case IPropertySymbol or IEventSymbol when HasAddedAccessor(symbol, batch):
+                    // B2: rewrites to a direct accessor-shim call / store
+                    // access (patch-materialized surface).
                     return true;
             }
             // Declared in batch source but NOT a renamed pre-existing type:
@@ -1396,38 +1724,72 @@ public static class PatchRewriter
             return false;
         }
 
-        static bool IsAccessiblePublicly(ISymbol? symbol)
+        // C2′a relaxation for BODY references: hot when every required
+        // (operation × visibility) cell measured green; otherwise the
+        // conservative cold verdict stands, naming the failing cell.
+        string? CheckBodyAccess(ISymbol symbol, string[] operations)
         {
-            for (ISymbol? current = symbol;
-                current is not null and not INamespaceSymbol;
-                current = current.ContainingType)
+            List<string> buckets = RequiredBuckets(symbol, ShimVisibilityBucket);
+            if (buckets.Count == 0)
+                return null; // public all the way down
+            if (caps == null)
+                return Violation(symbol, CapsAbsentDetail);
+            foreach (string operation in operations)
             {
-                if (current.DeclaredAccessibility is not Accessibility.Public
-                    and not Accessibility.NotApplicable)
+                foreach (string bucket in buckets)
                 {
-                    return false;
+                    if (!caps.Allows(operation, bucket))
+                        return Violation(symbol, CellRedDetail(operation, bucket));
                 }
             }
-            return true;
+            return null;
         }
 
-        string? CheckType(ITypeSymbol? type)
+        string? CheckBodyType(ITypeSymbol? type, string[] operations)
         {
             switch (type)
             {
                 case IArrayTypeSymbol array:
-                    return CheckType(array.ElementType);
+                    return CheckBodyType(array.ElementType, operations);
                 case IPointerTypeSymbol pointer:
-                    return CheckType(pointer.PointedAtType);
+                    return CheckBodyType(pointer.PointedAtType, operations);
+                case INamedTypeSymbol named:
+                {
+                    if (IsPatchLocal(named))
+                        return null;
+                    string? violation = CheckBodyAccess(named, operations);
+                    if (violation != null)
+                        return violation;
+                    foreach (ITypeSymbol argument in named.TypeArguments)
+                    {
+                        violation = CheckBodyType(argument, operations);
+                        if (violation != null)
+                            return violation;
+                    }
+                    return null;
+                }
+                default:
+                    return null; // type parameters, dynamic, null
+            }
+        }
+
+        string? CheckSignatureType(ITypeSymbol? type)
+        {
+            switch (type)
+            {
+                case IArrayTypeSymbol array:
+                    return CheckSignatureType(array.ElementType);
+                case IPointerTypeSymbol pointer:
+                    return CheckSignatureType(pointer.PointedAtType);
                 case INamedTypeSymbol named:
                 {
                     if (IsPatchLocal(named))
                         return null;
                     if (!IsAccessiblePublicly(named))
-                        return Violation(named);
+                        return Violation(named, SignatureDetail);
                     foreach (ITypeSymbol argument in named.TypeArguments)
                     {
-                        string? nested = CheckType(argument);
+                        string? nested = CheckSignatureType(argument);
                         if (nested != null)
                             return nested;
                     }
@@ -1439,24 +1801,26 @@ public static class PatchRewriter
         }
 
         // Signature surface first: the (public) shim must be able to NAME
-        // these types in its own declaration.
+        // these types in its own declaration — never relaxed by the body
+        // matrix (no probe cell covers declaration-site loading yet).
         if (!declared.IsStatic && !IsAccessiblePublicly(declared.ContainingType))
         {
             return "added instance member on a non-public type: " + memberDisplay +
-                " (the shim cannot name the declaring type; use unity_recompile)";
+                " (the shim cannot name the declaring type — signature-level non-public type; " +
+                "not yet probed; use unity_recompile)";
         }
-        string? signatureViolation = CheckType(declared.ReturnType);
+        string? signatureViolation = CheckSignatureType(declared.ReturnType);
         if (signatureViolation != null)
             return signatureViolation;
         foreach (IParameterSymbol parameter in declared.Parameters)
         {
-            signatureViolation = CheckType(parameter.Type);
+            signatureViolation = CheckSignatureType(parameter.Type);
             if (signatureViolation != null)
                 return signatureViolation;
         }
 
         // Body references: every bound member/type the shim would touch.
-        foreach (SyntaxNode node in decl.DescendantNodes())
+        foreach (SyntaxNode node in bodyNode.DescendantNodes())
         {
             if (node is not SimpleNameSyntax name)
                 continue;
@@ -1472,16 +1836,415 @@ public static class PatchRewriter
                 continue;
             if (symbol is INamedTypeSymbol typeRef)
             {
-                string? typeViolation = CheckType(typeRef);
+                // typeof/cast/expression type → the type token itself must
+                // JIT (castclass + ldtoken columns); `new T(...)` adds the
+                // constructor's newobj on top.
+                string? typeViolation = CheckBodyType(
+                    typeRef, IsObjectCreationType(name) ? TypeCreationOps : TypeReferenceOps);
                 if (typeViolation != null)
                     return typeViolation;
                 continue;
             }
-            if (!IsAccessiblePublicly(symbol))
-                return Violation(symbol);
+            string? memberViolation = symbol switch
+            {
+                IFieldSymbol field => CheckBodyAccess(
+                    field, field.IsStatic ? StaticFieldOps : InstanceFieldOps),
+                IMethodSymbol { MethodKind: MethodKind.Constructor } ctor =>
+                    CheckBodyAccess(ctor, CtorOps),
+                IMethodSymbol method => CheckBodyAccess(method, CallOps),
+                IPropertySymbol property => CheckBodyAccess(property, CallOps),
+                IEventSymbol @event => CheckBodyAccess(@event, CallOps),
+                _ => CheckBodyAccess(symbol, CallOps), // unreachable (kind-filtered)
+            };
+            if (memberViolation != null)
+                return memberViolation;
+        }
+
+        // `new T(...)` resolves T's CONSTRUCTOR on top of the type token,
+        // and the ctor symbol hangs on the creation node — a non-public
+        // ctor on a public type never surfaces through the name scan above
+        // (the type-name check only folds the TYPE's own visibility).
+        foreach (BaseObjectCreationExpressionSyntax creation in bodyNode.DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
+        {
+            if (model.GetSymbolInfo(creation).Symbol is not IMethodSymbol creationCtor)
+                continue;
+            if (IsPatchLocal(creationCtor))
+                continue;
+            string? ctorViolation = CheckBodyAccess(creationCtor, CtorOps);
+            if (ctorViolation != null)
+                return ctorViolation;
         }
 
         return null;
+    }
+
+    /// <summary>Public (or accessibility-less) all the way up the
+    /// containing-type chain — the only surface a PUBLIC shim signature may
+    /// name, and the only one the JIT never access-checks.</summary>
+    private static bool IsAccessiblePublicly(ISymbol? symbol)
+    {
+        for (ISymbol? current = symbol;
+            current is not null and not INamespaceSymbol;
+            current = current.ContainingType)
+        {
+            if (current.DeclaredAccessibility is not Accessibility.Public
+                and not Accessibility.NotApplicable)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Probe matrix column(s) one accessibility level maps to for
+    /// ADDED members (M2 shims). The shim is an unrelated type, so
+    /// `protected` degrades to the private column; IgnoresAccessChecksTo
+    /// makes the patch assembly-equivalent, so every internal flavor maps to
+    /// the internal column.</summary>
+    private static string? ShimVisibilityBucket(Accessibility accessibility) => accessibility switch
+    {
+        Accessibility.Private => "private",
+        Accessibility.Protected => "private",
+        Accessibility.Internal => "internal",
+        Accessibility.ProtectedOrInternal => "internal",
+        Accessibility.ProtectedAndInternal => "internal",
+        _ => null,
+    };
+
+    /// <summary>Probe matrix column(s) for KEPT bodies (the patch COPY of
+    /// the edited type): the copy derives from the same original base chain,
+    /// so plain `protected` (and the protected leg of `protected internal`)
+    /// stays legal by inheritance and never needs a cell; `private
+    /// protected` still needs the same-assembly leg → internal column.</summary>
+    private static string? KeptVisibilityBucket(Accessibility accessibility) => accessibility switch
+    {
+        Accessibility.Private => "private",
+        Accessibility.Internal => "internal",
+        Accessibility.ProtectedAndInternal => "internal",
+        _ => null,
+    };
+
+    /// <summary>The JIT resolves the member AND its whole containing-type
+    /// chain: every non-public level on the way up contributes its column.</summary>
+    private static List<string> RequiredBuckets(ISymbol symbol, Func<Accessibility, string?> bucket)
+    {
+        var buckets = new List<string>(2);
+        for (ISymbol? current = symbol;
+            current is not null and not INamespaceSymbol;
+            current = current.ContainingType)
+        {
+            string? column = bucket(current.DeclaredAccessibility);
+            if (column != null && !buckets.Contains(column))
+                buckets.Add(column);
+        }
+        return buckets;
+    }
+
+    /// <summary>C2′b: scan every produced body OUTSIDE added members (kept
+    /// member bodies, new-type bodies, added-field initializers) for
+    /// references that end up as ORIGINAL-metadata tokens of non-public
+    /// surface, and cold-name the first one whose probe cell measured red.
+    /// Only invoked when the matrix has a red cell (callers short-circuit
+    /// the all-green/absent cases — those keep today's hot verdicts).
+    ///
+    /// What emits an original token from a kept body: every reference to
+    /// non-batch metadata (other assemblies, unedited files — the patch is
+    /// its own assembly either way); and, for the RENAMED batch types
+    /// themselves, whatever the rewrite re-qualifies to the original —
+    /// type tokens (typeof/casts/creations), constructors, unqualified
+    /// static STATE, and any access through a non-`this` receiver
+    /// (receivers are original-typed after the rewrite). `this.`-routed
+    /// member access keeps the PATCH COPY's same-assembly token and plain
+    /// `protected` stays legal through the copy's inheritance, so neither
+    /// needs a cell. Known boundary (over to the detour-time JIT net):
+    /// operator/indexer/foreach/await pattern calls bind to no name node
+    /// and are not scanned; member-declaration signatures (parameter/
+    /// return/field types) load at type-load, which no cell measures.</summary>
+    private static string? FindKeptSurfaceAccessViolation(
+        CompilationUnitSyntax root,
+        SemanticModel model,
+        PatchBatchContext batch,
+        Dictionary<IFieldSymbol, AddedFieldInfo> addedFieldSymbols,
+        HashSet<INamedTypeSymbol> renamedSymbols,
+        Func<SyntaxNode, bool> inAddedMember,
+        Func<SyntaxNode, bool> inStrippedSpan)
+    {
+        AccessCaps caps = batch.RuntimeCaps!;
+
+        string Violation(SyntaxNode node, ISymbol symbol, string operation, string bucket) =>
+            "patched body references non-public surface: " + EnclosingMemberDisplay(node) + " uses " +
+            symbol.ToDisplayString(SymbolDisplayFormat.CSharpShortErrorMessageFormat) +
+            " (this runtime's Mono blocks " + operation + " access to " + bucket +
+            " members — probe cell " + operation + "_" + bucket +
+            " is red; make the referenced surface public or use unity_recompile)";
+
+        string? CheckAccess(SyntaxNode node, ISymbol symbol, string[] operations)
+        {
+            List<string> buckets = RequiredBuckets(symbol, KeptVisibilityBucket);
+            if (buckets.Count == 0)
+                return null;
+            foreach (string operation in operations)
+            {
+                foreach (string bucket in buckets)
+                {
+                    if (!caps.Allows(operation, bucket))
+                        return Violation(node, symbol, operation, bucket);
+                }
+            }
+            return null;
+        }
+
+        bool IsKeptExempt(ISymbol symbol, bool thisReceiver)
+        {
+            switch (symbol)
+            {
+                case IMethodSymbol method when TryGetAddedTarget(method, batch, out _, out _):
+                    return true; // rewrites to a direct shim call (patch-materialized)
+                case IPropertySymbol or IEventSymbol when HasAddedAccessor(symbol, batch):
+                    return true; // B2: rewrites to a shim call / store access
+                case IFieldSymbol field when
+                    addedFieldSymbols.ContainsKey(field) || batch.AddedEnumMembers.ContainsKey(field):
+                    return true; // rewrites to store access / cast literal
+                case IFieldSymbol { IsConst: true }:
+                    return true; // inlined at compile time; no runtime token
+            }
+            if (!symbol.Locations.Any(location => location.IsInSource))
+                return false; // original metadata: always an original token
+
+            // A brand-new NESTED type under a renamed container re-qualifies
+            // to the PATCH name (PatchQualifiedDisplay): patch tokens.
+            for (INamedTypeSymbol? container = symbol as INamedTypeSymbol ?? symbol.ContainingType;
+                container != null; container = container.ContainingType)
+            {
+                if (batch.NewTypeSymbols.Contains(container.OriginalDefinition))
+                    return true;
+            }
+
+            INamedTypeSymbol? top = symbol as INamedTypeSymbol ?? symbol.ContainingType;
+            while (top?.ContainingType != null)
+                top = top.ContainingType;
+            if (top == null || !IsRenamedTypeSymbol(top, renamedSymbols))
+                return true; // brand-new surface: compiles into the patch itself
+
+            // Declared on a RENAMED batch type: only `this.`-routed
+            // instance/static-method references keep patch-copy tokens.
+            if (symbol is INamedTypeSymbol)
+                return false; // type refs re-qualify to the original name
+            if (symbol is IMethodSymbol { MethodKind: MethodKind.Constructor })
+                return false; // `new Foo()` re-qualifies to the original ctor
+            if (!thisReceiver)
+                return false; // receivers are original-typed after the rewrite
+            bool staticState = symbol switch
+            {
+                IFieldSymbol f => f.IsStatic,
+                IPropertySymbol p => p.IsStatic,
+                IEventSymbol e => e.IsStatic,
+                _ => false,
+            };
+            return !staticState; // unqualified static state re-qualifies too
+        }
+
+        string? CheckTypeRef(SyntaxNode node, ITypeSymbol? type, string[] operations)
+        {
+            switch (type)
+            {
+                case IArrayTypeSymbol array:
+                    return CheckTypeRef(node, array.ElementType, operations);
+                case IPointerTypeSymbol pointer:
+                    return CheckTypeRef(node, pointer.PointedAtType, operations);
+                case INamedTypeSymbol named:
+                {
+                    if (IsKeptExempt(named, thisReceiver: false))
+                        return null;
+                    string? violation = CheckAccess(node, named, operations);
+                    if (violation != null)
+                        return violation;
+                    foreach (ITypeSymbol argument in named.TypeArguments)
+                    {
+                        violation = CheckTypeRef(node, argument, operations);
+                        if (violation != null)
+                            return violation;
+                    }
+                    return null;
+                }
+                default:
+                    return null; // type parameters, dynamic, null
+            }
+        }
+
+        foreach (SyntaxNode node in root.DescendantNodes())
+        {
+            if (node is not SimpleNameSyntax name)
+                continue;
+            if (inAddedMember(name) || inStrippedSpan(name) || IsDeclarationName(name))
+                continue;
+            if (name.Ancestors().Any(a => a is UsingDirectiveSyntax))
+                continue; // compile-time lookup only; no token
+            ISymbol? symbol = model.GetSymbolInfo(name).Symbol;
+            if (symbol == null)
+                continue;
+            if (symbol.Kind is not SymbolKind.Method and not SymbolKind.Property
+                and not SymbolKind.Field and not SymbolKind.Event and not SymbolKind.NamedType)
+            {
+                continue;
+            }
+
+            if (symbol is INamedTypeSymbol typeRef)
+            {
+                // A pure qualifier emits no type token of its own — the
+                // qualified MEMBER's token folds the containing chain
+                // (RequiredBuckets); only typeof/cast/creation/argument
+                // positions load the type.
+                if (name.Parent is MemberAccessExpressionSyntax qualifier && qualifier.Expression == name)
+                    continue;
+                if (name.Parent is QualifiedNameSyntax qualified && qualified.Left == name)
+                    continue;
+                if (InMemberSignature(name) || FindEnclosingNameOf(name, model) != null)
+                    continue;
+                string? typeViolation = CheckTypeRef(
+                    name, typeRef, IsObjectCreationType(name) ? TypeCreationOps : TypeReferenceOps);
+                if (typeViolation != null)
+                    return typeViolation;
+                continue;
+            }
+
+            if (IsKeptExempt(symbol, HasThisOrImplicitReceiver(name)))
+                continue;
+            if (InMemberSignature(name) || FindEnclosingNameOf(name, model) != null)
+                continue;
+            string? memberViolation = symbol switch
+            {
+                IFieldSymbol field => CheckAccess(
+                    name, field, field.IsStatic ? StaticFieldOps : InstanceFieldOps),
+                IMethodSymbol { MethodKind: MethodKind.Constructor } ctor =>
+                    CheckAccess(name, ctor, CtorOps),
+                IMethodSymbol method => CheckAccess(name, method, CallOps),
+                IPropertySymbol property => CheckAccess(name, property, CallOps),
+                IEventSymbol @event => CheckAccess(name, @event, CallOps),
+                _ => null,
+            };
+            if (memberViolation != null)
+                return memberViolation;
+        }
+
+        // `new T(...)` — the constructor symbol hangs on the creation node.
+        foreach (BaseObjectCreationExpressionSyntax creation in root.DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
+        {
+            if (inAddedMember(creation) || inStrippedSpan(creation))
+                continue;
+            if (model.GetSymbolInfo(creation).Symbol is not IMethodSymbol creationCtor)
+                continue;
+            if (IsKeptExempt(creationCtor, thisReceiver: false))
+                continue;
+            string? ctorViolation = CheckAccess(creation, creationCtor, CtorOps);
+            if (ctorViolation != null)
+                return ctorViolation;
+        }
+
+        // A standalone `this` in a kept member rewrites to
+        // `((global::Ns.Foo)(object)this)` — a castclass against the
+        // ORIGINAL type, which may itself be non-public.
+        foreach (ThisExpressionSyntax thisNode in root.DescendantNodes().OfType<ThisExpressionSyntax>())
+        {
+            if (inAddedMember(thisNode) || inStrippedSpan(thisNode))
+                continue;
+            bool isReceiver =
+                (thisNode.Parent is MemberAccessExpressionSyntax mae && mae.Expression == thisNode) ||
+                (thisNode.Parent is ElementAccessExpressionSyntax eae && eae.Expression == thisNode);
+            if (isReceiver)
+                continue;
+            TypeDeclarationSyntax? enclosingType = thisNode.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+            if (enclosingType == null)
+                continue;
+            if (model.GetDeclaredSymbol(enclosingType) is not INamedTypeSymbol enclosingSymbol)
+                continue;
+            if (!IsRenamedTypeSymbol(enclosingSymbol, renamedSymbols))
+                continue;
+            string? escapeViolation = CheckAccess(thisNode, enclosingSymbol, TypeReferenceOps);
+            if (escapeViolation != null)
+                return escapeViolation;
+        }
+
+        return null;
+    }
+
+    /// <summary>Receiver shape of a (member) name node: `this.X` and
+    /// unqualified `X` (implicit this / implicit static context) bind to the
+    /// patch copy's own tokens; everything else goes through an expression
+    /// that is ORIGINAL-typed after the rewrite.</summary>
+    private static bool HasThisOrImplicitReceiver(SimpleNameSyntax name)
+    {
+        if (name.Parent is MemberAccessExpressionSyntax access && access.Name == name)
+            return access.Expression is ThisExpressionSyntax;
+        if (name.Parent is MemberBindingExpressionSyntax)
+            return false; // x?.Member
+        return true;
+    }
+
+    /// <summary>True when the name sits in a member-declaration SIGNATURE
+    /// position (parameter/return/field/property types, base lists,
+    /// constraints, attributes): those load at type-load time — outside the
+    /// per-operation probe matrix — and kept signatures have always shipped,
+    /// so the kept-surface scan leaves them alone. Body positions (including
+    /// local declarations and initializer expressions) return false.</summary>
+    private static bool InMemberSignature(SyntaxNode node)
+    {
+        foreach (SyntaxNode ancestor in node.Ancestors())
+        {
+            switch (ancestor)
+            {
+                case ParameterSyntax:
+                case BaseListSyntax:
+                case TypeParameterConstraintClauseSyntax:
+                case ExplicitInterfaceSpecifierSyntax:
+                case AttributeListSyntax:
+                case DelegateDeclarationSyntax:
+                    return true;
+                case MethodDeclarationSyntax method when method.ReturnType.FullSpan.Contains(node.Span):
+                    return true;
+                case BasePropertyDeclarationSyntax property when property.Type.FullSpan.Contains(node.Span):
+                    return true;
+                case BaseFieldDeclarationSyntax field when field.Declaration.Type.FullSpan.Contains(node.Span):
+                    return true;
+                case StatementSyntax:
+                case BaseTypeDeclarationSyntax:
+                    return false;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>"Type.Member" display of the member declaration enclosing
+    /// `node`, for kept-surface violation messages.</summary>
+    private static string EnclosingMemberDisplay(SyntaxNode node)
+    {
+        string member = "";
+        foreach (SyntaxNode ancestor in node.Ancestors())
+        {
+            if (member.Length == 0)
+            {
+                member = ancestor switch
+                {
+                    MethodDeclarationSyntax method => method.Identifier.Text,
+                    ConstructorDeclarationSyntax => ".ctor",
+                    DestructorDeclarationSyntax => "~dtor",
+                    PropertyDeclarationSyntax property => property.Identifier.Text,
+                    IndexerDeclarationSyntax => "this[]",
+                    EventDeclarationSyntax @event => @event.Identifier.Text,
+                    OperatorDeclarationSyntax op => "operator " + op.OperatorToken.Text,
+                    ConversionOperatorDeclarationSyntax => "conversion",
+                    VariableDeclaratorSyntax declarator when
+                        declarator.Parent?.Parent is BaseFieldDeclarationSyntax => declarator.Identifier.Text,
+                    _ => "",
+                };
+            }
+            if (ancestor is BaseTypeDeclarationSyntax typeDecl)
+            {
+                string typeName = HotDiff.MetadataName(typeDecl);
+                return member.Length == 0 ? typeName : typeName + "." + member;
+            }
+        }
+        return member.Length == 0 ? "(file)" : member;
     }
 
     /// <summary>Constructive layout verification for a type with M4 field
@@ -1771,7 +2534,7 @@ public static class PatchRewriter
             {
                 result.FieldStoreRegistrations.Add(new FieldStoreRegistration
                 {
-                    FieldKey = FieldStoreRegistry.FieldKey(info.DeclaringType, info.Name),
+                    FieldKey = FieldStoreRegistry.FieldKey(info.DeclaringType, info.RegistryFieldName),
                     Entry = new FieldStoreRegistry.StoreEntry
                     {
                         StoreTypeMetadataName = info.StoreMetadataName,
@@ -1855,6 +2618,659 @@ public static class PatchRewriter
             .WithTriviaFrom(rewrittenNode);
     }
 
+    // ── B2: added property/indexer/event call-site materialization ───
+
+    /// <summary>Compound-assignment operator token for the supported
+    /// assignment kinds (??= is excluded: the expansion would always call
+    /// the setter, losing the null-skip semantics).</summary>
+    private static SyntaxKind? CompoundBinaryKind(SyntaxKind assignmentKind) => assignmentKind switch
+    {
+        SyntaxKind.AddAssignmentExpression => SyntaxKind.AddExpression,
+        SyntaxKind.SubtractAssignmentExpression => SyntaxKind.SubtractExpression,
+        SyntaxKind.MultiplyAssignmentExpression => SyntaxKind.MultiplyExpression,
+        SyntaxKind.DivideAssignmentExpression => SyntaxKind.DivideExpression,
+        SyntaxKind.ModuloAssignmentExpression => SyntaxKind.ModuloExpression,
+        SyntaxKind.AndAssignmentExpression => SyntaxKind.BitwiseAndExpression,
+        SyntaxKind.OrAssignmentExpression => SyntaxKind.BitwiseOrExpression,
+        SyntaxKind.ExclusiveOrAssignmentExpression => SyntaxKind.ExclusiveOrExpression,
+        SyntaxKind.LeftShiftAssignmentExpression => SyntaxKind.LeftShiftExpression,
+        SyntaxKind.RightShiftAssignmentExpression => SyntaxKind.RightShiftExpression,
+        _ => null,
+    };
+
+    private static ExpressionSyntax UnwrapParens(ExpressionSyntax expression)
+    {
+        while (expression is ParenthesizedExpressionSyntax parens)
+            expression = parens.Expression;
+        return expression;
+    }
+
+    /// <summary>Rewrite every reference that binds to an accessor ADDED by
+    /// this batch (B2). Reads become `Shims.get_X(recv, …)`, statement
+    /// assignments become `Shims.set_X(recv, …, value)`, compound statement
+    /// assignments expand to get+op+set (receiver/index arguments gated to
+    /// repeatable shapes), event subscriptions become add_/remove_ calls,
+    /// and same-file AUTO-property references route to the lvalue-shaped
+    /// backing store. Returns a pointed cold reason for any form whose
+    /// semantics the expansion cannot preserve.</summary>
+    private static string? RewriteAddedAccessorReferences(
+        CompilationUnitSyntax root,
+        SemanticModel model,
+        PatchBatchContext batch,
+        Dictionary<IMethodSymbol, AddedFieldInfo> autoStores,
+        Func<SyntaxNode, ShimTarget?> enclosingAddedTarget,
+        Func<SyntaxNode, bool> inStrippedSpan,
+        Dictionary<SyntaxNode, SyntaxNode> nodeReplacements,
+        Dictionary<SyntaxNode, Func<SyntaxNode, SyntaxNode>> dynamicReplacements)
+    {
+        if (batch.AddedMembers.Count == 0)
+            return null;
+
+        ShimTarget? Added(IMethodSymbol? accessor)
+        {
+            if (accessor == null)
+                return null;
+            return batch.AddedMembers.TryGetValue(accessor.OriginalDefinition, out ShimTarget? target) ? target : null;
+        }
+
+        foreach (SyntaxNode node in root.DescendantNodes())
+        {
+            if (node is not (IdentifierNameSyntax or MemberAccessExpressionSyntax or ElementAccessExpressionSyntax
+                or MemberBindingExpressionSyntax or ElementBindingExpressionSyntax))
+            {
+                continue;
+            }
+            if (inStrippedSpan(node) || nodeReplacements.ContainsKey(node) || dynamicReplacements.ContainsKey(node))
+                continue;
+            if (node.Parent is MemberAccessExpressionSyntax parentAccess && parentAccess.Name == node)
+                continue; // the outer member access owns it
+            if (node is IdentifierNameSyntax && IsDeclarationName(node))
+                continue;
+
+            SymbolInfo symbolInfo = model.GetSymbolInfo(node);
+            ISymbol? symbol = symbolInfo.Symbol;
+            if (symbol is not (IPropertySymbol or IEventSymbol))
+            {
+                // Invalid-form uses (`ref obj.P`, `obj.E = x`) bind with
+                // candidates only — resolve them so the matrix can NAME the
+                // unsupported form instead of leaking a CS1061 on the
+                // extracted member.
+                symbol = symbolInfo.CandidateSymbols.FirstOrDefault(c => c is IPropertySymbol or IEventSymbol);
+            }
+            ShimTarget? getTarget = null;
+            ShimTarget? setTarget = null;
+            IMethodSymbol? getAccessor = null;
+            AddedFieldInfo? store = null;
+            bool isEvent = false;
+            ITypeSymbol? valueType = null;
+            string display;
+
+            switch (symbol)
+            {
+                case IPropertySymbol property:
+                {
+                    getTarget = Added(property.GetMethod);
+                    setTarget = Added(property.SetMethod);
+                    if (getTarget == null && setTarget == null)
+                        continue;
+                    getAccessor = property.GetMethod ?? property.SetMethod;
+                    valueType = property.Type;
+                    display = (getTarget ?? setTarget)!.DeclaringTypeMetadataName + "." +
+                        (property.IsIndexer ? "this[]" : property.Name);
+                    if (property.GetMethod != null &&
+                        autoStores.TryGetValue(property.GetMethod.OriginalDefinition, out AddedFieldInfo? getStore))
+                    {
+                        store = getStore;
+                    }
+                    else if (property.SetMethod != null &&
+                        autoStores.TryGetValue(property.SetMethod.OriginalDefinition, out AddedFieldInfo? setStore))
+                    {
+                        store = setStore;
+                    }
+                    break;
+                }
+                case IEventSymbol @event:
+                {
+                    getTarget = Added(@event.AddMethod);     // +=
+                    setTarget = Added(@event.RemoveMethod);  // -=
+                    if (getTarget == null && setTarget == null)
+                        continue;
+                    getAccessor = @event.AddMethod ?? @event.RemoveMethod;
+                    isEvent = true;
+                    display = (getTarget ?? setTarget)!.DeclaringTypeMetadataName + "." + @event.Name;
+                    break;
+                }
+                default:
+                    continue;
+            }
+
+            // Conditional access has no expressible receiver for the shim.
+            if (node is MemberBindingExpressionSyntax or ElementBindingExpressionSyntax)
+            {
+                return "added member accessed through ?. (conditional access): " + display +
+                    " — rewrite the access without ?. or use unity_recompile";
+            }
+
+            // nameof(P) — the member is extracted from the patch copy, so
+            // materialize the constant string.
+            InvocationExpressionSyntax? nameofInvocation = FindEnclosingNameOf(node, model);
+            if (nameofInvocation != null)
+            {
+                if (!nodeReplacements.ContainsKey(nameofInvocation))
+                {
+                    string constant = symbol is IEventSymbol evt ? evt.Name : ((IPropertySymbol)symbol!).Name;
+                    nodeReplacements[nameofInvocation] = SyntaxFactory.LiteralExpression(
+                            SyntaxKind.StringLiteralExpression,
+                            SyntaxFactory.Literal(constant))
+                        .WithTriviaFrom(nameofInvocation);
+                }
+                continue;
+            }
+
+            if (node.Ancestors().Any(a => a is AttributeListSyntax))
+            {
+                return "added member referenced inside an attribute: " + display +
+                    " (attributes need compile-time constants; use unity_recompile)";
+            }
+            if (node.Parent is NameColonSyntax)
+            {
+                return "added property used in a pattern: " + display +
+                    " (property patterns bind to original metadata; use unity_recompile)";
+            }
+
+            var reference = (ExpressionSyntax)node;
+            ExpressionSyntax effective = reference;
+            while (effective.Parent is ParenthesizedExpressionSyntax parens)
+                effective = parens;
+            SyntaxNode? use = effective.Parent;
+            ShimTarget? enclosingAdded = enclosingAddedTarget(node);
+            ShimTarget anyTarget = (getTarget ?? setTarget)!;
+            string typeArgumentText = AccessorTypeArgumentText(anyTarget, getAccessor!);
+
+            // ── events: only += / -= are expressible ────────────────
+            if (isEvent)
+            {
+                if (use is AssignmentExpressionSyntax eventAssign && eventAssign.Left == effective &&
+                    (eventAssign.IsKind(SyntaxKind.AddAssignmentExpression) ||
+                     eventAssign.IsKind(SyntaxKind.SubtractAssignmentExpression)))
+                {
+                    ShimTarget? eventAccessor = eventAssign.IsKind(SyntaxKind.AddAssignmentExpression)
+                        ? getTarget
+                        : setTarget;
+                    if (eventAccessor == null)
+                    {
+                        return "added event accessor not available for " +
+                            (eventAssign.IsKind(SyntaxKind.AddAssignmentExpression) ? "+=" : "-=") +
+                            ": " + display + " — use unity_recompile";
+                    }
+                    string? receiverCold = AccessorReceiverGuard(
+                        reference, eventAccessor, model, enclosingAdded, display);
+                    if (receiverCold != null)
+                        return receiverCold;
+                    ShimTarget capturedEvent = eventAccessor;
+                    ShimTarget? capturedEnclosing = enclosingAdded;
+                    string capturedTypeArgs = typeArgumentText;
+                    dynamicReplacements[eventAssign] = rewrittenNode => BuildAccessorAssignmentCall(
+                        (AssignmentExpressionSyntax)rewrittenNode, capturedEvent, capturedEnclosing, capturedTypeArgs);
+                    continue;
+                }
+                return "added event can only be subscribed with += / -=: " + display +
+                    " — use unity_recompile";
+            }
+
+            // ── same-file AUTO-property: lvalue-shaped store access ──
+            // `Store.P.Ref(target)` (or the holder field) carries field
+            // semantics, so reads, writes, compound assignments, ++/-- and
+            // deconstruction targets all materialize from ONE rewrite.
+            if (store != null)
+            {
+                if (use is AssignmentExpressionSyntax storeAssign && storeAssign.Left == effective &&
+                    storeAssign.Parent is InitializerExpressionSyntax)
+                {
+                    return "added property used in an object initializer: " + display +
+                        " — assign it in a separate statement or use unity_recompile";
+                }
+                if (IsByRefUse(effective))
+                {
+                    // Would compile against the ref-returning store but NOT
+                    // against the eventual real compile (CS0206) — diverging
+                    // semantics, so fail closed.
+                    return "added property passed by ref/out: " + display + " — use unity_recompile";
+                }
+                AddedFieldInfo capturedStore = store;
+                bool insideAdded = enclosingAdded != null;
+                dynamicReplacements[node] = rewrittenNode =>
+                    BuildFieldStoreAccess(rewrittenNode, capturedStore, insideAdded);
+                continue;
+            }
+
+            // ── full property / indexer: the shim-call matrix ────────
+            if (use is AssignmentExpressionSyntax assign && assign.Left == effective)
+            {
+                if (assign.Parent is InitializerExpressionSyntax)
+                {
+                    return "added property used in an object initializer: " + display +
+                        " — assign it in a separate statement or use unity_recompile";
+                }
+
+                SyntaxKind assignKind = assign.Kind();
+                if (assignKind == SyntaxKind.SimpleAssignmentExpression)
+                {
+                    if (setTarget == null)
+                    {
+                        return "added property has no set accessor to assign through: " + display +
+                            " — use unity_recompile";
+                    }
+                    if (!AssignmentResultDiscarded(assign))
+                    {
+                        return "assignment to an added property is used as a value: " + display +
+                            " (the set shim returns void) — split the statement or use unity_recompile";
+                    }
+                    string? receiverCold = AccessorReceiverGuard(reference, setTarget, model, enclosingAdded, display);
+                    if (receiverCold != null)
+                        return receiverCold;
+                    ShimTarget capturedSet = setTarget;
+                    ShimTarget? capturedEnclosing = enclosingAdded;
+                    string capturedTypeArgs = typeArgumentText;
+                    dynamicReplacements[assign] = rewrittenNode => BuildAccessorAssignmentCall(
+                        (AssignmentExpressionSyntax)rewrittenNode, capturedSet, capturedEnclosing, capturedTypeArgs);
+                    continue;
+                }
+
+                if (assignKind == SyntaxKind.CoalesceAssignmentExpression)
+                {
+                    return "??= on an added property cannot preserve its set-skip semantics: " + display +
+                        " — use unity_recompile";
+                }
+
+                SyntaxKind? binaryKind = CompoundBinaryKind(assignKind);
+                if (binaryKind != null)
+                {
+                    if (getTarget == null || setTarget == null)
+                    {
+                        return "compound assignment needs both accessors of the added property: " + display +
+                            " — use unity_recompile";
+                    }
+                    if (!AssignmentResultDiscarded(assign))
+                    {
+                        return "compound assignment to an added property is used as a value: " + display +
+                            " — split the statement or use unity_recompile";
+                    }
+                    string? receiverCold = AccessorReceiverGuard(reference, setTarget, model, enclosingAdded, display);
+                    if (receiverCold != null)
+                        return receiverCold;
+                    // The expansion evaluates receiver and index arguments
+                    // TWICE (get, then set): only repeatable shapes pass.
+                    string? repeatCold = CompoundRepeatableGuard(reference, setTarget, model, display);
+                    if (repeatCold != null)
+                        return repeatCold;
+                    string castFqn = valueType!.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                    ShimTarget capturedGet = getTarget;
+                    ShimTarget capturedSet = setTarget;
+                    ShimTarget? capturedEnclosing = enclosingAdded;
+                    string capturedTypeArgs = typeArgumentText;
+                    SyntaxKind capturedBinary = binaryKind.Value;
+                    dynamicReplacements[assign] = rewrittenNode => BuildAccessorCompoundCall(
+                        (AssignmentExpressionSyntax)rewrittenNode, capturedGet, capturedSet,
+                        capturedBinary, castFqn, capturedEnclosing, capturedTypeArgs);
+                    continue;
+                }
+
+                return "unsupported assignment to an added property: " + display + " — use unity_recompile";
+            }
+
+            if ((use is PrefixUnaryExpressionSyntax pre &&
+                    (pre.IsKind(SyntaxKind.PreIncrementExpression) || pre.IsKind(SyntaxKind.PreDecrementExpression))) ||
+                (use is PostfixUnaryExpressionSyntax post &&
+                    (post.IsKind(SyntaxKind.PostIncrementExpression) || post.IsKind(SyntaxKind.PostDecrementExpression))))
+            {
+                return "increment/decrement of an added property: " + display +
+                    " — rewrite it as '+= 1' / '-= 1' or use unity_recompile";
+            }
+
+            if (IsByRefUse(effective))
+                return "added property passed by ref/out: " + display + " — use unity_recompile";
+
+            if (InAssignmentTargetChain(effective))
+            {
+                return "added property in a deconstruction or nested assignment target: " + display +
+                    " — use unity_recompile";
+            }
+
+            // Plain READ in value position.
+            if (getTarget == null)
+            {
+                return "added property has no get accessor to read through: " + display +
+                    " — use unity_recompile";
+            }
+            {
+                string? receiverCold = AccessorReceiverGuard(reference, getTarget, model, enclosingAdded, display);
+                if (receiverCold != null)
+                    return receiverCold;
+                ShimTarget capturedGet = getTarget;
+                ShimTarget? capturedEnclosing = enclosingAdded;
+                string capturedTypeArgs = typeArgumentText;
+                dynamicReplacements[node] = rewrittenNode => BuildAccessorGetCall(
+                    rewrittenNode, capturedGet, capturedEnclosing, capturedTypeArgs);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>True when the (paren-climbed) use site passes the expression
+    /// by reference: a ref/out argument or a `ref` expression (ref locals,
+    /// ref returns).</summary>
+    private static bool IsByRefUse(ExpressionSyntax effective)
+    {
+        if (effective.Parent is RefExpressionSyntax)
+            return true;
+        return effective.Parent is ArgumentSyntax argument &&
+            argument.Expression == effective &&
+            !argument.RefKindKeyword.IsKind(SyntaxKind.None);
+    }
+
+    /// <summary>True when the assignment's value is provably discarded:
+    /// expression statements and for-statement initializer/incrementor
+    /// positions. Everything else (chained assignments, lambda bodies,
+    /// arrow bodies) stays conservative.</summary>
+    private static bool AssignmentResultDiscarded(AssignmentExpressionSyntax assign) =>
+        assign.Parent is ExpressionStatementSyntax || assign.Parent is ForStatementSyntax;
+
+    /// <summary>True when the (paren-climbed) expression sits inside an
+    /// assignment TARGET through tuple/deconstruction nesting.</summary>
+    private static bool InAssignmentTargetChain(ExpressionSyntax effective)
+    {
+        SyntaxNode current = effective;
+        while (true)
+        {
+            switch (current.Parent)
+            {
+                case ParenthesizedExpressionSyntax parens:
+                    current = parens;
+                    continue;
+                case ArgumentSyntax { Parent: TupleExpressionSyntax tuple }:
+                    current = tuple;
+                    continue;
+                case AssignmentExpressionSyntax assignment when assignment.Left == current:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>Receiver shapes the accessor-shim call cannot express:
+    /// `base.P` (no base argument exists), and value-type receivers that are
+    /// not plainly an lvalue (the shim takes self by ref) — including patch-
+    /// typed `this` in KEPT members, whose `(T)(object)this` cast boxes a
+    /// COPY for structs.</summary>
+    private static string? AccessorReceiverGuard(
+        ExpressionSyntax reference,
+        ShimTarget target,
+        SemanticModel model,
+        ShimTarget? enclosingAdded,
+        string display)
+    {
+        ExpressionSyntax? receiver = reference switch
+        {
+            MemberAccessExpressionSyntax memberAccess => memberAccess.Expression,
+            ElementAccessExpressionSyntax elementAccess => elementAccess.Expression,
+            _ => null,
+        };
+
+        if (receiver is BaseExpressionSyntax)
+        {
+            return "added member accessed through base: " + display +
+                " — access it through this or use unity_recompile";
+        }
+        if (!target.HasSelf || !target.SelfIsValueType || target.SelfIsRefLike)
+            return null;
+
+        // By-ref self: the receiver must be a variable.
+        if (receiver == null || receiver is ThisExpressionSyntax)
+        {
+            return enclosingAdded != null
+                ? null // `self` is already the by-ref parameter
+                : "added struct member referenced through this in a kept member: " + display +
+                  " (the patch-typed this cannot be passed by ref to the shim; use unity_recompile)";
+        }
+        if (receiver is IdentifierNameSyntax identifier &&
+            model.GetSymbolInfo(identifier).Symbol is ILocalSymbol or IParameterSymbol or IFieldSymbol)
+        {
+            return null;
+        }
+        return "added struct member needs a simple variable receiver: " + display +
+            " (the shim takes the receiver by ref) — hoist it into a local or use unity_recompile";
+    }
+
+    /// <summary>Compound expansion repeats the receiver and index arguments
+    /// (get, then set): only shapes that cannot observe the duplication
+    /// pass — this/self, locals, parameters, fields, literals and type
+    /// qualifiers (static accessors drop the receiver entirely).</summary>
+    private static string? CompoundRepeatableGuard(
+        ExpressionSyntax reference,
+        ShimTarget target,
+        SemanticModel model,
+        string display)
+    {
+        bool Repeatable(ExpressionSyntax? expression)
+        {
+            switch (expression)
+            {
+                case null:
+                case ThisExpressionSyntax:
+                case LiteralExpressionSyntax:
+                    return true;
+                case IdentifierNameSyntax identifier:
+                    return model.GetSymbolInfo(identifier).Symbol
+                        is ILocalSymbol or IParameterSymbol or IFieldSymbol or INamedTypeSymbol;
+                case MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax } thisMember:
+                    return model.GetSymbolInfo(thisMember).Symbol is IFieldSymbol;
+                default:
+                    return false;
+            }
+        }
+
+        if (target.HasSelf)
+        {
+            ExpressionSyntax? receiver = reference switch
+            {
+                MemberAccessExpressionSyntax memberAccess => memberAccess.Expression,
+                ElementAccessExpressionSyntax elementAccess => elementAccess.Expression,
+                _ => null,
+            };
+            if (!Repeatable(receiver))
+            {
+                return "compound assignment to an added property through a receiver with possible " +
+                    "side effects: " + display + " — hoist the receiver into a local or use unity_recompile";
+            }
+        }
+        if (reference is ElementAccessExpressionSyntax element)
+        {
+            foreach (ArgumentSyntax argument in element.ArgumentList.Arguments)
+            {
+                if (!argument.RefKindKeyword.IsKind(SyntaxKind.None))
+                    return "added indexer takes a by-ref index argument in a compound assignment: " + display +
+                        " — use unity_recompile";
+                if (!Repeatable(argument.Expression))
+                {
+                    return "compound assignment to an added indexer with non-trivial index arguments: " +
+                        display + " — hoist them into locals or use unity_recompile";
+                }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Explicit type arguments for an accessor shim on a generic
+    /// declaring chain. Instance accessors infer everything from `self`;
+    /// STATIC accessors have no argument to infer from, so the chain's type
+    /// arguments materialize explicitly.</summary>
+    private static string AccessorTypeArgumentText(ShimTarget target, IMethodSymbol accessor)
+    {
+        if (!target.GenericShim || target.HasSelf)
+            return "";
+
+        var arguments = new List<ITypeSymbol>();
+        var chain = new List<INamedTypeSymbol>();
+        for (INamedTypeSymbol? current = accessor.ContainingType; current != null; current = current.ContainingType)
+            chain.Insert(0, current);
+        foreach (INamedTypeSymbol type in chain)
+            arguments.AddRange(type.TypeArguments);
+
+        if (arguments.Count != target.TypeParameters.Length)
+            return "";
+        foreach (ITypeSymbol argument in arguments)
+        {
+            if (!IsSpeakableType(argument))
+                return "";
+        }
+        return "<" + string.Join(
+            ", ",
+            arguments.Select(a => a.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))) + ">";
+    }
+
+    /// <summary>Receiver and index arguments of a rewritten reference node:
+    /// `obj.P` → (obj, []), `obj[i, j]` → (obj, [i, j]), bare `P` → (null, []).</summary>
+    private static ExpressionSyntax? AccessorReceiver(
+        ExpressionSyntax rewrittenReference,
+        out IReadOnlyList<ArgumentSyntax> indexArguments)
+    {
+        switch (rewrittenReference)
+        {
+            case MemberAccessExpressionSyntax memberAccess:
+                indexArguments = Array.Empty<ArgumentSyntax>();
+                return memberAccess.Expression;
+            case ElementAccessExpressionSyntax elementAccess:
+                indexArguments = elementAccess.ArgumentList.Arguments;
+                return elementAccess.Expression;
+            default:
+                indexArguments = Array.Empty<ArgumentSyntax>();
+                return null;
+        }
+    }
+
+    /// <summary>The shim call's `self` argument (mirrors
+    /// BuildShimInvocation): null receiver / `this` becomes `self` inside
+    /// added members or the patch-cast `this` in kept members; explicit
+    /// receivers pass through; value types add `ref`. Static targets drop
+    /// the (type-qualifier) receiver entirely — callers return null.</summary>
+    private static ArgumentSyntax? AccessorSelfArgument(
+        ExpressionSyntax? rewrittenReceiver,
+        ShimTarget target,
+        ShimTarget? enclosingAdded)
+    {
+        if (!target.HasSelf)
+            return null;
+
+        ExpressionSyntax selfExpression;
+        if (rewrittenReceiver == null || rewrittenReceiver is ThisExpressionSyntax)
+        {
+            selfExpression = enclosingAdded != null
+                ? SyntaxFactory.IdentifierName("self")
+                : SyntaxFactory.ParseExpression("((" + target.DeclaringTypeFqn + ")(object)this)");
+        }
+        else
+        {
+            selfExpression = rewrittenReceiver.WithoutTrivia();
+        }
+
+        ArgumentSyntax argument = SyntaxFactory.Argument(selfExpression);
+        if (target.SelfIsValueType && !target.SelfIsRefLike)
+            argument = argument.WithRefKindKeyword(SyntaxFactory.Token(SyntaxKind.RefKeyword));
+        return argument;
+    }
+
+    private static InvocationExpressionSyntax AccessorShimInvocation(
+        ShimTarget target,
+        string typeArgumentText,
+        List<ArgumentSyntax> arguments)
+    {
+        return SyntaxFactory.InvocationExpression(
+            SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName + typeArgumentText),
+            SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(arguments)));
+    }
+
+    /// <summary>`obj.P` / `P` / `obj[i]` → `Shims.get_X(obj, i…)`.</summary>
+    private static SyntaxNode BuildAccessorGetCall(
+        SyntaxNode rewrittenReference,
+        ShimTarget getTarget,
+        ShimTarget? enclosingAdded,
+        string typeArgumentText)
+    {
+        ExpressionSyntax? receiver = AccessorReceiver(
+            (ExpressionSyntax)rewrittenReference, out IReadOnlyList<ArgumentSyntax> indexArguments);
+        var arguments = new List<ArgumentSyntax>();
+        ArgumentSyntax? self = AccessorSelfArgument(receiver, getTarget, enclosingAdded);
+        if (self != null)
+            arguments.Add(self);
+        arguments.AddRange(indexArguments);
+        return AccessorShimInvocation(getTarget, typeArgumentText, arguments)
+            .WithTriviaFrom(rewrittenReference);
+    }
+
+    /// <summary>`obj.P = v` → `Shims.set_P(obj, v)`; `obj[i] = v` →
+    /// `Shims.set_Item(obj, i, v)`; `obj.E += h` → `Shims.add_E(obj, h)`.
+    /// Statement positions only (registration gated).</summary>
+    private static SyntaxNode BuildAccessorAssignmentCall(
+        AssignmentExpressionSyntax rewrittenAssign,
+        ShimTarget accessorTarget,
+        ShimTarget? enclosingAdded,
+        string typeArgumentText)
+    {
+        ExpressionSyntax left = UnwrapParens(rewrittenAssign.Left);
+        ExpressionSyntax? receiver = AccessorReceiver(left, out IReadOnlyList<ArgumentSyntax> indexArguments);
+        var arguments = new List<ArgumentSyntax>();
+        ArgumentSyntax? self = AccessorSelfArgument(receiver, accessorTarget, enclosingAdded);
+        if (self != null)
+            arguments.Add(self);
+        arguments.AddRange(indexArguments);
+        arguments.Add(SyntaxFactory.Argument(rewrittenAssign.Right.WithoutTrivia()));
+        return AccessorShimInvocation(accessorTarget, typeArgumentText, arguments)
+            .WithTriviaFrom(rewrittenAssign);
+    }
+
+    /// <summary>`obj.P op= v` → `Shims.set_P(obj, (T)(Shims.get_P(obj) op
+    /// (v)))` — the cast reproduces the compound assignment's implicit
+    /// narrowing (byte/short/char/enum stay compilable). Receiver and index
+    /// arguments repeat; the registration gated them to effect-free shapes.</summary>
+    private static SyntaxNode BuildAccessorCompoundCall(
+        AssignmentExpressionSyntax rewrittenAssign,
+        ShimTarget getTarget,
+        ShimTarget setTarget,
+        SyntaxKind binaryKind,
+        string valueTypeCastFqn,
+        ShimTarget? enclosingAdded,
+        string typeArgumentText)
+    {
+        ExpressionSyntax left = UnwrapParens(rewrittenAssign.Left);
+        ExpressionSyntax? receiver = AccessorReceiver(left, out IReadOnlyList<ArgumentSyntax> indexArguments);
+
+        var getArguments = new List<ArgumentSyntax>();
+        ArgumentSyntax? getSelf = AccessorSelfArgument(receiver, getTarget, enclosingAdded);
+        if (getSelf != null)
+            getArguments.Add(getSelf);
+        getArguments.AddRange(indexArguments);
+        InvocationExpressionSyntax getCall = AccessorShimInvocation(getTarget, typeArgumentText, getArguments);
+
+        ExpressionSyntax computed = SyntaxFactory.CastExpression(
+            SyntaxFactory.ParseTypeName(valueTypeCastFqn),
+            SyntaxFactory.ParenthesizedExpression(SyntaxFactory.BinaryExpression(
+                binaryKind,
+                getCall,
+                SyntaxFactory.ParenthesizedExpression(rewrittenAssign.Right.WithoutTrivia()))));
+
+        var setArguments = new List<ArgumentSyntax>();
+        ArgumentSyntax? setSelf = AccessorSelfArgument(receiver, setTarget, enclosingAdded);
+        if (setSelf != null)
+            setArguments.Add(setSelf);
+        setArguments.AddRange(indexArguments);
+        setArguments.Add(SyntaxFactory.Argument(computed));
+        return AccessorShimInvocation(setTarget, typeArgumentText, setArguments)
+            .WithTriviaFrom(rewrittenAssign);
+    }
+
     // ── B1: kept callers of re-added members ─────────────────────────
 
     /// <summary>Walk every reference to a RE-ADDED member (same-signature
@@ -1870,7 +3286,7 @@ public static class PatchRewriter
         SemanticModel model,
         PatchBatchContext batch,
         HotDiffFileResult diff,
-        Dictionary<MethodDeclarationSyntax, ShimTarget> addedDecls,
+        List<(SyntaxNode Node, ShimTarget Target)> addedBodySpans,
         HashSet<string> newTypeNames,
         List<HotDiffMethod> ensured)
     {
@@ -1904,7 +3320,7 @@ public static class PatchRewriter
             // nameof(...) materializes as a constant — nothing to redirect.
             if (FindEnclosingNameOf(node, model) != null)
                 continue;
-            if (addedDecls.Keys.Any(decl => decl.FullSpan.Contains(node.Span)))
+            if (addedBodySpans.Any(span => span.Node.FullSpan.Contains(node.Span)))
                 continue; // inside an added member: the shim body itself
 
             string? cold = EnsureSiteDetour(node, target, diff, newTypeNames, ensured);
@@ -2161,27 +3577,7 @@ public static class PatchRewriter
 
         var parameters = new List<ParameterSyntax>();
         if (target.HasSelf)
-        {
-            var selfModifiers = new List<SyntaxToken>();
-            if (target.SelfIsRefLike)
-            {
-                // ref-struct receivers cannot be extension receivers in this
-                // language surface: plain by-value static shim.
-            }
-            else if (target.SelfIsValueType)
-            {
-                selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.RefKeyword));
-                selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.ThisKeyword));
-            }
-            else
-            {
-                selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.ThisKeyword));
-            }
-
-            parameters.Add(SyntaxFactory.Parameter(SyntaxFactory.Identifier("self"))
-                .WithModifiers(SyntaxFactory.TokenList(selfModifiers))
-                .WithType(SyntaxFactory.ParseTypeName(target.DeclaringTypeFqn).WithTrailingTrivia(SyntaxFactory.Space)));
-        }
+            parameters.Add(BuildSelfParameter(target));
         parameters.AddRange(decl.ParameterList.Parameters);
 
         MethodDeclarationSyntax shim = SyntaxFactory.MethodDeclaration(decl.ReturnType.WithLeadingTrivia(SyntaxFactory.Space), decl.Identifier.Text)
@@ -2194,29 +3590,171 @@ public static class PatchRewriter
                 ? SyntaxFactory.Token(SyntaxKind.SemicolonToken)
                 : default);
 
-        if (target.GenericShim && target.TypeParameters.Length > 0)
-        {
-            shim = shim.WithTypeParameterList(SyntaxFactory.TypeParameterList(
-                SyntaxFactory.SeparatedList(target.TypeParameters.Select(SyntaxFactory.TypeParameter))));
+        shim = WithShimTypeParameters(shim, target, originalRoot, decl.ConstraintClauses);
 
-            // Carry the declaring chain's constraints so `A<T> self` stays
-            // well-formed (e.g. `where T : class`).
-            var constraints = new List<TypeParameterConstraintClauseSyntax>();
-            foreach (TypeDeclarationSyntax typeDecl in originalRoot.DescendantNodes().OfType<TypeDeclarationSyntax>())
-            {
-                if (HotDiff.MetadataName(typeDecl) != target.DeclaringTypeMetadataName &&
-                    !target.DeclaringTypeMetadataName.StartsWith(HotDiff.MetadataName(typeDecl) + "+", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-                constraints.AddRange(typeDecl.ConstraintClauses);
-            }
-            // The method's OWN constraints (B1) come from the already
-            // rewritten declaration, so type references are requalified.
-            constraints.AddRange(decl.ConstraintClauses);
-            if (constraints.Count > 0)
-                shim = shim.WithConstraintClauses(SyntaxFactory.List(constraints));
+        return shim.NormalizeWhitespace().WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+    }
+
+    /// <summary>The shim's leading `self` parameter (extension receiver;
+    /// by-ref for value types, plain by-value for ref structs).</summary>
+    private static ParameterSyntax BuildSelfParameter(ShimTarget target)
+    {
+        var selfModifiers = new List<SyntaxToken>();
+        if (target.SelfIsRefLike)
+        {
+            // ref-struct receivers cannot be extension receivers in this
+            // language surface: plain by-value static shim.
         }
+        else if (target.SelfIsValueType)
+        {
+            selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.RefKeyword));
+            selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.ThisKeyword));
+        }
+        else
+        {
+            selfModifiers.Add(SyntaxFactory.Token(SyntaxKind.ThisKeyword));
+        }
+
+        return SyntaxFactory.Parameter(SyntaxFactory.Identifier("self"))
+            .WithModifiers(SyntaxFactory.TokenList(selfModifiers))
+            .WithType(SyntaxFactory.ParseTypeName(target.DeclaringTypeFqn).WithTrailingTrivia(SyntaxFactory.Space));
+    }
+
+    /// <summary>Apply the flattened type-parameter list (declaring chain
+    /// + method's own, B1) and carry the chain's constraint clauses so
+    /// `A&lt;T&gt; self` stays well-formed (e.g. `where T : class`).</summary>
+    private static MethodDeclarationSyntax WithShimTypeParameters(
+        MethodDeclarationSyntax shim,
+        ShimTarget target,
+        CompilationUnitSyntax originalRoot,
+        SyntaxList<TypeParameterConstraintClauseSyntax> ownConstraints)
+    {
+        if (!target.GenericShim || target.TypeParameters.Length == 0)
+            return shim;
+
+        shim = shim.WithTypeParameterList(SyntaxFactory.TypeParameterList(
+            SyntaxFactory.SeparatedList(target.TypeParameters.Select(SyntaxFactory.TypeParameter))));
+
+        var constraints = new List<TypeParameterConstraintClauseSyntax>();
+        foreach (TypeDeclarationSyntax typeDecl in originalRoot.DescendantNodes().OfType<TypeDeclarationSyntax>())
+        {
+            if (HotDiff.MetadataName(typeDecl) != target.DeclaringTypeMetadataName &&
+                !target.DeclaringTypeMetadataName.StartsWith(HotDiff.MetadataName(typeDecl) + "+", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            constraints.AddRange(typeDecl.ConstraintClauses);
+        }
+        // The member's OWN constraints (B1) come from the already
+        // rewritten declaration, so type references are requalified.
+        constraints.AddRange(ownConstraints);
+        if (constraints.Count > 0)
+            shim = shim.WithConstraintClauses(SyntaxFactory.List(constraints));
+        return shim;
+    }
+
+    /// <summary>B2: build one accessor shim from the (already rewritten)
+    /// added property/indexer/event declaration:
+    ///   get_P → `static T get_P(self)`        (body = accessor body)
+    ///   set_P → `static void set_P(self, T value)`
+    ///   get_Item/set_Item carry the indexer's parameter list;
+    ///   add_E/remove_E take the handler as `value`.
+    /// Auto-property accessors synthesize a store read/write body.</summary>
+    private static MethodDeclarationSyntax BuildAccessorShimMethod(
+        BasePropertyDeclarationSyntax rewrittenContainer,
+        AddedAccessorInfo info,
+        CompilationUnitSyntax originalRoot)
+    {
+        ShimTarget target = info.Target;
+        bool isGet = target.MethodName.StartsWith("get_", StringComparison.Ordinal);
+
+        var modifiers = new List<SyntaxToken>
+        {
+            SyntaxFactory.Token(SyntaxKind.PublicKeyword),
+            SyntaxFactory.Token(SyntaxKind.StaticKeyword),
+        };
+        foreach (SyntaxToken modifier in rewrittenContainer.Modifiers)
+        {
+            if (modifier.IsKind(SyntaxKind.UnsafeKeyword))
+                modifiers.Add(SyntaxFactory.Token(SyntaxKind.UnsafeKeyword));
+        }
+
+        TypeSyntax returnType = isGet
+            ? rewrittenContainer.Type.WithoutTrivia()
+            : SyntaxFactory.PredefinedType(SyntaxFactory.Token(SyntaxKind.VoidKeyword));
+
+        var parameters = new List<ParameterSyntax>();
+        if (target.HasSelf)
+            parameters.Add(BuildSelfParameter(target));
+        if (rewrittenContainer is IndexerDeclarationSyntax rewrittenIndexer)
+            parameters.AddRange(rewrittenIndexer.ParameterList.Parameters);
+        if (!isGet)
+        {
+            // set_/add_/remove_: the value parameter comes last (`value` is
+            // a legal parameter name — accessor bodies keep compiling).
+            parameters.Add(SyntaxFactory.Parameter(SyntaxFactory.Identifier("value"))
+                .WithType(rewrittenContainer.Type.WithoutTrivia().WithTrailingTrivia(SyntaxFactory.Space)));
+        }
+
+        MethodDeclarationSyntax shim = SyntaxFactory
+            .MethodDeclaration(returnType.WithLeadingTrivia(SyntaxFactory.Space), target.MethodName)
+            .WithModifiers(SyntaxFactory.TokenList(modifiers))
+            .WithParameterList(SyntaxFactory.ParameterList(SyntaxFactory.SeparatedList(parameters)));
+
+        // Locate the rewritten body (the original accessor's KEYWORD finds
+        // its rewritten counterpart — replace passes keep accessor order).
+        AccessorDeclarationSyntax? accessor = null;
+        ArrowExpressionClauseSyntax? arrow = null;
+        if (info.Accessor != null)
+        {
+            string keyword = info.Accessor.Keyword.Text;
+            accessor = (rewrittenContainer.AccessorList?.Accessors ?? default)
+                .FirstOrDefault(a => a.Keyword.Text == keyword);
+        }
+        else
+        {
+            arrow = rewrittenContainer switch
+            {
+                PropertyDeclarationSyntax p => p.ExpressionBody,
+                IndexerDeclarationSyntax i => i.ExpressionBody,
+                _ => null,
+            };
+        }
+
+        if (info.IsAuto && info.Store != null)
+        {
+            string access = info.Store.IsStatic
+                ? info.Store.StoreFqn + "." + info.Store.Name
+                : info.Store.StoreFqn + "." + info.Store.Name + ".Ref(self)";
+            ExpressionSyntax body = SyntaxFactory.ParseExpression(isGet ? access : access + " = value");
+            shim = shim
+                .WithExpressionBody(SyntaxFactory.ArrowExpressionClause(body))
+                .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken));
+        }
+        else if (arrow != null)
+        {
+            shim = shim
+                .WithExpressionBody(arrow)
+                .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken));
+        }
+        else if (accessor?.Body != null)
+        {
+            shim = shim.WithBody(accessor.Body);
+        }
+        else if (accessor?.ExpressionBody != null)
+        {
+            shim = shim
+                .WithExpressionBody(accessor.ExpressionBody)
+                .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken));
+        }
+        else
+        {
+            // Unreachable (HotDiff fails body-less non-auto accessors
+            // closed); an empty body beats a malformed declaration.
+            shim = shim.WithBody(SyntaxFactory.Block());
+        }
+
+        shim = WithShimTypeParameters(shim, target, originalRoot, default);
 
         return shim.NormalizeWhitespace().WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
     }
@@ -2731,7 +4269,23 @@ public static class PatchRewriter
         });
     }
 
-    private static INamedTypeSymbol? FindOriginalType(
+    /// <summary>Resolve a patched type's ORIGINAL symbol across the whole
+    /// reference set — any project assembly works (Assembly-CSharp or an
+    /// asmdef assembly; B3 relies on this being assembly-agnostic).
+    ///
+    /// KNOWN BOUNDARY: matching is by metadata name, FIRST reference wins.
+    /// The request carries no source→assembly attribution, so two project
+    /// assemblies declaring the SAME metadata name cannot be told apart —
+    /// when the first match is not the edited type's home, the layout guard
+    /// fails CLOSED (cold) for differing layouts; layout-identical
+    /// duplicates would detour whichever same-named type Unity's own
+    /// name-based domain scan finds first. The configuration is already
+    /// pathological in user code (Assembly-CSharp auto-references every
+    /// autoReferenced asmdef, so an unqualified use of such a name is a
+    /// CS0433 ambiguity). Pinned by HotPatchTests
+    /// .Same_name_type_in_two_assemblies_binds_first_and_fails_closed.
+    /// Internal for the B6 partial passes (layout ordering, completeness).</summary>
+    internal static INamedTypeSymbol? FindOriginalType(
         CSharpCompilation binding,
         string metadataName,
         out string? assemblyName)

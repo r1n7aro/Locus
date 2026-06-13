@@ -40,6 +40,47 @@ public sealed class ShimTarget
     public string MemberKey = "";
 }
 
+/// <summary>C0 measured (operation × visibility) JIT access matrix, projected
+/// for classification (C2′a): the rewriter consults it to decide whether an
+/// added member's non-public BODY reference may go hot through the existing
+/// IgnoresAccessChecksTo + IgnoreAccessibility mechanism. Null when the
+/// request carried no usable matrix (old plugin, failed probe) — consumers
+/// must then keep today's conservative cold verdicts.</summary>
+public sealed class AccessCaps
+{
+    private readonly Dictionary<string, bool> _cells;
+
+    private AccessCaps(Dictionary<string, bool> cells) => _cells = cells;
+
+    /// <summary>Null when absent or empty: "no measured caps" and "no green
+    /// cells" gate identically (conservative).</summary>
+    public static AccessCaps? FromCells(IReadOnlyDictionary<string, bool>? cells)
+    {
+        if (cells == null || cells.Count == 0)
+            return null;
+        return new AccessCaps(new Dictionary<string, bool>(cells, StringComparer.Ordinal));
+    }
+
+    /// <summary>The "{op}_{visibility}" probe cell measured green on the
+    /// running editor's Mono (AccessProbeSource cell naming).</summary>
+    public bool Allows(string op, string visibility) =>
+        _cells.TryGetValue(op + "_" + visibility, out bool ok) && ok;
+
+    /// <summary>Every canonical probe cell measured green (the universal
+    /// result on every Unity tested so far). The C2′b kept-surface scan
+    /// short-circuits then: nothing it could check can fail, so the
+    /// rewrite pays zero scan cost on green runtimes.</summary>
+    public bool CoversAllCells()
+    {
+        foreach (AccessProbeCell cell in AccessProbeSource.Cells)
+        {
+            if (!Allows(cell.Op, cell.Visibility))
+                return false;
+        }
+        return true;
+    }
+}
+
 /// <summary>
 /// Batch-wide rewrite context (M1): ONE binding compilation over every hot
 /// file's un-renamed tree (source declarations shadow the original metadata,
@@ -93,6 +134,10 @@ public sealed class PatchBatchContext
     /// shadow (CS0436) the earlier holder its re-sent fields still bind to.</summary>
     public string StoreDiscriminator = "";
 
+    /// <summary>Measured runtime access caps for this domain generation
+    /// (C2′a); null = conservative (non-public body references stay cold).</summary>
+    public AccessCaps? RuntimeCaps;
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -106,23 +151,39 @@ public sealed class PatchBatchContext
         IReadOnlyDictionary<string, MemberSurfaceRegistry.ShimEntry> earlierShims,
         IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null,
         string storeDiscriminator = "",
-        bool allowUnsafe = false)
+        bool allowUnsafe = false,
+        AccessCaps? runtimeCaps = null)
     {
+        // The binding model must RESOLVE what the emit will BIND: the emit
+        // compilation has always carried IgnoreAccessibility (kept bodies
+        // legitimately reach the original's privates), so the binding takes
+        // the same flag — otherwise a non-public symbol from pure metadata
+        // (another assembly, or an unedited file of the project assembly:
+        // the batch is named LocusHotPatchBinding, so even "same-assembly"
+        // internals are foreign here) binds to null, the access scans skip
+        // it, and the reference ships hot UNGATED (C2′b). Known boundary,
+        // unchanged from the emit side: an inaccessible overload may now
+        // win resolution over an accessible one — binding and emit at least
+        // agree on it.
+        var bindingOptions = new CSharpCompilationOptions(
+            OutputKind.DynamicallyLinkedLibrary,
+            allowUnsafe: allowUnsafe,
+            metadataImportOptions: MetadataImportOptions.All,
+            assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default);
+        CompileService.ApplyIgnoreAccessibility(bindingOptions);
+
         var context = new PatchBatchContext
         {
             Binding = CSharpCompilation.Create(
                 "LocusHotPatchBinding",
                 files.Select(f => f.Tree),
                 references,
-                new CSharpCompilationOptions(
-                    OutputKind.DynamicallyLinkedLibrary,
-                    allowUnsafe: allowUnsafe,
-                    metadataImportOptions: MetadataImportOptions.All,
-                    assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default)),
+                bindingOptions),
             EarlierShims = earlierShims,
             EarlierFieldStores = earlierFieldStores
                 ?? new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal),
             StoreDiscriminator = storeDiscriminator,
+            RuntimeCaps = runtimeCaps,
         };
 
         foreach (var (_, tree, diff) in files)
@@ -154,10 +215,13 @@ public sealed class PatchBatchContext
 
             foreach (HotDiffMethod added in diff.ChangedMethods.Where(m => m.Added))
             {
+                IMethodSymbol? symbol = null;
                 MethodDeclarationSyntax? decl = FindAddedMethodDeclaration(root, added);
-                if (decl == null)
-                    continue;
-                if (model.GetDeclaredSymbol(decl) is not IMethodSymbol symbol)
+                if (decl != null)
+                    symbol = model.GetDeclaredSymbol(decl);
+                else
+                    symbol = FindAddedAccessorSymbol(root, model, added, out _, out _); // B2 accessors
+                if (symbol == null)
                     continue;
 
                 ShimTarget target = BuildShimTarget(symbol, added);
@@ -196,6 +260,129 @@ public sealed class PatchBatchContext
         }
 
         return context;
+    }
+
+    /// <summary>Locate the accessor declaration an added accessor-shaped
+    /// HotDiffMethod (get_X/set_X/get_Item/set_Item/add_X/remove_X) refers
+    /// to and return its method symbol (B2). `container` is the owning
+    /// property/indexer/event declaration; `accessor` is null for an
+    /// expression-bodied property/indexer (the implicit getter).</summary>
+    internal static IMethodSymbol? FindAddedAccessorSymbol(
+        CompilationUnitSyntax root,
+        SemanticModel model,
+        HotDiffMethod added,
+        out BasePropertyDeclarationSyntax? container,
+        out AccessorDeclarationSyntax? accessor)
+    {
+        container = null;
+        accessor = null;
+
+        foreach (TypeDeclarationSyntax typeDecl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+        {
+            if (HotDiff.MetadataName(typeDecl) != added.DeclaringType)
+                continue;
+
+            foreach (MemberDeclarationSyntax member in typeDecl.Members)
+            {
+                switch (member)
+                {
+                    case PropertyDeclarationSyntax property:
+                    {
+                        if (property.Modifiers.Any(SyntaxKind.StaticKeyword) != added.IsStatic)
+                            continue;
+                        if (added.Name == "get_" + property.Identifier.Text)
+                        {
+                            if (added.ParamTypeNames.Length != 0)
+                                continue;
+                            if (property.ExpressionBody != null)
+                            {
+                                container = property;
+                                return (model.GetDeclaredSymbol(property) as IPropertySymbol)?.GetMethod;
+                            }
+                            AccessorDeclarationSyntax? getter = (property.AccessorList?.Accessors ?? default)
+                                .FirstOrDefault(a => a.Keyword.Text == "get");
+                            if (getter == null)
+                                continue;
+                            container = property;
+                            accessor = getter;
+                            return model.GetDeclaredSymbol(getter);
+                        }
+                        if (added.Name == "set_" + property.Identifier.Text)
+                        {
+                            AccessorDeclarationSyntax? setter = (property.AccessorList?.Accessors ?? default)
+                                .FirstOrDefault(a => a.Keyword.Text is "set" or "init");
+                            if (setter == null)
+                                continue;
+                            if (!HotDiff.AccessorParams(setter, null, HotDiff.TokenText(property.Type))
+                                .SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
+                                continue;
+                            container = property;
+                            accessor = setter;
+                            return model.GetDeclaredSymbol(setter);
+                        }
+                        continue;
+                    }
+
+                    case IndexerDeclarationSyntax indexer when
+                        (added.Name == "get_Item" || added.Name == "set_Item") && !added.IsStatic:
+                    {
+                        if (added.Name == "get_Item")
+                        {
+                            if (indexer.ExpressionBody != null)
+                            {
+                                if (!HotDiff.ParamTypeNames(indexer.ParameterList)
+                                    .SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
+                                    continue;
+                                container = indexer;
+                                return (model.GetDeclaredSymbol(indexer) as IPropertySymbol)?.GetMethod;
+                            }
+                            AccessorDeclarationSyntax? getter = (indexer.AccessorList?.Accessors ?? default)
+                                .FirstOrDefault(a => a.Keyword.Text == "get");
+                            if (getter == null ||
+                                !HotDiff.AccessorParams(getter, indexer.ParameterList, HotDiff.TokenText(indexer.Type))
+                                    .SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
+                            {
+                                continue;
+                            }
+                            container = indexer;
+                            accessor = getter;
+                            return model.GetDeclaredSymbol(getter);
+                        }
+                        AccessorDeclarationSyntax? setter2 = (indexer.AccessorList?.Accessors ?? default)
+                            .FirstOrDefault(a => a.Keyword.Text is "set" or "init");
+                        if (setter2 == null ||
+                            !HotDiff.AccessorParams(setter2, indexer.ParameterList, HotDiff.TokenText(indexer.Type))
+                                .SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
+                        {
+                            continue;
+                        }
+                        container = indexer;
+                        accessor = setter2;
+                        return model.GetDeclaredSymbol(setter2);
+                    }
+
+                    case EventDeclarationSyntax @event:
+                    {
+                        if (@event.Modifiers.Any(SyntaxKind.StaticKeyword) != added.IsStatic)
+                            continue;
+                        string? keyword =
+                            added.Name == "add_" + @event.Identifier.Text ? "add"
+                            : added.Name == "remove_" + @event.Identifier.Text ? "remove"
+                            : null;
+                        if (keyword == null)
+                            continue;
+                        AccessorDeclarationSyntax? eventAccessor = (@event.AccessorList?.Accessors ?? default)
+                            .FirstOrDefault(a => a.Keyword.Text == keyword);
+                        if (eventAccessor == null)
+                            continue;
+                        container = @event;
+                        accessor = eventAccessor;
+                        return model.GetDeclaredSymbol(eventAccessor);
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     internal static MethodDeclarationSyntax? FindAddedMethodDeclaration(CompilationUnitSyntax root, HotDiffMethod added)

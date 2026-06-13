@@ -500,14 +500,19 @@ namespace Game
     }
 
     [Fact]
-    public void Auto_property_added_is_cold()
+    public void Auto_property_added_is_hot_with_store_backing()
     {
+        // B2: the accessor pair shims and the backing field virtualizes
+        // through an M4 store.
         var result = Analyze(
             PlayerOld,
             PlayerOld.Replace("public void Update()", "public int Mana { get; set; }\n        public void Update()"));
 
-        Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Contains(result.ChangedMethods, m => m.Name == "get_Mana" && m.Added);
+        Assert.Contains(result.ChangedMethods, m => m.Name == "set_Mana" && m.Added);
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("<Mana>k__BackingField", change.Name);
     }
 
     [Fact]
@@ -793,15 +798,230 @@ class C
     }
 
     [Fact]
-    public void Property_added_is_cold()
+    public void Property_added_is_hot_with_accessor_shims()
     {
         const string oldText = "class A { void M() { } }";
-        const string newText = "class A { void M() { } int Value { get { return 1; } } }";
+        const string newText = "class A { void M() { } int Value { get { return 1; } set { M(); } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal(2, result.ChangedMethods.Count);
+        var getter = result.ChangedMethods.Single(m => m.Name == "get_Value");
+        Assert.True(getter.Added);
+        Assert.Empty(getter.ParamTypeNames);
+        Assert.False(getter.IsStatic);
+        var setter = result.ChangedMethods.Single(m => m.Name == "set_Value");
+        Assert.True(setter.Added);
+        Assert.Equal(new[] { "Int32" }, setter.ParamTypeNames);
+        Assert.Empty(result.FieldChanges);
+        Assert.Equal(new[] { "A" }, result.PatchedTypes);
+    }
+
+    [Fact]
+    public void Expression_bodied_property_added_is_hot_as_getter()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } int Value => 41; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var getter = Assert.Single(result.ChangedMethods);
+        Assert.True(getter.Added);
+        Assert.Equal("get_Value", getter.Name);
+    }
+
+    [Fact]
+    public void Static_property_added_is_hot()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } static int Value { get { return 1; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var getter = Assert.Single(result.ChangedMethods);
+        Assert.True(getter.IsStatic);
+        Assert.Equal("get_Value", getter.Name);
+    }
+
+    [Fact]
+    public void Added_virtual_property_is_cold()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public virtual int Value { get { return 1; } } }";
 
         var result = Analyze(oldText, newText);
 
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("property added"));
+        Assert.Contains(result.Reasons, r => r.Contains("virtual member added"));
+    }
+
+    [Fact]
+    public void Added_property_with_base_access_is_cold()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public string Tag { get { return base.ToString(); } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("base access"));
+    }
+
+    [Fact]
+    public void Added_explicit_interface_property_is_cold()
+    {
+        const string oldText = "interface I { int V { get; } } class A : I { public int V { get { return 1; } } }";
+        const string newText = "interface I { int V { get; } } class A : I { public int V { get { return 1; } } int I.Hidden { get { return 2; } } }";
+
+        // The interface itself did not change; the class adds an explicit
+        // implementation (which would also fail the interface diff if I
+        // changed — this isolates the member-level guard).
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+    }
+
+    [Fact]
+    public void Added_indexer_is_hot_with_item_accessors()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public string this[int i, string k] { get { return k; } set { M(); } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var getter = result.ChangedMethods.Single(m => m.Name == "get_Item");
+        Assert.True(getter.Added);
+        Assert.Equal(new[] { "Int32", "String" }, getter.ParamTypeNames);
+        var setter = result.ChangedMethods.Single(m => m.Name == "set_Item");
+        Assert.Equal(new[] { "Int32", "String", "String" }, setter.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Added_event_with_accessors_is_hot()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public event System.Action Fired { add { M(); } remove { M(); } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var add = result.ChangedMethods.Single(m => m.Name == "add_Fired");
+        Assert.True(add.Added);
+        Assert.Equal(new[] { "Action" }, add.ParamTypeNames);
+        Assert.Contains(result.ChangedMethods, m => m.Name == "remove_Fired");
+    }
+
+    [Fact]
+    public void Added_field_like_event_is_cold_with_pointed_reason()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public event System.Action Fired; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("field-like event added"));
+    }
+
+    [Fact]
+    public void Added_auto_property_is_hot_with_backing_field_store()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public int Cargo { get; set; } = 5; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Contains(result.ChangedMethods, m => m.Name == "get_Cargo" && m.Added);
+        Assert.Contains(result.ChangedMethods, m => m.Name == "set_Cargo" && m.Added);
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("<Cargo>k__BackingField", change.Name);
+        Assert.Equal("added", change.Kind);
+        Assert.False(change.IsStatic);
+        // The initializer rides the instance-initializer ctor redirect.
+        Assert.Contains(result.ChangedMethods, m => m.IsCtor && !m.Added);
+    }
+
+    [Fact]
+    public void Added_static_auto_property_uses_static_holder()
+    {
+        const string oldText = "class A { void M() { } }";
+        const string newText = "class A { void M() { } public static int Total { get; set; } = 7; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var change = Assert.Single(result.FieldChanges);
+        Assert.Equal("<Total>k__BackingField", change.Name);
+        Assert.True(change.IsStatic);
+    }
+
+    [Fact]
+    public void Added_auto_property_on_struct_is_cold()
+    {
+        const string oldText = "struct A { public int V; }";
+        const string newText = "struct A { public int V; public int Cargo { get; set; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("struct field layout changed"));
+    }
+
+    [Fact]
+    public void Added_auto_property_in_generic_type_is_cold()
+    {
+        const string oldText = "class A<T> { void M() { } }";
+        const string newText = "class A<T> { void M() { } public int Cargo { get; set; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("generic type field layout changed"));
+    }
+
+    [Fact]
+    public void Full_property_added_in_generic_type_is_hot()
+    {
+        const string oldText = "class A<T> { void M() { } }";
+        const string newText = "class A<T> { void M() { } public int Depth { get { return 3; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var getter = Assert.Single(result.ChangedMethods);
+        Assert.Equal("get_Depth", getter.Name);
+        Assert.True(getter.Added);
+    }
+
+    [Fact]
+    public void Auto_to_full_property_conversion_is_cold()
+    {
+        const string oldText = "class A { public int V { get; set; } }";
+        const string newText = "class A { int _v; public int V { get { return _v; } set { _v = value; } } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("field layout changed"));
+    }
+
+    [Fact]
+    public void Kept_auto_property_initializer_edit_still_redirects_ctor()
+    {
+        const string oldText = "class A { public int V { get; set; } = 1; }";
+        const string newText = "class A { public int V { get; set; } = 2; }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var ctor = Assert.Single(result.ChangedMethods);
+        Assert.True(ctor.IsCtor);
+        Assert.False(ctor.Added);
     }
 
     [Fact]
@@ -1099,6 +1319,25 @@ namespace Game
     }
 
     [Fact]
+    public void Generic_method_with_two_type_parameters_decomposes_carrying_both()
+    {
+        // B1: the remove+add path preserves the full method type-parameter
+        // list (the shim flattens chain + method parameters) — the diff
+        // matrix otherwise only exercises 0 or 1 type parameters.
+        const string oldText = "class A { public T1 M<T1, T2>(T1 a, T2 b) { return a; } }";
+        const string newText = "class A { public T1 M<T1, T2>(T1 a, T2 b) { System.Console.WriteLine(1); return a; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Single(result.RemovedMembers, m => m.Name == "M");
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(2, added.TypeParameterCount);
+        Assert.Equal(new[] { "T1", "T2" }, added.ParamTypeNames);
+    }
+
+    [Fact]
     public void Generic_method_added_is_hot_as_shim()
     {
         const string oldText = "class A { }";
@@ -1150,16 +1389,185 @@ namespace Game
         Assert.Contains(result.Reasons, r => r.Contains("Unity message methods cannot take the remove+add path"));
     }
 
+    // ── B6: partial types ────────────────────────────────────────────
+
     [Fact]
-    public void Partial_type_in_file_is_cold()
+    public void Partial_type_body_change_is_hot()
     {
         const string oldText = "partial class A { void M() { } }";
         const string newText = "partial class A { void M() { System.Console.WriteLine(1); } }";
 
         var result = Analyze(oldText, newText);
 
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("A", method.DeclaringType);
+        Assert.Equal("M", method.Name);
+        Assert.False(method.Added);
+        Assert.Equal(new[] { "A" }, result.PatchedTypes);
+    }
+
+    [Fact]
+    public void Partial_type_two_parts_in_one_file_merge_for_the_member_diff()
+    {
+        const string oldText =
+            "partial class A { void M() { } }\n" +
+            "partial class A { int N() { return 1; } }";
+        const string newText =
+            "partial class A { void M() { } }\n" +
+            "partial class A { int N() { return 2; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("N", method.Name);
+    }
+
+    [Fact]
+    public void Partial_type_added_member_is_hot()
+    {
+        const string oldText = "partial class A { int M() { return 1; } }";
+        const string newText = "partial class A { int M() { return Extra(); } int Extra() { return 2; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        Assert.Contains(result.ChangedMethods, m => m.Name == "Extra" && m.Added);
+        Assert.Contains(result.ChangedMethods, m => m.Name == "M" && !m.Added);
+    }
+
+    [Fact]
+    public void Partial_type_field_added_is_cold()
+    {
+        const string oldText = "partial class A { int M() { return 1; } }";
+        const string newText = "partial class A { int _x; int M() { return _x; } }";
+
+        var result = Analyze(oldText, newText);
+
         Assert.False(result.Hot);
-        Assert.Contains(result.Reasons, r => r.Contains("partial type in file"));
+        Assert.Contains(result.Reasons, r => r.Contains("partial type field layout changed"));
+    }
+
+    [Fact]
+    public void Partial_type_static_field_added_is_cold()
+    {
+        const string oldText = "partial class A { int M() { return 1; } }";
+        const string newText = "partial class A { static int S; int M() { return S; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial type field layout changed"));
+    }
+
+    [Fact]
+    public void Partial_type_instance_initializer_change_is_cold()
+    {
+        const string oldText = "partial class A { int _x = 1; int M() { return _x; } }";
+        const string newText = "partial class A { int _x = 2; int M() { return _x; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial type instance initializer changed"));
+    }
+
+    [Fact]
+    public void Partial_part_added_to_file_is_cold()
+    {
+        const string oldText = "partial class A { void M() { } }";
+        const string newText = "partial class A { void M() { } }\npartial class A { void N() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial type part count changed"));
+    }
+
+    [Fact]
+    public void Partial_part_removed_from_file_is_cold()
+    {
+        const string oldText = "partial class A { void M() { } }\nclass B { }";
+        const string newText = "class B { }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial type part removed"));
+    }
+
+    [Fact]
+    public void New_partial_type_declaration_is_cold()
+    {
+        const string oldText = "class B { }";
+        const string newText = "class B { }\npublic partial class A { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("new partial type declaration"));
+    }
+
+    [Fact]
+    public void Partial_modifier_added_to_existing_type_is_cold()
+    {
+        const string oldText = "public class A { void M() { } }";
+        const string newText = "public partial class A { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("type declaration changed"));
+    }
+
+    [Fact]
+    public void Using_change_in_file_with_partial_type_is_cold()
+    {
+        const string oldText = "using System;\npartial class A { void M() { } }";
+        const string newText = "using System;\nusing System.Text;\npartial class A { void M() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("using directives changed in a file with a partial type"));
+    }
+
+    [Fact]
+    public void Partial_method_declared_twice_in_one_file_is_cold()
+    {
+        const string oldText = "partial class A { partial void M(); }\npartial class A { partial void M() { } }";
+        const string newText = "partial class A { partial void M(); }\npartial class A { partial void M() { System.Console.WriteLine(1); } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial method declared twice in this file"));
+    }
+
+    [Fact]
+    public void Duplicate_non_partial_type_declaration_is_cold()
+    {
+        const string oldText = "class A { void M() { } }\nclass A { void N() { } }";
+        const string newText = "class A { void M() { System.Console.WriteLine(1); } }\nclass A { void N() { } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("duplicate type declaration"));
+    }
+
+    [Fact]
+    public void Partial_struct_body_change_is_hot()
+    {
+        const string oldText = "partial struct A { public int M() { return 1; } }";
+        const string newText = "partial struct A { public int M() { return 2; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot);
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("M", method.Name);
     }
 
     [Fact]

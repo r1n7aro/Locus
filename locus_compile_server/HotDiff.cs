@@ -220,30 +220,51 @@ public static class HotDiff
             return result;
         }
 
-        Dictionary<string, BaseTypeDeclarationSyntax> oldTypes = CollectTypes(oldRoot, result.Reasons);
-        Dictionary<string, BaseTypeDeclarationSyntax> newTypes = CollectTypes(newRoot, result.Reasons);
+        Dictionary<string, List<BaseTypeDeclarationSyntax>> oldTypes = CollectTypes(oldRoot, result.Reasons);
+        Dictionary<string, List<BaseTypeDeclarationSyntax>> newTypes = CollectTypes(newRoot, result.Reasons);
         if (result.Reasons.Count > 0)
             return result;
 
         foreach (string removed in oldTypes.Keys.Where(k => !newTypes.ContainsKey(k)).OrderBy(k => k, StringComparer.Ordinal))
         {
-            ClassifyRemovedType(removed, oldTypes[removed], oldRoot, result);
+            // B6: a vanished PARTIAL declaration is not a type removal — the
+            // type usually lives on through its other parts (other files or
+            // a generator), and the M5 tombstone/stub machinery would treat
+            // a still-alive type as deleted.
+            if (IsPartialParts(oldTypes[removed]))
+            {
+                result.Reasons.Add("partial type part removed: " + removed +
+                    " (other parts may still declare the type; use unity_recompile)");
+                return result;
+            }
+            ClassifyRemovedType(removed, oldTypes[removed][0], oldRoot, result);
             if (result.Reasons.Count > 0)
                 return result;
         }
 
         foreach (var pair in newTypes)
         {
-            if (!oldTypes.ContainsKey(pair.Key))
-                result.NewTypes.Add(pair.Key);
+            if (oldTypes.ContainsKey(pair.Key))
+                continue;
+            // B6: a NEW partial declaration is ambiguous from one file — it
+            // may be a part added to an EXISTING type (a layout/member merge
+            // no patch can express) or a brand-new type whose other parts
+            // (disk or generator) are invisible here. Fail closed (v1).
+            if (IsPartialParts(pair.Value))
+            {
+                result.Reasons.Add("new partial type declaration: " + pair.Key +
+                    " (other parts may exist on disk or come from a source generator; use unity_recompile)");
+                return result;
+            }
+            result.NewTypes.Add(pair.Key);
         }
 
         foreach (var pair in newTypes)
         {
-            if (!oldTypes.TryGetValue(pair.Key, out BaseTypeDeclarationSyntax? oldDecl))
+            if (!oldTypes.TryGetValue(pair.Key, out List<BaseTypeDeclarationSyntax>? oldParts))
                 continue;
 
-            DiffType(pair.Key, oldDecl, pair.Value, result);
+            DiffType(pair.Key, oldParts, pair.Value, result);
             if (result.Reasons.Count > 0)
                 return result;
         }
@@ -257,7 +278,21 @@ public static class HotDiff
             // directives — fail the file closed first.
             foreach (var pair in newTypes)
             {
-                if (!oldTypes.ContainsKey(pair.Key) || pair.Value is not TypeDeclarationSyntax type)
+                if (!oldTypes.ContainsKey(pair.Key))
+                    continue;
+                // B6 (v1): the whole-file re-detour cannot reason about
+                // members declared by OTHER parts (their files keep the old
+                // directives, yet initializers/ctors interleave with this
+                // part's members in the compiled type).
+                if (IsPartialParts(pair.Value))
+                {
+                    result.ChangedMethods.Clear();
+                    result.PatchedTypes.Clear();
+                    result.Reasons.Add("using directives changed in a file with a partial type: " +
+                        pair.Key + " (the whole-file re-detour cannot cover the other parts; use unity_recompile)");
+                    return result;
+                }
+                if (pair.Value[0] is not TypeDeclarationSyntax type)
                     continue;
                 string? gate = UsingRehookGateReason(pair.Key, type);
                 if (gate != null)
@@ -270,7 +305,7 @@ public static class HotDiff
             }
             foreach (var pair in newTypes)
             {
-                if (!oldTypes.ContainsKey(pair.Key) || pair.Value is not TypeDeclarationSyntax type)
+                if (!oldTypes.ContainsKey(pair.Key) || pair.Value[0] is not TypeDeclarationSyntax type)
                     continue;
                 if (type is InterfaceDeclarationSyntax)
                     continue; // gate guarantees no default implementations
@@ -286,11 +321,16 @@ public static class HotDiff
 
     // ── type collection ──────────────────────────────────────────────
 
-    private static Dictionary<string, BaseTypeDeclarationSyntax> CollectTypes(
+    /// <summary>One metadata type name → its declarations in THIS file, in
+    /// source order. Non-partial types always have exactly one part; partial
+    /// types (B6) may have several in one file — and further parts in OTHER
+    /// files, which the batch pulls in as baseline siblings (the per-file
+    /// diff only ever speaks about the members this file declares).</summary>
+    private static Dictionary<string, List<BaseTypeDeclarationSyntax>> CollectTypes(
         CompilationUnitSyntax root,
         List<string> reasons)
     {
-        var types = new Dictionary<string, BaseTypeDeclarationSyntax>(StringComparer.Ordinal);
+        var types = new Dictionary<string, List<BaseTypeDeclarationSyntax>>(StringComparer.Ordinal);
 
         foreach (BaseTypeDeclarationSyntax decl in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
         {
@@ -300,19 +340,32 @@ public static class HotDiff
                 return types;
             }
 
-            // A patch source only contains this file's part: compiling it
-            // would drop the other parts' members and fields.
-            if (decl.Modifiers.Any(SyntaxKind.PartialKeyword))
+            string metadataName = MetadataName(decl);
+            if (!types.TryGetValue(metadataName, out List<BaseTypeDeclarationSyntax>? parts))
+                types[metadataName] = parts = new List<BaseTypeDeclarationSyntax>();
+            parts.Add(decl);
+        }
+
+        // Same-name declarations are only legal as partial parts; a duplicate
+        // without the modifier would not compile (CS0101/CS0260) — fail
+        // closed so a real compile surfaces the error.
+        foreach (var pair in types)
+        {
+            if (pair.Value.Count > 1 &&
+                pair.Value.Any(d => !d.Modifiers.Any(SyntaxKind.PartialKeyword)))
             {
-                reasons.Add("partial type in file: " + decl.Identifier.Text);
+                reasons.Add("duplicate type declaration: " + pair.Key);
                 return types;
             }
-
-            types[MetadataName(decl)] = decl;
         }
 
         return types;
     }
+
+    /// <summary>Any part declared `partial` (a single partial declaration
+    /// counts: the other parts may live in other files or a generator).</summary>
+    private static bool IsPartialParts(List<BaseTypeDeclarationSyntax> parts) =>
+        parts.Any(d => d.Modifiers.Any(SyntaxKind.PartialKeyword));
 
     /// <summary>"Ns.Sub.Outer+Inner`1" — CLR metadata naming.</summary>
     internal static string MetadataName(BaseTypeDeclarationSyntax decl)
@@ -350,56 +403,88 @@ public static class HotDiff
 
     private static void DiffType(
         string metadataName,
-        BaseTypeDeclarationSyntax oldDecl,
-        BaseTypeDeclarationSyntax newDecl,
+        List<BaseTypeDeclarationSyntax> oldParts,
+        List<BaseTypeDeclarationSyntax> newParts,
         HotDiffFileResult result)
     {
-        if (oldDecl.RawKind != newDecl.RawKind)
+        // B6: a part added to (or dropped from) THIS file changes how the
+        // compiler interleaves the type's members — no per-file diff can
+        // verify the result. Matching counts pair parts by source order.
+        if (oldParts.Count != newParts.Count)
         {
-            result.Reasons.Add("type kind changed: " + metadataName);
+            result.Reasons.Add("partial type part count changed in file: " + metadataName +
+                " (parts cannot be hot-added or hot-removed; use unity_recompile)");
             return;
+        }
+        for (int i = 0; i < oldParts.Count; i++)
+        {
+            if (oldParts[i].RawKind != newParts[i].RawKind)
+            {
+                result.Reasons.Add("type kind changed: " + metadataName);
+                return;
+            }
         }
 
         // Enum values are inlined constants: changes/removals/reorders are
         // unverifiable (no metadata trace) and stay cold. APPEND-ONLY
         // additions are safe — existing code never references them — and
-        // batch references materialize as cast literals (H7e).
-        if (oldDecl is EnumDeclarationSyntax || newDecl is EnumDeclarationSyntax)
+        // batch references materialize as cast literals (H7e). Enums cannot
+        // be partial, so both sides are single-part here.
+        if (oldParts[0] is EnumDeclarationSyntax || newParts[0] is EnumDeclarationSyntax)
         {
-            if (TokenText(oldDecl) == TokenText(newDecl))
+            if (TokenText(oldParts[0]) == TokenText(newParts[0]))
                 return;
-            DiffEnum(metadataName, (EnumDeclarationSyntax)oldDecl, (EnumDeclarationSyntax)newDecl, result);
+            DiffEnum(metadataName, (EnumDeclarationSyntax)oldParts[0], (EnumDeclarationSyntax)newParts[0], result);
             return;
         }
 
         // Interfaces: default-implementation bodies dispatch through the
         // IMT, where Mono detour reliability is unverified; signature-only
         // members are pure type surface. Any interface change stays cold.
-        if (oldDecl is InterfaceDeclarationSyntax)
+        if (oldParts[0] is InterfaceDeclarationSyntax)
         {
-            if (TokenText(oldDecl) != TokenText(newDecl))
-                result.Reasons.Add(
-                    "interface changed: " + metadataName +
-                    " (interface dispatch cannot be hot-patched)");
+            for (int i = 0; i < oldParts.Count; i++)
+            {
+                if (TokenText(oldParts[i]) != TokenText(newParts[i]))
+                {
+                    result.Reasons.Add(
+                        "interface changed: " + metadataName +
+                        " (interface dispatch cannot be hot-patched)");
+                    return;
+                }
+            }
             return;
         }
 
-        var oldType = (TypeDeclarationSyntax)oldDecl;
-        var newType = (TypeDeclarationSyntax)newDecl;
+        List<TypeDeclarationSyntax> oldTypeParts = oldParts.Cast<TypeDeclarationSyntax>().ToList();
+        List<TypeDeclarationSyntax> newTypeParts = newParts.Cast<TypeDeclarationSyntax>().ToList();
 
-        if (TypeHeaderText(oldType) != TypeHeaderText(newType))
+        for (int i = 0; i < oldTypeParts.Count; i++)
         {
-            result.Reasons.Add("type declaration changed: " + metadataName);
-            return;
+            if (TypeHeaderText(oldTypeParts[i]) != TypeHeaderText(newTypeParts[i]))
+            {
+                result.Reasons.Add("type declaration changed: " + metadataName);
+                return;
+            }
         }
 
-        bool genericContext = IsGenericContext(newType);
-        bool burstContext = HasBurstCompileAttribute(oldType) || HasBurstCompileAttribute(newType);
+        bool isPartial = IsPartialParts(oldParts) || IsPartialParts(newParts);
+        // Generic/Burst context comes from the REAL parts (parent chains
+        // intact); the merged views below are detached synthetic nodes.
+        bool genericContext = newTypeParts.Any(IsGenericContext);
+        bool burstContext = oldTypeParts.Any(HasBurstCompileAttribute) || newTypeParts.Any(HasBurstCompileAttribute);
+
+        // B6: same-file parts merge into ONE member-level view (members
+        // concatenated in source order) so every member diff below sees the
+        // whole in-file surface. Members of OTHER files' parts are out of
+        // scope by construction: they are unchanged baselines.
+        TypeDeclarationSyntax oldType = MergeParts(oldTypeParts);
+        TypeDeclarationSyntax newType = MergeParts(newTypeParts);
 
         // M4: plain field add/remove/retype virtualizes through stores;
         // everything else layout-shaped stays cold.
         int fieldChangesBefore = result.FieldChanges.Count;
-        if (!DiffFieldLayout(metadataName, oldType, newType, genericContext, result))
+        if (!DiffFieldLayout(metadataName, oldType, newType, genericContext, isPartial, result))
             return;
         bool fieldsChanged = result.FieldChanges.Count > fieldChangesBefore;
 
@@ -467,6 +552,16 @@ public static class HotDiff
                 result.Reasons.Add("generic type initializer changed: " + metadataName);
                 return;
             }
+            if (isPartial)
+            {
+                // B6 (v1): initializers compile into every non-chained
+                // constructor — and a partial type's constructors (or the
+                // lack of an explicit one) can only be seen across ALL
+                // parts, which this per-file diff cannot.
+                result.Reasons.Add("partial type instance initializer changed: " + metadataName +
+                    " (initializers compile into constructors that may live in other parts; use unity_recompile)");
+                return;
+            }
 
             // Instance field/auto-property initializers compile into every
             // non-chained constructor: redirect them all (or the implicit
@@ -490,6 +585,18 @@ public static class HotDiff
 
         if (patched)
             result.PatchedTypes.Add(metadataName);
+    }
+
+    /// <summary>Single member-level view of same-file partial parts: the
+    /// first part with every part's members concatenated in source order.
+    /// DETACHED synthetic node when merging really happened — callers must
+    /// not walk its parents (generic/Burst context is computed from the real
+    /// parts before merging).</summary>
+    private static TypeDeclarationSyntax MergeParts(List<TypeDeclarationSyntax> parts)
+    {
+        if (parts.Count == 1)
+            return parts[0];
+        return parts[0].WithMembers(SyntaxFactory.List(parts.SelectMany(p => p.Members)));
     }
 
     // ── enum additions (H7e) ─────────────────────────────────────────
@@ -722,12 +829,14 @@ public static class HotDiff
     /// FIELD additions, removals and retypes become FieldChanges (hot via
     /// store virtualization); auto-property/event-field changes, kept-field
     /// reorders, modifier/attribute changes, and any field change on a
-    /// struct or generic type stay cold. Returns false on cold.</summary>
+    /// struct, generic or partial (B6 v1) type stay cold. Returns false on
+    /// cold.</summary>
     private static bool DiffFieldLayout(
         string metadataName,
         TypeDeclarationSyntax oldType,
         TypeDeclarationSyntax newType,
         bool genericContext,
+        bool isPartial,
         HotDiffFileResult result)
     {
         List<FieldDeclaratorEntry> oldFields = InstanceFieldEntries(oldType);
@@ -766,13 +875,44 @@ public static class HotDiff
                 removed.Add(field);
         }
 
+        // B2: a NEW field-like event would need compiler-generated accessors
+        // and a backing delegate field in the original layout — point-name
+        // it ahead of the generic skeleton verdict. (Removals/changes keep
+        // the layout verdict below.)
+        var oldEventFieldNames = EventFieldNames(oldType);
+        foreach (string eventName in EventFieldNames(newType))
+        {
+            if (!oldEventFieldNames.Contains(eventName))
+            {
+                result.Reasons.Add("field-like event added: " + metadataName + "." + eventName +
+                    " (the compiler-generated accessors and backing field need a real compile; " +
+                    "declare explicit add/remove accessors or use unity_recompile)");
+                return false;
+            }
+        }
+
+        // B2: auto-properties ADDED by the edit virtualize their backing
+        // field (accessor shims + M4 store) — exclude them from the skeleton
+        // and record the backing-field change. A same-named pre-existing
+        // property of ANY shape keeps the conservative layout verdict
+        // (shape conversions move real backing storage).
+        var oldPropertyNames = new HashSet<string>(
+            oldType.Members.OfType<PropertyDeclarationSyntax>().Select(p => p.Identifier.Text),
+            StringComparer.Ordinal);
+        var addedAutoProps = newType.Members.OfType<PropertyDeclarationSyntax>()
+            .Where(p => IsAutoProperty(p) && !oldPropertyNames.Contains(p.Identifier.Text))
+            .ToList();
+        var addedAutoNames = new HashSet<string>(
+            addedAutoProps.Select(p => p.Identifier.Text), StringComparer.Ordinal);
+
         // Kept fields, auto-properties and field-like events must keep
         // their exact shape and relative order: the skeleton sequence
-        // (added/removed fields excluded) is compared verbatim.
+        // (added/removed fields and added auto-properties excluded) is
+        // compared verbatim.
         var addedNames = new HashSet<string>(added.Select(f => f.Name), StringComparer.Ordinal);
         var removedNames = new HashSet<string>(removed.Select(f => f.Name), StringComparer.Ordinal);
-        List<string> oldSkeleton = LayoutSkeleton(oldType, removedNames);
-        List<string> newSkeleton = LayoutSkeleton(newType, addedNames);
+        List<string> oldSkeleton = LayoutSkeleton(oldType, removedNames, new HashSet<string>(StringComparer.Ordinal));
+        List<string> newSkeleton = LayoutSkeleton(newType, addedNames, addedAutoNames);
         if (!oldSkeleton.SequenceEqual(newSkeleton, StringComparer.Ordinal))
         {
             result.Reasons.Add("field layout changed: " + metadataName +
@@ -787,7 +927,8 @@ public static class HotDiff
         var staticAdded = newStatics.Values.Where(f => !oldStatics.ContainsKey(f.Name)).ToList();
         var staticRemoved = oldStatics.Values.Where(f => !newStatics.ContainsKey(f.Name)).ToList();
 
-        if (added.Count == 0 && removed.Count == 0 && staticAdded.Count == 0 && staticRemoved.Count == 0)
+        if (added.Count == 0 && removed.Count == 0 && staticAdded.Count == 0 && staticRemoved.Count == 0 &&
+            addedAutoProps.Count == 0)
             return true;
 
         if (newType is StructDeclarationSyntax)
@@ -799,6 +940,16 @@ public static class HotDiff
         if (genericContext)
         {
             result.Reasons.Add("generic type field layout changed: " + metadataName);
+            return false;
+        }
+        if (isPartial)
+        {
+            // B6 (v1): field virtualization re-materializes initializers
+            // into the type's constructors and anchors removed-field
+            // placeholders by in-file position — both undefined when other
+            // parts (other files, generators) contribute to the layout.
+            result.Reasons.Add("partial type field layout changed: " + metadataName +
+                " (cross-part field virtualization is not supported; use unity_recompile)");
             return false;
         }
 
@@ -845,8 +996,32 @@ public static class HotDiff
                 IsStatic = true,
             });
         }
+        // B2: added auto-properties virtualize their backing field. The
+        // FieldChange carries the METADATA backing name (layout
+        // verification); the rewriter binds it to the property declaration.
+        foreach (PropertyDeclarationSyntax property in addedAutoProps)
+        {
+            result.FieldChanges.Add(new HotDiffFieldChange
+            {
+                DeclaringType = metadataName,
+                Name = AutoPropertyBackingFieldName(property.Identifier.Text),
+                Kind = "added",
+                IsStatic = property.Modifiers.Any(SyntaxKind.StaticKeyword),
+            });
+        }
 
         return true;
+    }
+
+    private static HashSet<string> EventFieldNames(TypeDeclarationSyntax type)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (EventFieldDeclarationSyntax eventField in type.Members.OfType<EventFieldDeclarationSyntax>())
+        {
+            foreach (VariableDeclaratorSyntax declarator in eventField.Declaration.Variables)
+                names.Add(declarator.Identifier.Text);
+        }
+        return names;
     }
 
     private static List<FieldDeclaratorEntry> InstanceFieldEntries(TypeDeclarationSyntax type)
@@ -900,11 +1075,15 @@ public static class HotDiff
         return entries;
     }
 
-    /// <summary>The layout sequence with added/removed plain fields
-    /// excluded: kept fields shrink to name markers (their shape equality is
-    /// checked separately), auto-properties and field-like events keep their
-    /// full shape text — so any change or reorder among them stays cold.</summary>
-    private static List<string> LayoutSkeleton(TypeDeclarationSyntax type, HashSet<string> excludedFieldNames)
+    /// <summary>The layout sequence with added/removed plain fields (and B2:
+    /// added auto-properties) excluded: kept fields shrink to name markers
+    /// (their shape equality is checked separately), auto-properties and
+    /// field-like events keep their full shape text — so any change or
+    /// reorder among them stays cold.</summary>
+    private static List<string> LayoutSkeleton(
+        TypeDeclarationSyntax type,
+        HashSet<string> excludedFieldNames,
+        HashSet<string> excludedAutoPropertyNames)
     {
         var sequence = new List<string>();
         foreach (MemberDeclarationSyntax member in type.Members)
@@ -932,6 +1111,8 @@ public static class HotDiff
                     break;
 
                 case PropertyDeclarationSyntax property when IsAutoProperty(property):
+                    if (excludedAutoPropertyNames.Contains(property.Identifier.Text))
+                        break;
                     sequence.Add(
                         "autoprop|" + ModifiersText(property.Modifiers) + "|" +
                         AttributeListsText(property.AttributeLists) + "|" +
@@ -1353,7 +1534,10 @@ public static class HotDiff
                     "O|" + op.OperatorToken.Text + "|" + ParamKey(op.ParameterList),
                 ConversionOperatorDeclarationSyntax conv =>
                     "V|" + conv.ImplicitOrExplicitKeyword.Text + "|" + TokenText(conv.Type) + "|" + ParamKey(conv.ParameterList),
-                PropertyDeclarationSyntax property when !IsAutoProperty(property) =>
+                // Auto-properties join the member diff for the ADDED case
+                // (B2); every kept-pair change is intercepted earlier by the
+                // layout skeleton / initializer diffs (they run first).
+                PropertyDeclarationSyntax property =>
                     "P|" + (property.ExplicitInterfaceSpecifier != null ? TokenText(property.ExplicitInterfaceSpecifier) : "") +
                     property.Identifier.Text,
                 IndexerDeclarationSyntax indexer =>
@@ -1370,9 +1554,18 @@ public static class HotDiff
 
             if (members.ContainsKey(key))
             {
-                // Same signature twice would not compile; treat as cold so a
-                // real compile surfaces the error.
-                reasons.Add("duplicate member signature: " + metadataName);
+                // B6 (v1): a partial METHOD whose defining and implementing
+                // declarations live in the SAME file (merged part view)
+                // legally carries one signature twice — the member pairing
+                // below cannot tell the halves apart, so fail closed by
+                // name. (Split across FILES each side diffs alone and flows
+                // normally.) Any other duplicate would not compile.
+                bool partialMethodPair =
+                    member is MethodDeclarationSyntax dup && dup.Modifiers.Any(SyntaxKind.PartialKeyword);
+                reasons.Add(partialMethodPair
+                    ? "partial method declared twice in this file: " + metadataName +
+                      " (move the implementing declaration to another part or use unity_recompile)"
+                    : "duplicate member signature: " + metadataName);
                 return members;
             }
             members.Add(key, member);
@@ -1479,14 +1672,111 @@ public static class HotDiff
                 return true;
 
             case PropertyDeclarationSyntax property:
-                // Properties add metadata surface even when they are backed
-                // only by methods; external call sites cannot bind to them
-                // until the original assembly is recompiled.
-                result.Reasons.Add("property added: " + metadataName + "." + property.Identifier.Text);
-                return false;
+            {
+                // B2: an added property decomposes into accessor shims
+                // (get_X/set_X) — call sites only exist inside the batch
+                // (the surface is new), and the rewriter materializes them
+                // as direct shim calls. Auto-properties additionally
+                // virtualize their backing field through an M4 store
+                // (DiffFieldLayout recorded the FieldChange).
+                string display = property.Identifier.Text;
+                string? guard = AddedAccessorMemberGuard(
+                    metadataName, display, property, property.Modifiers,
+                    property.ExplicitInterfaceSpecifier != null, burstContext,
+                    property.AccessorList?.Accessors ?? default);
+                if (guard != null)
+                {
+                    result.Reasons.Add(guard);
+                    return false;
+                }
+                bool propertyStatic = property.Modifiers.Any(SyntaxKind.StaticKeyword);
+                if (property.ExpressionBody != null)
+                {
+                    AddMethod(result, metadataName, "get_" + display, Array.Empty<string>(),
+                        propertyStatic, isCtor: false, added: true);
+                    return true;
+                }
+                bool auto = IsAutoProperty(property);
+                foreach (AccessorDeclarationSyntax accessor in property.AccessorList?.Accessors ?? default)
+                {
+                    if (!auto && accessor.Body == null && accessor.ExpressionBody == null)
+                    {
+                        // Mixed auto/bodied accessors do not compile; fail
+                        // closed so a real compile surfaces the error.
+                        result.Reasons.Add("added property accessor has no body: " + metadataName + "." + display);
+                        return false;
+                    }
+                    AddMethod(result, metadataName, AccessorName(accessor, display),
+                        AccessorParams(accessor, null, TokenText(property.Type)),
+                        propertyStatic, isCtor: false, added: true);
+                }
+                return true;
+            }
 
-            case IndexerDeclarationSyntax:
-            case EventDeclarationSyntax:
+            case IndexerDeclarationSyntax indexer:
+            {
+                // B2: get_Item/set_Item accessor shims, parameterized by the
+                // indexer's own parameter list.
+                string? guard = AddedAccessorMemberGuard(
+                    metadataName, "this[]", indexer, indexer.Modifiers,
+                    indexer.ExplicitInterfaceSpecifier != null, burstContext,
+                    indexer.AccessorList?.Accessors ?? default);
+                if (guard != null)
+                {
+                    result.Reasons.Add(guard);
+                    return false;
+                }
+                if (indexer.ExpressionBody != null)
+                {
+                    AddMethod(result, metadataName, "get_Item", ParamTypeNames(indexer.ParameterList),
+                        isStatic: false, isCtor: false, added: true);
+                    return true;
+                }
+                foreach (AccessorDeclarationSyntax accessor in indexer.AccessorList?.Accessors ?? default)
+                {
+                    if (accessor.Body == null && accessor.ExpressionBody == null)
+                    {
+                        result.Reasons.Add("added indexer accessor has no body: " + metadataName + ".this[]");
+                        return false;
+                    }
+                    AddMethod(result, metadataName, AccessorName(accessor, "Item"),
+                        AccessorParams(accessor, indexer.ParameterList, TokenText(indexer.Type)),
+                        isStatic: false, isCtor: false, added: true);
+                }
+                return true;
+            }
+
+            case EventDeclarationSyntax @event:
+            {
+                // B2: add_X/remove_X accessor shims. Field-like events
+                // (EventFieldDeclaration) never reach here — DiffFieldLayout
+                // names them cold (compiler-generated accessors + backing
+                // delegate field).
+                string display = @event.Identifier.Text;
+                string? guard = AddedAccessorMemberGuard(
+                    metadataName, display, @event, @event.Modifiers,
+                    @event.ExplicitInterfaceSpecifier != null, burstContext,
+                    @event.AccessorList?.Accessors ?? default);
+                if (guard != null)
+                {
+                    result.Reasons.Add(guard);
+                    return false;
+                }
+                bool eventStatic = @event.Modifiers.Any(SyntaxKind.StaticKeyword);
+                foreach (AccessorDeclarationSyntax accessor in @event.AccessorList?.Accessors ?? default)
+                {
+                    if (accessor.Body == null && accessor.ExpressionBody == null)
+                    {
+                        result.Reasons.Add("added event accessor has no body: " + metadataName + "." + display);
+                        return false;
+                    }
+                    string prefix = accessor.Keyword.Text == "add" ? "add_" : "remove_";
+                    AddMethod(result, metadataName, prefix + display, new[] { SimpleTypeName(@event.Type) },
+                        eventStatic, isCtor: false, added: true);
+                }
+                return true;
+            }
+
             case OperatorDeclarationSyntax:
             case ConversionOperatorDeclarationSyntax:
                 // Adding these is rare and their call sites live outside the
@@ -1498,6 +1788,44 @@ public static class HotDiff
                 return true;
         }
     }
+
+    /// <summary>Shared B2 gate for added accessor-shaped members
+    /// (property/indexer/event): the same structural blockers as added
+    /// methods — Burst, explicit interface, virtual slots, `base.` access
+    /// (a static shim cannot express any of them). Null when hot.</summary>
+    private static string? AddedAccessorMemberGuard(
+        string metadataName,
+        string displayName,
+        MemberDeclarationSyntax member,
+        SyntaxTokenList modifiers,
+        bool explicitInterface,
+        bool burstContext,
+        SyntaxList<AccessorDeclarationSyntax> accessors)
+    {
+        if (burstContext || HasBurstCompileAttribute(member) || accessors.Any(HasBurstCompileAttribute))
+            return "Burst-compiled member added: " + metadataName + "." + displayName;
+        if (explicitInterface)
+            return "explicit interface implementation added: " + metadataName;
+        if (modifiers.Any(m =>
+            m.IsKind(SyntaxKind.VirtualKeyword) || m.IsKind(SyntaxKind.OverrideKeyword) ||
+            m.IsKind(SyntaxKind.AbstractKeyword) || m.IsKind(SyntaxKind.SealedKeyword)))
+        {
+            // Shims are static dispatch; a new virtual slot (or an override
+            // of one) cannot be reproduced without a real compile.
+            return "virtual member added: " + metadataName + "." + displayName +
+                " (virtual dispatch needs a real compile; use unity_recompile)";
+        }
+        if (member.DescendantNodes().OfType<BaseExpressionSyntax>().Any())
+        {
+            return "added member uses base access: " + metadataName + "." + displayName +
+                " (base calls cannot be expressed by a shim; use unity_recompile)";
+        }
+        return null;
+    }
+
+    /// <summary>Compiler naming of an auto-property's backing field.</summary>
+    internal static string AutoPropertyBackingFieldName(string propertyName) =>
+        "<" + propertyName + ">k__BackingField";
 
     /// <summary>Classify a member that only exists in the OLD text (M5).
     /// Returns false (with a reason) when it forces the cold path; otherwise
