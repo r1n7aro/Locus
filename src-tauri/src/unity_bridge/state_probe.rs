@@ -652,6 +652,16 @@ fn cached_observer_state(project_path: &str, now_ms: u64) -> Option<SemanticStat
     entry.current.clone()
 }
 
+pub(crate) fn clear_project_observer_state(project_path: &str) {
+    if let Ok(mut runtime) = observer_runtime().lock() {
+        if let Some(entry) = runtime.projects.get_mut(&project_key(project_path)) {
+            entry.current = None;
+            entry.history.clear();
+            entry.last_observed_at_ms = None;
+        }
+    }
+}
+
 fn observer_observation(project_path: &str) -> Option<ObserverObservation> {
     let runtime = observer_runtime().lock().ok()?;
     let entry = runtime.projects.get(&project_key(project_path))?;

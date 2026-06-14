@@ -2370,7 +2370,9 @@ pub async fn launch_unity_project(
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<crate::unity_bridge::UnityLaunchResult, AppError> {
     let cwd = workspace.path.read().await.clone();
-    crate::unity_bridge::launch_project(&cwd).map_err(Into::into)
+    crate::unity_bridge::launch_project(&cwd)
+        .await
+        .map_err(Into::into)
 }
 
 /// Drive a Unity recompile + domain reload and wait for it to settle. Thin

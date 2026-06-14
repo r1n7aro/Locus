@@ -596,6 +596,73 @@ fn pipe_response_transient_broker_error(response: &PipeResponse) -> bool {
             .unwrap_or(false)
 }
 
+const SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS: u32 = 3;
+const SHORT_MESSAGE_TRANSIENT_READY_WAIT: Duration = Duration::from_secs(30);
+
+fn transient_broker_error_from_response(response: &PipeResponse) -> Option<&str> {
+    if response.ok {
+        return None;
+    }
+    response
+        .error
+        .as_deref()
+        .filter(|error| is_transient_broker_error(error))
+}
+
+async fn wait_before_transient_retry(
+    project_path: &str,
+    context: &str,
+    error: &str,
+    attempt: u32,
+) -> Result<(), String> {
+    eprintln!(
+        "[Locus] {context} hit transient Unity broker state on attempt {attempt}: {error}; waiting for bridge readiness"
+    );
+    wait_for_unity_bridge_ready(project_path, SHORT_MESSAGE_TRANSIENT_READY_WAIT, context).await
+}
+
+pub(crate) async fn send_message_with_transient_retry(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    timeout: Duration,
+    context: &str,
+) -> Result<PipeResponse, String> {
+    let mut attempt = 1;
+    loop {
+        let resp = send_message_with_timeout(project_path, msg_type, message, timeout).await?;
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
+        else {
+            return Ok(resp);
+        };
+        if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
+            return Ok(resp);
+        }
+        wait_before_transient_retry(project_path, context, &error, attempt).await?;
+        attempt += 1;
+    }
+}
+
+async fn send_message_without_timeout_with_transient_retry(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+) -> Result<PipeResponse, String> {
+    let mut attempt = 1;
+    loop {
+        let resp = send_message_without_timeout(project_path, msg_type, message).await?;
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
+        else {
+            return Ok(resp);
+        };
+        if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
+            return Ok(resp);
+        }
+        wait_before_transient_retry(project_path, msg_type, &error, attempt).await?;
+        attempt += 1;
+    }
+}
+
 pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
 pub const UNITY_EDITOR_STATUS_DISCONNECTED: &str = "disconnected";
@@ -633,6 +700,7 @@ pub struct UnityLaunchResult {
     pub editor_path: String,
     pub project_path: String,
     pub project_version: String,
+    pub process_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1042,7 +1110,7 @@ fn normalized_project_path_for_launch(project_path: &str) -> PathBuf {
     dunce::canonicalize(trimmed).unwrap_or_else(|_| Path::new(trimmed).to_path_buf())
 }
 
-pub fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
+pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
     if !is_unity_project(project_path) {
         return Err("Current working directory is not a Unity project".to_string());
     }
@@ -1067,24 +1135,42 @@ pub fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    command.spawn().map_err(|error| {
+    let child = command.spawn().map_err(|error| {
         format!(
             "Failed to launch Unity Editor '{}': {}",
             editor_path.display(),
             error
         )
     })?;
+    let process_id = child.id();
+    let checked_at_ms = unix_now_ms();
+    let editor_path = editor_path.display().to_string();
+    let project_path = project_path.display().to_string();
+
+    process::cache_project_editor_process(
+        &project_path,
+        UnityEditorProcessInfo {
+            state: UnityEditorProcessState::Running,
+            process_id: Some(process_id),
+            executable_path: Some(editor_path.clone()),
+            project_path: Some(project_path.clone()),
+            checked_at_ms,
+            last_error: None,
+        },
+    )
+    .await;
+    state_probe::clear_project_observer_state(&project_path);
 
     eprintln!(
-        "[Locus] launched Unity Editor: editor='{}', project='{}'",
-        editor_path.display(),
-        project_path.display()
+        "[Locus] launched Unity Editor: editor='{}', project='{}', process_id={}",
+        editor_path, project_path, process_id
     );
 
     Ok(UnityLaunchResult {
-        editor_path: editor_path.display().to_string(),
-        project_path: project_path.display().to_string(),
+        editor_path,
+        project_path,
         project_version,
+        process_id,
     })
 }
 
@@ -2175,27 +2261,33 @@ fn rewrite_run_states_output_for_size(
 async fn sidecar_compile_for_run_states(
     project_path: &str,
     prepared_request: &serde_json::Value,
-    register_image: bool,
+    cache_mode: RunStatesCompileCacheMode,
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
         Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
     };
 
-    match crate::csharp_compile::compile_run_states(
-        &params,
-        prepared_request,
-        false,
-        register_image,
-    )
-    .await
-    {
+    let cache_key = run_states_compile_cache_key(project_path, &params, prepared_request);
+    if cache_mode == RunStatesCompileCacheMode::Consume {
+        if let Some(key) = cache_key.as_deref() {
+            if let Some(cached) = take_cached_run_states_compile(key) {
+                return SidecarCompileAttempt::Compiled {
+                    payload: cached.payload,
+                };
+            }
+        }
+    }
+
+    match crate::csharp_compile::compile_run_states(&params, prepared_request, false, false).await {
         Ok(Ok(assembly)) => {
-            let payload = serde_json::json!({
-                "assembly_b64": assembly.assembly_b64,
-                "entry_type": assembly
-                    .entry_type
-                    .unwrap_or_else(|| RUN_STATES_ENTRY_TYPE_FALLBACK.to_string()),
+            let assembly_b64 = assembly.assembly_b64;
+            let assembly_path = assembly.assembly_path;
+            let entry_type = assembly
+                .entry_type
+                .unwrap_or_else(|| RUN_STATES_ENTRY_TYPE_FALLBACK.to_string());
+            let mut payload = serde_json::json!({
+                "entry_type": entry_type,
                 "request_editor_status": prepared_request
                     .get("request_editor_status")
                     .and_then(serde_json::Value::as_str)
@@ -2204,9 +2296,33 @@ async fn sidecar_compile_for_run_states(
                     .get("initial_state")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
-            })
-            .to_string();
-            SidecarCompileAttempt::Compiled { payload }
+            });
+            if let Some(object) = payload.as_object_mut() {
+                if let Some(path) = assembly_path {
+                    object.insert("assembly_path".to_string(), serde_json::Value::String(path));
+                } else {
+                    object.insert(
+                        "assembly_b64".to_string(),
+                        serde_json::Value::String(assembly_b64),
+                    );
+                }
+            }
+            let payload = payload.to_string();
+            let compiled = SidecarCompileAttempt::Compiled {
+                payload: payload.clone(),
+            };
+            if cache_mode == RunStatesCompileCacheMode::Store {
+                if let Some(key) = cache_key {
+                    store_cached_run_states_compile(
+                        key,
+                        CachedRunStatesAssembly {
+                            payload,
+                            inserted_at_ms: unix_now_ms(),
+                        },
+                    );
+                }
+            }
+            compiled
         }
         Ok(Err(failure)) => SidecarCompileAttempt::CompileError(if failure.stage == "validation" {
             failure.message
@@ -2229,7 +2345,13 @@ pub async fn unity_run_states(
     let mut payload = serde_json::to_string(&prepared.request)
         .map_err(|error| format!("Failed to serialize unity_run_states request: {}", error))?;
     if crate::csharp_compile::is_enabled() {
-        match sidecar_compile_for_run_states(project_path, &prepared.request, true).await {
+        match sidecar_compile_for_run_states(
+            project_path,
+            &prepared.request,
+            RunStatesCompileCacheMode::Consume,
+        )
+        .await
+        {
             SidecarCompileAttempt::Compiled { payload: loaded } => {
                 msg_type = "run_states_loaded";
                 payload = loaded;
@@ -2300,7 +2422,13 @@ pub async fn compile_run_states(
     // touches it). The pre-check image is never loaded into Unity, so it
     // must not enter the session image registry.
     if crate::csharp_compile::is_enabled() {
-        match sidecar_compile_for_run_states(project_path, &prepared.request, false).await {
+        match sidecar_compile_for_run_states(
+            project_path,
+            &prepared.request,
+            RunStatesCompileCacheMode::Store,
+        )
+        .await
+        {
             SidecarCompileAttempt::Compiled { .. } => {
                 return Ok("run_states compilation ok".to_string());
             }
@@ -2335,10 +2463,11 @@ pub async fn compile_run_states(
 }
 
 /// Pre-compile a View Script (compile_named / invoke_named) request in the
-/// sidecar. On success the request gains `assembly_b64` / `assembly_id`
-/// fields: a current Unity plugin loads those bytes on a cache miss instead
-/// of compiling, an older plugin ignores the extra fields and compiles from
-/// source exactly as before — so no fallback handshake is needed.
+/// sidecar. On success the request gains `assembly_path` (or a base64
+/// fallback) plus `assembly_id`: a current Unity plugin loads the artifact on
+/// a cache miss instead of compiling, an older plugin ignores the extra
+/// fields and compiles from source exactly as before — so no fallback
+/// handshake is needed.
 ///
 /// Returns `Ok(Some(augmented))` to send, `Ok(None)` to send the original
 /// request (sidecar unavailable), or `Err` with a deterministic compile
@@ -2384,10 +2513,63 @@ async fn augment_view_script_request_with_sidecar(
         Ok(Ok(assembly)) => {
             let mut augmented = request.clone();
             if let Some(object) = augmented.as_object_mut() {
+                if let Some(path) = assembly.assembly_path {
+                    object.insert("assembly_path".to_string(), serde_json::Value::String(path));
+                } else {
+                    object.insert(
+                        "assembly_b64".to_string(),
+                        serde_json::Value::String(assembly.assembly_b64),
+                    );
+                }
                 object.insert(
-                    "assembly_b64".to_string(),
-                    serde_json::Value::String(assembly.assembly_b64),
+                    "assembly_id".to_string(),
+                    serde_json::Value::String(assembly.assembly_name),
                 );
+                Ok(Some(augmented))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(Err(failure)) => Err(failure.message),
+        Err(error) => {
+            crate::csharp_compile::note_fallback(&error);
+            Ok(None)
+        }
+    }
+}
+
+/// Pre-compile a Skill Package Unity script bundle in the sidecar. The
+/// augmented request keeps the source payload so current Unity plugins can
+/// fall back to their local compiler if the precompiled assembly cannot be
+/// loaded.
+async fn augment_skill_package_request_with_sidecar(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    if !crate::csharp_compile::is_enabled() {
+        return Ok(None);
+    }
+
+    let params = match sidecar_compile_params(project_path).await {
+        Ok(params) => params,
+        Err(reason) => {
+            crate::csharp_compile::note_fallback(&reason);
+            return Ok(None);
+        }
+    };
+
+    match crate::csharp_compile::compile_skill_package(&params, request).await {
+        Ok(Ok(assembly)) => {
+            let mut augmented = request.clone();
+            if let Some(object) = augmented.as_object_mut() {
+                if let Some(path) = assembly.assembly_path {
+                    object.insert("assembly_path".to_string(), serde_json::Value::String(path));
+                } else {
+                    object.insert(
+                        "assembly_b64".to_string(),
+                        serde_json::Value::String(assembly.assembly_b64),
+                    );
+                }
                 object.insert(
                     "assembly_id".to_string(),
                     serde_json::Value::String(assembly.assembly_name),
@@ -2431,7 +2613,9 @@ pub async fn compile_skill_package(
 ) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let payload = serde_json::to_string(request).map_err(|error| {
+    let augmented = augment_skill_package_request_with_sidecar(project_path, request).await?;
+    let effective_request = augmented.as_ref().unwrap_or(request);
+    let payload = serde_json::to_string(effective_request).map_err(|error| {
         format!(
             "Failed to serialize compile_skill_package request: {}",
             error
@@ -2545,7 +2729,9 @@ async fn send_view_binding_message(
     let _guard = op_lock.lock().await;
     let payload = serde_json::to_string(request)
         .map_err(|error| format!("Failed to serialize {} request: {}", message_type, error))?;
-    let resp = send_message_without_timeout(project_path, message_type, &payload).await?;
+    let resp =
+        send_message_without_timeout_with_transient_retry(project_path, message_type, &payload)
+            .await?;
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
@@ -2835,11 +3021,12 @@ pub async fn refresh_unity_type_index(
         }
     }
 
-    let resp = send_message_with_timeout(
+    let resp = send_message_with_transient_retry(
         project_path,
         "export_type_index",
         "",
         Duration::from_secs(30),
+        "while exporting the Unity type index",
     )
     .await?;
 
@@ -2880,11 +3067,12 @@ pub struct UnityTypeIndexUpdateResult {
 }
 
 async fn current_unity_type_index_fingerprint(project_path: &str) -> Result<String, String> {
-    let resp = send_message_with_timeout(
+    let resp = send_message_with_transient_retry(
         project_path,
         "export_type_index_fingerprint",
         "",
         Duration::from_secs(10),
+        "while refreshing the Unity type-index fingerprint",
     )
     .await?;
 
@@ -3077,6 +3265,84 @@ enum SidecarCompileAttempt {
     Unavailable(String),
 }
 
+#[derive(Clone)]
+struct CachedRunStatesAssembly {
+    payload: String,
+    inserted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStatesCompileCacheMode {
+    Store,
+    Consume,
+}
+
+const RUN_STATES_COMPILE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+const RUN_STATES_COMPILE_CACHE_MAX: usize = 16;
+
+fn run_states_compile_cache() -> &'static StdMutex<HashMap<String, CachedRunStatesAssembly>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, CachedRunStatesAssembly>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn run_states_compile_cache_key(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    prepared_request: &serde_json::Value,
+) -> Option<String> {
+    let request_bytes = serde_json::to_vec(prepared_request).ok()?;
+    Some(format!(
+        "{}\n{}\n{}\n{}",
+        project_runtime_key(project_path),
+        params.fingerprint,
+        params.domain_generation,
+        sha256_hex(&request_bytes)
+    ))
+}
+
+fn prune_run_states_compile_cache(cache: &mut HashMap<String, CachedRunStatesAssembly>) {
+    let now = unix_now_ms();
+    cache.retain(|_, entry| {
+        now.saturating_sub(entry.inserted_at_ms) <= RUN_STATES_COMPILE_CACHE_TTL_MS
+    });
+    if cache.len() <= RUN_STATES_COMPILE_CACHE_MAX {
+        return;
+    }
+    let mut entries: Vec<(String, u64)> = cache
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.inserted_at_ms))
+        .collect();
+    entries.sort_by_key(|(_, inserted_at)| *inserted_at);
+    let remove_count = cache.len().saturating_sub(RUN_STATES_COMPILE_CACHE_MAX);
+    for (key, _) in entries.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
+}
+
+fn take_cached_run_states_compile(key: &str) -> Option<CachedRunStatesAssembly> {
+    let mut cache = run_states_compile_cache().lock().ok()?;
+    prune_run_states_compile_cache(&mut cache);
+    cache.remove(key)
+}
+
+fn store_cached_run_states_compile(key: String, entry: CachedRunStatesAssembly) {
+    if let Ok(mut cache) = run_states_compile_cache().lock() {
+        prune_run_states_compile_cache(&mut cache);
+        cache.insert(key, entry);
+        prune_run_states_compile_cache(&mut cache);
+    }
+}
+
 const SNIPPET_ENTRY_TYPE_FALLBACK: &str = "Locus.RuntimeSnippets.__LocusAsyncSnippetHost";
 const RUN_STATES_ENTRY_TYPE_FALLBACK: &str = "Locus.RuntimeStateMachines.__LocusRunStatesHost";
 
@@ -3116,21 +3382,33 @@ async fn sidecar_compile_for_execute(
     };
 
     let compile_started = std::time::Instant::now();
-    match crate::csharp_compile::compile_snippet(&params, prepared_code, false, true).await {
+    match crate::csharp_compile::compile_snippet(&params, prepared_code, false, false).await {
         Ok(Ok(assembly)) => {
+            let assembly_b64 = assembly.assembly_b64;
+            let assembly_path = assembly.assembly_path;
+            let entry_type = assembly
+                .entry_type
+                .unwrap_or_else(|| SNIPPET_ENTRY_TYPE_FALLBACK.to_string());
             eprintln!(
                 "[CsharpCompile] snippet compiled in {}ms ({} KB, mode {})",
                 compile_started.elapsed().as_millis(),
-                assembly.assembly_b64.len() / 1024,
+                assembly_b64.len() / 1024,
                 assembly.mode.as_deref().unwrap_or("?")
             );
-            let payload = serde_json::json!({
-                "assembly_b64": assembly.assembly_b64,
-                "entry_type": assembly
-                    .entry_type
-                    .unwrap_or_else(|| SNIPPET_ENTRY_TYPE_FALLBACK.to_string()),
-            })
-            .to_string();
+            let mut payload = serde_json::json!({
+                "entry_type": entry_type,
+            });
+            if let Some(object) = payload.as_object_mut() {
+                if let Some(path) = assembly_path {
+                    object.insert("assembly_path".to_string(), serde_json::Value::String(path));
+                } else {
+                    object.insert(
+                        "assembly_b64".to_string(),
+                        serde_json::Value::String(assembly_b64),
+                    );
+                }
+            }
+            let payload = payload.to_string();
             SidecarCompileAttempt::Compiled { payload }
         }
         Ok(Err(failure)) => {
@@ -3975,6 +4253,44 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ReloadStateMessage {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    domain_generation: String,
+    #[serde(default)]
+    converged_serial: i64,
+}
+
+/// Read Unity's reload lifecycle — the per-process session id, per-domain
+/// generation, and the serial that advances on every successful compilation —
+/// for the hot-reload coordinator. Best-effort: any failure (pipe down,
+/// mid-reload, a plugin predating the message) returns None and the caller
+/// retries on the next poll.
+async fn fetch_reload_state(project_path: &str) -> Option<(String, String, i64)> {
+    let resp = send_message_with_timeout(
+        project_path,
+        "get_reload_state",
+        "",
+        Duration::from_secs(4),
+    )
+    .await
+    .ok()?;
+    if !resp.ok {
+        return None;
+    }
+    let parsed: ReloadStateMessage = serde_json::from_str(resp.message.as_deref()?).ok()?;
+    if parsed.session_id.is_empty() || parsed.domain_generation.is_empty() {
+        return None;
+    }
+    Some((
+        parsed.session_id,
+        parsed.domain_generation,
+        parsed.converged_serial,
+    ))
+}
+
 pub async fn start_unity_monitor(
     app_handle: AppHandle,
     project_path: String,
@@ -3989,12 +4305,20 @@ pub async fn start_unity_monitor(
         pipe_name
     );
     state_probe::start_observer(&project_path);
+    // The status badge's unapplied count reflects the workspace this monitor
+    // watches (not stale pending from a prior project / another editor).
+    crate::unity_hotreload::coordinator::set_active_project(&project_path);
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
         let mut last_detected_editor_process: Option<UnityEditorProcessInfo> = None;
         let mut disconnected_attempts: u32 = 0;
         let mut last_play_mode: Option<bool> = None;
+        // Whether a reload-state baseline has landed since the current connection
+        // came up. Stays false until a fetch actually succeeds, so a failed
+        // connect-time probe keeps retrying every poll instead of leaving the
+        // first successful sample to coincide with a post-edit state.
+        let mut reload_state_seeded = false;
 
         loop {
             let mut status = query_unity_connection_status(&project_path).await;
@@ -4018,12 +4342,9 @@ pub async fn start_unity_monitor(
             }
 
             if connected {
-                if last_status != Some(true) {
+                let just_connected = last_status != Some(true);
+                if just_connected {
                     eprintln!("[Locus] Unity Editor connected! (pipe: {})", pipe_name);
-                    // Distinguishes a real domain reload from a transient
-                    // pipe drop: detour state is only cleared when the
-                    // domain generation actually moved (P2-1).
-                    crate::unity_hotreload::coordinator::on_pipe_reconnected(&project_path).await;
                     // Pre-start the compile-server sidecar (and JIT-warm
                     // Roslyn) so the first unity_execute does not pay the
                     // cold-start cost. No-op while the feature is off.
@@ -4044,10 +4365,47 @@ pub async fn start_unity_monitor(
                         });
                     }
                 }
+                // Reconcile the hot-reload "unapplied" set against the editor's
+                // reload lifecycle on every poll (not only on reconnect): a
+                // Unity-initiated recompile (manual Ctrl+R, save, focus
+                // auto-refresh) converges it like a Locus recompile, while a
+                // bare domain reload (entering play mode) keeps edits pending —
+                // detected whether or not the pipe dropped across the reload,
+                // and a transient pipe drop within one domain keeps detours.
+                //
+                // ALWAYS establish a reload-state baseline before any edit:
+                // otherwise an edit that compiles before the first sample would
+                // be the first sample and only seed, missing the convergence (or,
+                // worse, be mistaken for a startup-compiled survivor). Keep
+                // retrying until a fetch lands (a connect-time probe can fail
+                // mid-startup); afterwards keep observing whenever the feature is
+                // on OR there is outstanding tracking (so toggling hot reload off
+                // with pending work does not strand a stale count).
+                if !reload_state_seeded
+                    || crate::unity_hotreload::is_enabled()
+                    || crate::unity_hotreload::coordinator::has_pending_state(&project_path).await
+                {
+                    if let Some((session, generation, serial)) =
+                        fetch_reload_state(&project_path).await
+                    {
+                        crate::unity_hotreload::coordinator::observe_reload_state(
+                            &project_path,
+                            session,
+                            generation,
+                            serial,
+                        )
+                        .await;
+                        reload_state_seeded = true;
+                    }
+                }
                 disconnected_attempts = 0;
             } else {
                 disconnected_attempts = disconnected_attempts.saturating_add(1);
                 status.reconnect_attempts = disconnected_attempts;
+                // Lost the editor: a relaunch is a fresh instance, so force a new
+                // baseline on reconnect rather than judging it against the dead
+                // session's trackers.
+                reload_state_seeded = false;
 
                 match status.last_error.as_deref() {
                     Some(error) if last_status != Some(false) => {
@@ -4099,6 +4457,12 @@ pub async fn start_unity_monitor(
                     apply_unity_process_info(&mut status, process_info);
                     if process_not_running {
                         sync_background_hook_for_status(&mut status, &project_path).await;
+                        // The editor is gone: reset its dead detour state but KEEP
+                        // the tracked edits — they are still not in any running
+                        // editor. A relaunch's startup recompile loads them, and
+                        // the next reload-state sample converges them then (or
+                        // keeps them if that compile fails).
+                        crate::unity_hotreload::coordinator::on_editor_exited(&project_path).await;
                     }
                 }
             }
@@ -4144,9 +4508,10 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
+        is_transient_broker_error, pipe_response_transient_broker_error,
         read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
-        rewrite_run_states_output_for_size, UnityBackgroundHookState, UnityBackgroundHookStatus,
-        UnityConnectionStatus, UnityEditorProcessState,
+        rewrite_run_states_output_for_size, PipeResponse, UnityBackgroundHookState,
+        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
     };
     use serde_json::json;
 
@@ -4187,6 +4552,32 @@ mod tests {
             },
             checked_at_ms,
         }
+    }
+
+    #[test]
+    fn managed_reload_errors_are_retryable_transient_broker_responses() {
+        for error in [
+            "managed_reloading",
+            "managed_not_ready",
+            "domain_reload_interrupted",
+        ] {
+            assert!(is_transient_broker_error(error), "{error}");
+            assert!(pipe_response_transient_broker_error(&PipeResponse {
+                ok: false,
+                error: Some(error.to_string()),
+                message: None,
+                process_id: None,
+                process_path: None,
+            }));
+        }
+
+        assert!(!pipe_response_transient_broker_error(&PipeResponse {
+            ok: false,
+            error: Some("native_queue_full".to_string()),
+            message: None,
+            process_id: None,
+            process_path: None,
+        }));
     }
 
     #[test]

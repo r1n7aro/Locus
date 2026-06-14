@@ -728,10 +728,10 @@ pub async fn install_or_update_plugin_with_force_close(
     };
 
     if restart_after_install {
-        let launch = super::launch_project(project_path)?;
+        let launch = super::launch_project(project_path).await?;
         eprintln!(
-            "[Locus] relaunched Unity after plugin install: editor='{}', project='{}'",
-            launch.editor_path, launch.project_path
+            "[Locus] relaunched Unity after plugin install: editor='{}', project='{}', process_id={}",
+            launch.editor_path, launch.project_path, launch.process_id
         );
     }
 
