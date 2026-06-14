@@ -24,6 +24,7 @@ import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
 import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
+import TestingSettings from "./settings/TestingSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
@@ -48,6 +49,7 @@ const emit = defineEmits<{
 const {
   resetConfirm, handleResetOnboarding, activeCategory,
   providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
+  claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
@@ -139,6 +141,16 @@ watch(
             <path d="M6 0a.5.5 0 0 1 .5.5V3h3V.5a.5.5 0 0 1 1 0V3h1a.5.5 0 0 1 .5.5v3A3.5 3.5 0 0 1 8.5 10c-.002.434-.01.845-.04 1.22-.041.514-.126 1.003-.317 1.424a2.083 2.083 0 0 1-.97 1.028C6.725 13.9 6.169 14 5.5 14c-.998 0-1.61.33-1.974.718A1.922 1.922 0 0 0 3 16H2c0-.616.232-1.34.797-1.94C3.323 13.484 4.169 13 5.5 13c.998 0 1.61-.33 1.974-.718.16-.21.26-.485.3-.79H4.5A3.5 3.5 0 0 1 1 7V3.5a.5.5 0 0 1 .5-.5h1V.5a.5.5 0 0 1 1 0V3h3V.5A.5.5 0 0 1 6 0z"/>
           </svg>
           <span>{{ t("settings.tab.unityConnection") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'testing' }"
+          @click="activeCategory = 'testing'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M12.78 2.72a.75.75 0 0 1 0 1.06l-5.5 5.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 0 1 1.06-1.06l1.47 1.47 4.97-4.97a.75.75 0 0 1 1.06 0zM3 11.25A1.75 1.75 0 0 0 4.75 13h6.5A1.75 1.75 0 0 0 13 11.25V8.5a.75.75 0 0 1 1.5 0v2.75a3.25 3.25 0 0 1-3.25 3.25h-6.5A3.25 3.25 0 0 1 1.5 11.25v-6.5A3.25 3.25 0 0 1 4.75 1.5H8.5a.75.75 0 0 1 0 1.5H4.75A1.75 1.75 0 0 0 3 4.75v6.5z"/>
+          </svg>
+          <span>{{ t("settings.tab.testing") }}</span>
         </button>
         <div class="sidebar-group-label">{{ t("settings.group.tools") }}</div>
         <button
@@ -273,6 +285,9 @@ watch(
           :all-models="allModels"
           :custom-endpoints="customEndpoints"
           :custom-endpoint-saving="customEndpointSaving"
+          :claude-code-test-status="claudeCodeTestStatus"
+          :claude-code-test-result="claudeCodeTestResult"
+          @test-claude-code="testClaudeCode"
           @start-edit="startEdit"
           @cancel-edit="cancelEdit"
           @save-key="saveKey"
@@ -337,6 +352,10 @@ watch(
 
       <template v-if="activeCategory === 'unityConnection'">
         <UnityConnectionSettings />
+      </template>
+
+      <template v-if="activeCategory === 'testing'">
+        <TestingSettings />
       </template>
 
       <template v-if="activeCategory === 'knowledge'">

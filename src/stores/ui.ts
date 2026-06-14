@@ -30,7 +30,7 @@ interface PendingChatPrefill extends ChatPrefillOptions {
 
 export const useUiStore = defineStore("ui", () => {
   const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "plugins" | "agent" | "settings">("chat");
-  const settingsCategoryHint = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
+  const settingsCategoryHint = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);

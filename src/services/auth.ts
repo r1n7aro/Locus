@@ -83,6 +83,12 @@ export function getProviders(): Promise<ProviderStatus[]> {
   return ipcInvoke<ProviderStatus[]>("get_providers");
 }
 
+/** Live connectivity/auth test for the Claude Code CLI. Resolves with the
+ *  model reply on success; rejects with an AppError describing the failure. */
+export function testClaudeCodeCli(): Promise<string> {
+  return ipcInvoke<string>("test_claude_code_cli");
+}
+
 export function saveProviderKey(provider: string, key: string): Promise<boolean> {
   return ipcInvoke<boolean>("save_provider_key", { provider, key });
 }

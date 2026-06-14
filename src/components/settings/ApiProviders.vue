@@ -40,6 +40,8 @@ const props = defineProps<{
   allModels: ModelOption[];
   customEndpoints: CustomEndpoint[];
   customEndpointSaving?: boolean;
+  claudeCodeTestStatus?: "idle" | "testing" | "success" | "error";
+  claudeCodeTestResult?: string;
   mode?: "full" | "onboarding";
   onboardingFocus?: "custom" | "codex" | null;
 }>();
@@ -66,6 +68,7 @@ const emit = defineEmits<{
   startAddEndpoint: [];
   startEditEndpoint: [ep: CustomEndpoint];
   deleteEndpoint: [id: string];
+  testClaudeCode: [];
   "update:editKey": [value: string];
   "update:oauthCode": [value: string];
 }>();
@@ -359,6 +362,29 @@ function quotaCreditsLabel() {
 
       <div class="provider-detail" style="padding-top: 0;">
         <span class="oauth-hint">{{ t("settings.claudeCode.hint") }}</span>
+      </div>
+
+      <div class="provider-detail">
+        <div class="codex-status-copy">
+          <span
+            v-if="claudeCodeTestResult"
+            class="key-hint"
+            :class="{ 'codex-validation-error': claudeCodeTestStatus === 'error' }"
+          >{{ claudeCodeTestResult }}</span>
+          <span v-else class="oauth-hint">{{ t("settings.claudeCode.testHint") }}</span>
+        </div>
+        <div class="provider-actions">
+          <button
+            class="test-btn"
+            type="button"
+            :disabled="!claudeCodeProvider?.hasKey || claudeCodeTestStatus === 'testing'"
+            @click="emit('testClaudeCode')"
+          >
+            {{ claudeCodeTestStatus === 'testing'
+              ? t("settings.claudeCode.testing")
+              : t("settings.claudeCode.test") }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
