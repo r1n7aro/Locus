@@ -18,7 +18,7 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 `@locus/view-runtime` currently exposes these runtime values:
 
 - `view`: `manifest`, `summary`, `reload`, `callScript`, `assets.search`, `logs.read/latest/open`, `session`, `llm`, `storage`, `fs`, `path`, `unity`, `files`, `undo`, `propertyDrawer`, `unityObjectDrawer`, `objectReferencePicker`, `openLog`, `onUpdate`.
-- `session`: `create`, `show`, `display`, `load`, `activeRun`, `events`, `queueInput`, `chat`, `send`, `wait`, `onEvent`.
+- `session`: `create`, `show`, `display`, `load`, `activeRun`, `events`, `queueInput`, `chat`, `send`, `wait`, `onEvent`, `fork`, `forkFromMessage`, `list`, `listArchived`, `rename`, `archive`, `unarchive`, `delete`, `undo`, `rollback`.
 - `llm`: `call`.
 - `storage`: `get`, `set`, `remove`.
 - `fs`: `readFile`, `writeFile`, `appendFile`, `mkdir`, `readdir`, `stat`, `lstat`, `access`, `unlink`, `rm`, `rename`, `copyFile`, `constants`.
@@ -120,3 +120,5 @@ Debug-only tools live in `debug.md`: `view_capture`, `view_snapshot`, `view_acti
 ## Usage Guidance
 
 Start with `view`, `unity`, `property`, and components from `@locus/components`. Reach for the expanded helper exports only when custom rendering or value parsing requires them.
+
+`session` covers the full session lifecycle: alongside `create`/`chat`/`wait`, it exposes `fork`/`forkFromMessage`, `list`/`listArchived`, `rename`, `archive`/`unarchive`, `delete`, and conversation-history `undo`/`rollback`. These operate on any session id in the current workspace — there is no per-View ownership scoping, so a View can manage sessions it did not create. `delete`, `undo`, and `rollback` are destructive and irreversible; confirm intent (and prefer `archive` for cleanup) before calling.

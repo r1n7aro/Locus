@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 82940
+      "bytes": 85903
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 211032
+      "bytes": 227847
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 205565
+      "bytes": 222096
     },
     {
       "path": "src/services/asset.ts",
@@ -321,7 +321,7 @@
     },
     {
       "path": "src/services/unity.ts",
-      "bytes": 11790
+      "bytes": 12170
     },
     {
       "path": "src/services/unitySerializedProperty.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 69346
+      "bytes": 73178
     }
   ]
 }
