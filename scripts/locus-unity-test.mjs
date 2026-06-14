@@ -54,6 +54,7 @@ if (driverResult.signal) {
     console.warn(
       `[locus] Tauri dev exited with ${driverResult.code} after the Unity driver reported success; treating the driver result as authoritative.`,
     );
+    process.exit(0);
   } else {
     printDriverFailure(driverResult);
     process.exit(driverResult.code);
@@ -66,14 +67,18 @@ function printHelp() {
 
 Examples:
   bun run locus:test:unity -- --project F:\\Game --suite connect
+  bun run locus:test:unity -- --project F:\\Game --suite type-index --type-index-sample all
   bun run locus:test:unity -- --project F:\\Game --suite state-probe --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite native-bridge --prepare-native --install-plugin
   bun run locus:test:unity:native -- --project F:\\Game
   bun run locus:test:unity:smoke -- --project F:\\Game
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
 
 Driver options:
-  --suite <name>              connect | state-probe | native-bridge | hot-reload | all
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | execute | all
+  --type-index-sample <mode>  sample32 | all, default sample32
+  --type-index-full           Shortcut for --type-index-sample all
   --connect-timeout-ms <ms>   Unity launch/connect timeout, default 60000
   --timeout-ms <ms>           Per-suite timeout, default 300000
   --poll-ms <ms>              Connection poll interval, default 500
