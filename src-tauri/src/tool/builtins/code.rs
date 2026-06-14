@@ -488,12 +488,7 @@ pub(super) fn code_diagnostics() -> ToolDef {
                                 };
                             }
                         };
-                        format_code_diagnostic_output(
-                            "workspace",
-                            min_severity,
-                            max_results,
-                            all,
-                        )
+                        format_code_diagnostic_output("workspace", min_severity, max_results, all)
                     }
                 };
 
