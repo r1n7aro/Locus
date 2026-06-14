@@ -71,11 +71,12 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
     // Short timeout: when the editor is too busy to answer (domain reload,
     // import), fall back to the in-Unity compile path quickly instead of
     // stalling the tool call for the default pipe timeout.
-    let resp = crate::unity_bridge::send_message_with_timeout(
+    let resp = crate::unity_bridge::send_message_with_transient_retry(
         project_path,
         "get_compile_params",
         &payload,
         std::time::Duration::from_secs(10),
+        "while fetching Unity compile params",
     )
     .await?;
     if !resp.ok {

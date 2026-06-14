@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -18,6 +18,7 @@ pub const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// Compiles can be slow right after a sidecar cold start (Roslyn JIT +
 /// first-time reference loading over a few hundred DLLs).
 pub const COMPILE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const SCHEMA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// A running compile-server process plus the JSON-RPC plumbing.
 pub struct CompileClient {
@@ -26,6 +27,7 @@ pub struct CompileClient {
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
     next_id: AtomicI64,
     exited_rx: watch::Receiver<bool>,
+    unusable: AtomicBool,
 }
 
 impl CompileClient {
@@ -74,6 +76,7 @@ impl CompileClient {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(0),
             exited_rx,
+            unusable: AtomicBool::new(false),
         });
 
         let reader_client = std::sync::Arc::clone(&client);
@@ -87,7 +90,7 @@ impl CompileClient {
     }
 
     pub fn has_exited(&self) -> bool {
-        *self.exited_rx.borrow()
+        self.unusable.load(Ordering::Relaxed) || *self.exited_rx.borrow()
     }
 
     async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
@@ -201,6 +204,30 @@ impl CompileClient {
         params: Value,
         timeout: std::time::Duration,
     ) -> Result<Value, String> {
+        self.request_with_timeout_inner(method, params, timeout, true)
+            .await
+    }
+
+    pub async fn request_with_timeout_no_kill(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
+        self.request_with_timeout_inner(method, params, timeout, false)
+            .await
+    }
+
+    async fn request_with_timeout_inner(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+        kill_on_timeout: bool,
+    ) -> Result<Value, String> {
+        if self.has_exited() {
+            return Err("C# compile server is not running".to_string());
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -220,6 +247,9 @@ impl CompileClient {
                 if let Ok(mut pending) = self.pending.lock() {
                     pending.remove(&id);
                 }
+                if kill_on_timeout {
+                    self.kill_after_timeout(method);
+                }
                 Err(format!("C# compile server request '{method}' timed out"))
             }
         }
@@ -237,6 +267,20 @@ impl CompileClient {
 
     /// Synchronous best-effort kill for app-exit paths.
     pub fn kill_process(&self) {
+        self.unusable.store(true, Ordering::Relaxed);
+        self.fail_all_pending("C# compile server stopped");
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.start_kill();
+            }
+        }
+    }
+
+    fn kill_after_timeout(&self, method: &str) {
+        let reason = format!("C# compile server request '{method}' timed out; restarting sidecar");
+        eprintln!("[CsharpCompile] {reason}");
+        self.unusable.store(true, Ordering::Relaxed);
+        self.fail_all_pending(&reason);
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
                 let _ = child.start_kill();

@@ -222,6 +222,7 @@ pub struct CompileParams {
 #[derive(Debug, Clone)]
 pub struct CompiledAssembly {
     pub assembly_b64: String,
+    pub assembly_path: Option<String>,
     pub assembly_name: String,
     pub entry_type: Option<String>,
     /// Snippet compiles: "statements" or "expression" (the mode that won).
@@ -255,6 +256,7 @@ pub async fn compile_snippet(
         "params": compile_params,
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
+        "returnAssemblyPath": true,
     });
     let outcome = request_compile("compile/snippet", request).await;
     record_outcome(&outcome);
@@ -275,6 +277,7 @@ pub async fn compile_run_states(
         "params": compile_params,
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
+        "returnAssemblyPath": true,
     });
     let outcome = request_compile("compile/runStates", request).await;
     record_outcome(&outcome);
@@ -282,9 +285,9 @@ pub async fn compile_run_states(
 }
 
 /// Compile a View Script (compile_named / invoke_named). The result rides
-/// inside the legacy pipe message as optional `assembly_b64` / `assembly_id`
-/// fields: a current Unity plugin loads the bytes on a cache miss, an older
-/// plugin ignores them and compiles from source as before.
+/// inside the legacy pipe message as optional `assembly_path` (or base64
+/// fallback) plus `assembly_id`: a current Unity plugin loads the artifact on
+/// a cache miss, an older plugin ignores the fields and compiles from source.
 pub async fn compile_view_script(
     compile_params: &CompileParams,
     source: &str,
@@ -296,8 +299,62 @@ pub async fn compile_view_script(
         "path": source_path,
         "scriptName": script_name,
         "params": compile_params,
+        "returnAssemblyPath": true,
     });
     let outcome = request_compile("compile/viewScript", request).await;
+    record_outcome(&outcome);
+    outcome
+}
+
+/// Compile a Skill Package Unity script bundle. This rides on compile/raw so
+/// the sidecar owns Roslyn/reference materialization while Unity keeps the
+/// existing assembly load, activation, and type-index delta logic.
+pub async fn compile_skill_package(
+    compile_params: &CompileParams,
+    request: &Value,
+) -> Result<CompileOutcome, String> {
+    let package_id = request
+        .get("packageId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "compile_skill_package request missing packageId".to_string())?;
+    let source_hash = request
+        .get("sourceHash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "compile_skill_package request missing sourceHash".to_string())?;
+    let scripts = request
+        .get("scripts")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "compile_skill_package request has no scripts".to_string())?;
+
+    let mut sources = Vec::with_capacity(scripts.len());
+    for script in scripts {
+        let path = script
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "compile_skill_package script missing path".to_string())?;
+        let source = script
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("compile_skill_package script missing source: {path}"))?;
+        sources.push(json!({
+            "path": path.replace('\\', "/"),
+            "text": source,
+        }));
+    }
+
+    let raw_request = json!({
+        "assemblyName": build_skill_package_assembly_name(package_id, source_hash),
+        "sources": sources,
+        "params": compile_params,
+        "returnAssemblyPath": true,
+        "diagnosticStyle": "viewScript",
+        "emitDebugSymbols": false,
+    });
+    let outcome = request_compile("compile/raw", raw_request).await;
     record_outcome(&outcome);
     outcome
 }
@@ -305,6 +362,29 @@ pub async fn compile_view_script(
 /// Compile an arbitrary source set (tests and the warm-up).
 pub async fn compile_raw(request: Value) -> Result<CompileOutcome, String> {
     request_compile("compile/raw", request).await
+}
+
+fn build_skill_package_assembly_name(package_id: &str, source_hash: &str) -> String {
+    let mut short_hash = sanitize_assembly_name_part(source_hash);
+    if short_hash.len() > 12 {
+        short_hash.truncate(12);
+    }
+    format!(
+        "__LocusSkillPackage_{}_{}",
+        sanitize_assembly_name_part(package_id),
+        short_hash
+    )
+}
+
+fn sanitize_assembly_name_part(value: &str) -> String {
+    if value.is_empty() {
+        return "Script".to_string();
+    }
+
+    value
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { '_' })
+        .collect()
 }
 
 // ── hot patch (unity_hot_reload) ─────────────────────────────────────
@@ -389,6 +469,7 @@ pub enum HotPatchOutcome {
     Compiled {
         assembly_name: String,
         assembly_b64: String,
+        assembly_path: Option<String>,
         methods: Vec<HotPatchMethod>,
         new_types: Vec<HotPatchNewType>,
         caller_scan_note: Option<String>,
@@ -470,6 +551,7 @@ pub async fn compile_hot_patch(
         "params": compile_params,
         "referenceSessionImages": true,
         "registerImage": false,
+        "returnAssemblyPath": true,
         "extraReferencePaths": extra_reference_paths,
     });
     if !baseline_siblings.is_empty() {
@@ -499,18 +581,21 @@ pub async fn register_session_image(
     domain_generation: &str,
     assembly_name: &str,
     assembly_b64: &str,
+    assembly_path: Option<&str>,
 ) -> Result<(), String> {
+    let mut request = json!({
+        "domainGeneration": domain_generation,
+        "assemblyName": assembly_name,
+    });
+    if let Some(path) = assembly_path.filter(|path| !path.is_empty()) {
+        request["assemblyPath"] = json!(path);
+    } else {
+        request["assemblyB64"] = json!(assembly_b64);
+    }
+
     let client = manager::ensure_client().await?;
     let value = client
-        .request_with_timeout(
-            "image/register",
-            json!({
-                "domainGeneration": domain_generation,
-                "assemblyName": assembly_name,
-                "assemblyB64": assembly_b64,
-            }),
-            client::DEFAULT_REQUEST_TIMEOUT,
-        )
+        .request_with_timeout("image/register", request, client::DEFAULT_REQUEST_TIMEOUT)
         .await?;
     let success = value
         .get("success")
@@ -629,8 +714,18 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     let assembly_b64 = value
         .get("assemblyB64")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "malformed compile server response (missing assemblyB64)".to_string())?
+        .unwrap_or("")
         .to_string();
+    let assembly_path = value
+        .get("assemblyPath")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    if assembly_b64.is_empty() && assembly_path.is_none() {
+        return Err(
+            "malformed compile server response (missing assemblyB64/assemblyPath)".to_string(),
+        );
+    }
     let assembly_name = value
         .get("assemblyName")
         .and_then(|v| v.as_str())
@@ -646,6 +741,7 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     Ok(HotPatchOutcome::Compiled {
         assembly_name,
         assembly_b64,
+        assembly_path,
         methods,
         new_types,
         caller_scan_note: value
@@ -726,6 +822,20 @@ pub async fn index_types(
     serde_json::from_value(types).map_err(|e| format!("malformed index/types entries: {e}"))
 }
 
+/// Build the project SerializedProperty schema from reference metadata in the
+/// sidecar (`index/schema`). The caller owns cache currency and fallback to
+/// Unity-side reflection.
+pub async fn index_serialized_schema(compile_params: &CompileParams) -> Result<Value, String> {
+    let client = manager::ensure_client().await?;
+    client
+        .request_with_timeout_no_kill(
+            "index/schema",
+            json!({ "params": compile_params }),
+            client::SCHEMA_REQUEST_TIMEOUT,
+        )
+        .await
+}
+
 /// Test-only flag control (`initialize` needs an AppHandle).
 #[cfg(test)]
 pub fn initialize_enabled_for_tests(value: bool) {
@@ -763,8 +873,18 @@ fn parse_compile_result(value: Value) -> Result<CompileOutcome, String> {
     let assembly_b64 = value
         .get("assemblyB64")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "malformed compile server response (missing assemblyB64)".to_string())?
+        .unwrap_or("")
         .to_string();
+    let assembly_path = value
+        .get("assemblyPath")
+        .and_then(|v| v.as_str())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    if assembly_b64.is_empty() && assembly_path.is_none() {
+        return Err(
+            "malformed compile server response (missing assemblyB64/assemblyPath)".to_string(),
+        );
+    }
     let assembly_name = value
         .get("assemblyName")
         .and_then(|v| v.as_str())
@@ -781,6 +901,7 @@ fn parse_compile_result(value: Value) -> Result<CompileOutcome, String> {
 
     Ok(Ok(CompiledAssembly {
         assembly_b64,
+        assembly_path,
         assembly_name,
         entry_type,
         mode,
@@ -813,6 +934,23 @@ mod tests {
             Some("Locus.RuntimeSnippets.__LocusAsyncSnippetHost")
         );
         assert_eq!(assembly.mode.as_deref(), Some("statements"));
+    }
+
+    #[test]
+    fn parse_compile_result_accepts_assembly_path() {
+        let value = json!({
+            "success": true,
+            "assemblyName": "__LocusRuntimeAsync_00000000_00000001",
+            "assemblyPath": "C:/Temp/__LocusRuntimeAsync.dll",
+            "entryType": "Locus.RuntimeSnippets.__LocusAsyncSnippetHost",
+        });
+        let outcome = parse_compile_result(value).expect("parse");
+        let assembly = outcome.expect("success");
+        assert_eq!(assembly.assembly_b64, "");
+        assert_eq!(
+            assembly.assembly_path.as_deref(),
+            Some("C:/Temp/__LocusRuntimeAsync.dll")
+        );
     }
 
     #[test]
@@ -925,6 +1063,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_hot_patch_result_accepts_assembly_path() {
+        let value = json!({
+            "hot": true,
+            "success": true,
+            "assemblyName": "__LocusHotPatch_00000000_00000001",
+            "assemblyPath": "C:/Temp/__LocusHotPatch.dll",
+            "methods": [],
+            "newTypes": [],
+        });
+        match parse_hot_patch_result(value).expect("parse") {
+            HotPatchOutcome::Compiled {
+                assembly_b64,
+                assembly_path,
+                ..
+            } => {
+                assert_eq!(assembly_b64, "");
+                assert_eq!(
+                    assembly_path.as_deref(),
+                    Some("C:/Temp/__LocusHotPatch.dll")
+                );
+            }
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn access_caps_serialize_camel_case_and_default_conservative() {
         let caps = AccessCaps::default();
         assert!(!caps.create_delegate_non_public);
@@ -964,6 +1128,14 @@ mod tests {
         assert_eq!(value["langVersion"], "9");
         assert_eq!(value["referencePaths"][0], "a.dll");
         assert_eq!(value["allowUnsafe"], true);
+    }
+
+    #[test]
+    fn skill_package_assembly_name_matches_unity_contract() {
+        assert_eq!(
+            build_skill_package_assembly_name("studio.tools.psd-to-ugui", "abcdef0123456789abcdef"),
+            "__LocusSkillPackage_studio_tools_psd_to_ugui_abcdef012345"
+        );
     }
 
     /// End-to-end sidecar smoke: spawn, BCL-only compile, crash recovery,
