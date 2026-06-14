@@ -32,13 +32,23 @@ import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRunti
 import { getLastEffort, getLastModel, getModelDefaults } from "../services/model";
 import { markStartupPhase } from "../services/startupPerf";
 import {
+  archiveSession,
   chat as launchSessionChat,
   createSession as createLocusSession,
+  deleteSession,
+  forkSession,
+  forkSessionFromMessage,
   getSessionActiveRun,
+  listArchivedSessions,
   listSessionEvents,
+  listSessions,
   loadSession as loadLocusSession,
   queueChatInput,
+  renameSession,
+  rollbackSessionToMessage,
   saveActiveSessionSelection,
+  unarchiveSession,
+  undoLatestConversationTurn,
 } from "../services/session";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import {
@@ -2579,6 +2589,18 @@ async function loadView(
             queueSessionInput: (request: ViewSessionQueueInputRequest) => queueChatInput(request),
             sendSessionMessage: (request) => sendRuntimeSessionMessage(request),
             waitSession: (request) => waitRuntimeSession(request),
+            forkSession: (sessionId, title) => forkSession(sessionId, title),
+            forkSessionFromMessage: (sessionId, messageId, title) =>
+              forkSessionFromMessage(sessionId, messageId, title),
+            listSessions: () => listSessions(),
+            listArchivedSessions: () => listArchivedSessions(),
+            renameSession: (sessionId, title) => renameSession(sessionId, title),
+            archiveSession: (sessionId) => archiveSession(sessionId),
+            unarchiveSession: (sessionId) => unarchiveSession(sessionId),
+            deleteSession: (sessionId) => deleteSession(sessionId),
+            undoSessionTurn: (sessionId) => undoLatestConversationTurn(sessionId),
+            rollbackSessionToMessage: (sessionId, messageId) =>
+              rollbackSessionToMessage(sessionId, messageId),
             callLlm: (request) => callRuntimeLlm(request),
             onSessionEvent: (handler) =>
               getLocusRuntime().subscribe<StreamEvent>("stream-event", handler),

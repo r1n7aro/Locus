@@ -145,6 +145,7 @@ import type {
   SessionDetail,
   SessionEventRecord,
   SessionRunSummary,
+  SessionSummary,
   StreamEvent,
 } from "../../types";
 import * as PropertyTreeService from "../../services/propertyTree";
@@ -268,6 +269,16 @@ export interface ViewRuntimeApi {
   queueSessionInput(request: ViewSessionQueueInputRequest): Promise<ViewSessionQueueInputResult>;
   sendSessionMessage(request: ViewSessionChatRequest): Promise<ViewSessionChatResult>;
   waitSession(request: ViewSessionWaitRequest): Promise<ViewSessionWaitResult>;
+  forkSession(sessionId: string, title?: string | null): Promise<string>;
+  forkSessionFromMessage(sessionId: string, messageId: string, title?: string | null): Promise<string>;
+  listSessions(): Promise<SessionSummary[]>;
+  listArchivedSessions(): Promise<SessionSummary[]>;
+  renameSession(sessionId: string, title: string): Promise<void>;
+  archiveSession(sessionId: string): Promise<void>;
+  unarchiveSession(sessionId: string): Promise<void>;
+  deleteSession(sessionId: string): Promise<void>;
+  undoSessionTurn(sessionId: string): Promise<SessionDetail>;
+  rollbackSessionToMessage(sessionId: string, messageId: string): Promise<SessionDetail>;
   callLlm(request: ViewLlmCallRequest): Promise<ViewLlmCallResult>;
   onSessionEvent(handler: (event: StreamEvent) => void): Promise<ViewRuntimeUnsubscribe>;
   readFrontendLog(limit?: number): Promise<ViewFrontendLogEntry[]>;
@@ -1605,6 +1616,18 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     wait: (request: string | ViewSessionWaitRequest, runId?: string | null) =>
       api.waitSession(typeof request === "string" ? { sessionId: request, runId } : request),
     onEvent: (handler: (event: StreamEvent) => void) => api.onSessionEvent(handler),
+    fork: (sessionId: string, title?: string | null) => api.forkSession(sessionId, title),
+    forkFromMessage: (sessionId: string, messageId: string, title?: string | null) =>
+      api.forkSessionFromMessage(sessionId, messageId, title),
+    list: () => api.listSessions(),
+    listArchived: () => api.listArchivedSessions(),
+    rename: (sessionId: string, title: string) => api.renameSession(sessionId, title),
+    archive: (sessionId: string) => api.archiveSession(sessionId),
+    unarchive: (sessionId: string) => api.unarchiveSession(sessionId),
+    delete: (sessionId: string) => api.deleteSession(sessionId),
+    undo: (sessionId: string) => api.undoSessionTurn(sessionId),
+    rollback: (sessionId: string, messageId: string) =>
+      api.rollbackSessionToMessage(sessionId, messageId),
   };
 
   const llm = {
@@ -2084,6 +2107,34 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
         runId: request.runId ?? "",
         timeoutMs: request.timeoutMs ?? "",
       }),
+    forkSession: (sessionId, title) =>
+      measureRequest("forkSession", () => api.forkSession(sessionId, title), { sessionId }),
+    forkSessionFromMessage: (sessionId, messageId, title) =>
+      measureRequest(
+        "forkSessionFromMessage",
+        () => api.forkSessionFromMessage(sessionId, messageId, title),
+        { sessionId, messageId },
+      ),
+    listSessions: () =>
+      measureRequest("listSessions", () => api.listSessions(), {}),
+    listArchivedSessions: () =>
+      measureRequest("listArchivedSessions", () => api.listArchivedSessions(), {}),
+    renameSession: (sessionId, title) =>
+      measureRequest("renameSession", () => api.renameSession(sessionId, title), { sessionId }),
+    archiveSession: (sessionId) =>
+      measureRequest("archiveSession", () => api.archiveSession(sessionId), { sessionId }),
+    unarchiveSession: (sessionId) =>
+      measureRequest("unarchiveSession", () => api.unarchiveSession(sessionId), { sessionId }),
+    deleteSession: (sessionId) =>
+      measureRequest("deleteSession", () => api.deleteSession(sessionId), { sessionId }),
+    undoSessionTurn: (sessionId) =>
+      measureRequest("undoSessionTurn", () => api.undoSessionTurn(sessionId), { sessionId }),
+    rollbackSessionToMessage: (sessionId, messageId) =>
+      measureRequest(
+        "rollbackSessionToMessage",
+        () => api.rollbackSessionToMessage(sessionId, messageId),
+        { sessionId, messageId },
+      ),
     callLlm: (request) =>
       measureRequest("callLlm", () => api.callLlm(request), {
         sessionId: request.sessionId ?? "",
