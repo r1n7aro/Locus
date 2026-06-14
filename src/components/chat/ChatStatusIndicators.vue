@@ -41,6 +41,8 @@ import type {
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
+import HotReloadDebugModal from "../HotReloadDebugModal.vue";
+import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
 type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload";
@@ -363,6 +365,8 @@ const effectiveUnityLaunchState = computed<UnityLaunchState>(() => {
   return props.unityLaunching ? "starting" : "idle";
 });
 
+const unityLaunchInFlight = computed(() => effectiveUnityLaunchState.value !== "idle");
+
 const unityRecompileWaitingConnection = computed(() =>
   !!props.unityRecompiling
   && !props.unityConnected
@@ -395,6 +399,7 @@ const unityConnectionFallbackSummary = computed(() => {
 
 const unitySummary = computed(() => {
   if (unityPluginLabel.value) return unityPluginLabel.value;
+  if (unityLaunchInFlight.value) return unityConnectionFallbackSummary.value;
   if (unitySemanticState.value) return unitySemanticSummaryLabel(unitySemanticState.value);
   return unityConnectionFallbackSummary.value;
 });
@@ -412,6 +417,7 @@ const unityFallbackTone = computed<StatusTone>(() =>
 
 const unityTone = computed<StatusTone>(() => {
   if (props.unityPluginStatus) return "danger";
+  if (unityLaunchInFlight.value) return "accent";
   if (unitySemanticState.value) {
     return UNITY_SEMANTIC_PHASE_TONES[unitySemanticPhase.value] ?? "warning";
   }
@@ -608,7 +614,7 @@ async function refreshStateProbeStatus() {
 const unityRows = computed<StatusDetailRow[]>(() => {
   const rows: StatusDetailRow[] = [];
   const status = props.unityConnectionStatus ?? null;
-  const semantic = unitySemanticState.value;
+  const semantic = unityLaunchInFlight.value ? null : unitySemanticState.value;
   const phaseLabel = semantic ? unitySemanticPhaseLabel(semantic.phase) : "";
   const diagnostics: StatusDetailRow[] = [];
 
@@ -1283,10 +1289,7 @@ async function refreshHotReloadStatus() {
   }
 }
 
-async function setHotReloadEnabled(value: boolean) {
-  if (hotReloadPending.value) return;
-  if (hotReloadStatus.value && hotReloadStatus.value.hotReloadEnabled === value) return;
-  if (!hotReloadCanToggle.value) return;
+async function applyHotReloadEnabled(value: boolean) {
   hotReloadPending.value = true;
   try {
     hotReloadStatus.value = await unityHotReloadSetEnabled(value);
@@ -1296,6 +1299,28 @@ async function setHotReloadEnabled(value: boolean) {
     await refreshHotReloadStatus();
   } finally {
     hotReloadPending.value = false;
+  }
+}
+
+// Enabling routes through the Debug-mode gate (detect Code Optimization →
+// prompt → auto-switch → enable); disabling is unconditional.
+const {
+  promptVisible: hotReloadDebugPromptVisible,
+  adjusting: hotReloadDebugAdjusting,
+  adjustError: hotReloadDebugError,
+  guardedEnable: hotReloadGuardedEnable,
+  confirmAdjust: hotReloadConfirmAdjust,
+  cancelAdjust: hotReloadCancelAdjust,
+} = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
+
+async function setHotReloadEnabled(value: boolean) {
+  if (hotReloadPending.value) return;
+  if (hotReloadStatus.value && hotReloadStatus.value.hotReloadEnabled === value) return;
+  if (!hotReloadCanToggle.value) return;
+  if (value) {
+    await hotReloadGuardedEnable();
+  } else {
+    await applyHotReloadEnabled(false);
   }
 }
 
@@ -1705,6 +1730,13 @@ onUnmounted(() => {
         </details>
       </div>
     </Transition>
+    <HotReloadDebugModal
+      :visible="hotReloadDebugPromptVisible"
+      :adjusting="hotReloadDebugAdjusting"
+      :error="hotReloadDebugError"
+      @confirm="hotReloadConfirmAdjust"
+      @cancel="hotReloadCancelAdjust"
+    />
   </div>
 </template>
 

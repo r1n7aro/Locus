@@ -7,6 +7,7 @@ import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
 import { t } from "../i18n";
+import type { UnityLaunchResult } from "../services/unity";
 import type {
   AssetDbLightStatus,
   AssetDbScanEvent,
@@ -100,6 +101,37 @@ export const useProjectStore = defineStore("project", () => {
     } else if (hook?.state === "patched" || hook?.state === "disabled") {
       notificationStore.clearByOperation(UNITY_BACKGROUND_HOOK_NOTICE_OPERATION);
     }
+  }
+
+  function connectionStatusFromLaunchResult(result: UnityLaunchResult): UnityConnectionStatus {
+    const now = Date.now();
+    return {
+      connected: false,
+      editorStatus: "disconnected",
+      controlChannelState: "starting",
+      editorProcessState: "running",
+      editorProcessId: result.processId,
+      editorProcessPath: result.editorPath,
+      editorProjectPath: result.projectPath,
+      processCheckedAtMs: now,
+      processLastError: null,
+      pipeName: unityConnectionStatus.value?.pipeName ?? "",
+      latencyMs: null,
+      reconnectAttempts: 0,
+      lastError: null,
+      backgroundHook: unityConnectionStatus.value?.backgroundHook ?? {
+        enabled: false,
+        supported: false,
+        state: "inactive",
+        patched: false,
+        processId: null,
+        editorProcessPath: null,
+        symbolCount: 0,
+        error: null,
+        updatedAtMs: now,
+      },
+      checkedAtMs: now,
+    };
   }
 
   function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {
@@ -273,7 +305,8 @@ export const useProjectStore = defineStore("project", () => {
     clearUnityLaunchPoll();
     unityLaunchState.value = "starting";
     try {
-      await unityService.launchUnityProject();
+      const launch = await unityService.launchUnityProject();
+      setUnityConnectionStatus(connectionStatusFromLaunchResult(launch));
       if (unityConnected.value) {
         resetUnityLaunchState();
         return;

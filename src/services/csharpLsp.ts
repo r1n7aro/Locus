@@ -74,6 +74,40 @@ export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileS
   );
 }
 
+export interface HotReloadPreflight {
+  connected: boolean;
+  /** "debug" | "release" when readable; null when the editor is unreachable. */
+  codeOptimization: string | null;
+}
+
+/** Enable-time check: the connected editor's Code Optimization, for the
+ * Debug-mode gate the hot-reload toggles run before turning the feature on. */
+export function unityHotReloadPreflight(): Promise<HotReloadPreflight> {
+  return ipcInvoke<HotReloadPreflight>("unity_hot_reload_preflight", undefined, {
+    operation: "unityHotReloadPreflight",
+    notify: false,
+    throwOnError: true,
+  });
+}
+
+export interface CodeOptimizationResult {
+  codeOptimization: string;
+}
+
+/** Switch the connected editor's Code Optimization to Debug (the auto-fix the
+ * user confirms in the enable-time prompt). Triggers a Unity recompile. */
+export function unityHotReloadSetCodeOptimizationDebug(): Promise<CodeOptimizationResult> {
+  return ipcInvoke<CodeOptimizationResult>(
+    "unity_hot_reload_set_code_optimization_debug",
+    undefined,
+    {
+      operation: "unityHotReloadSetCodeOptimizationDebug",
+      notify: false,
+      throwOnError: true,
+    },
+  );
+}
+
 export function unityRecompileRun(): Promise<string> {
   return ipcInvoke<string>("unity_recompile_run", undefined, {
     operation: "unityRecompileRun",

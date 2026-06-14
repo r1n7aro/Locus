@@ -45,6 +45,7 @@ export interface UnityLaunchResult {
   editorPath: string;
   projectPath: string;
   projectVersion: string;
+  processId: number;
 }
 
 export function launchUnityProject(): Promise<UnityLaunchResult> {

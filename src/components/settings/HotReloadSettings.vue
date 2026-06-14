@@ -2,8 +2,10 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
 import { useCopyFeedback } from "../../composables/useCopyFeedback";
+import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import HotReloadDebugModal from "../HotReloadDebugModal.vue";
 import {
   subscribeUnityHotReloadSelfTest,
   subscribeUnitySidecarCompilerStatus,
@@ -113,11 +115,10 @@ const hotReloadStatsLabel = computed(() => {
   );
 });
 
-async function toggleHotReloadEnabled() {
-  if (!sidecarReady.value || hotReloadBusy.value) return;
+async function applyHotReloadEnabled(value: boolean) {
   hotReloadBusy.value = true;
   try {
-    sidecarStatus.value = await unityHotReloadSetEnabled(!hotReloadEnabled.value);
+    sidecarStatus.value = await unityHotReloadSetEnabled(value);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -128,6 +129,26 @@ async function toggleHotReloadEnabled() {
     await refreshSidecarStatus();
   } finally {
     hotReloadBusy.value = false;
+  }
+}
+
+// Enabling routes through the Debug-mode gate (detect Code Optimization →
+// prompt → auto-switch → enable); disabling is unconditional.
+const {
+  promptVisible: hotReloadDebugPromptVisible,
+  adjusting: hotReloadDebugAdjusting,
+  adjustError: hotReloadDebugError,
+  guardedEnable: hotReloadGuardedEnable,
+  confirmAdjust: hotReloadConfirmAdjust,
+  cancelAdjust: hotReloadCancelAdjust,
+} = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
+
+async function toggleHotReloadEnabled() {
+  if (!sidecarReady.value || hotReloadBusy.value) return;
+  if (hotReloadEnabled.value) {
+    await applyHotReloadEnabled(false);
+  } else {
+    await hotReloadGuardedEnable();
   }
 }
 
@@ -243,7 +264,7 @@ onUnmounted(() => {
           <BaseSwitch
             v-if="sidecarReady"
             :model-value="hotReloadEnabled"
-            :disabled="hotReloadBusy || !sidecarEnabled"
+            :disabled="hotReloadBusy || !sidecarEnabled || hotReloadDebugPromptVisible"
             :aria-label="t('settings.codeAnalysis.hotReloadLabel')"
             @update:model-value="toggleHotReloadEnabled"
           />
@@ -286,6 +307,13 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+    <HotReloadDebugModal
+      :visible="hotReloadDebugPromptVisible"
+      :adjusting="hotReloadDebugAdjusting"
+      :error="hotReloadDebugError"
+      @confirm="hotReloadConfirmAdjust"
+      @cancel="hotReloadCancelAdjust"
+    />
   </div>
 </template>
 
