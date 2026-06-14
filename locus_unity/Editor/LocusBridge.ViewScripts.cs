@@ -50,6 +50,7 @@ namespace Locus
             // of compiling `source`; on any load failure the local compile
             // path still runs. Older plugin builds ignore these fields.
             public string assembly_b64;
+            public string assembly_path;
             public string assembly_id;
         }
 
@@ -77,6 +78,13 @@ namespace Locus
             public string packageId;
             public string sourceHash;
             public SkillPackageScriptSource[] scripts;
+
+            // Optional: assembly pre-compiled by the Locus compile-server
+            // sidecar. Current desktop builds include these fields; older
+            // builds omit them and take the local compile fallback.
+            public string assembly_b64;
+            public string assembly_path;
+            public string assembly_id;
         }
 
         [Serializable]
@@ -110,6 +118,12 @@ namespace Locus
             public string TypeIndexFingerprint;
             public TypeIndexEntry[] PublicTypes;
             public Assembly Assembly;
+        }
+
+        private sealed class SkillPackageAssemblyCompileResult
+        {
+            public CompiledSkillPackageAssembly Compiled;
+            public bool CacheHit;
         }
 
         private static void InvalidateViewScriptCache()
@@ -175,22 +189,17 @@ namespace Locus
                 return ErrorResponse(requestId, ex.Message);
             }
 
-            string prepareError = await EnsureExecuteCodeCompilationReadyAsync();
-            if (!string.IsNullOrEmpty(prepareError))
-                return ErrorResponse(requestId, prepareError);
-
-            bool cacheHit;
-            CompiledSkillPackageAssembly compiled;
+            SkillPackageAssemblyCompileResult result;
             try
             {
-                compiled = CompileOrGetSkillPackageAssembly(request, out cacheHit);
+                result = await CompileOrGetSkillPackageAssemblyAsync(request);
             }
             catch (Exception ex)
             {
                 return ErrorResponse(requestId, ex.Message);
             }
 
-            return OkResponse(requestId, BuildCompileSkillPackageResponse(compiled, cacheHit));
+            return OkResponse(requestId, BuildCompileSkillPackageResponse(result.Compiled, result.CacheHit));
         }
 
         private static async Task<PipeEnvelope> HandleInvokeSkillPackage(string requestId, string message)
@@ -467,18 +476,20 @@ namespace Locus
 
         /// <summary>
         /// Load a View Script assembly pre-compiled by the compile-server
-        /// sidecar (optional `assembly_b64` on the request). Returns null —
-        /// falling back to the local compile — when the request has no bytes
-        /// or the load fails for any reason; the source is always present.
+        /// sidecar (optional assembly path/base64 on the request). Returns
+        /// null — falling back to the local compile — when the request has no
+        /// bytes or the load fails for any reason; the source is always
+        /// present.
         /// </summary>
         private static CompiledViewScript TryLoadPrecompiledViewScript(ViewCompileNamedRequest request)
         {
-            if (string.IsNullOrEmpty(request.assembly_b64))
+            if (string.IsNullOrEmpty(request.assembly_b64) &&
+                string.IsNullOrEmpty(request.assembly_path))
                 return null;
 
             try
             {
-                byte[] assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+                byte[] assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
                 Assembly assembly = Assembly.Load(assemblyBytes);
                 Type entryType = ResolveEntryType(assembly, request.entryType);
                 string assemblyId = string.IsNullOrEmpty(request.assembly_id)
@@ -505,9 +516,15 @@ namespace Locus
             }
         }
 
-        private static CompiledSkillPackageAssembly CompileOrGetSkillPackageAssembly(
-            SkillPackageCompileRequest request,
-            out bool cacheHit)
+        private static bool HasPrecompiledSkillPackageAssemblyPayload(SkillPackageCompileRequest request)
+        {
+            return request != null &&
+                   (!string.IsNullOrEmpty(request.assembly_b64) ||
+                    !string.IsNullOrEmpty(request.assembly_path));
+        }
+
+        private static async Task<SkillPackageAssemblyCompileResult> CompileOrGetSkillPackageAssemblyAsync(
+            SkillPackageCompileRequest request)
         {
             string cacheKey = BuildSkillPackageAssemblyCacheKey(request);
 
@@ -517,14 +534,120 @@ namespace Locus
                 if (_skillPackageAssemblyCache.TryGetValue(cacheKey, out cached))
                 {
                     ActivateSkillPackageAssembly(cached);
-                    cacheHit = true;
-                    return cached;
+                    return new SkillPackageAssemblyCompileResult
+                    {
+                        Compiled = cached,
+                        CacheHit = true
+                    };
+                }
+            }
+
+            CompiledSkillPackageAssembly precompiled = TryLoadPrecompiledSkillPackageAssembly(request);
+            if (precompiled != null)
+            {
+                lock (_skillPackageAssemblyCacheLock)
+                {
+                    CompiledSkillPackageAssembly cached;
+                    if (_skillPackageAssemblyCache.TryGetValue(cacheKey, out cached))
+                    {
+                        ActivateSkillPackageAssembly(cached);
+                        return new SkillPackageAssemblyCompileResult
+                        {
+                            Compiled = cached,
+                            CacheHit = true
+                        };
+                    }
+
+                    _skillPackageAssemblyCache[cacheKey] = precompiled;
+                }
+                ActivateSkillPackageAssembly(precompiled);
+                return new SkillPackageAssemblyCompileResult
+                {
+                    Compiled = precompiled,
+                    CacheHit = false
+                };
+            }
+
+            string prepareError = await EnsureExecuteCodeCompilationReadyAsync();
+            if (!string.IsNullOrEmpty(prepareError))
+                throw new Exception(prepareError);
+
+            lock (_skillPackageAssemblyCacheLock)
+            {
+                CompiledSkillPackageAssembly cached;
+                if (_skillPackageAssemblyCache.TryGetValue(cacheKey, out cached))
+                {
+                    ActivateSkillPackageAssembly(cached);
+                    return new SkillPackageAssemblyCompileResult
+                    {
+                        Compiled = cached,
+                        CacheHit = true
+                    };
                 }
 
                 CompiledSkillPackageAssembly compiled = CompileSkillPackageAssembly(request);
                 _skillPackageAssemblyCache[cacheKey] = compiled;
-                cacheHit = false;
-                return compiled;
+                return new SkillPackageAssemblyCompileResult
+                {
+                    Compiled = compiled,
+                    CacheHit = false
+                };
+            }
+        }
+
+        private static CompiledSkillPackageAssembly TryLoadPrecompiledSkillPackageAssembly(
+            SkillPackageCompileRequest request)
+        {
+            if (!HasPrecompiledSkillPackageAssemblyPayload(request))
+                return null;
+
+            try
+            {
+                string assemblyId = string.IsNullOrEmpty(request.assembly_id)
+                    ? BuildSkillPackageAssemblyId(request)
+                    : request.assembly_id;
+                string assemblyPath = SkillPackageAssemblyPath(assemblyId);
+                Assembly assembly = FindLoadedAssemblyByName(assemblyId);
+                if (assembly == null)
+                {
+                    byte[] assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
+                    Directory.CreateDirectory(Path.GetDirectoryName(assemblyPath));
+                    File.WriteAllBytes(assemblyPath, assemblyBytes);
+                    assembly = Assembly.LoadFile(assemblyPath);
+                }
+                else
+                {
+                    string loadedPath = SafeAssemblyLocation(assembly);
+                    if (!string.IsNullOrEmpty(loadedPath))
+                        assemblyPath = loadedPath;
+                }
+
+                string loadedName = SafeAssemblyName(assembly);
+                if (!string.Equals(loadedName, assemblyId, StringComparison.Ordinal))
+                    throw new Exception("assembly name mismatch: expected " + assemblyId + ", got " + loadedName);
+
+                Type[] assemblyTypes = SafeGetAssemblyTypes(assembly) ?? new Type[0];
+                int publicTypeCount = assemblyTypes
+                    .Count(type => type != null && type.IsPublic && !type.IsNested);
+
+                return new CompiledSkillPackageAssembly
+                {
+                    PackageId = request.packageId,
+                    Hash = request.sourceHash,
+                    AssemblyId = assemblyId,
+                    AssemblyPath = assemblyPath.Replace('\\', '/'),
+                    ScriptCount = request.scripts != null ? request.scripts.Length : 0,
+                    PublicTypeCount = publicTypeCount,
+                    PublicTypes = BuildTypeIndexEntriesForAssembly(assembly, assemblyId),
+                    Assembly = assembly
+                };
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    "[Locus] precompiled Skill Package load failed; compiling in Unity instead: " +
+                    ex.Message);
+                return null;
             }
         }
 
@@ -708,15 +831,7 @@ namespace Locus
                 throw new Exception("parse failed: " + ex.Message);
             }
 
-            string shortHash = SanitizeAssemblyNamePart(request.sourceHash);
-            if (shortHash.Length > 12)
-                shortHash = shortHash.Substring(0, 12);
-
-            string assemblyId =
-                "__LocusSkillPackage_" +
-                SanitizeAssemblyNamePart(request.packageId) +
-                "_" +
-                shortHash;
+            string assemblyId = BuildSkillPackageAssemblyId(request);
 
             CSharpCompilation compilation = CSharpCompilation.Create(
                 assemblyName: assemblyId,
@@ -780,6 +895,18 @@ namespace Locus
                     throw new Exception("assembly load/bootstrap failed: " + ex.Message);
                 }
             }
+        }
+
+        private static string BuildSkillPackageAssemblyId(SkillPackageCompileRequest request)
+        {
+            string shortHash = SanitizeAssemblyNamePart(request.sourceHash);
+            if (shortHash.Length > 12)
+                shortHash = shortHash.Substring(0, 12);
+
+            return "__LocusSkillPackage_" +
+                   SanitizeAssemblyNamePart(request.packageId) +
+                   "_" +
+                   shortHash;
         }
 
         private static Assembly FindLoadedAssemblyByName(string assemblyName)

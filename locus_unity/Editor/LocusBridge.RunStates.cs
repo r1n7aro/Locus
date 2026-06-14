@@ -74,7 +74,7 @@ namespace Locus
             }
         }
 
-        private enum RunStatesControlKind
+        internal enum RunStatesControlKind
         {
             Sleep,
             Goto,
@@ -82,7 +82,7 @@ namespace Locus
             Fail
         }
 
-        private sealed class RunStatesControlException : Exception
+        internal sealed class RunStatesControlException : Exception
         {
             public RunStatesControlKind Kind;
             public string Target;
@@ -2501,6 +2501,7 @@ namespace Locus
         private sealed class RunStatesLoadedRequest
         {
             public string assembly_b64;
+            public string assembly_path;
             public string entry_type;
             public string request_editor_status;
             public string initial_state;
@@ -2526,7 +2527,9 @@ namespace Locus
                 return ErrorResponse(requestId, "run_states_loaded request parse failed: " + ex.Message);
             }
 
-            if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+            if (request == null ||
+                (string.IsNullOrEmpty(request.assembly_b64) &&
+                 string.IsNullOrEmpty(request.assembly_path)))
                 return ErrorResponse(requestId, "run_states_loaded request missing assembly bytes");
             if (string.IsNullOrWhiteSpace(request.initial_state))
                 return ErrorResponse(requestId, "initial_state is required");
@@ -2534,11 +2537,11 @@ namespace Locus
             byte[] assemblyBytes;
             try
             {
-                assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+                assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
             }
             catch (Exception ex)
             {
-                return ErrorResponse(requestId, "run_states_loaded assembly decode failed: " + ex.Message);
+                return ErrorResponse(requestId, "run_states_loaded assembly load failed: " + ex.Message);
             }
 
             string entryTypeName = string.IsNullOrEmpty(request.entry_type)
@@ -2870,6 +2873,7 @@ namespace Locus
 
             sb.Append(indent).AppendLine("new global::System.Action<global::Locus.LocusBridge.RuntimeCtx>(ctx =>");
             sb.Append(indent).AppendLine("{");
+            sb.Append(indent).AppendLine("    var print = new global::System.Action<object>(ctx.Print);");
             sb.Append(indent).Append("    #line 1 ").AppendLine(ToCSharpStringLiteral("unity_run_states:" + stateName + ":" + phase));
             sb.AppendLine(code);
             sb.Append(indent).AppendLine("    #line default");

@@ -219,20 +219,22 @@ namespace Locus
         public static SerializedPropertySnapshot SnapshotSerializedProperty(
             SerializedProperty prop,
             int maxDepth = 4,
-            int maxArrayItems = 64)
+            int maxArrayItems = 64,
+            bool dynamicSchema = false)
         {
             if (prop == null)
                 return null;
 
             maxDepth = Math.Max(0, maxDepth);
             maxArrayItems = Math.Max(0, maxArrayItems);
-            return SnapshotSerializedProperty(prop.Copy(), 0, maxDepth, maxArrayItems);
+            return SnapshotSerializedProperty(prop.Copy(), 0, maxDepth, maxArrayItems, dynamicSchema);
         }
 
         public static SerializedPropertySnapshot SnapshotSerializedObject(
             UnityEngine.Object obj,
             int maxDepth = 4,
-            int maxArrayItems = 64)
+            int maxArrayItems = 64,
+            bool dynamicSchema = false)
         {
             if (obj == null)
                 return null;
@@ -248,7 +250,7 @@ namespace Locus
             bool enterChildren = true;
             while (cursor.NextVisible(enterChildren))
             {
-                children.Add(SnapshotSerializedProperty(cursor, 1, maxDepth, maxArrayItems));
+                children.Add(SnapshotSerializedProperty(cursor, 1, maxDepth, maxArrayItems, dynamicSchema));
                 enterChildren = false;
             }
 
@@ -344,7 +346,7 @@ namespace Locus
             }
         }
 
-        public static object SerializedPropertyValue(SerializedProperty prop)
+        public static object SerializedPropertyValue(SerializedProperty prop, bool resolveSchema = true)
         {
             if (prop == null)
                 return null;
@@ -367,7 +369,7 @@ namespace Locus
                         { "index", prop.enumValueIndex },
                         { "name", SerializedEnumDisplayName(prop) },
                         { "numericValue", SerializedEnumNumericValue(prop) },
-                        { "isFlags", IsFlagsEnum(prop) }
+                        { "isFlags", resolveSchema && IsFlagsEnum(prop) }
                     };
                 case SerializedPropertyType.ObjectReference:
                     return prop.objectReferenceValue != null
@@ -928,15 +930,19 @@ namespace Locus
             SerializedProperty prop,
             int depth,
             int maxDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            bool dynamicSchema)
         {
             bool isArray = prop.isArray && prop.propertyType == SerializedPropertyType.Generic;
             int arraySize = -1;
             if (isArray)
                 TryGetArraySize(prop, out arraySize);
 
-            Type fieldType = ResolveSerializedPropertyFieldType(prop);
-            FieldInfo fieldInfo = ResolveSerializedPropertyFieldInfo(prop);
+            Type fieldType = dynamicSchema ? null : ResolveSerializedPropertyFieldType(prop);
+            FieldInfo fieldInfo = dynamicSchema ? null : ResolveSerializedPropertyFieldInfo(prop);
+            bool isEnum = prop.propertyType == SerializedPropertyType.Enum;
+            bool isManagedReference = prop.propertyType == SerializedPropertyType.ManagedReference;
+            bool isObjectReference = prop.propertyType == SerializedPropertyType.ObjectReference;
             var snapshot = new SerializedPropertySnapshot
             {
                 propertyPath = prop.propertyPath,
@@ -946,23 +952,23 @@ namespace Locus
                 valueType = prop.propertyType.ToString(),
                 fieldTypeFullName = FieldTypeFullName(fieldType),
                 fieldTypeAssembly = FieldTypeAssembly(fieldType),
-                value = SerializedPropertyValue(prop),
+                value = SerializedPropertyValue(prop, !dynamicSchema),
                 displayValue = SerializedPropertyDisplayValue(prop),
                 editable = IsSerializedPropertyWritable(prop),
                 isArray = isArray,
                 arraySize = arraySize,
-                isFlagsEnum = prop.propertyType == SerializedPropertyType.Enum && IsFlagsEnum(prop),
-                enumValueIndex = prop.propertyType == SerializedPropertyType.Enum ? prop.enumValueIndex : -1,
-                enumValueFlag = prop.propertyType == SerializedPropertyType.Enum ? SerializedEnumNumericValue(prop) : 0,
-                enumOptions = prop.propertyType == SerializedPropertyType.Enum
+                isFlagsEnum = !dynamicSchema && isEnum && IsFlagsEnum(prop),
+                enumValueIndex = isEnum ? prop.enumValueIndex : -1,
+                enumValueFlag = isEnum ? SerializedEnumNumericValue(prop) : 0,
+                enumOptions = !dynamicSchema && isEnum
                     ? SerializedEnumOptions(prop)
                     : new SerializedEnumOption[0],
                 children = new SerializedPropertySnapshot[0],
-                isManagedReference = prop.propertyType == SerializedPropertyType.ManagedReference,
-                managedReferenceFullTypename = prop.propertyType == SerializedPropertyType.ManagedReference ? prop.managedReferenceFullTypename ?? "" : "",
-                managedReferenceFieldTypename = prop.propertyType == SerializedPropertyType.ManagedReference ? prop.managedReferenceFieldTypename ?? "" : "",
-                managedReferenceDisplayName = prop.propertyType == SerializedPropertyType.ManagedReference ? ManagedReferenceDisplayName(prop.managedReferenceFullTypename) : "",
-                managedReferenceTypes = prop.propertyType == SerializedPropertyType.ManagedReference
+                isManagedReference = isManagedReference,
+                managedReferenceFullTypename = isManagedReference ? prop.managedReferenceFullTypename ?? "" : "",
+                managedReferenceFieldTypename = isManagedReference ? prop.managedReferenceFieldTypename ?? "" : "",
+                managedReferenceDisplayName = isManagedReference ? ManagedReferenceDisplayName(prop.managedReferenceFullTypename) : "",
+                managedReferenceTypes = !dynamicSchema && isManagedReference
                     ? ManagedReferenceTypeOptions(prop)
                     : new SerializedManagedReferenceTypeOption[0],
                 tooltip = SerializedFieldTooltip(fieldInfo),
@@ -974,17 +980,17 @@ namespace Locus
                 multiline = IsSerializedFieldMultiline(fieldInfo),
                 minLines = SerializedFieldMinLines(fieldInfo),
                 maxLines = SerializedFieldMaxLines(fieldInfo),
-                referenceTypeFullName = prop.propertyType == SerializedPropertyType.ObjectReference
+                referenceTypeFullName = !dynamicSchema && isObjectReference
                     ? FieldTypeFullName(fieldType)
                     : "",
-                referenceTypeAssembly = prop.propertyType == SerializedPropertyType.ObjectReference
+                referenceTypeAssembly = !dynamicSchema && isObjectReference
                     ? FieldTypeAssembly(fieldType)
                     : "",
                 attributes = SerializedFieldAttributes(fieldInfo)
             };
 
             if (depth < maxDepth)
-                snapshot.children = SnapshotChildren(prop, depth, maxDepth, maxArrayItems, isArray, arraySize);
+                snapshot.children = SnapshotChildren(prop, depth, maxDepth, maxArrayItems, isArray, arraySize, dynamicSchema);
 
             snapshot.hasChildren = snapshot.children != null && snapshot.children.Length > 0;
             return snapshot;
@@ -996,7 +1002,8 @@ namespace Locus
             int maxDepth,
             int maxArrayItems,
             bool isArray,
-            int arraySize)
+            int arraySize,
+            bool dynamicSchema)
         {
             if (isArray)
             {
@@ -1011,7 +1018,7 @@ namespace Locus
                     {
                         SerializedProperty element = prop.GetArrayElementAtIndex(i);
                         if (element != null)
-                            items.Add(SnapshotSerializedProperty(element, depth + 1, maxDepth, maxArrayItems));
+                            items.Add(SnapshotSerializedProperty(element, depth + 1, maxDepth, maxArrayItems, dynamicSchema));
                     }
                     catch
                     {
@@ -1029,7 +1036,7 @@ namespace Locus
             bool enterChildren = true;
             while (cursor.NextVisible(enterChildren) && (end == null || !SerializedProperty.EqualContents(cursor, end)))
             {
-                children.Add(SnapshotSerializedProperty(cursor, depth + 1, maxDepth, maxArrayItems));
+                children.Add(SnapshotSerializedProperty(cursor, depth + 1, maxDepth, maxArrayItems, dynamicSchema));
                 enterChildren = false;
             }
             return children.ToArray();

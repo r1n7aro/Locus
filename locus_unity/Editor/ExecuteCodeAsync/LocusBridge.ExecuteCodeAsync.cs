@@ -420,6 +420,7 @@ namespace Locus
         private sealed class ExecuteLoadedRequest
         {
             public string assembly_b64;
+            public string assembly_path;
             public string entry_type;
         }
 
@@ -452,7 +453,9 @@ namespace Locus
                 return ErrorResponse(requestId, "execute_loaded request parse failed: " + ex.Message);
             }
 
-            if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+            if (request == null ||
+                (string.IsNullOrEmpty(request.assembly_b64) &&
+                 string.IsNullOrEmpty(request.assembly_path)))
             {
                 LogExecuteLoadedDebug(requestId, "missing assembly bytes");
                 return ErrorResponse(requestId, "execute_loaded request missing assembly bytes");
@@ -461,13 +464,13 @@ namespace Locus
             byte[] assemblyBytes;
             try
             {
-                assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+                assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
             }
             catch (Exception ex)
             {
                 if (ExecuteCodeDebugLoggingEnabled)
-                    LogExecuteLoadedDebug(requestId, "assembly decode failed: " + ex.Message);
-                return ErrorResponse(requestId, "execute_loaded assembly decode failed: " + ex.Message);
+                    LogExecuteLoadedDebug(requestId, "assembly load failed: " + ex.Message);
+                return ErrorResponse(requestId, "execute_loaded assembly load failed: " + ex.Message);
             }
 
             string entryTypeName = string.IsNullOrEmpty(request.entry_type)

@@ -83,6 +83,47 @@ namespace Locus
             return await tcs.Task;
         }
 
+        // ───────────────── hot_reload_set_debug ─────────────────
+
+        [Serializable]
+        private sealed class CodeOptimizationDto
+        {
+            public string code_optimization;
+        }
+
+        /// <summary>
+        /// Enable-time auto-fix: switch the editor's Code Optimization to
+        /// Debug (Release inlines call sites past the MonoMod redirect, so hot
+        /// patches would not take effect). Same effect as clicking the bug
+        /// icon in the status bar — Unity schedules a script recompile. The
+        /// assignment and read-back are synchronous, so the response carries
+        /// the resulting value before the recompile is processed.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleHotReloadSetDebug(string requestId)
+        {
+            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            PostToMainThread(delegate
+            {
+                try
+                {
+                    if (CompilationPipeline.codeOptimization != CodeOptimization.Debug)
+                        CompilationPipeline.codeOptimization = CodeOptimization.Debug;
+
+                    var payload = new CodeOptimizationDto();
+                    payload.code_optimization =
+                        CompilationPipeline.codeOptimization == CodeOptimization.Debug
+                            ? "debug"
+                            : "release";
+                    tcs.SetResult(OkResponse(requestId, JsonUtility.ToJson(payload)));
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetResult(ErrorResponse(requestId, "hot_reload_set_debug failed: " + ex.Message));
+                }
+            });
+            return await tcs.Task;
+        }
+
         // NoInlining so the reflection invocations below always go through
         // the patched native entry, regardless of the editor's own
         // optimization mode.
@@ -215,6 +256,7 @@ namespace Locus
         {
             public string patch_id;
             public string assembly_b64;
+            public string assembly_path;
             public string domain_generation;
             public HotPatchMethodDto[] methods;
         }
@@ -249,7 +291,9 @@ namespace Locus
                 return ErrorResponse(requestId, "hot_patch_loaded request parse failed: " + ex.Message);
             }
 
-            if (request == null || string.IsNullOrEmpty(request.assembly_b64))
+            if (request == null ||
+                (string.IsNullOrEmpty(request.assembly_b64) &&
+                 string.IsNullOrEmpty(request.assembly_path)))
                 return ErrorResponse(requestId, "hot_patch_loaded request missing assembly bytes");
             if (request.methods == null)
                 request.methods = new HotPatchMethodDto[0];
@@ -265,11 +309,11 @@ namespace Locus
             byte[] assemblyBytes;
             try
             {
-                assemblyBytes = Convert.FromBase64String(request.assembly_b64);
+                assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
             }
             catch (Exception ex)
             {
-                return ErrorResponse(requestId, "hot_patch_loaded assembly decode failed: " + ex.Message);
+                return ErrorResponse(requestId, "hot_patch_loaded assembly load failed: " + ex.Message);
             }
 
             string patchId = string.IsNullOrEmpty(request.patch_id) ? Guid.NewGuid().ToString("N") : request.patch_id;

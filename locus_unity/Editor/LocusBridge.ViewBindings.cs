@@ -15,6 +15,9 @@ namespace Locus
 {
     public static partial class LocusBridge
     {
+        private const int ViewBindingFilteredDiscoverMaxResults = 500;
+        private const int ViewBindingIncludeAllDiscoverMaxResults = 50000;
+
         [Serializable]
         private sealed class ViewBindingTarget
         {
@@ -40,6 +43,7 @@ namespace Locus
             public ViewBindingTarget target;
             public int maxDepth;
             public int maxArrayItems;
+            public string schemaMode;
         }
 
         [Serializable]
@@ -49,6 +53,7 @@ namespace Locus
             public ViewBindingTarget target;
             public string valueJson;
             public string mode;
+            public string schemaMode;
         }
 
         [Serializable]
@@ -67,6 +72,8 @@ namespace Locus
             public string fieldType;
             public int maxDepth;
             public int maxResults;
+            public bool includeAll;
+            public string schemaMode;
         }
 
         private sealed class ViewBindingDiscoverMatch
@@ -111,7 +118,7 @@ namespace Locus
             return await RunViewBindingOnMainThread(
                 requestId,
                 "view_binding_read",
-                delegate { return ReadViewBinding(request.bindingId, request.target, request.maxDepth, request.maxArrayItems); });
+                delegate { return ReadViewBinding(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, IsDynamicSchemaMode(request.schemaMode)); });
         }
 
         private static async Task<PipeEnvelope> HandleViewBindingWrite(string requestId, string message)
@@ -130,7 +137,7 @@ namespace Locus
             return await RunViewBindingOnMainThread(
                 requestId,
                 "view_binding_write",
-                delegate { return WriteViewBinding(request.bindingId, request.target, request.valueJson, request.mode); });
+                delegate { return WriteViewBinding(request.bindingId, request.target, request.valueJson, request.mode, IsDynamicSchemaMode(request.schemaMode)); });
         }
 
         private static async Task<PipeEnvelope> HandleViewBindingApply(string requestId, string message)
@@ -219,6 +226,7 @@ namespace Locus
             public ViewBindingTarget target;
             public string valueJson;
             public string mode;
+            public bool dynamicSchema;
             public UnityEngine.Object obj;
         }
 
@@ -276,6 +284,7 @@ namespace Locus
                         target = ViewBindingTargetWithLocalFileIds(write.target, obj),
                         valueJson = write.valueJson,
                         mode = write.mode,
+                        dynamicSchema = IsDynamicSchemaMode(write.schemaMode),
                         obj = obj
                     });
                 }
@@ -322,7 +331,7 @@ namespace Locus
                             {
                                 prop = ApplyViewBindingPreviewValue(obj, serialized, prop, write);
                                 resultItems[write.index] =
-                                    BuildBindingReadJson(write.bindingId, write.target, prop, false);
+                                    BuildBindingReadJson(write.bindingId, write.target, prop, false, write.dynamicSchema);
                             }
                             else
                             {
@@ -350,7 +359,7 @@ namespace Locus
                         AppliedViewBindingWrite item = applied[i];
                         SerializedProperty freshProp = serialized.FindProperty(item.write.target.propertyPath);
                         resultItems[item.write.index] =
-                            BuildBindingReadJson(item.write.bindingId, item.write.target, freshProp != null ? freshProp : item.prop, true);
+                            BuildBindingReadJson(item.write.bindingId, item.write.target, freshProp != null ? freshProp : item.prop, true, item.write.dynamicSchema);
                     }
                 }
                 catch (Exception ex)
@@ -393,7 +402,17 @@ namespace Locus
                    target.componentIndex.ToString(CultureInfo.InvariantCulture);
         }
 
-        private static string ReadViewBinding(string bindingId, ViewBindingTarget target, int maxDepth = 0, int maxArrayItems = 0)
+        private static bool IsDynamicSchemaMode(string schemaMode)
+        {
+            return string.Equals((schemaMode ?? "").Trim(), "dynamic", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ReadViewBinding(
+            string bindingId,
+            ViewBindingTarget target,
+            int maxDepth = 0,
+            int maxArrayItems = 0,
+            bool dynamicSchema = false)
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
             target = ViewBindingTargetWithLocalFileIds(target, obj);
@@ -407,7 +426,8 @@ namespace Locus
                     target,
                     obj,
                     depthLimit,
-                    arrayLimit);
+                    arrayLimit,
+                    dynamicSchema);
                 SerializedPropertySnapshot objectSnapshot = properties.Length == 1
                     ? properties[0]
                     : BuildViewBindingAggregateSnapshot(target, obj, properties);
@@ -418,7 +438,7 @@ namespace Locus
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
             int propertyDepthLimit = maxDepth > 0 ? Math.Min(maxDepth, 16) : 4;
             int propertyArrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 512) : 64;
-            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit);
+            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit, dynamicSchema);
             ApplyViewBindingTargetToSnapshotTree(propertySnapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(
                 bindingId,
@@ -431,18 +451,20 @@ namespace Locus
             ViewBindingTarget target,
             UnityEngine.Object obj,
             int maxDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            bool dynamicSchema)
         {
             GameObject go = obj as GameObject;
             if (go == null)
-                return new[] { SnapshotViewBindingObject(target, obj, maxDepth, maxArrayItems) };
+                return new[] { SnapshotViewBindingObject(target, obj, maxDepth, maxArrayItems, dynamicSchema) };
 
             var properties = new List<SerializedPropertySnapshot>();
             properties.Add(SnapshotViewBindingObject(
                 ViewBindingGameObjectTarget(target),
                 go,
                 maxDepth,
-                maxArrayItems));
+                maxArrayItems,
+                dynamicSchema));
 
             var componentIndexes = new Dictionary<string, int>(StringComparer.Ordinal);
             Component[] components = go.GetComponents<Component>();
@@ -461,7 +483,8 @@ namespace Locus
                     ViewBindingComponentTarget(target, componentType, componentIndex),
                     component,
                     maxDepth,
-                    maxArrayItems));
+                    maxArrayItems,
+                    dynamicSchema));
             }
 
             return properties.ToArray();
@@ -471,10 +494,11 @@ namespace Locus
             ViewBindingTarget target,
             UnityEngine.Object obj,
             int maxDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            bool dynamicSchema)
         {
             target = ViewBindingTargetWithLocalFileIds(target, obj);
-            SerializedPropertySnapshot snapshot = SnapshotSerializedObject(obj, maxDepth, maxArrayItems);
+            SerializedPropertySnapshot snapshot = SnapshotSerializedObject(obj, maxDepth, maxArrayItems, dynamicSchema);
             if (snapshot == null)
                 return null;
 
@@ -1011,7 +1035,12 @@ namespace Locus
             }
         }
 
-        private static string WriteViewBinding(string bindingId, ViewBindingTarget target, string valueJson, string mode = null)
+        private static string WriteViewBinding(
+            string bindingId,
+            ViewBindingTarget target,
+            string valueJson,
+            string mode = null,
+            bool dynamicSchema = false)
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
             if (IsViewBindingSyntheticHeaderProperty(obj, target))
@@ -1032,16 +1061,17 @@ namespace Locus
                     target = target,
                     valueJson = valueJson,
                     mode = mode,
+                    dynamicSchema = dynamicSchema,
                     obj = obj
                 };
                 prop = ApplyViewBindingPreviewValue(obj, serialized, prop, write);
-                return BuildBindingReadJson(bindingId, target, prop, false);
+                return BuildBindingReadJson(bindingId, target, prop, false, dynamicSchema);
             }
 
             SetSerializedPropertyValue(prop, valueJson);
             ApplyViewBindingSerializedChanges(serialized, obj);
             SerializedProperty updated = serialized.FindProperty(target.propertyPath);
-            return BuildBindingReadJson(bindingId, target, updated != null ? updated : prop, true);
+            return BuildBindingReadJson(bindingId, target, updated != null ? updated : prop, true, dynamicSchema);
         }
 
         private static string DiscoverViewBindingProperties(ViewBindingDiscoverRequest request)
@@ -1049,12 +1079,17 @@ namespace Locus
             string query = NormalizeSearchText(request.query);
             string fieldName = (request.fieldName ?? "").Trim();
             string fieldType = (request.fieldType ?? "").Trim();
-            if (string.IsNullOrEmpty(query) && string.IsNullOrEmpty(fieldName) && string.IsNullOrEmpty(fieldType))
+            bool dynamicSchema = IsDynamicSchemaMode(request.schemaMode);
+            bool includeAll = request.includeAll || dynamicSchema;
+            if (!includeAll && string.IsNullOrEmpty(query) && string.IsNullOrEmpty(fieldName) && string.IsNullOrEmpty(fieldType))
                 throw new Exception("View binding discover requires query, fieldName, or fieldType");
 
             int maxDepth = request.maxDepth > 0 ? Math.Min(request.maxDepth, 32) : 8;
-            int maxResults = request.maxResults > 0 ? Math.Min(request.maxResults, 500) : 100;
+            int maxResults = request.maxResults > 0
+                ? Math.Min(request.maxResults, includeAll ? ViewBindingIncludeAllDiscoverMaxResults : ViewBindingFilteredDiscoverMaxResults)
+                : includeAll ? ViewBindingIncludeAllDiscoverMaxResults : 100;
             UnityEngine.Object obj = ResolveViewBindingObject(request.target);
+            ViewBindingTarget resolvedTarget = ViewBindingTargetWithLocalFileIds(request.target, obj);
             var serialized = new SerializedObject(obj);
             serialized.Update();
 
@@ -1068,13 +1103,17 @@ namespace Locus
                 if (depth > maxDepth)
                     continue;
 
-                Type resolvedType = ResolveSerializedPropertyFieldType(cursor);
-                if (!MatchesViewBindingDiscoveryName(cursor, fieldName))
-                    continue;
-                if (!MatchesViewBindingDiscoveryQuery(cursor, resolvedType, query))
-                    continue;
-                if (!string.IsNullOrEmpty(fieldType) && !TypeMatches(resolvedType, fieldType))
-                    continue;
+                Type resolvedType = null;
+                if (!includeAll)
+                {
+                    resolvedType = ResolveSerializedPropertyFieldType(cursor);
+                    if (!MatchesViewBindingDiscoveryName(cursor, fieldName))
+                        continue;
+                    if (!MatchesViewBindingDiscoveryQuery(cursor, resolvedType, query))
+                        continue;
+                    if (!string.IsNullOrEmpty(fieldType) && !TypeMatches(resolvedType, fieldType))
+                        continue;
+                }
 
                 matches.Add(BuildViewBindingDiscoverMatch(cursor, resolvedType, depth));
                 if (matches.Count >= maxResults)
@@ -1086,7 +1125,7 @@ namespace Locus
                 ok = true,
                 bindingId = request.bindingId ?? "",
                 message = matches.Count == 0 ? "No matching properties." : "ok",
-                target = request.target,
+                target = resolvedTarget,
                 matches = matches.ToArray()
             }, 0);
         }
@@ -1759,9 +1798,10 @@ namespace Locus
             string bindingId,
             ViewBindingTarget target,
             SerializedProperty prop,
-            bool saved)
+            bool saved,
+            bool dynamicSchema = false)
         {
-            SerializedPropertySnapshot snapshot = SnapshotSerializedProperty(prop);
+            SerializedPropertySnapshot snapshot = SnapshotSerializedProperty(prop, 4, 64, dynamicSchema);
             UnityEngine.Object obj = prop != null && prop.serializedObject != null
                 ? prop.serializedObject.targetObject
                 : null;

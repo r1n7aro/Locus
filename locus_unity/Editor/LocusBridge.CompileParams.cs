@@ -37,6 +37,21 @@ namespace Locus
             public string known_fingerprint;
         }
 
+        /// <summary>
+        /// Reply shape for the get_reload_state probe (see the message handler
+        /// in LocusBridge.cs). domain_generation changes on every domain
+        /// reload; converged_serial advances only on a successful compilation,
+        /// so the desktop can tell a compile-driven convergence from a
+        /// no-compile reload.
+        /// </summary>
+        [Serializable]
+        private sealed class ReloadStatePayload
+        {
+            public string session_id;
+            public string domain_generation;
+            public int converged_serial;
+        }
+
         [Serializable]
         private sealed class CompileParamsPayload
         {
@@ -100,8 +115,25 @@ namespace Locus
             {
                 string[] defines = SnippetPreprocessorSymbols;
                 bool allowUnsafe = GetCachedCompileAllowUnsafe();
-                string fingerprint = ComputeCompileParamsFingerprint(
+                string fingerprint;
+                if (TryUseCachedCompileParamsFingerprint(knownFingerprint, out fingerprint))
+                {
+                    var unchangedPayload = new CompileParamsPayload
+                    {
+                        unchanged = true,
+                        fingerprint = fingerprint,
+                        domain_generation = _compileDomainGeneration,
+                        lang_version = CompileParamsLanguageVersion,
+                        defines = Array.Empty<string>(),
+                        reference_paths = Array.Empty<string>(),
+                        allow_unsafe = allowUnsafe
+                    };
+                    return OkResponse(requestId, JsonUtility.ToJson(unchangedPayload));
+                }
+
+                fingerprint = ComputeCompileParamsFingerprint(
                     paths, defines, CompileParamsLanguageVersion, allowUnsafe);
+                CacheCompileParamsFingerprint(fingerprint);
 
                 var payload = new CompileParamsPayload
                 {
@@ -126,6 +158,53 @@ namespace Locus
             catch (Exception ex)
             {
                 return ErrorResponse(requestId, "get_compile_params failed: " + ex.Message);
+            }
+        }
+
+        private static bool TryUseCachedCompileParamsFingerprint(
+            string knownFingerprint,
+            out string fingerprint)
+        {
+            fingerprint = null;
+            if (string.IsNullOrEmpty(knownFingerprint))
+                return false;
+
+            long nowTicks = DateTime.UtcNow.Ticks;
+            lock (_compileCacheLock)
+            {
+                if (!_compileReferencePathsReady ||
+                    !_compileParamsFingerprintReady ||
+                    string.IsNullOrEmpty(_cachedCompileParamsFingerprint))
+                {
+                    return false;
+                }
+
+                if (!string.Equals(
+                        knownFingerprint,
+                        _cachedCompileParamsFingerprint,
+                        StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (nowTicks - _cachedCompileParamsFingerprintCheckedAtTicks >=
+                    CompileParamsFingerprintAuditIntervalTicks)
+                {
+                    return false;
+                }
+
+                fingerprint = _cachedCompileParamsFingerprint;
+                return true;
+            }
+        }
+
+        private static void CacheCompileParamsFingerprint(string fingerprint)
+        {
+            lock (_compileCacheLock)
+            {
+                _cachedCompileParamsFingerprint = fingerprint;
+                _compileParamsFingerprintReady = true;
+                _cachedCompileParamsFingerprintCheckedAtTicks = DateTime.UtcNow.Ticks;
             }
         }
 

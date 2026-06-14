@@ -32,6 +32,13 @@ namespace Locus
 
         private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false);
 
+        private static byte[] ReadAssemblyPayload(string assemblyB64, string assemblyPath)
+        {
+            if (!string.IsNullOrEmpty(assemblyPath))
+                return File.ReadAllBytes(assemblyPath);
+            return Convert.FromBase64String(assemblyB64);
+        }
+
         // ───────────────── Constants ─────────────────
 
         private const int ExecuteTimeoutMs = 30000;
@@ -60,6 +67,10 @@ namespace Locus
         private static bool _metadataReferencesReady;
         private static List<string> _cachedCompileReferencePaths;
         private static bool _compileReferencePathsReady;
+        private static string _cachedCompileParamsFingerprint;
+        private static bool _compileParamsFingerprintReady;
+        private static long _cachedCompileParamsFingerprintCheckedAtTicks;
+        private const long CompileParamsFingerprintAuditIntervalTicks = TimeSpan.TicksPerSecond * 5L;
         /// <summary>Any project script assembly compiles with "Allow unsafe
         /// code" — hot patches follow it (B4). Cached together with the
         /// reference paths (same CompilationPipeline walk, same lifetime).</summary>
@@ -70,6 +81,27 @@ namespace Locus
 
         private const string SessionKey_RecompileInProgress = "Locus_RecompileInProgress";
         private const string SessionKey_RecompileResult = "Locus_RecompileResult";
+        // Convergence signalling read by the desktop via get_reload_state.
+        // CompileAwaitingReload: set by OnCompilationFinished on a SUCCESSFUL
+        // compile (any initiator), consumed by OnAfterAssemblyReload in the next
+        // domain to advance ConvergedSerial — so the serial only moves once the
+        // newly compiled assemblies are actually LOADED (true convergence),
+        // never while the old domain still runs the old code. A no-compile
+        // domain reload (e.g. entering play mode) leaves the serial untouched.
+        // EditorSessionId is a per-process id (reset on restart) so the desktop
+        // converges against a fresh editor instance even if it never observed
+        // the old one exit.
+        private const string SessionKey_CompileAwaitingReload = "Locus_CompileAwaitingReload";
+        private const string SessionKey_ConvergedSerial = "Locus_ConvergedSerial";
+        private const string SessionKey_EditorSessionId = "Locus_EditorSessionId";
+        // Set when request_recompile issues a compilation, cleared by the next
+        // OnCompilationFinished (any compile). While true, a domain reload is
+        // loading an EARLIER compile's assemblies — not the requested one's — so
+        // OnAfterAssemblyReload must not advance ConvergedSerial or complete the
+        // request: a stale reload would otherwise converge edits that belong to
+        // the still-running requested compile, reporting them applied before they
+        // are loaded.
+        private const string SessionKey_RecompilePendingCompile = "Locus_RecompilePendingCompile";
 
         private static volatile bool _recompileRequested;
         private static volatile string _lastCompileResult;
@@ -452,9 +484,11 @@ namespace Locus
 
         private static void OnAssemblyCompilationFinished(string assemblyPath, CompilerMessage[] messages)
         {
-            if (!_recompileRequested)
-                return;
-
+            // Collect errors for EVERY compilation, not just Locus-requested
+            // ones, so OnCompilationFinished can tell a successful compile from
+            // a failed one regardless of who triggered it (the convergence
+            // serial must only advance on success). Reset each cycle in
+            // OnCompilationFinished.
             lock (_recompileErrorsLock)
             {
                 foreach (var msg in messages)
@@ -474,32 +508,59 @@ namespace Locus
             // Compilation did fire — cancel the "no compilation" check
             _recompileCheckFrames = -1;
 
+            // A requested compile (if any) has now finished: its reload is the
+            // one allowed to converge. Clear the in-flight marker for EVERY
+            // compile finish — the flag was set when this request was issued, so
+            // the first finish after it is the requested compile (or a coalesced
+            // superset). This frees OnAfterAssemblyReload to converge again.
+            SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
+
+            // Snapshot + reset the per-cycle error set (collected for every
+            // compilation by OnAssemblyCompilationFinished) so success/failure
+            // is known whoever triggered this compile.
+            List<string> errors = null;
+            lock (_recompileErrorsLock)
+            {
+                if (_recompileErrors.Count > 0)
+                    errors = new List<string>(_recompileErrors);
+                _recompileErrors.Clear();
+            }
+            bool succeeded = errors == null;
+
+            // Initiator-agnostic convergence signal: a SUCCESSFUL compilation —
+            // requested by Locus or triggered by Unity itself (manual Ctrl+R,
+            // save, auto-refresh on focus, startup) — will make the loaded
+            // assemblies reflect the current on-disk sources ONCE its domain
+            // reload completes. Only flag it here; OnAfterAssemblyReload advances
+            // the convergence serial after the new assemblies are actually
+            // loaded, so the desktop never converges while the old domain still
+            // runs the old code (or if the reload never fires). Write the flag
+            // BOTH ways: a FAILED compile must clear a stale flag left by a prior
+            // successful-but-not-yet-reloaded compile, otherwise a later bare
+            // domain reload would consume it and falsely report convergence.
+            SessionState.SetBool(SessionKey_CompileAwaitingReload, succeeded);
+
             if (!_recompileRequested)
                 return;
 
             _recompileRequested = false;
 
-            lock (_recompileErrorsLock)
+            if (!succeeded)
             {
-                if (_recompileErrors.Count > 0)
-                {
-                    // Compilation failed. Persist the error so Rust can surface it after any reconnect.
-                    SetCompileResult("error:" + string.Join("\n", _recompileErrors));
-                    _recompileErrors.Clear();
+                // Compilation failed. Persist the error so Rust can surface it after any reconnect.
+                SetCompileResult("error:" + string.Join("\n", errors));
 
-                    // Failed compilations do not trigger a domain reload, so clear the in-progress flag here.
-                    SessionState.SetBool(SessionKey_RecompileInProgress, false);
-                    _domainReloadCheckFrames = -1;
-                }
-                else
-                {
-                    // Compilation finished successfully. Mark the result and wait for the real reload signal.
-                    SetCompileResult("awaiting_reload");
-                    _recompileErrors.Clear();
-                    Debug.Log($"[Locus] Compilation succeeded, waiting for domain reload. isCompiling={EditorApplication.isCompiling}, isPlaying={EditorApplication.isPlaying}");
-                    // If we are still in the same AppDomain after a few frames, reload did not fire.
-                    _domainReloadCheckFrames = 0;
-                }
+                // Failed compilations do not trigger a domain reload, so clear the in-progress flag here.
+                SessionState.SetBool(SessionKey_RecompileInProgress, false);
+                _domainReloadCheckFrames = -1;
+            }
+            else
+            {
+                // Compilation finished successfully. Mark the result and wait for the real reload signal.
+                SetCompileResult("awaiting_reload");
+                Debug.Log($"[Locus] Compilation succeeded, waiting for domain reload. isCompiling={EditorApplication.isCompiling}, isPlaying={EditorApplication.isPlaying}");
+                // If we are still in the same AppDomain after a few frames, reload did not fire.
+                _domainReloadCheckFrames = 0;
             }
         }
 
@@ -508,7 +569,32 @@ namespace Locus
             RefreshCachedEditorState();
             NativeOnAfterReload();
 
-            // afterAssemblyReload is the authoritative completion point for a successful recompile.
+            // A reload that fires while a requested compile is still in flight is
+            // loading an EARLIER compile's assemblies, not the requested one's.
+            // Advancing the serial or completing the request now would converge
+            // edits that belong to the in-flight compile (not yet loaded). Defer
+            // to that compile's own reload, which runs after its
+            // OnCompilationFinished clears this marker.
+            if (SessionState.GetBool(SessionKey_RecompilePendingCompile, false))
+                return;
+
+            // Initiator-agnostic convergence: if this reload was driven by a
+            // successful compilation (flagged by OnCompilationFinished in the
+            // previous domain), the new assemblies are now loaded — disk is the
+            // loaded truth. Advance the convergence serial so the desktop clears
+            // its "unapplied" tracking. This fires for Unity-initiated recompiles
+            // (Ctrl+R, save, focus auto-refresh) too, not just Locus
+            // request_recompile, and only AFTER load — never at compile time.
+            if (SessionState.GetBool(SessionKey_CompileAwaitingReload, false))
+            {
+                SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
+                SessionState.SetInt(
+                    SessionKey_ConvergedSerial,
+                    SessionState.GetInt(SessionKey_ConvergedSerial, 0) + 1);
+            }
+
+            // afterAssemblyReload is also the completion point for a
+            // Locus-requested recompile (drives get_compile_result polling).
             if (!SessionState.GetBool(SessionKey_RecompileInProgress, false))
                 return;
 
@@ -524,6 +610,9 @@ namespace Locus
                 _cachedMetadataReferences = null;
                 _compileReferencePathsReady = false;
                 _cachedCompileReferencePaths = null;
+                _compileParamsFingerprintReady = false;
+                _cachedCompileParamsFingerprint = null;
+                _cachedCompileParamsFingerprintCheckedAtTicks = 0;
                 _cachedCompileAllowUnsafe = false;
             }
         }
@@ -558,6 +647,24 @@ namespace Locus
         {
             _lastCompileResult = null;
             SessionState.SetString(SessionKey_RecompileResult, "");
+        }
+
+        /// <summary>
+        /// Stable id for this editor process, minted once and kept in
+        /// SessionState (survives domain reloads, reset on restart). The desktop
+        /// reads it via get_reload_state to recognize a fresh editor instance —
+        /// whose loaded assemblies always reflect disk — and converge even when
+        /// it never observed the previous instance exit.
+        /// </summary>
+        private static string EnsureEditorSessionId()
+        {
+            string id = SessionState.GetString(SessionKey_EditorSessionId, "");
+            if (string.IsNullOrEmpty(id))
+            {
+                id = Guid.NewGuid().ToString("N");
+                SessionState.SetString(SessionKey_EditorSessionId, id);
+            }
+            return id;
         }
 
         private static void QueueChangedAssets(IEnumerable<string> assetPaths)
@@ -724,6 +831,11 @@ namespace Locus
                         _recompileRequested = false;
                         SetCompileResult("error:Unity 未检测到脚本变更，编译未触发。请确认 .cs 文件已正确写入且路径位于 Assets 目录内。");
                         SessionState.SetBool(SessionKey_RecompileInProgress, false);
+                        // No compile/reload happened — drop any stale awaiting flag
+                        // so it cannot be consumed by a later unrelated reload, and
+                        // clear the in-flight marker so future reloads converge.
+                        SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
+                        SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
                         _domainReloadCheckFrames = -1;
                     }
                 }
@@ -740,6 +852,10 @@ namespace Locus
                     _domainReloadCheckFrames = -1;
                     SetCompileResult("error:编译成功但域重载未触发。请检查 Unity Editor 当前状态是否正常。");
                     SessionState.SetBool(SessionKey_RecompileInProgress, false);
+                    // The compile's reload never fired — its assemblies are on
+                    // disk but unloaded. Drop the awaiting flag so a later
+                    // unrelated reload does not claim this compile's convergence.
+                    SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
                 }
             }
 
@@ -1133,6 +1249,9 @@ namespace Locus
                     case "hot_reload_probe":
                         return await HandleHotReloadProbe(reqId).ConfigureAwait(false);
 
+                    case "hot_reload_set_debug":
+                        return await HandleHotReloadSetDebug(reqId).ConfigureAwait(false);
+
                     case "hot_reload_access_probe":
                         return await HandleHotReloadAccessProbe(reqId, msg.message).ConfigureAwait(false);
 
@@ -1211,6 +1330,11 @@ namespace Locus
                             AssetDatabase.Refresh();
                             _domainReloadCheckFrames = -1;
                             CompilationPipeline.RequestScriptCompilation();
+                            // Mark the requested compile in-flight: until its
+                            // OnCompilationFinished fires, any domain reload is an
+                            // earlier compile's and must not complete this request
+                            // or advance the convergence serial.
+                            SessionState.SetBool(SessionKey_RecompilePendingCompile, true);
 
                             _recompileCheckFrames = 0;
                         });
@@ -1269,6 +1393,38 @@ namespace Locus
                                     FlushQueuedAssetImports();
 
                                 tcs.SetResult(OkResponse(reqId, lines.Length + " assets queued"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
+                    case "get_reload_state":
+                    {
+                        // Lightweight reload-lifecycle probe the desktop polls to
+                        // reconcile its hot-reload "unapplied changes" set: the
+                        // per-domain generation (changes on every reload) plus a
+                        // serial that advances on every SUCCESSFUL compilation
+                        // (any initiator). A moved serial means a real compile
+                        // converged disk into the loaded assemblies; a changed
+                        // generation with an unchanged serial is a no-compile
+                        // reload (e.g. entering play mode). SessionState read on
+                        // the main thread, like get_compile_result.
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                var payload = new ReloadStatePayload
+                                {
+                                    session_id = EnsureEditorSessionId(),
+                                    domain_generation = _compileDomainGeneration,
+                                    converged_serial = SessionState.GetInt(SessionKey_ConvergedSerial, 0),
+                                };
+                                tcs.SetResult(OkResponse(reqId, JsonUtility.ToJson(payload)));
                             }
                             catch (Exception ex)
                             {
