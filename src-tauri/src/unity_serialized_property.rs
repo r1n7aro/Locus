@@ -69,15 +69,22 @@ pub async fn read(
     request: UnitySerializedPropertyReadRequest,
 ) -> Result<UnitySerializedPropertyReadResult, String> {
     validate_object_target(&request.target)?;
+    let schema = load_schema_for_target(working_dir, &request.target).await;
+    let schema_mode = if schema.is_some() { "dynamic" } else { "full" };
     let payload = serde_json::json!({
         "bindingId": request.binding_id,
         "target": request.target,
         "maxDepth": request.max_depth.unwrap_or_default(),
         "maxArrayItems": request.max_array_items.unwrap_or_default(),
+        "schemaMode": schema_mode,
     });
     let raw = crate::unity_bridge::view_binding_read(working_dir, &payload).await?;
-    serde_json::from_str(&raw)
-        .map_err(|error| format!("Invalid unity_serialized_property_read response: {}", error))
+    let mut result: UnitySerializedPropertyReadResult = serde_json::from_str(&raw)
+        .map_err(|error| format!("Invalid unity_serialized_property_read response: {}", error))?;
+    if let Some(schema) = schema {
+        schema.enrich_read_result(&mut result);
+    }
+    Ok(result)
 }
 
 pub async fn discover(
@@ -85,22 +92,45 @@ pub async fn discover(
     request: UnitySerializedPropertyDiscoverRequest,
 ) -> Result<UnitySerializedPropertyDiscoverResult, String> {
     validate_object_target(&request.target)?;
+    let schema = load_schema_for_target(working_dir, &request.target).await;
+    let filters = crate::unity_serialized_schema::DiscoverFilters {
+        query: request.query.clone(),
+        field_name: request.field_name.clone(),
+        field_type: request.field_type.clone(),
+        max_results: request.max_results,
+    };
+    let include_all = schema.is_some() && !discover_has_filters(&filters);
+    let schema_mode = if include_all { "dynamic" } else { "full" };
+    let unity_max_results = if include_all {
+        request.max_results.unwrap_or_default().max(5000)
+    } else {
+        request.max_results.unwrap_or_default()
+    };
     let payload = serde_json::json!({
         "bindingId": request.binding_id,
         "target": request.target,
-        "query": request.query.unwrap_or_default(),
-        "fieldName": request.field_name.unwrap_or_default(),
-        "fieldType": request.field_type.unwrap_or_default(),
+        "query": if include_all { String::new() } else { request.query.unwrap_or_default() },
+        "fieldName": if include_all { String::new() } else { request.field_name.unwrap_or_default() },
+        "fieldType": if include_all { String::new() } else { request.field_type.unwrap_or_default() },
         "maxDepth": request.max_depth.unwrap_or_default(),
-        "maxResults": request.max_results.unwrap_or_default(),
+        "maxResults": unity_max_results,
+        "includeAll": include_all,
+        "schemaMode": schema_mode,
     });
     let raw = crate::unity_bridge::view_binding_discover(working_dir, &payload).await?;
-    serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "Invalid unity_serialized_property_discover response: {}",
-            error
-        )
-    })
+    let mut result: UnitySerializedPropertyDiscoverResult =
+        serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "Invalid unity_serialized_property_discover response: {}",
+                error
+            )
+        })?;
+    if include_all {
+        if let Some(schema) = schema {
+            schema.enrich_discover_result(&mut result, &filters);
+        }
+    }
+    Ok(result)
 }
 
 pub async fn write(
@@ -108,6 +138,8 @@ pub async fn write(
     request: UnitySerializedPropertyWriteRequest,
 ) -> Result<UnitySerializedPropertyWriteResult, String> {
     validate_property_target(&request.target)?;
+    let schema = load_schema_for_target(working_dir, &request.target).await;
+    let schema_mode = if schema.is_some() { "dynamic" } else { "full" };
     let value_json = serde_json::to_string(&request.value)
         .map_err(|error| format!("Failed to serialize serialized property value: {}", error))?;
     let payload = serde_json::json!({
@@ -115,14 +147,22 @@ pub async fn write(
         "target": request.target,
         "valueJson": value_json,
         "mode": normalize_write_mode(request.write_mode.as_deref())?,
+        "schemaMode": schema_mode,
     });
     let raw = crate::unity_bridge::view_binding_write(working_dir, &payload).await?;
-    serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "Invalid unity_serialized_property_write response: {}",
-            error
-        )
-    })
+    let mut result: UnitySerializedPropertyWriteResult =
+        serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "Invalid unity_serialized_property_write response: {}",
+                error
+            )
+        })?;
+    if let Some(schema) = schema {
+        if schema.can_enrich_target(&result.read.target) {
+            schema.enrich_read_result(&mut result.read);
+        }
+    }
+    Ok(result)
 }
 
 pub async fn apply(
@@ -132,25 +172,83 @@ pub async fn apply(
     for write in &request.writes {
         validate_property_target(&write.target)?;
     }
+    let schema = if request.writes.iter().any(|write| {
+        !crate::unity_serialized_schema::target_is_static_schema_excluded(&write.target)
+    }) {
+        crate::unity_serialized_schema::try_load_current_schema(working_dir).await
+    } else {
+        None
+    };
     let mut writes = Vec::with_capacity(request.writes.len());
     for write in request.writes {
         let value_json = serde_json::to_string(&write.value)
             .map_err(|error| format!("Failed to serialize serialized property value: {}", error))?;
+        let schema_mode = if schema
+            .as_ref()
+            .map(|schema| schema.can_enrich_target(&write.target))
+            .unwrap_or(false)
+        {
+            "dynamic"
+        } else {
+            "full"
+        };
         writes.push(serde_json::json!({
             "bindingId": write.binding_id,
             "target": write.target,
             "valueJson": value_json,
             "mode": normalize_write_mode(write.write_mode.as_deref())?,
+            "schemaMode": schema_mode,
         }));
     }
     let payload = serde_json::json!({ "writes": writes });
     let raw = crate::unity_bridge::view_binding_apply(working_dir, &payload).await?;
-    serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "Invalid unity_serialized_property_apply response: {}",
-            error
-        )
-    })
+    let mut result: UnitySerializedPropertyApplyResult =
+        serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "Invalid unity_serialized_property_apply response: {}",
+                error
+            )
+        })?;
+    if let Some(schema) = schema {
+        for item in &mut result.results {
+            if schema.can_enrich_target(&item.read.target) {
+                schema.enrich_read_result(&mut item.read);
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn load_schema_for_target(
+    working_dir: &str,
+    target: &UnitySerializedPropertyTarget,
+) -> Option<std::sync::Arc<crate::unity_serialized_schema::SerializedSchemaIndex>> {
+    if crate::unity_serialized_schema::target_is_static_schema_excluded(target) {
+        return None;
+    }
+    let schema = crate::unity_serialized_schema::try_load_current_schema(working_dir).await;
+    schema.filter(|schema| schema.can_enrich_target(target))
+}
+
+fn discover_has_filters(filters: &crate::unity_serialized_schema::DiscoverFilters) -> bool {
+    filters
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || filters
+            .field_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        || filters
+            .field_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
 }
 
 fn normalize_write_mode(mode: Option<&str>) -> Result<&'static str, String> {
