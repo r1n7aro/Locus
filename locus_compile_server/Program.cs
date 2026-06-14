@@ -15,6 +15,7 @@
 //   compile/hotPatch  -> diff + rewrite + compile a hot-patch assembly
 //   compile/accessProbe -> compile the C0 runtime access-probe assembly
 //   index/types       -> Unity type index built from reference metadata
+//   index/schema      -> SerializedProperty schema built from reference metadata
 
 using System.Globalization;
 using System.Text.Json;
@@ -113,6 +114,9 @@ while (true)
                 break;
             case "index/types":
                 result = service.HandleIndexTypes(@params);
+                break;
+            case "index/schema":
+                result = service.HandleIndexSchema(@params);
                 break;
             default:
                 error = RpcError(-32601, $"method not found: {method}");

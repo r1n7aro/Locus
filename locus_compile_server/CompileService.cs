@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -67,6 +69,17 @@ public sealed class CompileRawRequestDto
 
     [JsonPropertyName("registerImage")]
     public bool RegisterImage { get; set; }
+
+    [JsonPropertyName("emitDebugSymbols")]
+    public bool? EmitDebugSymbols { get; set; }
+
+    [JsonPropertyName("returnAssemblyPath")]
+    public bool ReturnAssemblyPath { get; set; }
+
+    /// <summary>Optional diagnostic formatter. "viewScript" mirrors
+    /// LocusBridge.ViewScripts.cs with path-qualified errors.</summary>
+    [JsonPropertyName("diagnosticStyle")]
+    public string? DiagnosticStyle { get; set; }
 }
 
 public sealed class CompileSnippetRequestDto
@@ -85,6 +98,9 @@ public sealed class CompileSnippetRequestDto
     /// register (e.g. not the compile_run_states pre-check).</summary>
     [JsonPropertyName("registerImage")]
     public bool RegisterImage { get; set; }
+
+    [JsonPropertyName("returnAssemblyPath")]
+    public bool ReturnAssemblyPath { get; set; }
 }
 
 public sealed class CompileRunStatesRequestDto
@@ -100,6 +116,9 @@ public sealed class CompileRunStatesRequestDto
 
     [JsonPropertyName("registerImage")]
     public bool RegisterImage { get; set; }
+
+    [JsonPropertyName("returnAssemblyPath")]
+    public bool ReturnAssemblyPath { get; set; }
 }
 
 public sealed class CompileViewScriptRequestDto
@@ -115,6 +134,9 @@ public sealed class CompileViewScriptRequestDto
 
     [JsonPropertyName("params")]
     public CompileParamsDto? Params { get; set; }
+
+    [JsonPropertyName("returnAssemblyPath")]
+    public bool ReturnAssemblyPath { get; set; }
 }
 
 public sealed class HotDiffFileDto
@@ -144,6 +166,12 @@ public sealed class IndexTypesRequestDto
     public CompileParamsDto? Params { get; set; }
 }
 
+public sealed class IndexSchemaRequestDto
+{
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+}
+
 public sealed class RegisterImageRequestDto
 {
     [JsonPropertyName("domainGeneration")]
@@ -154,6 +182,9 @@ public sealed class RegisterImageRequestDto
 
     [JsonPropertyName("assemblyB64")]
     public string? AssemblyB64 { get; set; }
+
+    [JsonPropertyName("assemblyPath")]
+    public string? AssemblyPath { get; set; }
 }
 
 public sealed class CompileHotPatchRequestDto
@@ -169,6 +200,9 @@ public sealed class CompileHotPatchRequestDto
 
     [JsonPropertyName("registerImage")]
     public bool RegisterImage { get; set; } = true;
+
+    [JsonPropertyName("returnAssemblyPath")]
+    public bool ReturnAssemblyPath { get; set; }
 
     /// <summary>Extra reference DLLs for THIS compile only (the plugin's
     /// Locus.HotReload.Runtime.dll for field stores). Kept out of `params`
@@ -246,7 +280,7 @@ public sealed class CompileAccessProbeRequestDto
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 3;
+    public const int ProtocolVersion = 5;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -264,12 +298,21 @@ public sealed class CompileService
         allowUnsafe: false,
         assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default);
 
-    /// <summary>
-    /// Unlike the legacy Unity-side path (no PDB), emit an embedded portable
-    /// PDB: `Assembly.Load(byte[])` then yields line numbers in stack traces.
-    /// </summary>
-    private static readonly EmitOptions SnippetEmitOptions = new(
+    private static readonly EmitOptions LightweightEmitOptions = new();
+
+    /// <summary>Optional embedded portable PDB for diagnostics-heavy paths.</summary>
+    private static readonly EmitOptions EmbeddedPdbEmitOptions = new(
         debugInformationFormat: DebugInformationFormat.Embedded);
+
+    private static EmitOptions EmitOptionsFor(bool emitDebugSymbols)
+    {
+        return emitDebugSymbols ? EmbeddedPdbEmitOptions : LightweightEmitOptions;
+    }
+
+    private const string AssemblyArtifactRootName = "LocusCompileServer";
+    private const int MaxAssemblyArtifactFiles = 256;
+    private static readonly TimeSpan AssemblyArtifactMaxAge = TimeSpan.FromHours(6);
+    private static int _assemblyArtifactRootPruned;
 
     private static readonly Lazy<ImmutableArray<MetadataReference>> HostBclReferences =
         new(BuildHostBclReferences);
@@ -292,6 +335,11 @@ public sealed class CompileService
     private string? _cachedFingerprint;
     private ImmutableArray<MetadataReference> _cachedReferences;
     private CSharpParseOptions _cachedParseOptions = DefaultParseOptions(Array.Empty<string>());
+
+    public CompileService()
+    {
+        PruneAssemblyArtifactRootOnce();
+    }
 
     // ── handlers ─────────────────────────────────────────────────────
 
@@ -332,7 +380,9 @@ public sealed class CompileService
             sources,
             request.Params,
             request.UseHostBcl,
-            request.ReferenceSessionImages);
+            request.ReferenceSessionImages,
+            request.EmitDebugSymbols ?? true,
+            ResolveDiagnosticStyle(request.DiagnosticStyle));
 
         if (bytes == null)
             return FailureResult(error!, "compile", startedAt);
@@ -340,7 +390,7 @@ public sealed class CompileService
         if (request.RegisterImage && !string.IsNullOrEmpty(request.Params?.DomainGeneration))
             _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
 
-        return SuccessResult(bytes, assemblyName, startedAt);
+        return SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
     }
 
     public JsonNode HandleRegisterImage(JsonNode? @params)
@@ -350,17 +400,23 @@ public sealed class CompileService
             throw new RpcInvalidParamsException("image/register requires domainGeneration");
         if (string.IsNullOrWhiteSpace(request.AssemblyName))
             throw new RpcInvalidParamsException("image/register requires assemblyName");
-        if (string.IsNullOrWhiteSpace(request.AssemblyB64))
-            throw new RpcInvalidParamsException("image/register requires assemblyB64");
+        if (string.IsNullOrWhiteSpace(request.AssemblyB64) &&
+            string.IsNullOrWhiteSpace(request.AssemblyPath))
+        {
+            throw new RpcInvalidParamsException("image/register requires assemblyB64 or assemblyPath");
+        }
 
         byte[] bytes;
         try
         {
-            bytes = Convert.FromBase64String(request.AssemblyB64!);
+            if (!string.IsNullOrWhiteSpace(request.AssemblyPath))
+                bytes = File.ReadAllBytes(request.AssemblyPath!);
+            else
+                bytes = Convert.FromBase64String(request.AssemblyB64!);
         }
-        catch (FormatException ex)
+        catch (Exception ex)
         {
-            throw new RpcInvalidParamsException("image/register assemblyB64 is invalid: " + ex.Message);
+            throw new RpcInvalidParamsException("image/register assembly payload is invalid: " + ex.Message);
         }
 
         _imageRegistry.Register(request.DomainGeneration!, request.AssemblyName!, bytes);
@@ -467,7 +523,7 @@ public sealed class CompileService
         if (bytes == null)
             return FailureResult(error!, "compile", startedAt);
 
-        return SuccessResult(bytes, assemblyName, startedAt);
+        return SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
     }
 
     public JsonNode HandleCompileRunStates(JsonNode? @params)
@@ -495,7 +551,7 @@ public sealed class CompileService
         if (request.RegisterImage && !string.IsNullOrEmpty(request.Params?.DomainGeneration))
             _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
 
-        JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
+        JsonNode result = SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
         result["entryType"] = RunStatesSource.FullHostTypeName;
         return result;
     }
@@ -611,8 +667,9 @@ public sealed class CompileService
         {
             try
             {
-                if (File.Exists(extraPath))
-                    references = references.Add(MetadataReference.CreateFromFile(extraPath));
+                PortableExecutableReference? reference = _referenceCache.GetOrCreate(extraPath);
+                if (reference != null)
+                    references = references.Add(reference);
             }
             catch (Exception ex)
             {
@@ -859,7 +916,7 @@ public sealed class CompileService
         EmitResult emitResult;
         try
         {
-            emitResult = compilation.Emit(peStream, options: SnippetEmitOptions);
+            emitResult = compilation.Emit(peStream, options: LightweightEmitOptions);
         }
         catch (Exception ex)
         {
@@ -912,7 +969,7 @@ public sealed class CompileService
             }
         }
 
-        JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
+        JsonNode result = SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
@@ -968,7 +1025,7 @@ public sealed class CompileService
         EmitResult emitResult;
         try
         {
-            emitResult = compilation.Emit(peStream, options: SnippetEmitOptions);
+            emitResult = compilation.Emit(peStream, options: LightweightEmitOptions);
         }
         catch (Exception ex)
         {
@@ -1570,6 +1627,23 @@ public sealed class CompileService
         return result;
     }
 
+    /// <summary>
+    /// Produce the project SerializedProperty schema from reference metadata:
+    /// member field types, Unity attributes, enum shape and assignability
+    /// inputs for managed reference candidates.
+    /// </summary>
+    public JsonNode HandleIndexSchema(JsonNode? @params)
+    {
+        var request = Deserialize<IndexSchemaRequestDto>(@params);
+        long startedAt = Environment.TickCount64;
+
+        ImmutableArray<MetadataReference> references = ResolveReferences(request.Params, useHostBcl: false);
+        JsonObject result = SerializedSchemaSource.Build(
+            references.OfType<PortableExecutableReference>());
+        result["durationMs"] = Environment.TickCount64 - startedAt;
+        return result;
+    }
+
     /// <summary>Assembly definition names straight from the PE metadata (no
     /// symbol materialization).</summary>
     private static List<string> ReferenceAssemblyNames(ImmutableArray<MetadataReference> references)
@@ -1685,7 +1759,7 @@ namespace System.Runtime.CompilerServices
         if (request.RegisterImage && !string.IsNullOrEmpty(request.Params?.DomainGeneration))
             _imageRegistry.Register(request.Params!.DomainGeneration!, assemblyName, bytes);
 
-        JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
+        JsonNode result = SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
         result["entryType"] = UnitySnippetSource.FullHostTypeName;
         result["mode"] = mode;
         return result;
@@ -1729,7 +1803,9 @@ namespace System.Runtime.CompilerServices
         IReadOnlyList<(string Path, string Text)> sources,
         CompileParamsDto? compileParams,
         bool useHostBcl,
-        bool referenceSessionImages)
+        bool referenceSessionImages,
+        bool emitDebugSymbols,
+        DiagnosticStyle style = DiagnosticStyle.Snippet)
     {
         CSharpParseOptions parseOptions = ResolveParseOptions(compileParams);
 
@@ -1747,10 +1823,17 @@ namespace System.Runtime.CompilerServices
         }
         catch (Exception ex)
         {
-            return (null, "parse failed: " + ex);
+            return (null, "parse failed: " + (style == DiagnosticStyle.ViewScript ? ex.Message : ex.ToString()));
         }
 
-        return EmitCompilation(assemblyName, trees, compileParams, useHostBcl, referenceSessionImages);
+        return EmitCompilation(
+            assemblyName,
+            trees,
+            compileParams,
+            useHostBcl,
+            referenceSessionImages,
+            style,
+            emitDebugSymbols: emitDebugSymbols);
     }
 
     /// <summary>Which Unity-side error formatting a compile mirrors.</summary>
@@ -1762,13 +1845,21 @@ namespace System.Runtime.CompilerServices
         ViewScript,
     }
 
+    private static DiagnosticStyle ResolveDiagnosticStyle(string? value)
+    {
+        return string.Equals(value, "viewScript", StringComparison.OrdinalIgnoreCase)
+            ? DiagnosticStyle.ViewScript
+            : DiagnosticStyle.Snippet;
+    }
+
     private (byte[]? Bytes, string? Error) EmitCompilation(
         string assemblyName,
         IReadOnlyList<SyntaxTree> trees,
         CompileParamsDto? compileParams,
         bool useHostBcl,
         bool referenceSessionImages,
-        DiagnosticStyle style = DiagnosticStyle.Snippet)
+        DiagnosticStyle style = DiagnosticStyle.Snippet,
+        bool emitDebugSymbols = false)
     {
         ImmutableArray<MetadataReference> references = ResolveReferences(compileParams, useHostBcl);
         if (referenceSessionImages)
@@ -1788,7 +1879,7 @@ namespace System.Runtime.CompilerServices
         EmitResult emitResult;
         try
         {
-            emitResult = compilation.Emit(peStream, options: SnippetEmitOptions);
+            emitResult = compilation.Emit(peStream, options: EmitOptionsFor(emitDebugSymbols));
         }
         catch (Exception ex)
         {
@@ -1935,15 +2026,174 @@ namespace System.Runtime.CompilerServices
         return $"__Locus{kind}_{gen8}_{counter:X8}";
     }
 
-    private static JsonNode SuccessResult(byte[] bytes, string assemblyName, long startedAt)
+    private static JsonNode SuccessResult(
+        byte[] bytes,
+        string assemblyName,
+        long startedAt,
+        bool returnAssemblyPath = false)
     {
-        return new JsonObject
+        var result = new JsonObject
         {
             ["success"] = true,
             ["assemblyName"] = assemblyName,
-            ["assemblyB64"] = Convert.ToBase64String(bytes),
             ["durationMs"] = Environment.TickCount64 - startedAt,
         };
+
+        string? assemblyPath = returnAssemblyPath
+            ? TryWriteAssemblyArtifact(bytes, assemblyName)
+            : null;
+        if (!string.IsNullOrEmpty(assemblyPath))
+            result["assemblyPath"] = assemblyPath;
+        else
+            result["assemblyB64"] = Convert.ToBase64String(bytes);
+
+        return result;
+    }
+
+    private static string? TryWriteAssemblyArtifact(byte[] bytes, string assemblyName)
+    {
+        try
+        {
+            string dir = CurrentAssemblyArtifactDir();
+            Directory.CreateDirectory(dir);
+            string fileName = SanitizeAssemblyNamePart(assemblyName) + "_" +
+                              Guid.NewGuid().ToString("N") + ".dll";
+            string path = Path.Combine(dir, fileName);
+            File.WriteAllBytes(path, bytes);
+            PruneAssemblyArtifacts(dir);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[LocusCompileServer] assembly artifact write failed: " + ex.Message);
+            return null;
+        }
+    }
+
+    private static string AssemblyArtifactRootPath()
+    {
+        return Path.Combine(Path.GetTempPath(), AssemblyArtifactRootName);
+    }
+
+    private static string CurrentAssemblyArtifactDir()
+    {
+        return Path.Combine(
+            AssemblyArtifactRootPath(),
+            Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static void PruneAssemblyArtifactRootOnce()
+    {
+        if (Interlocked.Exchange(ref _assemblyArtifactRootPruned, 1) != 0)
+            return;
+
+        PruneAssemblyArtifactRoot(AssemblyArtifactRootPath(), DateTime.UtcNow);
+    }
+
+    private static void PruneAssemblyArtifactRoot(string root, DateTime now)
+    {
+        try
+        {
+            var rootInfo = new DirectoryInfo(root);
+            if (!rootInfo.Exists)
+                return;
+
+            int currentPid = Environment.ProcessId;
+            foreach (DirectoryInfo dir in rootInfo.EnumerateDirectories())
+            {
+                try
+                {
+                    if (!int.TryParse(dir.Name, NumberStyles.None, CultureInfo.InvariantCulture, out int pid))
+                        continue;
+
+                    if (pid == currentPid)
+                    {
+                        PruneAssemblyArtifacts(dir.FullName);
+                        continue;
+                    }
+
+                    bool pidIsAlive = IsProcessAlive(pid);
+                    bool directoryTooOld = now - LastActivityUtc(dir) > AssemblyArtifactMaxAge;
+                    if (!pidIsAlive || directoryTooOld)
+                    {
+                        dir.Delete(recursive: true);
+                        continue;
+                    }
+
+                    PruneAssemblyArtifacts(dir.FullName);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        "[LocusCompileServer] assembly artifact directory prune failed: " +
+                        dir.FullName + ": " + ex.Message);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[LocusCompileServer] assembly artifact root prune failed: " + ex.Message);
+        }
+    }
+
+    private static DateTime LastActivityUtc(DirectoryInfo dir)
+    {
+        dir.Refresh();
+        DateTime last = dir.LastWriteTimeUtc;
+        foreach (FileSystemInfo entry in dir.EnumerateFileSystemInfos())
+        {
+            if (entry.LastWriteTimeUtc > last)
+                last = entry.LastWriteTimeUtc;
+        }
+        return last;
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        if (pid <= 0)
+            return false;
+
+        try
+        {
+            using Process process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private static void PruneAssemblyArtifacts(string dir)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            var files = new DirectoryInfo(dir)
+                .GetFiles("*.dll")
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ToArray();
+
+            for (int i = 0; i < files.Length; i++)
+            {
+                bool tooMany = i >= MaxAssemblyArtifactFiles;
+                bool tooOld = now - files[i].LastWriteTimeUtc > AssemblyArtifactMaxAge;
+                if (tooMany || tooOld)
+                    files[i].Delete();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("[LocusCompileServer] assembly artifact prune failed: " + ex.Message);
+        }
     }
 
     private static JsonNode FailureResult(string error, string stage, long startedAt)

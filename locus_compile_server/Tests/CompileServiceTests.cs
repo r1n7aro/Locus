@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Reflection;
 using System.Text.Json.Nodes;
 using Xunit;
 
@@ -24,6 +26,15 @@ public class CompileServiceTests
         return service.HandleCompileRaw(request);
     }
 
+    private static void InvokePruneAssemblyArtifactRoot(string root, DateTime now)
+    {
+        MethodInfo? method = typeof(CompileService).GetMethod(
+            "PruneAssemblyArtifactRoot",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+        method!.Invoke(null, new object[] { root, now });
+    }
+
     [Fact]
     public void Compile_raw_emits_a_pe_image()
     {
@@ -39,6 +50,37 @@ public class CompileServiceTests
         Assert.True(bytes.Length > 512);
         Assert.Equal((byte)'M', bytes[0]);
         Assert.Equal((byte)'Z', bytes[1]);
+    }
+
+    [Fact]
+    public void Assembly_artifact_root_prunes_dead_pid_directories()
+    {
+        string root = Path.Combine(
+            Path.GetTempPath(),
+            "locus-artifact-prune-test-" + Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            string deadPidDir = Path.Combine(root, int.MaxValue.ToString(CultureInfo.InvariantCulture));
+            Directory.CreateDirectory(deadPidDir);
+            File.WriteAllText(Path.Combine(deadPidDir, "dead.dll"), "old");
+
+            string currentPidDir = Path.Combine(root, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+            Directory.CreateDirectory(currentPidDir);
+            string currentArtifact = Path.Combine(currentPidDir, "current.dll");
+            File.WriteAllText(currentArtifact, "new");
+
+            InvokePruneAssemblyArtifactRoot(root, DateTime.UtcNow);
+
+            Assert.False(Directory.Exists(deadPidDir));
+            Assert.True(Directory.Exists(currentPidDir));
+            Assert.True(File.Exists(currentArtifact));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
     }
 
     /// <summary>
@@ -82,6 +124,42 @@ public class CompileServiceTests
 
         Assert.False(result["success"]!.GetValue<bool>());
         Assert.Contains("CS0029 at 1:11:", result["error"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Compile_raw_can_return_an_assembly_path()
+    {
+        var service = new CompileService();
+        JsonNode result = CompileRaw(service, "PathA.cs", "class PathA { }", new JsonObject
+        {
+            ["assemblyName"] = "RawPathA",
+            ["returnAssemblyPath"] = true,
+        });
+
+        Assert.True(result["success"]!.GetValue<bool>());
+        string path = result["assemblyPath"]!.GetValue<string>();
+        Assert.True(File.Exists(path), path);
+        Assert.Null(result["assemblyB64"]);
+    }
+
+    [Fact]
+    public void Compile_raw_can_emit_view_script_style_diagnostics()
+    {
+        var service = new CompileService();
+        JsonNode result = CompileRaw(
+            service,
+            "Skills\\demo\\Editor\\Tool.cs",
+            "public class Tool { void M() { int x = \"oops\"; } }",
+            new JsonObject
+            {
+                ["diagnosticStyle"] = "viewScript",
+                ["emitDebugSymbols"] = false,
+            });
+
+        Assert.False(result["success"]!.GetValue<bool>());
+        Assert.Equal(
+            "compilation failed:\n  CS0029 at Skills/demo/Editor/Tool.cs:1:40: Cannot implicitly convert type 'string' to 'int'\n",
+            result["error"]!.GetValue<string>());
     }
 
     /// <summary>
