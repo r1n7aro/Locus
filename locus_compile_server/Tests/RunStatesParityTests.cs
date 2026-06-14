@@ -93,6 +93,36 @@ public class RunStatesParityTests
     }
 
     [Fact]
+    public void Handler_print_alias_matches_unity_and_preserves_line_mapping()
+    {
+        var (port, reference) = BuildPair(
+            "playing",
+            "main",
+            new[]
+            {
+                ((string?)"main", (string?)null,
+                    (string?)"print(\"start\");",
+                    (string?)"print(\"update\"); ctx.Done(\"ok\");",
+                    (string?)"print(\"end\");"),
+            },
+            null);
+
+        string source = RunStatesSource.BuildRunStatesSource(port);
+
+        Assert.Equal(UnityReferenceImpl.BuildRunStatesSource(reference), source);
+        int aliasIndex = source.IndexOf(
+            "var print = new global::System.Action<object>(ctx.Print);",
+            StringComparison.Ordinal);
+        int lineIndex = source.IndexOf(
+            "#line 1 \"unity_run_states:main:start\"",
+            StringComparison.Ordinal);
+
+        Assert.True(aliasIndex >= 0);
+        Assert.True(lineIndex > aliasIndex);
+        Assert.Contains("print(\"update\"); ctx.Done(\"ok\");", source);
+    }
+
+    [Fact]
     public void Entry_type_matches_the_unity_contract()
     {
         Assert.Equal(

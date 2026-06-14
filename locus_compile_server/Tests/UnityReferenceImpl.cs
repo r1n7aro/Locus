@@ -268,6 +268,7 @@ internal static class UnityReferenceImpl
 
         sb.Append(indent).AppendLine("new global::System.Action<global::Locus.LocusBridge.RuntimeCtx>(ctx =>");
         sb.Append(indent).AppendLine("{");
+        sb.Append(indent).AppendLine("    var print = new global::System.Action<object>(ctx.Print);");
         sb.Append(indent).Append("    #line 1 ").AppendLine(ToCSharpStringLiteral("unity_run_states:" + stateName + ":" + phase));
         sb.AppendLine(code);
         sb.Append(indent).AppendLine("    #line default");
