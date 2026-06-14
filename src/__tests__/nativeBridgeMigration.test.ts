@@ -103,7 +103,8 @@ describe("native bridge migration", () => {
     expect(service).toContain("subscribeUnityNativeBridgeSelfTest");
     expect(settings).toContain("TestingSettings");
     expect(settings).toContain("activeCategory === 'testing'");
-    expect(testing).toContain("unityNativeBridgeSelfTestRun");
+    expect(testing).toContain("runUnityIntegrationTests");
+    expect(testing).toContain('"native-bridge"');
     expect(zh).toContain('"settings.tab.testing": "测试"');
     expect(en).toContain('"settings.tab.testing": "Testing"');
   });
@@ -115,7 +116,8 @@ describe("native bridge migration", () => {
     expect(bridge).toContain("private static readonly bool _isUnityWorkerProcess = DetectUnityWorkerProcess();");
     expect(bridge).toContain('arg.IndexOf("AssetImportWorker", StringComparison.OrdinalIgnoreCase) >= 0');
     expect(bridge).toContain("NativeShutdownInWorkerProcess();");
-    expect(bridge).toContain("if (_isUnityWorkerProcess)\n                return;\n\n            NativeStartIfEnabled();");
+    expect(bridge).toContain("public static void Start()");
+    expect(bridge).toContain("NativeStartIfEnabled();");
     expect(managed).toContain("if (_isUnityWorkerProcess)\n                return;");
     expect(managed).toContain("private static void NativeShutdownInWorkerProcess()");
     expect(managed).toContain("locus_shutdown();");
@@ -198,11 +200,11 @@ describe("native bridge migration", () => {
     expect(plugin).toContain("Unity closed for plugin update");
     expect(plugin).toContain("PLUGIN_INSTALL_LOCK_RELEASE_SETTLE");
     expect(plugin).toContain("plugin install hit a locked file after Unity close");
-    expect(plugin).toContain("super::launch_project(project_path)?");
+    expect(plugin).toContain("super::launch_project(project_path).await?");
     expect(process).toContain("taskkill");
     expect(process).toContain("force_close_current_project_unity_processes");
     expect(process).toContain("unity_process_args_are_worker");
-    expect(cli).toContain("check_or_install_plugin(&project, config.install_plugin).await?");
+    expect(cli).toContain("check_or_install_plugin(&project, config.install_plugin, &sink).await?");
     expect(workspace).toContain("install_or_update_plugin_with_force_close");
   });
 });

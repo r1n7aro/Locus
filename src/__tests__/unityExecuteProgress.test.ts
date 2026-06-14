@@ -87,6 +87,9 @@ describe("unityExecuteProgress", () => {
     expect(transportSource).toContain("disconnect_with_reason");
     expect(transportSource).toContain("fail_all_pending(conn, reason)");
     expect(agentSource).toContain("execute_unity_execute");
+    expect(agentSource).toContain("unity_execute_editor_status_intent");
+    expect(agentSource).toContain("let has_unity_execution_barrier = has_unity_execute");
+    expect(agentSource).toContain("because a Unity tool is a barrier");
     expect(agentSource).toContain("unity_execute_code_with_progress_cancellable");
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_progress");
@@ -106,14 +109,21 @@ describe("unityExecuteProgress", () => {
     expect(asyncExecuteSource).toContain("Execution failed");
     expect(asyncExecuteSource).not.toContain("DisplayCancelableProgressBar(");
     expect(read("tools/unity_execute.json")).toContain("reports progress to the Locus tool call panel");
+    expect(read("tools/unity_execute.json")).toContain("code explicitly changes status through EditorApplication play/pause APIs");
   });
 
   it("requires unity_execute request_editor_status like unity_run_states", () => {
     const unityExecuteDefinition = JSON.parse(read("tools/unity_execute.json"));
     const unityRunStatesDefinition = JSON.parse(read("tools/unity_run_states.json"));
 
-    expect(unityExecuteDefinition.parameters.properties.request_editor_status).toEqual(
-      unityRunStatesDefinition.parameters.properties.request_editor_status,
+    expect(unityExecuteDefinition.parameters.properties.request_editor_status.type).toBe(
+      unityRunStatesDefinition.parameters.properties.request_editor_status.type,
+    );
+    expect(unityExecuteDefinition.parameters.properties.request_editor_status.enum).toEqual(
+      unityRunStatesDefinition.parameters.properties.request_editor_status.enum,
+    );
+    expect(unityExecuteDefinition.parameters.properties.request_editor_status.description).toContain(
+      "code explicitly changes status through EditorApplication play/pause APIs",
     );
     expect(unityExecuteDefinition.parameters.required).toContain("request_editor_status");
     expect(unityExecuteDefinition.parameters.required).not.toContain("editor_status");

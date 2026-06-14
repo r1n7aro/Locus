@@ -141,6 +141,7 @@ describe("chat panel toggle layout", () => {
   it("keeps the global tool permission mode in settings", () => {
     const settingsView = read("src/components/SettingsView.vue");
     const toolPermissions = read("src/components/settings/ToolPermissions.vue");
+    const settingsState = read("src/composables/useSettingsState.ts");
 
     expect(settingsView).toContain(':tool-permission-mode="chatStore.toolPermissionMode"');
     expect(settingsView).toContain(':behavior-list="approvalBehaviorList"');
@@ -164,6 +165,8 @@ describe("chat panel toggle layout", () => {
     expect(toolPermissions.indexOf("settings.perms.behaviorTitle")).toBeLessThan(
       toolPermissions.indexOf("settings.perms.globalMode"),
     );
+    expect(settingsState).toMatch(/name:\s*"behavior\.unity_editor_status_change",[\s\S]*defaultMode:\s*"auto"/);
+    expect(settingsState).toMatch(/name:\s*"behavior\.knowledge_governance",[\s\S]*defaultMode:\s*"auto"/);
   });
 
   it("keeps the toggle mounted during streaming and keeps token usage next to the model selector", () => {

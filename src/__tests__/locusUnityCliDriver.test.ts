@@ -38,7 +38,8 @@ describe("Locus Unity CLI driver", () => {
     );
 
     expect(driver).toContain("ensure_connected");
-    expect(driver).toContain("unity_bridge::launch_project(project)");
+    expect(driver).toContain("unity_bridge::launch_project(project).await");
+    expect(driver).toContain('"processId": launch.process_id');
     expect(driver).toContain("DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000");
     expect(driver).toContain("DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 20_000");
     expect(driver).toContain("--no-progress-timeout-ms");
@@ -46,6 +47,15 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("connection_progress_signature");
     expect(driver).toContain("prepare_suite_environment");
     expect(driver).toContain("run_event_selftest");
+    expect(driver).toContain("CliDriverSuite::Sidecar");
+    expect(driver).toContain("CliDriverSuite::TypeIndex");
+    expect(driver).toContain("--type-index-sample");
+    expect(driver).toContain("run_sidecar_suite");
+    expect(driver).toContain("run_type_index_suite");
+    expect(driver).toContain("CliDriverSuite::Execute");
+    expect(driver).toContain("run_execute_suite");
+    expect(driver).toContain("unity_bridge::unity_run_states");
+    expect(driver).toContain("UNITY_EXECUTE_CANCELLED");
     expect(driver).toContain("unity_bridge::run_state_probe_selftest");
     expect(driver).toContain("unity_bridge::run_native_bridge_selftest");
     expect(driver).toContain("crate::unity_hotreload::selftest::run");
@@ -62,6 +72,81 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("native_transport_confirmed");
     // The native-bridge suite hard-fails unless the required broker is active.
     expect(driver).toContain("expected 'native_broker'");
+  });
+
+  it("exposes the Settings integration-test runner", () => {
+    const lib = read("src-tauri/src/lib.rs");
+    const system = read("src-tauri/src/commands/system.rs");
+    const service = read("src/services/integrationTests.ts");
+    const settings = read("src/components/settings/TestingSettings.vue");
+    const typeIndex = read("src-tauri/src/unity_type_index_selftest.rs");
+
+    expect(lib).toContain("commands::unity_integration_test_run");
+    expect(system).toContain("pub async fn unity_integration_test_run");
+    expect(service).toContain("unity_integration_test_run");
+    expect(service).toContain("unity-integration-test");
+    expect(service).toContain('"execute"');
+    expect(settings).toContain('id: "execute"');
+    expect(settings).toContain("typeIndexSampleMode");
+    expect(settings).toContain('"sample32"');
+    expect(settings).toContain('"all"');
+    expect(settings).not.toContain("@tauri-apps/plugin-dialog");
+    expect(settings).not.toContain("getWorkingDir");
+    expect(settings).not.toContain("browseProjectPath");
+    expect(settings).not.toContain("projectPath:");
+    expect(typeIndex).toContain("TypeIndexSampleMode");
+    expect(typeIndex).toContain("Sample32");
+    expect(typeIndex).toContain("All");
+  });
+
+  it("guards the Type Index suite against transient Unity reload windows", () => {
+    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const params = read("src-tauri/src/csharp_compile/params.rs");
+    const driver = read("src-tauri/src/cli_driver.rs");
+    const settings = read("src/components/settings/TestingSettings.vue");
+
+    expect(bridge).toContain("send_message_with_transient_retry");
+    expect(bridge).toContain("SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS");
+    expect(bridge).toContain("wait_for_unity_bridge_ready(project_path, SHORT_MESSAGE_TRANSIENT_READY_WAIT");
+    expect(bridge).toContain("send_message_without_timeout_with_transient_retry(project_path, message_type, &payload)");
+    expect(params).toContain("send_message_with_transient_retry(");
+    expect(driver).toContain("emit_suite_failure(sink, suite, &error);");
+    expect(settings).toContain("const previousLine = suiteLogs[target][suiteLogs[target].length - 1];");
+    expect(settings).toContain("if (previousLine === line) return;");
+  });
+
+  it("keeps Type Index include-all discover large enough for dense Unity assets", () => {
+    const typeIndex = read("src-tauri/src/unity_type_index_selftest.rs");
+    const viewBindings = read("locus_unity/Editor/LocusBridge.ViewBindings.cs");
+
+    expect(typeIndex).toContain("DISCOVER_INCLUDE_ALL_MAX_RESULTS: i32 = 50_000");
+    expect(typeIndex).toContain(
+      "if include_all { DISCOVER_INCLUDE_ALL_MAX_RESULTS } else { DISCOVER_MAX_RESULTS }",
+    );
+    expect(viewBindings).toContain("ViewBindingIncludeAllDiscoverMaxResults = 50000");
+    expect(viewBindings).toContain("ViewBindingFilteredDiscoverMaxResults = 500");
+  });
+
+  it("streams Type Index progress every ~1% of sampled targets", () => {
+    const typeIndex = read("src-tauri/src/unity_type_index_selftest.rs");
+    const driver = read("src-tauri/src/cli_driver.rs");
+
+    // Progress is computed over the sampled targets and throttled to whole percents,
+    // collapsing to one line per target when fewer than 100 are sampled.
+    expect(typeIndex).toContain("pub struct TypeIndexProgress");
+    expect(typeIndex).toContain(
+      "fn next_progress_percent(processed: u32, total: u32, last_percent: u32) -> Option<u32>",
+    );
+    expect(typeIndex).toContain("on_progress: &mut (dyn FnMut(TypeIndexProgress) + Send)");
+    expect(typeIndex).toContain(
+      "next_progress_percent(processed_targets, total_targets, last_percent)",
+    );
+
+    // The driver turns each milestone into a neutral suite_event progress line.
+    expect(driver).toContain(
+      "crate::unity_type_index_selftest::run(project, sample_mode, &mut on_progress)",
+    );
+    expect(driver).toContain("type-index: {}/{} targets ({}%) · {} properties checked");
   });
 
   it("uses driver JSON as the authoritative Unity test result", () => {
@@ -84,6 +169,7 @@ describe("Locus Unity CLI driver", () => {
     expect(script).toContain('"taskkill"');
     expect(script).toContain('"/T"');
     expect(script).toContain("treating the driver result as authoritative");
+    expect(script).toContain("process.exit(0);");
   });
 
   it("uses the native broker as the only Unity command transport", () => {
