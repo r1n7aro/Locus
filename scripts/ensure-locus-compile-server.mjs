@@ -3,7 +3,7 @@
 // repairing stale src-tauri/gen/compile-server outputs after protocol bumps.
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -204,6 +204,37 @@ async function publishCompileServer() {
   }
 }
 
+async function fileMtimeMs(filePath) {
+  try {
+    return (await stat(filePath)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+async function latestCompileServerSourceMtimeMs() {
+  const root = path.join(repoRoot, "locus_compile_server");
+  let latest = 0;
+
+  async function walk(dir) {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === "bin" || entry.name === "obj") {
+        continue;
+      }
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+      } else if (entry.isFile() && (entry.name.endsWith(".cs") || entry.name.endsWith(".csproj"))) {
+        latest = Math.max(latest, await fileMtimeMs(entryPath));
+      }
+    }
+  }
+
+  await walk(root);
+  return latest;
+}
+
 function describeObserved(result) {
   if (!result.ok) return result.reason;
   const protocol = result.result?.protocolVersion ?? "?";
@@ -221,16 +252,20 @@ function matchesExpected(result, expected) {
 
 const expected = await readExpectedVersions();
 const current = await inspectPublishedVersion(expected.protocolVersion);
+const latestSourceMtimeMs = await latestCompileServerSourceMtimeMs();
+const outputMtimeMs = await fileMtimeMs(outputDll);
+const outputCurrentForSource = outputMtimeMs >= latestSourceMtimeMs;
 
-if (matchesExpected(current, expected)) {
+if (matchesExpected(current, expected) && outputCurrentForSource) {
   console.log(
     `[locus] compile server current (protocol ${expected.protocolVersion}, wrapper contract ${expected.wrapperContractVersion}); skipping publish.`,
   );
   process.exit(0);
 }
 
+const sourceReason = outputCurrentForSource ? "" : "; source changed after published DLL";
 console.log(
-  `[locus] compile server publish required: expected protocol ${expected.protocolVersion}, wrapper contract ${expected.wrapperContractVersion}; found ${describeObserved(current)}.`,
+  `[locus] compile server publish required: expected protocol ${expected.protocolVersion}, wrapper contract ${expected.wrapperContractVersion}; found ${describeObserved(current)}${sourceReason}.`,
 );
 await publishCompileServer();
 
