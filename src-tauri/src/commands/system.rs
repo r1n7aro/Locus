@@ -354,6 +354,24 @@ pub async fn unity_native_bridge_selftest_run(
 }
 
 #[tauri::command]
+pub async fn unity_integration_test_run(
+    app: AppHandle,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    request: crate::cli_driver::UnityIntegrationTestRunRequest,
+) -> Result<crate::cli_driver::UnityIntegrationTestRunStarted, crate::error::AppError> {
+    crate::cli_driver::spawn_ui(app, workspace.inner().clone(), request).map_err(|error| {
+        crate::error::AppError::new("unity.integration_test.start_failed", error)
+            .operation("unityIntegrationTestRun")
+    })
+}
+
+#[tauri::command]
+pub fn unity_integration_test_cancel() -> Result<(), crate::error::AppError> {
+    crate::cli_driver::cancel_ui();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_view_windows_above_main(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {

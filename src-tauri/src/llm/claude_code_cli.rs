@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -200,8 +200,21 @@ pub enum ClaudeCliLoginState {
 /// subprocess startup per status refresh). Mirrors the CLI's own auth sources:
 /// explicit env vars, the OAuth credentials file under the Claude config dir,
 /// or an `apiKeyHelper` in settings.json.
+///
+/// This is only a fast heuristic — `settings.json`-based credentials are NOT
+/// honored at runtime because real turns spawn the CLI with
+/// `--setting-sources ""`. Use [`run_login_test`] for an authoritative check
+/// that exercises the actual endpoint and credentials.
 pub fn claude_cli_login_status() -> (ClaudeCliLoginState, String) {
-    for var in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
+    // `ANTHROPIC_AUTH_TOKEN` is the bearer-token variable used with custom
+    // endpoints/gateways (alongside `ANTHROPIC_BASE_URL`); Locus forwards the
+    // whole environment to the CLI child, so honoring it here keeps the status
+    // indicator in sync with what a real turn can actually authenticate with.
+    for var in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
         if std::env::var(var)
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
@@ -373,12 +386,9 @@ pub async fn run_turn<H: ClaudeCodeHost>(
         cmd.arg(tool);
     }
 
-    let mut envs: HashMap<OsString, OsString> = std::env::vars_os().collect();
-    envs.entry(OsString::from("CLAUDE_CODE_ENTRYPOINT"))
-        .or_insert_with(|| OsString::from("locus-rs"));
+    let mut envs = base_child_env();
     envs.entry(OsString::from("LOCUS_SESSION_ID"))
         .or_insert_with(|| OsString::from(options.locus_session_id.clone()));
-    crate::network::extend_proxy_env_map(&mut envs);
 
     if options.debug {
         let abs_dir = claude_code_debug_dir();
@@ -669,6 +679,173 @@ pub async fn run_turn<H: ClaudeCodeHost>(
     }
 
     Ok(result)
+}
+
+/// Environment handed to every Claude Code CLI child: the full Locus process
+/// environment (so user-configured `ANTHROPIC_*` variables — including
+/// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` for a custom default endpoint —
+/// flow straight through), plus the Locus entrypoint tag and resolved proxy
+/// settings. Callers add per-run extras (e.g. `LOCUS_SESSION_ID`) on top.
+fn base_child_env() -> HashMap<OsString, OsString> {
+    let mut envs: HashMap<OsString, OsString> = std::env::vars_os().collect();
+    envs.entry(OsString::from("CLAUDE_CODE_ENTRYPOINT"))
+        .or_insert_with(|| OsString::from("locus-rs"));
+    crate::network::extend_proxy_env_map(&mut envs);
+    envs
+}
+
+/// Trivial prompt used by the connectivity test. Kept tiny to minimize the real
+/// (billed) round-trip the CLI makes against the active endpoint.
+const LOGIN_TEST_PROMPT: &str = "Respond with the single word: OK";
+
+/// How long to wait for the connectivity test turn before giving up.
+const LOGIN_TEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Authoritative connectivity / auth check: spawn the Claude Code CLI under the
+/// same hermetic flags and environment a real Locus turn uses, send a trivial
+/// prompt, and report whether the turn completed. Unlike
+/// [`claude_cli_login_status`] this exercises the genuine endpoint resolution
+/// (`ANTHROPIC_BASE_URL`), credentials, and proxy — so a setup that only works
+/// via `settings.json` (which `--setting-sources ""` disables) correctly fails
+/// here, matching real turns. Returns the model reply on success, or a
+/// human-readable error.
+pub async fn run_login_test() -> Result<String, String> {
+    let cli_path = find_claude_cli().ok_or_else(|| {
+        "Claude Code CLI not found. Install `@anthropic-ai/claude-code` and ensure `claude` is available in PATH.".to_string()
+    })?;
+
+    let mut cmd = tokio::process::Command::new(&cli_path);
+    cmd.kill_on_drop(true);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .arg("--print")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--permission-mode")
+        .arg("bypassPermissions")
+        // Mirror run_turn's hermetic flags so the test reflects exactly what a
+        // real Locus turn sees (settings.json is NOT consulted).
+        .arg("--strict-mcp-config")
+        .arg("--setting-sources")
+        .arg("");
+    // Deny every builtin: with bypassPermissions in effect the model must not be
+    // able to touch the machine just because we sent it a prompt. The prompt is
+    // delivered via stdin (below), never as a positional arg, so this variadic
+    // flag can sit last without swallowing it.
+    cmd.arg("--disallowed-tools");
+    for tool in DISALLOWED_CLAUDE_BUILTINS {
+        cmd.arg(tool);
+    }
+    cmd.envs(base_child_env());
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start Claude Code CLI: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        // `--print` with no positional prompt reads the prompt from stdin.
+        let _ = stdin.write_all(LOGIN_TEST_PROMPT.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.flush().await;
+        // Dropped here → EOF, so the CLI stops waiting for more input.
+    }
+
+    let output = match tokio::time::timeout(LOGIN_TEST_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("Failed waiting for Claude Code CLI: {}", e)),
+        Err(_) => {
+            // Future dropped here → kill_on_drop terminates the child.
+            return Err(format!(
+                "Claude Code CLI did not respond within {}s",
+                LOGIN_TEST_TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_login_test_output(&stdout, &stderr, output.status.success(), output.status.code())
+}
+
+/// Interpret the `--output-format json` result of the connectivity probe.
+fn parse_login_test_output(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+    code: Option<i32>,
+) -> Result<String, String> {
+    // `--output-format json` emits a single result object; tolerate either a
+    // whole-buffer object or (defensively) the last non-empty line.
+    let value = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .or_else(|| {
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .last()
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        });
+
+    if let Some(value) = value {
+        // Some builds wrap the result in a single-element array.
+        let result_value = if value.is_array() {
+            value
+                .as_array()
+                .and_then(|items| items.last())
+                .cloned()
+                .unwrap_or(value)
+        } else {
+            value
+        };
+        let mut parsed = ClaudeCodeTurnResult::default();
+        parse_result_message(&result_value, &mut parsed)?;
+        let reply = parsed.final_text.trim();
+        let endpoint = active_endpoint_label();
+        return Ok(if reply.is_empty() {
+            format!("Connected to {endpoint}.")
+        } else {
+            format!(
+                "Connected to {endpoint}. Reply: {}",
+                truncate_for_display(reply, 120)
+            )
+        });
+    }
+
+    let detail = stderr.trim();
+    if !detail.is_empty() {
+        return Err(format!("Claude Code CLI failed: {}", detail));
+    }
+    if !success {
+        return Err(match code {
+            Some(code) => format!("Claude Code CLI exited with status {code}"),
+            None => "Claude Code CLI exited abnormally".to_string(),
+        });
+    }
+    Err("Claude Code CLI produced no result".to_string())
+}
+
+/// Label for the endpoint the CLI will talk to, shown in the test result —
+/// reflects `ANTHROPIC_BASE_URL` when a custom default endpoint is configured.
+fn active_endpoint_label() -> String {
+    match std::env::var("ANTHROPIC_BASE_URL") {
+        Ok(url) if !url.trim().is_empty() => url.trim().to_string(),
+        _ => "api.anthropic.com (default)".to_string(),
+    }
+}
+
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(max_chars).collect();
+    format!("{prefix}…")
 }
 
 fn parse_result_message(

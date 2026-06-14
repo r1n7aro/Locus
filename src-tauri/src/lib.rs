@@ -53,7 +53,9 @@ pub mod unity_csharp;
 mod unity_docs;
 pub mod unity_hotreload;
 pub mod unity_serialized_property;
+pub mod unity_serialized_schema;
 pub mod unity_type_index;
+pub mod unity_type_index_selftest;
 pub mod unity_yaml;
 pub mod vcs;
 pub mod view;
@@ -1051,6 +1053,7 @@ pub fn run() {
             commands::save_api_key,
             commands::clear_api_key,
             commands::get_providers,
+            commands::test_claude_code_cli,
             commands::save_provider_key,
             commands::delete_provider_key,
             commands::get_app_storage_info,
@@ -1311,6 +1314,8 @@ pub fn run() {
             commands::get_unity_semantic_state,
             commands::unity_state_probe_selftest_run,
             commands::unity_native_bridge_selftest_run,
+            commands::unity_integration_test_run,
+            commands::unity_integration_test_cancel,
             commands::csharp_lsp_get_status,
             commands::csharp_lsp_set_enabled,
             commands::csharp_lsp_restart,
@@ -1319,6 +1324,8 @@ pub fn run() {
             commands::unity_hot_reload_set_enabled,
             commands::unity_hot_reload_selftest_run,
             commands::unity_hot_reload_access_probe_run,
+            commands::unity_hot_reload_preflight,
+            commands::unity_hot_reload_set_code_optimization_debug,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

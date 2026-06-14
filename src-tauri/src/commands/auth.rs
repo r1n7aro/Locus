@@ -192,6 +192,17 @@ pub async fn get_providers(
     Ok(providers)
 }
 
+/// Live connectivity / auth check for the Claude Code CLI: spawns the CLI
+/// exactly as a real turn would (same hermetic flags, full environment, proxy)
+/// and reports the outcome. Returns the model reply on success, or a
+/// human-readable error explaining why the turn could not complete.
+#[tauri::command]
+pub async fn test_claude_code_cli() -> Result<String, AppError> {
+    crate::llm::claude_code_cli::run_login_test()
+        .await
+        .map_err(|e| e.into())
+}
+
 #[tauri::command]
 pub async fn save_provider_key(
     provider: String,

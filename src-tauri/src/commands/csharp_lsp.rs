@@ -92,6 +92,65 @@ pub async fn unity_hot_reload_access_probe_run(
         .map_err(|error| AppError::new("unity_hotreload.access_probe_failed", error))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotReloadPreflight {
+    /// Whether a Unity editor answered the probe.
+    pub connected: bool,
+    /// "debug" | "release" when readable; `None` when the editor is
+    /// unreachable or the value could not be parsed.
+    pub code_optimization: Option<String>,
+}
+
+/// Enable-time check the toggle UI runs before turning hot reload on: report
+/// the connected editor's Code Optimization so the UI can warn (and offer to
+/// auto-switch) when it is Release. Independent of the `unity_hot_reload`
+/// feature flag. Never errors on a missing editor — the UI treats "can't tell"
+/// as "go ahead", and the execution-time probe still gates real hot reloads.
+#[tauri::command]
+pub async fn unity_hot_reload_preflight(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<HotReloadPreflight, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Ok(HotReloadPreflight {
+            connected: false,
+            code_optimization: None,
+        });
+    }
+    let (connected, code_optimization) =
+        crate::unity_hotreload::coordinator::detect_code_optimization(&cwd).await;
+    Ok(HotReloadPreflight {
+        connected,
+        code_optimization,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeOptimizationResult {
+    pub code_optimization: String,
+}
+
+/// Switch the connected editor's Code Optimization to Debug (the auto-fix the
+/// user confirms in the enable-time prompt). Triggers a Unity script recompile.
+#[tauri::command]
+pub async fn unity_hot_reload_set_code_optimization_debug(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<CodeOptimizationResult, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    let code_optimization = crate::unity_hotreload::coordinator::set_code_optimization_debug(&cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.set_code_optimization_failed", error))?;
+    Ok(CodeOptimizationResult { code_optimization })
+}
+
 #[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
