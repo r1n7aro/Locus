@@ -40,10 +40,25 @@ struct AccessProbeCacheEntry {
 struct ProjectState {
     pending: HashMap<String, PendingEdit>,
     cold_paths: BTreeSet<String>,
-    /// Last Unity AppDomain generation seen for this project — used to tell
-    /// a real domain reload (detours died) from a transient pipe drop
-    /// (detours still live) on reconnect.
+    /// Last reload-state sample observed for this project (via
+    /// `get_reload_state`): the editor process id, AppDomain generation and
+    /// compile-convergence serial. A changed session id is a fresh editor
+    /// instance (loaded assemblies match disk → converge); within one session a
+    /// moved serial is a compile-driven convergence, a generation change with
+    /// the serial held is a no-compile domain reload (play mode), and an
+    /// all-same sample is a transient pipe drop (keep detours).
+    last_session_id: Option<String>,
     last_domain_generation: Option<String>,
+    last_converged_serial: Option<i64>,
+    /// Set when an editor we were monitoring exited with edits still tracked.
+    /// A relaunch's startup recompile loads those edits from disk, so the next
+    /// new-session sample treats a moved serial (serial > 0) as their
+    /// convergence. Consulted only at that first post-relaunch sample, then
+    /// cleared; same-session serial moves drive convergence afterwards. Set
+    /// explicitly (not inferred from `pending` being non-empty) so a fresh edit
+    /// that races ahead of the connect baseline is never mistaken for a
+    /// startup-compiled survivor — that would under-report.
+    pending_survived_exit: bool,
     /// C0 capability matrix, probed once per domain generation (the probe
     /// assembly and the measured Mono both die with the domain).
     access_probe: Option<AccessProbeCacheEntry>,
@@ -52,6 +67,33 @@ struct ProjectState {
 fn projects() -> &'static Mutex<HashMap<String, ProjectState>> {
     static STATE: OnceLock<Mutex<HashMap<String, ProjectState>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The project whose unapplied count the status card reflects. The connection
+/// monitor sets it to the workspace it watches so a stale project's pending
+/// (another editor that has since converged, a prior workspace) cannot inflate
+/// the badge. Unset → aggregate across projects (back-compat for tests).
+fn active_project() -> &'static std::sync::Mutex<Option<String>> {
+    static ACTIVE: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn set_active_project(project_path: &str) {
+    if let Ok(mut active) = active_project().lock() {
+        *active = Some(project_key(project_path));
+    }
+}
+
+/// Does this project still hold tracking the monitor must keep reconciling
+/// (pending edits or a cold queue)? Lets the monitor keep observing reload
+/// state after the user toggles hot reload off with work outstanding, so a
+/// later Unity recompile still converges it instead of stranding a stale count.
+pub async fn has_pending_state(project_path: &str) -> bool {
+    let projects = projects().lock().await;
+    projects
+        .get(&project_key(project_path))
+        .map(|state| !state.pending.is_empty() || !state.cold_paths.is_empty())
+        .unwrap_or(false)
 }
 
 fn project_key(project_path: &str) -> String {
@@ -322,12 +364,19 @@ async fn is_pending_edit_unapplied(edit: &PendingEdit) -> bool {
 }
 
 pub async fn unapplied_change_count() -> u64 {
+    let active = active_project().lock().ok().and_then(|active| active.clone());
     let snapshot: Vec<PendingEdit> = {
         let projects = projects().lock().await;
-        projects
-            .values()
-            .flat_map(|state| state.pending.values().cloned())
-            .collect()
+        match active.as_deref() {
+            Some(key) => projects
+                .get(key)
+                .map(|state| state.pending.values().cloned().collect())
+                .unwrap_or_default(),
+            None => projects
+                .values()
+                .flat_map(|state| state.pending.values().cloned())
+                .collect(),
+        }
     };
 
     let mut count = 0u64;
@@ -539,13 +588,23 @@ pub async fn on_recompile_converged(project_path: &str) {
     if let Some(state) = projects.get_mut(&project_key(project_path)) {
         state.pending.clear();
         state.cold_paths.clear();
-        // The old domain died with the recompile; the next reconnect (or
-        // hot reload) re-learns the new generation.
+        // The old domain died with the recompile; the next observation
+        // re-seeds the session/generation/serial trackers.
+        state.last_session_id = None;
         state.last_domain_generation = None;
+        state.last_converged_serial = None;
+        // Survivors (if any) are now compiled in — the hint is spent.
+        state.pending_survived_exit = false;
     }
     drop(projects);
     on_domain_reloaded(project_path).await;
     super::set_cold_queue_depth(0);
+    // A real compile changes the type/member surface, the reference assembly
+    // mtimes, and serialized schema — invalidate the cached type index (which
+    // also cascades to compile params + serialized schema) so a Unity-initiated
+    // recompile leaves the same consistent caches an explicit unity_recompile
+    // does, not a stale window.
+    crate::unity_type_index::invalidate_cached_type_index(project_path).await;
 }
 
 /// A Unity domain reload invalidates active detours and transient hot-patch
@@ -572,50 +631,161 @@ pub async fn on_domain_reloaded(project_path: &str) {
     }
 }
 
-/// The Unity pipe (re)connected. A reconnect does NOT always mean the domain
-/// reloaded — transient pipe drops (editor stalls, focus loss) keep detours
-/// alive. Fetch the current domain generation and only invalidate
-/// detour-derived state (active-patch counter, TI-C rows) when the
-/// generation actually moved; unknown → fail closed (treat as reloaded).
-pub async fn on_pipe_reconnected(project_path: &str) {
-    let current_generation = if super::is_enabled() && crate::csharp_compile::is_enabled() {
-        crate::csharp_compile::params::get_params(project_path)
-            .await
-            .ok()
-            .map(|params| params.domain_generation)
-    } else {
-        // Feature off: no detours/TI-C rows exist; skip the roundtrip and
-        // keep the conservative cleanup path.
-        None
-    };
+/// How a reload-state sample relates to the last one observed for a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadDecision {
+    /// First sample this session: seed the trackers, take no action.
+    Seed,
+    /// Nothing moved (steady state / transient pipe blip): keep everything.
+    Unchanged,
+    /// A successful compilation advanced the convergence serial — disk is now
+    /// the loaded truth (whether it reloaded the domain or compiled in place).
+    Converged,
+    /// The domain generation moved with no compilation behind it (e.g. entering
+    /// play mode): live detours died but disk still differs from the loaded
+    /// assemblies, so the edits stay pending.
+    Reloaded,
+}
 
-    if reconnect_requires_cleanup(project_path, current_generation).await {
-        on_domain_reloaded(project_path).await;
+/// Classify a `(session, generation, serial)` sample against the last one.
+///
+/// A changed session id is a fresh editor instance: its detours are dead, but a
+/// clean disk load is NOT proven in general — startup compilation can fail and
+/// leave the editor running the last good assemblies, not the current sources.
+/// The exception is edits that survived the previous editor's exit
+/// (`survived_exit`): they are on disk, so the relaunch's startup recompile
+/// loads them — proven once that instance reports a successful compile
+/// (serial > 0). So a new session with survivors and a moved serial converges;
+/// a new session whose serial is still 0 (not compiled yet, or startup compile
+/// failed) keeps pending, as does any new session without recorded survivors.
+/// Within one session a moved serial is a real compile (covers compile-in-place),
+/// a generation change with the serial held is a no-compile domain reload, and
+/// an all-same sample is a transient pipe drop.
+fn classify_reload(
+    last_session: Option<&str>,
+    last_generation: Option<&str>,
+    last_serial: Option<i64>,
+    current_session: &str,
+    current_generation: &str,
+    current_serial: i64,
+    survived_exit: bool,
+) -> ReloadDecision {
+    let Some(last_session) = last_session else {
+        // First sample for this project this app session: nothing to compare
+        // against. If edits survived a prior editor's exit and this instance has
+        // already compiled (serial > 0), its startup recompile loaded them —
+        // converge. Otherwise just seed the trackers and keep any pending
+        // uncleared. (The monitor seeds a baseline on connect, before any edit,
+        // so a fresh edit is never the first sample and so never mistaken here
+        // for a survivor.)
+        if survived_exit && current_serial > 0 {
+            return ReloadDecision::Converged;
+        }
+        return ReloadDecision::Seed;
+    };
+    if last_session != current_session {
+        // Fresh editor instance. Converge only the edits we know outlived the
+        // previous editor, and only once this instance has compiled them in
+        // (serial > 0); otherwise keep evidence until it reports a compile.
+        if survived_exit && current_serial > 0 {
+            return ReloadDecision::Converged;
+        }
+        return ReloadDecision::Reloaded;
+    }
+    if last_serial != Some(current_serial) {
+        ReloadDecision::Converged
+    } else if last_generation != Some(current_generation) {
+        ReloadDecision::Reloaded
     } else {
-        eprintln!(
-            "[HotReload] pipe reconnected within the same domain generation; active patches kept"
-        );
+        ReloadDecision::Unchanged
     }
 }
 
-/// Decide whether a reconnect needs detour-state cleanup, recording the
-/// generation for the next comparison. Split out for testability.
-async fn reconnect_requires_cleanup(
+/// Reconcile pending edits against the editor's reload lifecycle. The
+/// connection monitor calls this every poll while connected (and right after a
+/// reconnect), feeding the `(domain_generation, converged_serial)` pair read
+/// from Unity via `get_reload_state`.
+///
+/// This is what makes a Unity-initiated recompile (manual Ctrl+R, save, focus
+/// auto-refresh, startup) converge the unapplied set exactly like a Locus
+/// `unity_recompile`: convergence keys on Unity's own compilation serial, not
+/// on who asked for the compile — and it works whether or not the pipe dropped
+/// across the reload (the native broker survives it). A transient pipe drop
+/// within one domain (same generation, same serial) keeps active detours.
+pub async fn observe_reload_state(
     project_path: &str,
-    current_generation: Option<String>,
-) -> bool {
+    session_id: String,
+    domain_generation: String,
+    converged_serial: i64,
+) {
+    let decision = {
+        let projects = projects().lock().await;
+        let state = projects.get(&project_key(project_path));
+        let survived_exit = state.map(|state| state.pending_survived_exit).unwrap_or(false);
+        classify_reload(
+            state.and_then(|state| state.last_session_id.as_deref()),
+            state.and_then(|state| state.last_domain_generation.as_deref()),
+            state.and_then(|state| state.last_converged_serial),
+            &session_id,
+            &domain_generation,
+            converged_serial,
+            survived_exit,
+        )
+    };
+
+    match decision {
+        ReloadDecision::Converged => {
+            eprintln!(
+                "[HotReload] editor converged (session {session_id}, serial {converged_serial}); clearing tracked edits"
+            );
+            on_recompile_converged(project_path).await;
+        }
+        ReloadDecision::Reloaded => {
+            eprintln!(
+                "[HotReload] editor domain reloaded with no recompile; detours dropped, edits stay pending"
+            );
+            on_domain_reloaded(project_path).await;
+        }
+        ReloadDecision::Seed | ReloadDecision::Unchanged => {}
+    }
+
+    // Always record the latest sample so the next one is judged against it
+    // (convergence/reload may have reset the trackers above).
     let mut projects = projects().lock().await;
     let state = projects.entry(project_key(project_path)).or_default();
-    match current_generation {
-        Some(generation) => {
-            let unchanged = state.last_domain_generation.as_deref() == Some(generation.as_str());
-            state.last_domain_generation = Some(generation);
-            !unchanged
-        }
-        None => {
-            state.last_domain_generation = None;
-            true
-        }
+    state.last_session_id = Some(session_id);
+    state.last_domain_generation = Some(domain_generation);
+    state.last_converged_serial = Some(converged_serial);
+    // The survived-exit hint is for the first sample of the relaunched instance
+    // only (consulted above). Past it, this instance's own serial moves drive
+    // convergence, so clear it — otherwise a later edit made before the next
+    // sample could be swept up by a stale hint.
+    state.pending_survived_exit = false;
+}
+
+/// The editor process is gone (quit or crash). Its detours died with it, so
+/// re-mark hot-applied edits as unapplied and zero the active-patch counters —
+/// but KEEP pending/cold. Those edits are still not in any running editor, and a
+/// relaunch is NOT proof they are: startup compilation can fail and leave the
+/// editor running the last good assemblies. They converge only when a session
+/// reports a successful compile (a moved serial) or an explicit unity_recompile.
+/// The trackers reset so the next connect re-seeds a baseline.
+pub async fn on_editor_exited(project_path: &str) {
+    // Reuse the domain-reload cleanup: drops active detours, re-marks
+    // hot-applied edits unapplied, and clears hot-patch type-index rows — all
+    // without touching pending/cold.
+    on_domain_reloaded(project_path).await;
+    let mut projects = projects().lock().await;
+    if let Some(state) = projects.get_mut(&project_key(project_path)) {
+        // Remember that these edits outlived the editor: the relaunch's startup
+        // recompile will load them, so the next new-session sample converges on
+        // a moved serial (serial > 0) rather than stranding a stale count. A
+        // failed startup compile leaves serial 0, so they correctly stay pending.
+        state.pending_survived_exit =
+            !state.pending.is_empty() || !state.cold_paths.is_empty();
+        state.last_session_id = None;
+        state.last_domain_generation = None;
+        state.last_converged_serial = None;
     }
 }
 
@@ -645,6 +815,15 @@ fn base64_decoded_len(value: &str) -> u64 {
         .take_while(|byte| **byte == b'=')
         .count();
     ((len / 4) * 3).saturating_sub(padding) as u64
+}
+
+fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64 {
+    if let Some(path) = assembly_path.filter(|path| !path.is_empty()) {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return metadata.len();
+        }
+    }
+    base64_decoded_len(assembly_b64)
 }
 
 pub async fn pending_paths(project_path: &str) -> Vec<String> {
@@ -742,6 +921,87 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ── enable-time Code Optimization gate ───────────────────────────────
+
+/// Read the connected editor's Code Optimization for the toggle-time gate
+/// (the icon above the chat input and the Settings switch both call this
+/// before turning hot reload on). Reuses `hot_reload_probe`, which every
+/// hot-reload-capable plugin already answers, so the warning works even
+/// before the in-project plugin is updated.
+///
+/// Returns `(connected, code_optimization)`. The editor being unreachable →
+/// `(false, None)`; a connected editor whose probe could not be parsed (an
+/// older plugin shape) → `(true, None)`. The caller only blocks the toggle on
+/// a positive `Some("release")`; every other case enables directly, because
+/// the execution-time `run_probe` still gates real hot reloads.
+pub async fn detect_code_optimization(project_path: &str) -> (bool, Option<String>) {
+    let resp = match crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_probe",
+        "",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        // No connected editor (or the pipe timed out): nothing to gate on now.
+        Err(_) => return (false, None),
+    };
+
+    if !resp.ok {
+        // Connected, but the probe errored (e.g. a plugin predating it).
+        return (true, None);
+    }
+
+    let message = resp.message.unwrap_or_default();
+    match serde_json::from_str::<HotReloadProbeResponse>(&message) {
+        Ok(probe) if !probe.code_optimization.is_empty() => (true, Some(probe.code_optimization)),
+        _ => (true, None),
+    }
+}
+
+/// Switch the connected editor to Code Optimization = Debug (the toggle-time
+/// auto-fix the user confirmed). Triggers a script recompile in Unity, exactly
+/// like flipping the status-bar bug icon. Returns the resulting value.
+pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
+    let resp = crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_set_debug",
+        "",
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|error| {
+        format!("Could not reach the Unity editor to change Code Optimization: {error}")
+    })?;
+
+    if !resp.ok {
+        let error = resp
+            .error
+            .unwrap_or_else(|| "Unity rejected the Code Optimization change".to_string());
+        if error.starts_with("unknown message type") {
+            return Err(
+                "The Unity plugin in this project predates the Code Optimization auto-switch. \
+                 Update the Locus plugin (reopen the project from Locus), or set Code \
+                 Optimization to Debug yourself from the Unity status bar."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Unity could not switch Code Optimization to Debug: {error}"
+        ));
+    }
+
+    let message = resp.message.unwrap_or_default();
+    let parsed: HotReloadProbeResponse = serde_json::from_str(&message)
+        .map_err(|error| format!("Code Optimization response parse failed: {error}"))?;
+    Ok(if parsed.code_optimization.is_empty() {
+        "debug".to_string()
+    } else {
+        parsed.code_optimization
+    })
 }
 
 // ── access probe (C0 runtime capability matrix) ─────────────────────
@@ -1046,13 +1306,10 @@ pub async fn hot_reload(
             format!("Could not get compile params from Unity ({error}); use unity_recompile.")
         })?;
 
-    // Remember the generation so a later transient pipe reconnect is not
-    // mistaken for a domain reload (which would wrongly clear patch state).
-    {
-        let mut projects = projects().lock().await;
-        let state = projects.entry(project_key(project_path)).or_default();
-        state.last_domain_generation = Some(params.domain_generation.clone());
-    }
+    // The generation/serial trackers are maintained solely by
+    // `observe_reload_state` (the monitor samples every poll while connected),
+    // so a transient pipe drop within one domain is judged "unchanged" there
+    // and never mistaken for a reload — no need to record the generation here.
 
     // C0: per-domain-generation runtime capability matrix (Mono JIT access
     // checks + emit primitives), probed once before the generation's first
@@ -1128,6 +1385,7 @@ pub async fn hot_reload(
         crate::csharp_compile::HotPatchOutcome::Compiled {
             assembly_name,
             assembly_b64,
+            assembly_path,
             methods,
             new_types,
             caller_scan_note,
@@ -1153,9 +1411,8 @@ pub async fn hot_reload(
             // execute path. Simplest correct path: send hot_patch_loaded
             // whenever there are methods; for pure new-type patches send it
             // too — Unity loads the assembly and applies zero detours.
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "patch_id": assembly_name,
-                "assembly_b64": assembly_b64,
                 "domain_generation": params.domain_generation,
                 "methods": methods.iter().map(|m| serde_json::json!({
                     "declaring_type": m.declaring_type,
@@ -1169,8 +1426,21 @@ pub async fn hot_reload(
                     // established compatibility discipline).
                     "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
                 })).collect::<Vec<_>>(),
-            })
-            .to_string();
+            });
+            if let Some(object) = payload.as_object_mut() {
+                if let Some(path) = &assembly_path {
+                    object.insert(
+                        "assembly_path".to_string(),
+                        serde_json::Value::String(path.clone()),
+                    );
+                } else {
+                    object.insert(
+                        "assembly_b64".to_string(),
+                        serde_json::Value::String(assembly_b64.clone()),
+                    );
+                }
+            }
+            let payload = payload.to_string();
 
             let resp = match crate::unity_bridge::send_message_with_timeout(
                 project_path,
@@ -1218,6 +1488,7 @@ pub async fn hot_reload(
                 &params.domain_generation,
                 &assembly_name,
                 &assembly_b64,
+                assembly_path.as_deref(),
             )
             .await
             {
@@ -1225,7 +1496,7 @@ pub async fn hot_reload(
                 Err(error) => Some(error),
             };
 
-            let assembly_bytes = base64_decoded_len(&assembly_b64);
+            let assembly_bytes = assembly_artifact_len(&assembly_b64, assembly_path.as_deref());
             let code_entries = methods.len().saturating_add(new_types.len()) as u64;
             super::record_patch_applied(assembly_bytes, code_entries);
             // H6: arm the convergence scheduler (threshold / idle / play exit).
@@ -1490,28 +1761,217 @@ mod tests {
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }
 
+    #[test]
+    fn classify_reload_distinguishes_compile_from_bare_reload() {
+        use ReloadDecision::*;
+        // First sample: seed only (pending may be uncompiled — never clear).
+        assert_eq!(classify_reload(None, None, None, "s1", "g1", 0, false), Seed);
+        // Nothing moved (steady state / transient pipe blip).
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(0), "s1", "g1", 0, false),
+            Unchanged
+        );
+        // Compile + reload: generation and serial both moved.
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(0), "s1", "g2", 1, false),
+            Converged
+        );
+        // Bare domain reload (entered play mode): generation moved, serial held.
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(2), "s1", "g2", 2, false),
+            Reloaded
+        );
+        // Compile in place (no reload): serial moved without a generation change.
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(2), "s1", "g1", 3, false),
+            Converged
+        );
+        // Editor restart (NEW session) WITHOUT recorded survivors: keep evidence.
+        // A fresh editor's startup compile can fail, leaving the sources
+        // unloaded, and without the survived-exit hint we cannot prove the
+        // moved serial compiled THESE edits — so do not converge (safe
+        // over-report) until the instance reports a same-session compile.
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(0), "s2", "gNew", 0, false),
+            Reloaded
+        );
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(5), "s2", "gNew", 7, false),
+            Reloaded
+        );
+        // ...but once that new instance reports a successful compile, it converges.
+        assert_eq!(
+            classify_reload(Some("s2"), Some("gNew"), Some(0), "s2", "gX", 1, false),
+            Converged
+        );
+        // First sample with no baseline only seeds, even if the serial looks
+        // advanced — documents the race the monitor avoids by seeding a baseline
+        // on connect before any edit can be the first sample.
+        assert_eq!(classify_reload(None, None, None, "s1", "g2", 5, false), Seed);
+
+        // ── Edits that survived the previous editor's exit ──
+        // Relaunch's startup recompile loaded them (serial advanced past 0):
+        // converge, whether the first sample lands on the seed path (trackers
+        // blanked on exit)...
+        assert_eq!(
+            classify_reload(None, None, None, "s2", "gNew", 1, true),
+            Converged
+        );
+        // ...or on the new-session path (exit not observed, trackers stale).
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(3), "s2", "gNew", 4, true),
+            Converged
+        );
+        // Survivors but the relaunch has not compiled yet (serial still 0): keep
+        // pending — startup compile may have failed, leaving last-good loaded.
+        assert_eq!(
+            classify_reload(None, None, None, "s2", "gNew", 0, true),
+            Seed
+        );
+        assert_eq!(
+            classify_reload(Some("s1"), Some("g1"), Some(3), "s2", "gNew", 0, true),
+            Reloaded
+        );
+    }
+
+    async fn unapplied_in_project(project: &str) -> u64 {
+        let snapshot: Vec<PendingEdit> = {
+            let projects = projects().lock().await;
+            projects
+                .get(&project_key(project))
+                .map(|state| state.pending.values().cloned().collect())
+                .unwrap_or_default()
+        };
+        let mut count = 0u64;
+        for edit in snapshot {
+            if is_pending_edit_unapplied(&edit).await {
+                count += 1;
+            }
+        }
+        count
+    }
+
     #[tokio::test]
-    async fn reconnect_cleanup_tracks_domain_generation() {
-        let project = r"C:\HotReloadTest\Reconnect";
+    async fn observe_converges_on_compile_and_keeps_on_bare_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "locus-observe-reload-{}",
+            std::process::id() as u64
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        ));
+        let assets = dir.join("Assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let file = assets.join("Obs.cs");
+        let file_path = file.to_string_lossy().to_string();
+        let project = dir.to_string_lossy().to_string();
 
-        // First sighting of a generation: unknown → cleanup required.
-        assert!(reconnect_requires_cleanup(project, Some("gen-1".to_string())).await);
-        // Transient pipe drop within the same generation: keep detours.
-        assert!(!reconnect_requires_cleanup(project, Some("gen-1".to_string())).await);
-        // Real domain reload (new generation): cleanup.
-        assert!(reconnect_requires_cleanup(project, Some("gen-2".to_string())).await);
-        // Unknown generation (params fetch failed): fail closed.
-        assert!(reconnect_requires_cleanup(project, None).await);
-        assert!(reconnect_requires_cleanup(project, Some("gen-2".to_string())).await);
-
-        // Convergence forgets the generation: next reconnect cleans again.
-        {
+        // Seed pending directly rather than through note_cs_written, so the test
+        // does not race other tests on the global hot-reload enabled flag (the
+        // reconciliation paths under test do not read that flag).
+        async fn seed(project: &str, path: &str, baseline: &str) {
             let mut projects = projects().lock().await;
             let state = projects.entry(project_key(project)).or_default();
-            state.last_domain_generation = Some("gen-3".to_string());
+            state.pending.insert(
+                file_key(path),
+                PendingEdit {
+                    absolute_path: path.to_string(),
+                    baseline: baseline.to_string(),
+                    applied_text: None,
+                },
+            );
         }
-        on_recompile_converged(project).await;
-        assert!(reconnect_requires_cleanup(project, Some("gen-3".to_string())).await);
+
+        // An edit on disk that differs from its compiled baseline is unapplied.
+        std::fs::write(&file, "v1").unwrap();
+        seed(&project, &file_path, "v0").await;
+        assert_eq!(unapplied_in_project(&project).await, 1);
+
+        // Seed the reload tracker, then a Unity recompile (serial moves) converges.
+        observe_reload_state(&project, "s1".to_string(), "g1".to_string(), 0).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "seeding takes no action"
+        );
+        observe_reload_state(&project, "s1".to_string(), "g2".to_string(), 1).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "a compile-driven reload converges pending"
+        );
+
+        // A fresh edit, then a bare domain reload (play mode) keeps it pending.
+        std::fs::write(&file, "v2").unwrap();
+        seed(&project, &file_path, "v1").await;
+        observe_reload_state(&project, "s1".to_string(), "g2".to_string(), 1).await; // record current sample
+        observe_reload_state(&project, "s1".to_string(), "g3".to_string(), 1).await; // generation moved, serial held
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "a bare reload keeps edits pending"
+        );
+
+        // A fresh editor instance (new session id) does NOT auto-converge — the
+        // startup compile is unproven — so edits stay pending until the new
+        // instance reports a successful compile.
+        observe_reload_state(&project, "s2".to_string(), "g9".to_string(), 0).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "a new editor instance keeps pending until a confirmed compile"
+        );
+        observe_reload_state(&project, "s2".to_string(), "g10".to_string(), 1).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "a confirmed compile in the new instance converges"
+        );
+
+        // Editor exit PRESERVES pending (a relaunch is not proof of a clean
+        // compile) — it only resets the dead detour state, never deletes the
+        // evidence. It does, however, record that the edits outlived the editor.
+        std::fs::write(&file, "v3").unwrap();
+        seed(&project, &file_path, "v2").await;
+        assert_eq!(unapplied_in_project(&project).await, 1);
+        on_editor_exited(&project).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "exit preserves pending as evidence"
+        );
+
+        // Relaunch whose startup recompile loaded the survivors (serial > 0):
+        // the first new-session sample converges them instead of stranding the
+        // count — the original "still unapplied after restarting Unity" bug.
+        observe_reload_state(&project, "s3".to_string(), "gReboot".to_string(), 1).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "a relaunch that recompiled the survivors converges them"
+        );
+
+        // Now the failed-startup path: exit with fresh pending, relaunch reports
+        // serial 0 (startup compile failed / not run) — keep pending until a
+        // real compile in the new instance advances the serial.
+        std::fs::write(&file, "v4").unwrap();
+        seed(&project, &file_path, "v3").await;
+        on_editor_exited(&project).await;
+        observe_reload_state(&project, "s4".to_string(), "gBoot".to_string(), 0).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "a relaunch that has not compiled (serial 0) keeps survivors pending"
+        );
+        observe_reload_state(&project, "s4".to_string(), "gBoot2".to_string(), 1).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "the new instance's first successful compile converges them"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
