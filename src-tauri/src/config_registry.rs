@@ -568,7 +568,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
     ];
 
     for (name, label, desc) in behavior_list {
-        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("ask");
+        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("auto");
 
         out.push(ConfigEntry {
             key: format!("permissions.{}", name),

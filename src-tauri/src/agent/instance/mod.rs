@@ -8362,11 +8362,12 @@ impl AgentInstance {
                 // unity_hot_reload reads the just-edited files from disk;
                 // running it concurrently with the same round's write/edit
                 // calls would race them, so it shares the sequential barrier.
-                let has_unity_compile_barrier = has_unity_recompile
+                let has_unity_execution_barrier = has_unity_execute
+                    || has_unity_recompile
                     || prepared.iter().any(|(tc, _)| tc.name == "unity_hot_reload");
-                let results = if has_unity_compile_barrier {
+                let results = if has_unity_execution_barrier {
                     eprintln!(
-                        "[Agent {}] executing tool round sequentially because a Unity compile tool is a barrier",
+                        "[Agent {}] executing tool round sequentially because a Unity tool is a barrier",
                         self.id
                     );
                     let mut results = Vec::with_capacity(prepared.len());
@@ -8441,7 +8442,7 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
-                if !has_unity_compile_barrier {
+                if !has_unity_execution_barrier {
                     let queued_asset_paths: Vec<String> = prepared
                         .iter()
                         .zip(results.iter())
@@ -9084,6 +9085,164 @@ impl AgentInstance {
         }
     }
 
+    fn strip_csharp_comments_and_literals(code: &str) -> String {
+        let mut out = String::with_capacity(code.len());
+        let mut chars = code.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '/' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    out.push(' ');
+                    out.push(' ');
+                    for value in chars.by_ref() {
+                        if value == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                        out.push(' ');
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    out.push(' ');
+                    out.push(' ');
+                    let mut previous = '\0';
+                    for value in chars.by_ref() {
+                        if value == '\n' {
+                            out.push('\n');
+                        } else {
+                            out.push(' ');
+                        }
+                        if previous == '*' && value == '/' {
+                            break;
+                        }
+                        previous = value;
+                    }
+                }
+                '@' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    out.push(' ');
+                    out.push(' ');
+                    while let Some(value) = chars.next() {
+                        if value == '\n' {
+                            out.push('\n');
+                        } else {
+                            out.push(' ');
+                        }
+                        if value == '"' {
+                            if chars.peek() == Some(&'"') {
+                                chars.next();
+                                out.push(' ');
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+                '"' => {
+                    out.push(' ');
+                    let mut escaped = false;
+                    for value in chars.by_ref() {
+                        if value == '\n' {
+                            out.push('\n');
+                        } else {
+                            out.push(' ');
+                        }
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
+                        if value == '\\' {
+                            escaped = true;
+                            continue;
+                        }
+                        if value == '"' {
+                            break;
+                        }
+                    }
+                }
+                '\'' => {
+                    out.push(' ');
+                    let mut escaped = false;
+                    for value in chars.by_ref() {
+                        if value == '\n' {
+                            out.push('\n');
+                        } else {
+                            out.push(' ');
+                        }
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
+                        if value == '\\' {
+                            escaped = true;
+                            continue;
+                        }
+                        if value == '\'' {
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(ch),
+            }
+        }
+
+        out
+    }
+
+    fn unity_execute_editor_status_intent(
+        code: &str,
+        current_status: &str,
+    ) -> Option<&'static str> {
+        let stripped = Self::strip_csharp_comments_and_literals(code);
+        let compact = stripped
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+
+        let mut first: Option<(usize, &'static str)> = None;
+        let mut add_intent = |pattern: &str, status: &'static str| {
+            if let Some(index) = compact.find(pattern) {
+                if first.map(|(current, _)| index < current).unwrap_or(true) {
+                    first = Some((index, status));
+                }
+            }
+        };
+
+        add_intent(
+            "editorapplication.isplaying=true",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+        );
+        add_intent(
+            "editorapplication.enterplaymode(",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+        );
+        add_intent(
+            "editorapplication.isplaying=false",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_EDITING,
+        );
+        add_intent(
+            "editorapplication.exitplaymode(",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_EDITING,
+        );
+        add_intent(
+            "editorapplication.ispaused=true",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+        );
+        if crate::unity_bridge::normalize_editor_status(current_status)
+            == crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED
+        {
+            add_intent(
+                "editorapplication.ispaused=false",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+            );
+        }
+
+        first.map(|(_, status)| status)
+    }
+
     fn user_wait_target(&self, run_id: &str) -> UserWaitTarget {
         match self.parent_tool_call.as_ref() {
             Some(parent) => UserWaitTarget {
@@ -9215,7 +9374,7 @@ impl AgentInstance {
                 perms
                     .get(PERMISSION_BEHAVIOR_KNOWLEDGE_GOVERNANCE)
                     .map(String::as_str),
-                true,
+                false,
             );
         drop(perms);
 
@@ -9344,7 +9503,7 @@ impl AgentInstance {
             perms
                 .get(PERMISSION_BEHAVIOR_UNITY_EDITOR_STATUS_CHANGE)
                 .map(String::as_str),
-            true,
+            false,
         );
         drop(perms);
 
@@ -11643,6 +11802,7 @@ impl AgentInstance {
             });
         }
 
+        let mut execution_status = current_status;
         if current_status != requested_status {
             match self
                 .request_unity_editor_status_change_confirm(
@@ -11687,6 +11847,49 @@ impl AgentInstance {
                     output: format!("Failed to change Unity Editor status: {}", error),
                     is_error: true,
                 });
+            }
+            execution_status = requested_status;
+        }
+
+        if let Some(code_requested_status) =
+            Self::unity_execute_editor_status_intent(code, execution_status)
+        {
+            if code_requested_status != execution_status {
+                match self
+                    .request_unity_editor_status_change_confirm(
+                        app_handle,
+                        "unity_execute",
+                        tool_call_id,
+                        execution_status,
+                        code_requested_status,
+                        run_id,
+                    )
+                    .await
+                {
+                    ToolConfirmDecision::Allow => {}
+                    ToolConfirmDecision::Deny { feedback } => {
+                        if self.is_cancel_requested() {
+                            return Self::interrupted_tool_result();
+                        }
+                        let output = match feedback {
+                            Some(feedback) => format!(
+                                "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
+                                feedback
+                            ),
+                            None => "user_denied_editor_state_change".to_string(),
+                        };
+                        return ExecutedToolResult::from_tool_result(ToolResult {
+                            output,
+                            is_error: true,
+                        });
+                    }
+                    ToolConfirmDecision::PreflightError { output } => {
+                        return ExecutedToolResult::from_tool_result(ToolResult {
+                            output,
+                            is_error: true,
+                        });
+                    }
+                }
             }
         }
 
@@ -16708,18 +16911,61 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn behavior_permission_defaults_to_approval_and_allows_auto_override() {
-        assert!(AgentInstance::permission_setting_requires_confirm(
-            None, true
+    fn behavior_permission_defaults_to_auto_and_allows_ask_override() {
+        assert!(!AgentInstance::permission_setting_requires_confirm(
+            None, false
         ));
         assert!(AgentInstance::permission_setting_requires_confirm(
             Some("ask"),
-            true
+            false
         ));
         assert!(!AgentInstance::permission_setting_requires_confirm(
             Some("auto"),
             true
         ));
+    }
+
+    #[test]
+    fn unity_execute_detects_explicit_editor_status_changes_before_running_code() {
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                r#"
+                print("EditorApplication.isPlaying = false");
+                // EditorApplication.isPlaying = false;
+                UnityEditor.EditorApplication.isPlaying = true;
+                "#,
+                crate::unity_bridge::UNITY_EDITOR_STATUS_EDITING,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "UnityEditor.EditorApplication.ExitPlaymode();",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_EDITING)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "EditorApplication.isPaused = true;",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "EditorApplication.isPaused = false;",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "EditorApplication.isPaused = false;",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+            ),
+            None
+        );
     }
 
     #[test]
