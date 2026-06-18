@@ -67,6 +67,18 @@ describe("plugin Skill package", () => {
     expect(publish).toContain("Verify the final release archive");
     expect(publish).toContain("A new plugin adds exactly one file");
     expect(publish).toContain("Include the user-facing metadata");
+    expect(publish).toContain("summaryI18n");
+    expect(publish).toContain("descriptionI18n");
+    expect(publish).toContain("descriptionSourceI18n");
+    expect(publish).toContain("Default to English and Chinese registry metadata");
+    expect(publish).toContain("summaryI18n.en");
+    expect(publish).toContain("summaryI18n.zh");
+    expect(publish).toContain("descriptionI18n.en");
+    expect(publish).toContain("descriptionI18n.zh");
+    expect(publish).toContain("descriptionSourceI18n.en");
+    expect(publish).toContain("descriptionSourceI18n.zh");
+    expect(publish).toContain("README.en.md");
+    expect(publish).toContain("README.zh.md");
     expect(publish).toContain("legacy or npm-style fields");
     expect(publish).toContain("Include standard stats definitions for GitHub-hosted plugins");
     expect(publish).toContain("Store `downloadSource`, never generated `download`, `latestVersion`, or release SHA fields");
