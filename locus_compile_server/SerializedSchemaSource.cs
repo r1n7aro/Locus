@@ -15,7 +15,7 @@ namespace Locus.CompileServer;
 /// </summary>
 public static class SerializedSchemaSource
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
     private const TypeAttributes SerializableTypeAttributeFlag = (TypeAttributes)0x00002000;
 
     public static JsonObject Build(IEnumerable<PortableExecutableReference> references)
@@ -43,9 +43,18 @@ public static class SerializedSchemaSource
         var relevantTypeKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (INamedTypeSymbol type in candidateTypes)
         {
-            string key = TypeKey(TypeFullName(type), type.ContainingAssembly.Identity.Name);
-            if (IsSchemaRootType(type, unityObjectType, serializableTypeKeys.Contains(key)))
-                AddTypeAndBaseClosure(type, relevantTypeKeys);
+            try
+            {
+                string key = TypeKey(TypeFullName(type), type.ContainingAssembly.Identity.Name);
+                if (IsSchemaRootType(type, unityObjectType, serializableTypeKeys.Contains(key)))
+                    AddTypeAndBaseClosure(type, relevantTypeKeys);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    "[LocusCompileServer] serialized schema skipped root type " +
+                    type.ToDisplayString() + ": " + ex.Message);
+            }
         }
         AddSerializedFieldTypeClosure(candidateTypes, listType, relevantTypeKeys);
 
@@ -109,10 +118,16 @@ public static class SerializedSchemaSource
         bool changed = false;
         for (INamedTypeSymbol? current = type; current != null; current = current.BaseType)
         {
-            string assemblyName = current.ContainingAssembly.Identity.Name;
+            // Index the open generic definition, not the constructed base. A base
+            // such as TransitionAsset<ITransitionDetailed> would otherwise be keyed
+            // by its constructed name while TypeToJson emits the definition under
+            // the open name (TransitionAsset`1), so the type that actually declares
+            // the inherited fields would never be written into the schema.
+            INamedTypeSymbol definition = current.OriginalDefinition;
+            string assemblyName = definition.ContainingAssembly.Identity.Name;
             if (!ShouldIndexAssembly(assemblyName))
                 continue;
-            changed |= keys.Add(TypeKey(TypeFullName(current), assemblyName));
+            changed |= keys.Add(TypeKey(TypeFullName(definition), assemblyName));
         }
         return changed;
     }
@@ -235,7 +250,7 @@ public static class SerializedSchemaSource
         {
             ["fullName"] = TypeFullName(type),
             ["assembly"] = type.ContainingAssembly.Identity.Name,
-            ["baseTypeFullName"] = TypeFullName(type.BaseType),
+            ["baseTypeFullName"] = SchemaTypeRefName(type.BaseType),
             ["baseTypeAssembly"] = TypeAssembly(type.BaseType),
             ["interfaces"] = interfaces,
             ["isSerializable"] = IsSerializableType(type, hasSerializableMetadataFlag),
@@ -245,6 +260,7 @@ public static class SerializedSchemaSource
             ["containsGenericParameters"] = ContainsGenericParameters(type),
             ["isUnityObject"] = IsOrDerivesFrom(type, unityObjectType),
             ["isFlagsEnum"] = HasAttribute(type.GetAttributes(), "System.FlagsAttribute"),
+            ["typeParameters"] = TypeParametersToJson(type),
             ["enumOptions"] = EnumOptionsToJson(type),
             ["fields"] = fields,
         };
@@ -289,9 +305,9 @@ public static class SerializedSchemaSource
         return new JsonObject
         {
             ["name"] = field.Name,
-            ["fieldTypeFullName"] = TypeFullName(fieldType),
+            ["fieldTypeFullName"] = SchemaTypeRefName(fieldType),
             ["fieldTypeAssembly"] = TypeAssembly(fieldType),
-            ["elementTypeFullName"] = hasElement ? TypeFullName(serializedType) : "",
+            ["elementTypeFullName"] = hasElement ? SchemaTypeRefName(serializedType) : "",
             ["elementTypeAssembly"] = hasElement ? TypeAssembly(serializedType) : "",
             ["isArray"] = fieldType is IArrayTypeSymbol,
             ["isList"] = IsListType(fieldType, listType),
@@ -315,7 +331,7 @@ public static class SerializedSchemaSource
     {
         return new JsonObject
         {
-            ["fullName"] = TypeFullName(type),
+            ["fullName"] = SchemaTypeRefName(type),
             ["assembly"] = type.ContainingAssembly.Identity.Name,
         };
     }
@@ -578,9 +594,33 @@ public static class SerializedSchemaSource
 
     private static string TypeAssembly(ITypeSymbol? type)
     {
-        if (type is IArrayTypeSymbol array)
-            return TypeAssembly(array.ElementType);
-        return type?.ContainingAssembly?.Identity.Name ?? "";
+        return TypeAssemblyIdentity(type)?.Name ?? "";
+    }
+
+    /// <summary>
+    /// Resolves the defining assembly identity of a type, unwrapping array and
+    /// pointer types to their underlying element type. Array, pointer, dynamic
+    /// and function-pointer symbols have no ContainingAssembly of their own, so
+    /// this returns null for them and callers must tolerate a missing identity
+    /// rather than dereferencing it.
+    /// </summary>
+    private static AssemblyIdentity? TypeAssemblyIdentity(ITypeSymbol? type)
+    {
+        ITypeSymbol? current = type;
+        while (true)
+        {
+            switch (current)
+            {
+                case IArrayTypeSymbol array:
+                    current = array.ElementType;
+                    break;
+                case IPointerTypeSymbol pointer:
+                    current = pointer.PointedAtType;
+                    break;
+                default:
+                    return current?.ContainingAssembly?.Identity;
+            }
+        }
     }
 
     private static HashSet<string> SerializableTypeKeys(IEnumerable<PortableExecutableReference> references)
@@ -653,11 +693,75 @@ public static class SerializedSchemaSource
 
         string args = string.Join(
             ",",
-            named.TypeArguments.Select(arg => "["
-                + TypeFullName(arg)
-                + ", "
-                + AssemblyQualifiedName(arg.ContainingAssembly.Identity)
-                + "]"));
+            named.TypeArguments.Select(arg =>
+            {
+                // Array/pointer/dynamic type arguments have no ContainingAssembly
+                // of their own; resolve through to the element type and fall back
+                // to a name-only entry when even that is unavailable.
+                AssemblyIdentity? argAssembly = TypeAssemblyIdentity(arg);
+                return argAssembly == null
+                    ? "[" + TypeFullName(arg) + "]"
+                    : "[" + TypeFullName(arg) + ", " + AssemblyQualifiedName(argAssembly) + "]";
+            }));
+        return baseName + "[" + args + "]";
+    }
+
+    private static JsonArray TypeParametersToJson(INamedTypeSymbol type)
+    {
+        var parameters = new JsonArray();
+        foreach (ITypeParameterSymbol typeParameter in type.TypeParameters)
+            parameters.Add(typeParameter.Name);
+        return parameters;
+    }
+
+    /// <summary>
+    /// Renders a schema type reference (field type, element type, base type) the
+    /// same way <see cref="TypeFullName"/> renders fully-concrete types, but keeps
+    /// open type-parameter references as positional placeholders <c>!n</c> so the
+    /// consumer can substitute them against a constructed instantiation. A bare
+    /// type parameter becomes <c>!0</c>; a type parameter used as a generic
+    /// argument becomes <c>[!0]</c>; concrete arguments stay assembly-qualified.
+    /// For types with no type parameters anywhere the output is byte-identical to
+    /// <see cref="TypeFullName"/>, so non-generic and closed-generic references are
+    /// unchanged.
+    /// </summary>
+    private static string SchemaTypeRefName(ITypeSymbol? type)
+    {
+        if (type == null)
+            return "";
+        if (type is ITypeParameterSymbol typeParameter)
+            return "!" + typeParameter.Ordinal.ToString(CultureInfo.InvariantCulture);
+        if (type is IArrayTypeSymbol array)
+            return SchemaTypeRefName(array.ElementType) + "[]";
+        if (type is not INamedTypeSymbol named)
+            return type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::", "", StringComparison.Ordinal);
+
+        INamedTypeSymbol definition = named.OriginalDefinition;
+        var names = new Stack<string>();
+        for (INamedTypeSymbol? current = definition; current != null; current = current.ContainingType)
+            names.Push(current.MetadataName);
+        string nested = string.Join("+", names);
+        string ns = definition.ContainingNamespace.IsGlobalNamespace
+            ? ""
+            : definition.ContainingNamespace.ToDisplayString();
+        string baseName = ns.Length == 0 ? nested : ns + "." + nested;
+        if (named.TypeArguments.Length == 0)
+            return baseName;
+
+        string args = string.Join(
+            ",",
+            named.TypeArguments.Select(arg =>
+            {
+                if (arg is ITypeParameterSymbol parameter)
+                    return "[!" + parameter.Ordinal.ToString(CultureInfo.InvariantCulture) + "]";
+                // Array/pointer/dynamic type arguments have no ContainingAssembly
+                // of their own; resolve through to the element type and fall back
+                // to a name-only entry when even that is unavailable.
+                AssemblyIdentity? argAssembly = TypeAssemblyIdentity(arg);
+                return argAssembly == null
+                    ? "[" + SchemaTypeRefName(arg) + "]"
+                    : "[" + SchemaTypeRefName(arg) + ", " + AssemblyQualifiedName(argAssembly) + "]";
+            }));
         return baseName + "[" + args + "]";
     }
 

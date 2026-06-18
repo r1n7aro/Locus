@@ -359,4 +359,143 @@ namespace Game
         Assert.DoesNotContain(types, type => type!["fullName"]!.GetValue<string>() == "Game.Utility");
         Assert.Contains(types, type => type!["fullName"]!.GetValue<string>() == "Game.Data");
     }
+
+    [Fact]
+    public void Builds_schema_for_generic_base_with_array_type_argument()
+    {
+        // Regression: a constructed generic reached through the base-type closure
+        // whose type argument is an array (Base<int[]>) used to throw a
+        // NullReferenceException, because array/pointer symbols have no
+        // ContainingAssembly of their own. The whole index/schema request failed.
+        string path = CompileToDisk("SchemaArrayTypeArg", @"
+using System;
+
+namespace UnityEngine
+{
+    public class Object { }
+}
+
+namespace Game
+{
+    public class Base<T> { }
+
+    [Serializable]
+    public class Derived : Base<int[]> { }
+}
+");
+
+        JsonObject result = BuildFromPaths(path);
+        JsonArray types = result["types"]!.AsArray();
+
+        // Must be present (not silently skipped) and carry a well-formed base name
+        // with the array argument resolved to its element type's assembly.
+        JsonNode derived = types.Single(t => t!["fullName"]!.GetValue<string>() == "Game.Derived")!;
+        Assert.StartsWith(
+            "Game.Base`1[[System.Int32[], ",
+            derived["baseTypeFullName"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Emits_type_parameters_and_positional_placeholders_for_generics()
+    {
+        string path = CompileToDisk("SchemaGenerics", @"
+using System;
+using System.Collections.Generic;
+
+namespace UnityEngine
+{
+    public class Object { }
+    public sealed class SerializeField : Attribute { }
+    public sealed class SerializeReference : Attribute { }
+}
+
+namespace Game
+{
+    [Serializable]
+    public struct Toggle<T>
+    {
+        public bool enable;
+        public T data;
+        public List<T> history;
+    }
+
+    [Serializable]
+    public class Owner
+    {
+        public Toggle<int> toggle;
+    }
+
+    public abstract class Wrapper<TValue> : UnityEngine.Object, IWrapper<TValue>
+    {
+        [UnityEngine.SerializeReference]
+        public TValue payload;
+    }
+
+    public interface IThing { }
+    public interface IWrapper<TValue> { }
+
+    public class ConcreteWrapper : Wrapper<IThing> { }
+}
+");
+
+        JsonObject result = BuildFromPaths(path);
+        Assert.Equal(2, result["schemaVersion"]!.GetValue<int>());
+        JsonArray types = result["types"]!.AsArray();
+
+        // Generic definition records its type-parameter names.
+        JsonNode toggle = types.Single(t => t!["fullName"]!.GetValue<string>() == "Game.Toggle`1")!;
+        Assert.Equal(
+            new[] { "T" },
+            toggle["typeParameters"]!.AsArray().Select(p => p!.GetValue<string>()).ToArray());
+
+        JsonArray toggleFields = toggle["fields"]!.AsArray();
+        // Bare type parameter -> positional placeholder.
+        JsonNode data = toggleFields.Single(f => f!["name"]!.GetValue<string>() == "data")!;
+        Assert.Equal("!0", data["fieldTypeFullName"]!.GetValue<string>());
+        // Concrete member keeps its own type.
+        JsonNode enable = toggleFields.Single(f => f!["name"]!.GetValue<string>() == "enable")!;
+        Assert.Equal("System.Boolean", enable["fieldTypeFullName"]!.GetValue<string>());
+        // Nested generic keeps the placeholder inside the argument list.
+        JsonNode history = toggleFields.Single(f => f!["name"]!.GetValue<string>() == "history")!;
+        Assert.Equal(
+            "System.Collections.Generic.List`1[[!0]]",
+            history["fieldTypeFullName"]!.GetValue<string>());
+        Assert.Equal("!0", history["elementTypeFullName"]!.GetValue<string>());
+
+        // A closed instantiation used as a field keeps the assembly-qualified
+        // constructed name (byte-identical to the previous renderer).
+        JsonNode owner = types.Single(t => t!["fullName"]!.GetValue<string>() == "Game.Owner")!;
+        JsonNode toggleField = owner["fields"]!.AsArray()
+            .Single(f => f!["name"]!.GetValue<string>() == "toggle")!;
+        Assert.StartsWith(
+            "Game.Toggle`1[[System.Int32, ",
+            toggleField["fieldTypeFullName"]!.GetValue<string>());
+
+        // The open generic base is now registered (previously dropped because the
+        // base closure keyed it by its constructed name), and the derived type
+        // points at the constructed base.
+        JsonNode wrapperDef = types.Single(t => t!["fullName"]!.GetValue<string>() == "Game.Wrapper`1")!;
+        Assert.Equal(
+            new[] { "TValue" },
+            wrapperDef["typeParameters"]!.AsArray().Select(p => p!.GetValue<string>()).ToArray());
+        JsonNode payload = wrapperDef["fields"]!.AsArray()
+            .Single(f => f!["name"]!.GetValue<string>() == "payload")!;
+        Assert.True(payload["hasSerializeReference"]!.GetValue<bool>());
+        Assert.Equal("!0", payload["fieldTypeFullName"]!.GetValue<string>());
+        JsonNode wrapperInterface = wrapperDef["interfaces"]!.AsArray()
+            .Single(iface => iface!["fullName"]!.GetValue<string>().StartsWith("Game.IWrapper`1", StringComparison.Ordinal))!;
+        Assert.Equal(
+            "Game.IWrapper`1[[!0]]",
+            wrapperInterface["fullName"]!.GetValue<string>());
+
+        JsonNode concrete = types.Single(t => t!["fullName"]!.GetValue<string>() == "Game.ConcreteWrapper")!;
+        Assert.StartsWith(
+            "Game.Wrapper`1[[Game.IThing, ",
+            concrete["baseTypeFullName"]!.GetValue<string>());
+        Assert.Contains(
+            concrete["interfaces"]!.AsArray(),
+            iface => iface!["fullName"]!.GetValue<string>().StartsWith(
+                "Game.IWrapper`1[[Game.IThing, ",
+                StringComparison.Ordinal));
+    }
 }
