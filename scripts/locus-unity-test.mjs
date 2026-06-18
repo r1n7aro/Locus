@@ -72,11 +72,14 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite native-bridge --prepare-native --install-plugin
   bun run locus:test:unity:native -- --project F:\\Game
   bun run locus:test:unity:smoke -- --project F:\\Game
+  bun run locus:test:unity:release -- --project F:\\Game
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | execute | all
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | all
+                              hot-reload-release runs Release first, then switches to Debug at runtime and runs again
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
   --connect-timeout-ms <ms>   Unity launch/connect timeout, default 60000

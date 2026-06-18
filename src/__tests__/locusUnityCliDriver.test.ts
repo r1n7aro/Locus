@@ -18,6 +18,8 @@ describe("Locus Unity CLI driver", () => {
     expect(pkg).toContain("--no-progress-timeout-ms 20000");
     expect(pkg).toContain('"locus:test:unity:smoke"');
     expect(pkg).toContain("--suite connect,native-bridge,state-probe");
+    expect(pkg).toContain('"locus:test:unity:release"');
+    expect(pkg).toContain("--suite connect,hot-reload-release");
     expect(pkg).toContain('"locus:test:unity:full"');
     expect(pkg).toContain("--suite all --connect-timeout-ms 60000 --timeout-ms 1200000");
     expect(normalizedScript).toContain('"dev",\n  "--",\n  "--",\n  "--locus-driver"');
@@ -38,8 +40,9 @@ describe("Locus Unity CLI driver", () => {
     );
 
     expect(driver).toContain("ensure_connected");
-    expect(driver).toContain("unity_bridge::launch_project(project).await");
+    expect(driver).toContain("unity_bridge::launch_project_with_options(project, launch_code_optimization)");
     expect(driver).toContain('"processId": launch.process_id');
+    expect(driver).toContain('"codeOptimization": match launch_code_optimization');
     expect(driver).toContain("DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000");
     expect(driver).toContain("DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 20_000");
     expect(driver).toContain("--no-progress-timeout-ms");

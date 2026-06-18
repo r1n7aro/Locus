@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use crate::{
     unity_bridge::{
         self, PluginStatus, UnityConnectionStatus, UnityEditorProcessState,
-        UNITY_EDITOR_STATUS_EDITING,
+        UnityLaunchCodeOptimization, UNITY_EDITOR_STATUS_EDITING,
     },
     workspace::Workspace,
 };
@@ -48,6 +48,7 @@ pub enum CliDriverSuite {
     StateProbe,
     NativeBridge,
     HotReload,
+    HotReloadRelease,
     Execute,
 }
 
@@ -60,6 +61,7 @@ impl CliDriverSuite {
             CliDriverSuite::StateProbe => "state-probe",
             CliDriverSuite::NativeBridge => "native-bridge",
             CliDriverSuite::HotReload => "hot-reload",
+            CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::Execute => "execute",
         }
     }
@@ -72,6 +74,7 @@ impl CliDriverSuite {
             CliDriverSuite::StateProbe => Some("unity-state-probe-selftest"),
             CliDriverSuite::NativeBridge => Some("unity-native-bridge-selftest"),
             CliDriverSuite::HotReload => Some("unity-hotreload-selftest"),
+            CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
         }
@@ -245,6 +248,18 @@ impl UnityIntegrationTestRunRequest {
 impl CliDriverConfig {
     pub fn from_env_args() -> Option<Result<Self, String>> {
         Self::parse(std::env::args().skip(1).collect())
+    }
+
+    fn launch_code_optimization(&self) -> Option<UnityLaunchCodeOptimization> {
+        if self
+            .suites
+            .iter()
+            .any(|suite| matches!(suite, CliDriverSuite::HotReloadRelease))
+        {
+            Some(UnityLaunchCodeOptimization::Release)
+        } else {
+            None
+        }
     }
 
     fn parse(args: Vec<String>) -> Option<Result<Self, String>> {
@@ -464,6 +479,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
                 CliDriverSuite::StateProbe,
                 CliDriverSuite::NativeBridge,
                 CliDriverSuite::HotReload,
+                CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::Execute,
             ] {
                 if !suites.contains(&suite) {
@@ -479,11 +495,15 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         "state-probe" | "state_probe" | "state" => CliDriverSuite::StateProbe,
         "native-bridge" | "native_bridge" | "native" => CliDriverSuite::NativeBridge,
         "hot-reload" | "hot_reload" | "hotreload" | "hot" => CliDriverSuite::HotReload,
+        "hot-reload-release" | "hot_reload_release" | "hotrelease" | "hot-release"
+        | "hot_release" | "release-hot-reload" | "release_hot_reload" => {
+            CliDriverSuite::HotReloadRelease
+        }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, execute, or all.",
+            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, or all.",
             value
         ))
         }
@@ -501,8 +521,14 @@ pub fn spawn(app_handle: AppHandle, workspace: Arc<Workspace>, config: CliDriver
     tauri::async_runtime::spawn(async move {
         let _cancel_guard = cancel_tx;
         let sink = DriverEventSink::cli();
-        let exit_code =
-            match run_driver(app_handle.clone(), workspace, config, sink.clone(), cancel_rx).await
+        let exit_code = match run_driver(
+            app_handle.clone(),
+            workspace,
+            config,
+            sink.clone(),
+            cancel_rx,
+        )
+        .await
         {
             Ok(()) => 0,
             Err(error) => {
@@ -653,7 +679,8 @@ async fn run_driver(
                 run_sidecar_suite(&project, *suite, &sink).await?;
             }
             CliDriverSuite::TypeIndex => {
-                run_type_index_suite(&project, *suite, config.type_index_sample_mode, &sink).await?;
+                run_type_index_suite(&project, *suite, config.type_index_sample_mode, &sink)
+                    .await?;
             }
             CliDriverSuite::StateProbe => {
                 unity_bridge::set_state_probe_enabled(true);
@@ -697,31 +724,17 @@ async fn run_driver(
                     ));
                 }
             }
-            CliDriverSuite::HotReload => {
-                crate::csharp_compile::set_enabled(true).await;
-                crate::csharp_compile::warm_up_in_background();
-                crate::unity_hotreload::set_enabled(true);
-                if config.force_edit_mode {
-                    ensure_edit_mode(
-                        &project,
-                        config.connect_timeout,
-                        config.poll_interval,
-                        &sink,
-                        &mut cancel_rx,
-                    )
-                    .await?;
-                }
-                let summary = run_event_selftest(
+            CliDriverSuite::HotReload | CliDriverSuite::HotReloadRelease => {
+                run_hot_reload_suite(
                     &app_handle,
                     &project,
                     *suite,
-                    config.suite_timeout,
+                    &config,
                     &sink,
                     &mut cancel_rx,
-                    crate::unity_hotreload::selftest::run(app_handle.clone(), project.clone()),
+                    matches!(*suite, CliDriverSuite::HotReloadRelease),
                 )
                 .await?;
-                ensure_summary_passed(summary)?;
             }
             CliDriverSuite::Execute => {
                 // The execute suite drives the real unity_execute / unity_run_states
@@ -874,7 +887,10 @@ async fn ensure_connected(
                 UnityEditorProcessState::NotRunning
             )
         {
-            let launch = unity_bridge::launch_project(project).await?;
+            let launch_code_optimization = config.launch_code_optimization();
+            let launch =
+                unity_bridge::launch_project_with_options(project, launch_code_optimization)
+                    .await?;
             sink.emit(
                 "unity_launch",
                 json!({
@@ -882,6 +898,11 @@ async fn ensure_connected(
                     "projectPath": launch.project_path,
                     "projectVersion": launch.project_version,
                     "processId": launch.process_id,
+                    "codeOptimization": match launch_code_optimization {
+                        Some(UnityLaunchCodeOptimization::Debug) => "debug",
+                        Some(UnityLaunchCodeOptimization::Release) => "release",
+                        None => "default",
+                    },
                 }),
             );
             launched = true;
@@ -1134,15 +1155,14 @@ async fn run_type_index_suite(
             }),
         );
     };
-    let summary = match crate::unity_type_index_selftest::run(project, sample_mode, &mut on_progress)
-        .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            emit_suite_failure(sink, suite, &error);
-            return Err(error);
-        }
-    };
+    let summary =
+        match crate::unity_type_index_selftest::run(project, sample_mode, &mut on_progress).await {
+            Ok(summary) => summary,
+            Err(error) => {
+                emit_suite_failure(sink, suite, &error);
+                return Err(error);
+            }
+        };
     if summary.failed > 0 {
         for line in &summary.lines {
             sink.emit(
@@ -1287,7 +1307,10 @@ impl<'a> ExecuteSuiteRun<'a> {
             }
             Ok(output) => self.fail(
                 name,
-                format!("expected '{expect}' in output, got '{}'", clip(&output, 160)),
+                format!(
+                    "expected '{expect}' in output, got '{}'",
+                    clip(&output, 160)
+                ),
             ),
             Err(error) => self.fail(name, format!("execute error: {}", clip(&error, 200))),
         }
@@ -1386,7 +1409,10 @@ print("E7:done");"#;
                 } else if observed.api_regressions > 0 {
                     self.fail(
                         "E7 progress",
-                        format!("api progress revision regressed {}x", observed.api_regressions),
+                        format!(
+                            "api progress revision regressed {}x",
+                            observed.api_regressions
+                        ),
                     );
                 } else {
                     self.pass(
@@ -1402,7 +1428,10 @@ print("E7:done");"#;
                 "E7 progress",
                 format!("expected 'E7:done', got '{}'", clip(&output, 160)),
             ),
-            Err(error) => self.fail("E7 progress", format!("execute error: {}", clip(&error, 200))),
+            Err(error) => self.fail(
+                "E7 progress",
+                format!("execute error: {}", clip(&error, 200)),
+            ),
         }
     }
 
@@ -1547,7 +1576,9 @@ print("E7:done");"#;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let type_name = format!("LocusExecuteSelfTestSubject_{}", &token[..8]);
         let rel_dir = "Assets/LocusExecuteSelfTest";
-        let dir = Path::new(project).join("Assets").join("LocusExecuteSelfTest");
+        let dir = Path::new(project)
+            .join("Assets")
+            .join("LocusExecuteSelfTest");
         let file = dir.join(format!("{type_name}.cs"));
         let meta = dir.join(format!("{type_name}.cs.meta"));
 
@@ -1645,7 +1676,9 @@ print("E7:done");"#;
             tokio::time::sleep(config.poll_interval).await;
         }
         if cleaned {
-            self.line("E10 recompile: project restored (type removed, recompiled back)".to_string());
+            self.line(
+                "E10 recompile: project restored (type removed, recompiled back)".to_string(),
+            );
         } else {
             self.line(
                 "E10 recompile: WARNING test script removed but project may still be recompiling"
@@ -1719,8 +1752,13 @@ async fn run_execute_suite(
 
     // Baseline correctness: compile -> load -> run -> capture output, with both
     // UnityEngine and UnityEditor references resolving on the editor main thread.
-    run.check_marker(project, "E1 round-trip", r#"print("E1:" + (40 + 2));"#, "E1:42")
-        .await;
+    run.check_marker(
+        project,
+        "E1 round-trip",
+        r#"print("E1:" + (40 + 2));"#,
+        "E1:42",
+    )
+    .await;
     run.check_marker(
         project,
         "E2 unity-engine",
@@ -1788,6 +1826,212 @@ async fn run_execute_suite(
             "execute suite finished with {} failed check(s)",
             run.failed
         ))
+    }
+}
+
+async fn run_hot_reload_suite(
+    app_handle: &AppHandle,
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+    force_release: bool,
+) -> Result<(), String> {
+    crate::csharp_compile::set_enabled(true).await;
+    crate::csharp_compile::warm_up_in_background();
+    crate::unity_hotreload::set_enabled(true);
+
+    if force_release {
+        for desired in ["release", "debug"] {
+            run_hot_reload_selftest_once(
+                app_handle,
+                project,
+                suite,
+                config,
+                sink,
+                cancel_rx,
+                Some(desired),
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    } else {
+        run_hot_reload_selftest_once(
+            app_handle, project, suite, config, sink, cancel_rx, None, false,
+        )
+        .await
+    }
+}
+
+async fn run_hot_reload_selftest_once(
+    app_handle: &AppHandle,
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+    desired_code_optimization: Option<&'static str>,
+    force_set_code_optimization: bool,
+) -> Result<(), String> {
+    if config.force_edit_mode {
+        ensure_edit_mode(
+            project,
+            config.connect_timeout,
+            config.poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
+    }
+
+    if let Some(desired) = desired_code_optimization {
+        sink.emit(
+            "code_optimization",
+            json!({
+                "suite": suite.as_str(),
+                "action": "phase_start",
+                "desired": desired,
+            }),
+        );
+        ensure_code_optimization(
+            project,
+            suite,
+            desired,
+            config.connect_timeout,
+            config.poll_interval,
+            sink,
+            cancel_rx,
+            force_set_code_optimization,
+        )
+        .await?;
+    }
+
+    let summary = run_event_selftest(
+        app_handle,
+        project,
+        suite,
+        config.suite_timeout,
+        sink,
+        cancel_rx,
+        crate::unity_hotreload::selftest::run(app_handle.clone(), project.to_string()),
+    )
+    .await?;
+    ensure_summary_passed(summary)
+}
+
+async fn ensure_code_optimization(
+    project: &str,
+    suite: CliDriverSuite,
+    desired: &'static str,
+    timeout: Duration,
+    poll_interval: Duration,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+    force_set: bool,
+) -> Result<Option<String>, String> {
+    let (connected, before) =
+        crate::unity_hotreload::coordinator::detect_code_optimization(project).await;
+    sink.emit(
+        "code_optimization",
+        json!({
+            "suite": suite.as_str(),
+            "action": "probe",
+            "connected": connected,
+            "desired": desired,
+            "before": before,
+        }),
+    );
+
+    if before.as_deref() == Some(desired) && !force_set {
+        return Ok(before);
+    }
+
+    let reported =
+        crate::unity_hotreload::coordinator::set_code_optimization(project, desired).await?;
+    sink.emit(
+        "code_optimization",
+        json!({
+            "suite": suite.as_str(),
+            "action": "set",
+            "desired": desired,
+            "reported": reported,
+        }),
+    );
+
+    wait_for_code_optimization(
+        project,
+        suite,
+        desired,
+        timeout,
+        poll_interval,
+        sink,
+        cancel_rx,
+    )
+    .await?;
+    Ok(before)
+}
+
+async fn wait_for_code_optimization(
+    project: &str,
+    suite: CliDriverSuite,
+    desired: &'static str,
+    timeout: Duration,
+    poll_interval: Duration,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if *cancel_rx.borrow() {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+
+        let status = unity_bridge::query_unity_connection_status(project).await;
+        let (probe_connected, code_optimization) = if status.connected {
+            crate::unity_hotreload::coordinator::detect_code_optimization(project).await
+        } else {
+            (false, None)
+        };
+        if status.connected
+            && status.editor_status == UNITY_EDITOR_STATUS_EDITING
+            && probe_connected
+            && code_optimization.as_deref() == Some(desired)
+        {
+            sink.emit(
+                "code_optimization",
+                json!({
+                    "suite": suite.as_str(),
+                    "action": "ready",
+                    "desired": desired,
+                    "codeOptimization": code_optimization,
+                    "elapsedMs": started.elapsed().as_millis(),
+                }),
+            );
+            return Ok(());
+        }
+
+        let last_detail = format!(
+            "connected={} editorStatus={} probeConnected={} codeOptimization={}",
+            status.connected,
+            status.editor_status,
+            probe_connected,
+            code_optimization.as_deref().unwrap_or("unknown")
+        );
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "Unity Code Optimization did not reach {desired} within {}ms; last {last_detail}",
+                timeout.as_millis(),
+            ));
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = cancel_rx.changed() => {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+        }
     }
 }
 
@@ -1994,6 +2238,7 @@ fn emit_json<T: Serialize>(event: &str, payload: &T) {
 #[cfg(test)]
 mod tests {
     use super::{CliDriverConfig, CliDriverSuite};
+    use crate::unity_bridge::UnityLaunchCodeOptimization;
 
     fn parse(args: &[&str]) -> Option<Result<CliDriverConfig, String>> {
         CliDriverConfig::parse(args.iter().map(|arg| arg.to_string()).collect())
@@ -2055,18 +2300,53 @@ mod tests {
                 CliDriverSuite::StateProbe,
                 CliDriverSuite::NativeBridge,
                 CliDriverSuite::HotReload,
+                CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::Execute
             ]
         );
     }
 
     #[test]
-    fn parse_execute_suite_aliases() {
-        for alias in ["execute", "exec", "unity-execute", "execute-code", "run-states"] {
+    fn parse_hot_reload_release_suite_aliases() {
+        for alias in [
+            "hot-reload-release",
+            "hot_release",
+            "hot-release",
+            "release-hot-reload",
+        ] {
             let parsed = parse(&["--locus-unity-test", "--suite", alias])
                 .unwrap()
                 .unwrap();
-            assert_eq!(parsed.suites, vec![CliDriverSuite::Execute], "alias {alias}");
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::HotReloadRelease],
+                "alias {alias}"
+            );
+            assert_eq!(
+                parsed.launch_code_optimization(),
+                Some(UnityLaunchCodeOptimization::Release),
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_execute_suite_aliases() {
+        for alias in [
+            "execute",
+            "exec",
+            "unity-execute",
+            "execute-code",
+            "run-states",
+        ] {
+            let parsed = parse(&["--locus-unity-test", "--suite", alias])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::Execute],
+                "alias {alias}"
+            );
         }
     }
 }
