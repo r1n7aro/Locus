@@ -1,76 +1,79 @@
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import {
   unityHotReloadPreflight,
-  unityHotReloadSetCodeOptimizationDebug,
+  unityHotReloadSetCodeOptimization,
 } from "../services/csharpLsp";
 import { normalizeAppError } from "../services/errors";
 
 /**
- * Enable-time gate shared by both hot-reload toggles (the icon above the chat
- * input and the Settings switch). Hot patches only take effect when the Unity
- * editor's Code Optimization is Debug — Release inlines call sites past the
- * MonoMod redirect, so patches silently do nothing.
+ * Release-first hot reload (shared by the icon above the chat input and the
+ * Settings switch). Enabling NO LONGER blocks on the editor's Code
+ * Optimization: hot reload works in Release, where Mono inlines only some
+ * small methods — those converge via an automatic recompile instead of the
+ * live detour (see the Rust coordinator / Unity LocusBridge.HotReload).
  *
- * Before turning the feature on we probe the connected editor. On a positive
- * "release" we surface a modal; confirming switches the editor to Debug and
- * then runs the caller's `enable` step. When the editor is unreachable or the
- * value can't be read, we enable directly — the execution-time probe still
- * guards real hot reloads, so there is nothing to block on yet.
+ * We still read the connected editor's optimization so the UI can show an
+ * OPTIONAL, dismissible "switch to Debug" hint (Debug avoids the occasional
+ * convergence recompile), mirroring the reference plugin's suggestion rather
+ * than the old hard gate.
  *
- * `enable` is the caller's own "turn it on" routine (it owns the
- * `unityHotReloadSetEnabled(true)` call and its component's status/error
- * state), so each call site keeps its existing behaviour and only the gate is
- * shared.
+ * `enable` is the caller's own "turn it on" routine; it runs unconditionally.
  */
 export function useHotReloadDebugGuard(enable: () => Promise<void>) {
-  const promptVisible = ref(false);
-  const adjusting = ref(false);
-  const adjustError = ref("");
+  const codeOptimization = ref<string | null>(null);
+  const switching = ref(false);
+  const switchError = ref("");
 
-  async function guardedEnable() {
-    let codeOptimization: string | null = null;
+  // Only a positively-read "release" shows the hint; unknown (editor down /
+  // old plugin) stays quiet, exactly as the execution path does.
+  const isRelease = computed(() => codeOptimization.value === "release");
+
+  async function refreshOptimization() {
     try {
-      codeOptimization = (await unityHotReloadPreflight()).codeOptimization;
+      codeOptimization.value = (await unityHotReloadPreflight()).codeOptimization;
     } catch {
-      // Can't tell (editor down, command failed) → don't block; the
-      // execution-time probe gates the actual hot reload.
-      codeOptimization = null;
+      codeOptimization.value = null;
     }
-    if (codeOptimization === "release") {
-      adjustError.value = "";
-      promptVisible.value = true;
-      return;
-    }
+  }
+
+  async function enableHotReload() {
     await enable();
+    // Refresh the hint in the background once it's on (non-blocking).
+    void refreshOptimization();
   }
 
-  async function confirmAdjust() {
-    if (adjusting.value) return;
-    adjusting.value = true;
-    adjustError.value = "";
+  /** Switch the connected editor to an explicit Code Optimization level.
+   * Triggers a Unity recompile; on failure we re-read the real state. */
+  async function setOptimization(level: "debug" | "release") {
+    if (switching.value) return;
+    switching.value = true;
+    switchError.value = "";
     try {
-      await unityHotReloadSetCodeOptimizationDebug();
-      promptVisible.value = false;
-      await enable();
+      const result = await unityHotReloadSetCodeOptimization(level);
+      codeOptimization.value = result.codeOptimization;
     } catch (error) {
-      adjustError.value = normalizeAppError(error).message;
+      switchError.value = normalizeAppError(error).message;
+      // The switch may have partially landed (e.g. a recompile interrupted the
+      // probe) — re-read so the UI reflects the editor's actual level.
+      void refreshOptimization();
     } finally {
-      adjusting.value = false;
+      switching.value = false;
     }
   }
 
-  function cancelAdjust() {
-    if (adjusting.value) return;
-    promptVisible.value = false;
-    adjustError.value = "";
+  // Back-compat: the Settings switch still offers a one-shot "switch to Debug".
+  async function switchToDebug() {
+    await setOptimization("debug");
   }
 
   return {
-    promptVisible,
-    adjusting,
-    adjustError,
-    guardedEnable,
-    confirmAdjust,
-    cancelAdjust,
+    codeOptimization,
+    isRelease,
+    switching,
+    switchError,
+    refreshOptimization,
+    enableHotReload,
+    setOptimization,
+    switchToDebug,
   };
 }

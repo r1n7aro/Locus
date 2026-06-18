@@ -5,7 +5,6 @@ import { useCopyFeedback } from "../../composables/useCopyFeedback";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
-import HotReloadDebugModal from "../HotReloadDebugModal.vue";
 import {
   subscribeUnityHotReloadSelfTest,
   subscribeUnitySidecarCompilerStatus,
@@ -132,15 +131,16 @@ async function applyHotReloadEnabled(value: boolean) {
   }
 }
 
-// Enabling routes through the Debug-mode gate (detect Code Optimization →
-// prompt → auto-switch → enable); disabling is unconditional.
+// Release-first: enabling no longer blocks on Code Optimization. Hot reload
+// works in Release (methods Unity inlines converge via recompile); we surface
+// the editor's optimization only as an optional "switch to Debug" hint.
 const {
-  promptVisible: hotReloadDebugPromptVisible,
-  adjusting: hotReloadDebugAdjusting,
-  adjustError: hotReloadDebugError,
-  guardedEnable: hotReloadGuardedEnable,
-  confirmAdjust: hotReloadConfirmAdjust,
-  cancelAdjust: hotReloadCancelAdjust,
+  isRelease: hotReloadIsRelease,
+  switching: hotReloadSwitching,
+  switchError: hotReloadSwitchError,
+  refreshOptimization: refreshHotReloadOptimization,
+  enableHotReload: hotReloadEnable,
+  switchToDebug: hotReloadSwitchToDebug,
 } = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
 
 async function toggleHotReloadEnabled() {
@@ -148,7 +148,7 @@ async function toggleHotReloadEnabled() {
   if (hotReloadEnabled.value) {
     await applyHotReloadEnabled(false);
   } else {
-    await hotReloadGuardedEnable();
+    await hotReloadEnable();
   }
 }
 
@@ -191,6 +191,7 @@ async function copyHotReloadSelfTestLog() {
 
 onMounted(() => {
   void refreshSidecarStatus();
+  void refreshHotReloadOptimization();
   void subscribeUnitySidecarCompilerStatus((payload) => {
     sidecarStatus.value = payload;
     sidecarReady.value = true;
@@ -258,13 +259,29 @@ onUnmounted(() => {
           <span v-if="!sidecarEnabled" class="tool-desc tool-dep">
             {{ t("settings.codeAnalysis.hotReloadDepSidecar") }}
           </span>
-          <span class="tool-desc tool-dep">{{ t("settings.codeAnalysis.hotReloadDepDebug") }}</span>
+          <template v-if="hotReloadEnabled && hotReloadIsRelease">
+            <span class="tool-desc tool-dep">
+              {{ t("settings.codeAnalysis.hotReloadReleaseHint") }}
+            </span>
+            <div class="hotreload-switch-row">
+              <BaseButton :disabled="hotReloadSwitching" @click="hotReloadSwitchToDebug">
+                {{
+                  hotReloadSwitching
+                    ? t("settings.codeAnalysis.hotReloadSwitching")
+                    : t("settings.codeAnalysis.hotReloadSwitchToDebug")
+                }}
+              </BaseButton>
+              <span v-if="hotReloadSwitchError" class="tool-desc status-error">
+                {{ hotReloadSwitchError }}
+              </span>
+            </div>
+          </template>
         </div>
         <div class="master-actions">
           <BaseSwitch
             v-if="sidecarReady"
             :model-value="hotReloadEnabled"
-            :disabled="hotReloadBusy || !sidecarEnabled || hotReloadDebugPromptVisible"
+            :disabled="hotReloadBusy || !sidecarEnabled"
             :aria-label="t('settings.codeAnalysis.hotReloadLabel')"
             @update:model-value="toggleHotReloadEnabled"
           />
@@ -307,13 +324,6 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
-    <HotReloadDebugModal
-      :visible="hotReloadDebugPromptVisible"
-      :adjusting="hotReloadDebugAdjusting"
-      :error="hotReloadDebugError"
-      @confirm="hotReloadConfirmAdjust"
-      @cancel="hotReloadCancelAdjust"
-    />
   </div>
 </template>
 
@@ -360,6 +370,12 @@ onUnmounted(() => {
 }
 .tool-dep {
   color: var(--status-warning-fg, var(--text-secondary));
+}
+.hotreload-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
 }
 .status-error {
   color: var(--status-danger-fg);

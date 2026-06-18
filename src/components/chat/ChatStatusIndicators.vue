@@ -41,7 +41,7 @@ import type {
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
-import HotReloadDebugModal from "../HotReloadDebugModal.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
@@ -1128,6 +1128,12 @@ const hotReloadRows = computed<StatusDetailRow[]>(() => {
     return rows;
   }
   rows.push({ label: t("chat.status.detail.status"), value: hotReloadSummary.value });
+  if (hotReloadIsRelease.value) {
+    rows.push({
+      label: t("chat.status.hotReload.rows.release"),
+      value: t("chat.status.hotReload.releaseHint"),
+    });
+  }
   rows.push({
     label: t("chat.status.hotReload.rows.compiler"),
     value: hotReloadCompilerLabel(status),
@@ -1302,23 +1308,80 @@ async function applyHotReloadEnabled(value: boolean) {
   }
 }
 
-// Enabling routes through the Debug-mode gate (detect Code Optimization →
-// prompt → auto-switch → enable); disabling is unconditional.
+// Release-first: enabling no longer blocks on Code Optimization. Hot reload
+// works in Release (methods Unity inlines converge via recompile); the
+// editor's optimization is surfaced only as an optional hint row.
 const {
-  promptVisible: hotReloadDebugPromptVisible,
-  adjusting: hotReloadDebugAdjusting,
-  adjustError: hotReloadDebugError,
-  guardedEnable: hotReloadGuardedEnable,
-  confirmAdjust: hotReloadConfirmAdjust,
-  cancelAdjust: hotReloadCancelAdjust,
+  isRelease: hotReloadIsRelease,
+  codeOptimization: hotReloadCodeOptimization,
+  switching: hotReloadOptimizationSwitching,
+  switchError: hotReloadOptimizationError,
+  refreshOptimization: refreshHotReloadOptimization,
+  enableHotReload: hotReloadEnable,
+  setOptimization: setHotReloadOptimization,
 } = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
+
+// Code Optimization selector (hot-reload popover). Debug keeps every method
+// hot-reloadable; Release runs faster but inlines small methods, whose edits
+// converge via recompile. The option hints explain the trade-off to the user.
+const codeOptimizationOptions = computed<DropdownOption[]>(() => {
+  const busy = hotReloadOptimizationSwitching.value;
+  return [
+    {
+      value: "debug",
+      label: t("chat.status.hotReload.codeOpt.debug"),
+      hint: t("chat.status.hotReload.codeOpt.debugHint"),
+      disabled: busy,
+    },
+    {
+      value: "release",
+      label: t("chat.status.hotReload.codeOpt.release"),
+      hint: t("chat.status.hotReload.codeOpt.releaseHint"),
+      disabled: busy,
+    },
+  ];
+});
+
+const codeOptimizationModel = computed(() => hotReloadCodeOptimization.value ?? "");
+
+// The editor's level is only knowable while it answers the probe. Disable (and
+// show a placeholder) when it's unreadable or a switch/recompile is in flight.
+const codeOptimizationKnown = computed(() =>
+  !!props.unityConnected && hotReloadCodeOptimization.value != null,
+);
+
+const codeOptimizationDisabled = computed(() =>
+  hotReloadOptimizationSwitching.value
+  || hotReloadBusy.value
+  || !codeOptimizationKnown.value,
+);
+
+const codeOptimizationSelectedLabel = computed(() => {
+  if (hotReloadOptimizationSwitching.value) {
+    return t("chat.status.hotReload.codeOpt.switching");
+  }
+  if (!codeOptimizationKnown.value) return t("chat.status.hotReload.codeOpt.unknown");
+  return "";
+});
+
+const codeOptimizationLabel = computed(() => t("chat.status.hotReload.codeOpt.label"));
+const codeOptimizationAriaLabel = computed(() => t("chat.status.hotReload.codeOpt.ariaLabel"));
+
+async function applyCodeOptimization(level: string) {
+  if (level !== "debug" && level !== "release") return;
+  if (level === hotReloadCodeOptimization.value) return;
+  await setHotReloadOptimization(level);
+  // Keep the rest of the hot-reload panel (status rows, tone) in sync with the
+  // recompile the switch just triggered.
+  await refreshHotReloadStatus();
+}
 
 async function setHotReloadEnabled(value: boolean) {
   if (hotReloadPending.value) return;
   if (hotReloadStatus.value && hotReloadStatus.value.hotReloadEnabled === value) return;
   if (!hotReloadCanToggle.value) return;
   if (value) {
-    await hotReloadGuardedEnable();
+    await hotReloadEnable();
   } else {
     await applyHotReloadEnabled(false);
   }
@@ -1440,6 +1503,7 @@ function togglePopover(id: StatusId) {
   }
   if (activePopover.value === "hotReload") {
     void refreshHotReloadStatus();
+    void refreshHotReloadOptimization();
   }
   if (activePopover.value === "unity") {
     void refreshUnitySemanticState();
@@ -1713,6 +1777,23 @@ onUnmounted(() => {
           :options="activeItem.modeOptions"
           @update:model-value="applySegmentedMode(activeItem.id, $event)"
         />
+        <div v-if="activeItem.id === 'hotReload'" class="chat-status-codeopt">
+          <span class="chat-status-codeopt-label">{{ codeOptimizationLabel }}</span>
+          <BaseDropdown
+            class="chat-status-codeopt-dropdown"
+            size="sm"
+            menu-align="start"
+            :model-value="codeOptimizationModel"
+            :options="codeOptimizationOptions"
+            :selected-label="codeOptimizationSelectedLabel"
+            :disabled="codeOptimizationDisabled"
+            :aria-label="codeOptimizationAriaLabel"
+            @update:model-value="applyCodeOptimization"
+          />
+          <span v-if="hotReloadOptimizationError" class="chat-status-codeopt-error">
+            {{ hotReloadOptimizationError }}
+          </span>
+        </div>
         <dl v-if="activeMainRows.length > 0" class="chat-status-detail-list">
           <template v-for="row in activeMainRows" :key="`${row.label}:${row.value}`">
             <dt :class="{ 'is-primary': row.tier === 'primary' }">{{ row.label }}</dt>
@@ -1730,13 +1811,6 @@ onUnmounted(() => {
         </details>
       </div>
     </Transition>
-    <HotReloadDebugModal
-      :visible="hotReloadDebugPromptVisible"
-      :adjusting="hotReloadDebugAdjusting"
-      :error="hotReloadDebugError"
-      @confirm="hotReloadConfirmAdjust"
-      @cancel="hotReloadCancelAdjust"
-    />
   </div>
 </template>
 
@@ -1909,6 +1983,43 @@ onUnmounted(() => {
 .chat-status-mode :deep(.base-segmented-item) {
   flex: 1 1 0;
   padding: 0 8px;
+}
+
+.chat-status-codeopt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chat-status-codeopt-label {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.chat-status-codeopt-dropdown {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Roomier option rows for the mode descriptions (scoped to this dropdown). */
+.chat-status-codeopt-dropdown :deep(.base-dropdown-item) {
+  gap: 4px;
+  padding-top: 9px;
+  padding-bottom: 9px;
+}
+
+.chat-status-codeopt-dropdown :deep(.base-dropdown-item-hint) {
+  line-height: 1.6;
+}
+
+.chat-status-codeopt-error {
+  flex-basis: 100%;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--status-danger-fg);
+  overflow-wrap: anywhere;
 }
 
 .chat-status-detail-list {

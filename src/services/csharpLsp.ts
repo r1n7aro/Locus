@@ -108,6 +108,23 @@ export function unityHotReloadSetCodeOptimizationDebug(): Promise<CodeOptimizati
   );
 }
 
+/** Switch the connected editor's Code Optimization to an explicit level
+ * ("debug" | "release"), from the hot-reload popover dropdown. Triggers a
+ * Unity recompile. */
+export function unityHotReloadSetCodeOptimization(
+  level: "debug" | "release",
+): Promise<CodeOptimizationResult> {
+  return ipcInvoke<CodeOptimizationResult>(
+    "unity_hot_reload_set_code_optimization",
+    { level },
+    {
+      operation: "unityHotReloadSetCodeOptimization",
+      notify: false,
+      throwOnError: true,
+    },
+  );
+}
+
 export function unityRecompileRun(): Promise<string> {
   return ipcInvoke<string>("unity_recompile_run", undefined, {
     operation: "unityRecompileRun",
