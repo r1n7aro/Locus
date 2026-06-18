@@ -364,7 +364,10 @@ async fn is_pending_edit_unapplied(edit: &PendingEdit) -> bool {
 }
 
 pub async fn unapplied_change_count() -> u64 {
-    let active = active_project().lock().ok().and_then(|active| active.clone());
+    let active = active_project()
+        .lock()
+        .ok()
+        .and_then(|active| active.clone());
     let snapshot: Vec<PendingEdit> = {
         let projects = projects().lock().await;
         match active.as_deref() {
@@ -721,7 +724,9 @@ pub async fn observe_reload_state(
     let decision = {
         let projects = projects().lock().await;
         let state = projects.get(&project_key(project_path));
-        let survived_exit = state.map(|state| state.pending_survived_exit).unwrap_or(false);
+        let survived_exit = state
+            .map(|state| state.pending_survived_exit)
+            .unwrap_or(false);
         classify_reload(
             state.and_then(|state| state.last_session_id.as_deref()),
             state.and_then(|state| state.last_domain_generation.as_deref()),
@@ -781,8 +786,7 @@ pub async fn on_editor_exited(project_path: &str) {
         // recompile will load them, so the next new-session sample converges on
         // a moved serial (serial > 0) rather than stranding a stale count. A
         // failed startup compile leaves serial 0, so they correctly stay pending.
-        state.pending_survived_exit =
-            !state.pending.is_empty() || !state.cold_paths.is_empty();
+        state.pending_survived_exit = !state.pending.is_empty() || !state.cold_paths.is_empty();
         state.last_session_id = None;
         state.last_domain_generation = None;
         state.last_converged_serial = None;
@@ -903,13 +907,11 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
     let probe: HotReloadProbeResponse = serde_json::from_str(&message)
         .map_err(|error| format!("Unity probe response parse failed: {error}"))?;
 
-    if probe.code_optimization != "debug" {
-        return Err(
-            "Hot reload requires Unity Editor Code Optimization = Debug (currently Release; \
-             switch it in the Unity status bar or Preferences > General), or use unity_recompile."
-                .to_string(),
-        );
-    }
+    // Code Optimization is informational now (Release-first). The editor may be
+    // in Release, where Mono inlines some small methods past the detour; the
+    // apply path detects those per method and converges them with a recompile,
+    // so the probe no longer blocks on Release. The detour self-test below is
+    // the real capability gate.
     if !probe.detour_ok {
         return Err(format!(
             "The detour engine self-test failed in this editor ({}); use unity_recompile.",
@@ -962,14 +964,24 @@ pub async fn detect_code_optimization(project_path: &str) -> (bool, Option<Strin
     }
 }
 
-/// Switch the connected editor to Code Optimization = Debug (the toggle-time
-/// auto-fix the user confirmed). Triggers a script recompile in Unity, exactly
-/// like flipping the status-bar bug icon. Returns the resulting value.
-pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
+fn normalize_code_optimization(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "debug" => Some("debug"),
+        "release" => Some("release"),
+        _ => None,
+    }
+}
+
+async fn send_code_optimization_request(
+    project_path: &str,
+    message_type: &str,
+    payload: &str,
+    desired: &str,
+) -> Result<String, String> {
     let resp = crate::unity_bridge::send_message_with_timeout(
         project_path,
-        "hot_reload_set_debug",
-        "",
+        message_type,
+        payload,
         std::time::Duration::from_secs(15),
     )
     .await
@@ -981,16 +993,18 @@ pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, S
         let error = resp
             .error
             .unwrap_or_else(|| "Unity rejected the Code Optimization change".to_string());
+        if error == "domain_reload_interrupted" {
+            return Ok(desired.to_string());
+        }
         if error.starts_with("unknown message type") {
-            return Err(
+            return Err(format!(
                 "The Unity plugin in this project predates the Code Optimization auto-switch. \
                  Update the Locus plugin (reopen the project from Locus), or set Code \
-                 Optimization to Debug yourself from the Unity status bar."
-                    .to_string(),
-            );
+                 Optimization to {desired} yourself from the Unity status bar."
+            ));
         }
         return Err(format!(
-            "Unity could not switch Code Optimization to Debug: {error}"
+            "Unity could not switch Code Optimization to {desired}: {error}"
         ));
     }
 
@@ -998,10 +1012,38 @@ pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, S
     let parsed: HotReloadProbeResponse = serde_json::from_str(&message)
         .map_err(|error| format!("Code Optimization response parse failed: {error}"))?;
     Ok(if parsed.code_optimization.is_empty() {
-        "debug".to_string()
+        desired.to_string()
     } else {
         parsed.code_optimization
     })
+}
+
+/// Switch the connected editor to the requested Code Optimization. Triggers a
+/// script recompile in Unity, exactly like flipping the status-bar bug icon.
+/// Returns the resulting value reported by Unity.
+pub async fn set_code_optimization(project_path: &str, desired: &str) -> Result<String, String> {
+    let desired = normalize_code_optimization(desired)
+        .ok_or_else(|| "Code Optimization must be 'debug' or 'release'".to_string())?;
+    match send_code_optimization_request(
+        project_path,
+        "hot_reload_set_code_optimization",
+        desired,
+        desired,
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(error) if desired == "debug" && error.contains("predates") => {
+            send_code_optimization_request(project_path, "hot_reload_set_debug", "", desired).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Switch the connected editor to Code Optimization = Debug (the optional
+/// toggle-time auto-fix the user confirmed).
+pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
+    set_code_optimization(project_path, "debug").await
 }
 
 // ── access probe (C0 runtime capability matrix) ─────────────────────
@@ -1419,6 +1461,7 @@ pub async fn hot_reload(
                     "patch_declaring_type": m.patch_declaring_type,
                     "name": m.name,
                     "param_type_names": m.param_type_names,
+                    "param_type_sigs": m.param_type_sigs,
                     "is_static": m.is_static,
                     "is_ctor": m.is_ctor,
                     // Older plugins ignore the unknown field and then fail
@@ -1502,17 +1545,32 @@ pub async fn hot_reload(
             // H6: arm the convergence scheduler (threshold / idle / play exit).
             super::note_patch_applied(project_path);
 
-            let engine = resp
+            // Typed parse of the Unity apply response: the detour engine used,
+            // plus any original methods Unity inlined in Release. Inlined
+            // methods get a live detour, but their inlined call sites bypass it,
+            // so they need a recompile to converge (handled just below).
+            #[derive(serde::Deserialize, Default)]
+            #[serde(default)]
+            struct HotPatchLoadedResponse {
+                detour_engine: String,
+                inlined_method_keys: Vec<String>,
+            }
+            let loaded = resp
                 .message
                 .as_deref()
-                .and_then(|message| serde_json::from_str::<serde_json::Value>(message).ok())
-                .and_then(|value| {
-                    value
-                        .get("detour_engine")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
+                .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
                 .unwrap_or_default();
+            let engine = loaded.detour_engine;
+            let inlined_method_keys = loaded.inlined_method_keys;
+
+            // Route inlined methods to the same convergence path Locus uses for
+            // any non-hot-safe change, so a silent recompile bakes them in. The
+            // per-method DTO carries no source file, so queue the whole batch
+            // (coarse but correct — convergence clears it either way).
+            if !inlined_method_keys.is_empty() {
+                let queued = queue_cold_paths(project_path, &changed_keys).await;
+                super::set_cold_queue_depth(queued as u64);
+            }
 
             let stub_count = methods.iter().filter(|m| m.is_stub).count();
             let mut summary = format!(
@@ -1543,11 +1601,46 @@ pub async fn hot_reload(
                     ".\nSidecar image registration failed: {error}. Run unity_recompile before the next hot reload."
                 ));
             }
-            summary.push_str(
-                ".\nChanges are live in the running Editor — no recompile, no domain reload, \
-                 state preserved. The files are on disk, so the next unity_recompile or domain \
-                 reload makes them permanent automatically.",
-            );
+            if inlined_method_keys.is_empty() {
+                summary.push_str(
+                    ".\nChanges are live in the running Editor — no recompile, no domain reload, \
+                     state preserved. The files are on disk, so the next unity_recompile or domain \
+                     reload makes them permanent automatically.",
+                );
+            } else {
+                // Release-first honesty: Mono inlined some originals, so the detour
+                // is bypassed at their inlined call sites and those edits are NOT
+                // live yet. Report tersely — names + the one action that matters.
+                // (Keep the exact phrase "inlined in Release"; the self-test keys on it.)
+                let names: Vec<String> = inlined_method_keys
+                    .iter()
+                    .map(|key| {
+                        let mut parts = key.split('|');
+                        match (parts.next(), parts.next()) {
+                            (Some(ty), Some(name)) if !name.is_empty() => format!("{ty}.{name}"),
+                            (Some(ty), _) => ty.to_string(),
+                            _ => key.clone(),
+                        }
+                    })
+                    .collect();
+                let playing = {
+                    let (connected, status, _) =
+                        crate::unity_bridge::query_unity_status(project_path).await;
+                    connected && crate::unity_bridge::is_play_mode_status(status)
+                };
+                let action = if playing {
+                    "exit Play Mode or run unity_recompile (exit reloads the domain, dropping \
+                     play-mode state), or switch Code Optimization to Debug"
+                } else {
+                    "run unity_recompile, or switch Code Optimization to Debug"
+                };
+                summary.push_str(&format!(
+                    ".\n{} method(s) inlined in Release — NOT live yet: {}. To apply: {}.",
+                    names.len(),
+                    names.join(", "),
+                    action,
+                ));
+            }
 
             // TI-C: layer new public top-level types into the cached type
             // index so auto-usings resolve them immediately.
@@ -1765,7 +1858,10 @@ mod tests {
     fn classify_reload_distinguishes_compile_from_bare_reload() {
         use ReloadDecision::*;
         // First sample: seed only (pending may be uncompiled — never clear).
-        assert_eq!(classify_reload(None, None, None, "s1", "g1", 0, false), Seed);
+        assert_eq!(
+            classify_reload(None, None, None, "s1", "g1", 0, false),
+            Seed
+        );
         // Nothing moved (steady state / transient pipe blip).
         assert_eq!(
             classify_reload(Some("s1"), Some("g1"), Some(0), "s1", "g1", 0, false),
@@ -1807,7 +1903,10 @@ mod tests {
         // First sample with no baseline only seeds, even if the serial looks
         // advanced — documents the race the monitor avoids by seeding a baseline
         // on connect before any edit can be the first sample.
-        assert_eq!(classify_reload(None, None, None, "s1", "g2", 5, false), Seed);
+        assert_eq!(
+            classify_reload(None, None, None, "s1", "g2", 5, false),
+            Seed
+        );
 
         // ── Edits that survived the previous editor's exit ──
         // Relaunch's startup recompile loaded them (serial advanced past 0):

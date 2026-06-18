@@ -399,6 +399,11 @@ pub struct HotPatchMethod {
     pub name: String,
     #[serde(default)]
     pub param_type_names: Vec<String>,
+    /// Enriched per-parameter identity (namespace + closed generic arguments)
+    /// parallel to `param_type_names`; used by Unity only to disambiguate
+    /// overloads that share simple names. Empty for older sidecars.
+    #[serde(default)]
+    pub param_type_sigs: Vec<String>,
     #[serde(default)]
     pub is_static: bool,
     #[serde(default)]

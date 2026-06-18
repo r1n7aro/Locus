@@ -151,6 +151,30 @@ pub async fn unity_hot_reload_set_code_optimization_debug(
     Ok(CodeOptimizationResult { code_optimization })
 }
 
+/// Switch the connected editor's Code Optimization to an explicit level
+/// ("debug" | "release"), driven by the hot-reload popover dropdown. Triggers a
+/// Unity script recompile, exactly like flipping the Editor's status-bar icon.
+#[tauri::command]
+pub async fn unity_hot_reload_set_code_optimization(
+    level: String,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<CodeOptimizationResult, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    let code_optimization =
+        crate::unity_hotreload::coordinator::set_code_optimization(&cwd, &level)
+            .await
+            .map_err(|error| {
+                AppError::new("unity_hotreload.set_code_optimization_failed", error)
+            })?;
+    Ok(CodeOptimizationResult { code_optimization })
+}
+
 #[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,

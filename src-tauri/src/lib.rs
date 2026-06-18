@@ -1326,6 +1326,7 @@ pub fn run() {
             commands::unity_hot_reload_access_probe_run,
             commands::unity_hot_reload_preflight,
             commands::unity_hot_reload_set_code_optimization_debug,
+            commands::unity_hot_reload_set_code_optimization,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

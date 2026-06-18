@@ -631,8 +631,7 @@ pub(crate) async fn send_message_with_transient_retry(
     let mut attempt = 1;
     loop {
         let resp = send_message_with_timeout(project_path, msg_type, message, timeout).await?;
-        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
-        else {
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned) else {
             return Ok(resp);
         };
         if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
@@ -651,8 +650,7 @@ async fn send_message_without_timeout_with_transient_retry(
     let mut attempt = 1;
     loop {
         let resp = send_message_without_timeout(project_path, msg_type, message).await?;
-        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
-        else {
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned) else {
             return Ok(resp);
         };
         if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
@@ -1110,7 +1108,20 @@ fn normalized_project_path_for_launch(project_path: &str) -> PathBuf {
     dunce::canonicalize(trimmed).unwrap_or_else(|_| Path::new(trimmed).to_path_buf())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnityLaunchCodeOptimization {
+    Debug,
+    Release,
+}
+
 pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
+    launch_project_with_options(project_path, None).await
+}
+
+pub async fn launch_project_with_options(
+    project_path: &str,
+    code_optimization: Option<UnityLaunchCodeOptimization>,
+) -> Result<UnityLaunchResult, String> {
     if !is_unity_project(project_path) {
         return Err("Current working directory is not a Unity project".to_string());
     }
@@ -1127,6 +1138,15 @@ pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, Str
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    match code_optimization {
+        Some(UnityLaunchCodeOptimization::Debug) => {
+            command.arg("-debugCodeOptimization");
+        }
+        Some(UnityLaunchCodeOptimization::Release) => {
+            command.arg("-releaseCodeOptimization");
+        }
+        None => {}
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -4269,14 +4289,10 @@ struct ReloadStateMessage {
 /// mid-reload, a plugin predating the message) returns None and the caller
 /// retries on the next poll.
 async fn fetch_reload_state(project_path: &str) -> Option<(String, String, i64)> {
-    let resp = send_message_with_timeout(
-        project_path,
-        "get_reload_state",
-        "",
-        Duration::from_secs(4),
-    )
-    .await
-    .ok()?;
+    let resp =
+        send_message_with_timeout(project_path, "get_reload_state", "", Duration::from_secs(4))
+            .await
+            .ok()?;
     if !resp.ok {
         return None;
     }
