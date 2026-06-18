@@ -844,6 +844,7 @@ public sealed class CompileService
                     ["patchDeclaringType"] = map.PatchDeclaringType,
                     ["name"] = map.Name,
                     ["paramTypeNames"] = new JsonArray(map.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
+                    ["paramTypeSigs"] = new JsonArray(map.ParamTypeSigs.Select(p => (JsonNode)p).ToArray()),
                     ["isStatic"] = map.IsStatic,
                     ["isCtor"] = map.IsCtor,
                 };

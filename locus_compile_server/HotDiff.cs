@@ -18,6 +18,13 @@ public sealed class HotDiffMethod
     /// <summary>Reflection simple type names per parameter ("Int32", "String[]", "List`1", "Int32&" for ref/out/in).</summary>
     public string[] ParamTypeNames = Array.Empty<string>();
 
+    /// <summary>Per-parameter enriched identity tokens parallel to
+    /// <see cref="ParamTypeNames"/>: the type namespace as written in source
+    /// plus closed generic arguments. Used only to disambiguate overloads that
+    /// collapse to the same simple names (distinct parameter namespace or
+    /// generic argument). Defaults to the simple names when nothing enriches.</summary>
+    public string[] ParamTypeSigs = Array.Empty<string>();
+
     public bool IsStatic;
     public bool IsCtor;
 
@@ -576,7 +583,8 @@ public static class HotDiff
             else
             {
                 foreach (ConstructorDeclarationSyntax ctor in ctors)
-                    AddMethod(result, metadataName, ".ctor", ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true, added: false);
+                    AddMethod(result, metadataName, ".ctor", ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true, added: false,
+                        paramTypeSigs: ParamTypeSigs(ctor.ParameterList));
             }
             patched = true;
         }
@@ -2126,7 +2134,8 @@ public static class HotDiff
                 }
                 AddMethod(
                     result, metadataName, newMethod.Identifier.Text, ParamTypeNames(newMethod.ParameterList),
-                    newMethod.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: false);
+                    newMethod.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newMethod.ParameterList));
                 return true;
             }
 
@@ -2154,7 +2163,8 @@ public static class HotDiff
                 }
                 AddMethod(
                     result, metadataName, ".ctor", ParamTypeNames(newCtor.ParameterList),
-                    isStatic: false, isCtor: true, added: false);
+                    isStatic: false, isCtor: true, added: false,
+                    paramTypeSigs: ParamTypeSigs(newCtor.ParameterList));
                 return true;
             }
 
@@ -2188,7 +2198,8 @@ public static class HotDiff
                     result.Reasons.Add("unsupported operator changed: " + metadataName + ".operator" + newOp.OperatorToken.Text);
                     return false;
                 }
-                AddMethod(result, metadataName, opName, ParamTypeNames(newOp.ParameterList), isStatic: true, isCtor: false, added: false);
+                AddMethod(result, metadataName, opName, ParamTypeNames(newOp.ParameterList), isStatic: true, isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newOp.ParameterList));
                 return true;
             }
 
@@ -2220,7 +2231,8 @@ public static class HotDiff
                 string convName = newConv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword)
                     ? "op_Implicit"
                     : "op_Explicit";
-                AddMethod(result, metadataName, convName, ParamTypeNames(newConv.ParameterList), isStatic: true, isCtor: false, added: false);
+                AddMethod(result, metadataName, convName, ParamTypeNames(newConv.ParameterList), isStatic: true, isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newConv.ParameterList));
                 return true;
             }
 
@@ -2452,13 +2464,15 @@ public static class HotDiff
         bool isStatic,
         bool isCtor,
         bool added,
-        int typeParameterCount = 0)
+        int typeParameterCount = 0,
+        string[]? paramTypeSigs = null)
     {
         result.ChangedMethods.Add(new HotDiffMethod
         {
             DeclaringType = declaringType,
             Name = name,
             ParamTypeNames = paramTypeNames,
+            ParamTypeSigs = paramTypeSigs ?? paramTypeNames,
             IsStatic = isStatic,
             IsCtor = isCtor,
             Added = added,
@@ -2810,6 +2824,66 @@ public static class HotDiff
     {
         TypeSyntax parsed = SyntaxFactory.ParseTypeName(typeText);
         return SimpleTypeName(parsed);
+    }
+
+    /// <summary>Enriched per-parameter identity tokens parallel to
+    /// <see cref="ParamTypeNames"/>: each preserves the type's namespace (as
+    /// written) and closed generic arguments so overloads that share simple
+    /// names can be told apart. The Unity resolver mirrors this grammar from
+    /// reflection. Ref/out/in still carry the trailing "&amp;".</summary>
+    internal static string[] ParamTypeSigs(BaseParameterListSyntax? parameters)
+    {
+        if (parameters == null)
+            return Array.Empty<string>();
+
+        return parameters.Parameters
+            .Select(p =>
+            {
+                string name = p.Type != null ? QualifiedTypeName(p.Type) : "";
+                bool byRef = p.Modifiers.Any(m =>
+                    m.IsKind(SyntaxKind.RefKeyword) || m.IsKind(SyntaxKind.OutKeyword) || m.IsKind(SyntaxKind.InKeyword));
+                return byRef ? name + "&" : name;
+            })
+            .ToArray();
+    }
+
+    /// <summary>Like <see cref="SimpleTypeName"/> but keeps the namespace the
+    /// source wrote and the closed generic arguments, in a grammar the Unity
+    /// resolver reproduces from reflection: namespace-qualified name,
+    /// "Name`N&lt;arg,...&gt;" for generics, "[]" for arrays, "&amp;" for byref.
+    /// Used only for overload disambiguation — never emitted as source.</summary>
+    internal static string QualifiedTypeName(TypeSyntax type)
+    {
+        switch (type)
+        {
+            case PredefinedTypeSyntax predefined:
+                return PredefinedName(predefined.Keyword.Text);
+            case NullableTypeSyntax nullable:
+                return "Nullable`1<" + QualifiedTypeName(nullable.ElementType) + ">";
+            case ArrayTypeSyntax array:
+            {
+                string element = QualifiedTypeName(array.ElementType);
+                foreach (ArrayRankSpecifierSyntax rank in array.RankSpecifiers)
+                    element += "[" + new string(',', rank.Rank - 1) + "]";
+                return element;
+            }
+            case GenericNameSyntax generic:
+                return generic.Identifier.Text + "`" + generic.TypeArgumentList.Arguments.Count +
+                    "<" + string.Join(",", generic.TypeArgumentList.Arguments.Select(QualifiedTypeName)) + ">";
+            case IdentifierNameSyntax identifier:
+                return identifier.Identifier.Text == "dynamic" ? "Object" : identifier.Identifier.Text;
+            case QualifiedNameSyntax qualified:
+                return QualifiedTypeName(qualified.Left) + "." + QualifiedTypeName(qualified.Right);
+            case AliasQualifiedNameSyntax alias:
+                return QualifiedTypeName(alias.Name);
+            case TupleTypeSyntax tuple:
+                return "ValueTuple`" + tuple.Elements.Count +
+                    "<" + string.Join(",", tuple.Elements.Select(e => QualifiedTypeName(e.Type))) + ">";
+            case RefTypeSyntax refType:
+                return QualifiedTypeName(refType.Type) + "&";
+            default:
+                return type.ToString().Trim();
+        }
     }
 
     /// <summary>Simple (arity-stripped) name of a metadata type name's last

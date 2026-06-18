@@ -14,6 +14,14 @@ public sealed class PatchMethodMap
     public string PatchDeclaringType = "";
     public string Name = "";
     public string[] ParamTypeNames = Array.Empty<string>();
+
+    /// <summary>Enriched per-parameter identity (namespace + closed generic
+    /// arguments) parallel to <see cref="ParamTypeNames"/>, for breaking ties
+    /// between overloads that share simple names. Empty when no enrichment is
+    /// available — Unity then matches on the simple names and, on a tie, falls
+    /// back to a fail-closed cold verdict.</summary>
+    public string[] ParamTypeSigs = Array.Empty<string>();
+
     public bool IsStatic;
     public bool IsCtor;
 
@@ -1413,6 +1421,7 @@ public static class PatchRewriter
                 PatchDeclaringType = PatchTypeName(method.DeclaringType),
                 Name = method.Name,
                 ParamTypeNames = method.ParamTypeNames,
+                ParamTypeSigs = method.ParamTypeSigs,
                 IsStatic = method.IsStatic,
                 IsCtor = method.IsCtor,
             });
