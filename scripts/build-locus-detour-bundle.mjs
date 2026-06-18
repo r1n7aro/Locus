@@ -138,7 +138,11 @@ async function collectInputDlls() {
     await ensureDownloaded(nupkgUrl, nupkgPath);
 
     const extractDir = path.join(tmpRoot, `${pkg.id}.${pkg.version}`);
-    if (!existsSync(path.join(extractDir, pkg.libDir))) {
+    const needsExtract =
+      !existsSync(path.join(extractDir, pkg.libDir)) ||
+      pkg.dlls.some((dll) => !existsSync(path.join(extractDir, ...pkg.libDir.split("/"), dll)));
+
+    if (needsExtract) {
       await extractArchive(nupkgPath, extractDir);
     }
 
@@ -149,7 +153,7 @@ async function collectInputDlls() {
       }
       const target = path.join(inputsDir, dll);
       await rm(target, { force: true });
-      await rename(source, target);
+      await copyFile(source, target);
       inputDlls.push(target);
     }
   }
