@@ -1249,6 +1249,9 @@ namespace Locus
                     case "hot_reload_probe":
                         return await HandleHotReloadProbe(reqId).ConfigureAwait(false);
 
+                    case "hot_reload_set_code_optimization":
+                        return await HandleHotReloadSetCodeOptimization(reqId, msg.message).ConfigureAwait(false);
+
                     case "hot_reload_set_debug":
                         return await HandleHotReloadSetDebug(reqId).ConfigureAwait(false);
 

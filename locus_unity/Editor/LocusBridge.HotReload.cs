@@ -91,23 +91,66 @@ namespace Locus
             public string code_optimization;
         }
 
-        /// <summary>
-        /// Enable-time auto-fix: switch the editor's Code Optimization to
-        /// Debug (Release inlines call sites past the MonoMod redirect, so hot
-        /// patches would not take effect). Same effect as clicking the bug
-        /// icon in the status bar — Unity schedules a script recompile. The
-        /// assignment and read-back are synchronous, so the response carries
-        /// the resulting value before the recompile is processed.
-        /// </summary>
-        private static async Task<PipeEnvelope> HandleHotReloadSetDebug(string requestId)
+        private static bool TryParseCodeOptimization(
+            string requestJson,
+            out CodeOptimization optimization,
+            out string error)
         {
+            optimization = CodeOptimization.Debug;
+            error = null;
+
+            string desired = (requestJson ?? "").Trim();
+            if (desired.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    CodeOptimizationDto request = JsonUtility.FromJson<CodeOptimizationDto>(desired);
+                    desired = request != null ? request.code_optimization : "";
+                }
+                catch (Exception ex)
+                {
+                    error = "Code Optimization request parse failed: " + ex.Message;
+                    return false;
+                }
+            }
+
+            if (string.Equals(desired, "debug", StringComparison.OrdinalIgnoreCase))
+            {
+                optimization = CodeOptimization.Debug;
+                return true;
+            }
+            if (string.Equals(desired, "release", StringComparison.OrdinalIgnoreCase))
+            {
+                optimization = CodeOptimization.Release;
+                return true;
+            }
+
+            error = "Code Optimization must be 'debug' or 'release'";
+            return false;
+        }
+
+        /// <summary>
+        /// Switch the editor's Code Optimization. Same effect as clicking the
+        /// bug icon in the status bar — Unity schedules a script recompile.
+        /// The assignment and read-back are synchronous, so the response
+        /// carries the resulting value before the recompile is processed.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleHotReloadSetCodeOptimization(
+            string requestId,
+            string requestJson)
+        {
+            CodeOptimization desired;
+            string parseError;
+            if (!TryParseCodeOptimization(requestJson, out desired, out parseError))
+                return ErrorResponse(requestId, parseError);
+
             var tcs = new TaskCompletionSource<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try
                 {
-                    if (CompilationPipeline.codeOptimization != CodeOptimization.Debug)
-                        CompilationPipeline.codeOptimization = CodeOptimization.Debug;
+                    if (CompilationPipeline.codeOptimization != desired)
+                        CompilationPipeline.codeOptimization = desired;
 
                     var payload = new CodeOptimizationDto();
                     payload.code_optimization =
@@ -122,6 +165,11 @@ namespace Locus
                 }
             });
             return await tcs.Task;
+        }
+
+        private static Task<PipeEnvelope> HandleHotReloadSetDebug(string requestId)
+        {
+            return HandleHotReloadSetCodeOptimization(requestId, "debug");
         }
 
         // NoInlining so the reflection invocations below always go through
@@ -242,6 +290,11 @@ namespace Locus
             public string patch_declaring_type;
             public string name;
             public string[] param_type_names;
+
+            // Enriched per-parameter identity (namespace + closed generic
+            // arguments) parallel to param_type_names. Present from newer
+            // sidecars; used only to break a same-simple-name overload tie.
+            public string[] param_type_sigs;
             public bool is_static;
             public bool is_ctor;
 
@@ -267,6 +320,11 @@ namespace Locus
             public string patch_id;
             public int method_count;
             public string detour_engine;
+
+            // MethodKey identities Unity inlined in Release: their detours are
+            // live but bypassed at inlined call sites, so the desktop queues a
+            // convergence recompile for them. Empty in Debug / when none.
+            public string[] inlined_method_keys;
         }
 
         /// <summary>
@@ -341,13 +399,10 @@ namespace Locus
             byte[] assemblyBytes,
             HotPatchMethodDto[] methods)
         {
-            if (CompilationPipeline.codeOptimization != CodeOptimization.Debug)
-            {
-                return ErrorResponse(
-                    requestId,
-                    "hot reload requires Editor Code Optimization = Debug (Release inlines call sites past the redirect)");
-            }
-
+            // Release-first: apply detours regardless of Code Optimization. In
+            // Release, Mono inlines some small methods, whose inlined call sites
+            // bypass the detour; we detect those after applying and converge
+            // them with a recompile (see below) rather than refusing the patch.
             Assembly patchAssembly;
             try
             {
@@ -443,13 +498,35 @@ namespace Locus
                 }
             }
 
+            // Release-first: a method Unity inlined keeps a live detour, but its
+            // inlined call sites bypass it, so the patch won't take effect there
+            // until a recompile. Report those originals so the desktop can queue
+            // a convergence recompile. Skip ctors and compiler-generated members
+            // (state machines / lambdas), mirroring the reference plugin.
+            var inlinedKeys = new List<string>();
+            foreach (HotPatchApplyChange change in applied)
+            {
+                MethodBase original = change.NewEntry.Original;
+                if (original == null || original is ConstructorInfo)
+                    continue;
+                bool synthesized =
+                    (original.Name != null && original.Name.IndexOf('<') >= 0)
+                    || (original.DeclaringType != null && original.DeclaringType.Name.IndexOf('<') >= 0);
+                if (synthesized)
+                    continue;
+                if (IsMethodInlined(original))
+                    inlinedKeys.Add(change.MethodKey);
+            }
+
             var response = new HotPatchLoadedResponse
             {
                 patch_id = patchId,
                 method_count = applied.Count,
                 detour_engine = engineSummary ?? "load_only",
+                inlined_method_keys = inlinedKeys.ToArray(),
             };
-            Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId);
+            Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId
+                + (inlinedKeys.Count > 0 ? " (" + inlinedKeys.Count + " inlined in Release)" : ""));
             return OkResponse(requestId, JsonUtility.ToJson(response));
         }
 
@@ -767,6 +844,7 @@ namespace Locus
         {
             error = null;
             string[] wanted = dto.param_type_names ?? new string[0];
+            string[] sigs = dto.param_type_sigs ?? new string[0];
 
             MethodBase[] candidates;
             if (dto.is_ctor)
@@ -781,7 +859,12 @@ namespace Locus
                     BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
             }
 
-            MethodBase match = null;
+            // Phase 1 — coarse match on the simple parameter names the desktop
+            // always sends. This is the historical identity and its behaviour is
+            // unchanged; the only difference is that ALL matches are collected
+            // instead of failing on the second, so a same-simple-name overload
+            // can be disambiguated below rather than rejected outright.
+            var coarse = new List<MethodBase>();
             for (int i = 0; i < candidates.Length; i++)
             {
                 MethodBase candidate = candidates[i];
@@ -795,35 +878,233 @@ namespace Locus
                 ParameterInfo[] parameters = candidate.GetParameters();
                 if (parameters.Length != wanted.Length)
                     continue;
+                if (CoarseParamsMatch(parameters, wanted))
+                    coarse.Add(candidate);
+            }
 
-                bool paramsMatch = true;
-                for (int p = 0; p < parameters.Length; p++)
+            if (coarse.Count == 0)
+            {
+                error = "no matching overload";
+                return null;
+            }
+            if (coarse.Count == 1)
+                return coarse[0];
+
+            // Phase 2 — the simple names collide (overloads distinct only by
+            // parameter namespace or generic argument). Break the tie with the
+            // enriched per-parameter signatures. A token the desktop left
+            // un-qualified still matches every coarse candidate (suffix
+            // tolerance), so this only ever narrows the set — never past where
+            // the simple names already pointed.
+            if (sigs.Length == wanted.Length && wanted.Length > 0)
+            {
+                try
                 {
-                    // Patch copies rename self-typed operator/conversion
-                    // parameters ("Foo__LocusPatch"): match against the
-                    // original-name identity the desktop sent.
-                    string parameterName = StripPatchTypeSuffix(parameters[p].ParameterType.Name);
-                    if (!string.Equals(parameterName, wanted[p], StringComparison.Ordinal) &&
-                        !string.Equals(parameters[p].ParameterType.Name, wanted[p], StringComparison.Ordinal))
+                    MethodBase refined = null;
+                    bool refinedAmbiguous = false;
+                    foreach (MethodBase candidate in coarse)
                     {
-                        paramsMatch = false;
+                        if (!SigParamsMatch(candidate.GetParameters(), sigs))
+                            continue;
+                        if (refined != null)
+                        {
+                            refinedAmbiguous = true;
+                            break;
+                        }
+                        refined = candidate;
+                    }
+                    if (refined != null && !refinedAmbiguous)
+                        return refined;
+                }
+                catch
+                {
+                    // Any reflection oddity falls through to the fail-closed
+                    // ambiguous verdict below — never worse than before.
+                }
+            }
+
+            error = "ambiguous overload";
+            return null;
+        }
+
+        private static bool CoarseParamsMatch(ParameterInfo[] parameters, string[] wanted)
+        {
+            for (int p = 0; p < parameters.Length; p++)
+            {
+                // Patch copies rename self-typed operator/conversion parameters
+                // ("Foo__LocusPatch"): match against the original-name identity
+                // the desktop sent.
+                string parameterName = StripPatchTypeSuffix(parameters[p].ParameterType.Name);
+                if (!string.Equals(parameterName, wanted[p], StringComparison.Ordinal) &&
+                    !string.Equals(parameters[p].ParameterType.Name, wanted[p], StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static bool SigParamsMatch(ParameterInfo[] parameters, string[] sigs)
+        {
+            for (int p = 0; p < parameters.Length; p++)
+            {
+                if (!TypeTokenMatch(sigs[p], BuildSigToken(parameters[p].ParameterType)))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>Reflected parameter type rendered in the desktop's signature
+        /// grammar (HotDiff.QualifiedTypeName): namespace-qualified name,
+        /// "Name`N&lt;arg,...&gt;" for closed generics, "[]" for arrays, "&amp;"
+        /// for byref.</summary>
+        private static string BuildSigToken(Type t)
+        {
+            if (t == null)
+                return "";
+            if (t.IsByRef)
+                return BuildSigToken(t.GetElementType()) + "&";
+            if (t.IsArray)
+                return BuildSigToken(t.GetElementType()) + "[" + new string(',', t.GetArrayRank() - 1) + "]";
+            if (t.IsGenericType && !t.IsGenericTypeDefinition)
+            {
+                Type def = t.GetGenericTypeDefinition();
+                string genericHead = NormalizeTypeName(def.FullName ?? def.Name);
+                Type[] args = t.GetGenericArguments();
+                var rendered = new string[args.Length];
+                for (int i = 0; i < args.Length; i++)
+                    rendered[i] = BuildSigToken(args[i]);
+                return genericHead + "<" + string.Join(",", rendered) + ">";
+            }
+            return NormalizeTypeName(t.FullName ?? t.Name);
+        }
+
+        /// <summary>Strip the patch-copy marker and unify the nested-type '+'
+        /// with the '.' the desktop writes, so suffix comparison is uniform.</summary>
+        private static string NormalizeTypeName(string name)
+        {
+            return StripPatchTypeSuffix(name ?? "").Replace('+', '.');
+        }
+
+        /// <summary>True when the desktop signature token <paramref name="want"/>
+        /// identifies the reflected token <paramref name="refl"/>. Heads match on
+        /// a namespace-suffix boundary (the desktop may send a less-qualified
+        /// name); generic arguments are compared only when the desktop supplied
+        /// them, so an un-enriched token stays as permissive as its simple
+        /// name.</summary>
+        private static bool TypeTokenMatch(string want, string refl)
+        {
+            if (want == null || refl == null)
+                return false;
+            want = want.Trim();
+            refl = refl.Trim();
+
+            bool wantByRef = want.EndsWith("&", StringComparison.Ordinal);
+            bool reflByRef = refl.EndsWith("&", StringComparison.Ordinal);
+            if (wantByRef != reflByRef)
+                return false;
+            if (wantByRef)
+                return TypeTokenMatch(want.Substring(0, want.Length - 1), refl.Substring(0, refl.Length - 1));
+
+            string wantArray = TrailingArraySuffix(want);
+            string reflArray = TrailingArraySuffix(refl);
+            if (wantArray.Length > 0 || reflArray.Length > 0)
+            {
+                if (!string.Equals(wantArray, reflArray, StringComparison.Ordinal))
+                    return false;
+                return TypeTokenMatch(
+                    want.Substring(0, want.Length - wantArray.Length),
+                    refl.Substring(0, refl.Length - reflArray.Length));
+            }
+
+            string wantHead, reflHead;
+            string[] wantArgs, reflArgs;
+            SplitGeneric(want, out wantHead, out wantArgs);
+            SplitGeneric(refl, out reflHead, out reflArgs);
+
+            if (!HeadMatch(wantHead, reflHead))
+                return false;
+
+            if (wantArgs == null)
+                return true; // desktop did not qualify the generic arguments
+            if (reflArgs == null || wantArgs.Length != reflArgs.Length)
+                return false;
+            for (int i = 0; i < wantArgs.Length; i++)
+            {
+                if (!TypeTokenMatch(wantArgs[i], reflArgs[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool HeadMatch(string want, string refl)
+        {
+            want = NormalizeTypeName(want);
+            refl = NormalizeTypeName(refl);
+            return string.Equals(refl, want, StringComparison.Ordinal) ||
+                refl.EndsWith("." + want, StringComparison.Ordinal);
+        }
+
+        /// <summary>The trailing array rank group ("[]", "[,]", …) of a token, or
+        /// "" when it is not an array. Generic argument lists use "&lt;&gt;", so a
+        /// trailing "[...]" of only commas is unambiguously an array.</summary>
+        private static string TrailingArraySuffix(string token)
+        {
+            if (token.Length == 0 || token[token.Length - 1] != ']')
+                return "";
+            int open = token.LastIndexOf('[');
+            if (open < 0)
+                return "";
+            for (int i = open + 1; i < token.Length - 1; i++)
+            {
+                if (token[i] != ',')
+                    return "";
+            }
+            return token.Substring(open);
+        }
+
+        /// <summary>Split "Head&lt;arg,arg&gt;" into the head and its top-level
+        /// argument tokens; args is null when there is no generic list.</summary>
+        private static void SplitGeneric(string token, out string head, out string[] args)
+        {
+            int open = token.IndexOf('<');
+            if (open < 0)
+            {
+                head = token;
+                args = null;
+                return;
+            }
+            head = token.Substring(0, open);
+            var list = new List<string>();
+            int depth = 0;
+            int start = open + 1;
+            for (int i = open; i < token.Length; i++)
+            {
+                char c = token[i];
+                if (c == '<' || c == '[')
+                {
+                    depth++;
+                }
+                else if (c == ']')
+                {
+                    depth--;
+                }
+                else if (c == '>')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        list.Add(token.Substring(start, i - start));
                         break;
                     }
                 }
-                if (!paramsMatch)
-                    continue;
-
-                if (match != null)
+                else if (c == ',' && depth == 1)
                 {
-                    error = "ambiguous overload";
-                    return null;
+                    list.Add(token.Substring(start, i - start));
+                    start = i + 1;
                 }
-                match = candidate;
             }
-
-            if (match == null)
-                error = "no matching overload";
-            return match;
+            args = list.ToArray();
         }
 
         /// <summary>"Foo__LocusPatch" → "Foo", "Outer__LocusPatch+Inner" →
