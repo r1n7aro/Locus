@@ -187,6 +187,8 @@ struct SchemaType {
     #[serde(default)]
     is_flags_enum: bool,
     #[serde(default)]
+    type_parameters: Vec<String>,
+    #[serde(default)]
     enum_options: Vec<UnityEnumOption>,
     #[serde(default)]
     fields: Vec<SchemaField>,
@@ -240,6 +242,29 @@ struct ResolvedFieldSchema {
     field: SchemaField,
     field_type_full_name: String,
     field_type_assembly: String,
+    element_type_full_name: String,
+    element_type_assembly: String,
+}
+
+/// A fully-concrete type argument lifted out of a constructed generic name such
+/// as `Foo`1[[System.Int32, mscorlib, Version=…]]`. `full_name`/`assembly` are
+/// the bare name and simple assembly name used when a type parameter is the
+/// whole field type; `aqn` is the verbatim assembly-qualified text spliced back
+/// in when the parameter appears nested inside another generic argument, so the
+/// rendered string matches the compiler's output byte-for-byte.
+#[derive(Debug, Clone)]
+struct ConcreteArg {
+    full_name: String,
+    assembly: String,
+    aqn: String,
+}
+
+#[derive(Debug, Clone)]
+struct TypeCursor {
+    concrete_full_name: String,
+    assembly: String,
+    open_full_name: String,
+    args: Vec<ConcreteArg>,
 }
 
 #[derive(Debug)]
@@ -258,7 +283,7 @@ pub struct DiscoverFilters {
 
 impl SerializedSchemaIndex {
     fn new(payload: SerializedSchemaPayload) -> Self {
-        if payload.schema_version > 1 {
+        if payload.schema_version > 2 {
             eprintln!(
                 "[UnitySerializedSchema] newer schema version {}; attempting best-effort parse",
                 payload.schema_version
@@ -388,6 +413,17 @@ impl SerializedSchemaIndex {
         }
         if !resolved.field.enum_options.is_empty() {
             snapshot.enum_options = resolved.field.enum_options.clone();
+        } else if snapshot.enum_options.is_empty() {
+            // The declared field type may be a type parameter that substitutes to
+            // an enum (e.g. ToggleProperty<SomeEnum>.data); the field carries no
+            // enum metadata, but the resolved concrete type does.
+            if let Some((options, is_flags)) = self.type_enum_options(
+                &resolved.field_type_full_name,
+                &resolved.field_type_assembly,
+            ) {
+                snapshot.enum_options = options;
+                snapshot.is_flags_enum = is_flags;
+            }
         }
         if snapshot.property_type == "ObjectReference" {
             snapshot.reference_type_full_name = resolved.field_type_full_name.clone();
@@ -503,33 +539,34 @@ impl SerializedSchemaIndex {
             let bracket = part.find('[');
             let member_name = bracket.map_or(part, |idx| &part[..idx]);
             if !member_name.is_empty() {
-                let field = self.find_field(&current_full_name, &current_assembly, member_name)?;
-                current_full_name = field.field_type_full_name.clone();
-                current_assembly = field.field_type_assembly.clone();
-                resolved = Some(ResolvedFieldSchema {
-                    field,
-                    field_type_full_name: current_full_name.clone(),
-                    field_type_assembly: current_assembly.clone(),
-                });
+                let rf = self.resolve_field(&current_full_name, &current_assembly, member_name)?;
+                current_full_name = rf.field_type_full_name.clone();
+                current_assembly = rf.field_type_assembly.clone();
+                resolved = Some(rf);
             }
 
             if part.contains('[') {
                 let base = resolved.as_ref()?;
-                let generic_element = generic_first_argument_type_ref(&base.field_type_full_name);
-                let element_full_name = if !base.field.element_type_full_name.trim().is_empty() {
-                    base.field.element_type_full_name.clone()
-                } else if let Some((full_name, _)) = &generic_element {
-                    full_name.clone()
-                } else {
-                    strip_array_suffix(&base.field_type_full_name)
-                };
-                let element_assembly = if !base.field.element_type_assembly.trim().is_empty() {
-                    base.field.element_type_assembly.clone()
-                } else if let Some((_, assembly)) = &generic_element {
-                    assembly.clone()
-                } else {
-                    base.field_type_assembly.clone()
-                };
+                // Prefer the already-substituted element type recorded on the
+                // field; otherwise lift the element out of the (concrete)
+                // collection name, falling back to stripping an array suffix.
+                let (element_full_name, element_assembly) =
+                    if !base.element_type_full_name.trim().is_empty() {
+                        (
+                            base.element_type_full_name.clone(),
+                            base.element_type_assembly.clone(),
+                        )
+                    } else if let Some((_, args)) = parse_constructed_name(&current_full_name) {
+                        match args.into_iter().next() {
+                            Some(arg) => (arg.full_name, arg.assembly),
+                            None => (String::new(), String::new()),
+                        }
+                    } else {
+                        (
+                            strip_array_suffix(&current_full_name),
+                            current_assembly.clone(),
+                        )
+                    };
                 if element_full_name.trim().is_empty() {
                     return None;
                 }
@@ -538,6 +575,10 @@ impl SerializedSchemaIndex {
                 if let Some(prev) = &mut resolved {
                     prev.field_type_full_name = current_full_name.clone();
                     prev.field_type_assembly = current_assembly.clone();
+                    // The element has been drilled into; any further index step
+                    // must re-derive from the (new) concrete collection name.
+                    prev.element_type_full_name = String::new();
+                    prev.element_type_assembly = String::new();
                 }
             }
         }
@@ -545,23 +586,104 @@ impl SerializedSchemaIndex {
         resolved
     }
 
-    fn find_field(
+    /// Resolves a member on `owner_full_name`, parsing a constructed generic
+    /// owner into its open definition plus arguments and substituting any type
+    /// parameters in the field's declared type against those arguments.
+    fn resolve_field(
         &self,
         owner_full_name: &str,
         owner_assembly: &str,
-        field_name: &str,
-    ) -> Option<SchemaField> {
-        let mut current = self.find_type(owner_full_name, owner_assembly)?;
-        loop {
-            if let Some(field) = current.fields.iter().find(|field| field.name == field_name) {
-                return Some(field.clone());
-            }
+        member_name: &str,
+    ) -> Option<ResolvedFieldSchema> {
+        let (open_name, args) = match parse_constructed_name(owner_full_name) {
+            Some((open, args)) => (open, args),
+            None => (open_definition_name(owner_full_name), Vec::new()),
+        };
+        let (field, ctx) =
+            self.find_field_substituted(&open_name, owner_assembly, &args, member_name)?;
+        let (field_type_full_name, field_type_assembly) = substitute_type_ref(
+            &field.field_type_full_name,
+            &field.field_type_assembly,
+            &ctx,
+        );
+        let (element_type_full_name, element_type_assembly) =
+            if field.element_type_full_name.trim().is_empty() {
+                (String::new(), String::new())
+            } else {
+                substitute_type_ref(
+                    &field.element_type_full_name,
+                    &field.element_type_assembly,
+                    &ctx,
+                )
+            };
+        Some(ResolvedFieldSchema {
+            field,
+            field_type_full_name,
+            field_type_assembly,
+            element_type_full_name,
+            element_type_assembly,
+        })
+    }
 
-            if current.base_type_full_name.trim().is_empty() {
+    /// Walks the field's owner and its base chain, threading a substitution
+    /// context (the constructed type arguments) so a base reached through a
+    /// constructed generic such as `Base`1[[!0]]` is resolved with the derived
+    /// type's arguments applied. Returns the matching field together with the
+    /// argument context of the type that declared it.
+    fn find_field_substituted(
+        &self,
+        open_full_name: &str,
+        assembly: &str,
+        args: &[ConcreteArg],
+        field_name: &str,
+    ) -> Option<(SchemaField, Vec<ConcreteArg>)> {
+        let mut current_full_name = open_full_name.to_string();
+        let mut current_assembly = assembly.to_string();
+        let mut current_args = args.to_vec();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(type_key(&current_full_name, &current_assembly)) {
                 return None;
             }
-            current = self.find_type(&current.base_type_full_name, &current.base_type_assembly)?;
+            let schema_type = self.find_type(&current_full_name, &current_assembly)?;
+            if let Some(field) = schema_type.fields.iter().find(|f| f.name == field_name) {
+                return Some((field.clone(), current_args));
+            }
+            if schema_type.base_type_full_name.trim().is_empty() {
+                return None;
+            }
+            let base_template = schema_type.base_type_full_name.clone();
+            let base_assembly_stored = schema_type.base_type_assembly.clone();
+            let (base_concrete, base_assembly) =
+                substitute_type_ref(&base_template, &base_assembly_stored, &current_args);
+            match parse_constructed_name(&base_concrete) {
+                Some((open, base_args)) => {
+                    current_full_name = open;
+                    current_assembly = base_assembly;
+                    current_args = base_args;
+                }
+                None => {
+                    current_full_name = open_definition_name(&base_concrete);
+                    current_assembly = base_assembly;
+                    current_args = Vec::new();
+                }
+            }
         }
+    }
+
+    /// Returns enum metadata for a concrete type if the schema knows it as an
+    /// enum, used to recover enum options for fields whose type parameter
+    /// substituted to an enum.
+    fn type_enum_options(
+        &self,
+        full_name: &str,
+        assembly: &str,
+    ) -> Option<(Vec<UnityEnumOption>, bool)> {
+        let schema_type = self.find_type(full_name, assembly)?;
+        if schema_type.enum_options.is_empty() {
+            return None;
+        }
+        Some((schema_type.enum_options.clone(), schema_type.is_flags_enum))
     }
 
     fn find_type(&self, full_name: &str, assembly: &str) -> Option<&SchemaType> {
@@ -571,8 +693,28 @@ impl SerializedSchemaIndex {
             }
         }
 
-        let keys = self.keys_by_full_name.get(full_name)?;
-        keys.iter().find_map(|key| self.types_by_key.get(key))
+        if let Some(keys) = self.keys_by_full_name.get(full_name) {
+            if let Some(schema_type) = keys.iter().find_map(|key| self.types_by_key.get(key)) {
+                return Some(schema_type);
+            }
+        }
+
+        // Constructed generic reference: fall back to the open generic
+        // definition (e.g. `Foo`1[[System.Int32, …]]` -> `Foo`1`).
+        // The schema stores generic types under their open-definition name; the
+        // caller supplies a constructed argument context for substitution.
+        let open = open_definition_name(full_name);
+        if open != full_name {
+            if !assembly.trim().is_empty() {
+                if let Some(schema_type) = self.types_by_key.get(&type_key(&open, assembly)) {
+                    return Some(schema_type);
+                }
+            }
+            if let Some(keys) = self.keys_by_full_name.get(&open) {
+                return keys.iter().find_map(|key| self.types_by_key.get(key));
+            }
+        }
+        None
     }
 
     fn type_or_base_has_serialize_reference(&self, schema_type: &SchemaType) -> bool {
@@ -608,27 +750,33 @@ impl SerializedSchemaIndex {
             return true;
         }
 
+        let mut current = TypeCursor::new(full_name, assembly);
         let mut seen = HashSet::new();
-        let mut current = self.find_type(full_name, assembly);
-        while let Some(schema_type) = current {
-            let key = type_key(&schema_type.full_name, &schema_type.assembly);
+        loop {
+            let key = type_key(&current.concrete_full_name, &current.assembly);
             if !seen.insert(key) {
                 break;
             }
-            if name_matches(&schema_type.full_name, expected) {
-                return true;
-            }
-            if schema_type
-                .interfaces
-                .iter()
-                .any(|iface| name_matches(&iface.full_name, expected))
+            let Some(schema_type) = self.find_type(&current.open_full_name, &current.assembly)
+            else {
+                break;
+            };
+            if name_matches(&current.concrete_full_name, expected)
+                || name_matches(&schema_type.full_name, expected)
             {
                 return true;
             }
-            current = self.find_type(
-                &schema_type.base_type_full_name,
-                &schema_type.base_type_assembly,
-            );
+            for iface in &schema_type.interfaces {
+                let (iface_full_name, _) =
+                    substitute_type_ref(&iface.full_name, &iface.assembly, &current.args);
+                if name_matches(&iface_full_name, expected) {
+                    return true;
+                }
+            }
+            let Some(next) = current.substituted_base(schema_type) else {
+                break;
+            };
+            current = next;
         }
         false
     }
@@ -697,31 +845,44 @@ impl SerializedSchemaIndex {
             return true;
         }
 
-        let Some(schema_type) = self.find_type(full_name, assembly) else {
-            return false;
-        };
-
-        if schema_type.interfaces.iter().any(|iface| {
-            same_type(
-                &iface.full_name,
-                &iface.assembly,
+        let mut current = TypeCursor::new(full_name, assembly);
+        let mut seen = HashSet::new();
+        loop {
+            let key = type_key(&current.concrete_full_name, &current.assembly);
+            if !seen.insert(key) {
+                return false;
+            }
+            if same_type(
+                &current.concrete_full_name,
+                &current.assembly,
                 base_full_name,
                 base_assembly,
-            )
-        }) {
-            return true;
-        }
+            ) {
+                return true;
+            }
 
-        if schema_type.base_type_full_name.trim().is_empty() {
-            return false;
-        }
+            let Some(schema_type) = self.find_type(&current.open_full_name, &current.assembly)
+            else {
+                return false;
+            };
+            for iface in &schema_type.interfaces {
+                let (iface_full_name, iface_assembly) =
+                    substitute_type_ref(&iface.full_name, &iface.assembly, &current.args);
+                if same_type(
+                    &iface_full_name,
+                    &iface_assembly,
+                    base_full_name,
+                    base_assembly,
+                ) {
+                    return true;
+                }
+            }
 
-        self.type_is_assignable_to(
-            &schema_type.base_type_full_name,
-            &schema_type.base_type_assembly,
-            base_full_name,
-            base_assembly,
-        )
+            let Some(next) = current.substituted_base(schema_type) else {
+                return false;
+            };
+            current = next;
+        }
     }
 }
 
@@ -783,7 +944,8 @@ fn name_matches(full_name: &str, expected: &str) -> bool {
 }
 
 fn simple_type_name(full_name: &str) -> &str {
-    let after_nested = full_name.rsplit('+').next().unwrap_or(full_name);
+    let type_name = full_name.split("[[").next().unwrap_or(full_name);
+    let after_nested = type_name.rsplit('+').next().unwrap_or(type_name);
     after_nested.rsplit('.').next().unwrap_or(after_nested)
 }
 
@@ -796,33 +958,198 @@ fn is_serialized_array_size_path(property_path: &str) -> bool {
     path == "Array.size" || path.ends_with(".Array.size")
 }
 
-fn generic_first_argument_type_ref(full_name: &str) -> Option<(String, String)> {
-    let start = full_name.find("[[")? + 2;
-    let rest = &full_name[start..];
-    let mut depth = 0usize;
-    let mut end = None;
-    for (idx, ch) in rest.char_indices() {
-        match ch {
-            '[' => depth = depth.saturating_add(1),
-            ']' if depth == 0 => {
-                end = Some(idx);
-                break;
+impl TypeCursor {
+    fn new(full_name: &str, assembly: &str) -> Self {
+        match parse_constructed_name(full_name) {
+            Some((open_full_name, args)) => Self {
+                concrete_full_name: full_name.trim().to_string(),
+                assembly: assembly.trim().to_string(),
+                open_full_name,
+                args,
+            },
+            None => {
+                let full_name = full_name.trim().to_string();
+                Self {
+                    concrete_full_name: full_name.clone(),
+                    assembly: assembly.trim().to_string(),
+                    open_full_name: full_name,
+                    args: Vec::new(),
+                }
             }
-            ']' => depth = depth.saturating_sub(1),
+        }
+    }
+
+    fn substituted_base(&self, schema_type: &SchemaType) -> Option<Self> {
+        if schema_type.base_type_full_name.trim().is_empty() {
+            return None;
+        }
+        let (base_full_name, base_assembly) = substitute_type_ref(
+            &schema_type.base_type_full_name,
+            &schema_type.base_type_assembly,
+            &self.args,
+        );
+        if base_full_name.trim().is_empty() {
+            None
+        } else {
+            Some(Self::new(&base_full_name, &base_assembly))
+        }
+    }
+}
+
+/// Strips a constructed generic instantiation down to the open generic
+/// definition name: `Foo`1[[System.Int32, …]]` -> `Foo`1`. Non-generic names,
+/// including arrays, are returned unchanged.
+fn open_definition_name(full_name: &str) -> String {
+    let trimmed = full_name.trim();
+    match parse_constructed_name(trimmed) {
+        Some((open, _)) => open,
+        None => trimmed.to_string(),
+    }
+}
+
+/// Parses a constructed generic name into its open definition and the concrete
+/// type arguments, e.g.
+/// `Dictionary`2[[System.String, mscorlib, …],[Game.Handle, Asm, …]]`
+/// -> ("System.Collections.Generic.Dictionary`2", [String, Game.Handle]).
+/// Returns `None` when the name is not a constructed generic.
+fn parse_constructed_name(full_name: &str) -> Option<(String, Vec<ConcreteArg>)> {
+    let trimmed = full_name.trim();
+    let open_end = trimmed.find("[[")?;
+    let open = trimmed[..open_end].trim().to_string();
+    if open.is_empty() {
+        return None;
+    }
+    // Remainder is `[[arg0],[arg1],…]`; strip the single outer bracket pair.
+    let remainder = &trimmed[open_end..];
+    if !remainder.starts_with('[') || !remainder.ends_with(']') || remainder.len() < 2 {
+        return None;
+    }
+    let inner = &remainder[1..remainder.len() - 1];
+    let groups = split_top_level_groups(inner)?;
+    let args = groups
+        .iter()
+        .map(|group| parse_concrete_arg(group))
+        .collect();
+    Some((open, args))
+}
+
+/// Splits `[a],[b],[c]` into the inner contents `[a, b, c]`, respecting nested
+/// brackets so an argument that is itself a constructed generic stays intact.
+fn split_top_level_groups(inner: &str) -> Option<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '[' => {
+                if depth == 0 {
+                    start = Some(idx + 1);
+                }
+                depth += 1;
+            }
+            ']' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let begin = start.take()?;
+                    groups.push(inner[begin..idx].to_string());
+                }
+            }
             _ => {}
         }
     }
-    let arg = rest[..end?].trim();
-    if arg.is_empty() {
+    if depth != 0 {
         return None;
+    }
+    Some(groups)
+}
+
+fn parse_concrete_arg(content: &str) -> ConcreteArg {
+    let content = content.trim();
+    let (full_name, assembly) = split_generic_argument_type_and_assembly(content);
+    ConcreteArg {
+        full_name: full_name.trim().to_string(),
+        assembly: assembly.trim().to_string(),
+        aqn: content.to_string(),
+    }
+}
+
+/// `!0` -> `Some(0)`; anything else -> `None`.
+fn parse_param_token(value: &str) -> Option<usize> {
+    let digits = value.strip_prefix('!')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Substitutes type-parameter placeholders in a stored type reference against a
+/// constructed type's arguments. A bare `!n` (optionally `!n[]`) takes both its
+/// name and assembly from the argument; a `!n` nested inside another generic is
+/// spliced back assembly-qualified so the rendered name matches the compiler's
+/// output. References without placeholders are returned unchanged.
+fn substitute_type_ref(
+    stored_full: &str,
+    stored_assembly: &str,
+    ctx: &[ConcreteArg],
+) -> (String, String) {
+    let trimmed = stored_full.trim();
+    if trimmed.is_empty() {
+        return (String::new(), stored_assembly.to_string());
+    }
+    let (core, array_suffix) = match trimmed.strip_suffix("[]") {
+        Some(core) => (core, "[]"),
+        None => (trimmed, ""),
+    };
+
+    if let Some(ordinal) = parse_param_token(core) {
+        if let Some(arg) = ctx.get(ordinal) {
+            return (
+                format!("{}{}", arg.full_name, array_suffix),
+                arg.assembly.clone(),
+            );
+        }
+        return (format!("{core}{array_suffix}"), stored_assembly.to_string());
     }
 
-    let split = split_generic_argument_type_and_assembly(arg);
-    let type_name = split.0.trim();
-    if type_name.is_empty() {
-        return None;
+    if !core.contains('!') {
+        return (format!("{core}{array_suffix}"), stored_assembly.to_string());
     }
-    Some((type_name.to_string(), split.1.trim().to_string()))
+
+    let rendered = render_type_template(core, ctx);
+    (
+        format!("{rendered}{array_suffix}"),
+        stored_assembly.to_string(),
+    )
+}
+
+/// Replaces every `[!n]` argument group in a stored generic template with the
+/// assembly-qualified text of `ctx[n]`, leaving concrete arguments untouched.
+/// Type parameters only ever appear as a complete argument group, so this purely
+/// textual replacement is exact and handles arbitrary nesting.
+fn render_type_template(core: &str, ctx: &[ConcreteArg]) -> String {
+    let mut result = String::with_capacity(core.len() + 32);
+    let mut rest = core;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("[!") {
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let tail = &after[digits.len()..];
+            if !digits.is_empty() && tail.starts_with(']') {
+                match digits.parse::<usize>().ok().and_then(|ord| ctx.get(ord)) {
+                    Some(arg) => result.push_str(&format!("[{}]", arg.aqn)),
+                    None => result.push_str(&format!("[!{digits}]")),
+                }
+                rest = &tail[1..];
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        result.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    result
 }
 
 fn split_generic_argument_type_and_assembly(value: &str) -> (&str, &str) {
@@ -1205,5 +1532,389 @@ mod tests {
             options[0].value,
             "__LocusSkillPackage_tool_hash Tool.DynamicItem"
         );
+    }
+
+    #[test]
+    fn resolves_constructed_generic_field_child() {
+        // ToggleProperty<int>.data : T -> System.Int32 and .enable : bool.
+        let index = SerializedSchemaIndex::new(SerializedSchemaPayload {
+            schema_version: 2,
+            types: vec![
+                SchemaType {
+                    full_name: "ProjectB.EntityAction".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    fields: vec![SchemaField {
+                        name: "minFps".to_string(),
+                        field_type_full_name: "ProjectB.ToggleProperty`1[[System.Int32, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089]]".to_string(),
+                        field_type_assembly: "Assembly-CSharp".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "ProjectB.ToggleProperty`1".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    type_parameters: vec!["T".to_string()],
+                    fields: vec![
+                        SchemaField {
+                            name: "enable".to_string(),
+                            field_type_full_name: "System.Boolean".to_string(),
+                            field_type_assembly: "mscorlib".to_string(),
+                            ..Default::default()
+                        },
+                        SchemaField {
+                            name: "data".to_string(),
+                            field_type_full_name: "!0".to_string(),
+                            // Deliberately wrong; a bare parameter must take both
+                            // its name and assembly from the constructed argument.
+                            field_type_assembly: "Assembly-CSharp".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        });
+        let target = UnitySerializedPropertyTarget {
+            kind: "asset".to_string(),
+            target_type_full_name: Some("ProjectB.EntityAction".to_string()),
+            target_type_assembly: Some("Assembly-CSharp".to_string()),
+            ..Default::default()
+        };
+
+        let data = index
+            .resolve_property_schema(&target, "minFps.data")
+            .expect("data schema");
+        assert_eq!(data.field_type_full_name, "System.Int32");
+        assert_eq!(data.field_type_assembly, "mscorlib");
+
+        let enable = index
+            .resolve_property_schema(&target, "minFps.enable")
+            .expect("enable schema");
+        assert_eq!(enable.field_type_full_name, "System.Boolean");
+        assert_eq!(enable.field_type_assembly, "mscorlib");
+    }
+
+    #[test]
+    fn rejects_serialize_reference_inherited_through_constructed_generic_base() {
+        // TransitionAsset : TransitionAsset<ITransitionDetailed>, where the base
+        // declares a [SerializeReference] field. The owner must still be excluded
+        // from static enrichment even though the SerializeReference is inherited
+        // through a constructed generic base.
+        let index = SerializedSchemaIndex::new(SerializedSchemaPayload {
+            schema_version: 2,
+            types: vec![
+                SchemaType {
+                    full_name: "Animancer.TransitionAsset".to_string(),
+                    assembly: "Kybernetik.Animancer".to_string(),
+                    base_type_full_name: "Animancer.TransitionAsset`1[[Animancer.ITransitionDetailed, Kybernetik.Animancer, Version=8.0.0.0, Culture=neutral, PublicKeyToken=null]]".to_string(),
+                    base_type_assembly: "Kybernetik.Animancer".to_string(),
+                    is_unity_object: true,
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Animancer.TransitionAsset`1".to_string(),
+                    assembly: "Kybernetik.Animancer".to_string(),
+                    type_parameters: vec!["TTransition".to_string()],
+                    is_unity_object: true,
+                    fields: vec![SchemaField {
+                        name: "_Transition".to_string(),
+                        field_type_full_name: "!0".to_string(),
+                        field_type_assembly: "Kybernetik.Animancer".to_string(),
+                        has_serialize_reference: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        });
+        let target = UnitySerializedPropertyTarget {
+            kind: "asset".to_string(),
+            target_type_full_name: Some("Animancer.TransitionAsset".to_string()),
+            target_type_assembly: Some("Kybernetik.Animancer".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!index.can_enrich_target(&target));
+
+        // And were it ever resolved, the inherited managed-reference field type
+        // substitutes from the constructed base argument.
+        let resolved = index
+            .resolve_property_schema(&target, "_Transition")
+            .expect("inherited field schema");
+        assert_eq!(
+            resolved.field_type_full_name,
+            "Animancer.ITransitionDetailed"
+        );
+        assert_eq!(resolved.field_type_assembly, "Kybernetik.Animancer");
+    }
+
+    #[test]
+    fn resolves_nested_generic_field_and_array_element() {
+        let index = SerializedSchemaIndex::new(SerializedSchemaPayload {
+            schema_version: 2,
+            types: vec![
+                SchemaType {
+                    full_name: "Game.Owner".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    fields: vec![SchemaField {
+                        name: "holder".to_string(),
+                        field_type_full_name: "Game.Holder`1[[Game.Item, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null]]".to_string(),
+                        field_type_assembly: "Assembly-CSharp".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Game.Holder`1".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    type_parameters: vec!["T".to_string()],
+                    fields: vec![SchemaField {
+                        name: "items".to_string(),
+                        field_type_full_name: "System.Collections.Generic.List`1[[!0]]".to_string(),
+                        field_type_assembly: "mscorlib".to_string(),
+                        element_type_full_name: "!0".to_string(),
+                        element_type_assembly: "Assembly-CSharp".to_string(),
+                        is_list: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Game.Item".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    fields: vec![SchemaField {
+                        name: "label".to_string(),
+                        field_type_full_name: "System.String".to_string(),
+                        field_type_assembly: "mscorlib".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        });
+        let target = UnitySerializedPropertyTarget {
+            kind: "asset".to_string(),
+            target_type_full_name: Some("Game.Owner".to_string()),
+            target_type_assembly: Some("Assembly-CSharp".to_string()),
+            ..Default::default()
+        };
+
+        // The nested List<T> renders with the substituted, assembly-qualified arg
+        // spliced in verbatim.
+        let items = index
+            .resolve_property_schema(&target, "holder.items")
+            .expect("items schema");
+        assert_eq!(
+            items.field_type_full_name,
+            "System.Collections.Generic.List`1[[Game.Item, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null]]"
+        );
+
+        let element = index
+            .resolve_property_schema(&target, "holder.items.Array.data[0]")
+            .expect("element schema");
+        assert_eq!(element.field_type_full_name, "Game.Item");
+        assert_eq!(element.field_type_assembly, "Assembly-CSharp");
+
+        let label = index
+            .resolve_property_schema(&target, "holder.items.Array.data[0].label")
+            .expect("label schema");
+        assert_eq!(label.field_type_full_name, "System.String");
+    }
+
+    #[test]
+    fn discover_field_type_filter_does_not_match_array_parent_as_element_type() {
+        let index = SerializedSchemaIndex::new(SerializedSchemaPayload {
+            schema_version: 2,
+            types: vec![
+                SchemaType {
+                    full_name: "Game.Owner".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    fields: vec![SchemaField {
+                        name: "items".to_string(),
+                        field_type_full_name: "Game.Item[]".to_string(),
+                        field_type_assembly: "Assembly-CSharp".to_string(),
+                        element_type_full_name: "Game.Item".to_string(),
+                        element_type_assembly: "Assembly-CSharp".to_string(),
+                        is_array: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Game.Item".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    fields: vec![SchemaField {
+                        name: "label".to_string(),
+                        field_type_full_name: "System.String".to_string(),
+                        field_type_assembly: "mscorlib".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        });
+        let target = UnitySerializedPropertyTarget {
+            kind: "asset".to_string(),
+            target_type_full_name: Some("Game.Owner".to_string()),
+            target_type_assembly: Some("Assembly-CSharp".to_string()),
+            ..Default::default()
+        };
+        let mut result = UnitySerializedPropertyDiscoverResult {
+            ok: true,
+            binding_id: None,
+            message: "ok".to_string(),
+            target,
+            matches: vec![
+                UnitySerializedPropertyDiscoverMatch {
+                    property_path: "items".to_string(),
+                    name: "items".to_string(),
+                    display_name: "Items".to_string(),
+                    property_type: "Array".to_string(),
+                    value_type: "Array".to_string(),
+                    field_type_full_name: String::new(),
+                    field_type_assembly: String::new(),
+                    display_value: String::new(),
+                    editable: true,
+                    has_children: true,
+                    is_array: true,
+                    is_managed_reference: false,
+                    depth: 1,
+                },
+                UnitySerializedPropertyDiscoverMatch {
+                    property_path: "items.Array.data[0]".to_string(),
+                    name: "data".to_string(),
+                    display_name: "Element 0".to_string(),
+                    property_type: "Generic".to_string(),
+                    value_type: "Generic".to_string(),
+                    field_type_full_name: String::new(),
+                    field_type_assembly: String::new(),
+                    display_value: String::new(),
+                    editable: true,
+                    has_children: true,
+                    is_array: false,
+                    is_managed_reference: false,
+                    depth: 2,
+                },
+            ],
+        };
+
+        index.enrich_discover_result(
+            &mut result,
+            &DiscoverFilters {
+                field_type: Some("Game.Item".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let paths = result
+            .matches
+            .iter()
+            .map(|entry| entry.property_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["items.Array.data[0]"]);
+    }
+
+    #[test]
+    fn type_matching_substitutes_generic_base_and_interface_arguments() {
+        let int_arg = "System.Int32, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
+        let string_arg = "System.String, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
+        let base_int = format!("Game.Base`1[[{int_arg}]]");
+        let base_string = format!("Game.Base`1[[{string_arg}]]");
+        let iface_int = format!("Game.IBox`1[[{int_arg}]]");
+        let iface_string = format!("Game.IBox`1[[{string_arg}]]");
+        let middle_int = format!("Game.Middle`1[[{int_arg}]]");
+        let index = SerializedSchemaIndex::new(SerializedSchemaPayload {
+            schema_version: 2,
+            types: vec![
+                SchemaType {
+                    full_name: "Game.Concrete".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    base_type_full_name: middle_int,
+                    base_type_assembly: "Assembly-CSharp".to_string(),
+                    is_serializable: true,
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Game.Middle`1".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    base_type_full_name: "Game.Base`1[[!0]]".to_string(),
+                    base_type_assembly: "Assembly-CSharp".to_string(),
+                    interfaces: vec![SchemaTypeRef {
+                        full_name: "Game.IBox`1[[!0]]".to_string(),
+                        assembly: "Assembly-CSharp".to_string(),
+                    }],
+                    type_parameters: vec!["T".to_string()],
+                    is_serializable: true,
+                    ..Default::default()
+                },
+                SchemaType {
+                    full_name: "Game.Base`1".to_string(),
+                    assembly: "Assembly-CSharp".to_string(),
+                    type_parameters: vec!["T".to_string()],
+                    is_serializable: true,
+                    ..Default::default()
+                },
+            ],
+        });
+
+        assert!(index.type_matches("Game.Concrete", "Assembly-CSharp", &base_int));
+        assert!(!index.type_matches("Game.Concrete", "Assembly-CSharp", &base_string));
+        assert!(index.type_matches("Game.Concrete", "Assembly-CSharp", &iface_int));
+        assert!(!index.type_matches("Game.Concrete", "Assembly-CSharp", &iface_string));
+        assert!(index.type_is_assignable_to(
+            "Game.Concrete",
+            "Assembly-CSharp",
+            &iface_int,
+            "Assembly-CSharp"
+        ));
+        assert!(!index.type_is_assignable_to(
+            "Game.Concrete",
+            "Assembly-CSharp",
+            &iface_string,
+            "Assembly-CSharp"
+        ));
+    }
+
+    #[test]
+    fn parses_assembly_qualified_constructed_name() {
+        let (open, args) = parse_constructed_name(
+            "Game.DictionaryList`2[[System.String, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089],[Game.Handle, Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null]]",
+        )
+        .expect("constructed name");
+        assert_eq!(open, "Game.DictionaryList`2");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].full_name, "System.String");
+        assert_eq!(args[0].assembly, "mscorlib");
+        assert_eq!(args[1].full_name, "Game.Handle");
+        assert_eq!(args[1].assembly, "Assembly-CSharp");
+
+        // A nested generic argument is kept intact as a single argument.
+        let (open_nested, nested_args) = parse_constructed_name(
+            "System.Collections.Generic.List`1[[System.Collections.Generic.List`1[[System.Int32, mscorlib]], mscorlib]]",
+        )
+        .expect("nested constructed name");
+        assert_eq!(open_nested, "System.Collections.Generic.List`1");
+        assert_eq!(nested_args.len(), 1);
+        assert_eq!(
+            nested_args[0].full_name,
+            "System.Collections.Generic.List`1[[System.Int32, mscorlib]]"
+        );
+        assert_eq!(nested_args[0].assembly, "mscorlib");
+
+        assert_eq!(
+            open_definition_name("Game.Holder`1[[Game.Item, Asm]]"),
+            "Game.Holder`1"
+        );
+        assert_eq!(open_definition_name("Game.Holder`1[]"), "Game.Holder`1[]");
+        assert_eq!(open_definition_name("System.Int32"), "System.Int32");
+        assert!(parse_constructed_name("System.Int32").is_none());
     }
 }
