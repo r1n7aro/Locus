@@ -770,7 +770,12 @@ pub async fn run_login_test() -> Result<String, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    parse_login_test_output(&stdout, &stderr, output.status.success(), output.status.code())
+    parse_login_test_output(
+        &stdout,
+        &stderr,
+        output.status.success(),
+        output.status.code(),
+    )
 }
 
 /// Interpret the `--output-format json` result of the connectivity probe.
