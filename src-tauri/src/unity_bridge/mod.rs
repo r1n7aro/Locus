@@ -2285,7 +2285,7 @@ async fn sidecar_compile_for_run_states(
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+        Err(reason) => return sidecar_unavailable(reason),
     };
 
     let cache_key = run_states_compile_cache_key(project_path, &params, prepared_request);
@@ -2349,7 +2349,7 @@ async fn sidecar_compile_for_run_states(
         } else {
             format!("run_states compilation exception: {}", failure.message)
         }),
-        Err(error) => SidecarCompileAttempt::Unavailable(error),
+        Err(error) => sidecar_unavailable(error),
     }
 }
 
@@ -2492,6 +2492,21 @@ pub async fn compile_run_states(
 /// Returns `Ok(Some(augmented))` to send, `Ok(None)` to send the original
 /// request (sidecar unavailable), or `Err` with a deterministic compile
 /// error in the Unity-side wording (View Script errors carry no prefix).
+/// View/Skill precompile counterpart of `sidecar_unavailable`: a graceful
+/// fallback sends the raw source (`Ok(None)` → Unity compiles in-process),
+/// unless the operator disabled the in-process fallback, in which case the
+/// unavailability is returned as an error so no in-Unity compile runs.
+fn sidecar_augment_unavailable(reason: String) -> Result<Option<serde_json::Value>, String> {
+    if crate::csharp_compile::block_in_process_fallback() {
+        Err(format!(
+            "sidecar compile unavailable and in-process fallback disabled: {reason}"
+        ))
+    } else {
+        crate::csharp_compile::note_fallback(&reason);
+        Ok(None)
+    }
+}
+
 async fn augment_view_script_request_with_sidecar(
     project_path: &str,
     request: &serde_json::Value,
@@ -2511,10 +2526,7 @@ async fn augment_view_script_request_with_sidecar(
 
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => {
-            crate::csharp_compile::note_fallback(&reason);
-            return Ok(None);
-        }
+        Err(reason) => return sidecar_augment_unavailable(reason),
     };
 
     let source_path = request
@@ -2551,10 +2563,7 @@ async fn augment_view_script_request_with_sidecar(
             }
         }
         Ok(Err(failure)) => Err(failure.message),
-        Err(error) => {
-            crate::csharp_compile::note_fallback(&error);
-            Ok(None)
-        }
+        Err(error) => sidecar_augment_unavailable(error),
     }
 }
 
@@ -2572,10 +2581,7 @@ async fn augment_skill_package_request_with_sidecar(
 
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => {
-            crate::csharp_compile::note_fallback(&reason);
-            return Ok(None);
-        }
+        Err(reason) => return sidecar_augment_unavailable(reason),
     };
 
     match crate::csharp_compile::compile_skill_package(&params, request).await {
@@ -2600,10 +2606,7 @@ async fn augment_skill_package_request_with_sidecar(
             }
         }
         Ok(Err(failure)) => Err(failure.message),
-        Err(error) => {
-            crate::csharp_compile::note_fallback(&error);
-            Ok(None)
-        }
+        Err(error) => sidecar_augment_unavailable(error),
     }
 }
 
@@ -3392,13 +3395,26 @@ async fn sidecar_compile_params(
 /// Compile a prepared unity_execute snippet in the sidecar. Error texts
 /// mirror the Unity-side `HandleExecuteCode` wording exactly ("async snippet
 /// compilation exception: " + the combined two-mode compile error).
+/// Map a sidecar "unavailable" (sidecar down / transport error) to either a
+/// graceful in-Unity fallback (`Unavailable`) or a hard error (`CompileError`)
+/// when the operator disabled the in-process fallback (pure-sidecar / A-B).
+fn sidecar_unavailable(reason: String) -> SidecarCompileAttempt {
+    if crate::csharp_compile::block_in_process_fallback() {
+        SidecarCompileAttempt::CompileError(format!(
+            "sidecar compile unavailable and in-process fallback disabled: {reason}"
+        ))
+    } else {
+        SidecarCompileAttempt::Unavailable(reason)
+    }
+}
+
 async fn sidecar_compile_for_execute(
     project_path: &str,
     prepared_code: &str,
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+        Err(reason) => return sidecar_unavailable(reason),
     };
 
     let compile_started = std::time::Instant::now();
@@ -3442,7 +3458,7 @@ async fn sidecar_compile_for_execute(
                 failure.message
             ))
         }
-        Err(error) => SidecarCompileAttempt::Unavailable(error),
+        Err(error) => sidecar_unavailable(error),
     }
 }
 

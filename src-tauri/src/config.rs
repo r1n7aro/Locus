@@ -45,6 +45,10 @@ fn default_unity_sidecar_compiler() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
+fn default_unity_in_process_compile_fallback() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 fn default_unity_hot_reload() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
@@ -261,6 +265,17 @@ pub struct AppConfig {
     /// least one release cycle.
     #[serde(default = "default_unity_sidecar_compiler", with = "serde_atomic_bool")]
     pub unity_sidecar_compiler: Arc<AtomicBool>,
+    /// When the sidecar compiler is on and a compile is *unavailable* (sidecar
+    /// down / transport error), fall back to the in-Unity Roslyn compile.
+    /// Default on (keeps the graceful behavior). Turn off for pure-sidecar /
+    /// A-B: an unavailable sidecar then returns an error instead of compiling
+    /// in Unity, so no in-process Roslyn runs. No effect when the sidecar
+    /// itself is off (the in-Unity path is then the only path).
+    #[serde(
+        default = "default_unity_in_process_compile_fallback",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_in_process_compile_fallback: Arc<AtomicBool>,
     /// Hot-patch Unity C# method-body edits via the compile-server sidecar
     /// (no Unity recompile / domain reload). Default off (phase H0 gate);
     /// signature/field changes always go through `unity_recompile`.
@@ -325,6 +340,7 @@ impl AppConfig {
             unity_state_probe_enabled: default_unity_state_probe_enabled(),
             csharp_lsp_enabled: default_debug_flag(),
             unity_sidecar_compiler: default_unity_sidecar_compiler(),
+            unity_in_process_compile_fallback: default_unity_in_process_compile_fallback(),
             unity_hot_reload: default_unity_hot_reload(),
             unity_native_bridge_enabled: default_unity_native_bridge_enabled(),
             code_analysis_tools: default_code_analysis_tools(),
@@ -506,6 +522,17 @@ impl AppConfig {
 
     pub fn set_unity_sidecar_compiler_enabled(&self, value: bool) -> Result<(), String> {
         self.unity_sidecar_compiler.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_in_process_compile_fallback_enabled(&self) -> bool {
+        self.unity_in_process_compile_fallback
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_in_process_compile_fallback_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_in_process_compile_fallback
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 

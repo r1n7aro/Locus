@@ -426,6 +426,9 @@ pub fn run() {
                 config.unity_sidecar_compiler_enabled(),
                 app.handle().clone(),
             );
+            csharp_compile::set_in_process_fallback(
+                config.unity_in_process_compile_fallback_enabled(),
+            );
             unity_hotreload::initialize(config.unity_hot_reload_enabled());
             code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
@@ -1321,6 +1324,8 @@ pub fn run() {
             commands::csharp_lsp_restart,
             commands::unity_sidecar_compiler_get_status,
             commands::unity_sidecar_compiler_set_enabled,
+            commands::unity_in_process_compile_fallback_get_enabled,
+            commands::unity_in_process_compile_fallback_set_enabled,
             commands::unity_hot_reload_set_enabled,
             commands::unity_hot_reload_selftest_run,
             commands::unity_hot_reload_access_probe_run,

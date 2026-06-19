@@ -47,6 +47,29 @@ pub async fn unity_sidecar_compiler_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_in_process_compile_fallback_get_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.unity_in_process_compile_fallback_enabled())
+}
+
+/// Toggle the in-Unity Roslyn fallback used when the sidecar is on but a
+/// compile is unavailable. Off = pure-sidecar (no in-process compile runs);
+/// on = graceful fallback. Useful for A-B testing the sidecar in isolation.
+#[tauri::command]
+pub async fn unity_in_process_compile_fallback_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_in_process_compile_fallback_enabled(value)
+        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
+
+    crate::csharp_compile::set_in_process_fallback(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
 pub async fn unity_hot_reload_set_enabled(
     value: bool,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
