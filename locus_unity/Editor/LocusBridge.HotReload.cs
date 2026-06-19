@@ -502,7 +502,10 @@ namespace Locus
             // inlined call sites bypass it, so the patch won't take effect there
             // until a recompile. Report those originals so the desktop can queue
             // a convergence recompile. Skip ctors and compiler-generated members
-            // (state machines / lambdas), mirroring the reference plugin.
+            // (state machines / lambdas), mirroring the reference plugin. Debug
+            // never inlines, so the Release flag gates IsMethodInlined's static
+            // fallback (a not-yet-JIT-evaluated method only matters in Release).
+            bool releaseMode = CompilationPipeline.codeOptimization == CodeOptimization.Release;
             var inlinedKeys = new List<string>();
             foreach (HotPatchApplyChange change in applied)
             {
@@ -514,7 +517,7 @@ namespace Locus
                     || (original.DeclaringType != null && original.DeclaringType.Name.IndexOf('<') >= 0);
                 if (synthesized)
                     continue;
-                if (IsMethodInlined(original))
+                if (IsMethodInlined(original, releaseMode))
                     inlinedKeys.Add(change.MethodKey);
             }
 
