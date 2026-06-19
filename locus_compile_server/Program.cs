@@ -112,6 +112,9 @@ while (true)
             case "compile/accessProbe":
                 result = service.HandleCompileAccessProbe(@params);
                 break;
+            case "caller/query":
+                result = service.HandleCallerQuery(@params);
+                break;
             case "index/types":
                 result = service.HandleIndexTypes(@params);
                 break;

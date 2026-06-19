@@ -1,6 +1,9 @@
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 
 namespace Locus.CompileServer;
 
@@ -26,9 +29,23 @@ public sealed class CallerScanResult
     /// (Unity: project-relative "Assets/...").</summary>
     public Dictionary<string, HashSet<string>> CallerFiles = new(StringComparer.Ordinal);
 
+    /// <summary>Target key → exact compiled caller methods and their source
+    /// files. Used by Release-inline caller refresh: refreshing the whole file
+    /// would create avoidable detours, so the coordinator asks for the method
+    /// that contains the call site.</summary>
+    public Dictionary<string, List<CallerScanLocation>> CallerLocations = new(StringComparer.Ordinal);
+
     /// <summary>Fail-closed error (unreadable assembly, missing PDB): the
     /// caller must treat every target as unverifiable.</summary>
     public string? Error;
+}
+
+public sealed class CallerScanLocation
+{
+    public string File = "";
+    public string CallerMethodKey = "";
+    public string DeclaringType = "";
+    public string MemberName = "";
 }
 
 /// <summary>
@@ -45,6 +62,186 @@ public sealed class CallerScanResult
 /// </summary>
 public static class CallerScan
 {
+    private sealed class AssemblyCallerIndex
+    {
+        public string Path = "";
+        public DateTime LastWriteUtc;
+        public long Length;
+        public Guid Mvid;
+        public string? Error;
+        public HashSet<string> TargetKeys = new(StringComparer.Ordinal);
+        public Dictionary<string, List<CallerScanLocation>> LocationsByTarget = new(StringComparer.Ordinal);
+        public Dictionary<string, string> UnmappedByTarget = new(StringComparer.Ordinal);
+    }
+
+    private static readonly object CacheLock = new();
+    private static readonly Dictionary<string, AssemblyCallerIndex> Cache = new(StringComparer.OrdinalIgnoreCase);
+
+    // ── Persistent tier ──────────────────────────────────────────────
+    // The in-memory cache above is rebuilt from scratch every time the sidecar
+    // restarts. The reverse caller graph of a large project assembly is the
+    // most expensive thing this file does (a full IL walk of every method
+    // body), so we also mirror each successfully-built index to disk, one JSON
+    // file per assembly, keyed by the assembly's on-disk identity. A restart
+    // then reloads instead of re-walking; editing one assembly only rewrites
+    // that assembly's file (incremental). Any cache I/O failure is swallowed —
+    // a missing/corrupt/locked cache simply rebuilds.
+
+    private const int PersistFormatVersion = 1;
+
+    private static readonly JsonSerializerOptions PersistJsonOptions = new()
+    {
+        // CallerScanLocation carries public FIELDS, not properties.
+        IncludeFields = true,
+    };
+
+    private sealed class PersistedCallerIndex
+    {
+        public int FormatVersion { get; set; }
+        public long LastWriteUtcTicks { get; set; }
+        public long Length { get; set; }
+        public string Mvid { get; set; } = "";
+        public List<string> TargetKeys { get; set; } = new();
+        public Dictionary<string, List<CallerScanLocation>> LocationsByTarget { get; set; } = new();
+        public Dictionary<string, string> UnmappedByTarget { get; set; } = new();
+    }
+
+    /// <summary>Per-project cache directory: under the project's own Library so
+    /// it lives and dies with the project and is naturally invalidated when the
+    /// user clears Library. Falls back to the OS temp dir for assemblies outside
+    /// the Unity layout (unit tests). Null only if even temp is unavailable.</summary>
+    private static string? PersistDir(string assemblyFullPath)
+    {
+        try
+        {
+            string normalized = assemblyFullPath.Replace('\\', '/');
+            int idx = normalized.LastIndexOf("/Library/ScriptAssemblies/", StringComparison.OrdinalIgnoreCase);
+            if (idx > 0)
+            {
+                string projectRoot = assemblyFullPath.Substring(0, idx);
+                return Path.Combine(projectRoot, "Library", "Locus", "CallerIndex");
+            }
+        }
+        catch
+        {
+        }
+        try
+        {
+            return Path.Combine(Path.GetTempPath(), "Locus", "CallerIndex");
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Stable per-assembly file name: sanitized assembly name plus a
+    /// path hash (disambiguates same-named assemblies sharing the temp fallback)
+    /// plus the format version (a bump orphans old files).</summary>
+    private static string PersistFileName(string assemblyFullPath)
+    {
+        string name = Path.GetFileNameWithoutExtension(assemblyFullPath);
+        var sanitized = new StringBuilder(name.Length);
+        foreach (char ch in name)
+            sanitized.Append(char.IsLetterOrDigit(ch) ? ch : '_');
+        byte[] digest = SHA1.HashData(Encoding.UTF8.GetBytes(assemblyFullPath.ToLowerInvariant()));
+        string hash = Convert.ToHexString(digest, 0, 6).ToLowerInvariant();
+        return $"{sanitized}-{hash}-v{PersistFormatVersion}.json";
+    }
+
+    private static Guid ReadAssemblyMvid(string assemblyFullPath)
+    {
+        using FileStream stream = File.OpenRead(assemblyFullPath);
+        using var peReader = new PEReader(stream);
+        MetadataReader reader = peReader.GetMetadataReader();
+        return reader.GetGuid(reader.GetModuleDefinition().Mvid);
+    }
+
+    private static AssemblyCallerIndex? TryLoadPersisted(string assemblyFullPath, DateTime lastWriteUtc, long length)
+    {
+        if (length < 0)
+            return null;
+        try
+        {
+            string? dir = PersistDir(assemblyFullPath);
+            if (dir == null)
+                return null;
+            string file = Path.Combine(dir, PersistFileName(assemblyFullPath));
+            if (!File.Exists(file))
+                return null;
+
+            PersistedCallerIndex? persisted =
+                JsonSerializer.Deserialize<PersistedCallerIndex>(File.ReadAllText(file), PersistJsonOptions);
+            if (persisted == null ||
+                persisted.FormatVersion != PersistFormatVersion ||
+                persisted.LastWriteUtcTicks != lastWriteUtc.Ticks ||
+                persisted.Length != length)
+            {
+                return null;
+            }
+
+            if (!Guid.TryParse(persisted.Mvid, out Guid persistedMvid) ||
+                persistedMvid != ReadAssemblyMvid(assemblyFullPath))
+            {
+                return null;
+            }
+
+            return new AssemblyCallerIndex
+            {
+                Path = assemblyFullPath,
+                LastWriteUtc = lastWriteUtc,
+                Length = length,
+                Mvid = persistedMvid,
+                TargetKeys = new HashSet<string>(persisted.TargetKeys ?? new List<string>(), StringComparer.Ordinal),
+                LocationsByTarget = new Dictionary<string, List<CallerScanLocation>>(
+                    persisted.LocationsByTarget ?? new(), StringComparer.Ordinal),
+                UnmappedByTarget = new Dictionary<string, string>(
+                    persisted.UnmappedByTarget ?? new(), StringComparer.Ordinal),
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void TrySavePersisted(AssemblyCallerIndex index)
+    {
+        // Never persist a failed build: a transient read/PDB error must not
+        // stick across restarts (re-deriving it is cheap).
+        if (index.Error != null || index.Length < 0)
+            return;
+        try
+        {
+            string? dir = PersistDir(index.Path);
+            if (dir == null)
+                return;
+            Directory.CreateDirectory(dir);
+            string file = Path.Combine(dir, PersistFileName(index.Path));
+
+            var persisted = new PersistedCallerIndex
+            {
+                FormatVersion = PersistFormatVersion,
+                LastWriteUtcTicks = index.LastWriteUtc.Ticks,
+                Length = index.Length,
+                Mvid = index.Mvid.ToString(),
+                TargetKeys = index.TargetKeys.ToList(),
+                LocationsByTarget = index.LocationsByTarget,
+                UnmappedByTarget = index.UnmappedByTarget,
+            };
+            string json = JsonSerializer.Serialize(persisted, PersistJsonOptions);
+
+            // Write-then-rename so a crash mid-write never leaves a torn file
+            // that the next load would reject (and rebuild) at best.
+            string tmp = file + ".tmp." + Guid.NewGuid().ToString("N");
+            File.WriteAllText(tmp, json);
+            File.Move(tmp, file, overwrite: true);
+        }
+        catch
+        {
+        }
+    }
+
     /// <summary>Is this reference path one of the project's own compiled
     /// assemblies (vs Unity/BCL references)?</summary>
     public static bool IsProjectAssemblyPath(string path)
@@ -56,48 +253,121 @@ public static class CallerScan
     public static CallerScanResult Scan(IEnumerable<string> assemblyPaths, IReadOnlyList<CallerScanTarget> targets)
     {
         var result = new CallerScanResult();
-        foreach (CallerScanTarget target in targets)
-            result.CallerFiles[CallerScanTarget.Key(target.DeclaringType, target.MemberName)] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        var memberTargets = new HashSet<(string Type, string Member)>();
-        var typeTargets = new HashSet<string>(StringComparer.Ordinal);
+        var targetKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (CallerScanTarget target in targets)
         {
-            if (string.IsNullOrEmpty(target.MemberName))
-                typeTargets.Add(target.DeclaringType);
-            else
-                memberTargets.Add((target.DeclaringType, target.MemberName));
+            string key = CallerScanTarget.Key(target.DeclaringType, target.MemberName);
+            targetKeys.Add(key);
+            result.CallerFiles[key] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            result.CallerLocations[key] = new List<CallerScanLocation>();
         }
 
         foreach (string assemblyPath in assemblyPaths)
         {
-            try
+            AssemblyCallerIndex index = GetOrBuildIndex(assemblyPath);
+            bool relevant = targetKeys.Any(key => index.TargetKeys.Contains(key));
+            if (index.Error != null && relevant)
             {
-                ScanAssembly(assemblyPath, memberTargets, typeTargets, result);
-            }
-            catch (Exception ex)
-            {
-                result.Error = "call-site scan failed for " + Path.GetFileName(assemblyPath) + ": " + ex.Message;
+                result.Error = index.Error;
                 return result;
             }
-            if (result.Error != null)
-                return result;
+
+            foreach (string key in targetKeys)
+            {
+                if (index.UnmappedByTarget.TryGetValue(key, out string? unmappedError))
+                {
+                    result.Error = unmappedError;
+                    return result;
+                }
+                if (!index.LocationsByTarget.TryGetValue(key, out List<CallerScanLocation>? locations))
+                    continue;
+                foreach (CallerScanLocation location in locations)
+                {
+                    result.CallerFiles[key].Add(location.File);
+                    if (!result.CallerLocations[key].Any(existing =>
+                            string.Equals(existing.File, location.File, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(existing.CallerMethodKey, location.CallerMethodKey, StringComparison.Ordinal)))
+                    {
+                        result.CallerLocations[key].Add(location);
+                    }
+                }
+            }
         }
 
         return result;
     }
 
-    private static void ScanAssembly(
-        string assemblyPath,
-        HashSet<(string Type, string Member)> memberTargets,
-        HashSet<string> typeTargets,
-        CallerScanResult result)
+    private static AssemblyCallerIndex GetOrBuildIndex(string assemblyPath)
+    {
+        FileInfo info = new(assemblyPath);
+        string fullPath = info.FullName;
+        DateTime lastWriteUtc = info.Exists ? info.LastWriteTimeUtc : DateTime.MinValue;
+        long length = info.Exists ? info.Length : -1;
+
+        lock (CacheLock)
+        {
+            if (Cache.TryGetValue(fullPath, out AssemblyCallerIndex? cached) &&
+                cached.LastWriteUtc == lastWriteUtc &&
+                cached.Length == length)
+            {
+                return cached;
+            }
+        }
+
+        // Persistent tier: a sidecar restart reloads the reverse graph from
+        // disk instead of re-walking every method body of a large assembly.
+        AssemblyCallerIndex? persisted = TryLoadPersisted(fullPath, lastWriteUtc, length);
+        if (persisted != null)
+        {
+            lock (CacheLock)
+            {
+                Cache[fullPath] = persisted;
+            }
+            return persisted;
+        }
+
+        AssemblyCallerIndex built;
+        try
+        {
+            built = BuildIndex(fullPath, lastWriteUtc, length);
+        }
+        catch (Exception ex)
+        {
+            built = new AssemblyCallerIndex
+            {
+                Path = fullPath,
+                LastWriteUtc = lastWriteUtc,
+                Length = length,
+                Error = "call-site scan failed for " + Path.GetFileName(assemblyPath) + ": " + ex.Message,
+            };
+        }
+
+        lock (CacheLock)
+        {
+            Cache[fullPath] = built;
+        }
+        TrySavePersisted(built);
+        return built;
+    }
+
+    private static AssemblyCallerIndex BuildIndex(string assemblyPath, DateTime lastWriteUtc, long length)
     {
         using FileStream stream = File.OpenRead(assemblyPath);
         using var peReader = new PEReader(stream);
         MetadataReader reader = peReader.GetMetadataReader();
+        ModuleDefinition module = reader.GetModuleDefinition();
 
-        // token (int) → target keys it represents.
+        var index = new AssemblyCallerIndex
+        {
+            Path = assemblyPath,
+            LastWriteUtc = lastWriteUtc,
+            Length = length,
+            Mvid = reader.GetGuid(module.Mvid),
+        };
+
+        // token (int) → target keys it represents. Unlike the old per-target
+        // pass, this maps every project-reference token once and caches the
+        // reverse caller graph until the assembly changes on disk.
         var tokenTargets = new Dictionary<int, List<string>>();
 
         void AddToken(EntityHandle handle, string key)
@@ -107,10 +377,13 @@ public static class CallerScan
                 tokenTargets[token] = keys = new List<string>();
             if (!keys.Contains(key))
                 keys.Add(key);
+            index.TargetKeys.Add(key);
         }
 
-        // External references (other project assemblies): MemberRefs whose
-        // parent TypeRef matches a target type.
+        // External references (other project assemblies): every MemberRef is a
+        // potential caller edge keyed by declaring type + member name. The
+        // existing M3 scan is intentionally overload-insensitive; the cached
+        // index keeps the same fail-closed over-approximation.
         foreach (MemberReferenceHandle memberRefHandle in reader.MemberReferences)
         {
             MemberReference memberRef = reader.GetMemberReference(memberRefHandle);
@@ -119,48 +392,31 @@ public static class CallerScan
                 continue;
 
             string memberName = reader.GetString(memberRef.Name);
-            if (memberTargets.Contains((parentType, memberName)))
-                AddToken(memberRefHandle, CallerScanTarget.Key(parentType, memberName));
-            if (typeTargets.Contains(parentType))
-                AddToken(memberRefHandle, CallerScanTarget.Key(parentType, ""));
+            AddToken(memberRefHandle, CallerScanTarget.Key(parentType, memberName));
+            AddToken(memberRefHandle, CallerScanTarget.Key(parentType, ""));
         }
 
         // Type references (castclass/isinst/typeof of a deleted type).
-        if (typeTargets.Count > 0)
+        foreach (TypeReferenceHandle typeRefHandle in reader.TypeReferences)
         {
-            foreach (TypeReferenceHandle typeRefHandle in reader.TypeReferences)
-            {
-                string? name = TypeRefFullName(reader, typeRefHandle);
-                if (name != null && typeTargets.Contains(name))
-                    AddToken(typeRefHandle, CallerScanTarget.Key(name, ""));
-            }
+            string? name = TypeRefFullName(reader, typeRefHandle);
+            if (name != null)
+                AddToken(typeRefHandle, CallerScanTarget.Key(name, ""));
         }
 
         // Same-assembly references: direct MethodDef/FieldDef/TypeDef tokens.
-        var selfTargetTypes = new HashSet<TypeDefinitionHandle>();
         foreach (TypeDefinitionHandle typeDefHandle in reader.TypeDefinitions)
         {
             string typeName = TypeDefFullName(reader, typeDefHandle);
-            bool wholeType = typeTargets.Contains(typeName);
-            bool hasMembers = memberTargets.Any(t => t.Type == typeName);
-            if (!wholeType && !hasMembers)
-                continue;
-
             TypeDefinition typeDef = reader.GetTypeDefinition(typeDefHandle);
-            if (wholeType)
-            {
-                selfTargetTypes.Add(typeDefHandle);
-                AddToken(typeDefHandle, CallerScanTarget.Key(typeName, ""));
-                foreach (FieldDefinitionHandle fieldHandle in typeDef.GetFields())
-                    AddToken(fieldHandle, CallerScanTarget.Key(typeName, ""));
-            }
+            AddToken(typeDefHandle, CallerScanTarget.Key(typeName, ""));
+            foreach (FieldDefinitionHandle fieldHandle in typeDef.GetFields())
+                AddToken(fieldHandle, CallerScanTarget.Key(typeName, ""));
             foreach (MethodDefinitionHandle methodHandle in typeDef.GetMethods())
             {
                 string methodName = reader.GetString(reader.GetMethodDefinition(methodHandle).Name);
-                if (memberTargets.Contains((typeName, methodName)))
-                    AddToken(methodHandle, CallerScanTarget.Key(typeName, methodName));
-                if (wholeType)
-                    AddToken(methodHandle, CallerScanTarget.Key(typeName, ""));
+                AddToken(methodHandle, CallerScanTarget.Key(typeName, methodName));
+                AddToken(methodHandle, CallerScanTarget.Key(typeName, ""));
             }
         }
 
@@ -182,24 +438,19 @@ public static class CallerScan
         }
 
         if (tokenTargets.Count == 0)
-            return;
+            return index;
 
         // PDB up-front: fail closed BEFORE reporting hits without locations.
         using MetadataReaderProvider? pdbProvider = OpenPortablePdb(assemblyPath, peReader, out string? pdbError);
         if (pdbProvider == null)
         {
-            result.Error = "cannot verify call sites: " + pdbError;
-            return;
+            index.Error = "cannot verify call sites: " + pdbError;
+            return index;
         }
         MetadataReader pdbReader = pdbProvider.GetMetadataReader();
 
         foreach (TypeDefinitionHandle typeDefHandle in reader.TypeDefinitions)
         {
-            // References from inside a deleted type don't count: the type
-            // goes away as a whole.
-            if (selfTargetTypes.Contains(typeDefHandle))
-                continue;
-
             TypeDefinition typeDef = reader.GetTypeDefinition(typeDefHandle);
             foreach (MethodDefinitionHandle methodHandle in typeDef.GetMethods())
             {
@@ -225,22 +476,44 @@ public static class CallerScan
                     continue;
 
                 string? file = SourceFileOf(reader, pdbReader, methodHandle);
-                if (file == null)
-                {
-                    result.Error =
-                        "cannot map a call site to its source file (no sequence points for " +
-                        TypeDefFullName(reader, typeDefHandle) + "." + reader.GetString(methodDef.Name) +
-                        " in " + Path.GetFileName(assemblyPath) + ")";
-                    return;
-                }
-
+                string callerType = TypeDefFullName(reader, typeDefHandle);
+                string callerName = reader.GetString(methodDef.Name);
+                string callerKey = CallerMethodKey(reader, callerType, methodDef);
                 foreach (string key in hits)
                 {
-                    if (result.CallerFiles.TryGetValue(key, out HashSet<string>? files))
-                        files.Add(file);
+                    // References from inside a deleted type don't count: the
+                    // type goes away as a whole. The cached index is global,
+                    // so apply that rule per emitted whole-type key.
+                    if (string.Equals(key, CallerScanTarget.Key(callerType, ""), StringComparison.Ordinal))
+                        continue;
+                    if (file == null)
+                    {
+                        index.UnmappedByTarget.TryAdd(
+                            key,
+                            "cannot map a call site to its source file (no sequence points for " +
+                            callerType + "." + callerName +
+                            " in " + Path.GetFileName(assemblyPath) + ")");
+                        continue;
+                    }
+                    if (!index.LocationsByTarget.TryGetValue(key, out List<CallerScanLocation>? locations))
+                        index.LocationsByTarget[key] = locations = new List<CallerScanLocation>();
+                    if (!locations.Any(existing =>
+                            string.Equals(existing.File, file, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(existing.CallerMethodKey, callerKey, StringComparison.Ordinal)))
+                    {
+                        locations.Add(new CallerScanLocation
+                        {
+                            File = file,
+                            CallerMethodKey = callerKey,
+                            DeclaringType = callerType,
+                            MemberName = callerName,
+                        });
+                    }
                 }
             }
         }
+
+        return index;
     }
 
     // ── IL walk ──────────────────────────────────────────────────────
@@ -436,6 +709,32 @@ public static class CallerScan
             return TypeDefFullName(reader, declaring) + "+" + name;
         string ns = typeDef.Namespace.IsNil ? "" : reader.GetString(typeDef.Namespace);
         return ns.Length == 0 ? name : ns + "." + name;
+    }
+
+    /// <summary>
+    /// Caller refresh only needs a stable method identity inside the source
+    /// file, so use declaring type + metadata name + parameter COUNT +
+    /// static/instance. When a source file has ambiguous overloads with the
+    /// same count, the force-detour phase fails that file closed.
+    /// </summary>
+    private static string CallerMethodKey(MetadataReader reader, string declaringType, MethodDefinition method)
+    {
+        string name = reader.GetString(method.Name);
+        int parameterCount = 0;
+        try
+        {
+            BlobReader blob = reader.GetBlobReader(method.Signature);
+            SignatureHeader header = blob.ReadSignatureHeader();
+            if (header.IsGeneric)
+                blob.ReadCompressedInteger();
+            parameterCount = blob.ReadCompressedInteger();
+        }
+        catch
+        {
+            parameterCount = method.GetParameters().Count;
+        }
+        bool isStatic = (method.Attributes & System.Reflection.MethodAttributes.Static) != 0;
+        return declaringType + "|" + name + "|" + parameterCount + (isStatic ? "|s" : "|i");
     }
 
     // ── PDB ──────────────────────────────────────────────────────────

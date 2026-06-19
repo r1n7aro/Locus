@@ -949,6 +949,47 @@ public static class PatchRewriter
             }
         }
 
+        // ── calls to CHANGED static methods in this batch → patch copy ─
+        // Release inline caller refresh compiles an unchanged caller together
+        // with the current callee diff. Without this narrow rewrite, the
+        // caller's type reference rewrite points back at the original callee
+        // and Mono can inline the stale body into the refreshed caller.
+        if (batch.PatchedMethods.Count > 0)
+        {
+            foreach (InvocationExpressionSyntax invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (InStrippedSpan(invocation) || dynamicReplacements.ContainsKey(invocation))
+                    continue;
+                if (!TryResolvePatchedMethodTarget(
+                    model.GetSymbolInfo(invocation), batch,
+                    out PatchedMethodTarget? target))
+                {
+                    continue;
+                }
+
+                PatchedMethodTarget capturedTarget = target;
+                if (!target.HasSelf)
+                {
+                    // Static callee → bind to the patch copy directly.
+                    dynamicReplacements[invocation] = rewrittenNode =>
+                        BuildPatchedMethodInvocation((InvocationExpressionSyntax)rewrittenNode, capturedTarget);
+                    continue;
+                }
+
+                // Instance callee → bind to the static self-shim, passing the
+                // receiver as `self`. Receiver shapes the shim cannot express
+                // (`base.M` has no base argument; `obj?.M()` would lose the
+                // null-propagation) keep the original call: it is still hot via
+                // the normal detour and converges fully at the queued recompile.
+                if (!PatchedInstanceReceiverExpressible(invocation.Expression))
+                    continue;
+                ShimTarget? enclosingAdded = EnclosingAddedTarget(invocation);
+                dynamicReplacements[invocation] = rewrittenNode =>
+                    BuildPatchedInstanceInvocation(
+                        (InvocationExpressionSyntax)rewrittenNode, capturedTarget, enclosingAdded);
+            }
+        }
+
         // ── calls to ADDED members → direct shim calls (M2) ──────────
         foreach (InvocationExpressionSyntax invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
@@ -1231,6 +1272,14 @@ public static class PatchRewriter
 
                 foreach (var (_, target) in group)
                 {
+                    // Inline-redirect self-shims are internal batch targets, not
+                    // user surface: the method is emitted (above) but it must NOT
+                    // register in the MemberSurfaceRegistry or take a re-edit
+                    // continuity detour — its only callers are the same batch's
+                    // refreshed bodies, rewritten by name.
+                    if (target.IsInlineRedirectShim)
+                        continue;
+
                     result.ShimRegistrations.Add(new ShimRegistration
                     {
                         MemberKey = target.MemberKey,
@@ -1676,6 +1725,28 @@ public static class PatchRewriter
     /// no cell for declaration-site type loading yet. Patch-materialized
     /// surface (added members/fields, appended enum members, new types) is
     /// always exempt.</summary>
+    /// <summary>Caps gate for a Release inline caller-refresh self-shim clone
+    /// (Option A), callable from <c>PatchBatchContext.Build</c> without exposing
+    /// the private added-field bookkeeping. A clone re-emits a CHANGED instance
+    /// method's body as a static self-shim, so it adds no fields — the empty
+    /// added-field map is correct, and conservatively treats any same-batch
+    /// added field the body touches as a capped access (safe: a violation only
+    /// drops the optimization, never fails the patch). Returns the violation
+    /// reason, or null when the shim is safe to emit.</summary>
+    internal static string? FindInlineShimAccessViolation(
+        IMethodSymbol method,
+        SyntaxNode bodyNode,
+        SemanticModel model,
+        PatchBatchContext batch,
+        HashSet<INamedTypeSymbol> renamedSymbols)
+        => FindShimAccessViolation(
+            method,
+            bodyNode,
+            model,
+            batch,
+            new Dictionary<IFieldSymbol, AddedFieldInfo>(SymbolEqualityComparer.Default),
+            renamedSymbols);
+
     private static string? FindShimAccessViolation(
         IMethodSymbol declared,
         SyntaxNode bodyNode,
@@ -3842,6 +3913,28 @@ public static class PatchRewriter
         return false;
     }
 
+    private static bool TryResolvePatchedMethodTarget(
+        SymbolInfo info,
+        PatchBatchContext batch,
+        out PatchedMethodTarget target)
+    {
+        if (info.Symbol is IMethodSymbol direct &&
+            batch.PatchedMethods.TryGetValue(direct.OriginalDefinition, out target!))
+        {
+            return true;
+        }
+        foreach (ISymbol candidate in info.CandidateSymbols)
+        {
+            if (candidate is IMethodSymbol method &&
+                batch.PatchedMethods.TryGetValue(method.OriginalDefinition, out target!))
+            {
+                return true;
+            }
+        }
+        target = null!;
+        return false;
+    }
+
     /// <summary>Explicit type arguments for a shim call whose target carries
     /// METHOD type parameters (B1): the original call's explicit/inferred
     /// arguments cannot be partially re-applied to the flattened
@@ -3946,6 +4039,68 @@ public static class PatchRewriter
 
         return SyntaxFactory.InvocationExpression(
                 SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName + typeArgumentText),
+                SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(arguments)))
+            .WithTriviaFrom(rewrittenInvocation);
+    }
+
+    private static SyntaxNode BuildPatchedMethodInvocation(
+        InvocationExpressionSyntax rewrittenInvocation,
+        PatchedMethodTarget target)
+    {
+        return SyntaxFactory.InvocationExpression(
+                SyntaxFactory.ParseExpression(target.PatchTypeFqn + "." + target.MethodName),
+                rewrittenInvocation.ArgumentList)
+            .WithTriviaFrom(rewrittenInvocation);
+    }
+
+    /// <summary>Receiver shapes the instance self-shim redirect can express:
+    /// an explicit or `this`/implicit receiver. `base.M` (no base argument) and
+    /// `obj?.M()` (null-propagation) are not expressible — the original call is
+    /// kept (still hot via the normal detour; converges at recompile).</summary>
+    private static bool PatchedInstanceReceiverExpressible(ExpressionSyntax invocationExpression) =>
+        invocationExpression switch
+        {
+            MemberAccessExpressionSyntax ma => ma.Expression is not BaseExpressionSyntax,
+            MemberBindingExpressionSyntax => false,
+            SimpleNameSyntax => true,
+            _ => false,
+        };
+
+    /// <summary>`recv.M(args)` / `M(args)` → `Foo__LocusShims.&lt;shim&gt;(self,
+    /// args)`, where the inlined callee's CHANGED body lives in the self-shim.
+    /// `self` mirrors AccessorSelfArgument: an explicit receiver passes through;
+    /// `this`/implicit becomes `self` inside another shim or `((Foo)(object)this)`
+    /// in a kept body; value-type receivers go by `ref`.</summary>
+    private static SyntaxNode BuildPatchedInstanceInvocation(
+        InvocationExpressionSyntax rewrittenInvocation,
+        PatchedMethodTarget target,
+        ShimTarget? enclosingAdded)
+    {
+        ExpressionSyntax? rewrittenReceiver = rewrittenInvocation.Expression is MemberAccessExpressionSyntax memberAccess
+            ? memberAccess.Expression
+            : null;
+
+        ExpressionSyntax selfExpression;
+        if (rewrittenReceiver == null || rewrittenReceiver is ThisExpressionSyntax)
+        {
+            selfExpression = enclosingAdded != null
+                ? SyntaxFactory.IdentifierName("self")
+                : SyntaxFactory.ParseExpression("((" + target.DeclaringTypeFqn + ")(object)this)");
+        }
+        else
+        {
+            selfExpression = rewrittenReceiver.WithoutTrivia();
+        }
+
+        ArgumentSyntax selfArgument = SyntaxFactory.Argument(selfExpression);
+        if (target.SelfIsValueType && !target.SelfIsRefLike)
+            selfArgument = selfArgument.WithRefKindKeyword(SyntaxFactory.Token(SyntaxKind.RefKeyword));
+
+        var arguments = new List<ArgumentSyntax> { selfArgument };
+        arguments.AddRange(rewrittenInvocation.ArgumentList.Arguments);
+
+        return SyntaxFactory.InvocationExpression(
+                SyntaxFactory.ParseExpression(target.ShimTypeFqn + "." + target.MethodName),
                 SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(arguments)))
             .WithTriviaFrom(rewrittenInvocation);
     }

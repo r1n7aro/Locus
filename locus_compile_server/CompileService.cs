@@ -151,6 +151,37 @@ public sealed class HotDiffFileDto
     public string? NewText { get; set; }
 }
 
+public sealed class ForceDetourDto
+{
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    /// <summary>
+    /// CallerScan caller method keys:
+    /// DeclaringType|MetadataName|ParameterCount|s/i.
+    /// </summary>
+    [JsonPropertyName("methodKeys")]
+    public string[]? MethodKeys { get; set; }
+}
+
+public sealed class CallerQueryTargetDto
+{
+    [JsonPropertyName("declaringType")]
+    public string? DeclaringType { get; set; }
+
+    [JsonPropertyName("memberName")]
+    public string? MemberName { get; set; }
+}
+
+public sealed class CallerQueryRequestDto
+{
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+
+    [JsonPropertyName("targets")]
+    public CallerQueryTargetDto[]? Targets { get; set; }
+}
+
 public sealed class AnalyzeHotDiffRequestDto
 {
     [JsonPropertyName("files")]
@@ -229,6 +260,14 @@ public sealed class CompileHotPatchRequestDto
     /// closed through the completeness gate.</summary>
     [JsonPropertyName("baselineSiblings")]
     public BaselineSiblingDto[]? BaselineSiblings { get; set; }
+
+    /// <summary>
+    /// Release-inline caller refresh: compile these unchanged caller files and
+    /// detour only the listed caller methods, so stale inlined call sites can
+    /// be refreshed without rehooking a whole file.
+    /// </summary>
+    [JsonPropertyName("forceDetours")]
+    public ForceDetourDto[]? ForceDetours { get; set; }
 }
 
 /// <summary>One candidate sibling part file (B6): current disk text only —
@@ -280,7 +319,7 @@ public sealed class CompileAccessProbeRequestDto
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 5;
+    public const int ProtocolVersion = 6;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -636,6 +675,352 @@ public sealed class CompileService
         };
     }
 
+    private static Dictionary<string, HashSet<string>> ForceDetourMap(ForceDetourDto[]? forceDetours)
+    {
+        var map = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (ForceDetourDto force in forceDetours ?? Array.Empty<ForceDetourDto>())
+        {
+            if (string.IsNullOrWhiteSpace(force.Path))
+                continue;
+            string key = NormalizePathKey(force.Path!);
+            if (!map.TryGetValue(key, out HashSet<string>? methods))
+                map[key] = methods = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string methodKey in force.MethodKeys ?? Array.Empty<string>())
+            {
+                if (!string.IsNullOrWhiteSpace(methodKey))
+                    methods.Add(methodKey);
+            }
+        }
+        return map;
+    }
+
+    private sealed class ForcedMethodKey
+    {
+        public string DeclaringType = "";
+        public string Name = "";
+        public int ParameterCount;
+        public bool IsStatic;
+    }
+
+    private static ForcedMethodKey? ParseForcedMethodKey(string key)
+    {
+        string[] parts = key.Split('|');
+        if (parts.Length != 4)
+            return null;
+        if (!int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int parameterCount))
+            return null;
+        return new ForcedMethodKey
+        {
+            DeclaringType = parts[0],
+            Name = parts[1],
+            ParameterCount = parameterCount,
+            IsStatic = string.Equals(parts[3], "s", StringComparison.Ordinal),
+        };
+    }
+
+    private static void ApplyForcedDetours(
+        string path,
+        string newText,
+        CSharpParseOptions parseOptions,
+        HotDiffFileResult diff,
+        HashSet<string> methodKeys)
+    {
+        if (methodKeys.Count == 0)
+            return;
+
+        CompilationUnitSyntax root;
+        try
+        {
+            root = CSharpSyntaxTree.ParseText(newText, parseOptions, path: path)
+                .GetCompilationUnitRoot();
+        }
+        catch (Exception ex)
+        {
+            diff.Hot = false;
+            diff.Reasons.Add("inline caller refresh could not parse " + path + ": " + ex.Message);
+            return;
+        }
+
+        var existing = new HashSet<string>(
+            diff.ChangedMethods.Select(m => ForceKey(m.DeclaringType, m.Name, m.ParamTypeNames.Length, m.IsStatic)),
+            StringComparer.Ordinal);
+
+        foreach (string rawKey in methodKeys)
+        {
+            ForcedMethodKey? key = ParseForcedMethodKey(rawKey);
+            if (key == null)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh received malformed method key: " + rawKey);
+                return;
+            }
+
+            var matches = new List<(TypeDeclarationSyntax Host, MemberDeclarationSyntax Member, HotDiffMethod Method)>();
+            foreach (TypeDeclarationSyntax type in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                string metadataName = HotDiff.MetadataName(type);
+                if (!string.Equals(metadataName, key.DeclaringType, StringComparison.Ordinal))
+                    continue;
+
+                foreach (MemberDeclarationSyntax member in type.Members)
+                {
+                    HotDiffMethod? method = ForcedMethodForMember(metadataName, member, key);
+                    if (method != null)
+                        matches.Add((type, member, method));
+                }
+            }
+
+            if (matches.Count == 0)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh could not find " + rawKey + " in " + path);
+                return;
+            }
+            if (matches.Count > 1)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh found ambiguous overloads for " + rawKey + " in " + path);
+                return;
+            }
+
+            var (host, memberDecl, forcedMethod) = matches[0];
+            string? gate = ForcedDetourGate(host, memberDecl, forcedMethod);
+            if (gate != null)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add(gate);
+                return;
+            }
+
+            string forceKey = ForceKey(
+                forcedMethod.DeclaringType,
+                forcedMethod.Name,
+                forcedMethod.ParamTypeNames.Length,
+                forcedMethod.IsStatic);
+            if (existing.Add(forceKey))
+                diff.ChangedMethods.Add(forcedMethod);
+            if (!diff.PatchedTypes.Contains(forcedMethod.DeclaringType, StringComparer.Ordinal))
+                diff.PatchedTypes.Add(forcedMethod.DeclaringType);
+        }
+
+        diff.PatchedTypes = diff.PatchedTypes.Distinct(StringComparer.Ordinal).OrderBy(t => t, StringComparer.Ordinal).ToList();
+    }
+
+    private static string ForceKey(string declaringType, string name, int parameterCount, bool isStatic) =>
+        declaringType + "|" + name + "|" + parameterCount + (isStatic ? "|s" : "|i");
+
+    /// <summary>Release inline caller-refresh, instance arm (Option A): for each
+    /// CHANGED instance method eligible for the self-shim redirect, inject a
+    /// uniquely-named clone into its type in the new-side tree and a synthetic
+    /// ADDED diff entry, so the existing M2 shim pipeline emits a static
+    /// self-shim while the original method keeps its normal detour. Returns the
+    /// clone specs so <c>PatchBatchContext.Build</c> can gate them on the access
+    /// caps and wire the original method's in-batch call sites to the shim.
+    /// <para>Static callees already redirect unconditionally (cheap table
+    /// entry); the instance arm runs only in refresh compiles (force detours
+    /// present), where alone a same-batch caller exists to inline into — a
+    /// normal edit has no in-batch caller, so the extra shim would be dead
+    /// weight.</para>
+    /// Mutates <paramref name="batchFiles"/> trees and diffs in place.</summary>
+    private static List<InlineRedirectClone> BuildInlineRedirectClones(
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        CSharpParseOptions parseOptions)
+    {
+        var clones = new List<InlineRedirectClone>();
+        for (int i = 0; i < batchFiles.Count; i++)
+        {
+            var (path, tree, diff) = batchFiles[i];
+            var root = (CompilationUnitSyntax)tree.GetRoot();
+
+            var additions = new Dictionary<TypeDeclarationSyntax, List<MethodDeclarationSyntax>>();
+            var pending = new List<(HotDiffMethod Clone, HotDiffMethod Original)>();
+            int counter = 0;
+
+            foreach (HotDiffMethod changed in diff.ChangedMethods.Where(m => !m.Added).ToList())
+            {
+                if (changed.IsCtor || changed.IsStatic || changed.TypeParameterCount != 0)
+                    continue;
+                MethodDeclarationSyntax? decl = PatchBatchContext.FindAddedMethodDeclaration(root, changed);
+                if (decl == null || !IsInlineCloneEligible(decl))
+                    continue;
+                if (decl.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault() is not TypeDeclarationSyntax host)
+                    continue;
+
+                string cloneName = changed.Name + "__LocusInline_" + counter++;
+                MethodDeclarationSyntax clone = decl
+                    .WithIdentifier(SyntaxFactory.Identifier(cloneName))
+                    .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+                if (!additions.TryGetValue(host, out List<MethodDeclarationSyntax>? list))
+                    additions[host] = list = new List<MethodDeclarationSyntax>();
+                list.Add(clone);
+
+                pending.Add((
+                    new HotDiffMethod
+                    {
+                        DeclaringType = changed.DeclaringType,
+                        Name = cloneName,
+                        ParamTypeNames = changed.ParamTypeNames,
+                        IsStatic = false,
+                        IsCtor = false,
+                        Added = true,
+                        TypeParameterCount = 0,
+                    },
+                    changed));
+            }
+
+            if (additions.Count == 0)
+                continue;
+
+            // computeReplacement receives the node with its descendants already
+            // rewritten — add to THAT so a clone in a nested type isn't lost
+            // when its outer type is also rewritten.
+            CompilationUnitSyntax newRoot = root.ReplaceNodes(
+                additions.Keys,
+                (original, rewritten) => ((TypeDeclarationSyntax)rewritten).AddMembers(additions[original].ToArray()));
+            batchFiles[i] = (path, CSharpSyntaxTree.Create(newRoot, parseOptions, path), diff);
+
+            foreach (var (cloneDiff, original) in pending)
+            {
+                diff.ChangedMethods.Add(cloneDiff);
+                clones.Add(new InlineRedirectClone { FilePath = path, Original = original, Clone = cloneDiff });
+            }
+        }
+        return clones;
+    }
+
+    /// <summary>An instance method whose changed body may be re-emitted as a
+    /// static self-shim: it must have a body, carry no method type parameters,
+    /// not be virtual/override/abstract/extern/partial/static or an explicit
+    /// interface impl (virtual dispatch and bodiless members can't be flattened
+    /// to a dispatch-free shim), and live in a non-interface, non-generic,
+    /// non-ref-struct type (the `((Foo)(object)this)` self-cast needs a boxable
+    /// reference identity for the implicit-receiver case).</summary>
+    private static bool IsInlineCloneEligible(MethodDeclarationSyntax decl)
+    {
+        if (decl.Body == null && decl.ExpressionBody == null)
+            return false;
+        if (decl.TypeParameterList is { Parameters.Count: > 0 })
+            return false;
+        if (decl.ExplicitInterfaceSpecifier != null)
+            return false;
+        foreach (SyntaxToken modifier in decl.Modifiers)
+        {
+            if (modifier.IsKind(SyntaxKind.VirtualKeyword) ||
+                modifier.IsKind(SyntaxKind.OverrideKeyword) ||
+                modifier.IsKind(SyntaxKind.AbstractKeyword) ||
+                modifier.IsKind(SyntaxKind.ExternKeyword) ||
+                modifier.IsKind(SyntaxKind.PartialKeyword) ||
+                modifier.IsKind(SyntaxKind.StaticKeyword))
+            {
+                return false;
+            }
+        }
+        foreach (TypeDeclarationSyntax type in decl.Ancestors().OfType<TypeDeclarationSyntax>())
+        {
+            if (type is InterfaceDeclarationSyntax)
+                return false;
+            if (type.TypeParameterList is { Parameters.Count: > 0 })
+                return false;
+            // Value types are deferred: a `ref self` shim cannot bind a temp
+            // receiver (`new S().M()`) and a by-value self would drop `this`
+            // mutations. Such edits converge via the queued recompile. (Build
+            // re-checks IsValueType at the symbol level for record structs.)
+            if (type is StructDeclarationSyntax)
+                return false;
+        }
+        return true;
+    }
+
+    private static HotDiffMethod? ForcedMethodForMember(
+        string metadataName,
+        MemberDeclarationSyntax member,
+        ForcedMethodKey key)
+    {
+        switch (member)
+        {
+            case MethodDeclarationSyntax method when
+                string.Equals(method.Identifier.Text, key.Name, StringComparison.Ordinal) &&
+                method.ParameterList.Parameters.Count == key.ParameterCount &&
+                method.Modifiers.Any(SyntaxKind.StaticKeyword) == key.IsStatic:
+                return new HotDiffMethod
+                {
+                    DeclaringType = metadataName,
+                    Name = method.Identifier.Text,
+                    ParamTypeNames = HotDiff.ParamTypeNames(method.ParameterList),
+                    ParamTypeSigs = HotDiff.ParamTypeSigs(method.ParameterList),
+                    IsStatic = key.IsStatic,
+                    IsCtor = false,
+                    Added = false,
+                };
+            case ConstructorDeclarationSyntax ctor when
+                string.Equals(key.Name, ".ctor", StringComparison.Ordinal) &&
+                ctor.ParameterList.Parameters.Count == key.ParameterCount &&
+                !key.IsStatic:
+                return new HotDiffMethod
+                {
+                    DeclaringType = metadataName,
+                    Name = ".ctor",
+                    ParamTypeNames = HotDiff.ParamTypeNames(ctor.ParameterList),
+                    ParamTypeSigs = HotDiff.ParamTypeSigs(ctor.ParameterList),
+                    IsStatic = false,
+                    IsCtor = true,
+                    Added = false,
+                };
+            default:
+                return null;
+        }
+    }
+
+    private static string? ForcedDetourGate(
+        TypeDeclarationSyntax host,
+        MemberDeclarationSyntax member,
+        HotDiffMethod method)
+    {
+        string Reason(string why) =>
+            "inline caller refresh cannot re-detour " + method.DeclaringType + "." + method.Name +
+            ": " + why + "; use unity_recompile";
+
+        if (host is InterfaceDeclarationSyntax)
+            return Reason("interface members are not supported");
+
+        for (SyntaxNode? current = host; current != null; current = current.Parent)
+        {
+            if (current is TypeDeclarationSyntax type && (type.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                return Reason("generic type members are not supported");
+        }
+
+        if (HasBurstCompileAttributeText(host.AttributeLists) || HasBurstCompileAttributeText(member.AttributeLists))
+            return Reason("Burst-compiled members are not supported");
+
+        switch (member)
+        {
+            case MethodDeclarationSyntax methodDecl:
+                if (methodDecl.TypeParameterList != null && methodDecl.TypeParameterList.Parameters.Count > 0)
+                    return Reason("generic methods are not supported");
+                if (methodDecl.ExplicitInterfaceSpecifier != null)
+                    return Reason("explicit interface implementations are not supported");
+                if (methodDecl.Body == null && methodDecl.ExpressionBody == null)
+                    return Reason("the method has no body");
+                break;
+            case ConstructorDeclarationSyntax ctor:
+                if (ctor.Modifiers.Any(SyntaxKind.StaticKeyword))
+                    return Reason("static constructors are not supported");
+                if (ctor.Body == null && ctor.ExpressionBody == null)
+                    return Reason("the constructor has no body");
+                break;
+            default:
+                return Reason("only methods and instance constructors are supported");
+        }
+
+        return null;
+    }
+
+    private static bool HasBurstCompileAttributeText(SyntaxList<AttributeListSyntax> attributes) =>
+        attributes.SelectMany(list => list.Attributes)
+            .Any(attribute => attribute.Name.ToString().Contains("BurstCompile", StringComparison.Ordinal));
+
     /// <summary>
     /// Full hot-patch pipeline: diff every file (same classification as
     /// analyze/hotDiff), rewrite the hot ones (PatchRewriter), and compile a
@@ -681,6 +1066,7 @@ public sealed class CompileService
         var syntaxErrors = new StringBuilder();
         var coldFiles = new JsonArray();
         bool anyCold = false;
+        Dictionary<string, HashSet<string>> forceDetours = ForceDetourMap(request.ForceDetours);
 
         foreach (HotDiffFileDto file in request.Files)
         {
@@ -695,6 +1081,8 @@ public sealed class CompileService
                 syntaxErrors.Append(diff.SyntaxError);
                 continue;
             }
+            if (forceDetours.TryGetValue(NormalizePathKey(file.Path!), out HashSet<string>? methodKeys))
+                ApplyForcedDetours(file.Path!, file.NewText, parseOptions, diff, methodKeys);
             if (!diff.Hot)
             {
                 anyCold = true;
@@ -785,13 +1173,23 @@ public sealed class CompileService
         // source declaration would shadow the metadata type that this
         // batch's re-sent earlier fields still bind to — CS0117).
         string storeDiscriminator = assemblyName[(assemblyName.LastIndexOf('_') + 1)..];
+
+        // Release inline caller-refresh (instance arm): in a refresh compile the
+        // force-detoured callers are in this batch, so a CHANGED instance method
+        // they inline must be reachable through a static self-shim. Inject the
+        // clones into batchFiles BEFORE binding so both the Build model and the
+        // per-file rewrite see them; Build gates each on the access caps.
+        List<InlineRedirectClone>? inlineClones =
+            forceDetours.Count > 0 ? BuildInlineRedirectClones(batchFiles, parseOptions) : null;
+
         PatchBatchContext batch = PatchBatchContext.Build(
             batchFiles, references,
             _memberSurfaceRegistry.SnapshotFor(generation),
             _fieldStoreRegistry.SnapshotFor(generation),
             storeDiscriminator,
             allowUnsafe: request.Params?.AllowUnsafe ?? false,
-            runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells));
+            runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells),
+            inlineClones: inlineClones);
 
         // B6 fail-closed gate: every batch-declared partial type must
         // account, across its disk parts, for every member the ORIGINAL
@@ -847,6 +1245,11 @@ public sealed class CompileService
                     ["paramTypeSigs"] = new JsonArray(map.ParamTypeSigs.Select(p => (JsonNode)p).ToArray()),
                     ["isStatic"] = map.IsStatic,
                     ["isCtor"] = map.IsCtor,
+                    // The edited file whose rewrite produced this detour. The
+                    // desktop maps a returned inlined MethodKey back to this path
+                    // to queue only the affected file(s) for recompile
+                    // convergence, instead of the whole batch.
+                    ["sourcePath"] = filePath,
                 };
                 if (map.OriginalAssembly != null)
                     method["originalAssembly"] = map.OriginalAssembly;
@@ -1052,6 +1455,83 @@ public sealed class CompileService
         }
         result["cells"] = cells;
         return result;
+    }
+
+    public JsonNode HandleCallerQuery(JsonNode? @params)
+    {
+        var request = Deserialize<CallerQueryRequestDto>(@params);
+        if (request.Targets == null || request.Targets.Length == 0)
+            throw new RpcInvalidParamsException("caller/query requires at least one target");
+
+        var projectAssemblies = (request.Params?.ReferencePaths ?? Array.Empty<string>())
+            .Where(CallerScan.IsProjectAssemblyPath)
+            .ToList();
+        if (projectAssemblies.Count == 0)
+        {
+            return new JsonObject
+            {
+                ["success"] = false,
+                ["error"] = "cannot query callers: no project assemblies (Library/ScriptAssemblies) in the reference set",
+            };
+        }
+
+        var targets = new List<CallerScanTarget>();
+        foreach (CallerQueryTargetDto target in request.Targets)
+        {
+            if (string.IsNullOrWhiteSpace(target.DeclaringType))
+                throw new RpcInvalidParamsException("caller/query targets require declaringType");
+            targets.Add(new CallerScanTarget
+            {
+                DeclaringType = target.DeclaringType!,
+                MemberName = target.MemberName ?? "",
+            });
+        }
+
+        CallerScanResult scan = CallerScan.Scan(projectAssemblies, targets);
+        if (scan.Error != null)
+        {
+            return new JsonObject
+            {
+                ["success"] = false,
+                ["error"] = scan.Error,
+            };
+        }
+
+        var targetJson = new JsonArray();
+        foreach (CallerScanTarget target in targets)
+        {
+            string key = CallerScanTarget.Key(target.DeclaringType, target.MemberName);
+            var callers = new JsonArray();
+            if (scan.CallerLocations.TryGetValue(key, out List<CallerScanLocation>? locations))
+            {
+                foreach (CallerScanLocation location in locations
+                    .OrderBy(l => l.File, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(l => l.CallerMethodKey, StringComparer.Ordinal))
+                {
+                    callers.Add(new JsonObject
+                    {
+                        ["file"] = location.File,
+                        ["methodKey"] = location.CallerMethodKey,
+                        ["declaringType"] = location.DeclaringType,
+                        ["memberName"] = location.MemberName,
+                    });
+                }
+            }
+            targetJson.Add(new JsonObject
+            {
+                ["declaringType"] = target.DeclaringType,
+                ["memberName"] = target.MemberName,
+                ["key"] = key,
+                ["callers"] = callers,
+            });
+        }
+
+        return new JsonObject
+        {
+            ["success"] = true,
+            ["assemblyCount"] = projectAssemblies.Count,
+            ["targets"] = targetJson,
+        };
     }
 
     /// <summary>Run the M3 caller scan for the batch's pending checks.

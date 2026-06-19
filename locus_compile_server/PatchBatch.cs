@@ -38,6 +38,59 @@ public sealed class ShimTarget
 
     /// <summary>Member identity across batches (original member shape).</summary>
     public string MemberKey = "";
+
+    /// <summary>Set for the synthetic self-shim of a CHANGED INSTANCE method
+    /// emitted only as a Release inline caller-refresh direct-call target
+    /// (Option A source clone). Such shims are internal to the batch: they are
+    /// NOT user surface, so they skip the MemberSurfaceRegistry registration
+    /// and the re-edit continuity detour the ADDED-member shims get.</summary>
+    public bool IsInlineRedirectShim;
+}
+
+/// <summary>Where calls to one CHANGED method in the same batch should bind so
+/// a refreshed caller's body invokes the CURRENT patch copy instead of letting
+/// Mono re-inline the stale original (Release inline caller refresh).
+/// <para>Static methods bind directly to the patch copy
+/// (<see cref="PatchTypeFqn"/>.<see cref="MethodName"/>(args)). Instance
+/// methods cannot — the patch copy is a distinct type that can't be invoked on
+/// the original receiver — so they bind to a static self-shim
+/// (<see cref="ShimTypeFqn"/>.<see cref="MethodName"/>(self, args)), the same
+/// shape the ADDED-member machinery uses.</para></summary>
+public sealed class PatchedMethodTarget
+{
+    /// <summary>Static form: the patch copy type FQN. Empty for instance.</summary>
+    public string PatchTypeFqn = "";
+
+    /// <summary>Method (static form) or self-shim (instance form) name to call.</summary>
+    public string MethodName = "";
+
+    /// <summary>Instance form: prepend the receiver as the shim's `self`
+    /// argument; the call binds to <see cref="ShimTypeFqn"/>.</summary>
+    public bool HasSelf;
+
+    /// <summary>Instance form: the static self-shim host class FQN
+    /// (`global::Ns.Foo__LocusShims`).</summary>
+    public string? ShimTypeFqn;
+
+    /// <summary>Instance form: the original declaring type FQN, for the
+    /// `((global::Ns.Foo)(object)this)` cast when the receiver is `this`.</summary>
+    public string DeclaringTypeFqn = "";
+
+    public bool SelfIsValueType;
+    public bool SelfIsRefLike;
+}
+
+/// <summary>One Release inline caller-refresh self-shim clone of a CHANGED
+/// instance method (Option A): a uniquely-named copy injected into the new-side
+/// tree BEFORE binding, so the existing ADDED-member shim pipeline turns it
+/// into a `static R Name(this Foo self, ...)` shim while the original method
+/// keeps its normal detour. <see cref="Original"/> identifies the method whose
+/// in-batch call sites redirect to the clone's shim.</summary>
+public sealed class InlineRedirectClone
+{
+    public string FilePath = "";
+    public HotDiffMethod Original = null!;
+    public HotDiffMethod Clone = null!;
 }
 
 /// <summary>C0 measured (operation × visibility) JIT access matrix, projected
@@ -100,6 +153,12 @@ public sealed class PatchBatchContext
     /// target. Keyed by the ORIGINAL DEFINITION of the method symbol.</summary>
     public Dictionary<IMethodSymbol, ShimTarget> AddedMembers = new(SymbolEqualityComparer.Default);
 
+    /// <summary>Changed ordinary static method symbols across the batch →
+    /// patch type target. Used by Release inline caller refresh: a refreshed
+    /// caller must call the current patch copy of an inlined callee, otherwise
+    /// Mono can inline the original callee body again.</summary>
+    public Dictionary<IMethodSymbol, PatchedMethodTarget> PatchedMethods = new(SymbolEqualityComparer.Default);
+
     /// <summary>Member keys that are REMOVED and re-ADDED with the same
     /// signature in this batch (B1 generic body changes): pre-existing
     /// compiled call sites exist, so every in-batch reference inside a KEPT
@@ -152,7 +211,8 @@ public sealed class PatchBatchContext
         IReadOnlyDictionary<string, FieldStoreRegistry.StoreEntry>? earlierFieldStores = null,
         string storeDiscriminator = "",
         bool allowUnsafe = false,
-        AccessCaps? runtimeCaps = null)
+        AccessCaps? runtimeCaps = null,
+        IReadOnlyList<InlineRedirectClone>? inlineClones = null)
     {
         // The binding model must RESOLVE what the emit will BIND: the emit
         // compilation has always carried IgnoreAccessibility (kept bodies
@@ -186,11 +246,21 @@ public sealed class PatchBatchContext
             RuntimeCaps = runtimeCaps,
         };
 
-        foreach (var (_, tree, diff) in files)
+        foreach (var (path, tree, diff) in files)
         {
             SemanticModel model = context.Binding.GetSemanticModel(tree);
             var root = (CompilationUnitSyntax)tree.GetRoot();
             var newTypeNames = new HashSet<string>(diff.NewTypes, StringComparer.Ordinal);
+
+            // Release inline caller-refresh self-shim clones live in the diff as
+            // synthetic ADDED methods (so the M2 shim pipeline emits them), but
+            // they are gated and wired separately below — keep the normal added
+            // loop from treating them as ordinary user-added surface.
+            var cloneNamesThisFile = new HashSet<string>(
+                (inlineClones ?? Array.Empty<InlineRedirectClone>())
+                    .Where(c => string.Equals(c.FilePath, path, StringComparison.OrdinalIgnoreCase))
+                    .Select(c => c.Clone.Name),
+                StringComparer.Ordinal);
 
             foreach (MemberDeclarationSyntax member in root.DescendantNodes().OfType<MemberDeclarationSyntax>())
             {
@@ -215,8 +285,10 @@ public sealed class PatchBatchContext
 
             foreach (HotDiffMethod added in diff.ChangedMethods.Where(m => m.Added))
             {
+                if (cloneNamesThisFile.Contains(added.Name))
+                    continue; // handled by the inline-redirect clone loop below
                 IMethodSymbol? symbol = null;
-                MethodDeclarationSyntax? decl = FindAddedMethodDeclaration(root, added);
+                MethodDeclarationSyntax? decl = FindMethodDeclaration(root, added);
                 if (decl != null)
                     symbol = model.GetDeclaredSymbol(decl);
                 else
@@ -238,6 +310,29 @@ public sealed class PatchBatchContext
                 }
             }
 
+            foreach (HotDiffMethod changed in diff.ChangedMethods.Where(m => !m.Added))
+            {
+                if (changed.IsCtor || !changed.IsStatic || changed.TypeParameterCount != 0)
+                    continue;
+                MethodDeclarationSyntax? decl = FindMethodDeclaration(root, changed);
+                if (decl == null)
+                    continue;
+                if ((decl.TypeParameterList?.Parameters.Count ?? 0) != 0)
+                    continue;
+                if (model.GetDeclaredSymbol(decl) is not IMethodSymbol symbol)
+                    continue;
+                if (symbol.MethodKind != MethodKind.Ordinary || !symbol.IsStatic || symbol.IsGenericMethod)
+                    continue;
+                if (ContainingTypeHasTypeParameters(symbol.ContainingType))
+                    continue;
+
+                context.PatchedMethods[symbol.OriginalDefinition] = new PatchedMethodTarget
+                {
+                    PatchTypeFqn = PatchQualifiedDisplay(symbol.ContainingType),
+                    MethodName = symbol.Name,
+                };
+            }
+
             foreach (HotDiffEnumAddition addition in diff.EnumAdditions)
             {
                 foreach (EnumDeclarationSyntax enumDecl in root.DescendantNodes().OfType<EnumDeclarationSyntax>())
@@ -256,6 +351,71 @@ public sealed class PatchBatchContext
                         }
                     }
                 }
+            }
+        }
+
+        // Release inline caller-refresh self-shim clones (Option A). A second
+        // pass, AFTER the whole batch's renamed/added/new-type context exists,
+        // so the caps gate sees the complete picture. Each clone is a synthetic
+        // ADDED instance method already injected into the new-side tree; here it
+        // is gated and, when shimmable, both wired as a shim (AddedMembers) and
+        // recorded as the redirect target for the original method's call sites.
+        if (inlineClones is { Count: > 0 })
+        {
+            var byPath = files.ToDictionary(
+                f => f.Path,
+                f => (Model: context.Binding.GetSemanticModel(f.Tree), Root: (CompilationUnitSyntax)f.Tree.GetRoot()),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (InlineRedirectClone clone in inlineClones)
+            {
+                if (!byPath.TryGetValue(clone.FilePath, out var bound))
+                    continue;
+                SemanticModel model = bound.Model;
+                CompilationUnitSyntax root = bound.Root;
+
+                MethodDeclarationSyntax? cloneDecl = FindMethodDeclaration(root, clone.Clone);
+                MethodDeclarationSyntax? originalDecl = FindMethodDeclaration(root, clone.Original);
+                if (cloneDecl == null || originalDecl == null)
+                    continue;
+                if (model.GetDeclaredSymbol(cloneDecl) is not IMethodSymbol cloneSymbol ||
+                    model.GetDeclaredSymbol(originalDecl) is not IMethodSymbol originalSymbol)
+                    continue;
+
+                // Value types (incl. record structs) are deferred — see
+                // IsInlineCloneEligible. Skip the redirect; converge via recompile.
+                if (originalSymbol.ContainingType.IsValueType)
+                    continue;
+
+                // Skip-not-cold: the static self-shim reaches the original
+                // type's members WITHOUT the layout identity the instance patch
+                // copy enjoys, so its non-public reach is gated by the measured
+                // caps. A violation only means the inline-refresh optimization
+                // can't apply here — drop the redirect and let the method
+                // converge via the queued recompile; it is still hot through its
+                // normal detour. Failing cold would REGRESS an otherwise-hot edit.
+                SyntaxNode? cloneBody = (SyntaxNode?)cloneDecl.Body ?? cloneDecl.ExpressionBody;
+                if (cloneBody != null &&
+                    PatchRewriter.FindInlineShimAccessViolation(
+                        cloneSymbol, cloneBody, model, context, context.RenamedSymbols) != null)
+                {
+                    continue;
+                }
+
+                ShimTarget shimTarget = BuildShimTarget(cloneSymbol, clone.Clone);
+                shimTarget.IsInlineRedirectShim = true;
+                context.AddedMembers[cloneSymbol.OriginalDefinition] = shimTarget;
+
+                INamedTypeSymbol declaringType = originalSymbol.ContainingType;
+                context.PatchedMethods[originalSymbol.OriginalDefinition] = new PatchedMethodTarget
+                {
+                    HasSelf = true,
+                    ShimTypeFqn = shimTarget.ShimTypeFqn,
+                    MethodName = shimTarget.MethodName,
+                    DeclaringTypeFqn = declaringType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    SelfIsValueType = declaringType.IsValueType,
+                    SelfIsRefLike = declaringType.IsRefLikeType,
+                };
             }
         }
 
@@ -385,26 +545,54 @@ public sealed class PatchBatchContext
         return null;
     }
 
-    internal static MethodDeclarationSyntax? FindAddedMethodDeclaration(CompilationUnitSyntax root, HotDiffMethod added)
+    internal static MethodDeclarationSyntax? FindAddedMethodDeclaration(CompilationUnitSyntax root, HotDiffMethod added) =>
+        FindMethodDeclaration(root, added);
+
+    private static MethodDeclarationSyntax? FindMethodDeclaration(CompilationUnitSyntax root, HotDiffMethod methodInfo)
     {
         foreach (TypeDeclarationSyntax typeDecl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
         {
-            if (HotDiff.MetadataName(typeDecl) != added.DeclaringType)
+            if (HotDiff.MetadataName(typeDecl) != methodInfo.DeclaringType)
                 continue;
             foreach (MethodDeclarationSyntax method in typeDecl.Members.OfType<MethodDeclarationSyntax>())
             {
-                if (method.Identifier.Text != added.Name)
+                if (method.Identifier.Text != methodInfo.Name)
                     continue;
-                if (method.Modifiers.Any(SyntaxKind.StaticKeyword) != added.IsStatic)
+                if (method.Modifiers.Any(SyntaxKind.StaticKeyword) != methodInfo.IsStatic)
                     continue;
-                if ((method.TypeParameterList?.Parameters.Count ?? 0) != added.TypeParameterCount)
+                if ((method.TypeParameterList?.Parameters.Count ?? 0) != methodInfo.TypeParameterCount)
                     continue;
-                if (!HotDiff.ParamTypeNames(method.ParameterList).SequenceEqual(added.ParamTypeNames, StringComparer.Ordinal))
+                if (!HotDiff.ParamTypeNames(method.ParameterList).SequenceEqual(methodInfo.ParamTypeNames, StringComparer.Ordinal))
                     continue;
                 return method;
             }
         }
         return null;
+    }
+
+    private static bool ContainingTypeHasTypeParameters(INamedTypeSymbol? type)
+    {
+        for (INamedTypeSymbol? current = type; current != null; current = current.ContainingType)
+        {
+            if (current.TypeParameters.Length > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private static string PatchQualifiedDisplay(INamedTypeSymbol type)
+    {
+        INamedTypeSymbol top = type;
+        while (top.ContainingType != null)
+            top = top.ContainingType;
+
+        string display = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        string prefix = top.ContainingNamespace is { IsGlobalNamespace: false } ns
+            ? "global::" + ns.ToDisplayString() + "." + top.Name
+            : "global::" + top.Name;
+        return display.StartsWith(prefix, StringComparison.Ordinal)
+            ? prefix + PatchRewriter.TypeNameSuffix + display[prefix.Length..]
+            : display;
     }
 
     private static ShimTarget BuildShimTarget(IMethodSymbol symbol, HotDiffMethod added)
