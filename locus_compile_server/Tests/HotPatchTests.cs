@@ -101,6 +101,45 @@ public class HotPatchTests : IDisposable
         return service.HandleCompileHotPatch(request);
     }
 
+    private static JsonNode HotPatchWithForceDetours(
+        CompileService service,
+        JsonObject @params,
+        (string Path, string Old, string New) file,
+        params string[] methodKeys)
+        => HotPatchWithForceDetours(
+            service,
+            @params,
+            new[] { file },
+            (file.Path, methodKeys));
+
+    private static JsonNode HotPatchWithForceDetours(
+        CompileService service,
+        JsonObject @params,
+        (string Path, string Old, string New)[] files,
+        params (string Path, string[] MethodKeys)[] forceDetours)
+    {
+        var request = new JsonObject
+        {
+            ["files"] = new JsonArray(files
+                .Select(f => (JsonNode)new JsonObject
+                {
+                    ["path"] = f.Path,
+                    ["oldText"] = f.Old,
+                    ["newText"] = f.New,
+                })
+                .ToArray()),
+            ["params"] = @params,
+            ["forceDetours"] = new JsonArray(forceDetours
+                .Select(force => (JsonNode)new JsonObject
+                {
+                    ["path"] = force.Path,
+                    ["methodKeys"] = new JsonArray(force.MethodKeys.Select(key => (JsonNode)key).ToArray()),
+                })
+                .ToArray()),
+        };
+        return service.HandleCompileHotPatch(request);
+    }
+
     private const string OriginalSource = @"
 namespace HotPatchE2E
 {
@@ -195,6 +234,311 @@ namespace HotPatchE2E
         Assert.Equal("Spawner", newType["simpleName"]!.GetValue<string>());
         Assert.True(newType["isPublic"]!.GetValue<bool>());
         Assert.True(newType["isTopLevel"]!.GetValue<bool>());
+    }
+
+    private const string InlineCallerRefreshSource = @"
+namespace InlineRefresh
+{
+    public static class Lib
+    {
+        public static int Value() { return 1; }
+    }
+
+    public static class Caller
+    {
+        public static int Call() { return Lib.Value(); }
+    }
+}";
+
+    [Fact]
+    public void Force_detours_compile_unchanged_caller_method_with_source_path()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "InlineRefreshOriginal", InlineCallerRefreshSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/Caller.cs", InlineCallerRefreshSource, InlineCallerRefreshSource),
+            "InlineRefresh.Caller|Call|0|s");
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("InlineRefresh.Caller", method["declaringType"]!.GetValue<string>());
+        Assert.Equal("Call", method["name"]!.GetValue<string>());
+        Assert.True(method["isStatic"]!.GetValue<bool>());
+        Assert.Equal("Assets/Caller.cs", method["sourcePath"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Force_detoured_interface_default_method_fails_closed()
+    {
+        const string source = @"
+namespace InlineRefresh
+{
+    public interface I
+    {
+        int M() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        JsonObject compileParams = ParamsFor();
+
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/I.cs", source, source),
+            "InlineRefresh.I|M|0|i");
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        Assert.Equal("Assets/I.cs", file["path"]!.GetValue<string>());
+        string reason = Assert.Single(file["reasons"]!.AsArray())!.GetValue<string>();
+        Assert.Contains("InlineRefresh.I.M", reason);
+        Assert.Contains("interface members are not supported", reason);
+    }
+
+    private const string InlineRefreshLibSource = @"
+namespace InlineRefresh
+{
+    public static class SplitLib
+    {
+        public static int Value() { return 1; }
+    }
+}";
+
+    private const string InlineRefreshCallerSource = @"
+namespace InlineRefresh
+{
+    public static class SplitCaller
+    {
+        public static int Call() { return SplitLib.Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Force_detoured_cross_file_caller_invokes_current_callee_patch_copy()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InlineRefreshSplitOriginal",
+            ("Assets/Lib.cs", InlineRefreshLibSource),
+            ("Assets/Caller.cs", InlineRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newLib = InlineRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/Lib.cs", InlineRefreshLibSource, newLib),
+                ("Assets/Caller.cs", InlineRefreshCallerSource, InlineRefreshCallerSource),
+            },
+            ("Assets/Caller.cs", new[] { "InlineRefresh.SplitCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "InlineRefresh.SplitCaller.Call", "InlineRefresh.SplitLib.Value" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inline-refresh-split", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InlineRefreshSplitOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchCaller = patch.GetType("InlineRefresh.SplitCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // ── Release inline caller refresh: INSTANCE callee (Option A self-shim) ──
+    // An instance callee cannot bind to a patch-copy method on the original
+    // receiver, so the refreshed caller binds to a static self-shim carrying the
+    // CHANGED body. The original method keeps its normal detour for non-inlined
+    // call sites.
+
+    private const string InstRefreshLibSource = @"
+namespace InlineRefresh
+{
+    public class InstLib
+    {
+        public int Value() { return 1; }
+    }
+}";
+
+    private const string InstRefreshCallerSource = @"
+namespace InlineRefresh
+{
+    public static class InstCaller
+    {
+        public static int Call() { return new InstLib().Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Force_detoured_caller_redirects_inlined_instance_callee_to_self_shim()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InstInlineRefreshOriginal",
+            ("Assets/InstLib.cs", InstRefreshLibSource),
+            ("Assets/InstCaller.cs", InstRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newLib = InstRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstLib.cs", InstRefreshLibSource, newLib),
+                ("Assets/InstCaller.cs", InstRefreshCallerSource, InstRefreshCallerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The synthetic self-shim clone is an internal direct-call target — it
+        // must NOT surface as a redirected method (only the real callee + caller).
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "InlineRefresh.InstCaller.Call", "InlineRefresh.InstLib.Value" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-inline-refresh", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InstInlineRefreshOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The refreshed caller binds `new InstLib().Value()` to the self-shim
+            // carrying the NEW body (41), so Call() == 41 + 1 — not the stale 2.
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string InstPrivLibSource = @"
+namespace InlineRefresh
+{
+    public class InstPrivLib
+    {
+        private int _secret = 41;
+        public int Value() { return 1; }
+    }
+}";
+
+    [Fact]
+    public void Inline_instance_redirect_skips_private_body_without_caps_but_stays_hot()
+    {
+        var service = new CompileService();
+        string callerSource = InstRefreshCallerSource.Replace("InstLib", "InstPrivLib");
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InstPrivInlineOriginal",
+            ("Assets/InstPrivLib.cs", InstPrivLibSource),
+            ("Assets/InstCaller.cs", callerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // The new body reaches the original type's PRIVATE field. Without
+        // measured caps the static self-shim cannot legally do so, so the
+        // redirect is SKIPPED — but the method is still hot via its normal
+        // detour, so the patch must stay HOT (never cold: that would regress).
+        string newLib = InstPrivLibSource.Replace(
+            "public int Value() { return 1; }",
+            "public int Value() { return _secret; }");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstPrivLib.cs", InstPrivLibSource, newLib),
+                ("Assets/InstCaller.cs", callerSource, callerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-priv-inline", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InstPrivInlineOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // No redirect was emitted: the caller still binds to the ORIGINAL
+            // Value (1), so Call() == 1 + 1. The edit converges at recompile.
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(2, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string InstSelfSource = @"
+namespace InlineRefresh
+{
+    public class InstSelf
+    {
+        public int Value() { return 1; }
+        public int Read() { return Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Inline_instance_redirect_rewrites_implicit_this_call_hot()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "InstSelfInlineOriginal", ("Assets/InstSelf.cs", InstSelfSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newSource = InstSelfSource.Replace(
+            "public int Value() { return 1; }",
+            "public int Value() { return 41; }");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/InstSelf.cs", InstSelfSource, newSource),
+            "InlineRefresh.InstSelf|Read|0|i");
+
+        // The bare this-call `Value()` inside the force-detoured INSTANCE method
+        // Read rewrites to the self-shim with `((InstSelf)(object)this)` — the
+        // patch must compile hot (the cast's runtime layout identity is honored
+        // on Mono; this asserts the rewrite is well-formed C#).
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
     }
 
     // Public state only: without measured runtime caps, added members may
