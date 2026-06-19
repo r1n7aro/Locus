@@ -56,10 +56,14 @@ namespace Locus
         private static double _lastNativeBackgroundHookCheckAt = -1.0;
         private static bool _nativeBackgroundHookApplied;
 
-        // ───────────────── P/Invoke surface (see lib.rs) ─────────────────
+        // Reused UTF-8 encode buffers for the high-frequency outbound calls
+        // (status heartbeat + editor-update events both fire every 0.25s). Guarded
+        // by a dedicated lock because an event can be emitted off the main thread.
+        private static readonly object _nativeEncodeLock = new object();
+        private static byte[] _nativeEncodeBufferA;
+        private static byte[] _nativeEncodeBufferB;
 
-        [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr LoadLibraryW(string lpLibFileName);
+        // ───────────────── P/Invoke surface (see lib.rs) ─────────────────
 
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern int locus_init(
@@ -341,9 +345,12 @@ namespace Locus
                 return;
             try
             {
-                byte[] typeBytes = Utf8NoBom.GetBytes(eventType);
-                byte[] payloadBytes = Utf8NoBom.GetBytes(message ?? "");
-                locus_emit_event(typeBytes, typeBytes.Length, payloadBytes, payloadBytes.Length);
+                lock (_nativeEncodeLock)
+                {
+                    int typeLen = EncodeUtf8Reusing(eventType, ref _nativeEncodeBufferA);
+                    int payloadLen = EncodeUtf8Reusing(message ?? "", ref _nativeEncodeBufferB);
+                    locus_emit_event(_nativeEncodeBufferA, typeLen, _nativeEncodeBufferB, payloadLen);
+                }
             }
             catch (Exception ex)
             {
@@ -381,13 +388,32 @@ namespace Locus
         {
             try
             {
-                byte[] status = Utf8NoBom.GetBytes(BuildCachedEditorStatusMessage());
-                locus_set_managed_state(state, _nativeGeneration, status, status.Length);
+                string status = BuildCachedEditorStatusMessage();
+                lock (_nativeEncodeLock)
+                {
+                    int statusLen = EncodeUtf8Reusing(status, ref _nativeEncodeBufferA);
+                    locus_set_managed_state(state, _nativeGeneration, _nativeEncodeBufferA, statusLen);
+                }
             }
             catch (Exception ex)
             {
                 Debug.LogWarning("[Locus] Native set_managed_state failed: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// Encode <paramref name="value"/> as UTF-8 into a reused buffer (grown as
+        /// needed) and return the byte length. The caller must hold
+        /// <see cref="_nativeEncodeLock"/> for the buffer it passes. Replaces the
+        /// per-call <c>byte[]</c> the 0.25s status/event path used to churn.
+        /// </summary>
+        private static int EncodeUtf8Reusing(string value, ref byte[] buffer)
+        {
+            value = value ?? "";
+            int maxBytes = Utf8NoBom.GetMaxByteCount(value.Length);
+            if (buffer == null || buffer.Length < maxBytes)
+                buffer = new byte[Math.Max(maxBytes, 256)];
+            return Utf8NoBom.GetBytes(value, 0, value.Length, buffer, 0);
         }
 
         private static void NativeSetCapabilities(string caps)
@@ -407,8 +433,6 @@ namespace Locus
         {
             try
             {
-                PreloadNativeDll();
-
                 string projectPath = Directory.GetParent(Application.dataPath).FullName;
                 string pipeName = ResolveNativePipeName();
                 if (string.IsNullOrEmpty(pipeName))
@@ -440,44 +464,6 @@ namespace Locus
                 Debug.LogError("[Locus] Native broker init failed: " + ex.Message);
                 return false;
             }
-        }
-
-        /// <summary>
-        /// Pre-load the broker DLL from a content-addressed cache path so the
-        /// subsequent DllImport binds to the required native plugin without
-        /// locking the package copy that plugin installation needs to replace.
-        /// </summary>
-        private static void PreloadNativeDll()
-        {
-            string dll = ResolveNativeDllPath();
-            if (string.IsNullOrEmpty(dll) || !File.Exists(dll))
-                throw new FileNotFoundException("locus_native.dll was not found", dll ?? "");
-
-            IntPtr handle = LoadLibraryW(dll);
-            if (handle == IntPtr.Zero)
-                throw new DllNotFoundException(
-                    "LoadLibraryW failed for " + dll + " (win32=" + Marshal.GetLastWin32Error() + ")");
-        }
-
-        private static string ResolveNativeDllPath()
-        {
-            string projectPath = Directory.GetParent(Application.dataPath).FullName;
-            string packaged = Path.Combine(
-                projectPath, "Packages", "com.farlocus.locus", "Editor", "Native", "x86_64", "locus_native.dll");
-            if (!File.Exists(packaged))
-                return packaged;
-
-            string hash = Sha256FileHexPrefix(packaged, 16);
-            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (string.IsNullOrEmpty(localAppData))
-                return packaged;
-
-            string dir = Path.Combine(localAppData, "Locus", "unity-native", hash);
-            Directory.CreateDirectory(dir);
-            string cached = Path.Combine(dir, "locus_native.dll");
-            if (!File.Exists(cached) || new FileInfo(cached).Length != new FileInfo(packaged).Length)
-                File.Copy(packaged, cached, true);
-            return cached;
         }
 
         private static bool NativeBridgeEnabled()
@@ -696,15 +682,6 @@ namespace Locus
             while (value.EndsWith("\\", StringComparison.Ordinal) && value.Length > 3)
                 value = value.Substring(0, value.Length - 1);
             return value.ToLowerInvariant();
-        }
-
-        private static string Sha256FileHexPrefix(string path, int bytesToTake)
-        {
-            using (SHA256 sha = SHA256.Create())
-            using (FileStream stream = File.OpenRead(path))
-            {
-                return HexPrefix(sha.ComputeHash(stream), bytesToTake);
-            }
         }
 
         private static string HexPrefix(byte[] bytes, int bytesToTake)
