@@ -1173,9 +1173,59 @@ namespace Locus
             }
         }
 
+        // Cached open delegate for ProfilerDriver.lastFrameIndex. Resolving the
+        // PropertyInfo and calling GetValue every sampled frame boxes the int and
+        // allocates an object[] for the (empty) argument list; binding the getter
+        // once to a Func<int> removes both from the per-frame sampling path.
+        private static Func<int> _lastFrameIndexGetter;
+        private static bool _lastFrameIndexGetterResolved;
+
         private static int CurrentProfilerFrameIndex()
         {
+            Func<int> getter = _lastFrameIndexGetter;
+            if (getter == null && !_lastFrameIndexGetterResolved)
+            {
+                _lastFrameIndexGetterResolved = true;
+                getter = _lastFrameIndexGetter = ResolveProfilerDriverIntGetter("lastFrameIndex");
+            }
+
+            if (getter != null)
+            {
+                try
+                {
+                    return getter();
+                }
+                catch
+                {
+                    // A version whose getter throws drops to the reflection path.
+                    _lastFrameIndexGetter = null;
+                }
+            }
+
             return ReadProfilerDriverIntProperty("lastFrameIndex", -1);
+        }
+
+        private static Func<int> ResolveProfilerDriverIntGetter(string propertyName)
+        {
+            try
+            {
+                PropertyInfo property = typeof(ProfilerDriver).GetProperty(
+                    propertyName,
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic
+                );
+                if (property == null || !property.CanRead || property.PropertyType != typeof(int))
+                    return null;
+
+                MethodInfo getter = property.GetGetMethod(true);
+                if (getter == null)
+                    return null;
+
+                return (Func<int>)Delegate.CreateDelegate(typeof(Func<int>), getter);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static int ReadProfilerDriverIntProperty(string propertyName, int fallback)
@@ -2724,13 +2774,16 @@ namespace Locus
             using (var peStream = new MemoryStream(16 * 1024))
             {
                 EmitResult emitResult;
-                try
+                using (EnterInProcessCompile())
                 {
-                    emitResult = compilation.Emit(peStream);
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception("emit failed: " + ex);
+                    try
+                    {
+                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception("emit failed: " + ex);
+                    }
                 }
 
                 if (!emitResult.Success)

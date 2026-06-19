@@ -59,6 +59,15 @@ namespace Locus
         private static int _lastEditorUpdateSelectionInstanceId = int.MinValue;
         private const double EditorUpdateEventIntervalSeconds = 0.25;
 
+        // Reused across the 0.25s editor-update tick so the idle steady state does
+        // not allocate a fresh payload/snapshot on every send. Written only on the
+        // main thread (PumpMainThreadQueue), so no synchronization is needed.
+        private static readonly EditorSelectionSnapshot _reusableSelectionSnapshot = new EditorSelectionSnapshot();
+        private static readonly EditorUpdatePayload _reusableEditorUpdatePayload = new EditorUpdatePayload();
+        private static readonly Dictionary<Type, string> _typeFullNameCache = new Dictionary<Type, string>();
+        private static int _cachedSelectionPathInstanceId = int.MinValue;
+        private static string _cachedSelectionPath = "";
+
         // ───────────────── Runtime compilation cache ─────────────────
 
         private static readonly object _compileCacheLock = new object();
@@ -140,13 +149,118 @@ namespace Locus
                 preprocessorSymbols: SnippetPreprocessorSymbols
             );
 
+        // ConcurrentBuild is disabled on purpose: the in-process Roslyn fallback
+        // must compile single-threaded. Roslyn's parallel build spins worker
+        // threads that, if still in flight when a synchronous domain reload
+        // begins (e.g. entering Play Mode), are not aborted and deadlock the
+        // editor inside mono_domain_try_unload ("Begin MonoManager ReloadAssembly"
+        // with 0% CPU). Single-threaded compiles run on the request's own worker
+        // thread and are drained by CancelAndDrainInProcessCompiles on reload.
         private static readonly CSharpCompilationOptions SnippetCompilationOptions =
             new CSharpCompilationOptions(
                 outputKind: OutputKind.DynamicallyLinkedLibrary,
                 optimizationLevel: OptimizationLevel.Release,
                 allowUnsafe: false,
                 assemblyIdentityComparer: DesktopAssemblyIdentityComparer.Default
-            );
+            ).WithConcurrentBuild(false);
+
+        // ───────────────── In-process compile reload guard ─────────────────
+        // Tracks in-flight in-process Roslyn compiles (execute_code / run_states /
+        // compile_named / compile_skill_package fallbacks) so a domain reload can
+        // cancel them and bounded-join before the domain unloads. Without this an
+        // in-flight compile thread survives into mono_domain_try_unload and the
+        // reload deadlocks forever.
+        private const int InProcessCompileDrainTimeoutMs = 5000;
+        private static readonly object _inProcessCompileGuardLock = new object();
+        private static int _inProcessCompileActive;
+        private static CancellationTokenSource _inProcessCompileReloadCts = new CancellationTokenSource();
+
+        /// <summary>
+        /// Token that trips when a domain reload begins. In-process compiles pass
+        /// it to Roslyn's Emit so a reload interrupts a compile in progress.
+        /// </summary>
+        private static CancellationToken InProcessCompileReloadToken
+        {
+            get
+            {
+                lock (_inProcessCompileGuardLock)
+                {
+                    return _inProcessCompileReloadCts.Token;
+                }
+            }
+        }
+
+        private readonly struct InProcessCompileScope : IDisposable
+        {
+            public void Dispose()
+            {
+                Interlocked.Decrement(ref _inProcessCompileActive);
+            }
+        }
+
+        /// <summary>
+        /// Mark an in-process Roslyn compile as active for the lifetime of the
+        /// returned scope. Wrap the CSharpCompilation.Emit call so a domain reload
+        /// can wait for it to finish.
+        /// </summary>
+        private static InProcessCompileScope EnterInProcessCompile()
+        {
+            Interlocked.Increment(ref _inProcessCompileActive);
+            return default(InProcessCompileScope);
+        }
+
+        /// <summary>
+        /// Cancel any in-flight in-process Roslyn compiles and bounded-wait for
+        /// them to unwind so none survive into mono_domain_try_unload. Called on
+        /// the main thread from OnBeforeAssemblyReload; the compiles run on worker
+        /// threads, observe the cancelled token, and finish quickly because they
+        /// are single-threaded (see SnippetCompilationOptions).
+        /// </summary>
+        private static void CancelAndDrainInProcessCompiles(int timeoutMs)
+        {
+            CancellationTokenSource cts;
+            lock (_inProcessCompileGuardLock)
+            {
+                cts = _inProcessCompileReloadCts;
+            }
+
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+            }
+
+            if (Volatile.Read(ref _inProcessCompileActive) > 0)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (Volatile.Read(ref _inProcessCompileActive) > 0 && sw.ElapsedMilliseconds < timeoutMs)
+                    Thread.Sleep(10);
+
+                int remaining = Volatile.Read(ref _inProcessCompileActive);
+                if (remaining > 0)
+                {
+                    Debug.LogWarning(
+                        "[Locus] in-process compile did not drain before assembly reload (active=" +
+                        remaining + "); proceeding with reload.");
+                }
+            }
+
+            // Fresh token for the next reload cycle (matters only when a reload is
+            // aborted; a real reload resets these statics in the new domain).
+            lock (_inProcessCompileGuardLock)
+            {
+                try
+                {
+                    _inProcessCompileReloadCts.Dispose();
+                }
+                catch
+                {
+                }
+                _inProcessCompileReloadCts = new CancellationTokenSource();
+            }
+        }
 
         private static string[] BuildSnippetPreprocessorSymbols()
         {
@@ -354,6 +468,10 @@ namespace Locus
         private static void OnBeforeAssemblyReload()
         {
             RefreshCachedEditorState();
+            // Cancel + bounded-join any in-flight in-process Roslyn compile before
+            // the domain unloads, otherwise its worker thread deadlocks the reload
+            // inside mono_domain_try_unload.
+            CancelAndDrainInProcessCompiles(InProcessCompileDrainTimeoutMs);
             NativeOnBeforeReload();
             Stop();
         }
@@ -923,41 +1041,62 @@ namespace Locus
             _lastEditorUpdateEventAt = now;
             _editorUpdateEventSequence++;
 
-            var payload = new EditorUpdatePayload
-            {
-                sequence = _editorUpdateEventSequence,
-                timeSinceStartup = now,
-                isPlaying = _isPlaying,
-                isPaused = _isPaused,
-                activeScenePath = _activeScenePath,
-                selection = BuildEditorSelectionSnapshot(selection, selectionInstanceId)
-            };
+            EditorUpdatePayload payload = _reusableEditorUpdatePayload;
+            payload.sequence = _editorUpdateEventSequence;
+            payload.timeSinceStartup = now;
+            payload.isPlaying = _isPlaying;
+            payload.isPaused = _isPaused;
+            payload.activeScenePath = _activeScenePath;
+            FillEditorSelectionSnapshot(_reusableSelectionSnapshot, selection, selectionInstanceId);
+            payload.selection = _reusableSelectionSnapshot;
             SendEventToRust("unity-editor-update", JsonUtility.ToJson(payload));
         }
 
-        private static EditorSelectionSnapshot BuildEditorSelectionSnapshot(UnityEngine.Object selection, int instanceId)
+        private static void FillEditorSelectionSnapshot(
+            EditorSelectionSnapshot target, UnityEngine.Object selection, int instanceId)
         {
             if (selection == null)
             {
-                return new EditorSelectionSnapshot
-                {
-                    kind = "none",
-                    name = "",
-                    type = "",
-                    path = "",
-                    instanceId = 0
-                };
+                target.kind = "none";
+                target.name = "";
+                target.type = "";
+                target.path = "";
+                target.instanceId = 0;
+                return;
             }
 
-            string path = AssetDatabase.GetAssetPath(selection) ?? "";
-            return new EditorSelectionSnapshot
+            // GetAssetPath hits the AssetDatabase and allocates a fresh string on
+            // every call; reuse the last result while the selection is unchanged.
+            string path;
+            if (instanceId == _cachedSelectionPathInstanceId)
             {
-                kind = EditorSelectionKind(selection, path),
-                name = selection.name ?? "",
-                type = selection.GetType().FullName ?? selection.GetType().Name,
-                path = path,
-                instanceId = instanceId
-            };
+                path = _cachedSelectionPath;
+            }
+            else
+            {
+                path = AssetDatabase.GetAssetPath(selection) ?? "";
+                _cachedSelectionPathInstanceId = instanceId;
+                _cachedSelectionPath = path;
+            }
+
+            target.kind = EditorSelectionKind(selection, path);
+            target.name = selection.name ?? "";
+            target.type = CachedTypeFullName(selection.GetType());
+            target.path = path;
+            target.instanceId = instanceId;
+        }
+
+        private static string CachedTypeFullName(Type type)
+        {
+            if (type == null)
+                return "";
+            string name;
+            if (!_typeFullNameCache.TryGetValue(type, out name))
+            {
+                name = type.FullName ?? type.Name;
+                _typeFullNameCache[type] = name;
+            }
+            return name;
         }
 
         private static string EditorSelectionKind(UnityEngine.Object selection, string path)

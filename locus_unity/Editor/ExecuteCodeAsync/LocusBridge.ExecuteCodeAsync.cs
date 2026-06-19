@@ -301,11 +301,23 @@ namespace Locus
             }
         }
 
+        // Cache the serialized progress JSON keyed by revision so repeated
+        // front-end polls between updates reuse the same string instead of
+        // re-running JsonUtility.ToJson on every call.
+        private static string _executeCodeProgressJsonCache;
+        private static int _executeCodeProgressJsonCacheRevision = int.MinValue;
+
         private static string GetExecuteCodeProgressJson()
         {
             lock (_executeCodeProgressLock)
             {
-                return JsonUtility.ToJson(_executeCodeProgress);
+                if (_executeCodeProgressJsonCache == null ||
+                    _executeCodeProgressJsonCacheRevision != _executeCodeProgressRevision)
+                {
+                    _executeCodeProgressJsonCache = JsonUtility.ToJson(_executeCodeProgress);
+                    _executeCodeProgressJsonCacheRevision = _executeCodeProgressRevision;
+                }
+                return _executeCodeProgressJsonCache;
             }
         }
 
@@ -858,14 +870,17 @@ namespace Locus
             using (var peStream = new MemoryStream(16 * 1024))
             {
                 EmitResult emitResult;
-                try
+                using (EnterInProcessCompile())
                 {
-                    emitResult = compilation.Emit(peStream);
-                }
-                catch (Exception ex)
-                {
-                    error = "emit failed: " + ex;
-                    return false;
+                    try
+                    {
+                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        error = "emit failed: " + ex;
+                        return false;
+                    }
                 }
 
                 if (!emitResult.Success)

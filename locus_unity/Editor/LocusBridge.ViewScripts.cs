@@ -776,13 +776,16 @@ namespace Locus
             using (var peStream = new MemoryStream(16 * 1024))
             {
                 EmitResult emitResult;
-                try
+                using (EnterInProcessCompile())
                 {
-                    emitResult = compilation.Emit(peStream);
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception("emit failed: " + ex.Message);
+                    try
+                    {
+                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception("emit failed: " + ex.Message);
+                    }
                 }
 
                 if (!emitResult.Success)
@@ -843,13 +846,16 @@ namespace Locus
             using (var peStream = new MemoryStream(64 * 1024))
             {
                 EmitResult emitResult;
-                try
+                using (EnterInProcessCompile())
                 {
-                    emitResult = compilation.Emit(peStream);
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception("emit failed: " + ex.Message);
+                    try
+                    {
+                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception("emit failed: " + ex.Message);
+                    }
                 }
 
                 if (!emitResult.Success)
