@@ -123,6 +123,38 @@ const PARTIAL_A_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartial
 const PARTIAL_B_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialB.cs";
 // Adversarial C#-syntax cases (A1–A4): pin known resolver / inlining gaps.
 const ADVERSARIAL_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestAdversarial.cs";
+const INLINE_CALLEE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallee.cs";
+const INLINE_CALLER_DIRECT_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerDirect.cs";
+const INLINE_CALLER_NESTED_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerNested.cs";
+const INLINE_CALLER_OVERLOAD_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerOverload.cs";
+const INLINE_CALLER_LAMBDA_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerLambda.cs";
+const INLINE_CALLER_BRANCH_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerBranch.cs";
+const INLINE_CALLER_ARRAY_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerArray.cs";
+// R12 — a depth-2 static inline chain across THREE files (Leaf→Mid→Top, each
+// hop AggressiveInlining bar the top): editing the leaf must refresh the mid
+// (round 1) and the top (round 2), exactly the INLINE_REFRESH_MAX_DEPTH limit.
+const INLINE_CHAIN_LEAF_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainLeaf.cs";
+const INLINE_CHAIN_MID_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainMid.cs";
+const INLINE_CHAIN_TOP_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainTop.cs";
+// R13 — cross-ASSEMBLY static inline refresh: a static lib method (Lib/ →
+// LocusSelfTestLib) inlined into an Assembly-CSharp caller. The refresh
+// recompiles callee+caller into ONE patch assembly, so the static patch-copy
+// redirect should erase the boundary.
+const LIB_INLINE_FILE: &str = "Assets/LocusHotReloadSelfTest/Lib/LocusSelfTestLibInline.cs";
+const LIB_INLINE_CALLER_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestLibInlineCaller.cs";
+// R14 — same-ASSEMBLY INSTANCE inline refresh: an instance callee inlined into
+// a static caller. Exercises the instance self-shim redirect (Option A) with
+// the assembly boundary ruled out — the same-assembly counterpart of R05.
+const INST_INLINEE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlinee.cs";
+const INST_INLINE_CALLER_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlineCaller.cs";
 
 const ALL_FILES: &[&str] = &[
     SUBJECT_FILE,
@@ -137,11 +169,26 @@ const ALL_FILES: &[&str] = &[
     PARTIAL_A_FILE,
     PARTIAL_B_FILE,
     ADVERSARIAL_FILE,
+    INLINE_CALLEE_FILE,
+    INLINE_CALLER_DIRECT_FILE,
+    INLINE_CALLER_NESTED_FILE,
+    INLINE_CALLER_OVERLOAD_FILE,
+    INLINE_CALLER_LAMBDA_FILE,
+    INLINE_CALLER_BRANCH_FILE,
+    INLINE_CALLER_ARRAY_FILE,
+    // Multi-file inline caller-refresh characterization probes (R12–R14).
+    INLINE_CHAIN_LEAF_FILE,
+    INLINE_CHAIN_MID_FILE,
+    INLINE_CHAIN_TOP_FILE,
+    LIB_INLINE_CALLER_FILE,
+    INST_INLINEE_FILE,
+    INST_INLINE_CALLER_FILE,
     // The .asmdef imports BEFORE the lib source so the assembly exists by
     // the time its first script imports (both flush in one batch anyway —
     // the compilation pipeline recomputes asmdef ownership per compile).
     LIB_ASMDEF_FILE,
     LIB_FILE,
+    LIB_INLINE_FILE,
 ];
 
 // Adversarial corpus: four legal-C# constructs that stress overload identity
@@ -171,6 +218,134 @@ public static class LocusSelfTestAdversarial
     // A4: callers bake the default value at compile time, like a const.
     public static int Defaulted(int x, int y = 1000) { return x + y; }
     public static int CallDefaulted() { return Defaulted(7000); }
+}
+"#;
+
+const INLINE_CALLEE_BASELINE: &str = r#"public static class LocusSelfTestInlineCallee
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Direct() { return 101; }
+
+    public static class Inner
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public static int Nested() { return 201; }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Pick(int x) { return x + 301; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Pick(string x) { return x.Length + 401; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int LambdaSeed() { return 501; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int BranchSeed(int x) { return x > 0 ? 601 : 0; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int ArraySeed() { return 701; }
+}
+"#;
+
+const INLINE_CALLER_DIRECT_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerDirect
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Direct() + 1; }
+}
+"#;
+
+const INLINE_CALLER_NESTED_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerNested
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Inner.Nested() + 2; }
+}
+"#;
+
+const INLINE_CALLER_OVERLOAD_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerOverload
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Pick(3) + 3; }
+}
+"#;
+
+const INLINE_CALLER_LAMBDA_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerLambda
+{
+    public static int Run()
+    {
+        System.Func<int> read = () => LocusSelfTestInlineCallee.LambdaSeed();
+        return read() + 4;
+    }
+}
+"#;
+
+const INLINE_CALLER_BRANCH_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerBranch
+{
+    public static int Run(int x)
+    {
+        return x > 0 ? LocusSelfTestInlineCallee.BranchSeed(x) + 5 : -1;
+    }
+}
+"#;
+
+const INLINE_CALLER_ARRAY_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerArray
+{
+    public static int Run()
+    {
+        var values = new System.Collections.Generic.List<int> { LocusSelfTestInlineCallee.ArraySeed() };
+        return values[0] + 6;
+    }
+}
+"#;
+
+// R12 — depth-2 static inline chain. Leaf and Mid are AggressiveInlining, so a
+// leaf edit must propagate through TWO refresh rounds to reach Top.
+const INLINE_CHAIN_LEAF_BASELINE: &str = r#"public static class LocusSelfTestChainLeaf
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Leaf() { return 3100; }
+}
+"#;
+
+const INLINE_CHAIN_MID_BASELINE: &str = r#"public static class LocusSelfTestChainMid
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Mid() { return LocusSelfTestChainLeaf.Leaf() + 30; }
+}
+"#;
+
+const INLINE_CHAIN_TOP_BASELINE: &str = r#"public static class LocusSelfTestChainTop
+{
+    public static int Top() { return LocusSelfTestChainMid.Mid() + 300; }
+}
+"#;
+
+// R13 — cross-asmdef STATIC inline refresh. The callee lives in the lib
+// assembly (Lib/ folder), the caller in Assembly-CSharp.
+const LIB_INLINE_BASELINE: &str = r#"public static class LocusSelfTestLibInline
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Seed() { return 6200; }
+}
+"#;
+
+const LIB_INLINE_CALLER_BASELINE: &str = r#"public static class LocusSelfTestLibInlineCaller
+{
+    public static int Run() { return LocusSelfTestLibInline.Seed() + 6; }
+}
+"#;
+
+// R14 — same-assembly INSTANCE inline refresh. Tap() is an instance method, so
+// the patched-method redirect does not cover it and the refreshed caller
+// re-inlines the stale body.
+const INST_INLINEE_BASELINE: &str = r#"public class LocusSelfTestInstInlinee
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public int Tap() { return 8400; }
+}
+"#;
+
+const INST_INLINE_CALLER_BASELINE: &str = r#"public static class LocusSelfTestInstInlineCaller
+{
+    public static int Run() { return new LocusSelfTestInstInlinee().Tap() + 8; }
 }
 "#;
 
@@ -450,20 +625,12 @@ struct SelfTest {
     /// tolerate an "inlined in Release" apply (the change converges on recompile
     /// rather than through the live detour). Detected once at the start of `run`.
     release_mode: bool,
+    /// Original Code Optimization mode, restored after the self-test forces
+    /// Release to exercise Mono inlining behavior.
+    original_code_optimization: Option<String>,
     /// Set by `apply_texts` from the latest apply summary: true when Unity
     /// reported methods it inlined (Release). Consulted by `expect_output`.
     last_apply_inlined: bool,
-    /// Phase 2b runs adversarial cases that pin KNOWN, still-open pipeline gaps
-    /// — they are EXPECTED to fail. While this is set, `pass`/`fail` record into
-    /// the diagnostic counters below instead of the suite tally, so an expected
-    /// failure cannot turn the (CLI-gated) suite red.
-    diagnostic_phase: bool,
-    /// Adversarial cases that unexpectedly PASSED (xpass): the pinned gap has
-    /// closed and the case should be promoted into the real suite.
-    diag_passed: u32,
-    /// Adversarial cases that failed as expected (xfail): the pinned gap is
-    /// still open. Steady state — not a suite failure.
-    diag_failed: u32,
 }
 
 /// Replace exactly one occurrence, failing loudly when the anchor text is
@@ -533,26 +700,13 @@ impl SelfTest {
     }
 
     fn pass(&mut self, name: &str, detail: impl Into<String>) {
-        if self.diagnostic_phase {
-            // An adversarial case unexpectedly passed: the pinned gap closed.
-            self.diag_passed += 1;
-            self.log(format!("XPASS {name}: {}", detail.into()));
-        } else {
-            self.passed += 1;
-            self.log(format!("PASS  {name}: {}", detail.into()));
-        }
+        self.passed += 1;
+        self.log(format!("PASS  {name}: {}", detail.into()));
     }
 
     fn fail(&mut self, name: &str, detail: impl Into<String>) {
-        if self.diagnostic_phase {
-            // Expected failure for a known-open gap: diagnostic, not a suite
-            // failure — keep it out of the CLI-gated `failed` verdict.
-            self.diag_failed += 1;
-            self.log(format!("xfail {name}: {}", detail.into()));
-        } else {
-            self.failed += 1;
-            self.log(format!("FAIL  {name}: {}", detail.into()));
-        }
+        self.failed += 1;
+        self.log(format!("FAIL  {name}: {}", detail.into()));
     }
 
     // ── primitives ───────────────────────────────────────────────────
@@ -813,6 +967,34 @@ impl SelfTest {
         // Adversarial syntax edge cases (A1–A4).
         self.write_tracked(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)
             .await?;
+        self.write_tracked(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_DIRECT_FILE, INLINE_CALLER_DIRECT_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_NESTED_FILE, INLINE_CALLER_NESTED_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_OVERLOAD_FILE, INLINE_CALLER_OVERLOAD_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_LAMBDA_FILE, INLINE_CALLER_LAMBDA_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_BRANCH_FILE, INLINE_CALLER_BRANCH_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_ARRAY_FILE, INLINE_CALLER_ARRAY_BASELINE)
+            .await?;
+        // Multi-file inline caller-refresh probes (R12–R14). The lib-side file
+        // (LIB_INLINE_FILE) is written with the other Lib/ source below.
+        self.write_tracked(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CHAIN_MID_FILE, INLINE_CHAIN_MID_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CHAIN_TOP_FILE, INLINE_CHAIN_TOP_BASELINE)
+            .await?;
+        self.write_tracked(LIB_INLINE_CALLER_FILE, LIB_INLINE_CALLER_BASELINE)
+            .await?;
+        self.write_tracked(INST_INLINEE_FILE, INST_INLINEE_BASELINE)
+            .await?;
+        self.write_tracked(INST_INLINE_CALLER_FILE, INST_INLINE_CALLER_BASELINE)
+            .await?;
         // Editor/ folder → Assembly-CSharp-Editor: edit-mode hot reload of
         // editor tooling is its own phase.
         self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await?;
@@ -823,6 +1005,8 @@ impl SelfTest {
         self.write_tracked(LIB_ASMDEF_FILE, LIB_ASMDEF_BASELINE)
             .await?;
         self.write_tracked(LIB_FILE, LIB_BASELINE).await?;
+        self.write_tracked(LIB_INLINE_FILE, LIB_INLINE_BASELINE)
+            .await?;
 
         // The corpus was written behind Unity's back: the AssetDatabase must
         // import it or the compile would not include the new files at all
@@ -2853,12 +3037,14 @@ impl SelfTest {
             // R05 — single Release-immediate probe. R06–R08 (local-variable /
             // method-group / lambda callers) were collapsed: they all reach the
             // same Assembly-CSharp LibRelay, so they exercise the identical
-            // LibRelay→LibBody inlined edge and can only ever agree with R05. In
-            // Release, Mono inlines LibBody into LibRelay, so the detour is
-            // bypassed and this immediate read stays stale (8) — apply now reports
-            // that ("inlined in Release") and converges via recompile. This strict
-            // probe documents the gap and flips green only if Release ever
-            // delivers immediate cross-asmdef effect.
+            // LibRelay→LibBody inlined edge and can only ever agree with R05.
+            // LibBody is an INSTANCE method Mono inlines into LibRelay in
+            // Release; the inline caller refresh now re-emits its changed body as
+            // a static self-shim (Option A) and rewrites LibRelay's
+            // `new LocusSelfTestLibType().LibBody()` to call that shim, so the
+            // refreshed caller observes the new body immediately even across the
+            // assembly boundary (callee+caller compile into one patch assembly).
+            // This strict probe is the suite-level gate for the instance arm.
             self.expect_release_immediate_output(
                 "R05 release strict cross-asmdef body edit",
                 "return LocusSelfTestSubject.Instance.LibRelay();",
@@ -3155,7 +3341,236 @@ impl SelfTest {
         };
     }
 
-    /// Phase 2b — adversarial C#-syntax cases that pin tricky resolver /
+    /// Phase 2b — Release-only positive coverage for caller refresh. The
+    /// callee is explicitly marked AggressiveInlining, so Unity/Mono reports it
+    /// as `inlined in Release`; Locus then refreshes the caller method within
+    /// the two-level hard limit and the immediate call-site read observes the
+    /// new value.
+    async fn run_release_inline_tests(&mut self) {
+        self.log("Phase 2b — Release inline caller refresh");
+        let name = "R10 aggressive-inlining caller refresh";
+        let edited = ADVERSARIAL_BASELINE.replace("return 5005;", "return 6116;");
+        if let Some(summary) = self
+            .apply_texts(
+                name,
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await
+        {
+            if !summary.contains("inlined in Release") {
+                self.fail(
+                    name,
+                    format!(
+                        "expected Release inline detection in summary, got: {}",
+                        squash(&summary)
+                    ),
+                );
+            } else {
+                self.pass(name, "reported inlined in Release");
+            }
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestAdversarial.CallInlined();",
+                "6116",
+            )
+            .await;
+        }
+
+        let _ = self
+            .apply_texts(
+                "R10 restore aggressive-inlining corpus",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+
+        let name = "R11 cross-file inline caller refresh batch";
+        let edited = INLINE_CALLEE_BASELINE
+            .replace("return 101;", "return 1101;")
+            .replace("return 201;", "return 1201;")
+            .replace("return x + 301;", "return x + 1301;")
+            .replace("return 501;", "return 1501;")
+            .replace("return x > 0 ? 601 : 0;", "return x > 0 ? 1601 : 0;")
+            .replace("return 701;", "return 1701;");
+        if let Some(summary) = self
+            .apply_texts(
+                name,
+                &[(INLINE_CALLEE_FILE, edited.as_str())],
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+            )
+            .await
+        {
+            // The summary must report Release inlining was detected; the caller
+            // refresh itself is proven BEHAVIORALLY by R11a–f below. The
+            // "Inline caller refresh patched" line only appears when the batch's
+            // refresh recompile actually patches a caller — which the large
+            // cumulative batch may legitimately skip (the predicted-inlined
+            // callees' direct detours deliver the values, methods==0 + a note),
+            // so it is not a reliable suite gate (keying on it reddened a healthy
+            // run while R11a–f all passed).
+            if !summary.contains("inlined in Release") {
+                self.fail(
+                    name,
+                    format!("expected Release inline detection, got: {}", squash(&summary)),
+                );
+            } else {
+                self.pass(name, "reported inlined in Release; caller refresh asserted behaviorally below");
+            }
+            self.expect_release_immediate_output(
+                "R11a direct caller file",
+                "return LocusSelfTestInlineCallerDirect.Run();",
+                "1102",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11b nested callee caller file",
+                "return LocusSelfTestInlineCallerNested.Run();",
+                "1203",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11c overload caller file",
+                "return LocusSelfTestInlineCallerOverload.Run();",
+                "1307",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11d lambda caller file",
+                "return LocusSelfTestInlineCallerLambda.Run();",
+                "1505",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11e branch caller file",
+                "return LocusSelfTestInlineCallerBranch.Run(2);",
+                "1606",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11f collection caller file",
+                "return LocusSelfTestInlineCallerArray.Run();",
+                "1707",
+            )
+            .await;
+        }
+
+        let _ = self
+            .apply_texts(
+                "R11 restore cross-file inline corpus",
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Phase 2b+ — multi-file caller-refresh coverage for the shapes R10/R11
+    /// don't reach: a depth-2 static chain (R12), a cross-assembly static callee
+    /// (R13), and a same-assembly INSTANCE callee (R14 — the same-assembly
+    /// counterpart of the R05 suite-gate, hot since the instance self-shim
+    /// redirect landed). All three are confirmed HOT on Unity, so they are real
+    /// suite assertions (promoted out of the earlier diagnostic phase).
+    async fn run_release_inline_multifile_tests(&mut self) {
+        self.log("Phase 2b+ — multi-file inline caller refresh");
+
+        // R12 — depth-2 static inline chain across three files: editing Leaf
+        // refreshes Mid (round 1, caller of Leaf) and then Top (round 2, caller
+        // of Mid), the exact INLINE_REFRESH_MAX_DEPTH ceiling. Each hop is
+        // static, and a force-detoured intermediate re-enters the diff as a
+        // changed method, so its own caller redirects too.
+        let name = "R12 depth-2 static inline chain";
+        self.log(format!("— {name}"));
+        let edited = INLINE_CHAIN_LEAF_BASELINE.replace("return 3100;", "return 9100;");
+        if self
+            .apply_texts(
+                name,
+                &[(INLINE_CHAIN_LEAF_FILE, edited.as_str())],
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestChainTop.Top();",
+                "9430", // 9100 + 30 + 300, observed at the two-hops-removed caller
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R12 restore inline chain",
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+            )
+            .await;
+
+        // R13 — cross-ASSEMBLY static inline refresh: a static lib method
+        // inlined into an Assembly-CSharp caller. The refresh recompiles
+        // callee+caller into ONE patch assembly, so the static patch-copy
+        // redirect erases the boundary (confirming the assembly boundary alone
+        // never blocked the refresh — R05's earlier failure was instance-only).
+        let name = "R13 cross-asmdef static inline refresh";
+        self.log(format!("— {name}"));
+        let edited = LIB_INLINE_BASELINE.replace("return 6200;", "return 7200;");
+        if self
+            .apply_texts(
+                name,
+                &[(LIB_INLINE_FILE, edited.as_str())],
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestLibInlineCaller.Run();",
+                "7206", // 7200 + 6, read through the Assembly-CSharp caller
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R13 restore lib inline corpus",
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+            )
+            .await;
+
+        // R14 — same-ASSEMBLY INSTANCE inline refresh: an instance callee
+        // inlined into a static caller. This is R05 with the assembly boundary
+        // removed. The instance self-shim redirect (Option A) binds the inlined
+        // instance call to the changed body's static self-shim, so the immediate
+        // read observes 9408 — the same-assembly companion to the R05 gate.
+        let name = "R14 same-asm instance inline refresh";
+        self.log(format!("— {name}"));
+        let edited = INST_INLINEE_BASELINE.replace("return 8400;", "return 9400;");
+        if self
+            .apply_texts(
+                name,
+                &[(INST_INLINEE_FILE, edited.as_str())],
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestInstInlineCaller.Run();",
+                "9408", // 9400 + 8 — instance self-shim delivers the new body
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R14 restore instance inline corpus",
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Phase 2c — adversarial C#-syntax cases that pin tricky resolver /
     /// inlining behaviour. They catch regressions and document the edges:
     ///   A1 — overloads distinct only by parameter NAMESPACE,
     ///   A2 — overloads distinct only by GENERIC ARGUMENT.
@@ -3163,30 +3578,19 @@ impl SelfTest {
     ///        identity is ambiguous; they resolve HOT via the enriched
     ///        per-parameter signature (namespace + closed generic argument)
     ///        the desktop now sends alongside (`param_type_sigs`).
-    ///   A3 — an [AggressiveInlining] method. Passes here only because Code
-    ///        Optimization is Debug (the JIT does not inline, so the detour
-    ///        holds); under Release the inlined call sites would bypass it.
-    ///   A4 — a default parameter VALUE change. Passes because the caller is
-    ///        co-located in this file and re-emitted with the new default; a
-    ///        caller outside the batch would keep the baked-in old value.
+    ///   A3 — an [AggressiveInlining] method body edit. Under the suite's
+    ///        forced Release the apply reports it inlined and converges via
+    ///        recompile (the behavioral assert tolerates the inline fallback).
+    ///   A4 — a default parameter VALUE change. The caller is co-located in this
+    ///        file and re-emitted with the new default; a caller outside the
+    ///        batch would keep the baked-in old value.
     ///
     /// All four edit a dedicated `LocusSelfTestAdversarial` type, so a failure
-    /// here cannot poison the other phases.
-    ///
-    /// Because these are EXPECTED failures, the phase records outcomes as
-    /// diagnostics (`diag_failed` = xfail, `diag_passed` = xpass) rather than
-    /// the suite tally — otherwise the CLI runner, which fails any suite with
-    /// `failed > 0`, would paint the hot-reload suite red on a healthy pipeline.
-    /// An xpass means a pinned gap has closed: promote that case into the real
-    /// suite.
+    /// here cannot poison the other phases. Once pinned as known gaps and routed
+    /// to the diagnostic tally; now confirmed HOT on Unity and promoted into the
+    /// real suite (a regression here legitimately reddens the suite again).
     async fn run_adversarial_tests(&mut self) {
-        self.log("Phase 2b — adversarial C# syntax edge cases");
-        // These cases pin KNOWN, still-open pipeline gaps and are EXPECTED to
-        // fail. The CLI runner fails a suite whenever failed>0, so route their
-        // outcomes into the diagnostic counters instead of the suite tally: an
-        // expected failure here must not turn the hot-reload suite red. The flag
-        // is cleared at the end of this phase (there are no early returns).
-        self.diagnostic_phase = true;
+        self.log("Phase 2c — adversarial C# syntax edge cases");
         let mut adv = ADVERSARIAL_BASELINE.to_string();
 
         // A1 — body edit of an overload distinct only by parameter namespace.
@@ -3275,19 +3679,6 @@ impl SelfTest {
                 "9000",
             )
             .await;
-        }
-
-        // Restore the suite-verdict semantics and report the diagnostic tally.
-        self.diagnostic_phase = false;
-        self.log(format!(
-            "Phase 2b diagnostics (excluded from suite verdict): {} known gap(s) still open (xfail), {} unexpectedly fixed (xpass)",
-            self.diag_failed, self.diag_passed,
-        ));
-        if self.diag_passed > 0 {
-            self.log(
-                "  note: an adversarial case now PASSES — the pinned gap has closed; \
-                 promote it out of Phase 2b into the real suite",
-            );
         }
     }
 
@@ -4075,6 +4466,11 @@ impl SelfTest {
             }
         }
 
+        self.cleanup_corpus().await;
+        self.restore_code_optimization().await;
+    }
+
+    async fn cleanup_corpus(&mut self) {
         // The corpus served its purpose. Deleting through the tracker keeps
         // the paths in the pending set, so the cleanup recompile forwards
         // them and the plugin refreshes the stale AssetDatabase entries away.
@@ -4090,6 +4486,26 @@ impl SelfTest {
         match crate::unity_bridge::recompile_and_wait(&self.project).await {
             Ok(_) => self.log("Cleanup recompile finished."),
             Err(error) => self.log(format!("cleanup recompile failed: {error}")),
+        }
+    }
+
+    async fn restore_code_optimization(&mut self) {
+        let Some(original) = self.original_code_optimization.take() else {
+            return;
+        };
+        if original != "debug" && original != "release" {
+            return;
+        }
+        if original == "release" {
+            return;
+        }
+        match coordinator::set_code_optimization(&self.project, &original).await {
+            Ok(value) => {
+                self.log(format!("Code Optimization restored to {value}."));
+            }
+            Err(error) => {
+                self.log(format!("Code Optimization restore failed: {error}"));
+            }
         }
     }
 
@@ -4142,24 +4558,37 @@ impl SelfTest {
             "editor connected in edit mode; features enabled",
         );
 
-        // Release-first: detect Code Optimization once. In Release the editor
-        // inlines some methods past the detour; the apply path converges those
-        // via recompile, so behavioral asserts below tolerate an "inlined in
-        // Release" apply instead of failing.
+        // Force Release for this suite so the AggressiveInlining sample and
+        // caller-refresh path run against Mono's actual inliner. Teardown
+        // restores the original mode on both success and post-switch failure.
         let (_, code_optimization) = coordinator::detect_code_optimization(&self.project).await;
-        self.release_mode = code_optimization.as_deref() == Some("release");
-        self.log(format!(
-            "Code Optimization = {} ({})",
-            code_optimization.as_deref().unwrap_or("unknown"),
-            if self.release_mode {
-                "Release-first: inlined methods converge via recompile"
-            } else {
-                "strict behavioral asserts"
+        self.original_code_optimization = code_optimization.clone();
+        if code_optimization.as_deref() != Some("release") {
+            match coordinator::set_code_optimization(&self.project, "release").await {
+                Ok(value) => {
+                    self.release_mode = value == "release";
+                    self.log(format!(
+                        "Code Optimization switched from {} to {} for Release inline coverage",
+                        code_optimization.as_deref().unwrap_or("unknown"),
+                        value,
+                    ));
+                }
+                Err(error) => {
+                    self.fail("preconditions", error);
+                    self.restore_code_optimization().await;
+                    self.emit(None, true);
+                    return;
+                }
             }
-        ));
+        } else {
+            self.release_mode = true;
+            self.log("Code Optimization = release");
+        }
 
         if let Err(error) = self.initialize_corpus().await {
             self.fail("initialize", error);
+            self.restore_code_optimization().await;
+            self.cleanup_corpus().await;
             self.emit(None, true);
             return;
         }
@@ -4176,15 +4605,16 @@ impl SelfTest {
         let mut helper = HELPER_BASELINE.to_string();
 
         self.run_positive_tests(&mut subject, &mut helper).await;
+        self.run_release_inline_tests().await;
+        self.run_release_inline_multifile_tests().await;
         self.run_adversarial_tests().await;
         self.run_negative_tests().await;
         self.run_deletion_tests(&mut subject, &mut helper).await;
         self.finalize().await;
 
         self.log(format!(
-            "Self-test finished: {} passed, {} failed \
-             ({} xfail / {} xpass adversarial diagnostics, excluded from verdict).",
-            self.passed, self.failed, self.diag_failed, self.diag_passed
+            "Self-test finished: {} passed, {} failed.",
+            self.passed, self.failed
         ));
         self.emit(None, true);
     }
@@ -4223,10 +4653,8 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
             epmo_enabled: None,
             editor_patch_live: false,
             release_mode: false,
+            original_code_optimization: None,
             last_apply_inlined: false,
-            diagnostic_phase: false,
-            diag_passed: 0,
-            diag_failed: 0,
         };
         test.run().await;
         RUNNING.store(false, Ordering::SeqCst);
