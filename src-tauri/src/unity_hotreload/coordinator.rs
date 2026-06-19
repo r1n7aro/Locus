@@ -8,7 +8,7 @@
 //! the current disk text against that baseline, so re-patching a method
 //! always re-detours from the original — patches never stack.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use tokio::sync::Mutex;
@@ -113,6 +113,21 @@ fn file_key(file_path: &str) -> String {
         .trim()
         .replace('\\', "/")
         .to_ascii_lowercase()
+}
+
+/// Reconstruct the `MethodKey` string the Unity plugin builds per detour
+/// (`LocusBridge.HotReload.cs::MethodKey`) from the same fields the desktop
+/// ships, so the inlined-method keys Unity returns can be mapped back to their
+/// source files. MUST stay byte-identical to that plugin function:
+/// `declaringType|name|param,types|s` (`|i` when instance).
+fn unity_method_key(method: &crate::csharp_compile::HotPatchMethod) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        method.declaring_type,
+        method.name,
+        method.param_type_names.join(","),
+        if method.is_static { "s" } else { "i" },
+    )
 }
 
 fn normalize_project_file_path(project_path: &str, file_path: &str) -> String {
@@ -830,6 +845,527 @@ fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64
     base64_decoded_len(assembly_b64)
 }
 
+#[derive(Debug)]
+struct AppliedHotPatch {
+    engine: String,
+    inlined_method_keys: Vec<String>,
+    image_register_error: Option<String>,
+}
+
+async fn apply_compiled_hot_patch(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    assembly_name: &str,
+    assembly_b64: &str,
+    assembly_path: Option<&String>,
+    methods: &[crate::csharp_compile::HotPatchMethod],
+    new_types: &[crate::csharp_compile::HotPatchNewType],
+) -> Result<AppliedHotPatch, String> {
+    let mut payload = serde_json::json!({
+        "patch_id": assembly_name,
+        "domain_generation": params.domain_generation,
+        "methods": methods.iter().map(|m| serde_json::json!({
+            "declaring_type": m.declaring_type,
+            "patch_declaring_type": m.patch_declaring_type,
+            "name": m.name,
+            "param_type_names": m.param_type_names,
+            "param_type_sigs": m.param_type_sigs,
+            "is_static": m.is_static,
+            "is_ctor": m.is_ctor,
+            // Older plugins ignore the unknown field and then fail
+            // resolution → whole-patch rollback + update hint (the
+            // established compatibility discipline).
+            "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(path) = assembly_path {
+            object.insert(
+                "assembly_path".to_string(),
+                serde_json::Value::String(path.clone()),
+            );
+        } else {
+            object.insert(
+                "assembly_b64".to_string(),
+                serde_json::Value::String(assembly_b64.to_string()),
+            );
+        }
+    }
+    let payload = payload.to_string();
+
+    let resp = match crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_patch_loaded",
+        &payload,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            super::record_patch_failure();
+            return Err(format!(
+                "Unity did not accept the hot patch ({error}); use unity_recompile."
+            ));
+        }
+    };
+
+    if !resp.ok {
+        super::record_patch_failure();
+        let error = resp
+            .error
+            .unwrap_or_else(|| "hot patch rejected".to_string());
+        if error.starts_with("unknown message type") {
+            return Err(
+                "The Unity plugin in this project predates hot reload; update the Locus plugin \
+                 or use unity_recompile."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Hot patch failed in Unity: {error}\nRun unity_recompile to converge."
+        ));
+    }
+
+    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
+    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
+    super::record_patch_applied(assembly_bytes, code_entries);
+    super::note_patch_applied(project_path);
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct HotPatchLoadedResponse {
+        detour_engine: String,
+        inlined_method_keys: Vec<String>,
+    }
+    let loaded = resp
+        .message
+        .as_deref()
+        .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
+        .unwrap_or_default();
+
+    let image_register_error = match crate::csharp_compile::register_session_image(
+        &params.domain_generation,
+        assembly_name,
+        assembly_b64,
+        assembly_path.map(|p| p.as_str()),
+    )
+    .await
+    {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+
+    let index_types: Vec<crate::unity_type_index::UnityTypeIndexEntry> = new_types
+        .iter()
+        .filter(|t| t.is_top_level && t.is_public)
+        .map(|t| crate::unity_type_index::UnityTypeIndexEntry {
+            simple_name: t.simple_name.clone(),
+            namespace: t.ns.clone(),
+            full_name: if t.ns.is_empty() {
+                t.simple_name.clone()
+            } else {
+                format!("{}.{}", t.ns, t.simple_name)
+            },
+            assembly: assembly_name.to_string(),
+        })
+        .collect();
+    if image_register_error.is_none() && !index_types.is_empty() {
+        if let Err(error) = crate::unity_type_index::append_hot_patch_types(
+            project_path,
+            assembly_name,
+            index_types,
+        )
+        .await
+        {
+            eprintln!("[HotReload] type index increment skipped: {error}");
+        }
+    }
+
+    Ok(AppliedHotPatch {
+        engine: loaded.detour_engine,
+        inlined_method_keys: loaded.inlined_method_keys,
+        image_register_error,
+    })
+}
+
+const INLINE_REFRESH_MAX_DEPTH: usize = 2;
+const INLINE_REFRESH_MAX_CALLERS_PER_TARGET: usize = 8;
+const INLINE_REFRESH_MAX_METHODS_TOTAL: usize = 16;
+const INLINE_REFRESH_MAX_FILES_TOTAL: usize = 16;
+
+#[derive(Debug, Default)]
+struct InlineCallerRefreshReport {
+    rounds: usize,
+    files: usize,
+    methods: usize,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct InlineRefreshFile {
+    path: String,
+    old_text: String,
+    new_text: String,
+    force_methods: BTreeSet<String>,
+}
+
+fn caller_query_target_from_unity_key(
+    key: &str,
+) -> Option<crate::csharp_compile::CallerQueryTarget> {
+    let parts: Vec<&str> = key.split('|').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let declaring_type = parts[0].trim();
+    let member_name = parts[1].trim();
+    if declaring_type.is_empty()
+        || member_name.is_empty()
+        || member_name == ".ctor"
+        || declaring_type.contains('<')
+        || member_name.contains('<')
+    {
+        return None;
+    }
+    Some(crate::csharp_compile::CallerQueryTarget {
+        declaring_type: declaring_type.to_string(),
+        member_name: member_name.to_string(),
+    })
+}
+
+fn resolve_caller_source_path(project_path: &str, file: &str) -> String {
+    let normalized = file.replace('\\', "/");
+    let path = std::path::Path::new(file);
+    if path.is_absolute() {
+        return file.to_string();
+    }
+    std::path::Path::new(project_path)
+        .join(normalized.trim_start_matches('/'))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn squash_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+async fn try_inline_caller_refresh(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    extra_references: &[String],
+    access_caps: &crate::csharp_compile::AccessCaps,
+    initial_methods: &[crate::csharp_compile::HotPatchMethod],
+    initial_patch_files: &[(String, String, String)],
+    initial_inlined_keys: &[String],
+) -> InlineCallerRefreshReport {
+    let mut report = InlineCallerRefreshReport::default();
+    let mut frontier: Vec<String> = initial_inlined_keys.to_vec();
+    let mut seen_targets = BTreeSet::<String>::new();
+    let mut refreshed_methods = BTreeSet::<String>::new();
+    let mut refreshed_files = BTreeSet::<String>::new();
+    let mut carry_files = {
+        let inlined: BTreeSet<String> = initial_inlined_keys.iter().cloned().collect();
+        let mut source_file_keys = BTreeSet::<String>::new();
+        for method in initial_methods {
+            if inlined.contains(&unity_method_key(method)) && !method.source_path.trim().is_empty()
+            {
+                source_file_keys.insert(file_key(&method.source_path));
+            }
+        }
+        let include_all = source_file_keys.is_empty();
+        let mut files = BTreeMap::<String, InlineRefreshFile>::new();
+        for (path, old_text, new_text) in initial_patch_files {
+            let key = file_key(path);
+            if include_all || source_file_keys.contains(&key) {
+                files.insert(
+                    key,
+                    InlineRefreshFile {
+                        path: path.clone(),
+                        old_text: old_text.clone(),
+                        new_text: new_text.clone(),
+                        force_methods: BTreeSet::new(),
+                    },
+                );
+            }
+        }
+        files
+    };
+
+    for depth in 0..INLINE_REFRESH_MAX_DEPTH {
+        let targets: Vec<crate::csharp_compile::CallerQueryTarget> = frontier
+            .iter()
+            .filter(|key| seen_targets.insert((*key).clone()))
+            .filter_map(|key| caller_query_target_from_unity_key(key))
+            .collect();
+        if targets.is_empty() {
+            break;
+        }
+
+        let query = match crate::csharp_compile::query_callers(params, &targets).await {
+            Ok(query) => query,
+            Err(error) => {
+                report.notes.push(format!(
+                    "caller refresh skipped: caller index unavailable ({error})"
+                ));
+                break;
+            }
+        };
+
+        let mut force_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut method_limit_hit = false;
+        for target in &query.targets {
+            if method_limit_hit {
+                break;
+            }
+            if target.callers.len() > INLINE_REFRESH_MAX_CALLERS_PER_TARGET {
+                report.notes.push(format!(
+                    "caller refresh skipped {} caller(s) for {}.{} (limit {})",
+                    target.callers.len(),
+                    target.declaring_type,
+                    target.member_name,
+                    INLINE_REFRESH_MAX_CALLERS_PER_TARGET
+                ));
+                continue;
+            }
+            for caller in &target.callers {
+                if caller.file.trim().is_empty() || caller.method_key.trim().is_empty() {
+                    continue;
+                }
+                if refreshed_methods.len() >= INLINE_REFRESH_MAX_METHODS_TOTAL {
+                    if !method_limit_hit {
+                        report.notes.push(format!(
+                            "caller refresh stopped at {} method(s) (limit {})",
+                            refreshed_methods.len(),
+                            INLINE_REFRESH_MAX_METHODS_TOTAL
+                        ));
+                    }
+                    method_limit_hit = true;
+                    break;
+                }
+                let absolute = resolve_caller_source_path(project_path, &caller.file);
+                let fkey = file_key(&absolute);
+                // Respect the file budget BEFORE claiming the method: a method
+                // skipped for the file cap must not be recorded as refreshed,
+                // or it would wrongly consume the method budget and suppress a
+                // later, in-budget refresh of the same method.
+                if !refreshed_files.contains(&fkey)
+                    && refreshed_files.len() >= INLINE_REFRESH_MAX_FILES_TOTAL
+                {
+                    report.notes.push(format!(
+                        "caller refresh stopped at {} file(s) (limit {})",
+                        refreshed_files.len(),
+                        INLINE_REFRESH_MAX_FILES_TOTAL
+                    ));
+                    continue;
+                }
+                let method_id = format!("{}::{}", fkey, caller.method_key);
+                if !refreshed_methods.insert(method_id) {
+                    continue;
+                }
+                refreshed_files.insert(fkey);
+                force_by_file
+                    .entry(absolute)
+                    .or_default()
+                    .insert(caller.method_key.clone());
+            }
+        }
+
+        if force_by_file.is_empty() {
+            break;
+        }
+
+        let forced_file_count = force_by_file.len();
+        let forced_method_count: usize = force_by_file.values().map(BTreeSet::len).sum();
+        let mut round_files = carry_files.clone();
+        for (path, methods) in force_by_file {
+            let current = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => text,
+                Err(error) => {
+                    report.notes.push(format!(
+                        "caller refresh skipped {}: failed to read source ({error})",
+                        display_project_path(project_path, &path)
+                    ));
+                    continue;
+                }
+            };
+            let key = file_key(&path);
+            let entry = round_files.entry(key).or_insert_with(|| InlineRefreshFile {
+                path: path.clone(),
+                old_text: current.clone(),
+                new_text: current,
+                force_methods: BTreeSet::new(),
+            });
+            entry.force_methods.extend(methods);
+        }
+
+        let files: Vec<(String, String, String)> = round_files
+            .values()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.old_text.clone(),
+                    file.new_text.clone(),
+                )
+            })
+            .collect();
+        let force_detours: Vec<crate::csharp_compile::ForceDetour> = round_files
+            .values()
+            .filter(|file| !file.force_methods.is_empty())
+            .map(|file| crate::csharp_compile::ForceDetour {
+                path: file.path.clone(),
+                method_keys: file.force_methods.iter().cloned().collect(),
+            })
+            .collect();
+
+        if files.is_empty() || force_detours.is_empty() {
+            break;
+        }
+
+        let baseline_siblings = discover_partial_siblings(project_path, &files).await;
+        let outcome = match crate::csharp_compile::compile_hot_patch(
+            params,
+            &files,
+            &baseline_siblings,
+            extra_references,
+            Some(access_caps),
+            &force_detours,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                report
+                    .notes
+                    .push(format!("caller refresh compile unavailable: {error}"));
+                break;
+            }
+        };
+
+        match outcome {
+            crate::csharp_compile::HotPatchOutcome::Compiled {
+                assembly_name,
+                assembly_b64,
+                assembly_path,
+                methods,
+                new_types,
+                ..
+            } => {
+                if methods.is_empty() {
+                    report
+                        .notes
+                        .push("caller refresh produced no detourable methods".to_string());
+                    break;
+                }
+                match apply_compiled_hot_patch(
+                    project_path,
+                    params,
+                    &assembly_name,
+                    &assembly_b64,
+                    assembly_path.as_ref(),
+                    &methods,
+                    &new_types,
+                )
+                .await
+                {
+                    Ok(applied) => {
+                        report.rounds = depth + 1;
+                        report.files += forced_file_count;
+                        report.methods += forced_method_count;
+                        carry_files = round_files;
+                        if let Some(error) = applied.image_register_error {
+                            report.notes.push(format!(
+                                "caller refresh image registration failed: {error}; run unity_recompile before the next hot reload"
+                            ));
+                            break;
+                        }
+                        frontier = applied.inlined_method_keys;
+                        if frontier.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        report.notes.push(format!(
+                            "caller refresh patch failed: {}",
+                            squash_line(&error)
+                        ));
+                        break;
+                    }
+                }
+            }
+            crate::csharp_compile::HotPatchOutcome::Cold { files } => {
+                let reasons: Vec<String> = files
+                    .iter()
+                    .map(|(path, reasons)| {
+                        format!(
+                            "{}: {}",
+                            display_project_path(project_path, path),
+                            reasons.join("; ")
+                        )
+                    })
+                    .collect();
+                report.notes.push(format!(
+                    "caller refresh stopped at cold verdict: {}",
+                    reasons.join(" | ")
+                ));
+                break;
+            }
+            crate::csharp_compile::HotPatchOutcome::Noop { .. } => {
+                report
+                    .notes
+                    .push("caller refresh found no effective caller detours".to_string());
+                break;
+            }
+            crate::csharp_compile::HotPatchOutcome::CompileError(message) => {
+                report.notes.push(format!(
+                    "caller refresh compile error: {}",
+                    squash_line(&message)
+                ));
+                break;
+            }
+        }
+    }
+
+    if !frontier.is_empty() && report.rounds >= INLINE_REFRESH_MAX_DEPTH {
+        report.notes.push(format!(
+            "caller refresh stopped at recursion depth {}",
+            INLINE_REFRESH_MAX_DEPTH
+        ));
+    }
+    report
+}
+
+async fn queue_inlined_method_files(
+    project_path: &str,
+    changed_keys: &[String],
+    methods: &[crate::csharp_compile::HotPatchMethod],
+    inlined_method_keys: &[String],
+) -> usize {
+    if inlined_method_keys.is_empty() {
+        return 0;
+    }
+    let method_key_to_file: BTreeMap<String, String> = methods
+        .iter()
+        .filter(|method| !method.source_path.is_empty())
+        .map(|method| (unity_method_key(method), file_key(&method.source_path)))
+        .collect();
+    let mut inlined_files: BTreeSet<String> = BTreeSet::new();
+    let mut unmapped = false;
+    for key in inlined_method_keys {
+        match method_key_to_file.get(key) {
+            Some(file) if !file.is_empty() => {
+                inlined_files.insert(file.clone());
+            }
+            _ => unmapped = true,
+        }
+    }
+    if unmapped || inlined_files.is_empty() {
+        queue_cold_paths(project_path, changed_keys).await
+    } else {
+        let files: Vec<String> = inlined_files.into_iter().collect();
+        queue_cold_paths(project_path, &files).await
+    }
+}
+
 pub async fn pending_paths(project_path: &str) -> Vec<String> {
     let projects = projects().lock().await;
     match projects.get(&project_key(project_path)) {
@@ -1376,6 +1912,7 @@ pub async fn hot_reload(
         &baseline_siblings,
         &extra_references,
         Some(&access_caps),
+        &[],
     )
     .await
     .map_err(|error| {
@@ -1446,131 +1983,62 @@ pub async fn hot_reload(
                 );
             }
 
-            // New-types-only patches skip the detour message: loading the
-            // assembly is enough... except nothing would load it. Ship it
-            // through the same pipe message with an empty method list NOT
-            // allowed (Unity rejects) — so require methods OR load via
-            // execute path. Simplest correct path: send hot_patch_loaded
-            // whenever there are methods; for pure new-type patches send it
-            // too — Unity loads the assembly and applies zero detours.
-            let mut payload = serde_json::json!({
-                "patch_id": assembly_name,
-                "domain_generation": params.domain_generation,
-                "methods": methods.iter().map(|m| serde_json::json!({
-                    "declaring_type": m.declaring_type,
-                    "patch_declaring_type": m.patch_declaring_type,
-                    "name": m.name,
-                    "param_type_names": m.param_type_names,
-                    "param_type_sigs": m.param_type_sigs,
-                    "is_static": m.is_static,
-                    "is_ctor": m.is_ctor,
-                    // Older plugins ignore the unknown field and then fail
-                    // resolution → whole-patch rollback + update hint (the
-                    // established compatibility discipline).
-                    "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
-                })).collect::<Vec<_>>(),
-            });
-            if let Some(object) = payload.as_object_mut() {
-                if let Some(path) = &assembly_path {
-                    object.insert(
-                        "assembly_path".to_string(),
-                        serde_json::Value::String(path.clone()),
-                    );
-                } else {
-                    object.insert(
-                        "assembly_b64".to_string(),
-                        serde_json::Value::String(assembly_b64.clone()),
-                    );
-                }
-            }
-            let payload = payload.to_string();
-
-            let resp = match crate::unity_bridge::send_message_with_timeout(
+            let applied = match apply_compiled_hot_patch(
                 project_path,
-                "hot_patch_loaded",
-                &payload,
-                std::time::Duration::from_secs(30),
+                &params,
+                &assembly_name,
+                &assembly_b64,
+                assembly_path.as_ref(),
+                &methods,
+                &new_types,
             )
             .await
             {
-                Ok(resp) => resp,
+                Ok(applied) => applied,
                 Err(error) => {
-                    super::record_patch_failure();
-                    // The patch never applied: queue the files so the
-                    // convergence pass (and the status card) covers them.
                     let queued = queue_cold_paths(project_path, &changed_keys).await;
                     super::set_cold_queue_depth(queued as u64);
-                    return Err(format!(
-                        "Unity did not accept the hot patch ({error}); use unity_recompile."
-                    ));
+                    return Err(error);
                 }
             };
-
-            if !resp.ok {
-                super::record_patch_failure();
-                let queued = queue_cold_paths(project_path, &changed_keys).await;
-                super::set_cold_queue_depth(queued as u64);
-                let error = resp
-                    .error
-                    .unwrap_or_else(|| "hot patch rejected".to_string());
-                if error.starts_with("unknown message type") {
-                    return Err(
-                        "The Unity plugin in this project predates hot reload; update the Locus \
-                         plugin or use unity_recompile."
-                            .to_string(),
-                    );
-                }
-                return Err(format!(
-                    "Hot patch failed in Unity: {error}\nRun unity_recompile to converge."
-                ));
-            }
 
             mark_changed_keys_applied(project_path, &changed_current_texts).await;
 
-            let image_register_error = match crate::csharp_compile::register_session_image(
-                &params.domain_generation,
-                &assembly_name,
-                &assembly_b64,
-                assembly_path.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => None,
-                Err(error) => Some(error),
-            };
-
-            let assembly_bytes = assembly_artifact_len(&assembly_b64, assembly_path.as_deref());
-            let code_entries = methods.len().saturating_add(new_types.len()) as u64;
-            super::record_patch_applied(assembly_bytes, code_entries);
-            // H6: arm the convergence scheduler (threshold / idle / play exit).
-            super::note_patch_applied(project_path);
-
-            // Typed parse of the Unity apply response: the detour engine used,
-            // plus any original methods Unity inlined in Release. Inlined
-            // methods get a live detour, but their inlined call sites bypass it,
-            // so they need a recompile to converge (handled just below).
-            #[derive(serde::Deserialize, Default)]
-            #[serde(default)]
-            struct HotPatchLoadedResponse {
-                detour_engine: String,
-                inlined_method_keys: Vec<String>,
-            }
-            let loaded = resp
-                .message
-                .as_deref()
-                .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
-                .unwrap_or_default();
-            let engine = loaded.detour_engine;
-            let inlined_method_keys = loaded.inlined_method_keys;
+            let engine = applied.engine;
+            let inlined_method_keys = applied.inlined_method_keys;
+            let image_register_error = applied.image_register_error;
 
             // Route inlined methods to the same convergence path Locus uses for
-            // any non-hot-safe change, so a silent recompile bakes them in. The
-            // per-method DTO carries no source file, so queue the whole batch
-            // (coarse but correct — convergence clears it either way).
+            // any non-hot-safe change, but queue only the source file(s) whose
+            // methods Unity reported as inlined. Fall back to the batch if a
+            // method key cannot be mapped.
             if !inlined_method_keys.is_empty() {
-                let queued = queue_cold_paths(project_path, &changed_keys).await;
+                let queued = queue_inlined_method_files(
+                    project_path,
+                    &changed_keys,
+                    &methods,
+                    &inlined_method_keys,
+                )
+                .await;
                 super::set_cold_queue_depth(queued as u64);
             }
+
+            let inline_refresh = if !inlined_method_keys.is_empty() {
+                Some(
+                    try_inline_caller_refresh(
+                        project_path,
+                        &params,
+                        &extra_references,
+                        &access_caps,
+                        &methods,
+                        &files,
+                        &inlined_method_keys,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
 
             let stub_count = methods.iter().filter(|m| m.is_stub).count();
             let mut summary = format!(
@@ -1600,6 +2068,17 @@ pub async fn hot_reload(
                 summary.push_str(&format!(
                     ".\nSidecar image registration failed: {error}. Run unity_recompile before the next hot reload."
                 ));
+            }
+            if let Some(refresh) = &inline_refresh {
+                if refresh.methods > 0 {
+                    summary.push_str(&format!(
+                        ".\nInline caller refresh patched {} caller method(s) across {} file(s) in {} round(s); unity_recompile is still queued for convergence.",
+                        refresh.methods, refresh.files, refresh.rounds
+                    ));
+                }
+                for note in &refresh.notes {
+                    summary.push_str(&format!("\nInline caller refresh: {note}."));
+                }
             }
             if inlined_method_keys.is_empty() {
                 summary.push_str(
@@ -1634,39 +2113,24 @@ pub async fn hot_reload(
                 } else {
                     "run unity_recompile, or switch Code Optimization to Debug"
                 };
-                summary.push_str(&format!(
-                    ".\n{} method(s) inlined in Release — NOT live yet: {}. To apply: {}.",
-                    names.len(),
-                    names.join(", "),
-                    action,
-                ));
-            }
-
-            // TI-C: layer new public top-level types into the cached type
-            // index so auto-usings resolve them immediately.
-            let index_types: Vec<crate::unity_type_index::UnityTypeIndexEntry> = new_types
-                .iter()
-                .filter(|t| t.is_top_level && t.is_public)
-                .map(|t| crate::unity_type_index::UnityTypeIndexEntry {
-                    simple_name: t.simple_name.clone(),
-                    namespace: t.ns.clone(),
-                    full_name: if t.ns.is_empty() {
-                        t.simple_name.clone()
-                    } else {
-                        format!("{}.{}", t.ns, t.simple_name)
-                    },
-                    assembly: assembly_name.clone(),
-                })
-                .collect();
-            if image_register_error.is_none() && !index_types.is_empty() {
-                if let Err(error) = crate::unity_type_index::append_hot_patch_types(
-                    project_path,
-                    &assembly_name,
-                    index_types,
-                )
-                .await
+                if inline_refresh
+                    .as_ref()
+                    .map(|refresh| refresh.methods > 0)
+                    .unwrap_or(false)
                 {
-                    eprintln!("[HotReload] type index increment skipped: {error}");
+                    summary.push_str(&format!(
+                        ".\n{} method(s) inlined in Release; project caller refresh was attempted for: {}. To converge fully: {}.",
+                        names.len(),
+                        names.join(", "),
+                        action,
+                    ));
+                } else {
+                    summary.push_str(&format!(
+                        ".\n{} method(s) inlined in Release — NOT live yet: {}. To apply: {}.",
+                        names.len(),
+                        names.join(", "),
+                        action,
+                    ));
                 }
             }
 
@@ -1703,6 +2167,31 @@ mod tests {
             &mut none,
         );
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn inline_method_keys_roundtrip_to_caller_query_targets() {
+        let method = crate::csharp_compile::HotPatchMethod {
+            declaring_type: "Game.Runtime.Foo+Bar".to_string(),
+            patch_declaring_type: "__LocusHotPatch.Foo_Bar".to_string(),
+            name: "Answer".to_string(),
+            param_type_names: vec!["Int32".to_string(), "String".to_string()],
+            param_type_sigs: vec!["System.Int32".to_string(), "System.String".to_string()],
+            is_static: true,
+            is_ctor: false,
+            source_path: r"F:\Game\Assets\Foo.cs".to_string(),
+            original_assembly: Some("Assembly-CSharp".to_string()),
+            is_stub: false,
+        };
+
+        let key = unity_method_key(&method);
+        assert_eq!(key, "Game.Runtime.Foo+Bar|Answer|Int32,String|s");
+
+        let target = caller_query_target_from_unity_key(&key).expect("target");
+        assert_eq!(target.declaring_type, "Game.Runtime.Foo+Bar");
+        assert_eq!(target.member_name, "Answer");
+        assert!(caller_query_target_from_unity_key("Game.Foo|.ctor||i").is_none());
+        assert!(caller_query_target_from_unity_key("Game.Foo|<Generated>||s").is_none());
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ describe("compile server dev ensure", () => {
     expect(buildScript).toContain("dotnet");
     expect(buildScript).toContain("publish");
     expect(program).toContain('case "index/schema":');
-    expect(csharp).toContain("public const int ProtocolVersion = 5;");
-    expect(manager).toContain("const EXPECTED_PROTOCOL_VERSION: i64 = 5;");
+    expect(csharp).toContain("public const int ProtocolVersion = 6;");
+    expect(manager).toContain("const EXPECTED_PROTOCOL_VERSION: i64 = 6;");
   });
 });

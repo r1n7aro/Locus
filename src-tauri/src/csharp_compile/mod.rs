@@ -24,6 +24,11 @@ use tauri::Emitter;
 pub const STATUS_EVENT: &str = "csharp-compile-status";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// Graceful fallback to the in-Unity Roslyn compile when the sidecar is on but
+// a compile is unavailable (sidecar down / transport error). Default true
+// (keeps current behavior). Set false for pure-sidecar / A-B: an unavailable
+// sidecar then surfaces as an error instead of an in-Unity compile.
+static IN_PROCESS_FALLBACK: AtomicBool = AtomicBool::new(true);
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 // Session counters for the phase-6 rollout: how often tool calls actually
@@ -69,6 +74,23 @@ pub fn initialize(enabled: bool, app_handle: tauri::AppHandle) {
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn in_process_fallback_enabled() -> bool {
+    IN_PROCESS_FALLBACK.load(Ordering::Relaxed)
+}
+
+/// Set whether a sidecar `Unavailable` falls back to the in-Unity compile.
+pub fn set_in_process_fallback(value: bool) {
+    IN_PROCESS_FALLBACK.store(value, Ordering::Relaxed);
+}
+
+/// True when a sidecar `Unavailable` must NOT fall back to the in-Unity
+/// compile: the sidecar is the active compiler and the operator disabled the
+/// in-process fallback (pure-sidecar / A-B). When the sidecar is off the
+/// in-Unity path is the only path, so this is always false.
+pub fn block_in_process_fallback() -> bool {
+    is_enabled() && !in_process_fallback_enabled()
 }
 
 /// Flip the feature flag. Disabling stops the running sidecar.
@@ -408,6 +430,12 @@ pub struct HotPatchMethod {
     pub is_static: bool,
     #[serde(default)]
     pub is_ctor: bool,
+    /// Edited source file (sidecar `sourcePath`) whose rewrite produced this
+    /// detour. Lets the coordinator map a returned inlined `MethodKey` back to a
+    /// single file_key and queue only that file for recompile convergence —
+    /// instead of the whole batch. Empty for older sidecars (→ batch fallback).
+    #[serde(default)]
+    pub source_path: String,
     /// When set, the "original" side of the detour lives in this specific
     /// assembly (an earlier patch's shim being re-edited, M2).
     #[serde(default)]
@@ -432,6 +460,59 @@ pub struct HotPatchNewType {
     pub is_public: bool,
     #[serde(default)]
     pub is_top_level: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceDetour {
+    pub path: String,
+    pub method_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryTarget {
+    pub declaring_type: String,
+    pub member_name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerLocation {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub method_key: String,
+    #[serde(default)]
+    pub declaring_type: String,
+    #[serde(default)]
+    pub member_name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryTargetResult {
+    #[serde(default)]
+    pub declaring_type: String,
+    #[serde(default)]
+    pub member_name: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub callers: Vec<CallerLocation>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryResult {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub assembly_count: u64,
+    #[serde(default)]
+    pub targets: Vec<CallerQueryTargetResult>,
 }
 
 /// C0 runtime capability matrix: how the running editor's Mono enforces
@@ -543,6 +624,7 @@ pub async fn compile_hot_patch(
     baseline_siblings: &[(String, String)],
     extra_reference_paths: &[String],
     runtime_caps: Option<&AccessCaps>,
+    force_detours: &[ForceDetour],
 ) -> Result<HotPatchOutcome, String> {
     let mut request = json!({
         "files": files
@@ -571,12 +653,38 @@ pub async fn compile_hot_patch(
         request["runtimeCaps"] = serde_json::to_value(caps)
             .map_err(|error| format!("runtimeCaps serialization failed: {error}"))?;
     }
+    if !force_detours.is_empty() {
+        request["forceDetours"] = serde_json::to_value(force_detours)
+            .map_err(|error| format!("forceDetours serialization failed: {error}"))?;
+    }
 
     let client = manager::ensure_client().await?;
     let value = client
         .request_with_timeout("compile/hotPatch", request, client::COMPILE_REQUEST_TIMEOUT)
         .await?;
     parse_hot_patch_result(value)
+}
+
+pub async fn query_callers(
+    compile_params: &CompileParams,
+    targets: &[CallerQueryTarget],
+) -> Result<CallerQueryResult, String> {
+    let request = json!({
+        "params": compile_params,
+        "targets": targets,
+    });
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout("caller/query", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .await?;
+    let result: CallerQueryResult = serde_json::from_value(value)
+        .map_err(|error| format!("malformed caller/query response: {error}"))?;
+    if !result.success {
+        return Err(result
+            .error
+            .unwrap_or_else(|| "caller/query failed".to_string()));
+    }
+    Ok(result)
 }
 
 /// Register a sidecar-built hot-patch image only after Unity has accepted and
