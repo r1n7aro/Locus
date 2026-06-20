@@ -73,6 +73,7 @@ export default defineConfig(async () => ({
       // Tauri dev rebuilds, and Node's fs watcher exits on EBUSY.
       ignored: [
         "**/src-tauri/**",
+        "**/testproject/**",
         "**/locus_compile_server/**/bin/**",
         "**/locus_compile_server/**/obj/**",
       ],
