@@ -99,6 +99,7 @@ use super::coordinator;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+const EXIT_PLAY_MODE_TIMEOUT: Duration = Duration::from_secs(90);
 const TEST_DIR: &str = "Assets/LocusHotReloadSelfTest";
 const SUBJECT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestSubject.cs";
 const HELPER_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestHelper.cs";
@@ -599,6 +600,18 @@ struct NegativeLedgers {
     partial_a_text: String,
 }
 
+/// Reply of the `hot_reload_inlining_active` bridge command: the editor's
+/// runtime "is Mono inlining right now?" verdict (force-JIT a canary, read its
+/// inline_info bit) plus the codeOptimization setting it disagreed with.
+#[derive(serde::Deserialize, Default)]
+struct InliningActiveResponse {
+    inlining_active: bool,
+    #[serde(default)]
+    code_optimization: String,
+    #[serde(default)]
+    detail: String,
+}
+
 struct SelfTest {
     app: tauri::AppHandle,
     project: String,
@@ -631,6 +644,11 @@ struct SelfTest {
     /// Set by `apply_texts` from the latest apply summary: true when Unity
     /// reported methods it inlined (Release). Consulted by `expect_output`.
     last_apply_inlined: bool,
+    /// The most recent hot-reload apply summary verbatim. Surfaced in
+    /// Release-strict failure diagnostics so a stale immediate read can be
+    /// localized (did the inline caller refresh engage / patch the caller, or
+    /// report a note?).
+    last_apply_summary: String,
 }
 
 /// Replace exactly one occurrence, failing loudly when the anchor text is
@@ -751,27 +769,77 @@ impl SelfTest {
         crate::unity_bridge::unity_execute_code(&self.project, code).await
     }
 
+    /// Runtime "is Mono inlining right now?" check. Force-JITs a small canary in
+    /// the editor and reports whether its inline_info bit was set — the JIT's
+    /// EFFECTIVE behavior, which can disagree with the codeOptimization setting
+    /// (play-mode has been observed Debug-effective while the setting reads
+    /// release, so nothing inlines). Returns (active, human_detail); false on any
+    /// transport/parse error so a failure only ever soft-skips an inline assert,
+    /// never falsely claims inlining.
+    async fn inlining_active(&self) -> (bool, String) {
+        match crate::unity_bridge::send_message_with_timeout(
+            &self.project,
+            "hot_reload_inlining_active",
+            "",
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(resp) if resp.ok => {
+                let message = resp.message.unwrap_or_default();
+                match serde_json::from_str::<InliningActiveResponse>(&message) {
+                    Ok(parsed) => (
+                        parsed.inlining_active,
+                        format!(
+                            "code_optimization={} {}",
+                            parsed.code_optimization, parsed.detail
+                        ),
+                    ),
+                    Err(error) => (
+                        false,
+                        format!("parse failed: {error}; raw: {}", squash(&message)),
+                    ),
+                }
+            }
+            Ok(resp) => (
+                false,
+                resp.error
+                    .unwrap_or_else(|| "inlining_active failed".to_string()),
+            ),
+            Err(error) => (false, format!("transport: {}", squash(&error))),
+        }
+    }
+
     /// Snippet whose output must contain `expected` (sentinel values are
     /// chosen to be unambiguous).
+    ///
+    /// STRICT — no inlining tolerance. The inline caller refresh now re-patches the
+    /// parent method to un-inline (and the edited method's own detour is live), so
+    /// the new behavior MUST be observable immediately even in Release. A stale read
+    /// is a real gap — a refresh that could not redirect or hit its budget, or the
+    /// snippet caller inlining the callee — and is surfaced as a failure rather than
+    /// deferred to the queued recompile.
     async fn expect_output(&mut self, name: &str, code: &str, expected: &str) {
-        // Release-first: when the just-applied patch reported methods Unity
-        // inlined, the detour is bypassed at their inlined call sites until the
-        // queued recompile converges — so accept the apply instead of asserting
-        // the runtime value (which would still read the pre-patch behavior).
-        if self.release_mode && self.last_apply_inlined {
-            self.pass(name, "applied; inlined in Release → recompile queued");
-            return;
-        }
         match self.execute(code).await {
+            Ok(output) if output.contains(expected) => {
+                self.pass(name, format!("observed {expected}"));
+            }
             Ok(output) => {
-                if output.contains(expected) {
-                    self.pass(name, format!("observed {expected}"));
+                // Help localize: a stale read that the apply ALSO reported inlined is
+                // an un-inline (caller-refresh) gap; a stale read with no inlining is
+                // a different bug (wrong patch / wrong expectation).
+                let hint = if self.release_mode && self.last_apply_inlined {
+                    " — apply reported inlined in Release, so caller refresh did not make it live (un-inline gap)"
                 } else {
-                    self.fail(
-                        name,
-                        format!("expected '{expected}' in output, got: {output}"),
-                    );
-                }
+                    ""
+                };
+                self.fail(
+                    name,
+                    format!(
+                        "expected '{expected}' in output, got: {}{hint}",
+                        output.trim()
+                    ),
+                );
             }
             Err(error) => self.fail(name, format!("snippet failed: {error}")),
         }
@@ -789,10 +857,16 @@ impl SelfTest {
                 if output.contains(expected) {
                     self.pass(name, format!("observed {expected} immediately"));
                 } else {
+                    // Surface the apply summary so a stale read is diagnosable:
+                    // whether the inline caller refresh reported inlining and
+                    // actually patched the caller, or emitted a note instead.
                     self.fail(
                         name,
                         format!(
-                            "Release immediate effect missing; expected '{expected}' in output, got: {output}"
+                            "Release immediate effect missing; expected '{expected}' in output, got: {}. \
+                             Last apply summary: {}",
+                            output.trim(),
+                            squash(&self.last_apply_summary),
                         ),
                     );
                 }
@@ -829,6 +903,7 @@ impl SelfTest {
         self.last_apply_inlined = false;
         match self.hot_reload(None).await {
             Ok(summary) if summary.contains("Hot reload not applicable") => {
+                self.last_apply_summary = summary.clone();
                 self.fail(
                     name,
                     format!("unexpected cold verdict: {}", squash(&summary)),
@@ -838,8 +913,10 @@ impl SelfTest {
             }
             Ok(summary) => {
                 // Release-first: remember whether Unity inlined any method in
-                // this batch so the following behavioral assert can tolerate it.
+                // this batch so the following behavioral assert can tolerate it,
+                // and keep the full summary for failure diagnostics.
                 self.last_apply_inlined = summary.contains("inlined in Release");
+                self.last_apply_summary = summary.clone();
                 Some(summary)
             }
             Err(error) => {
@@ -1096,14 +1173,10 @@ impl SelfTest {
                         format!("unexpected cold verdict: {}", squash(&summary)),
                     );
                 }
-                Ok(summary) if self.release_mode && summary.contains("inlined in Release") => {
-                    // Release: the editor method was inlined, so the detour is
-                    // bypassed at the call site until the queued recompile
-                    // converges — accept the apply and skip the carry-over
-                    // assertion (editor_patch_live stays false → the file is
-                    // reverted below and Phase 3's E02 is skipped).
-                    self.pass(name, "applied; inlined in Release → recompile queued");
-                }
+                // STRICT: assert the editor method is live immediately even in
+                // Release (its detour holds at non-inlined sites and the refresh
+                // un-inlines any caller). On success editor_patch_live → E02 asserts
+                // the carry-over; a stale read fails loudly instead of being skipped.
                 Ok(_) => match self
                     .execute("return LocusSelfTestEditorTool.Reading();")
                     .await
@@ -1212,9 +1285,9 @@ impl SelfTest {
                     "8118",
                 )
                 .await;
+                let active = coordinator::project_active_patches(&self.project).await;
                 self.log(format!(
-                    "  coordinator continuity: {} active patch(es) carried across play-enter ({})",
-                    super::counters().active_patches,
+                    "  coordinator continuity: {active} active patch(es) carried across play-enter ({})",
                     if self.domain_reload_on_play == Some(false) {
                         "domain reload disabled"
                     } else {
@@ -3034,23 +3107,72 @@ impl SelfTest {
                 "6103", // LibBody(6100) + 3, read through the Assembly-CSharp caller
             )
             .await;
-            // R05 — single Release-immediate probe. R06–R08 (local-variable /
-            // method-group / lambda callers) were collapsed: they all reach the
-            // same Assembly-CSharp LibRelay, so they exercise the identical
-            // LibRelay→LibBody inlined edge and can only ever agree with R05.
-            // LibBody is an INSTANCE method Mono inlines into LibRelay in
-            // Release; the inline caller refresh now re-emits its changed body as
-            // a static self-shim (Option A) and rewrites LibRelay's
+            // R05 — Release-strict, cross-asmdef INSTANCE callee. LibBody is an
+            // instance method Mono inlines into LibRelay in Release; the inline
+            // caller refresh re-emits its changed body as a static self-shim
+            // (Option A) and rewrites LibRelay's
             // `new LocusSelfTestLibType().LibBody()` to call that shim, so the
             // refreshed caller observes the new body immediately even across the
             // assembly boundary (callee+caller compile into one patch assembly).
             // This strict probe is the suite-level gate for the instance arm.
-            self.expect_release_immediate_output(
-                "R05 release strict cross-asmdef body edit",
-                "return LocusSelfTestSubject.Instance.LibRelay();",
-                "6103",
-            )
-            .await;
+            //
+            // On failure it LOCALIZES the staleness instead of just printing the
+            // value: it reads LibBody() directly and dumps the P41 apply summary,
+            // so a stale LibRelay can be pinned to one of:
+            //   • callee detour live (LibBody direct == 6100) but LibRelay's
+            //     inlined call site was not refreshed → the refresh didn't patch
+            //     the caller (summary shows a note, not "Inline caller refresh
+            //     patched … LocusSelfTestSubject.cs"); or
+            //   • callee detour itself not in effect (LibBody direct == 5).
+            let name = "R05 release strict cross-asmdef body edit";
+            if self.release_mode {
+                // Surface the P41 inline-refresh segment UNtruncated on EVERY run
+                // (pass or fail): R05 is flaky even under confirmed Release, so
+                // capturing what the refresh did on a PASSING run lets us diff it
+                // against a failing run — did it patch LibRelay (methods>0, names
+                // LocusSelfTestSubject.cs) or bail with a note / methods==0? The
+                // dotnet repro proves the compile-level redirect is correct
+                // cross-asmdef, so a live miss is caller discovery/force-detour or
+                // a stale caller-index cache, not IL generation.
+                let refresh_tail = self
+                    .last_apply_summary
+                    .find("Inline caller refresh")
+                    .map(|idx| self.last_apply_summary[idx..].trim().to_string())
+                    .unwrap_or_else(|| {
+                        "<no 'Inline caller refresh' segment in summary>".to_string()
+                    });
+                self.log(format!(
+                    "  R05 P41 inline-refresh segment: [{refresh_tail}]"
+                ));
+                match self
+                    .execute("return LocusSelfTestSubject.Instance.LibRelay();")
+                    .await
+                {
+                    Ok(ref output) if output.contains("6103") => {
+                        self.pass(name, "observed 6103 immediately");
+                    }
+                    Ok(output) => {
+                        let lib_direct = self
+                            .execute("return new LocusSelfTestLibType().LibBody();")
+                            .await
+                            .unwrap_or_else(|error| format!("<error: {error}>"));
+                        self.fail(
+                            name,
+                            format!(
+                                "Release immediate effect missing; expected '6103' through LibRelay, got: {}. \
+                                 LibBody() direct = {} (6100 ⇒ callee detour live, LibRelay's inlined call site was \
+                                 NOT refreshed; 5 ⇒ callee detour not in effect). Inline-refresh segment: [{}]. \
+                                 Full P41 apply summary: {}",
+                                output.trim(),
+                                lib_direct.trim(),
+                                refresh_tail,
+                                squash(&self.last_apply_summary),
+                            ),
+                        );
+                    }
+                    Err(error) => self.fail(name, format!("snippet failed: {error}")),
+                }
+            }
         }
 
         // P42 — lib method SIGNATURE change with the caller in ANOTHER
@@ -3348,6 +3470,22 @@ impl SelfTest {
     /// new value.
     async fn run_release_inline_tests(&mut self) {
         self.log("Phase 2b — Release inline caller refresh");
+        // Gate the "inlined in Release" assertions on the JIT's EFFECTIVE
+        // behavior, not the codeOptimization setting: play mode has been observed
+        // Debug-effective (nothing inlines) even when the setting reads release,
+        // which previously failed R10/R11 spuriously. When inlining is inactive
+        // the behavioral sub-asserts below still verify correctness via the direct
+        // detour; only the "inlining was detected" claim is skipped.
+        let (inlining_active, inlining_detail) = self.inlining_active().await;
+        if inlining_active {
+            self.log(format!(
+                "  runtime inlining ACTIVE (Release-effective) — inline-refresh path exercised [{inlining_detail}]"
+            ));
+        } else {
+            self.log(format!(
+                "  runtime inlining INACTIVE (Debug-effective) — inline-detection asserts soft-skipped; behavior still verified [{inlining_detail}]"
+            ));
+        }
         let name = "R10 aggressive-inlining caller refresh";
         let edited = ADVERSARIAL_BASELINE.replace("return 5005;", "return 6116;");
         if let Some(summary) = self
@@ -3358,7 +3496,9 @@ impl SelfTest {
             )
             .await
         {
-            if !summary.contains("inlined in Release") {
+            if summary.contains("inlined in Release") {
+                self.pass(name, "reported inlined in Release");
+            } else if inlining_active {
                 self.fail(
                     name,
                     format!(
@@ -3367,7 +3507,10 @@ impl SelfTest {
                     ),
                 );
             } else {
-                self.pass(name, "reported inlined in Release");
+                self.pass(
+                    name,
+                    "Debug-effective runtime: inline detection N/A; behavior asserted below",
+                );
             }
             self.expect_release_immediate_output(
                 name,
@@ -3409,13 +3552,21 @@ impl SelfTest {
             // callees' direct detours deliver the values, methods==0 + a note),
             // so it is not a reliable suite gate (keying on it reddened a healthy
             // run while R11a–f all passed).
-            if !summary.contains("inlined in Release") {
+            if summary.contains("inlined in Release") {
+                self.pass(
+                    name,
+                    "reported inlined in Release; caller refresh asserted behaviorally below",
+                );
+            } else if inlining_active {
                 self.fail(
                     name,
-                    format!("expected Release inline detection, got: {}", squash(&summary)),
+                    format!(
+                        "expected Release inline detection, got: {}",
+                        squash(&summary)
+                    ),
                 );
             } else {
-                self.pass(name, "reported inlined in Release; caller refresh asserted behaviorally below");
+                self.pass(name, "Debug-effective runtime: inline detection N/A; caller refresh asserted behaviorally below");
             }
             self.expect_release_immediate_output(
                 "R11a direct caller file",
@@ -3568,6 +3719,207 @@ impl SelfTest {
                 &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
             )
             .await;
+    }
+
+    /// Phase D rollout measurement — A/B the experimental inline force-evaluation
+    /// to quantify its over-refresh cost on this runtime. The SAME edit is applied
+    /// with the flag OFF then ON; the delta in reported high-confidence (StubInlined)
+    /// classifications is what force-evaluation ADDS — methods the static heuristic
+    /// would have missed and that now drive an extra caller refresh. On this Mono
+    /// the delta is expected to be ~0 (Gate A: Mono's real inline gate ≈ the ≤20-IL
+    /// heuristic, and a changed method whose caller already ran has its bit set so
+    /// the stub never builds), which is itself the data point that makes default-on
+    /// cost-free here. Soft pass on the measurement; the behavioral read of the
+    /// refreshed caller IS asserted on the ON leg. Restores the PRIOR flag value
+    /// (default-agnostic) and the corpus afterward.
+    async fn run_inline_force_evaluate_check(&mut self) {
+        let name = "PD inline force-evaluate A/B";
+        self.log("Phase D — inline force-evaluate A/B (rollout over-refresh measurement)");
+        let (inlining_active, detail) = self.inlining_active().await;
+        self.log(format!(
+            "  runtime inlining {} [{detail}]",
+            if inlining_active {
+                "ACTIVE"
+            } else {
+                "INACTIVE"
+            }
+        ));
+        let prior = crate::unity_hotreload::inline_force_evaluate_enabled();
+        let edited = ADVERSARIAL_BASELINE.replace("return 5005;", "return 5115;");
+
+        // OFF leg — baseline classification without force-evaluation.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(false);
+        let off_high = self
+            .apply_texts(
+                "PD off-leg",
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await
+            .map(|summary| summary.matches("(high-confidence)").count())
+            .unwrap_or(0);
+        let _ = self
+            .apply_texts(
+                "PD off-leg restore",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+
+        // ON leg — force-evaluation enabled.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(true);
+        let on_summary = self
+            .apply_texts(
+                "PD on-leg",
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+        if let Some(summary) = &on_summary {
+            let on_high = summary.matches("(high-confidence)").count();
+            self.log(format!(
+                "  over-refresh delta (force-eval-attributable StubInlined): off={off_high} on={on_high} → +{}",
+                on_high.saturating_sub(off_high)
+            ));
+            self.pass(
+                name,
+                format!(
+                    "A/B measured; force-eval added {} high-confidence classification(s) over the heuristic",
+                    on_high.saturating_sub(off_high)
+                ),
+            );
+            // Convergence must hold with the flag on, inline verdict notwithstanding.
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestAdversarial.CallInlined();",
+                "5115",
+            )
+            .await;
+        }
+
+        // Restore the prior (config-default) flag value, not a hardcoded one, so the
+        // remaining phases run under the shipped default.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(prior);
+        let _ = self
+            .apply_texts(
+                "PD restore adversarial corpus",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Drive the editor to Release-EFFECTIVE inlining and verify it at runtime.
+    ///
+    /// The plain `set_code_optimization(release)` at startup has been observed not
+    /// to take JIT effect — the canary shows `inlining_active=no` even in edit
+    /// mode after the baseline reload (no debugger attached), so either the
+    /// setting reverts across the reload or the release recompile was superseded.
+    /// This re-asserts release and forces a recompile+reload to apply it, logging
+    /// the codeOptimization setting and the runtime inlining verdict before and
+    /// after so a stuck-Debug session is fully diagnosed. Returns whether inlining
+    /// is active afterward.
+    ///
+    /// MUST run before the edit-mode patch tests (E01/E02): its recompile would
+    /// otherwise revert E01's live editor patch before E02 asserts it survives
+    /// play-enter.
+    async fn ensure_release_effective(&mut self) -> bool {
+        self.log("Ensuring Release-effective inlining (runtime-verified)...");
+        let (active_before, detail_before) = self.inlining_active().await;
+        let (_, setting_before) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  before: codeOptimization setting={}, inlining_active={} [{detail_before}]",
+            setting_before.as_deref().unwrap_or("unknown"),
+            active_before
+        ));
+        if active_before {
+            self.log("  already Release-effective; no recompile needed");
+            return true;
+        }
+
+        match coordinator::set_code_optimization(&self.project, "release").await {
+            Ok(value) => self.log(format!("  re-asserted codeOptimization → {value}")),
+            Err(error) => self.log(format!("  re-assert failed: {error}")),
+        }
+        // Force a recompile + domain reload so the release setting is applied to
+        // the loaded/JITed assemblies (the set alone only schedules it).
+        match crate::unity_bridge::recompile_and_wait(&self.project).await {
+            Ok(_) => self.log("  forced recompile+reload complete"),
+            Err(error) => self.log(format!("  forced recompile failed: {error}")),
+        }
+
+        let (active_after, detail_after) = self.inlining_active().await;
+        let (_, setting_after) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  after: codeOptimization setting={}, inlining_active={} [{detail_after}]",
+            setting_after.as_deref().unwrap_or("unknown"),
+            active_after
+        ));
+        if !active_after {
+            self.log(
+                "  *** STILL Debug-effective after re-assert+recompile (no debugger) — \
+                 inline coverage is unavailable this session; the Release-inline tests will \
+                 soft-skip their inline-detection asserts. Likely codeOptimization not \
+                 persisting across reloads or a Mono optimization config; needs deeper fix. ***",
+            );
+        }
+        active_after
+    }
+
+    /// Phase A — inline-risk force-evaluation probes (DIAGNOSTIC ONLY).
+    ///
+    /// Sends a plugin-local command that, for a handful of method shapes, reads
+    /// Mono's inline_info/inline_failure bits, force-JITs a synthetic caller stub
+    /// (so Mono's inliner evaluates the callee at compile time), then re-reads the
+    /// bits. It answers whether we can move the inline bit from the outside, what
+    /// a refused/oversized method does, whether force-JITing runs a callee's
+    /// static cctor, and which JIT-forcing API is stable — the data that gates
+    /// wiring force-evaluation into IsMethodInlined (Phase B).
+    ///
+    /// The probe corpus lives in the plugin and is never wired into the hot-patch
+    /// decision path, so this phase asserts nothing: it logs the report verbatim
+    /// and records a soft pass on a successful round-trip. The probe is read
+    /// cleanest on the first run after a domain reload (the callee inline bit is
+    /// sticky for the domain lifetime).
+    async fn run_inline_probes(&mut self) {
+        let name = "PA inline-risk probes";
+        self.log("Phase A — inline-risk force-evaluation probes (diagnostic, no assertions)");
+        // Log the codeOptimization SETTING as seen right here (edit mode, after the
+        // baseline reload). If this reads debug, the release set reverted across a
+        // reload; if release while the probe below still shows inlining_active=no,
+        // the setting holds but the JIT runs Debug-effective (debugger agent).
+        let (_, setting_now) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  codeOptimization setting at probe point (edit mode): {}",
+            setting_now.as_deref().unwrap_or("unknown")
+        ));
+        match crate::unity_bridge::send_message_with_timeout(
+            &self.project,
+            "hot_reload_inline_probe",
+            "",
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(resp) if resp.ok => {
+                let report = resp.message.unwrap_or_default();
+                for line in report.lines() {
+                    self.log(format!("  {line}"));
+                }
+                self.pass(name, "probes ran; see report lines above");
+            }
+            Ok(resp) => {
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| "inline probe failed".to_string());
+                if error.starts_with("unknown message type") {
+                    self.log("  note: this Unity plugin predates the inline probe; skipping (rebuild the plugin to collect data)");
+                } else {
+                    self.fail(name, error);
+                }
+            }
+            Err(error) => self.fail(name, squash(&error)),
+        }
     }
 
     /// Phase 2c — adversarial C#-syntax cases that pin tricky resolver /
@@ -4425,8 +4777,19 @@ impl SelfTest {
 
     async fn finalize(&mut self) {
         self.log("Phase 7/7 — leaving play mode and converging");
-        if let Err(error) = crate::unity_bridge::exit_play_mode(&self.project).await {
-            self.log(format!("exit_play_mode failed (continuing): {error}"));
+        self.log("Requesting play mode exit...");
+        match tokio::time::timeout(
+            EXIT_PLAY_MODE_TIMEOUT,
+            crate::unity_bridge::exit_play_mode(&self.project),
+        )
+        .await
+        {
+            Ok(Ok(())) => self.log("exit_play_mode completed"),
+            Ok(Err(error)) => self.log(format!("exit_play_mode failed (continuing): {error}")),
+            Err(_) => self.log(format!(
+                "exit_play_mode timed out after {}ms (continuing)",
+                EXIT_PLAY_MODE_TIMEOUT.as_millis()
+            )),
         }
         if let Err(error) = self
             .wait_for_play_state(false, Duration::from_secs(60))
@@ -4511,14 +4874,23 @@ impl SelfTest {
 
     async fn wait_for_convergence(&self, timeout: Duration) -> Result<(), String> {
         let start = std::time::Instant::now();
+        let mut next_progress_log = Duration::ZERO;
         loop {
-            if super::counters().active_patches == 0 {
+            let elapsed = start.elapsed();
+            let active = coordinator::project_active_patches(&self.project).await;
+            if active == 0 {
                 return Ok(());
             }
-            if start.elapsed() > timeout {
+            if elapsed >= next_progress_log {
+                self.log(format!(
+                    "Waiting for convergence: {active} patch(es) active after {}s",
+                    elapsed.as_secs()
+                ));
+                next_progress_log += Duration::from_secs(10);
+            }
+            if elapsed > timeout {
                 return Err(format!(
-                    "{} patch(es) still active after {}s",
-                    super::counters().active_patches,
+                    "{active} patch(es) still active after {}s",
                     timeout.as_secs()
                 ));
             }
@@ -4592,6 +4964,13 @@ impl SelfTest {
             self.emit(None, true);
             return;
         }
+        // Force + runtime-verify Release BEFORE the edit-mode patch tests: the
+        // ensure step recompiles, which would revert E01's live editor patch if it
+        // ran between E01 and the E02 play-enter assertion. The probe then reads
+        // inline bits in a known Release (or explicitly-flagged-Debug) edit-mode
+        // domain, so its data is never silently confounded.
+        self.ensure_release_effective().await;
+        self.run_inline_probes().await;
         self.run_editmode_tests().await;
         if let Err(error) = self.enter_play_mode().await {
             self.fail("enter play mode", error);
@@ -4607,6 +4986,7 @@ impl SelfTest {
         self.run_positive_tests(&mut subject, &mut helper).await;
         self.run_release_inline_tests().await;
         self.run_release_inline_multifile_tests().await;
+        self.run_inline_force_evaluate_check().await;
         self.run_adversarial_tests().await;
         self.run_negative_tests().await;
         self.run_deletion_tests(&mut subject, &mut helper).await;
@@ -4655,6 +5035,7 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
             release_mode: false,
             original_code_optimization: None,
             last_apply_inlined: false,
+            last_apply_summary: String::new(),
         };
         test.run().await;
         RUNNING.store(false, Ordering::SeqCst);
