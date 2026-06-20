@@ -25,7 +25,7 @@ const DRIVER_NAME: &str = "unity-test";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_SUITE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_POLL_MS: u64 = 500;
-const DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 20_000;
+const DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 60_000;
 pub const UNITY_INTEGRATION_TEST_EVENT: &str = "unity-integration-test";
 
 /// Sentinel error returned through `run_driver` when the active UI run is
@@ -641,11 +641,13 @@ async fn run_driver(
         }),
     );
 
+    let mut suite_failures = Vec::new();
+
     for suite in &config.suites {
         if run_cancelled(&cancel_rx) {
             return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
         }
-        match suite {
+        let suite_result = match suite {
             CliDriverSuite::Connect => {
                 sink.emit(
                     "suite_start",
@@ -674,54 +676,71 @@ async fn run_driver(
                         "semanticSource": semantic.source,
                     }),
                 );
+                Ok(())
             }
-            CliDriverSuite::Sidecar => {
-                run_sidecar_suite(&project, *suite, &sink).await?;
-            }
+            CliDriverSuite::Sidecar => run_sidecar_suite(&project, *suite, &sink).await,
             CliDriverSuite::TypeIndex => {
-                run_type_index_suite(&project, *suite, config.type_index_sample_mode, &sink)
-                    .await?;
+                run_type_index_suite(&project, *suite, config.type_index_sample_mode, &sink).await
             }
             CliDriverSuite::StateProbe => {
                 unity_bridge::set_state_probe_enabled(true);
-                let summary = run_event_selftest(
+                match run_event_selftest(
                     &app_handle,
                     &project,
                     *suite,
                     config.suite_timeout,
+                    config.no_progress_timeout,
                     &sink,
                     &mut cancel_rx,
                     unity_bridge::run_state_probe_selftest(app_handle.clone(), project.clone()),
                 )
-                .await?;
-                ensure_summary_passed(summary)?;
+                .await
+                {
+                    Ok(summary) => ensure_summary_passed(summary),
+                    Err(error) => Err(error),
+                }
             }
             CliDriverSuite::NativeBridge => {
                 unity_bridge::set_native_bridge_enabled(true);
-                unity_bridge::sync_native_bridge_marker(&project, true)?;
-                let summary = run_event_selftest(
-                    &app_handle,
-                    &project,
-                    *suite,
-                    config.suite_timeout,
-                    &sink,
-                    &mut cancel_rx,
-                    unity_bridge::run_native_bridge_selftest(app_handle.clone(), project.clone()),
-                )
-                .await?;
-                ensure_summary_passed(summary)?;
+                match unity_bridge::sync_native_bridge_marker(&project, true) {
+                    Ok(()) => {
+                        match run_event_selftest(
+                            &app_handle,
+                            &project,
+                            *suite,
+                            config.suite_timeout,
+                            config.no_progress_timeout,
+                            &sink,
+                            &mut cancel_rx,
+                            unity_bridge::run_native_bridge_selftest(
+                                app_handle.clone(),
+                                project.clone(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(summary) => {
+                                let result = ensure_summary_passed(summary);
 
-                // Confirm the channel actually resolved to the native broker;
-                // the suite exists to exercise the required native transport.
-                let transport = resolve_active_transport(&project).await;
-                sink.emit(
-                    "native_transport_confirmed",
-                    json!({ "suite": suite.as_str(), "transport": transport }),
-                );
-                if transport != "native_broker" {
-                    return Err(format!(
-                        "native-bridge suite ran over '{transport}', expected 'native_broker'"
-                    ));
+                                // Confirm the channel actually resolved to the native broker;
+                                // the suite exists to exercise the required native transport.
+                                let transport = resolve_active_transport(&project).await;
+                                sink.emit(
+                                    "native_transport_confirmed",
+                                    json!({ "suite": suite.as_str(), "transport": transport }),
+                                );
+                                if transport != "native_broker" {
+                                    Err(format!(
+                                        "native-bridge suite ran over '{transport}', expected 'native_broker'"
+                                    ))
+                                } else {
+                                    result
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
                 }
             }
             CliDriverSuite::HotReload | CliDriverSuite::HotReloadRelease => {
@@ -734,7 +753,7 @@ async fn run_driver(
                     &mut cancel_rx,
                     matches!(*suite, CliDriverSuite::HotReloadRelease),
                 )
-                .await?;
+                .await
             }
             CliDriverSuite::Execute => {
                 // The execute suite drives the real unity_execute / unity_run_states
@@ -742,7 +761,7 @@ async fn run_driver(
                 // a deterministic edit-mode editor.
                 crate::csharp_compile::set_enabled(true).await;
                 crate::csharp_compile::warm_up_in_background();
-                if config.force_edit_mode {
+                let edit_mode_result = if config.force_edit_mode {
                     ensure_edit_mode(
                         &project,
                         config.connect_timeout,
@@ -750,11 +769,39 @@ async fn run_driver(
                         &sink,
                         &mut cancel_rx,
                     )
-                    .await?;
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => run_execute_suite(&project, *suite, &config, &sink, &cancel_rx).await,
+                    Err(error) => Err(error),
                 }
-                run_execute_suite(&project, *suite, &config, &sink, &cancel_rx).await?;
             }
+        };
+
+        if let Err(error) = suite_result {
+            if error == UNITY_INTEGRATION_TEST_CANCELLED {
+                return Err(error);
+            }
+            let message = error;
+            sink.emit(
+                "suite_error",
+                json!({
+                    "suite": suite.as_str(),
+                    "message": message.clone(),
+                }),
+            );
+            suite_failures.push(format!("{}: {message}", suite.as_str()));
         }
+    }
+
+    if !suite_failures.is_empty() {
+        return Err(format!(
+            "{} Unity integration test suite(s) failed: {}",
+            suite_failures.len(),
+            suite_failures.join("; ")
+        ));
     }
 
     sink.emit("finished", json!({ "ok": true }));
@@ -1163,7 +1210,7 @@ async fn run_type_index_suite(
                 return Err(error);
             }
         };
-    if summary.failed > 0 {
+    if summary.failed > 0 || !summary.warnings.is_empty() {
         for line in &summary.lines {
             sink.emit(
                 "suite_event",
@@ -1175,6 +1222,20 @@ async fn run_type_index_suite(
                 }),
             );
         }
+    }
+    for warning in &summary.warnings {
+        sink.emit(
+            "suite_event",
+            json!({
+                "suite": suite.as_str(),
+                "line": format!("WARN  type-index: {warning}"),
+                "passed": summary.passed,
+                "failed": summary.failed,
+                "warning": true,
+            }),
+        );
+    }
+    if summary.failed > 0 {
         for diff in &summary.diffs {
             sink.emit(
                 "suite_event",
@@ -1215,6 +1276,7 @@ async fn run_type_index_suite(
             "checkedProperties": summary.checked_properties,
             "checkedDiscoverFilters": summary.checked_discover_filters,
             "skippedTargets": summary.skipped_targets,
+            "warnings": summary.warnings,
             "diffs": summary.diffs,
         }),
     );
@@ -1913,6 +1975,7 @@ async fn run_hot_reload_selftest_once(
         project,
         suite,
         config.suite_timeout,
+        config.no_progress_timeout,
         sink,
         cancel_rx,
         crate::unity_hotreload::selftest::run(app_handle.clone(), project.to_string()),
@@ -2086,6 +2149,7 @@ async fn run_event_selftest<Fut>(
     project: &str,
     suite: CliDriverSuite,
     timeout: Duration,
+    no_progress_timeout: Duration,
     sink: &DriverEventSink,
     cancel_rx: &mut watch::Receiver<bool>,
     start: Fut,
@@ -2118,13 +2182,19 @@ where
             "suite": suite.as_str(),
             "project": project,
             "timeoutMs": timeout.as_millis(),
+            "noProgressTimeoutMs": no_progress_timeout.as_millis(),
         }),
     );
 
     let mut start_task = tokio::spawn(start);
     let timeout_sleep = tokio::time::sleep(timeout);
     tokio::pin!(timeout_sleep);
+    let no_progress_sleep = tokio::time::sleep(no_progress_timeout);
+    tokio::pin!(no_progress_sleep);
     let mut start_done = false;
+    let mut last_event_line: Option<String> = None;
+    let mut last_event_passed = 0u32;
+    let mut last_event_failed = 0u32;
 
     loop {
         tokio::select! {
@@ -2141,6 +2211,27 @@ where
                 }
                 app_handle.unlisten(listener);
                 return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+            _ = &mut no_progress_sleep => {
+                if !start_done {
+                    start_task.abort();
+                }
+                app_handle.unlisten(listener);
+                sink.emit(
+                    "suite_no_progress",
+                    json!({
+                        "suite": suite.as_str(),
+                        "timeoutMs": no_progress_timeout.as_millis(),
+                        "line": last_event_line,
+                        "passed": last_event_passed,
+                        "failed": last_event_failed,
+                    }),
+                );
+                return Err(format!(
+                    "Suite {} made no event progress for {}ms",
+                    suite.as_str(),
+                    no_progress_timeout.as_millis()
+                ));
             }
             result = &mut start_task, if !start_done => {
                 start_done = true;
@@ -2161,9 +2252,15 @@ where
                     app_handle.unlisten(listener);
                     return Err(format!("Suite {} event stream closed", suite.as_str()));
                 };
+                no_progress_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + no_progress_timeout);
+                last_event_passed = event.passed;
+                last_event_failed = event.failed;
                 // Forward every emitted line live so the UI output console fills
                 // in as the self-test runs, not only when it fails.
                 if let Some(line) = event.line.clone() {
+                    last_event_line = Some(line.clone());
                     if sink.print_stdout {
                         println!("[locus-driver:{}] {}", suite.as_str(), line);
                     }

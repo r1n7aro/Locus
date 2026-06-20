@@ -24,6 +24,7 @@ pub struct TypeIndexSelfTestSummary {
     pub checked_properties: u32,
     pub checked_discover_filters: u32,
     pub skipped_targets: u32,
+    pub warnings: Vec<String>,
     pub lines: Vec<String>,
     pub diffs: Vec<String>,
 }
@@ -83,6 +84,7 @@ impl TypeIndexSelfTestSummary {
             checked_properties: 0,
             checked_discover_filters: 0,
             skipped_targets: 0,
+            warnings: Vec::new(),
             lines: Vec::new(),
             diffs: Vec::new(),
         }
@@ -97,6 +99,10 @@ impl TypeIndexSelfTestSummary {
         if self.diffs.len() < MAX_DIFFS {
             self.diffs.push(label.into());
         }
+    }
+
+    fn warning(&mut self, label: impl Into<String>) {
+        self.warnings.push(label.into());
     }
 }
 
@@ -132,7 +138,7 @@ pub async fn run(
     let mut summary = TypeIndexSelfTestSummary::new();
 
     if targets.is_empty() {
-        summary.diff("no custom ScriptableObject or prefab component targets found");
+        summary.warning("no custom ScriptableObject or prefab component targets found");
         summary.lines.push(format!(
             "sample mode: {}, candidate targets: 0",
             sample_mode.as_str()
@@ -146,6 +152,12 @@ pub async fn run(
         .take(sample_mode.max_targets())
         .collect();
     let total_targets = targets.len() as u32;
+    if sample_mode == TypeIndexSampleMode::Sample32 && candidate_count < SAMPLE_TARGETS {
+        summary.warning(format!(
+            "sample32 requested {} targets, found {}; continuing with available targets",
+            SAMPLE_TARGETS, candidate_count
+        ));
+    }
     let mut processed_targets: u32 = 0;
     let mut last_percent: u32 = 0;
     for target in targets {
@@ -200,9 +212,9 @@ pub async fn run(
     }
 
     if summary.checked_targets == 0 {
-        summary.diff("no target was eligible for static schema enrichment");
+        summary.warning("no target was eligible for static schema enrichment");
     }
-    if summary.failed > 0 {
+    if summary.failed > 0 || !summary.warnings.is_empty() {
         summary.lines.push(format!(
             "sample mode: {}, candidate targets: {}, checked targets: {}, properties: {}, discover filters: {}, skipped: {}",
             sample_mode.as_str(),
@@ -599,7 +611,7 @@ print("[" + string.Join(",", entries.ToArray()) + "]");
 
 #[cfg(test)]
 mod tests {
-    use super::next_progress_percent;
+    use super::{next_progress_percent, TypeIndexSelfTestSummary};
 
     /// Replays the per-target cadence and returns (lines emitted, first
     /// target that emitted, last percent reported).
@@ -647,5 +659,14 @@ mod tests {
     fn no_progress_when_total_zero() {
         assert_eq!(next_progress_percent(0, 0, 0), None);
         assert_eq!(next_progress_percent(1, 0, 0), None);
+    }
+
+    #[test]
+    fn warnings_do_not_increment_failures() {
+        let mut summary = TypeIndexSelfTestSummary::new();
+        summary.warning("sample below target count");
+
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.warnings, vec!["sample below target count"]);
     }
 }

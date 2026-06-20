@@ -15,14 +15,14 @@ describe("Locus Unity CLI driver", () => {
     expect(pkg).toContain('"locus:test:unity:native"');
     expect(pkg).toContain("--suite connect,native-bridge");
     expect(pkg).toContain("--connect-timeout-ms 60000");
-    expect(pkg).toContain("--no-progress-timeout-ms 20000");
+    expect(pkg).toContain("--no-progress-timeout-ms 60000");
     expect(pkg).toContain('"locus:test:unity:smoke"');
     expect(pkg).toContain("--suite connect,native-bridge,state-probe");
     expect(pkg).toContain('"locus:test:unity:release"');
     expect(pkg).toContain("--suite connect,hot-reload-release");
     expect(pkg).toContain('"locus:test:unity:full"');
     expect(pkg).toContain("--suite all --connect-timeout-ms 60000 --timeout-ms 1200000");
-    expect(normalizedScript).toContain('"dev",\n  "--",\n  "--",\n  "--locus-driver"');
+    expect(normalizedScript).toContain('"dev",\n    "--",\n    "--",\n    "--locus-driver"');
     expect(script).toContain('"--locus-driver"');
     expect(script).toContain('"unity-test"');
     expect(script).toContain('"dev"');
@@ -44,7 +44,7 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain('"processId": launch.process_id');
     expect(driver).toContain('"codeOptimization": match launch_code_optimization');
     expect(driver).toContain("DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000");
-    expect(driver).toContain("DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 20_000");
+    expect(driver).toContain("DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 60_000");
     expect(driver).toContain("--no-progress-timeout-ms");
     expect(driver).toContain("connection_stalled");
     expect(driver).toContain("connection_progress_signature");
@@ -62,6 +62,9 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("unity_bridge::run_state_probe_selftest");
     expect(driver).toContain("unity_bridge::run_native_bridge_selftest");
     expect(driver).toContain("crate::unity_hotreload::selftest::run");
+    expect(driver).toContain("let mut suite_failures = Vec::new();");
+    expect(driver).toContain('"suite_error"');
+    expect(driver).toContain("Unity integration test suite(s) failed");
     expect(driver).toContain("LOCUS_DRIVER_JSON");
     expect(driver).not.toContain("remote-debugging-port");
     expect(driver).not.toContain("chrome-devtools");
@@ -152,6 +155,19 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("type-index: {}/{} targets ({}%) · {} properties checked");
   });
 
+  it("keeps undersized Type Index samples as warnings", () => {
+    const typeIndex = read("src-tauri/src/unity_type_index_selftest.rs");
+    const driver = read("src-tauri/src/cli_driver.rs");
+
+    expect(typeIndex).toContain("pub warnings: Vec<String>");
+    expect(typeIndex).toContain("sample32 requested {} targets, found {}; continuing with available targets");
+    expect(typeIndex).toContain("summary.warning(\"no custom ScriptableObject or prefab component targets found\")");
+    expect(typeIndex).toContain("summary.warning(\"no target was eligible for static schema enrichment\")");
+    expect(driver).toContain("WARN  type-index: {warning}");
+    expect(driver).toContain("\"warnings\": summary.warnings");
+    expect(driver).toContain("if summary.failed == 0");
+  });
+
   it("uses driver JSON as the authoritative Unity test result", () => {
     const script = read("scripts/locus-unity-test.mjs");
 
@@ -163,6 +179,7 @@ describe("Locus Unity CLI driver", () => {
     expect(script).toContain("recent driver events");
     expect(script).toContain("driverError");
     expect(script).toContain("terminalEventSeen");
+    expect(script).toContain("--output-dir");
     expect(script).toContain('mkdtempSync(join(tmpdir(), "locus-unity-test-"))');
     expect(script).toContain('const logPath = join(logDir, "driver.log");');
     expect(script).toContain("logStream.write(chunk)");
@@ -173,6 +190,35 @@ describe("Locus Unity CLI driver", () => {
     expect(script).toContain('"/T"');
     expect(script).toContain("treating the driver result as authoritative");
     expect(script).toContain("process.exit(0);");
+  });
+
+  it("exposes a serial Unity project matrix runner", () => {
+    const pkg = read("package.json");
+    const script = read("scripts/locus-unity-test-matrix.mjs");
+    const viteConfig = read("vite.config.ts");
+
+    expect(pkg).toContain('"locus:test:unity:matrix"');
+    expect(pkg).toContain("scripts/locus-unity-test-matrix.mjs --prepare-native --install-plugin");
+    expect(pkg).toContain('"locus:test:unity:matrix:smoke"');
+    expect(pkg).toContain("--suite connect,native-bridge,state-probe");
+    expect(script).toContain('path.join(repoRoot, "testproject")');
+    expect(script).toContain('"ProjectSettings", "ProjectVersion.txt"');
+    expect(script).toContain('"scripts", "locus-unity-test.mjs"');
+    expect(script).toContain("--project-root");
+    expect(script).toContain("--project");
+    expect(script).toContain("--include");
+    expect(script).toContain("--exclude");
+    expect(script).toContain("--jobs");
+    expect(script).toContain("--output-dir");
+    expect(script).toContain('"matrix.log"');
+    expect(script).toContain('"project.log"');
+    expect(script).toContain('"driver.log"');
+    expect(script).toContain('"summary.json"');
+    expect(script).toContain('driverArgs.push("--suite", "connect,native-bridge")');
+    expect(script).toContain("Parallel Unity matrix jobs are currently disabled");
+    expect(script).toContain("Vite strictPort 14901");
+    expect(script).toContain("per-worker devUrl/port isolation or a built-app runner");
+    expect(viteConfig).toContain('"**/testproject/**"');
   });
 
   it("uses the native broker as the only Unity command transport", () => {
