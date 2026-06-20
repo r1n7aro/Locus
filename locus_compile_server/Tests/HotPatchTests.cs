@@ -444,6 +444,65 @@ namespace InlineRefresh
         }
     }
 
+    [Fact]
+    public void Force_detoured_caller_redirects_inlined_cross_asmdef_instance_callee_to_self_shim()
+    {
+        var service = new CompileService();
+        // Callee lives in its OWN assembly (the "lib"), like R05's
+        // LocusSelfTestLibType.LibBody, and the caller lives in the MAIN assembly
+        // that references it. The refresh patch then references the lib assembly
+        // AND recompiles the lib's source — the cross-asmdef duplicate-type case
+        // the same-assembly test above does not exercise.
+        string libPath = CompileProjectAssembly(
+            service,
+            "InstXLib",
+            ("Assets/InstLib.cs", InstRefreshLibSource));
+        string mainPath = CompileProjectAssembly(
+            service,
+            "InstXMain",
+            new[] { libPath },
+            ("Assets/InstCaller.cs", InstRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+
+        string newLib = InstRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstLib.cs", InstRefreshLibSource, newLib),
+                ("Assets/InstCaller.cs", InstRefreshCallerSource, InstRefreshCallerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] libBytes = File.ReadAllBytes(libPath);
+        byte[] mainBytes = File.ReadAllBytes(mainPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-xasm-inline-refresh", isCollectible: true);
+        try
+        {
+            Assembly lib = context.LoadFromStream(new MemoryStream(libBytes));
+            Assembly main = context.LoadFromStream(new MemoryStream(mainBytes));
+            context.Resolving += (_, name) =>
+                name.Name == "InstXLib" ? lib :
+                name.Name == "InstXMain" ? main : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The refreshed caller must bind `new InstLib().Value()` to the self-shim
+            // carrying the NEW body (41), so Call() == 42 — NOT the stale 2 that a
+            // missed redirect leaves (caller re-inlines the original lib's old body).
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
     private const string InstPrivLibSource = @"
 namespace InlineRefresh
 {
@@ -623,6 +682,66 @@ namespace ShimE2E
             object original = Activator.CreateInstance(calcAssembly.GetType("ShimE2E.Calc")!)!;
             object? boosted = shims.GetMethod("Boost")!.Invoke(null, new[] { original, (object)1 });
             Assert.Equal(10 + 5 + 1, boosted);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_member_with_anonymous_object_member_name_compiles_hot()
+    {
+        // Regression (R05 root cause): the added-member requalification pass
+        // rewrote the anonymous-object member NAME `Tag`/`Bump` (a NameEquals.Name,
+        // syntactically required to be an IdentifierName) into `self.Tag` — an
+        // invalid tree Roslyn's rewriter rejects with an InvalidCastException,
+        // aborting the whole inline caller-refresh compile. The member NAME must be
+        // left untouched; only the value expressions (`Seed`, `Bias`) are
+        // requalified to `self.Seed` / the static type.
+        var service = new CompileService();
+        string calcPath = CompileOriginal(service, "AnonE2ECalc", ShimCalcSource);
+        string callerPath = CompileOriginal(service, "AnonE2ECaller", ShimCallerSource);
+        JsonObject compileParams = ParamsFor(calcPath, callerPath);
+
+        string newCalc = ShimCalcSource.Replace(
+            "public int Value() { return Seed; }",
+            "public int Value() { return Seed; }\n" +
+            "        public int Boost(int extra) { var t = new { Tag = Seed, Bump = Bias }; return t.Tag + t.Bump + extra; }");
+        string newCaller = ShimCallerSource.Replace(
+            "public static int Run() { return 1; }",
+            "public static int Run() { var c = new Calc(); return c.Boost(7); }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Calc.cs", ShimCalcSource, newCalc),
+            ("Caller.cs", ShimCallerSource, newCaller));
+
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+
+        // Execute through the shim: the anon member names survived and the value
+        // expressions were correctly requalified (self.Seed + the static Bias).
+        byte[] calcBytes = File.ReadAllBytes(calcPath);
+        byte[] callerBytes = File.ReadAllBytes(callerPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+
+        var context = new AssemblyLoadContext("anon-e2e", isCollectible: true);
+        try
+        {
+            Assembly calcAssembly = context.LoadFromStream(new MemoryStream(calcBytes));
+            Assembly callerAssembly = context.LoadFromStream(new MemoryStream(callerBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "AnonE2ECalc" => calcAssembly,
+                "AnonE2ECaller" => callerAssembly,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchCaller = patch.GetType("ShimE2E.Caller__LocusPatch", throwOnError: true)!;
+            object? value = patchCaller.GetMethod("Run")!.Invoke(null, null);
+            Assert.Equal(10 + 5 + 7, value); // self.Seed(10) + Calc.Bias(5) + extra(7)
         }
         finally
         {

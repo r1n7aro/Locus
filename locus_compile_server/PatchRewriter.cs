@@ -4390,6 +4390,19 @@ public static class PatchRewriter
 
     private static bool IsDeclarationName(SyntaxNode node)
     {
+        // Binding-name positions: the identifier NAMES a thing being introduced
+        // (anonymous-object member `new { X = e }`, using alias `using X = T`,
+        // named argument / tuple element `f(x: e)`), not a reference. It is
+        // syntactically REQUIRED to stay an IdentifierName, so requalifying it to a
+        // member access / qualified name builds an invalid tree that Roslyn's
+        // rewriter rejects — it casts NameEquals.Name / NameColon.Name back to
+        // IdentifierNameSyntax and throws InvalidCastException, aborting the whole
+        // patch compile (observed as the inline caller-refresh failure behind R05).
+        if (node.Parent is NameEqualsSyntax nameEquals && nameEquals.Name == node)
+            return true;
+        if (node.Parent is NameColonSyntax nameColon && nameColon.Name == node)
+            return true;
+
         // The identifier inside a declaration header is a token, not a name
         // node, so the only name *nodes* to protect are explicit interface
         // specifiers (rewritten as type refs is fine) — nothing to do — and
