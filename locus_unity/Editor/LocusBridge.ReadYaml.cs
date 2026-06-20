@@ -92,7 +92,7 @@ namespace Locus
             string mode,
             string toolName)
         {
-            var tcs = new TaskCompletionSource<string>();
+            var tcs = LocusAsync.CreateTcs<string>();
 
             PostToMainThread(delegate
             {

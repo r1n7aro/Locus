@@ -214,41 +214,47 @@ namespace Locus
                 return ErrorResponse(requestId, ex.Message);
             }
 
-            var tcs = new TaskCompletionSource<string>();
-            PostToMainThread(delegate
-            {
-                try
-                {
-                    object result = InvokeCompiledSkillPackageMethod(request);
-                    tcs.TrySetResult(BuildInvokeSkillPackageResponse(request, result));
-                }
-                catch (TargetInvocationException ex)
-                {
-                    tcs.TrySetException(ex.InnerException ?? ex);
-                }
-                catch (Exception ex)
-                {
-                    tcs.TrySetException(ex);
-                }
-            });
-
-            Task completed = await Task.WhenAny(tcs.Task, Task.Delay(ExecuteTimeoutMs));
-            if (completed != tcs.Task)
-                return ErrorResponse(requestId, "invoke_skill_package timed out");
-
+            // Stage 1: invoke the user's static method ON the main thread and take
+            // its raw return value WITHOUT blocking on it. The synchronous body of
+            // the user method runs on the main thread (it may touch Unity APIs).
+            object raw;
             try
             {
-                return OkResponse(requestId, tcs.Task.Result);
+                raw = await LocusAsync.RunOnMainThreadAsync<object>(
+                    delegate { return InvokeCompiledSkillPackageMethodRaw(request); },
+                    ExecuteTimeoutMs);
             }
-            catch (AggregateException ex)
+            catch (TimeoutException)
             {
-                Exception inner = ex.InnerException ?? ex;
-                return ErrorResponse(requestId, inner.Message);
+                return ErrorResponse(requestId, "invoke_skill_package timed out");
+            }
+            catch (TargetInvocationException ex)
+            {
+                return ErrorResponse(requestId, (ex.InnerException ?? ex).Message);
             }
             catch (Exception ex)
             {
                 return ErrorResponse(requestId, ex.Message);
             }
+
+            // Stage 2: if the method returned a Task/Task<T>, await it OFF the main
+            // thread. Never block the main thread on user code — that deadlocks if
+            // the user awaits a main-thread continuation (the old GetAwaiter().GetResult()).
+            object result;
+            try
+            {
+                result = await UnwrapTaskResultAsync(raw, ExecuteTimeoutMs).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "invoke_skill_package awaited task timed out");
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, ex.Message);
+            }
+
+            return OkResponse(requestId, BuildInvokeSkillPackageResponse(request, result));
         }
 
         private static async Task<PipeEnvelope> HandleInvokeNamed(string requestId, string message)
@@ -317,7 +323,7 @@ namespace Locus
             bool cacheHit,
             ViewInvokeNamedRequest request)
         {
-            var tcs = new TaskCompletionSource<string>();
+            var tcs = LocusAsync.CreateTcs<string>();
             PostToMainThread(delegate
             {
                 try
@@ -1010,7 +1016,7 @@ namespace Locus
             return (request.entryType ?? "").Trim();
         }
 
-        private static object InvokeCompiledSkillPackageMethod(SkillPackageInvokeRequest request)
+        private static object InvokeCompiledSkillPackageMethodRaw(SkillPackageInvokeRequest request)
         {
             string typeName = EffectiveSkillPackageInvokeTypeName(request);
             Assembly assembly = FindSkillPackageInvokeAssembly(request);
@@ -1040,7 +1046,9 @@ namespace Locus
                 throw new Exception("Skill package methods may accept zero parameters or one JSON argument");
             }
 
-            return CompleteTaskResult(method.Invoke(null, args));
+            // Return the raw value (possibly a Task); the caller awaits it off the
+            // main thread instead of blocking here.
+            return method.Invoke(null, args);
         }
 
         private static Assembly FindSkillPackageInvokeAssembly(SkillPackageInvokeRequest request)
@@ -1129,13 +1137,20 @@ namespace Locus
             return null;
         }
 
-        private static object CompleteTaskResult(object result)
+        // Await a value that may be a Task/Task<T> WITHOUT blocking, off the main
+        // thread, bounded by a timeout. Replaces the old CompleteTaskResult, whose
+        // task.GetAwaiter().GetResult() ran inside the main-thread invoke and
+        // deadlocked the editor whenever the user method awaited a continuation
+        // that needed the main thread.
+        private static async Task<object> UnwrapTaskResultAsync(object result, int timeoutMs)
         {
             Task task = result as Task;
             if (task == null)
                 return result;
 
-            task.GetAwaiter().GetResult();
+            await LocusAsync.WithTimeout(task, timeoutMs, "invoke_skill_package awaited task").ConfigureAwait(false);
+
+            // Task<T> exposes Result; a non-generic Task does not.
             PropertyInfo resultProperty = task.GetType().GetProperty("Result");
             return resultProperty != null ? resultProperty.GetValue(task, null) : null;
         }

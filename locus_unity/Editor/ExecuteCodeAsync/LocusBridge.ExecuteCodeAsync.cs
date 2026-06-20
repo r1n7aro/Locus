@@ -55,7 +55,7 @@ namespace Locus
             private long _lastActivityTimestamp;
 
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
-            public readonly TaskCompletionSource<string> Completion = new TaskCompletionSource<string>();
+            public readonly TaskCompletionSource<string> Completion = LocusAsync.CreateTcs<string>();
 
             public AsyncSnippetExecution()
             {
@@ -943,7 +943,6 @@ namespace Locus
             sb.AppendLine("using System.Collections.Generic;");
             sb.AppendLine("using UnityEngine;");
             sb.AppendLine("using UnityEngine.SceneManagement;");
-            sb.AppendLine("using UnityEngine.UI;");
             sb.AppendLine("using UnityEditor;");
             sb.AppendLine("using UnityEditor.SceneManagement;");
             sb.AppendLine("using UnityEditor.Animations;");

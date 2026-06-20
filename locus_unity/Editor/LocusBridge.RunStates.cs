@@ -2356,7 +2356,12 @@ namespace Locus
                 case "editing":
                     _isPaused = false;
                     _isPlaying = false;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2374,7 +2379,12 @@ namespace Locus
                 case "playing":
                     _isPaused = false;
                     _isPlaying = true;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2392,7 +2402,12 @@ namespace Locus
                 case "playing_paused":
                     _isPaused = true;
                     _isPlaying = true;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2668,7 +2683,7 @@ namespace Locus
             string requestedEditorStatus,
             string initialState)
         {
-            var completion = new TaskCompletionSource<RunStatesCompletion>();
+            var completion = LocusAsync.CreateTcs<RunStatesCompletion>();
             PostToMainThread(delegate
             {
                 try
@@ -2832,7 +2847,6 @@ namespace Locus
             sb.AppendLine("using System.Collections.Generic;");
             sb.AppendLine("using UnityEngine;");
             sb.AppendLine("using UnityEngine.SceneManagement;");
-            sb.AppendLine("using UnityEngine.UI;");
             sb.AppendLine("using Unity.Profiling;");
             sb.AppendLine("using UnityEditor;");
             sb.AppendLine("using UnityEditor.Profiling;");

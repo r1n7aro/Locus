@@ -184,7 +184,7 @@ namespace Locus
             string operation,
             Func<string> action)
         {
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try

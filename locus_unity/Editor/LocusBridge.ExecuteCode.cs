@@ -38,7 +38,7 @@ namespace Locus
                 }
             }
 
-            var tcs = new TaskCompletionSource<string>();
+            var tcs = LocusAsync.CreateTcs<string>();
 
             // Build Unity-dependent metadata references on the main thread the first time execute_code runs.
             ReportExecuteCodeCompilerStage(reportStage, "Waiting for Unity main thread");

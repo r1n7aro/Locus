@@ -277,6 +277,17 @@ namespace Locus
         {
             try
             {
+                // Leave the main-thread pump immediately. The request executor and
+                // the synchronous prefix of every handler (reflection-heavy type
+                // index export, compile-params fingerprint hashing, Roslyn Emit,
+                // JsonUtility on plain types) now run on a background thread.
+                // Handlers marshal their Unity-API work back to the main thread via
+                // LocusAsync.SwitchToMainThread / PostToMainThread, which the pump
+                // drains. This restores the off-main-thread execution contract the
+                // old managed-pipe worker provided before the native broker became
+                // the sole transport.
+                await LocusAsync.SwitchToThreadPool();
+
                 PipeEnvelope response;
                 try
                 {
@@ -292,6 +303,10 @@ namespace Locus
                 if (string.IsNullOrEmpty(response.reply_to))
                     response.reply_to = id;
 
+                // A handler may have left us on the main thread (its last hop was
+                // SwitchToMainThread). Serialize + native write must not run on the
+                // main thread, so hop back off it first.
+                await LocusAsync.SwitchToThreadPool();
                 NativeComplete(id, response);
             }
             finally

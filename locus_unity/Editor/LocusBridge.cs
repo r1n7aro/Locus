@@ -434,6 +434,9 @@ namespace Locus
             }
 
             // Keep the bridge alive across edit sessions. Auto Refresh is only suppressed while a session is active.
+            // The static ctor (InitializeOnLoad) runs on the Unity main thread; record it so the
+            // LocusAsync.SwitchTo* primitives can tell which thread they are on.
+            LocusAsync.CaptureMainThread();
             RefreshCachedEditorState();
             EditorApplication.update += PumpMainThreadQueue;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
@@ -1310,7 +1313,7 @@ namespace Locus
 
                     case "get_console_text":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1394,8 +1397,17 @@ namespace Locus
                     case "hot_reload_set_debug":
                         return await HandleHotReloadSetDebug(reqId).ConfigureAwait(false);
 
+                    case "hot_reload_set_play_mode_reload":
+                        return await HandleHotReloadSetPlayModeReload(reqId, msg.message).ConfigureAwait(false);
+
                     case "hot_reload_access_probe":
                         return await HandleHotReloadAccessProbe(reqId, msg.message).ConfigureAwait(false);
+
+                    case "hot_reload_inline_probe":
+                        return await HandleHotReloadInlineProbe(reqId).ConfigureAwait(false);
+
+                    case "hot_reload_inlining_active":
+                        return await HandleHotReloadInliningActive(reqId).ConfigureAwait(false);
 
                     case "hot_patch_loaded":
                         return await HandleHotPatchLoaded(reqId, msg.message).ConfigureAwait(false);
@@ -1487,7 +1499,7 @@ namespace Locus
                     case "begin_edit_session":
                     {
                         string owner = msg.message ?? "";
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1505,7 +1517,7 @@ namespace Locus
                     case "end_edit_session":
                     {
                         string owner = msg.message ?? "";
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1524,7 +1536,7 @@ namespace Locus
                     {
                         string paths = msg.message ?? "";
                         var lines = paths.Split(new[] { '\n' }, System.StringSplitOptions.RemoveEmptyEntries);
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1555,7 +1567,7 @@ namespace Locus
                         // generation with an unchanged serial is a no-compile
                         // reload (e.g. entering play mode). SessionState read on
                         // the main thread, like get_compile_result.
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1578,7 +1590,7 @@ namespace Locus
 
                     case "get_compile_result":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1629,7 +1641,7 @@ namespace Locus
                     case "open_asset_inspector":
                     {
                         SelectAssetRequest request = ParseSelectAssetRequest(msg.message);
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1654,7 +1666,7 @@ namespace Locus
                     case "select_scene_object":
                     {
                         SceneObjectRequest request = ParseSceneObjectRequest(msg.message);
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1673,7 +1685,7 @@ namespace Locus
                     case "open_scene_object_inspector":
                     {
                         SceneObjectRequest request = ParseSceneObjectRequest(msg.message);
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1692,7 +1704,7 @@ namespace Locus
                     case "start_asset_drag":
                     {
                         StartAssetDragRequest request = ParseStartAssetDragRequest(msg.message);
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1713,7 +1725,7 @@ namespace Locus
 
                     case "cancel_asset_drag":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1731,7 +1743,7 @@ namespace Locus
 
                     case "open_frontend_window":
                     {
-                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
@@ -1758,7 +1770,7 @@ namespace Locus
 
                     case "reload_open_scenes":
                     {
-                        TaskCompletionSource<string> tcs = new TaskCompletionSource<string>();
+                        TaskCompletionSource<string> tcs = LocusAsync.CreateTcs<string>();
                         PostToMainThread(delegate
                         {
                             try

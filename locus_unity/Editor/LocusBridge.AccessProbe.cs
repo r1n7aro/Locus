@@ -136,21 +136,23 @@ namespace Locus
             // Main thread, like every other JIT-touching handler: keeps the
             // probe's Mono interactions on the same thread the real patches
             // use. The whole run is milliseconds.
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
-            PostToMainThread(delegate
+            try
             {
-                try
+                return await LocusAsync.RunOnMainThreadAsync<PipeEnvelope>(delegate
                 {
                     AccessProbeResponse response = RunAccessProbe(assemblyBytes, cells);
                     _accessProbeMatrixJson = JsonUtility.ToJson(response);
-                    tcs.SetResult(OkResponse(requestId, _accessProbeMatrixJson));
-                }
-                catch (Exception ex)
-                {
-                    tcs.SetResult(ErrorResponse(requestId, "hot_reload_access_probe failed: " + ex.Message));
-                }
-            });
-            return await tcs.Task;
+                    return OkResponse(requestId, _accessProbeMatrixJson);
+                }, ExecuteTimeoutMs);
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "hot_reload_access_probe timed out");
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "hot_reload_access_probe failed: " + ex.Message);
+            }
         }
 
         private static AccessProbeResponse RunAccessProbe(byte[] assemblyBytes, AccessProbeCellRequest[] cells)

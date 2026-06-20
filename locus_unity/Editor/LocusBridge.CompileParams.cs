@@ -88,7 +88,7 @@ namespace Locus
             List<string> paths = TryGetCachedCompileReferencePaths();
             if (paths == null)
             {
-                var collect = new TaskCompletionSource<List<string>>();
+                var collect = LocusAsync.CreateTcs<List<string>>();
                 PostToMainThread(delegate
                 {
                     try

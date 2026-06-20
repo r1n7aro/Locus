@@ -152,9 +152,9 @@ namespace Locus
             new Dictionary<string, AssetPreviewRenderSession>();
         private static bool AssetPreviewRenderCleanupRegistered;
 
-        private static Task<PipeEnvelope> HandleAssetThumbnail(string requestId, string message)
+        private static async Task<PipeEnvelope> HandleAssetThumbnail(string requestId, string message)
         {
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try
@@ -166,12 +166,20 @@ namespace Locus
                     tcs.SetResult(ErrorResponse(requestId, ex.Message));
                 }
             });
-            return tcs.Task;
+
+            try
+            {
+                return await LocusAsync.WithTimeout(tcs.Task, ExecuteTimeoutMs, "asset_thumbnail");
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "asset_thumbnail timed out");
+            }
         }
 
-        private static Task<PipeEnvelope> HandleAssetPreviewRender(string requestId, string message)
+        private static async Task<PipeEnvelope> HandleAssetPreviewRender(string requestId, string message)
         {
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try
@@ -183,7 +191,15 @@ namespace Locus
                     tcs.SetResult(ErrorResponse(requestId, ex.Message));
                 }
             });
-            return tcs.Task;
+
+            try
+            {
+                return await LocusAsync.WithTimeout(tcs.Task, ExecuteTimeoutMs, "asset_preview_render");
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "asset_preview_render timed out");
+            }
         }
 
         private static AssetThumbnailRequest ParseAssetThumbnailRequest(string json)

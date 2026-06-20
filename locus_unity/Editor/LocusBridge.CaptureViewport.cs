@@ -19,7 +19,7 @@ namespace Locus
         private static async Task<PipeEnvelope> HandleCaptureViewport(string requestId, string message)
         {
             CaptureViewportRequest request = ParseCaptureViewportRequest(message);
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
 
             PostToMainThread(delegate
             {
@@ -50,7 +50,14 @@ namespace Locus
                 }
             });
 
-            return await tcs.Task;
+            try
+            {
+                return await LocusAsync.WithTimeout(tcs.Task, ExecuteTimeoutMs, "capture_viewport");
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "capture_viewport timed out");
+            }
         }
 
         private static CaptureViewportRequest ParseCaptureViewportRequest(string message)
