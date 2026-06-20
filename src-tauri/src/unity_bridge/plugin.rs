@@ -558,19 +558,58 @@ fn install_or_update_plugin_with_source_dir(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
     }
-    std::fs::rename(&staging_dir, &install_dir).map_err(|e| {
-        format!(
-            "Failed to move staged plugin into {}: {}",
-            install_dir.display(),
-            e
-        )
-    })?;
+    move_staged_plugin_dir(&staging_dir, &install_dir)?;
 
     eprintln!(
         "[Locus] locus_unity plugin installed/updated at: {}",
         install_dir.display()
     );
     Ok(hash)
+}
+
+fn move_staged_plugin_dir(staging_dir: &Path, install_dir: &Path) -> Result<(), String> {
+    match std::fs::rename(staging_dir, install_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if is_access_denied_error(&error.to_string()) => {
+            eprintln!(
+                "[Locus] plugin staging rename was denied; falling back to recursive copy: {} -> {}: {}",
+                staging_dir.display(),
+                install_dir.display(),
+                error
+            );
+            if install_dir.exists() {
+                remove_plugin_dir(install_dir).map_err(|remove_error| {
+                    format!(
+                        "Failed to clean partial plugin install {} after rename failure: {}; original rename error: {}",
+                        install_dir.display(),
+                        remove_error,
+                        error
+                    )
+                })?;
+            }
+            copy_dir_contents(staging_dir, install_dir).map_err(|copy_error| {
+                format!(
+                    "Failed to copy staged plugin into {} after rename failure: {}; original rename error: {}",
+                    install_dir.display(),
+                    copy_error,
+                    error
+                )
+            })?;
+            if let Err(cleanup_error) = std::fs::remove_dir_all(staging_dir) {
+                eprintln!(
+                    "[Locus] failed to remove plugin staging directory after copy fallback: {}: {}",
+                    staging_dir.display(),
+                    cleanup_error
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "Failed to move staged plugin into {}: {}",
+            install_dir.display(),
+            error
+        )),
+    }
 }
 
 fn compute_dir_hash(dir: &std::path::Path) -> Result<String, String> {
