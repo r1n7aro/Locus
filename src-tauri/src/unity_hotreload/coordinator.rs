@@ -62,6 +62,25 @@ struct ProjectState {
     /// C0 capability matrix, probed once per domain generation (the probe
     /// assembly and the measured Mono both die with the domain).
     access_probe: Option<AccessProbeCacheEntry>,
+    // ── hot-patch counters (per project; the status card aggregates) ──
+    /// Monotonic this session: total hot patches applied / failed.
+    patches_applied: u64,
+    patch_failures: u64,
+    /// Live detours and their assembly bytes / method+type count. Reset together
+    /// when the domain dies (`on_domain_reloaded`). `cold_queued` is NOT stored
+    /// here — it is `cold_paths.len()`, so it can never drift (the old global
+    /// `store` was last-writer-wins across projects).
+    active_patches: u64,
+    active_patch_bytes: u64,
+    active_patch_code: u64,
+    // ── H6 automatic-convergence control (per project) ──
+    /// Bumped on every apply; an idle watchdog fires only if its generation is
+    /// still current when it wakes.
+    converge_generation: u64,
+    /// A convergence trigger fired during play mode: converge on play-mode exit.
+    convergence_pending: bool,
+    /// A convergence recompile is in flight for this project.
+    convergence_running: bool,
 }
 
 fn projects() -> &'static Mutex<HashMap<String, ProjectState>> {
@@ -115,6 +134,200 @@ fn file_key(file_path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+// ── per-project hot-patch counters & H6 automatic convergence ────────
+//
+// These tallies and the convergence state on `ProjectState` were once
+// module-global atomics shared by every project. That is fine for the status
+// card (which only DISPLAYS them) but was wrong for the convergence control
+// path, which reads them to decide WHEN to recompile: with two editors open,
+// one project's applies, resets and idle activity cross-contaminated the
+// other's convergence — a merged active count tripped the threshold early, a
+// domain reload zeroed a sibling's live count (under-converging it), and one
+// project's activity disarmed the other's idle watchdog. They now live per
+// project; `counters` re-aggregates them (active-project scoped) for the badge,
+// while `total_active_patches` keeps the global view the shared sidecar needs.
+
+const CONVERGE_ACTIVE_THRESHOLD: u64 = 8;
+const CONVERGE_IDLE_SECS: u64 = 10 * 60;
+
+/// Record a successful hot-patch apply against `project_path`: bumps the
+/// monotonic session total and the live-detour tallies (reset together when the
+/// domain dies, in `on_domain_reloaded`).
+async fn record_patch_applied(project_path: &str, assembly_bytes: u64, code_entries: u64) {
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.patches_applied += 1;
+        state.active_patches += 1;
+        state.active_patch_bytes += assembly_bytes;
+        state.active_patch_code += code_entries;
+    }
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Record a hot-patch apply/compile failure against `project_path`.
+async fn record_patch_failure(project_path: &str) {
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.patch_failures += 1;
+    }
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Hot-patch counters for the settings status card. Scoped to the active project
+/// when the monitor has set one (so a stale/background editor's tallies cannot
+/// inflate the badge), else summed across all — mirroring `unapplied_change_count`'s
+/// active-project discipline. `cold_queued` is the live `cold_paths` depth.
+pub async fn counters() -> super::HotReloadCounters {
+    let active = active_project()
+        .lock()
+        .ok()
+        .and_then(|active| active.clone());
+    let projects = projects().lock().await;
+    let states: Vec<&ProjectState> = match active.as_deref() {
+        Some(key) => projects.get(key).into_iter().collect(),
+        None => projects.values().collect(),
+    };
+    let mut totals = super::HotReloadCounters::default();
+    for state in states {
+        totals.patches_applied += state.patches_applied;
+        totals.patch_failures += state.patch_failures;
+        totals.active_patches += state.active_patches;
+        totals.active_patch_bytes += state.active_patch_bytes;
+        totals.active_patch_code += state.active_patch_code;
+        totals.cold_queued += state.cold_paths.len() as u64;
+    }
+    totals
+}
+
+/// Total live detours across ALL projects, ignoring active-project scope. The
+/// compile sidecar is a single shared process, so its binary must not be swapped
+/// (nor its lost-session gate cleared) while ANY project holds live patches.
+pub async fn total_active_patches() -> u64 {
+    let projects = projects().lock().await;
+    projects.values().map(|state| state.active_patches).sum()
+}
+
+/// Live detours for ONE project — the self-test waits on its own count, not a
+/// global a background editor could hold above zero.
+pub async fn project_active_patches(project_path: &str) -> u64 {
+    let projects = projects().lock().await;
+    projects
+        .get(&project_key(project_path))
+        .map(|state| state.active_patches)
+        .unwrap_or(0)
+}
+
+/// Called by the apply path after each successful hot patch. Arms this project's
+/// idle watchdog and fires an immediate convergence when ITS own live-patch
+/// count crosses the threshold — both keyed per project, so a second editor
+/// neither trips nor disarms this one's convergence.
+async fn note_patch_applied(project_path: &str) {
+    let (generation, over_threshold) = {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.converge_generation += 1;
+        (
+            state.converge_generation,
+            state.active_patches >= CONVERGE_ACTIVE_THRESHOLD,
+        )
+    };
+
+    if over_threshold {
+        let project = project_path.to_string();
+        tauri::async_runtime::spawn(async move {
+            try_converge(&project, "active patch threshold").await;
+        });
+    }
+
+    let project = project_path.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(CONVERGE_IDLE_SECS)).await;
+        let still_idle_with_patches = {
+            let projects = projects().lock().await;
+            projects
+                .get(&project_key(&project))
+                .map(|state| state.converge_generation == generation && state.active_patches > 0)
+                .unwrap_or(false)
+        };
+        if still_idle_with_patches {
+            try_converge(&project, "idle session").await;
+        }
+    });
+}
+
+/// Called from the connection monitor on an editor play-mode exit. Converges
+/// this project when a trigger was deferred during play or live patches remain.
+pub async fn on_play_mode_exited(project_path: &str) {
+    if !super::is_enabled() {
+        return;
+    }
+    let (was_pending, active) = {
+        let mut projects = projects().lock().await;
+        match projects.get_mut(&project_key(project_path)) {
+            Some(state) => (
+                std::mem::replace(&mut state.convergence_pending, false),
+                state.active_patches,
+            ),
+            None => (false, 0),
+        }
+    };
+    if !was_pending && active == 0 {
+        return;
+    }
+    try_converge(project_path, "left play mode").await;
+}
+
+/// Run the silent convergence recompile for `project_path` unless its editor is
+/// playing (then defer to the play-exit trigger). Reuses the unity_recompile
+/// pipeline, so the cold queue, pending baselines and type index all settle. The
+/// in-flight guard is per project: a second editor converges independently
+/// rather than being silently skipped while this one runs.
+async fn try_converge(project_path: &str, why: &str) {
+    if !super::is_enabled() || !crate::csharp_compile::is_enabled() {
+        return;
+    }
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        if state.active_patches == 0 && state.cold_paths.is_empty() {
+            return;
+        }
+        if state.convergence_running {
+            return; // one at a time, per project
+        }
+        state.convergence_running = true;
+    }
+
+    let result = async {
+        let (connected, status, _) = crate::unity_bridge::query_unity_status(project_path).await;
+        if !connected {
+            return Err("editor not connected".to_string());
+        }
+        if crate::unity_bridge::is_play_mode_status(status) {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(project_path)).or_default();
+            state.convergence_pending = true;
+            return Err("editor in play mode; deferred to play-mode exit".to_string());
+        }
+        eprintln!("[HotReload] auto-convergence ({why}): running a silent recompile");
+        crate::unity_bridge::recompile_and_wait(project_path).await
+    }
+    .await;
+
+    {
+        let mut projects = projects().lock().await;
+        if let Some(state) = projects.get_mut(&project_key(project_path)) {
+            state.convergence_running = false;
+        }
+    }
+    match result {
+        Ok(_) => eprintln!("[HotReload] auto-convergence completed ({why})"),
+        Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
+    }
+}
+
 /// Reconstruct the `MethodKey` string the Unity plugin builds per detour
 /// (`LocusBridge.HotReload.cs::MethodKey`) from the same fields the desktop
 /// ships, so the inlined-method keys Unity returns can be mapped back to their
@@ -128,6 +341,37 @@ fn unity_method_key(method: &crate::csharp_compile::HotPatchMethod) -> String {
         method.param_type_names.join(","),
         if method.is_static { "s" } else { "i" },
     )
+}
+
+/// Render each inlined `MethodKey` as `Type.name` with a confidence tag derived
+/// from the parallel `InlineRiskSource` the plugin reported. Three distinct
+/// labels, NOT two — a force-evaluated stub proves Mono *would* inline the callee
+/// in a synthetic context, which is a strong signal but not the same as a real
+/// caller having inlined it, so it is reported as `(high-confidence)`, never
+/// conflated with the runtime-observed `(confirmed)`:
+///   RuntimeInlined → `(confirmed)`        — Mono's own cached bit was already set
+///   StubInlined    → `(high-confidence)`  — force-JIT stub made Mono set the bit
+///   Predicted      → `(predicted)`        — static ≤20-IL heuristic only
+/// When `sources` is absent or shorter (older plugin) the bare name is used —
+/// never panics on a length mismatch.
+fn annotate_inlined_names(keys: &[String], sources: &[String]) -> Vec<String> {
+    keys.iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut parts = key.split('|');
+            let base = match (parts.next(), parts.next()) {
+                (Some(ty), Some(name)) if !name.is_empty() => format!("{ty}.{name}"),
+                (Some(ty), _) => ty.to_string(),
+                _ => key.clone(),
+            };
+            match sources.get(index).map(String::as_str) {
+                Some("RuntimeInlined") => format!("{base} (confirmed)"),
+                Some("StubInlined") => format!("{base} (high-confidence)"),
+                Some("Predicted") => format!("{base} (predicted)"),
+                _ => base,
+            }
+        })
+        .collect()
 }
 
 fn normalize_project_file_path(project_path: &str, file_path: &str) -> String {
@@ -616,7 +860,8 @@ pub async fn on_recompile_converged(project_path: &str) {
     }
     drop(projects);
     on_domain_reloaded(project_path).await;
-    super::set_cold_queue_depth(0);
+    // The cold queue is `cold_paths`, cleared above; on_domain_reloaded emits
+    // the refreshed status (no separate cold-depth counter to zero).
     // A real compile changes the type/member surface, the reference assembly
     // mtimes, and serialized schema — invalidate the cached type index (which
     // also cascades to compile params + serialized schema) so a Unity-initiated
@@ -635,9 +880,27 @@ pub async fn on_domain_reloaded(project_path: &str) {
             for edit in state.pending.values_mut() {
                 edit.applied_text = None;
             }
+            // All detours die with the AppDomain; disk already holds every
+            // hot-applied edit, so the real compile converges naturally. Reset
+            // only THIS project's live-detour tallies (a module-global store(0)
+            // used to zero a sibling editor's live count, under-converging it)
+            // and its deferred-convergence flag — the monotonic session totals
+            // stay.
+            state.active_patches = 0;
+            state.active_patch_bytes = 0;
+            state.active_patch_code = 0;
+            state.convergence_pending = false;
+        }
+        // The shared sidecar's lost-session gate clears once NO project holds
+        // live patches: with nothing left to split against the blanked
+        // registries, hot-apply is safe again. Keyed on the global total (not
+        // this one project) so a sibling whose patches are still split stays
+        // gated.
+        if projects.values().all(|state| state.active_patches == 0) {
+            super::clear_session_registry_lost();
         }
     }
-    super::reset_active_patches();
+    crate::csharp_compile::emit_status_in_background();
     match crate::unity_type_index::drop_hot_patch_types(project_path).await {
         Ok(removed) if removed > 0 => {
             eprintln!("[HotReload] dropped {removed} hot-patch type-index row(s)");
@@ -821,6 +1084,26 @@ async fn queue_cold_paths(project_path: &str, keys: &[String]) -> usize {
     state.cold_paths.len()
 }
 
+/// The compile-server sidecar restarted while hot patches were live, losing its
+/// in-memory hot-reload session registries (field stores, session images, member
+/// surfaces). Hot-applying now would let the sidecar's empty field-store registry
+/// mint a fresh store for an already-virtualized field and silently split its
+/// value from the live detours' copy. Route the batch to the `unity_recompile`
+/// convergence path instead — it rebuilds consistent state and clears the
+/// lost-session flag once no project holds live patches (`on_domain_reloaded`).
+/// Returns the agent-facing message and queues the changed files so the
+/// recompile drains them.
+async fn converge_after_session_loss(project_path: &str, changed_keys: &[String]) -> String {
+    let queued = queue_cold_paths(project_path, changed_keys).await;
+    crate::csharp_compile::emit_status_in_background();
+    format!(
+        "Hot reload unavailable: the compile server restarted while patches were live, losing the \
+         hot-reload session state. Applying these edits hot now could split a hot-added field's \
+         value, so they are queued for a real compile ({queued} file(s)). Run unity_recompile to \
+         converge; hot reload resumes cleanly afterward."
+    )
+}
+
 fn base64_decoded_len(value: &str) -> u64 {
     let trimmed = value.trim();
     let len = trimmed.len();
@@ -849,6 +1132,10 @@ fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64
 struct AppliedHotPatch {
     engine: String,
     inlined_method_keys: Vec<String>,
+    /// Parallel to `inlined_method_keys`: the InlineRiskSource name the plugin
+    /// reported for each ("RuntimeInlined" / "StubInlined" / "Predicted"). Empty
+    /// from older plugins.
+    inlined_sources: Vec<String>,
     image_register_error: Option<String>,
 }
 
@@ -864,6 +1151,9 @@ async fn apply_compiled_hot_patch(
     let mut payload = serde_json::json!({
         "patch_id": assembly_name,
         "domain_generation": params.domain_generation,
+        // Experimental Phase B gate (default off): ask the plugin to force-JIT a
+        // synthetic caller stub to evaluate inline risk. Older plugins ignore it.
+        "inline_force_evaluate": super::inline_force_evaluate_enabled(),
         "methods": methods.iter().map(|m| serde_json::json!({
             "declaring_type": m.declaring_type,
             "patch_declaring_type": m.patch_declaring_type,
@@ -903,7 +1193,7 @@ async fn apply_compiled_hot_patch(
     {
         Ok(resp) => resp,
         Err(error) => {
-            super::record_patch_failure();
+            record_patch_failure(project_path).await;
             return Err(format!(
                 "Unity did not accept the hot patch ({error}); use unity_recompile."
             ));
@@ -911,7 +1201,7 @@ async fn apply_compiled_hot_patch(
     };
 
     if !resp.ok {
-        super::record_patch_failure();
+        record_patch_failure(project_path).await;
         let error = resp
             .error
             .unwrap_or_else(|| "hot patch rejected".to_string());
@@ -929,14 +1219,15 @@ async fn apply_compiled_hot_patch(
 
     let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
     let code_entries = methods.len().saturating_add(new_types.len()) as u64;
-    super::record_patch_applied(assembly_bytes, code_entries);
-    super::note_patch_applied(project_path);
+    record_patch_applied(project_path, assembly_bytes, code_entries).await;
+    note_patch_applied(project_path).await;
 
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
     struct HotPatchLoadedResponse {
         detour_engine: String,
         inlined_method_keys: Vec<String>,
+        inlined_sources: Vec<String>,
     }
     let loaded = resp
         .message
@@ -985,6 +1276,7 @@ async fn apply_compiled_hot_patch(
     Ok(AppliedHotPatch {
         engine: loaded.detour_engine,
         inlined_method_keys: loaded.inlined_method_keys,
+        inlined_sources: loaded.inlined_sources,
         image_register_error,
     })
 }
@@ -1054,7 +1346,6 @@ async fn try_inline_caller_refresh(
     params: &crate::csharp_compile::CompileParams,
     extra_references: &[String],
     access_caps: &crate::csharp_compile::AccessCaps,
-    initial_methods: &[crate::csharp_compile::HotPatchMethod],
     initial_patch_files: &[(String, String, String)],
     initial_inlined_keys: &[String],
 ) -> InlineCallerRefreshReport {
@@ -1063,35 +1354,42 @@ async fn try_inline_caller_refresh(
     let mut seen_targets = BTreeSet::<String>::new();
     let mut refreshed_methods = BTreeSet::<String>::new();
     let mut refreshed_files = BTreeSet::<String>::new();
+    // Carry the WHOLE initial batch — every changed file with its diff — into the
+    // refresh compile, not just the inlined callees' own source files. A
+    // force-detoured caller is recompiled here, so the compilation must see every
+    // sibling the (still un-converged) batch introduced: e.g. an enum value or a
+    // type/member appended in ANOTHER file of the same batch. Subsetting to the
+    // inlined methods' files dropped those siblings, so the caller refresh failed
+    // to compile (CS0117: 'Type' has no definition for the appended member) — which
+    // silently defeated the un-inline and fell back to a queued recompile. The
+    // full set is self-consistent (the main apply just compiled it); the extra
+    // files only carry references — only the queried callers are force-detoured.
     let mut carry_files = {
-        let inlined: BTreeSet<String> = initial_inlined_keys.iter().cloned().collect();
-        let mut source_file_keys = BTreeSet::<String>::new();
-        for method in initial_methods {
-            if inlined.contains(&unity_method_key(method)) && !method.source_path.trim().is_empty()
-            {
-                source_file_keys.insert(file_key(&method.source_path));
-            }
-        }
-        let include_all = source_file_keys.is_empty();
         let mut files = BTreeMap::<String, InlineRefreshFile>::new();
         for (path, old_text, new_text) in initial_patch_files {
-            let key = file_key(path);
-            if include_all || source_file_keys.contains(&key) {
-                files.insert(
-                    key,
-                    InlineRefreshFile {
-                        path: path.clone(),
-                        old_text: old_text.clone(),
-                        new_text: new_text.clone(),
-                        force_methods: BTreeSet::new(),
-                    },
-                );
-            }
+            files.insert(
+                file_key(path),
+                InlineRefreshFile {
+                    path: path.clone(),
+                    old_text: old_text.clone(),
+                    new_text: new_text.clone(),
+                    force_methods: BTreeSet::new(),
+                },
+            );
         }
         files
     };
 
     for depth in 0..INLINE_REFRESH_MAX_DEPTH {
+        // A sidecar restart during refresh blanks the session registries; a
+        // force-detoured caller recompiled against them could split a virtualized
+        // field. Stop here and let the next hot reload converge via recompile.
+        if super::session_registry_lost() {
+            report.notes.push(
+                "caller refresh stopped: compile-server session lost to a restart".to_string(),
+            );
+            break;
+        }
         let targets: Vec<crate::csharp_compile::CallerQueryTarget> = frontier
             .iter()
             .filter(|key| seen_targets.insert((*key).clone()))
@@ -1411,6 +1709,11 @@ struct HotReloadProbeResponse {
     detour_ok: bool,
     #[serde(default)]
     code_optimization: String,
+    /// Whether entering Play Mode reloads the domain. `None` when the plugin
+    /// predates the toggle (the field is absent), so the UI shows "unknown"
+    /// rather than mistaking a missing field for "no reload".
+    #[serde(default)]
+    domain_reload_on_play: Option<bool>,
     #[serde(default)]
     error: String,
 }
@@ -1580,6 +1883,87 @@ pub async fn set_code_optimization(project_path: &str, desired: &str) -> Result<
 /// toggle-time auto-fix the user confirmed).
 pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
     set_code_optimization(project_path, "debug").await
+}
+
+// ── Enter-Play-Mode domain reload (manual popover toggle) ────────────
+
+/// One probe, both editor settings the hot-reload popover surfaces: Code
+/// Optimization and the Play-Mode domain-reload flag. Mirrors
+/// `detect_code_optimization`'s lenient contract — an unreachable editor →
+/// `(false, None, None)`; a connected editor whose probe could not be parsed
+/// (an older plugin) → `(true, None, None)`. Both settings are read off the
+/// single `hot_reload_probe` round-trip so the popover never double-probes.
+pub async fn detect_hot_reload_editor_settings(
+    project_path: &str,
+) -> (bool, Option<String>, Option<bool>) {
+    let resp = match crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_probe",
+        "",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(_) => return (false, None, None),
+    };
+
+    if !resp.ok {
+        return (true, None, None);
+    }
+
+    let message = resp.message.unwrap_or_default();
+    match serde_json::from_str::<HotReloadProbeResponse>(&message) {
+        Ok(probe) => (
+            true,
+            if probe.code_optimization.is_empty() {
+                None
+            } else {
+                Some(probe.code_optimization)
+            },
+            probe.domain_reload_on_play,
+        ),
+        _ => (true, None, None),
+    }
+}
+
+/// Set whether entering Play Mode reloads the managed domain
+/// (EditorSettings.enterPlayModeOptions / DisableDomainReload). Unlike a Code
+/// Optimization switch this does NOT trigger a recompile — it only flips the
+/// editor setting. Returns the resulting effective value reported by Unity.
+pub async fn set_play_mode_reload(project_path: &str, domain_reload: bool) -> Result<bool, String> {
+    let payload = serde_json::json!({ "domain_reload_on_play": domain_reload }).to_string();
+    let resp = crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_set_play_mode_reload",
+        &payload,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| {
+        format!("Could not reach the Unity editor to change Play Mode domain reload: {error}")
+    })?;
+
+    if !resp.ok {
+        let error = resp
+            .error
+            .unwrap_or_else(|| "Unity rejected the Play Mode domain-reload change".to_string());
+        if error.starts_with("unknown message type") {
+            return Err(
+                "The Unity plugin in this project predates the Play Mode domain-reload toggle. \
+                 Update the Locus plugin (reopen the project from Locus)."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Unity could not change Play Mode domain reload: {error}"
+        ));
+    }
+
+    let message = resp.message.unwrap_or_default();
+    let parsed: HotReloadProbeResponse = serde_json::from_str(&message)
+        .map_err(|error| format!("Play Mode domain-reload response parse failed: {error}"))?;
+    Ok(parsed.domain_reload_on_play.unwrap_or(domain_reload))
 }
 
 // ── access probe (C0 runtime capability matrix) ─────────────────────
@@ -1878,6 +2262,15 @@ pub async fn hot_reload(
         );
     }
 
+    // A prior request already saw the sidecar restart with patches live: its
+    // session registries are gone, so a hot apply could split a virtualized
+    // field's value. Converge through unity_recompile instead of compiling
+    // against the blank registry (which would also fail confusingly on any
+    // cross-patch reference the lost ImageRegistry can no longer resolve).
+    if super::session_registry_lost() {
+        return Ok(converge_after_session_loss(project_path, &changed_keys).await);
+    }
+
     let params = crate::csharp_compile::params::get_params(project_path)
         .await
         .map_err(|error| {
@@ -1906,7 +2299,7 @@ pub async fn hot_reload(
     let baseline_siblings = discover_partial_siblings(project_path, &files).await;
 
     let started = std::time::Instant::now();
-    let outcome = crate::csharp_compile::compile_hot_patch(
+    let outcome = match crate::csharp_compile::compile_hot_patch(
         &params,
         &files,
         &baseline_siblings,
@@ -1915,10 +2308,15 @@ pub async fn hot_reload(
         &[],
     )
     .await
-    .map_err(|error| {
-        super::record_patch_failure();
-        format!("Compile server unavailable ({error}); use unity_recompile.")
-    })?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record_patch_failure(project_path).await;
+            return Err(format!(
+                "Compile server unavailable ({error}); use unity_recompile."
+            ));
+        }
+    };
 
     match outcome {
         crate::csharp_compile::HotPatchOutcome::Cold { files: cold_files } => {
@@ -1931,7 +2329,7 @@ pub async fn hot_reload(
                 lines.push(format!("  {}: {}", path, reasons.join("; ")));
             }
             let queued = queue_cold_paths(project_path, &changed_keys).await;
-            super::set_cold_queue_depth(queued as u64);
+            crate::csharp_compile::emit_status_in_background();
             lines.push(format!(
                 "Run unity_recompile to apply them ({queued} file(s) queued). Hot-applied edits \
                  from earlier patches stay live until then."
@@ -1983,6 +2381,14 @@ pub async fn hot_reload(
                 );
             }
 
+            // The sidecar can have crashed and respawned during this very call's
+            // get_params / probe / compile (after the gate above), blanking the
+            // registries — so this freshly built assembly may carry a new,
+            // value-splitting field store. Re-check before shipping it to Unity.
+            if super::session_registry_lost() {
+                return Ok(converge_after_session_loss(project_path, &changed_keys).await);
+            }
+
             let applied = match apply_compiled_hot_patch(
                 project_path,
                 &params,
@@ -1996,8 +2402,8 @@ pub async fn hot_reload(
             {
                 Ok(applied) => applied,
                 Err(error) => {
-                    let queued = queue_cold_paths(project_path, &changed_keys).await;
-                    super::set_cold_queue_depth(queued as u64);
+                    queue_cold_paths(project_path, &changed_keys).await;
+                    crate::csharp_compile::emit_status_in_background();
                     return Err(error);
                 }
             };
@@ -2006,21 +2412,38 @@ pub async fn hot_reload(
 
             let engine = applied.engine;
             let inlined_method_keys = applied.inlined_method_keys;
+            let inlined_sources = applied.inlined_sources;
             let image_register_error = applied.image_register_error;
+
+            // Phase D rollout observability: count the force-evaluate-attributable
+            // classifications (StubInlined = the force-JIT stub moved Mono's bit;
+            // without the feature these fall to the static heuristic). An upper
+            // bound on the over-refresh the feature adds — logged so a gray rollout
+            // can weigh that cost against the tighter "is it live" reporting it buys.
+            let stub_inlined = inlined_sources
+                .iter()
+                .filter(|source| source.as_str() == "StubInlined")
+                .count();
+            if stub_inlined > 0 {
+                eprintln!(
+                    "[HotReload] inline force-evaluate: {stub_inlined}/{} inlined method(s) classified via the force-JIT stub this apply",
+                    inlined_method_keys.len()
+                );
+            }
 
             // Route inlined methods to the same convergence path Locus uses for
             // any non-hot-safe change, but queue only the source file(s) whose
             // methods Unity reported as inlined. Fall back to the batch if a
             // method key cannot be mapped.
             if !inlined_method_keys.is_empty() {
-                let queued = queue_inlined_method_files(
+                queue_inlined_method_files(
                     project_path,
                     &changed_keys,
                     &methods,
                     &inlined_method_keys,
                 )
                 .await;
-                super::set_cold_queue_depth(queued as u64);
+                crate::csharp_compile::emit_status_in_background();
             }
 
             let inline_refresh = if !inlined_method_keys.is_empty() {
@@ -2030,7 +2453,6 @@ pub async fn hot_reload(
                         &params,
                         &extra_references,
                         &access_caps,
-                        &methods,
                         &files,
                         &inlined_method_keys,
                     )
@@ -2089,19 +2511,10 @@ pub async fn hot_reload(
             } else {
                 // Release-first honesty: Mono inlined some originals, so the detour
                 // is bypassed at their inlined call sites and those edits are NOT
-                // live yet. Report tersely — names + the one action that matters.
-                // (Keep the exact phrase "inlined in Release"; the self-test keys on it.)
-                let names: Vec<String> = inlined_method_keys
-                    .iter()
-                    .map(|key| {
-                        let mut parts = key.split('|');
-                        match (parts.next(), parts.next()) {
-                            (Some(ty), Some(name)) if !name.is_empty() => format!("{ty}.{name}"),
-                            (Some(ty), _) => ty.to_string(),
-                            _ => key.clone(),
-                        }
-                    })
-                    .collect();
+                // live yet. Report tersely — names (tagged by the confidence the
+                // plugin reported) + the one action that matters. (Keep the exact
+                // phrase "inlined in Release"; the self-test keys on it.)
+                let names = annotate_inlined_names(&inlined_method_keys, &inlined_sources);
                 let playing = {
                     let (connected, status, _) =
                         crate::unity_bridge::query_unity_status(project_path).await;
@@ -2167,6 +2580,32 @@ mod tests {
             &mut none,
         );
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn inlined_names_annotate_by_reported_confidence() {
+        let keys = vec![
+            "Game.Foo|Bar|Int32|s".to_string(),
+            "Game.Foo|Baz||i".to_string(),
+            "Game.Foo|Qux|String|s".to_string(),
+        ];
+        let sources = vec![
+            "RuntimeInlined".to_string(),
+            "StubInlined".to_string(),
+            "Predicted".to_string(),
+        ];
+        let names = annotate_inlined_names(&keys, &sources);
+        assert_eq!(names[0], "Game.Foo.Bar (confirmed)");
+        assert_eq!(names[1], "Game.Foo.Baz (high-confidence)");
+        assert_eq!(names[2], "Game.Foo.Qux (predicted)");
+
+        // Older plugin: no sources → bare names, no panic on the length gap.
+        let bare = annotate_inlined_names(&keys, &[]);
+        assert_eq!(bare, vec!["Game.Foo.Bar", "Game.Foo.Baz", "Game.Foo.Qux"]);
+
+        // Unknown/empty source string also falls back to the bare name.
+        let unknown = annotate_inlined_names(&keys[..1], &["Mystery".to_string()]);
+        assert_eq!(unknown, vec!["Game.Foo.Bar"]);
     }
 
     #[test]
@@ -2308,7 +2747,7 @@ mod tests {
     async fn baseline_is_captured_once_and_cleared_on_convergence() {
         // Isolated project key for this test.
         let project = r"C:\HotReloadTest\Baseline";
-        super::super::initialize(true);
+        super::super::initialize(true, false);
         crate::csharp_compile::initialize_enabled_for_tests(true);
 
         note_cs_written(
@@ -2339,7 +2778,7 @@ mod tests {
             assert!(state.cold_paths.is_empty());
         }
 
-        super::super::initialize(false);
+        super::super::initialize(false, false);
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }
 
@@ -2636,9 +3075,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_patch_counters_are_isolated_per_project() {
+        // P2-a: the live-detour tallies and convergence state are per project, so
+        // two open editors never cross-contaminate (they were once module-global
+        // atomics shared by every project). Distinct keys keep this test isolated
+        // from the others sharing the process-global map.
+        let a = r"C:\HotReloadTest\CrosstalkA";
+        let b = r"C:\HotReloadTest\CrosstalkB";
+
+        record_patch_applied(a, 128, 3).await;
+        record_patch_applied(b, 64, 1).await;
+        record_patch_applied(b, 64, 1).await;
+        assert_eq!(project_active_patches(a).await, 1);
+        assert_eq!(project_active_patches(b).await, 2);
+
+        // The crux: a domain reload in A drops A's detours but must leave B's live
+        // count untouched. The old global `ACTIVE_PATCHES.store(0)` zeroed everyone,
+        // so B believed it had no active patch and under-converged.
+        on_domain_reloaded(a).await;
+        assert_eq!(
+            project_active_patches(a).await,
+            0,
+            "A's detours die with its domain"
+        );
+        assert_eq!(
+            project_active_patches(b).await,
+            2,
+            "B's active patches must survive A's domain reload"
+        );
+
+        // The monotonic session total is independent of the live-detour reset, and
+        // the active byte/code tallies reset alongside the patch count.
+        let (applied_a, bytes_a) = {
+            let projects = projects().lock().await;
+            let state = projects.get(&project_key(a)).expect("state");
+            (state.patches_applied, state.active_patch_bytes)
+        };
+        assert_eq!(
+            applied_a, 1,
+            "patches_applied is monotonic across the reload"
+        );
+        assert_eq!(bytes_a, 0, "active bytes reset with the domain");
+
+        on_recompile_converged(a).await;
+        on_recompile_converged(b).await;
+    }
+
+    #[tokio::test]
     async fn relative_project_paths_are_tracked_against_project_root() {
         let project = r"C:\HotReloadTest\Relative";
-        super::super::initialize(true);
+        super::super::initialize(true, false);
         crate::csharp_compile::initialize_enabled_for_tests(true);
 
         note_cs_written(project, r"Assets\Scripts\B.cs", "old".to_string()).await;
@@ -2652,7 +3138,7 @@ mod tests {
         }
 
         on_recompile_converged(project).await;
-        super::super::initialize(false);
+        super::super::initialize(false, false);
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }
 }

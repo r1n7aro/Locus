@@ -5,10 +5,13 @@ namespace Locus.CompileServer;
 /// lives in a per-field store (instance) or holder field (static) inside the
 /// FIRST patch assembly that introduced it. Later batches rewrite their
 /// accesses to that same store — regenerating one would silently split the
-/// values. Same lifecycle discipline as <see cref="ImageRegistry"/>: new
-/// domain generation discards everything; a sidecar restart loses the
-/// session and later references fail deterministically toward
-/// unity_recompile.
+/// values. Same lifecycle discipline as <see cref="ImageRegistry"/>: a new
+/// domain generation discards everything. A sidecar restart also loses this
+/// session, but — unlike a missing image, which fails the next compile closed —
+/// an emptied field registry would silently mint a fresh store and split the
+/// value. The desktop closes that gap: on a restart with live patches it flags
+/// the lost session (unity_hotreload::note_sidecar_session_lost) and routes the
+/// next batch to unity_recompile instead of hot-applying against blank state.
 /// </summary>
 public sealed class FieldStoreRegistry
 {

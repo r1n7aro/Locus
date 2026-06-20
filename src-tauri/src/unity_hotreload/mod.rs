@@ -11,23 +11,37 @@
 pub mod coordinator;
 pub mod selftest;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-// Session counters, surfaced through the csharp-compile status payload
-// (settings card) for rollout observability, mirroring the sidecar compiler
-// counters.
-static PATCHES_APPLIED: AtomicU64 = AtomicU64::new(0);
-static PATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_PATCHES: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_PATCH_BYTES: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_PATCH_CODE: AtomicU64 = AtomicU64::new(0);
-static COLD_QUEUED: AtomicU64 = AtomicU64::new(0);
+// Experimental (Phase B, default off): when set, the desktop tells the Unity
+// plugin (via the hot_patch_loaded payload) it may force-JIT a synthetic caller
+// stub to evaluate a not-yet-evaluated method's inline risk, instead of relying
+// only on the plugin's static heuristic. Correctness is unaffected — every
+// inline-risk verdict still converges through recompile.
+static INLINE_FORCE_EVALUATE: AtomicBool = AtomicBool::new(false);
 
-/// Called once from app setup with the persisted flag.
-pub fn initialize(enabled: bool) {
+// Set when the compile-server sidecar that held the live hot-reload session
+// registries — field stores, session images, member surfaces, all in-memory
+// instance state on `CompileService` — died and was respawned while patches
+// were still active. The fresh process starts with EMPTY registries, so a later
+// hot patch touching an already-virtualized field would miss its original store
+// (`FieldStoreRegistry.SnapshotFor` returns nothing), mint a new one, and
+// silently split the field's value from the copy the live detours read. While
+// this is set the coordinator refuses to hot-apply and routes edits to
+// `unity_recompile`, which rebuilds consistent state. The sidecar is shared by
+// every project, so the loss is global: it is cleared (by the coordinator's
+// `on_domain_reloaded`) only once NO project holds live patches — with nothing
+// left to split, the lost registries are moot. This is the crash/timeout-path
+// analogue of the `active_patches == 0` gate that stops a binary-change restart
+// from splitting the same state.
+static SESSION_REGISTRY_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Called once from app setup with the persisted flags.
+pub fn initialize(enabled: bool, inline_force_evaluate: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+    INLINE_FORCE_EVALUATE.store(inline_force_evaluate, Ordering::Relaxed);
 }
 
 pub fn is_enabled() -> bool {
@@ -39,7 +53,22 @@ pub fn set_enabled(value: bool) {
     crate::csharp_compile::emit_status_in_background();
 }
 
-/// Counter snapshot for the settings status payload.
+/// Whether the desktop should ask the plugin to force-evaluate inline risk
+/// (Phase B). Shipped to Unity in each hot_patch_loaded payload.
+pub fn inline_force_evaluate_enabled() -> bool {
+    INLINE_FORCE_EVALUATE.load(Ordering::Relaxed)
+}
+
+pub fn set_inline_force_evaluate_enabled(value: bool) {
+    INLINE_FORCE_EVALUATE.store(value, Ordering::Relaxed);
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Counter snapshot for the settings status payload (rollout observability,
+/// mirroring the sidecar compiler counters). The per-project tallies live in the
+/// coordinator's `ProjectState` — the convergence control path reads them per
+/// project so two open editors never cross-contaminate — and
+/// `coordinator::counters` aggregates them here for the status card.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HotReloadCounters {
     pub patches_applied: u64,
@@ -50,133 +79,29 @@ pub struct HotReloadCounters {
     pub cold_queued: u64,
 }
 
-pub fn counters() -> HotReloadCounters {
-    HotReloadCounters {
-        patches_applied: PATCHES_APPLIED.load(Ordering::Relaxed),
-        patch_failures: PATCH_FAILURES.load(Ordering::Relaxed),
-        active_patches: ACTIVE_PATCHES.load(Ordering::Relaxed),
-        active_patch_bytes: ACTIVE_PATCH_BYTES.load(Ordering::Relaxed),
-        active_patch_code: ACTIVE_PATCH_CODE.load(Ordering::Relaxed),
-        cold_queued: COLD_QUEUED.load(Ordering::Relaxed),
+/// Flagged by the compile-server manager when it respawns the sidecar after a
+/// crash/timeout with hot patches still live. See `SESSION_REGISTRY_LOST`.
+pub(crate) fn note_sidecar_session_lost() {
+    // Only log on the 0→1 edge so a burst of post-crash requests does not spam.
+    if !SESSION_REGISTRY_LOST.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[HotReload] compile server restarted with live patches; hot-reload session state \
+             lost — routing further edits to unity_recompile until convergence"
+        );
+        crate::csharp_compile::emit_status_in_background();
     }
 }
 
-pub(crate) fn record_patch_applied(assembly_bytes: u64, code_entries: u64) {
-    PATCHES_APPLIED.fetch_add(1, Ordering::Relaxed);
-    ACTIVE_PATCHES.fetch_add(1, Ordering::Relaxed);
-    ACTIVE_PATCH_BYTES.fetch_add(assembly_bytes, Ordering::Relaxed);
-    ACTIVE_PATCH_CODE.fetch_add(code_entries, Ordering::Relaxed);
-    crate::csharp_compile::emit_status_in_background();
+/// Whether a sidecar restart invalidated the live hot-reload session, so the
+/// next batch must converge through a real compile instead of hot-applying.
+pub fn session_registry_lost() -> bool {
+    SESSION_REGISTRY_LOST.load(Ordering::Relaxed)
 }
 
-pub(crate) fn record_patch_failure() {
-    PATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
-    crate::csharp_compile::emit_status_in_background();
-}
-
-pub(crate) fn set_cold_queue_depth(depth: u64) {
-    COLD_QUEUED.store(depth, Ordering::Relaxed);
-    crate::csharp_compile::emit_status_in_background();
-}
-
-/// All detours die with the AppDomain (recompile / reload); the disk already
-/// holds every hot-applied edit, so the real compile converges naturally.
-pub(crate) fn reset_active_patches() {
-    ACTIVE_PATCHES.store(0, Ordering::Relaxed);
-    ACTIVE_PATCH_BYTES.store(0, Ordering::Relaxed);
-    ACTIVE_PATCH_CODE.store(0, Ordering::Relaxed);
-    CONVERGENCE_PENDING.store(false, Ordering::Relaxed);
-    crate::csharp_compile::emit_status_in_background();
-}
-
-// ── H6: automatic convergence ────────────────────────────────────────
-//
-// Field virtualization (M4) makes the hot/real state gap grow with every
-// patch — convergence stops being an optimization and becomes part of the
-// mechanism. A silent real recompile runs when any of:
-//   • active patches reach the threshold,
-//   • the session goes idle with patches live,
-//   • the editor leaves play mode with patches live (deferred triggers
-//     also land here: recompiling mid-play would kill the play session).
-
-const CONVERGE_ACTIVE_THRESHOLD: u64 = 8;
-const CONVERGE_IDLE_SECS: u64 = 10 * 60;
-
-/// Bumped on every hot-reload apply; an idle watchdog only fires if its
-/// generation is still current when it wakes.
-static CONVERGE_GENERATION: AtomicU64 = AtomicU64::new(0);
-/// A trigger fired during play mode: converge on play-mode exit.
-static CONVERGENCE_PENDING: AtomicBool = AtomicBool::new(false);
-/// A convergence recompile is currently running.
-static CONVERGENCE_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Called by the coordinator after each successful hot patch.
-pub(crate) fn note_patch_applied(project_path: &str) {
-    let generation = CONVERGE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let project = project_path.to_string();
-
-    if counters().active_patches >= CONVERGE_ACTIVE_THRESHOLD {
-        let threshold_project = project.clone();
-        tauri::async_runtime::spawn(async move {
-            try_converge(&threshold_project, "active patch threshold").await;
-        });
-    }
-
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(CONVERGE_IDLE_SECS)).await;
-        if CONVERGE_GENERATION.load(Ordering::Relaxed) != generation {
-            return; // newer activity rearmed the watchdog
-        }
-        if counters().active_patches == 0 {
-            return;
-        }
-        try_converge(&project, "idle session").await;
-    });
-}
-
-/// Called from the connection monitor on an editor play-mode transition.
-pub(crate) async fn on_play_mode_exited(project_path: &str) {
-    if !is_enabled() {
-        return;
-    }
-    let pending = CONVERGENCE_PENDING.swap(false, Ordering::Relaxed);
-    if !pending && counters().active_patches == 0 {
-        return;
-    }
-    try_converge(project_path, "left play mode").await;
-}
-
-/// Run the silent convergence recompile unless the editor is playing (then
-/// defer to the play-exit trigger). Reuses the unity_recompile pipeline, so
-/// the cold queue, pending baselines and type index all settle.
-async fn try_converge(project_path: &str, why: &str) {
-    if !is_enabled() || !crate::csharp_compile::is_enabled() {
-        return;
-    }
-    if counters().active_patches == 0 && counters().cold_queued == 0 {
-        return;
-    }
-    if CONVERGENCE_RUNNING.swap(true, Ordering::Relaxed) {
-        return; // one at a time
-    }
-
-    let result = async {
-        let (connected, status, _) = crate::unity_bridge::query_unity_status(project_path).await;
-        if !connected {
-            return Err("editor not connected".to_string());
-        }
-        if crate::unity_bridge::is_play_mode_status(status) {
-            CONVERGENCE_PENDING.store(true, Ordering::Relaxed);
-            return Err("editor in play mode; deferred to play-mode exit".to_string());
-        }
-        eprintln!("[HotReload] auto-convergence ({why}): running a silent recompile");
-        crate::unity_bridge::recompile_and_wait(project_path).await
-    }
-    .await;
-
-    CONVERGENCE_RUNNING.store(false, Ordering::Relaxed);
-    match result {
-        Ok(_) => eprintln!("[HotReload] auto-convergence completed ({why})"),
-        Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
-    }
+/// Clear the lost-session gate. The coordinator calls this once no project holds
+/// live patches (a detour-killing convergence makes the blanked registries
+/// moot); keying on the global total — not a single project — keeps a sibling
+/// editor whose patches are still split correctly gated.
+pub(crate) fn clear_session_registry_lost() {
+    SESSION_REGISTRY_LOST.store(false, Ordering::Relaxed);
 }

@@ -152,7 +152,7 @@ pub struct CsharpCompileStatusPayload {
 
 pub async fn status() -> CsharpCompileStatusPayload {
     let running = manager::current_status().await;
-    let hot_reload = crate::unity_hotreload::counters();
+    let hot_reload = crate::unity_hotreload::coordinator::counters().await;
     let hot_unapplied_changes = crate::unity_hotreload::coordinator::unapplied_change_count().await;
     CsharpCompileStatusPayload {
         enabled: is_enabled(),

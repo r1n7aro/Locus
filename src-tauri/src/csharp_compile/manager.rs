@@ -195,12 +195,15 @@ async fn spawn_server() -> Result<Arc<ServerHandle>, String> {
 /// stores, session images) live in the server process, and replacing it
 /// while patches are live would split state — convergence clears the
 /// counter first.
-fn server_binary_changed(server: &ServerHandle) -> bool {
+async fn server_binary_changed(server: &ServerHandle) -> bool {
     let Some(current) = find_server_dll() else {
         return false;
     };
     if current != server.server_dll || dll_mtime(&current) != server.server_dll_mtime {
-        return crate::unity_hotreload::counters().active_patches == 0;
+        // The sidecar is shared by every project, so block the swap while ANY
+        // project holds live patches (the global total, not the active-project
+        // scoped status counter).
+        return crate::unity_hotreload::coordinator::total_active_patches().await == 0;
     }
     false
 }
@@ -210,7 +213,7 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
     let mut guard = active_server().lock().await;
     if let Some(server) = guard.as_ref() {
         if !server.client.has_exited() {
-            if !server_binary_changed(server) {
+            if !server_binary_changed(server).await {
                 return Ok(Arc::clone(&server.client));
             }
             eprintln!(
@@ -220,6 +223,16 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
             *guard = None;
         } else {
             eprintln!("[CsharpCompile] compile server exited; restarting");
+            // The dead process held the in-memory hot-reload session registries
+            // (field stores, session images, member surfaces). With patches still
+            // live, the respawned server starts blank, so a later hot patch
+            // touching an already-virtualized field would bind it to a fresh,
+            // value-splitting store. Flag the loss so the coordinator converges
+            // through unity_recompile — the crash/timeout-path analogue of the
+            // `active_patches == 0` gate that guards a binary-change restart.
+            if crate::unity_hotreload::coordinator::total_active_patches().await > 0 {
+                crate::unity_hotreload::note_sidecar_session_lost();
+            }
             *guard = None;
         }
     }
