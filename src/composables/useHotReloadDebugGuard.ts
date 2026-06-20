@@ -2,6 +2,7 @@ import { computed, ref } from "vue";
 import {
   unityHotReloadPreflight,
   unityHotReloadSetCodeOptimization,
+  unityHotReloadSetPlayModeReload,
 } from "../services/csharpLsp";
 import { normalizeAppError } from "../services/errors";
 
@@ -24,15 +25,42 @@ export function useHotReloadDebugGuard(enable: () => Promise<void>) {
   const switching = ref(false);
   const switchError = ref("");
 
+  // Manual "Reload Domain on entering Play Mode" toggle, read off the SAME
+  // preflight probe as Code Optimization. null = unknown (editor down / old
+  // plugin). Flipping it does NOT recompile — it just edits EditorSettings.
+  const domainReloadOnPlay = ref<boolean | null>(null);
+  const settingPlayModeReload = ref(false);
+  const playModeReloadError = ref("");
+
   // Only a positively-read "release" shows the hint; unknown (editor down /
   // old plugin) stays quiet, exactly as the execution path does.
   const isRelease = computed(() => codeOptimization.value === "release");
 
   async function refreshOptimization() {
     try {
-      codeOptimization.value = (await unityHotReloadPreflight()).codeOptimization;
+      const preflight = await unityHotReloadPreflight();
+      codeOptimization.value = preflight.codeOptimization;
+      domainReloadOnPlay.value = preflight.domainReloadOnPlay;
     } catch {
       codeOptimization.value = null;
+      domainReloadOnPlay.value = null;
+    }
+  }
+
+  /** Set whether entering Play Mode reloads the domain. On failure re-read the
+   * real EditorSettings state (the editor stays authoritative). */
+  async function setPlayModeReload(domainReload: boolean) {
+    if (settingPlayModeReload.value) return;
+    settingPlayModeReload.value = true;
+    playModeReloadError.value = "";
+    try {
+      const result = await unityHotReloadSetPlayModeReload(domainReload);
+      domainReloadOnPlay.value = result.domainReloadOnPlay;
+    } catch (error) {
+      playModeReloadError.value = normalizeAppError(error).message;
+      void refreshOptimization();
+    } finally {
+      settingPlayModeReload.value = false;
     }
   }
 
@@ -75,5 +103,9 @@ export function useHotReloadDebugGuard(enable: () => Promise<void>) {
     enableHotReload,
     setOptimization,
     switchToDebug,
+    domainReloadOnPlay,
+    settingPlayModeReload,
+    playModeReloadError,
+    setPlayModeReload,
   };
 }

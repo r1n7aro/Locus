@@ -1319,6 +1319,10 @@ const {
   refreshOptimization: refreshHotReloadOptimization,
   enableHotReload: hotReloadEnable,
   setOptimization: setHotReloadOptimization,
+  domainReloadOnPlay: hotReloadDomainReloadOnPlay,
+  settingPlayModeReload: hotReloadPlayModeReloadSwitching,
+  playModeReloadError: hotReloadPlayModeReloadError,
+  setPlayModeReload: setHotReloadPlayModeReload,
 } = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
 
 // Code Optimization selector (hot-reload popover). Debug keeps every method
@@ -1374,6 +1378,70 @@ async function applyCodeOptimization(level: string) {
   // Keep the rest of the hot-reload panel (status rows, tone) in sync with the
   // recompile the switch just triggered.
   await refreshHotReloadStatus();
+}
+
+// "Reload Domain on entering Play Mode" selector. "on" = Unity default (full
+// reload, clean static state); "off" = DisableDomainReload (Play keeps hot
+// patches and memory, but static state persists across plays). Manual only —
+// the agent never flips this.
+const playModeReloadOptions = computed<DropdownOption[]>(() => {
+  const busy = hotReloadPlayModeReloadSwitching.value;
+  return [
+    {
+      value: "on",
+      label: t("chat.status.hotReload.playReload.on"),
+      hint: t("chat.status.hotReload.playReload.onHint"),
+      disabled: busy,
+    },
+    {
+      value: "off",
+      label: t("chat.status.hotReload.playReload.off"),
+      hint: t("chat.status.hotReload.playReload.offHint"),
+      disabled: busy,
+    },
+  ];
+});
+
+const playModeReloadModel = computed(() =>
+  hotReloadDomainReloadOnPlay.value == null
+    ? ""
+    : hotReloadDomainReloadOnPlay.value
+      ? "on"
+      : "off",
+);
+
+// Only knowable while the editor answers the probe. Disable (and show a
+// placeholder) when it's unreadable or a switch is in flight.
+const playModeReloadKnown = computed(() =>
+  !!props.unityConnected && hotReloadDomainReloadOnPlay.value != null,
+);
+
+const playModeReloadDisabled = computed(() =>
+  hotReloadPlayModeReloadSwitching.value
+  || hotReloadBusy.value
+  || !playModeReloadKnown.value,
+);
+
+const playModeReloadSelectedLabel = computed(() => {
+  if (hotReloadPlayModeReloadSwitching.value) {
+    return t("chat.status.hotReload.playReload.switching");
+  }
+  if (!playModeReloadKnown.value) return t("chat.status.hotReload.playReload.unknown");
+  return "";
+});
+
+const playModeReloadLabel = computed(() => t("chat.status.hotReload.playReload.label"));
+const playModeReloadAriaLabel = computed(() =>
+  t("chat.status.hotReload.playReload.ariaLabel"),
+);
+
+async function applyPlayModeReload(value: string) {
+  if (value !== "on" && value !== "off") return;
+  const domainReload = value === "on";
+  if (domainReload === hotReloadDomainReloadOnPlay.value) return;
+  // No recompile happens — flipping EditorSettings is instant, so unlike the
+  // Code Optimization switch there's no status to re-sync afterwards.
+  await setHotReloadPlayModeReload(domainReload);
 }
 
 async function setHotReloadEnabled(value: boolean) {
@@ -1777,7 +1845,7 @@ onUnmounted(() => {
           :options="activeItem.modeOptions"
           @update:model-value="applySegmentedMode(activeItem.id, $event)"
         />
-        <div v-if="activeItem.id === 'hotReload'" class="chat-status-codeopt">
+        <div v-if="activeItem.id === 'hotReload'" class="chat-status-controls">
           <span class="chat-status-codeopt-label">{{ codeOptimizationLabel }}</span>
           <BaseDropdown
             class="chat-status-codeopt-dropdown"
@@ -1792,6 +1860,21 @@ onUnmounted(() => {
           />
           <span v-if="hotReloadOptimizationError" class="chat-status-codeopt-error">
             {{ hotReloadOptimizationError }}
+          </span>
+          <span class="chat-status-codeopt-label">{{ playModeReloadLabel }}</span>
+          <BaseDropdown
+            class="chat-status-codeopt-dropdown"
+            size="sm"
+            menu-align="start"
+            :model-value="playModeReloadModel"
+            :options="playModeReloadOptions"
+            :selected-label="playModeReloadSelectedLabel"
+            :disabled="playModeReloadDisabled"
+            :aria-label="playModeReloadAriaLabel"
+            @update:model-value="applyPlayModeReload"
+          />
+          <span v-if="hotReloadPlayModeReloadError" class="chat-status-codeopt-error">
+            {{ hotReloadPlayModeReloadError }}
           </span>
         </div>
         <dl v-if="activeMainRows.length > 0" class="chat-status-detail-list">
@@ -1985,22 +2068,30 @@ onUnmounted(() => {
   padding: 0 8px;
 }
 
-.chat-status-codeopt {
-  display: flex;
+/* Both editor-setting controls share one grid so the label column (sized to
+   the widest label) lines the two dropdowns up at the same left edge and
+   width, and the row rhythm matches the status list below. */
+.chat-status-controls {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
-  margin-top: 10px;
+  gap: 6px 10px;
+  margin-top: 8px;
 }
 
 .chat-status-codeopt-label {
-  flex: 0 0 auto;
   font-size: 12px;
   color: var(--text-secondary);
 }
 
 .chat-status-codeopt-dropdown {
-  flex: 1 1 auto;
   min-width: 0;
+}
+
+/* Trim the trigger height so the controls sit closer to the status rows below
+   instead of towering over them. */
+.chat-status-codeopt-dropdown :deep(.base-dropdown-trigger) {
+  min-height: 26px;
 }
 
 /* Roomier option rows for the mode descriptions (scoped to this dropdown). */
@@ -2015,7 +2106,7 @@ onUnmounted(() => {
 }
 
 .chat-status-codeopt-error {
-  flex-basis: 100%;
+  grid-column: 1 / -1;
   font-size: 11px;
   line-height: 1.4;
   color: var(--status-danger-fg);

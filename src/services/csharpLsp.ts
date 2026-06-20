@@ -78,6 +78,9 @@ export interface HotReloadPreflight {
   connected: boolean;
   /** "debug" | "release" when readable; null when the editor is unreachable. */
   codeOptimization: string | null;
+  /** Whether entering Play Mode reloads the domain (true = Unity default,
+   * false = DisableDomainReload); null when unreadable / older plugin. */
+  domainReloadOnPlay: boolean | null;
 }
 
 /** Enable-time check: the connected editor's Code Optimization, for the
@@ -119,6 +122,28 @@ export function unityHotReloadSetCodeOptimization(
     { level },
     {
       operation: "unityHotReloadSetCodeOptimization",
+      notify: false,
+      throwOnError: true,
+    },
+  );
+}
+
+export interface PlayModeReloadResult {
+  domainReloadOnPlay: boolean;
+}
+
+/** Set whether entering Play Mode reloads the domain (EditorSettings
+ * enterPlayModeOptions / DisableDomainReload), from the hot-reload popover
+ * toggle. Unlike the Code Optimization switch this does NOT trigger a Unity
+ * recompile. */
+export function unityHotReloadSetPlayModeReload(
+  domainReload: boolean,
+): Promise<PlayModeReloadResult> {
+  return ipcInvoke<PlayModeReloadResult>(
+    "unity_hot_reload_set_play_mode_reload",
+    { domainReload },
+    {
+      operation: "unityHotReloadSetPlayModeReload",
       notify: false,
       throwOnError: true,
     },
