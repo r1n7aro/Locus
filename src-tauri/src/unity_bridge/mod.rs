@@ -568,6 +568,11 @@ fn background_hook_marker_path(project_path: &str) -> PathBuf {
         .join("BackgroundHook.enabled")
 }
 
+fn native_background_hook_markers_present(project_path: &str) -> bool {
+    native_bridge_marker_path(project_path).is_file()
+        && background_hook_marker_path(project_path).is_file()
+}
+
 /// Transient native-broker errors meaning "the managed executor is briefly
 /// unavailable (mid domain reload) — retry" rather than a real failure. Flows
 /// that intentionally span a reload (e.g. recompile) treat a broker `ok:false`
@@ -1399,6 +1404,34 @@ fn process_hint_from_response(
     })
 }
 
+fn inactive_background_hook_status() -> UnityBackgroundHookStatus {
+    if background_hook::enabled() {
+        UnityBackgroundHookStatus {
+            enabled: true,
+            supported: cfg!(target_os = "windows"),
+            state: UnityBackgroundHookState::Inactive,
+            patched: false,
+            process_id: None,
+            editor_process_path: None,
+            symbol_count: 0,
+            error: None,
+            updated_at_ms: unix_now_ms(),
+        }
+    } else {
+        background_hook::status()
+    }
+}
+
+fn should_defer_background_hook_to_native(
+    status: &UnityConnectionStatus,
+    project_path: &str,
+) -> bool {
+    background_hook::enabled()
+        && native_bridge_enabled()
+        && !status.connected
+        && native_background_hook_markers_present(project_path)
+}
+
 async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, project_path: &str) {
     // The in-process native hook (when active) owns the patch and survives
     // domain reloads; the cross-process path then stands down.
@@ -1418,23 +1451,14 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
             return;
         }
 
-        status.background_hook = if background_hook::enabled() {
-            UnityBackgroundHookStatus {
-                enabled: true,
-                supported: cfg!(target_os = "windows"),
-                state: UnityBackgroundHookState::Inactive,
-                patched: false,
-                process_id: None,
-                editor_process_path: None,
-                symbol_count: 0,
-                error: None,
-                updated_at_ms: unix_now_ms(),
-            }
-        } else {
-            background_hook::status()
-        };
+        status.background_hook = inactive_background_hook_status();
         return;
     };
+
+    if should_defer_background_hook_to_native(status, project_path) {
+        status.background_hook = inactive_background_hook_status();
+        return;
+    }
 
     let Some(editor_process_path) = status.editor_process_path.clone() else {
         status.background_hook = UnityBackgroundHookStatus {
@@ -1763,6 +1787,9 @@ pub async fn ensure_background_hook_for_project(
     if let Some(native) = native_owned_background_hook(project_path).await {
         return Ok(native);
     }
+    if native_bridge_enabled() && native_background_hook_markers_present(project_path) {
+        return Ok(inactive_background_hook_status());
+    }
     let process_info = query_current_project_editor_process(project_path).await;
     let process_id = process_info.process_id.ok_or_else(|| {
         process_info
@@ -2016,7 +2043,9 @@ pub async fn query_unity_status_with_timeout(
 }
 
 pub async fn exit_play_mode(project_path: &str) -> Result<(), String> {
-    let resp = send_message(project_path, "exit_play_mode", "").await?;
+    let resp =
+        send_message_with_timeout(project_path, "exit_play_mode", "", Duration::from_secs(45))
+            .await?;
     if !resp.ok {
         return Err(resp
             .error
@@ -4365,7 +4394,10 @@ pub async fn start_unity_monitor(
                 if last_play_mode == Some(true) && !playing {
                     let play_exit_project = project_path.clone();
                     tokio::spawn(async move {
-                        crate::unity_hotreload::on_play_mode_exited(&play_exit_project).await;
+                        crate::unity_hotreload::coordinator::on_play_mode_exited(
+                            &play_exit_project,
+                        )
+                        .await;
                     });
                 }
                 last_play_mode = Some(playing);
@@ -4540,10 +4572,11 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
-        is_transient_broker_error, pipe_response_transient_broker_error,
-        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
-        rewrite_run_states_output_for_size, PipeResponse, UnityBackgroundHookState,
-        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
+        is_transient_broker_error, native_background_hook_markers_present,
+        pipe_response_transient_broker_error, read_project_unity_version, relative_asset_paths,
+        requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
+        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
+        UnityEditorProcessState,
     };
     use serde_json::json;
 
@@ -4637,6 +4670,23 @@ mod tests {
             "stale",
         )
         .is_none());
+    }
+
+    #[test]
+    fn native_background_hook_markers_require_native_and_hook_markers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_path = temp.path().to_string_lossy().to_string();
+
+        assert!(!native_background_hook_markers_present(&project_path));
+
+        super::sync_native_bridge_marker(&project_path, true).expect("write native marker");
+        assert!(!native_background_hook_markers_present(&project_path));
+
+        super::sync_background_hook_marker(&project_path, true).expect("write hook marker");
+        assert!(native_background_hook_markers_present(&project_path));
+
+        super::sync_background_hook_marker(&project_path, false).expect("remove hook marker");
+        assert!(!native_background_hook_markers_present(&project_path));
     }
 
     #[test]
