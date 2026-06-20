@@ -90,7 +90,6 @@ public static class UnitySnippetSource
         sb.AppendLine("using System.Collections.Generic;");
         sb.AppendLine("using UnityEngine;");
         sb.AppendLine("using UnityEngine.SceneManagement;");
-        sb.AppendLine("using UnityEngine.UI;");
         sb.AppendLine("using UnityEditor;");
         sb.AppendLine("using UnityEditor.SceneManagement;");
         sb.AppendLine("using UnityEditor.Animations;");

@@ -26,7 +26,6 @@ const DEFAULT_NAMESPACE_USINGS: &[&str] = &[
     "System.Collections.Generic",
     "UnityEngine",
     "UnityEngine.SceneManagement",
-    "UnityEngine.UI",
     "UnityEditor",
     "UnityEditor.SceneManagement",
     "UnityEditor.Animations",
@@ -1251,12 +1250,12 @@ mod tests {
     #[test]
     fn prepare_blocks_common_namespace_that_would_break_existing_type() {
         let index = test_index(&[
-            ("Button", "UnityEngine.UI"),
-            ("Button", "UnityEngine.UIElements"),
-            ("VisualElement", "UnityEngine.UIElements"),
+            ("Object", "UnityEngine"),
+            ("Object", "Game.Runtime"),
+            ("Widget", "Game.Runtime"),
         ]);
         let prepared = prepare_unity_execute_code(
-            "Button button = null;\nVisualElement root = null;",
+            "Object existing = null;\nWidget widget = null;",
             Some(&index),
         );
 
@@ -1264,7 +1263,7 @@ mod tests {
         assert!(prepared
             .blocked_conflicts
             .iter()
-            .any(|conflict| conflict.simple_name == "Button"));
+            .any(|conflict| conflict.simple_name == "Object"));
     }
 
     #[test]
