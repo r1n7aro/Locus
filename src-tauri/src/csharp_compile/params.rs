@@ -20,6 +20,8 @@ use tokio::sync::Mutex;
 
 use super::CompileParams;
 
+const COMPILE_PARAMS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 fn params_cache() -> &'static Mutex<HashMap<String, CompileParams>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CompileParams>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -68,14 +70,14 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
 
     let payload = serde_json::json!({ "known_fingerprint": known_fingerprint }).to_string();
     let roundtrip_started = std::time::Instant::now();
-    // Short timeout: when the editor is too busy to answer (domain reload,
-    // import), fall back to the in-Unity compile path quickly instead of
-    // stalling the tool call for the default pipe timeout.
+    // Bounded timeout: older Unity editors can spend tens of seconds settling
+    // after launch or a domain reload, but the request must still return before
+    // it can stall a tool call indefinitely.
     let resp = crate::unity_bridge::send_message_with_transient_retry(
         project_path,
         "get_compile_params",
         &payload,
-        std::time::Duration::from_secs(10),
+        COMPILE_PARAMS_REQUEST_TIMEOUT,
         "while fetching Unity compile params",
     )
     .await?;

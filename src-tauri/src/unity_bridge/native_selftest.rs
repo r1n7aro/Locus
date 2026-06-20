@@ -19,8 +19,9 @@ const EVENT_NAME: &str = "unity-native-bridge-selftest";
 const STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(20);
-const EDITOR_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
-const EDITOR_UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+const EDITOR_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const EDITOR_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+const EDITOR_UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -299,7 +300,7 @@ impl SelfTest {
             &self.project,
             "set_editor_status",
             desired_status,
-            Duration::from_secs(3),
+            EDITOR_STATUS_REQUEST_TIMEOUT,
         )
         .await?;
         if resp.ok {

@@ -405,7 +405,14 @@ mod windows_impl {
         message: &str,
         timeout: Option<Duration>,
     ) -> Result<PipeResponse, String> {
+        let trace_exit_play_mode = msg_type == "exit_play_mode";
+        if trace_exit_play_mode {
+            tracing::info!(log_module = "Locus", "exit_play_mode transport: connecting");
+        }
         let conn = get_or_connect(project_path).await?;
+        if trace_exit_play_mode {
+            tracing::info!(log_module = "Locus", "exit_play_mode transport: connected");
+        }
         let request_id = next_request_id();
 
         let env = PipeEnvelope {
@@ -428,6 +435,12 @@ mod windows_impl {
             pending.insert(request_id.clone(), tx);
         }
         let mut pending_guard = PendingRequestGuard::new(conn.clone(), request_id.clone());
+        if trace_exit_play_mode {
+            tracing::info!(
+                log_module = "Locus",
+                "exit_play_mode transport: writing request"
+            );
+        }
 
         let write_result = tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
             let mut writer_guard = conn.writer.lock().await;
@@ -460,8 +473,20 @@ mod windows_impl {
             close_connection(&conn, err.clone()).await;
             return Err(err);
         }
+        if trace_exit_play_mode {
+            tracing::info!(
+                log_module = "Locus",
+                "exit_play_mode transport: request written"
+            );
+        }
 
         let env = if let Some(timeout) = timeout {
+            if trace_exit_play_mode {
+                tracing::info!(
+                    log_module = "Locus",
+                    "exit_play_mode transport: awaiting response"
+                );
+            }
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(Ok(env))) => env,
                 Ok(Ok(Err(e))) => return Err(e),
@@ -484,6 +509,12 @@ mod windows_impl {
             }
         };
         pending_guard.disarm();
+        if trace_exit_play_mode {
+            tracing::info!(
+                log_module = "Locus",
+                "exit_play_mode transport: response received"
+            );
+        }
 
         Ok(PipeResponse {
             ok: env.ok.unwrap_or(false),
@@ -611,7 +642,19 @@ mod windows_impl {
         message: &str,
         timeout: Duration,
     ) -> Result<PipeResponse, String> {
-        send_message_inner(project_path, msg_type, message, Some(timeout)).await
+        let result = tokio::time::timeout(
+            timeout,
+            send_message_inner(project_path, msg_type, message, Some(timeout)),
+        )
+        .await
+        .map_err(|_| "Unity request timed out".to_string())?;
+        if msg_type == "exit_play_mode" && result.is_err() {
+            tracing::info!(
+                log_module = "Locus",
+                "exit_play_mode transport: request returned error"
+            );
+        }
+        result
     }
 
     pub async fn send_message_without_timeout(
