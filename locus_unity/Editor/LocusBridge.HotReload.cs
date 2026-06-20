@@ -50,22 +50,23 @@ namespace Locus
         {
             public bool detour_ok;
             public string code_optimization;
+            public bool domain_reload_on_play;
             public string detour_engine;
             public string error;
         }
 
         private static async Task<PipeEnvelope> HandleHotReloadProbe(string requestId)
         {
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
-            PostToMainThread(delegate
+            try
             {
-                try
+                return await LocusAsync.RunOnMainThreadAsync<PipeEnvelope>(delegate
                 {
                     var payload = new HotReloadProbePayload();
                     payload.code_optimization =
                         CompilationPipeline.codeOptimization == CodeOptimization.Debug
                             ? "debug"
                             : "release";
+                    payload.domain_reload_on_play = ReadDomainReloadOnPlay();
 
                     string engine;
                     string error;
@@ -73,14 +74,17 @@ namespace Locus
                     payload.detour_engine = engine ?? "";
                     payload.error = error ?? "";
 
-                    tcs.SetResult(OkResponse(requestId, JsonUtility.ToJson(payload)));
-                }
-                catch (Exception ex)
-                {
-                    tcs.SetResult(ErrorResponse(requestId, "hot_reload_probe failed: " + ex.Message));
-                }
-            });
-            return await tcs.Task;
+                    return OkResponse(requestId, JsonUtility.ToJson(payload));
+                }, ExecuteTimeoutMs);
+            }
+            catch (TimeoutException)
+            {
+                return ErrorResponse(requestId, "hot_reload_probe timed out");
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "hot_reload_probe failed: " + ex.Message);
+            }
         }
 
         // ───────────────── hot_reload_set_debug ─────────────────
@@ -144,7 +148,7 @@ namespace Locus
             if (!TryParseCodeOptimization(requestJson, out desired, out parseError))
                 return ErrorResponse(requestId, parseError);
 
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try
@@ -170,6 +174,127 @@ namespace Locus
         private static Task<PipeEnvelope> HandleHotReloadSetDebug(string requestId)
         {
             return HandleHotReloadSetCodeOptimization(requestId, "debug");
+        }
+
+        // ───────────────── hot_reload_set_play_mode_reload ─────────────────
+
+        [Serializable]
+        private sealed class PlayModeReloadDto
+        {
+            public bool domain_reload_on_play;
+        }
+
+        /// <summary>
+        /// Whether entering Play Mode reloads the managed domain. Unity reloads
+        /// UNLESS Enter Play Mode Options are enabled AND DisableDomainReload is
+        /// set; we report the EFFECTIVE behavior so the popover toggle matches
+        /// what actually happens on Play.
+        /// </summary>
+        private static bool ReadDomainReloadOnPlay()
+        {
+            if (!UnityEditor.EditorSettings.enterPlayModeOptionsEnabled)
+                return true;
+            return (UnityEditor.EditorSettings.enterPlayModeOptions
+                    & UnityEditor.EnterPlayModeOptions.DisableDomainReload) == 0;
+        }
+
+        /// <summary>
+        /// Flip EditorSettings so entering Play Mode does (or skips) a domain
+        /// reload, touching ONLY the DisableDomainReload bit — the user's
+        /// scene-reload choice is preserved. Disabling the reload requires the
+        /// options to be enabled for the flag to take effect.
+        /// </summary>
+        private static void ApplyDomainReloadOnPlay(bool domainReload)
+        {
+            UnityEditor.EnterPlayModeOptions options =
+                UnityEditor.EditorSettings.enterPlayModeOptions;
+            if (domainReload)
+            {
+                options &= ~UnityEditor.EnterPlayModeOptions.DisableDomainReload;
+                UnityEditor.EditorSettings.enterPlayModeOptions = options;
+            }
+            else
+            {
+                UnityEditor.EditorSettings.enterPlayModeOptionsEnabled = true;
+                options |= UnityEditor.EnterPlayModeOptions.DisableDomainReload;
+                UnityEditor.EditorSettings.enterPlayModeOptions = options;
+            }
+        }
+
+        private static bool TryParsePlayModeReload(
+            string requestJson,
+            out bool domainReload,
+            out string error)
+        {
+            domainReload = true;
+            error = null;
+
+            string desired = (requestJson ?? "").Trim();
+            if (desired.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    PlayModeReloadDto request = JsonUtility.FromJson<PlayModeReloadDto>(desired);
+                    domainReload = request != null && request.domain_reload_on_play;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    error = "Play Mode reload request parse failed: " + ex.Message;
+                    return false;
+                }
+            }
+
+            if (string.Equals(desired, "on", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(desired, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                domainReload = true;
+                return true;
+            }
+            if (string.Equals(desired, "off", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(desired, "false", StringComparison.OrdinalIgnoreCase))
+            {
+                domainReload = false;
+                return true;
+            }
+
+            error = "Play Mode reload must be 'on' or 'off'";
+            return false;
+        }
+
+        /// <summary>
+        /// Set whether entering Play Mode reloads the domain. Unlike a Code
+        /// Optimization switch this does NOT schedule a recompile; the assignment
+        /// and read-back are synchronous, so the response carries the resulting
+        /// effective value.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleHotReloadSetPlayModeReload(
+            string requestId,
+            string requestJson)
+        {
+            bool desired;
+            string parseError;
+            if (!TryParsePlayModeReload(requestJson, out desired, out parseError))
+                return ErrorResponse(requestId, parseError);
+
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+            PostToMainThread(delegate
+            {
+                try
+                {
+                    ApplyDomainReloadOnPlay(desired);
+
+                    var payload = new PlayModeReloadDto();
+                    payload.domain_reload_on_play = ReadDomainReloadOnPlay();
+                    tcs.SetResult(OkResponse(requestId, JsonUtility.ToJson(payload)));
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetResult(ErrorResponse(requestId,
+                        "hot_reload_set_play_mode_reload failed: " + ex.Message));
+                }
+            });
+            return await tcs.Task;
         }
 
         // NoInlining so the reflection invocations below always go through
@@ -312,6 +437,13 @@ namespace Locus
             public string assembly_path;
             public string domain_generation;
             public HotPatchMethodDto[] methods;
+
+            // Experimental (Phase B, default off): when true, inline-risk
+            // classification may JIT a synthetic caller stub to force Mono to
+            // evaluate a not-yet-evaluated callee instead of relying on the static
+            // heuristic. Delivered from the desktop config
+            // unity_inline_force_evaluate_enabled; absent (→ false) on older desktops.
+            public bool inline_force_evaluate;
         }
 
         [Serializable]
@@ -325,6 +457,13 @@ namespace Locus
             // live but bypassed at inlined call sites, so the desktop queues a
             // convergence recompile for them. Empty in Debug / when none.
             public string[] inlined_method_keys;
+
+            // Parallel to inlined_method_keys (same order and length): the
+            // InlineRiskSource that flagged each entry — "RuntimeInlined" (Mono's
+            // cached bit), "StubInlined" (force-evaluated) or "Predicted" (static
+            // heuristic). Lets the desktop word convergence by confidence; older
+            // desktops ignore the unknown field.
+            public string[] inlined_sources;
         }
 
         /// <summary>
@@ -378,12 +517,12 @@ namespace Locus
 
             // Apply on the main thread, between frames: the whole patch
             // lands atomically with respect to Update loops.
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try
                 {
-                    tcs.SetResult(ApplyHotPatchOnMainThread(requestId, patchId, assemblyBytes, request.methods));
+                    tcs.SetResult(ApplyHotPatchOnMainThread(requestId, patchId, assemblyBytes, request.methods, request.inline_force_evaluate));
                 }
                 catch (Exception ex)
                 {
@@ -397,7 +536,8 @@ namespace Locus
             string requestId,
             string patchId,
             byte[] assemblyBytes,
-            HotPatchMethodDto[] methods)
+            HotPatchMethodDto[] methods,
+            bool forceEvaluateInline)
         {
             // Release-first: apply detours regardless of Code Optimization. In
             // Release, Mono inlines some small methods, whose inlined call sites
@@ -500,13 +640,15 @@ namespace Locus
 
             // Release-first: a method Unity inlined keeps a live detour, but its
             // inlined call sites bypass it, so the patch won't take effect there
-            // until a recompile. Report those originals so the desktop can queue
-            // a convergence recompile. Skip ctors and compiler-generated members
+            // until a recompile. Report those originals (with the source that
+            // flagged each) so the desktop can queue a convergence recompile and
+            // word it by confidence. Skip ctors and compiler-generated members
             // (state machines / lambdas), mirroring the reference plugin. Debug
-            // never inlines, so the Release flag gates IsMethodInlined's static
+            // never inlines, so the Release flag gates ClassifyInlineRisk's static
             // fallback (a not-yet-JIT-evaluated method only matters in Release).
             bool releaseMode = CompilationPipeline.codeOptimization == CodeOptimization.Release;
             var inlinedKeys = new List<string>();
+            var inlinedSources = new List<string>();
             foreach (HotPatchApplyChange change in applied)
             {
                 MethodBase original = change.NewEntry.Original;
@@ -517,8 +659,12 @@ namespace Locus
                     || (original.DeclaringType != null && original.DeclaringType.Name.IndexOf('<') >= 0);
                 if (synthesized)
                     continue;
-                if (IsMethodInlined(original, releaseMode))
+                InlineRiskSource source = ClassifyInlineRisk(original, releaseMode, forceEvaluateInline);
+                if (IsInlineRiskSource(source))
+                {
                     inlinedKeys.Add(change.MethodKey);
+                    inlinedSources.Add(source.ToString());
+                }
             }
 
             var response = new HotPatchLoadedResponse
@@ -527,6 +673,7 @@ namespace Locus
                 method_count = applied.Count,
                 detour_engine = engineSummary ?? "load_only",
                 inlined_method_keys = inlinedKeys.ToArray(),
+                inlined_sources = inlinedSources.ToArray(),
             };
             Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId
                 + (inlinedKeys.Count > 0 ? " (" + inlinedKeys.Count + " inlined in Release)" : ""));
@@ -1127,7 +1274,7 @@ namespace Locus
         private static async Task<PipeEnvelope> HandleHotPatchDispose(string requestId, string payload)
         {
             string target = (payload ?? "").Trim();
-            var tcs = new TaskCompletionSource<PipeEnvelope>();
+            var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
             PostToMainThread(delegate
             {
                 try

@@ -53,6 +53,17 @@ fn default_unity_hot_reload() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_unity_inline_force_evaluate_enabled() -> Arc<AtomicBool> {
+    // Phase D rollout: default ON. The force-JIT stub only runs for methods whose
+    // Mono inline bits are still clear (a minority — in a running game most changed
+    // methods' callers have already JITed, so the bit is set and the stub is never
+    // built), is correctness-safe (every inline verdict converges via recompile),
+    // and only takes effect when hot reload is enabled (itself opt-in). A guard
+    // skips any type with a static initializer, so no cctor side effect is
+    // triggered. Set to false to disable.
+    Arc::new(AtomicBool::new(true))
+}
+
 fn default_unity_native_bridge_enabled() -> Arc<AtomicBool> {
     // Default-on: the native command channel survives domain reloads and is the
     // required Unity command transport.
@@ -290,6 +301,16 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub unity_native_bridge_enabled: Arc<AtomicBool>,
+    /// Let the Unity plugin force-JIT a synthetic caller stub to evaluate a
+    /// not-yet-evaluated method's inline risk (Phase B), instead of relying only
+    /// on the static heuristic. Default on (Phase D); correctness is unaffected
+    /// either way — every inline-risk state converges via recompile — so this only
+    /// trades a rare per-apply stub JIT for tighter "is it live yet" reporting.
+    #[serde(
+        default = "default_unity_inline_force_evaluate_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_inline_force_evaluate_enabled: Arc<AtomicBool>,
     #[serde(
         default = "default_code_analysis_tools",
         with = "serde_code_analysis_tools"
@@ -343,6 +364,7 @@ impl AppConfig {
             unity_in_process_compile_fallback: default_unity_in_process_compile_fallback(),
             unity_hot_reload: default_unity_hot_reload(),
             unity_native_bridge_enabled: default_unity_native_bridge_enabled(),
+            unity_inline_force_evaluate_enabled: default_unity_inline_force_evaluate_enabled(),
             code_analysis_tools: default_code_analysis_tools(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
@@ -551,6 +573,17 @@ impl AppConfig {
 
     pub fn set_unity_native_bridge_enabled(&self, value: bool) -> Result<(), String> {
         self.unity_native_bridge_enabled
+            .store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn unity_inline_force_evaluate_enabled(&self) -> bool {
+        self.unity_inline_force_evaluate_enabled
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_inline_force_evaluate_enabled(&self, value: bool) -> Result<(), String> {
+        self.unity_inline_force_evaluate_enabled
             .store(value, Ordering::Relaxed);
         self.persist()
     }
@@ -882,6 +915,43 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(!config.unity_native_bridge_enabled());
+    }
+
+    #[test]
+    fn unity_inline_force_evaluate_defaults_to_enabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        // Phase D rollout: a config that predates the flag gets force-evaluation on.
+        assert!(config.unity_inline_force_evaluate_enabled());
+    }
+
+    #[test]
+    fn unity_inline_force_evaluate_respects_explicit_opt_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "unity_inline_force_evaluate_enabled": false
+}"#,
+        )
+        .expect("opt-out config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert!(!config.unity_inline_force_evaluate_enabled());
     }
 
     #[test]
