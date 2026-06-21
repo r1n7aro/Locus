@@ -1,12 +1,12 @@
 {
-  "version": "0.4.1",
-  "releasedAt": "2026-06-12",
+  "version": "0.5.0",
+  "releasedAt": "2026-06-22",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,48 +29,37 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.4.1 (2026-06-12)",
+      "summary": "Locus v0.5.0 (2026-06-22)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
           "title": "新增",
           "items": [
-            "基于 Roslyn 语言服务器的 C# 代码分析：按需下载组件、加载 Unity 生成的解决方案，新增 code_symbol_search、code_goto_definition、code_find_references、code_hover、code_diagnostics 工具；code_diagnostics 无需回 Unity 编译即可获得编译器与分析器诊断，文件范围还会校验 Tag/Layer/场景/Resources/Input 字符串。",
-            "新增 unity_code_usages 工具：查找脚本或成员在场景、Prefab 与资源中的使用位置，覆盖挂载点、UnityEvent 绑定、序列化字段与 AnimationEvent，无需启动 Roslyn 服务器。",
-            "设置新增「代码分析」页：总开关与逐工具开关，可选注入 Microsoft.Unity.Analyzers（UNT*）诊断；聊天状态栏显示分析服务器状态（下载、加载工程、就绪），支持一键重启。",
-            "工具可按 Agent 启用或禁用，禁用的工具不会注入模型上下文；Agent 面板会列出已禁用的工具。",
-            "资产检查器重做：主窗口内浮动 Inspector 面板、带标签页的独立 Inspector 窗口，以及按窗口大小自动选择的自适应模式；文本资产内置查看器。",
-            "会话消息与 Unity 嵌入中的资产引用点击行为可配置：打开 Locus Inspector（浮动/独立窗口/自适应）、打开 Unity 自带 Inspector、仅在 Unity 中选中，或在文件管理器中显示。",
-            "新增曲线与渐变编辑器：在 Locus 中直接编辑 AnimationCurve 与 Gradient，曲线支持拖拽关键帧、切线模式、预设与循环模式，渐变支持颜色/透明度色标与混合模式；带应用/取消，Unity 可用时实时预览。",
-            "序列化属性新增 Bounds 与 HDR 颜色字段、带搜索的对象引用选择器、数组增删与拖拽排序，以及托管类型搜索。",
-            "新增 Claude Code CLI 模型渠道：直接驱动系统 claude 命令，设置页显示安装与登录状态；实验性选项可将 Claude Code CLI 模型加入模型列表。",
-            "Agent 读取文件时附带行号，与 code 系列工具的行号参数一致。"
+            "编辑器热更新已实现：Agent 现在能在运行时修改 C# 脚本并实时应用逻辑，能力覆盖主流商业热更新插件。",
+            "Unity IPC 连接已从 C# 插件迁移到使用 Rust 编写的 Native Plugin，可在域重载、Unity 主线程阻塞期间保持连接稳定，并实时上报 Unity 状态。",
+            "C# 编译已从 Unity 进程内迁移到独立的 CoreCLR 进程，旧编译路径暂时保留以作兼容。",
+            "Rust 后端的内存分配器切换为 mimalloc。",
+            "设置中新增「测试」页面：本版本架构改动较大，可能存在兼容性损失，遇到问题时可运行测试作为参考。",
+            "向 View Package 暴露了更多 API。"
           ]
         },
         {
           "title": "修复",
           "items": [
-            "unity_yaml_search 字段匹配现在能搜到深层嵌套的序列化数据（如 UnityEvent 持久化调用绑定），修复浅层深度搜不到的问题。",
-            "Windows 安装包改用 zlib 压缩，安装更快。",
-            "打磨内置工具说明与 Agent 使用指引（read/edit、bash、grep、Unity 工具）。",
-            "序列化表格视图模板与主应用共用同一实现。"
-          ]
-        },
-        {
-          "title": "移除",
-          "items": [
-            "移除「Claude Agent SDK」模型渠道，由 Claude Code CLI 渠道接替。"
+            "资产数据库的性能与正确性优化。",
+            "修复消息记录在某些情况下隐藏最后一条工具调用的问题。",
+            "grep 工具的路径现按工作区目录解析。"
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -80,48 +69,37 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.4.1 (2026-06-12)",
+      "summary": "Locus v0.5.0 (2026-06-22)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
           "title": "Added",
           "items": [
-            "C# code analysis powered by a Roslyn language server: Locus downloads the components on demand, loads the Unity-generated solution, and adds new agent tools — code_symbol_search, code_goto_definition, code_find_references, code_hover, and code_diagnostics; code_diagnostics reports compiler and analyzer errors and warnings without recompiling in Unity, and its file scope also validates tag/layer/scene/Resources/Input string literals against project settings.",
-            "New unity_code_usages tool: find where a script or member is used inside scenes, prefabs, and assets — attach points, UnityEvent bindings, serialized fields, and AnimationEvents. Works without the Roslyn server.",
-            "New \"Code Analysis\" settings tab with a master switch, per-tool switches, and optional Microsoft.Unity.Analyzers (UNT*) diagnostics; the chat status bar shows the analysis server lifecycle (download, project loading, ready) with one-click restart.",
-            "Tools can now be enabled or disabled per agent; disabled tools are removed from the agent's context entirely, and the agent dashboard lists them.",
-            "Reworked asset inspector: a floating Inspector panel inside the main window, standalone Inspector windows with tabs, and an adaptive mode that picks between them by window size. Text assets get a built-in viewer.",
-            "Configurable click actions for Unity asset references in chat messages and in the Unity embed: open the Locus Inspector (floating / window / adaptive), open Unity's own Inspector, select in Unity, or reveal in File Explorer.",
-            "Curve and gradient editors: edit AnimationCurve and Gradient properties directly in Locus — draggable keys, tangent modes, presets, and wrap modes for curves; color/alpha stops and blend mode for gradients — with Apply/Cancel and live preview in Unity when available.",
-            "New serialized property editors: Bounds and HDR color fields, an object reference picker with search, array add/remove/drag-to-reorder, and managed type search.",
-            "New Claude Code CLI provider: drives the system claude command directly, shows install and login state in settings; an experimental option adds Claude Code CLI models to the model list.",
-            "Agent file reads now include line numbers, matching the line arguments of the code tools."
+            "Editor hot reload is now available: the agent can modify C# scripts at runtime and apply the new logic live, matching the capabilities of mainstream commercial hot-reload plugins.",
+            "The Unity IPC connection has moved from the C# plugin to a native plugin written in Rust, which keeps the connection stable across domain reloads and while Unity's main thread is blocked, and reports Unity state in real time.",
+            "C# compilation has moved out of the Unity process into a standalone CoreCLR process; the old path is retained for now as a compatibility fallback.",
+            "The Rust backend's memory allocator was switched to mimalloc.",
+            "Settings has a new Testing page. This release involves significant architectural changes that may cause compatibility regressions, so if you run into problems you can run these tests for reference.",
+            "Exposed more APIs to the View Package."
           ]
         },
         {
           "title": "Fixed",
           "items": [
-            "unity_yaml_search field matching now reaches deeply nested serialized data (for example UnityEvent persistent-call bindings) that the previous shallow depth missed.",
-            "Windows installers now use zlib compression and install faster.",
-            "Refined built-in tool descriptions and agent guidance (read/edit, bash, grep, Unity tools).",
-            "The serialized table view template now shares one implementation with the main app."
-          ]
-        },
-        {
-          "title": "Removed",
-          "items": [
-            "The \"Claude Agent SDK\" provider channel was removed; the Claude Code CLI provider replaces it."
+            "Asset database performance and correctness improvements.",
+            "Fixed a case where the message history could hide the last tool call.",
+            "The grep tool now resolves paths against the workspace directory."
           ]
         }
       ],
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.4.1/locus_0.4.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
