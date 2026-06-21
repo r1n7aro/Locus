@@ -454,6 +454,13 @@ namespace Locus
             public string message;          // e.g. "Update", "OnTriggerEnter"
             public string param_type;       // engine arg type for component_proxy ("Collider"); empty for player_loop
             public string source_path;      // edited file (for replace-by-source teardown)
+
+            // Tier-2: when non-empty, the driven type lives in this exact assembly
+            // — a play-mode-born type whose only definition is the FIRST hot-patch
+            // assembly. declaring_type is then resolved THERE, bypassing the usual
+            // skip of __LocusHotPatch_ assemblies (mirrors HotPatchMethodDto.
+            // original_assembly). Empty for ordinary compiled types.
+            public string original_assembly;
         }
 
         [Serializable]
@@ -804,15 +811,37 @@ namespace Locus
 
             foreach (MessageDriverDto driver in drivers)
             {
-                if (driver == null || string.IsNullOrEmpty(driver.shim_type) || string.IsNullOrEmpty(driver.shim_method))
+                if (driver == null)
+                    continue;
+                // A clear-marker (feature #1 / play-mode-born message removal): its
+                // ONLY job was to put its source_path in `touched` above so the
+                // replace-by-source teardown cleared the stale driver. It wires
+                // nothing — skip it explicitly (it also has an empty shim).
+                if (driver.kind == "clear")
+                {
+                    Debug.Log("[Locus] message driver cleared for '" + driver.message
+                        + "' (removed from " + driver.source_path + ")");
+                    continue;
+                }
+                if (string.IsNullOrEmpty(driver.shim_type) || string.IsNullOrEmpty(driver.shim_method))
                     continue;
 
-                Type declaringType = ResolveHotPatchOriginalType(driver.declaring_type);
+                // Tier-2: a play-mode-born type lives ONLY in its first hot-patch
+                // assembly, which the default resolver skips. When the desktop pins
+                // that assembly, resolve there (the same bypass the M2 method detour
+                // uses); otherwise scan the domain as before.
+                Type declaringType = !string.IsNullOrEmpty(driver.original_assembly)
+                    ? ResolveTypeInAssembly(driver.original_assembly, driver.declaring_type)
+                    : ResolveHotPatchOriginalType(driver.declaring_type);
                 if (declaringType == null)
                 {
                     failed++;
                     Debug.LogWarning("[Locus] message driver: type " + driver.declaring_type
-                        + " not found in domain; '" + driver.message + "' could not be wired.");
+                        + " not found in domain"
+                        + (string.IsNullOrEmpty(driver.original_assembly)
+                            ? ""
+                            : " (assembly " + driver.original_assembly + "; earlier patch unloaded?)")
+                        + "; '" + driver.message + "' could not be wired.");
                     continue;
                 }
 
