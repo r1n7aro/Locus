@@ -446,6 +446,40 @@ pub struct HotPatchMethod {
     pub is_stub: bool,
 }
 
+/// A newly ADDED Unity message the engine never dispatches after load (each
+/// type's message set is fixed at load). The patch materializes it as an
+/// ordinary static shim and the plugin wires a driver by `kind`: "player_loop"
+/// (driven each frame by a PlayerLoop pump) or "component_proxy" (forwarded by a
+/// proxy MonoBehaviour attached to the target object).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotPatchMessageDriver {
+    /// Driver kind: "player_loop" | "component_proxy".
+    #[serde(default)]
+    pub kind: String,
+    /// Original declaring type (CLR metadata name) whose instances are driven.
+    pub declaring_type: String,
+    /// Static shim class in the patch assembly that holds the new body.
+    pub shim_type: String,
+    /// Shim method name; its leading parameter is the instance.
+    pub shim_method: String,
+    /// Message name (e.g. "Update", "OnTriggerEnter").
+    pub message: String,
+    /// Engine-delivered argument type for component_proxy (e.g. "Collider");
+    /// empty for the parameterless player_loop callbacks.
+    #[serde(default)]
+    pub param_type: String,
+    /// Edited source file that produced this registration. The plugin clears a
+    /// file's driver registrations before re-adding, so a deleted/changed-away
+    /// message stops being driven (replace-by-source, not accumulate).
+    #[serde(default)]
+    pub source_path: String,
+    /// Agent-facing caveat (lifecycle timing / approximate order); empty when the
+    /// driver matches native behavior. Surfaced in the hot-reload summary.
+    #[serde(default)]
+    pub note: String,
+}
+
 /// A type that only exists in the edited text (TI-C / snippet visibility).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -558,6 +592,7 @@ pub enum HotPatchOutcome {
         assembly_path: Option<String>,
         methods: Vec<HotPatchMethod>,
         new_types: Vec<HotPatchNewType>,
+        message_drivers: Vec<HotPatchMessageDriver>,
         caller_scan_note: Option<String>,
     },
 }
@@ -850,6 +885,13 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     let new_types: Vec<HotPatchNewType> =
         serde_json::from_value(value.get("newTypes").cloned().unwrap_or_else(|| json!([])))
             .map_err(|e| format!("malformed hot patch newTypes: {e}"))?;
+    let message_drivers: Vec<HotPatchMessageDriver> = serde_json::from_value(
+        value
+            .get("messageDrivers")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|e| format!("malformed hot patch messageDrivers: {e}"))?;
 
     Ok(HotPatchOutcome::Compiled {
         assembly_name,
@@ -857,6 +899,7 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
         assembly_path,
         methods,
         new_types,
+        message_drivers,
         caller_scan_note: value
             .get("callerScan")
             .and_then(|v| v.as_str())
@@ -1196,6 +1239,53 @@ mod tests {
                     assembly_path.as_deref(),
                     Some("C:/Temp/__LocusHotPatch.dll")
                 );
+            }
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hot_patch_result_reads_message_drivers() {
+        let value = json!({
+            "hot": true,
+            "success": true,
+            "assemblyName": "__LocusHotPatch_00000000_00000001",
+            "assemblyB64": "TVo=",
+            "methods": [],
+            "newTypes": [],
+            "messageDrivers": [
+                {
+                    "kind": "player_loop",
+                    "declaringType": "Game.Player",
+                    "shimType": "Game.Player__LocusShims",
+                    "shimMethod": "Update",
+                    "message": "Update",
+                    "paramType": "",
+                    "sourcePath": "Assets/Player.cs"
+                },
+                {
+                    "kind": "component_proxy",
+                    "declaringType": "Game.Mob",
+                    "shimType": "Game.Mob__LocusShims",
+                    "shimMethod": "OnTriggerEnter",
+                    "message": "OnTriggerEnter",
+                    "paramType": "Collider",
+                    "sourcePath": "Assets/Mob.cs"
+                }
+            ],
+        });
+        match parse_hot_patch_result(value).expect("parse") {
+            HotPatchOutcome::Compiled {
+                message_drivers, ..
+            } => {
+                assert_eq!(message_drivers.len(), 2);
+                assert_eq!(message_drivers[0].kind, "player_loop");
+                assert_eq!(message_drivers[0].message, "Update");
+                assert_eq!(message_drivers[0].param_type, "");
+                assert_eq!(message_drivers[1].kind, "component_proxy");
+                assert_eq!(message_drivers[1].declaring_type, "Game.Mob");
+                assert_eq!(message_drivers[1].shim_method, "OnTriggerEnter");
+                assert_eq!(message_drivers[1].param_type, "Collider");
             }
             other => panic!("expected Compiled, got {other:?}"),
         }

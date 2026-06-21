@@ -1128,6 +1128,115 @@ fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64
     base64_decoded_len(assembly_b64)
 }
 
+/// Decide whether a freshly applied hot patch that declared added Unity messages
+/// must fail closed (route the caller to a recompile) rather than be reported live.
+/// Two hard cases: a plugin that can't drive added messages at all (`pump_supported`
+/// false — an older plugin that ignored `message_drivers`), and a plugin that
+/// reported messages it could NOT wire (`pump_failed_count > 0`). Both become live
+/// natively after a recompile, so the file is not marked applied here. Returns the
+/// agent-facing error when it must fail closed, `Ok(())` when the patch may stand.
+fn message_driver_gate(
+    has_message_drivers: bool,
+    pump_supported: bool,
+    pump_failed_count: u64,
+) -> Result<(), String> {
+    if has_message_drivers && !pump_supported {
+        return Err(
+            "This project's Unity plugin can't drive newly added Unity messages \
+             (Update/LateUpdate/FixedUpdate). Update the Locus plugin, or run \
+             unity_recompile to make them live."
+                .to_string(),
+        );
+    }
+    if pump_failed_count > 0 {
+        return Err(format!(
+            "{pump_failed_count} newly added Unity message(s) could not be wired in Unity. \
+             Run unity_recompile to make them live."
+        ));
+    }
+    Ok(())
+}
+
+// Session capability cache: the plugin's last-echoed `pump_supported`, keyed by
+// domain generation (the plugin — and thus its capability — is fixed within a
+// generation; a recompile / domain reload re-learns it). Lets a message-driver
+// patch PREFLIGHT a plugin already known unable to drive added messages and route
+// straight to a recompile, instead of applying method detours we'd immediately fail
+// closed and discard. The post-response gate still backstops the first, unlearned
+// patch (and records the capability for the next one).
+static PUMP_CAPABILITY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::OnceLock::new();
+
+fn remember_pump_capability(domain_generation: &str, supported: bool) {
+    let map =
+        PUMP_CAPABILITY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut guard) = map.lock() {
+        guard.insert(domain_generation.to_string(), supported);
+    }
+}
+
+/// `Some(false)` = known unable to drive added messages, `Some(true)` = known able,
+/// `None` = not learned for this generation yet.
+fn known_pump_capability(domain_generation: &str) -> Option<bool> {
+    PUMP_CAPABILITY.get().and_then(|map| {
+        map.lock()
+            .ok()
+            .and_then(|guard| guard.get(domain_generation).copied())
+    })
+}
+
+/// Build the message-driver portion of the apply summary (appended after the
+/// redirect / new-type counts). The `total` added messages split into `driven`
+/// (total − skipped) and the skipped ones; when the plugin sent the skipped
+/// messages by name (`skipped_messages`, each a "message — reason") they are listed
+/// — capped so a large batch does not flood — else only the count is shown (older
+/// plugins). Each DISTINCT non-empty note is appended once, in first-seen order, so
+/// lifecycle / ordering / side-effect caveats reach the agent without repetition.
+/// Returns "" when there were no added messages.
+fn message_driver_summary(
+    total: usize,
+    skipped_count: u64,
+    skipped_messages: &[String],
+    notes: &[&str],
+) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let driven = (total as u64).saturating_sub(skipped_count);
+    if driven > 0 {
+        out.push_str(&format!(
+            ", {driven} added Unity message(s) wired to a runtime driver (see notes for timing/order caveats)"
+        ));
+    }
+    if skipped_count > 0 {
+        if skipped_messages.is_empty() {
+            out.push_str(&format!(
+                ", {skipped_count} added Unity message(s) not driven (not an engine message, edit-time only, or no live instance)"
+            ));
+        } else {
+            const MAX_NAMED: usize = 6;
+            let shown = skipped_messages.len().min(MAX_NAMED);
+            let names = skipped_messages[..shown].join("; ");
+            out.push_str(&format!(
+                ", {skipped_count} added Unity message(s) not driven: {names}"
+            ));
+            if skipped_messages.len() > shown {
+                out.push_str(&format!(" (+{} more)", skipped_messages.len() - shown));
+            }
+        }
+    }
+    let mut seen_notes: Vec<&str> = Vec::new();
+    for &note in notes {
+        if !note.is_empty() && !seen_notes.contains(&note) {
+            seen_notes.push(note);
+            out.push_str(&format!(".\n{note}"));
+        }
+    }
+    out
+}
+
 #[derive(Debug)]
 struct AppliedHotPatch {
     engine: String,
@@ -1137,6 +1246,14 @@ struct AppliedHotPatch {
     /// from older plugins.
     inlined_sources: Vec<String>,
     image_register_error: Option<String>,
+    /// Added Unity messages the plugin received but did not drive (not a
+    /// MonoBehaviour, parameter not the real engine type, edit-time-only, or a
+    /// catch-up with no live instance). Surfaced as a note, not an error.
+    pump_skipped_count: u64,
+    /// Each skipped message's "message — reason", when the plugin sent them, so the
+    /// summary can name them instead of showing a bare count. Empty from older
+    /// plugins (then only the count is reported).
+    pump_skipped_messages: Vec<String>,
 }
 
 async fn apply_compiled_hot_patch(
@@ -1147,7 +1264,20 @@ async fn apply_compiled_hot_patch(
     assembly_path: Option<&String>,
     methods: &[crate::csharp_compile::HotPatchMethod],
     new_types: &[crate::csharp_compile::HotPatchNewType],
+    message_drivers: &[crate::csharp_compile::HotPatchMessageDriver],
 ) -> Result<AppliedHotPatch, String> {
+    // Preflight (P1-b): if a prior apply in this domain generation already showed the
+    // plugin cannot drive added messages, do NOT apply method detours we would
+    // immediately fail closed and discard — fail closed now, before the Unity
+    // round-trip, so the caller routes straight to a recompile. The first, unlearned
+    // message-driver patch still hits the post-response gate below (which records the
+    // capability), so this only short-circuits once the answer is known.
+    if !message_drivers.is_empty()
+        && known_pump_capability(&params.domain_generation) == Some(false)
+    {
+        message_driver_gate(true, false, 0)?;
+    }
+
     let mut payload = serde_json::json!({
         "patch_id": assembly_name,
         "domain_generation": params.domain_generation,
@@ -1162,10 +1292,27 @@ async fn apply_compiled_hot_patch(
             "param_type_sigs": m.param_type_sigs,
             "is_static": m.is_static,
             "is_ctor": m.is_ctor,
+            // The edited file this detour came from. The plugin uses it to clear
+            // a file's stale pump registrations before re-adding (replace-by-source).
+            "source_path": m.source_path,
             // Older plugins ignore the unknown field and then fail
             // resolution → whole-patch rollback + update hint (the
             // established compatibility discipline).
             "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
+        })).collect::<Vec<_>>(),
+        // Newly added Unity messages the engine never discovers after load: the
+        // plugin wires a driver by `kind` (a PlayerLoop pump or a forwarding proxy
+        // MonoBehaviour). A plugin that supports this echoes pump_supported in its
+        // response; if it does not, the caller fails closed to a recompile rather
+        // than reporting a false "live" (see below).
+        "message_drivers": message_drivers.iter().map(|d| serde_json::json!({
+            "kind": d.kind,
+            "declaring_type": d.declaring_type,
+            "shim_type": d.shim_type,
+            "shim_method": d.shim_method,
+            "message": d.message,
+            "param_type": d.param_type,
+            "source_path": d.source_path,
         })).collect::<Vec<_>>(),
     });
     if let Some(object) = payload.as_object_mut() {
@@ -1217,23 +1364,50 @@ async fn apply_compiled_hot_patch(
         ));
     }
 
-    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
-    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
-    record_patch_applied(project_path, assembly_bytes, code_entries).await;
-    note_patch_applied(project_path).await;
-
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
     struct HotPatchLoadedResponse {
         detour_engine: String,
         inlined_method_keys: Vec<String>,
         inlined_sources: Vec<String>,
+        // Pump capability echo. Absent (→ false) from plugins that predate the
+        // PlayerLoop message pump: such a plugin silently load-onlys an
+        // add-a-message patch without driving it, so we must NOT report it live.
+        pump_supported: bool,
+        pumped_count: u64,
+        pump_skipped_count: u64,
+        // Per-message "message — reason" for each skipped driver (empty from older
+        // plugins). Lets the summary name them rather than show a bare count.
+        pump_skipped_messages: Vec<String>,
+        // Hard wiring failures (type/shim missing, unbindable shim). > 0 means the
+        // patch claimed a driver it could not honor — fail closed to a recompile.
+        pump_failed_count: u64,
     }
     let loaded = resp
         .message
         .as_deref()
         .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
         .unwrap_or_default();
+
+    // Learn the plugin's pump capability for this generation so the next
+    // message-driver patch can preflight instead of applying-then-failing-closed.
+    remember_pump_capability(&params.domain_generation, loaded.pump_supported);
+
+    // Fail closed if this patch adds Unity messages the plugin cannot honor: an
+    // older plugin that ignores `message_drivers` and load-onlys the patch, or one
+    // that reported messages it could not wire. A recompile makes them live
+    // natively; returning Err routes the caller to queue_cold_paths instead of
+    // marking the file applied / live.
+    message_driver_gate(
+        !message_drivers.is_empty(),
+        loaded.pump_supported,
+        loaded.pump_failed_count,
+    )?;
+
+    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
+    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
+    record_patch_applied(project_path, assembly_bytes, code_entries).await;
+    note_patch_applied(project_path).await;
 
     let image_register_error = match crate::csharp_compile::register_session_image(
         &params.domain_generation,
@@ -1278,6 +1452,8 @@ async fn apply_compiled_hot_patch(
         inlined_method_keys: loaded.inlined_method_keys,
         inlined_sources: loaded.inlined_sources,
         image_register_error,
+        pump_skipped_count: loaded.pump_skipped_count,
+        pump_skipped_messages: loaded.pump_skipped_messages,
     })
 }
 
@@ -1546,6 +1722,7 @@ async fn try_inline_caller_refresh(
                 assembly_path,
                 methods,
                 new_types,
+                message_drivers,
                 ..
             } => {
                 if methods.is_empty() {
@@ -1562,6 +1739,7 @@ async fn try_inline_caller_refresh(
                     assembly_path.as_ref(),
                     &methods,
                     &new_types,
+                    &message_drivers,
                 )
                 .await
                 {
@@ -2365,9 +2543,13 @@ pub async fn hot_reload(
             assembly_path,
             methods,
             new_types,
+            message_drivers,
             caller_scan_note,
         } => {
-            if methods.is_empty() && new_types.is_empty() {
+            // A patch that ONLY adds a new Unity PlayerLoop message has no
+            // detour and no new type, but it must still be loaded so the pump
+            // shim is in the domain and can be driven — so it is not a no-op.
+            if methods.is_empty() && new_types.is_empty() && message_drivers.is_empty() {
                 // Compiled-but-nothing-detourable means the batch ONLY adds
                 // new surface (methods / enum members): the patch is not
                 // loaded, because nothing in the running domain can reach it
@@ -2397,6 +2579,7 @@ pub async fn hot_reload(
                 assembly_path.as_ref(),
                 &methods,
                 &new_types,
+                &message_drivers,
             )
             .await
             {
@@ -2414,6 +2597,8 @@ pub async fn hot_reload(
             let inlined_method_keys = applied.inlined_method_keys;
             let inlined_sources = applied.inlined_sources;
             let image_register_error = applied.image_register_error;
+            let pump_skipped_count = applied.pump_skipped_count;
+            let pump_skipped_messages = applied.pump_skipped_messages;
 
             // Phase D rollout observability: count the force-evaluate-attributable
             // classifications (StubInlined = the force-JIT stub moved Mono's bit;
@@ -2471,6 +2656,20 @@ pub async fn hot_reload(
             );
             if !new_types.is_empty() {
                 summary.push_str(&format!(", {} new type(s) loaded", new_types.len()));
+            }
+            if !message_drivers.is_empty() {
+                // Hard failures already fail closed above, so the remainder is driven
+                // (pump/proxy/once-off catch-up) or benign-skipped. Report each
+                // skipped message by name (when the plugin sent them), and surface
+                // each distinct caveat note once so the agent understands why a driven
+                // message may not match native behavior.
+                let notes: Vec<&str> = message_drivers.iter().map(|d| d.note.as_str()).collect();
+                summary.push_str(&message_driver_summary(
+                    message_drivers.len(),
+                    pump_skipped_count,
+                    &pump_skipped_messages,
+                    &notes,
+                ));
             }
             if !engine.is_empty() {
                 summary.push_str(&format!(" (engine: {engine})"));
@@ -2555,6 +2754,103 @@ pub async fn hot_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_driver_gate_passes_when_supported_and_clean() {
+        // No added messages → always Ok, regardless of support / failures.
+        assert!(message_driver_gate(false, false, 0).is_ok());
+        // Added messages, plugin supports them, none failed → Ok.
+        assert!(message_driver_gate(true, true, 0).is_ok());
+    }
+
+    #[test]
+    fn message_driver_gate_fails_closed_when_plugin_cannot_drive() {
+        // Drivers sent but the plugin predates pump support → fail closed.
+        let err = message_driver_gate(true, false, 0).unwrap_err();
+        assert!(err.contains("can't drive"), "{err}");
+        assert!(err.contains("unity_recompile"), "{err}");
+    }
+
+    #[test]
+    fn message_driver_gate_fails_closed_on_reported_wiring_failures() {
+        // pump_failed_count > 0 fails closed even when the plugin supports driving.
+        let err = message_driver_gate(true, true, 2).unwrap_err();
+        assert!(err.contains('2'), "{err}");
+        assert!(err.contains("could not be wired"), "{err}");
+    }
+
+    #[test]
+    fn pump_capability_cache_roundtrips_and_overwrites() {
+        // Unique key so the process-global cache can't collide with other tests.
+        let gen = "test-gen-pump-capability-roundtrip";
+        assert_eq!(known_pump_capability(gen), None); // not learned yet
+        remember_pump_capability(gen, false);
+        assert_eq!(known_pump_capability(gen), Some(false)); // learned: unsupported → preflight fails closed
+        remember_pump_capability(gen, true);
+        assert_eq!(known_pump_capability(gen), Some(true)); // re-learned: supported
+    }
+
+    #[test]
+    fn message_driver_summary_reports_driven_and_named_skips() {
+        let skipped = vec![
+            "OnTriggerEnter — parameter is not UnityEngine.Collider (a same-named custom type) — left as a plain method".to_string(),
+            "Awake — no live instance to catch up (new instances need a recompile)".to_string(),
+        ];
+        // A note duplicated across drivers must appear once; the empty note is dropped.
+        let notes = vec![
+            "Update runs after native scripts.",
+            "Update runs after native scripts.",
+            "",
+        ];
+        let s = message_driver_summary(3, 2, &skipped, &notes); // 3 total, 2 skipped → 1 driven
+        assert!(
+            s.contains("1 added Unity message(s) wired to a runtime driver"),
+            "{s}"
+        );
+        assert!(s.contains("2 added Unity message(s) not driven"), "{s}");
+        assert!(s.contains("OnTriggerEnter"), "{s}");
+        assert!(s.contains("Awake"), "{s}");
+        assert_eq!(
+            s.matches("Update runs after native scripts.").count(),
+            1,
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn message_driver_summary_all_driven_has_no_skip_clause() {
+        let s = message_driver_summary(2, 0, &[], &["", ""]);
+        assert!(
+            s.contains("2 added Unity message(s) wired to a runtime driver"),
+            "{s}"
+        );
+        assert!(!s.contains("not driven"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_falls_back_to_count_without_names() {
+        // Older plugin: count > 0 but no names → the generic reason clause, no driven.
+        let s = message_driver_summary(1, 1, &[], &[""]);
+        assert!(
+            s.contains("1 added Unity message(s) not driven (not an engine message"),
+            "{s}"
+        );
+        assert!(!s.contains("wired to a runtime driver"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_caps_named_skips() {
+        let skipped: Vec<String> = (0..9).map(|i| format!("OnMsg{i} — reason")).collect();
+        let s = message_driver_summary(9, 9, &skipped, &[]);
+        assert!(s.contains("OnMsg0") && s.contains("OnMsg5"), "{s}"); // first 6 shown
+        assert!(!s.contains("OnMsg6"), "{s}"); // 7th onward capped
+        assert!(s.contains("(+3 more)"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_empty_when_no_messages() {
+        assert_eq!(message_driver_summary(0, 0, &[], &[]), "");
+    }
 
     #[test]
     fn partial_decl_names_are_grep_grade() {
