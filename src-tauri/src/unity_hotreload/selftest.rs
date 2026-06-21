@@ -10,14 +10,19 @@
 //!     pattern matching, nested types, iterator (coroutine) bodies, async
 //!     body edits and async↔sync, added methods (shim→shim chains) +
 //!     fields (instance and static, across separate batches),
-//!     instance-initializer edits, field deletion, signature changes
+//!     instance-initializer edits, field deletion, field RETYPE (the
+//!     remove+add decomposition — a live instance reads the new field's
+//!     default), added-const inlining, signature changes
 //!     (params / ref→out / static flip / rename) with call-site
 //!     verification, accessibility narrowing, using add/remove with
 //!     whole-file rehook, enum append, new files, new types in existing
 //!     files (top-level and nested), struct method bodies, interface-impl
 //!     bodies, deletions (members, properties, Unity messages, whole
 //!     files); plus edit-mode reloading of EDITOR-assembly code, in-flight
-//!     delegates following detours, Unity message body edits, store-held
+//!     delegates following detours, Unity message body edits, hot-added Unity
+//!     message drivers (PlayerLoop, lifecycle catch-up, plus component-proxy
+//!     forwarding for physics/trigger and non-physics messages), a
+//!     runtime diagnostic for hot-added MonoBehaviour AddComponent(Type), store-held
 //!     static persistence across patches, generic-typed and nested-type
 //!     field additions, #if-block edits, iterator→plain conversions,
 //!     extension-method additions (with the call site surviving LATER
@@ -60,7 +65,7 @@
 //!     virtual PROPERTY additions — plain property/indexer/event additions
 //!     are hot since B2), field-like event additions, struct
 //!     field layout, enum value edits, attribute edits, const edits,
-//!     new Unity message names, interface changes,
+//!     unsupported Unity message names/signatures, interface changes,
 //!     base-list changes, partial-type FIELD layout changes (body edits
 //!     are hot since B6), delegate signature changes,
 //!     conversions returning the declaring type, added members whose
@@ -70,7 +75,19 @@
 //!     untracked-input verdict for .asmdef edits (assembly restructuring
 //!     always needs unity_recompile), along with B2's pointed cold guards:
 //!     full-property ++, ??= set-skip, auto-property ref/out, and compound
-//!     indexers with non-repeatable index expressions.
+//!     indexers with non-repeatable index expressions; plus the N30+ extra
+//!     cold surface: type-kind flips (class↔struct), static-constructor
+//!     bodies, explicit-interface-implementation bodies, the enum-append
+//!     guards (non-literal value, value conflict) and enum removal, const
+//!     and constructor and finalizer REMOVAL, field-modifier changes,
+//!     operator additions, record types (rejected on presence — created
+//!     fresh so the C# 9 syntax never compiles), the M6 using-rehook gates
+//!     (non-literal const / non-literal static initializer / generic member /
+//!     explicit-interface / finalizer), and the remaining B6 partial
+//!     boundaries (part add/remove, new-part declaration, using-in-partial,
+//!     part-count change, initializer change, partial-method-twice). The
+//!     Burst, unsupported-operator and default-interface-method gate variants
+//!     stay in the HotDiff unit tests (package / unreachable / runtime-DIM).
 //!
 //! Flow: with the editor connected and NOT playing, it materializes a test
 //! corpus under Assets/LocusHotReloadSelfTest, imports + recompiles it as
@@ -79,7 +96,9 @@
 //! observable behavior through `unity_execute_code` snippets. Added-member
 //! behavior is always asserted through a PRE-EXISTING member (`Probe`)
 //! re-pointed at the new surface: snippets compile against the original
-//! assembly metadata, which never contains hot-added members. Every step
+//! assembly metadata, which never contains hot-added members. The hot-added
+//! MonoBehaviour AddComponent diagnostic uses reflection for the same reason.
+//! Every step
 //! is atomic: a failed apply reverts its file(s) on disk and in the ledger
 //! so one rejected patch cannot poison the following batches.
 //!
@@ -90,7 +109,7 @@
 //! the `unity-hotreload-selftest` event.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::Emitter;
@@ -100,11 +119,16 @@ use super::coordinator;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 const EXIT_PLAY_MODE_TIMEOUT: Duration = Duration::from_secs(90);
+const UNITY_SEMANTIC_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UNITY_SEMANTIC_READY_POLL: Duration = Duration::from_millis(500);
 const TEST_DIR: &str = "Assets/LocusHotReloadSelfTest";
 const SUBJECT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestSubject.cs";
+const MESSAGE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestMessages.cs";
 const HELPER_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestHelper.cs";
 const MODE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestMode.cs";
 const FRESH_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestFresh.cs";
+const HOT_ADDED_BEHAVIOUR_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestHotAddedBehaviour.cs";
 const STRUCT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestStruct.cs";
 const CTOR_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestCtor.cs";
 const IFACE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestIface.cs";
@@ -156,12 +180,39 @@ const LIB_INLINE_CALLER_FILE: &str =
 const INST_INLINEE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlinee.cs";
 const INST_INLINE_CALLER_FILE: &str =
     "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlineCaller.cs";
+// Extra cold-classification surface (negative phase only). COLD_FILE holds
+// several independent types, each mutated in isolation to pin one rejection
+// reason: type-kind flip, static ctor, explicit-interface body, enum guards,
+// const/field/ctor/finalizer removal, operator addition.
+const COLD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestColdSurface.cs";
+// A record type is rejected on PRESENCE (CollectTypes), so it cannot share a
+// file with anything else and must never reach a real compile — it is created
+// fresh inside the negative test, classified cold, and deleted (never imported
+// into the baseline), so a C#-9-shy editor can never abort the whole suite.
+const RECORD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestRecord.cs";
+// Using-rehook gates (M6): each file pairs ONE un-re-detourable member with a
+// using directive; toggling the using fails the whole-file re-detour closed
+// with that member's precise reason. One member per file — the gate reports
+// the FIRST it finds, so they cannot be combined.
+const USE_CONST_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseConst.cs";
+const USE_STATIC_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseStatic.cs";
+const USE_GENERIC_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseGeneric.cs";
+const USE_EXPLICIT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseExplicit.cs";
+const USE_FINALIZER_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseFinalizer.cs";
+// Partial-type cold boundaries (B6 v1). PARTIAL_COLD_FILE is a single-part
+// partial type used for part-removed / new-part / using-in-partial /
+// initializer / partial-method-twice; PARTIAL_COUNT_FILE carries TWO parts in
+// one file so the part-count change can fire.
+const PARTIAL_COLD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialCold.cs";
+const PARTIAL_COUNT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialCount.cs";
 
 const ALL_FILES: &[&str] = &[
     SUBJECT_FILE,
+    MESSAGE_FILE,
     HELPER_FILE,
     MODE_FILE,
     FRESH_FILE,
+    HOT_ADDED_BEHAVIOUR_FILE,
     STRUCT_FILE,
     CTOR_FILE,
     IFACE_FILE,
@@ -184,6 +235,18 @@ const ALL_FILES: &[&str] = &[
     LIB_INLINE_CALLER_FILE,
     INST_INLINEE_FILE,
     INST_INLINE_CALLER_FILE,
+    // Extra cold-classification corpus (negative phase). RECORD_FILE is
+    // deliberately ABSENT: it is created fresh inside its test and never
+    // baseline-imported (see the FRESH_FILE-style filter in initialize_corpus).
+    COLD_FILE,
+    USE_CONST_FILE,
+    USE_STATIC_FILE,
+    USE_GENERIC_FILE,
+    USE_EXPLICIT_FILE,
+    USE_FINALIZER_FILE,
+    PARTIAL_COLD_FILE,
+    PARTIAL_COUNT_FILE,
+    RECORD_FILE,
     // The .asmdef imports BEFORE the lib source so the assembly exists by
     // the time its first script imports (both flush in one batch anyway —
     // the compilation pipeline recomputes asmdef ownership per compile).
@@ -363,6 +426,7 @@ public class LocusSelfTestSubject : MonoBehaviour
     private int _ticks = 0;
     private int _seed = 40;
     private int _legacy = 3;
+    private int _flux = 5;
 
     public int Ticks { get { return _ticks; } }
     public int Gauge { get { return 17; } }
@@ -394,6 +458,8 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public int Probe() { return 0; }
     public int Spare() { return 1; }
+    public int Flux() { return _flux; }
+    public int Spark() { return 0; }
     private int SecretCore() { return 7000; }
     public int Vaulted() { return SecretCore() + s_secret; }
     public int Relay() { return new LocusSelfTestNegative().Echo(20) + 1; }
@@ -422,6 +488,95 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public Task<int> Pulse() { return Task.FromResult(2001); }
     public System.Collections.IEnumerator Counting() { yield return 1; }
+}
+"#;
+
+const MESSAGE_BASELINE: &str = r#"using UnityEngine;
+
+public class LocusSelfTestMessages : MonoBehaviour
+{
+    public static LocusSelfTestMessages Instance;
+    public static LocusSelfTestMessages Physics3D;
+    public static LocusSelfTestMessages Physics2D;
+    public static int UpdateCount;
+    public static int LateUpdateCount;
+    public static int FixedUpdateCount;
+    public static int Trigger3D;
+    public static int TriggerStay3D;
+    public static int TriggerExit3D;
+    public static int Collision3D;
+    public static int CollisionStay3D;
+    public static int CollisionExit3D;
+    public static int Trigger2D;
+    public static int TriggerStay2D;
+    public static int TriggerExit2D;
+    public static int Collision2D;
+    public static int CollisionStay2D;
+    public static int CollisionExit2D;
+
+    void Awake()
+    {
+        if (gameObject.name == "LocusHotReloadSelfTestMessages") Instance = this;
+        if (gameObject.name.EndsWith("3D")) Physics3D = this;
+        if (gameObject.name.EndsWith("2D")) Physics2D = this;
+    }
+
+    public int Marker() { return 1; }
+
+    public static void ResetFrameCounters()
+    {
+        UpdateCount = 0;
+        LateUpdateCount = 0;
+        FixedUpdateCount = 0;
+    }
+
+    public static void ResetProxyCounters()
+    {
+        Trigger3D = 0;
+        TriggerStay3D = 0;
+        TriggerExit3D = 0;
+        Collision3D = 0;
+        CollisionStay3D = 0;
+        CollisionExit3D = 0;
+        Trigger2D = 0;
+        TriggerStay2D = 0;
+        TriggerExit2D = 0;
+        Collision2D = 0;
+        CollisionStay2D = 0;
+        CollisionExit2D = 0;
+    }
+
+    public static int FrameTotal() { return UpdateCount + LateUpdateCount + FixedUpdateCount; }
+}
+
+public class LocusSelfTestLifecycleMessages : MonoBehaviour
+{
+    public static LocusSelfTestLifecycleMessages Instance;
+    public static int AwakeCatchUp;
+    public static int StartCatchUp;
+    public static int ValidateCatchUp;
+    public static int MouseDownCount;
+    public static int AnimatorIkLayer;
+    public static int DestroyCount;
+
+    public int Marker() { return 2; }
+
+    public static void ResetLifecycleCounters()
+    {
+        AwakeCatchUp = 0;
+        StartCatchUp = 0;
+        ValidateCatchUp = 0;
+    }
+
+    public static void ResetUtilityProxyCounters()
+    {
+        MouseDownCount = 0;
+        AnimatorIkLayer = 0;
+        DestroyCount = 0;
+    }
+
+    public static int LifecycleTotal() { return AwakeCatchUp + StartCatchUp + ValidateCatchUp; }
+    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }
 }
 "#;
 
@@ -500,6 +655,11 @@ public class LocusSelfTestNegative
     public int Hidden() { return _hidden; }
     internal int Wide() { return 5; }
     public T Echo<T>(T value) { return value; }
+}
+
+public class LocusSelfTestNegBehaviour : UnityEngine.MonoBehaviour
+{
+    public int Solid() { return 1; }
 }
 
 public class LocusSelfTestNegGeneric<T>
@@ -582,6 +742,150 @@ const PARTIAL_B_BASELINE: &str = r#"public partial class LocusSelfTestPartial
 }
 "#;
 
+// Cold-classification corpus: independent types, each mutated alone so exactly
+// one rejection reason fires (the unchanged siblings never diff). The Mark()
+// bodies differ on purpose so every swap anchor below is unique.
+const COLD_BASELINE: &str = r#"public class LocusSelfTestKind
+{
+    public int Mark() { return 1; }
+}
+
+public class LocusSelfTestStaticCtor
+{
+    public static int Counter;
+
+    static LocusSelfTestStaticCtor() { Counter = 1; }
+
+    public int Mark() { return Counter; }
+}
+
+public interface ILocusSelfTestExplicit
+{
+    int Plan();
+}
+
+public class LocusSelfTestExplicitImpl : ILocusSelfTestExplicit
+{
+    int ILocusSelfTestExplicit.Plan() { return 1; }
+}
+
+public enum LocusSelfTestColdEnum { P = 1, Q = 2 }
+
+public class LocusSelfTestConstHost
+{
+    public const int Cap = 5;
+
+    public int Use() { return 9; }
+}
+
+public class LocusSelfTestFieldMods
+{
+    public int Field;
+
+    public int Read() { return Field; }
+}
+
+public class LocusSelfTestCtorDrop
+{
+    public int Seed;
+
+    public LocusSelfTestCtorDrop() { Seed = 1; }
+    public LocusSelfTestCtorDrop(int seed) { Seed = seed; }
+}
+
+public class LocusSelfTestFinDrop
+{
+    public int Mark() { return 3; }
+
+    ~LocusSelfTestFinDrop() { }
+}
+
+public class LocusSelfTestOpHost
+{
+    public int Value;
+
+    public int Mark() { return Value; }
+}
+"#;
+
+// Created fresh and deleted inside its test — the record is rejected on
+// presence, so this text never reaches a real Unity compile.
+const RECORD_BASELINE: &str = r#"public record LocusSelfTestRecord
+{
+    public int Mark() { return 1; }
+}
+"#;
+
+// Using-rehook gate corpus (M6). Each file holds ONE member the whole-file
+// re-detour cannot reproduce; the test toggles a using directive to drive the
+// gate. Mark()/plain methods are present only as inert filler.
+const USE_CONST_BASELINE: &str = r#"public class LocusSelfTestUseConst
+{
+    public const int Cap = 1 + 2;
+
+    public int Mark() { return 7; }
+}
+"#;
+
+const USE_STATIC_BASELINE: &str = r#"public class LocusSelfTestUseStatic
+{
+    public static int Seed = Compute();
+
+    static int Compute() { return 3; }
+
+    public int Mark() { return 7; }
+}
+"#;
+
+const USE_GENERIC_BASELINE: &str = r#"public class LocusSelfTestUseGeneric
+{
+    public int Pick<T>(T value) { return 1; }
+}
+"#;
+
+const USE_EXPLICIT_BASELINE: &str = r#"public interface ILocusSelfTestUseExpl
+{
+    int Go();
+}
+
+public class LocusSelfTestUseExpl : ILocusSelfTestUseExpl
+{
+    int ILocusSelfTestUseExpl.Go() { return 1; }
+}
+"#;
+
+const USE_FINALIZER_BASELINE: &str = r#"public class LocusSelfTestUseFin
+{
+    public int Mark() { return 1; }
+
+    ~LocusSelfTestUseFin() { }
+}
+"#;
+
+// Single-part partial type: part-removed / new-part / using-in-partial /
+// initializer-changed / partial-method-twice all mutate this one file.
+const PARTIAL_COLD_BASELINE: &str = r#"public partial class LocusSelfTestPartialCold
+{
+    private int _value = 10;
+
+    partial void Hook();
+
+    public int Read() { return _value; }
+}
+"#;
+
+// Two parts of one type in one file, so dropping a part changes the count.
+const PARTIAL_COUNT_BASELINE: &str = r#"public partial class LocusSelfTestPartialCount
+{
+    public int A() { return 1; }
+}
+
+public partial class LocusSelfTestPartialCount
+{
+    public int B() { return 2; }
+}
+"#;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SelfTestEvent {
@@ -610,6 +914,22 @@ struct InliningActiveResponse {
     code_optimization: String,
     #[serde(default)]
     detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageDriverCapabilities {
+    physics3d: bool,
+    physics2d: bool,
+}
+
+impl MessageDriverCapabilities {
+    fn has_physics_proxy(self) -> bool {
+        self.physics3d || self.physics2d
+    }
+
+    fn label(self) -> String {
+        format!("physics3d={} physics2d={}", self.physics3d, self.physics2d)
+    }
 }
 
 struct SelfTest {
@@ -649,6 +969,10 @@ struct SelfTest {
     /// localized (did the inline caller refresh engage / patch the caller, or
     /// report a note?).
     last_apply_summary: String,
+    /// Unity projects can include only the 3D physics module, only the 2D
+    /// physics module, both, or neither. Proxy-message coverage follows the
+    /// modules actually loaded by the editor.
+    message_driver_capabilities: MessageDriverCapabilities,
 }
 
 /// Replace exactly one occurrence, failing loudly when the anchor text is
@@ -695,6 +1019,300 @@ fn squash(text: &str) -> String {
         line.truncate(360);
     }
     line
+}
+
+fn reload_boundary_error(error: &str) -> bool {
+    matches!(error, "managed_reloading" | "domain_reload_interrupted")
+        || error.contains("managed_reloading")
+        || error.contains("domain_reload_interrupted")
+}
+
+fn remaining_or_timeout(
+    started: Instant,
+    timeout: Duration,
+    action: &str,
+) -> Result<Duration, String> {
+    timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+        format!(
+            "{action} did not become ready within {}s",
+            timeout.as_secs()
+        )
+    })
+}
+
+fn spawn_test_objects_code(caps: MessageDriverCapabilities) -> String {
+    let mut code = String::from(
+        "foreach (var existing in UnityEngine.Object.FindObjectsByType<UnityEngine.GameObject>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.None))\n\
+         {\n\
+             if (existing != null && existing.name.StartsWith(\"LocusHotReloadSelfTest\")) UnityEngine.Object.Destroy(existing);\n\
+         }\n\
+         await ctx.WaitFrames(2);\n\
+         var go = new UnityEngine.GameObject(\"LocusHotReloadSelfTest\");\n\
+         go.AddComponent<LocusSelfTestSubject>();\n\
+         var messageGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages\");\n\
+         messageGo.AddComponent<LocusSelfTestMessages>();\n",
+    );
+    code.push_str(
+        "var lifecycleGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestLifecycleMessages\");\n\
+         LocusSelfTestLifecycleMessages.Instance = lifecycleGo.AddComponent<LocusSelfTestLifecycleMessages>();\n",
+    );
+    if caps.physics3d {
+        code.push_str(
+            "var message3DGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages3D\");\n\
+             message3DGo.AddComponent<LocusSelfTestMessages>();\n\
+             var box3D = message3DGo.AddComponent<UnityEngine.BoxCollider>();\n\
+             if (box3D == null) throw new System.InvalidOperationException(\"BoxCollider was not added\");\n\
+             box3D.isTrigger = true;\n",
+        );
+    }
+    if caps.physics2d {
+        code.push_str(
+            "var message2DGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages2D\");\n\
+             message2DGo.AddComponent<LocusSelfTestMessages>();\n\
+             var box2D = message2DGo.AddComponent<UnityEngine.BoxCollider2D>();\n\
+             if (box2D == null) throw new System.InvalidOperationException(\"BoxCollider2D was not added\");\n\
+             box2D.isTrigger = true;\n",
+        );
+    }
+    code.push_str("return \"spawned\";");
+    code
+}
+
+fn initial_proxy_methods(caps: MessageDriverCapabilities) -> String {
+    let mut methods = String::new();
+    if caps.physics3d {
+        methods.push_str(
+            "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 10 : 1; }\n\
+             void OnTriggerStay(Collider other) { TriggerStay3D += other != null ? 11 : 1; }\n\
+             void OnTriggerExit(Collider other) { TriggerExit3D += other != null ? 100 : 1; }\n\
+             void OnCollisionEnter(Collision collision) { Collision3D += collision == null ? 1 : 10; }\n\
+             void OnCollisionStay(Collision collision) { CollisionStay3D += collision == null ? 1 : 11; }\n\
+             void OnCollisionExit(Collision collision) { CollisionExit3D += collision == null ? 1 : 100; }\n",
+        );
+    }
+    if caps.physics2d {
+        methods.push_str(
+            "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 20 : 1; }\n\
+             void OnTriggerStay2D(Collider2D other) { TriggerStay2D += other != null ? 21 : 1; }\n\
+             void OnTriggerExit2D(Collider2D other) { TriggerExit2D += other != null ? 200 : 1; }\n\
+             void OnCollisionEnter2D(Collision2D collision) { Collision2D += collision == null ? 1 : 20; }\n\
+             void OnCollisionStay2D(Collision2D collision) { CollisionStay2D += collision == null ? 1 : 21; }\n\
+             void OnCollisionExit2D(Collision2D collision) { CollisionExit2D += collision == null ? 1 : 200; }\n",
+        );
+    }
+    methods
+}
+
+fn physics3d_proxy_initial_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionStay\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 10 && LocusSelfTestMessages.TriggerStay3D == 11 && LocusSelfTestMessages.TriggerExit3D == 100\n\
+         && LocusSelfTestMessages.Collision3D == 1 && LocusSelfTestMessages.CollisionStay3D == 1 && LocusSelfTestMessages.CollisionExit3D == 1\n\
+         ? \"proxy-3d-ok\"\n\
+         : (\"proxy-3d-missing t3=\" + LocusSelfTestMessages.Trigger3D + \" ts3=\" + LocusSelfTestMessages.TriggerStay3D + \" tx3=\" + LocusSelfTestMessages.TriggerExit3D\n\
+             + \" c3=\" + LocusSelfTestMessages.Collision3D + \" cs3=\" + LocusSelfTestMessages.CollisionStay3D + \" cx3=\" + LocusSelfTestMessages.CollisionExit3D);"
+}
+
+fn physics2d_proxy_initial_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter2D\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionStay2D\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 20 && LocusSelfTestMessages.TriggerStay2D == 21 && LocusSelfTestMessages.TriggerExit2D == 200\n\
+         && LocusSelfTestMessages.Collision2D == 1 && LocusSelfTestMessages.CollisionStay2D == 1 && LocusSelfTestMessages.CollisionExit2D == 1\n\
+         ? \"proxy-2d-ok\"\n\
+         : (\"proxy-2d-missing t2=\" + LocusSelfTestMessages.Trigger2D + \" ts2=\" + LocusSelfTestMessages.TriggerStay2D + \" tx2=\" + LocusSelfTestMessages.TriggerExit2D\n\
+             + \" c2=\" + LocusSelfTestMessages.Collision2D + \" cs2=\" + LocusSelfTestMessages.CollisionStay2D + \" cx2=\" + LocusSelfTestMessages.CollisionExit2D);"
+}
+
+fn physics3d_proxy_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 30 && LocusSelfTestMessages.TriggerStay3D == 3011 && LocusSelfTestMessages.Collision3D == 1\n\
+         ? \"proxy-3d-reedit-ok\"\n\
+         : (\"proxy-3d-reedit-mismatch t3=\" + LocusSelfTestMessages.Trigger3D + \" ts3=\" + LocusSelfTestMessages.TriggerStay3D + \" c3=\" + LocusSelfTestMessages.Collision3D);"
+}
+
+fn physics2d_proxy_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 40 && LocusSelfTestMessages.TriggerStay2D == 4021 && LocusSelfTestMessages.Collision2D == 1\n\
+         ? \"proxy-2d-reedit-ok\"\n\
+         : (\"proxy-2d-reedit-mismatch t2=\" + LocusSelfTestMessages.Trigger2D + \" ts2=\" + LocusSelfTestMessages.TriggerStay2D + \" c2=\" + LocusSelfTestMessages.Collision2D);"
+}
+
+fn physics3d_proxy_second_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-second-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-second-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 50 && LocusSelfTestMessages.TriggerExit3D == 5100 && LocusSelfTestMessages.CollisionExit3D == 1\n\
+         ? \"proxy-3d-second-reedit-ok\"\n\
+         : (\"proxy-3d-second-reedit-mismatch t3=\" + LocusSelfTestMessages.Trigger3D + \" tx3=\" + LocusSelfTestMessages.TriggerExit3D + \" cx3=\" + LocusSelfTestMessages.CollisionExit3D);"
+}
+
+fn physics2d_proxy_second_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-second-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-second-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 60 && LocusSelfTestMessages.TriggerExit2D == 6200 && LocusSelfTestMessages.CollisionExit2D == 1\n\
+         ? \"proxy-2d-second-reedit-ok\"\n\
+         : (\"proxy-2d-second-reedit-mismatch t2=\" + LocusSelfTestMessages.Trigger2D + \" tx2=\" + LocusSelfTestMessages.TriggerExit2D + \" cx2=\" + LocusSelfTestMessages.CollisionExit2D);"
+}
+
+fn utility_proxy_assertion() -> &'static str {
+    "LocusSelfTestLifecycleMessages.ResetUtilityProxyCounters();\n\
+     string InvokeMessageProxy(UnityEngine.GameObject go, string proxyTypeName, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != proxyTypeName) continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"utility-proxy-missing-method-\" + proxyTypeName + \".\" + message;\n\
+             object[] args = arg == null ? null : new object[] { arg };\n\
+             method.Invoke(behaviour, args);\n\
+             return \"\";\n\
+         }\n\
+         return \"utility-proxy-missing-component-\" + proxyTypeName + \".\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestLifecycleMessages.Instance;\n\
+     if (instance == null) return \"utility-proxy-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var err = InvokeMessageProxy(go, \"Locus.LocusMouseProxy\", \"OnMouseDown\", null); if (err.Length > 0) return err;\n\
+     err = InvokeMessageProxy(go, \"Locus.LocusEventProxy\", \"OnAnimatorIK\", 7); if (err.Length > 0) return err;\n\
+     err = InvokeMessageProxy(go, \"Locus.LocusEventProxy\", \"OnDestroy\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestLifecycleMessages.MouseDownCount == 1 && LocusSelfTestLifecycleMessages.AnimatorIkLayer == 7 && LocusSelfTestLifecycleMessages.DestroyCount == 1\n\
+         ? \"utility-proxy-ok\"\n\
+         : (\"utility-proxy-mismatch mouse=\" + LocusSelfTestLifecycleMessages.MouseDownCount + \" ik=\" + LocusSelfTestLifecycleMessages.AnimatorIkLayer + \" destroy=\" + LocusSelfTestLifecycleMessages.DestroyCount);"
 }
 
 impl SelfTest {
@@ -767,6 +1385,121 @@ impl SelfTest {
     /// Run a C# snippet in the editor and return its output text.
     async fn execute(&self, code: &str) -> Result<String, String> {
         crate::unity_bridge::unity_execute_code(&self.project, code).await
+    }
+
+    async fn wait_for_semantic_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+        require_asset_modification: bool,
+    ) -> Result<(), String> {
+        crate::unity_bridge::set_state_probe_enabled(true);
+        crate::unity_bridge::start_unity_semantic_state_observer(&self.project);
+
+        let started = Instant::now();
+        let mut last_signature = String::new();
+        loop {
+            let state = crate::unity_bridge::unity_semantic_state(&self.project).await;
+            let signature = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                state.phase,
+                state.source,
+                state.reload_phase.as_deref().unwrap_or(""),
+                state.domain.phase,
+                state.editor_mode.value,
+                state.safety.can_call_unity_api,
+                state.safety.can_modify_assets_safely,
+                state.safety.recommended_action
+            );
+            if signature != last_signature {
+                last_signature = signature;
+                self.log(format!(
+                    "  semantic wait ({action}): requirement={} phase={} source={} domain={} editorMode={} canCall={} canModify={} action={}",
+                    if require_asset_modification {
+                        "assetModification"
+                    } else {
+                        "unityApi"
+                    },
+                    state.phase,
+                    state.source,
+                    state.domain.phase,
+                    state.editor_mode.value,
+                    state.safety.can_call_unity_api,
+                    state.safety.can_modify_assets_safely,
+                    state.safety.recommended_action
+                ));
+            }
+            let ready = if require_asset_modification {
+                state.safety.can_modify_assets_safely
+            } else {
+                state.safety.can_call_unity_api
+            };
+            if ready {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "Unity was not ready for {action} within {}s; phase={} source={} recommendedAction={}",
+                    timeout.as_secs(),
+                    state.phase,
+                    state.source,
+                    state.safety.recommended_action
+                ));
+            }
+            tokio::time::sleep(UNITY_SEMANTIC_READY_POLL).await;
+        }
+    }
+
+    async fn wait_for_semantic_asset_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_for_semantic_ready(action, timeout, true).await
+    }
+
+    async fn wait_for_semantic_unity_api_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_for_semantic_ready(action, timeout, false).await
+    }
+
+    async fn set_code_optimization_retrying(
+        &self,
+        desired: &str,
+        action: &str,
+    ) -> Result<String, String> {
+        let started = Instant::now();
+        loop {
+            self.wait_for_semantic_asset_ready(
+                action,
+                remaining_or_timeout(started, UNITY_SEMANTIC_READY_TIMEOUT, action)?,
+            )
+            .await?;
+
+            match coordinator::set_code_optimization(&self.project, desired).await {
+                Ok(value) => {
+                    self.wait_for_semantic_asset_ready(
+                        action,
+                        remaining_or_timeout(started, UNITY_SEMANTIC_READY_TIMEOUT, action)?,
+                    )
+                    .await?;
+                    return Ok(value);
+                }
+                Err(error)
+                    if reload_boundary_error(&error)
+                        && started.elapsed() < UNITY_SEMANTIC_READY_TIMEOUT =>
+                {
+                    self.log(format!(
+                        "  {action}: Unity is reloading while switching Code Optimization ({error}); retrying"
+                    ));
+                    tokio::time::sleep(UNITY_SEMANTIC_READY_POLL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Runtime "is Mono inlining right now?" check. Force-JITs a small canary in
@@ -1030,6 +1763,7 @@ impl SelfTest {
         }
 
         self.write_tracked(SUBJECT_FILE, SUBJECT_BASELINE).await?;
+        self.write_tracked(MESSAGE_FILE, MESSAGE_BASELINE).await?;
         self.write_tracked(HELPER_FILE, HELPER_BASELINE).await?;
         self.write_tracked(MODE_FILE, MODE_BASELINE).await?;
         self.write_tracked(STRUCT_FILE, STRUCT_BASELINE).await?;
@@ -1040,6 +1774,24 @@ impl SelfTest {
         self.write_tracked(PARTIAL_A_FILE, PARTIAL_A_BASELINE)
             .await?;
         self.write_tracked(PARTIAL_B_FILE, PARTIAL_B_BASELINE)
+            .await?;
+        // Extra cold-classification corpus for the negative phase. RECORD_FILE
+        // is intentionally NOT written here — its test creates it fresh so the
+        // record syntax never reaches a real compile.
+        self.write_tracked(COLD_FILE, COLD_BASELINE).await?;
+        self.write_tracked(USE_CONST_FILE, USE_CONST_BASELINE)
+            .await?;
+        self.write_tracked(USE_STATIC_FILE, USE_STATIC_BASELINE)
+            .await?;
+        self.write_tracked(USE_GENERIC_FILE, USE_GENERIC_BASELINE)
+            .await?;
+        self.write_tracked(USE_EXPLICIT_FILE, USE_EXPLICIT_BASELINE)
+            .await?;
+        self.write_tracked(USE_FINALIZER_FILE, USE_FINALIZER_BASELINE)
+            .await?;
+        self.write_tracked(PARTIAL_COLD_FILE, PARTIAL_COLD_BASELINE)
+            .await?;
+        self.write_tracked(PARTIAL_COUNT_FILE, PARTIAL_COUNT_BASELINE)
             .await?;
         // Adversarial syntax edge cases (A1–A4).
         self.write_tracked(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)
@@ -1096,7 +1848,16 @@ impl SelfTest {
         imports.extend(
             ALL_FILES
                 .iter()
-                .filter(|relative| **relative != FRESH_FILE) // created later, mid-play
+                .filter(|relative| {
+                    // Created later, mid-play, so their baselines are empty and
+                    // the sidecar sees the full file as hot-added surface.
+                    // RECORD_FILE is created fresh in its own negative test and
+                    // never baseline-compiled (record syntax would otherwise
+                    // need a C# 9 editor just to import the corpus).
+                    **relative != FRESH_FILE
+                        && **relative != HOT_ADDED_BEHAVIOUR_FILE
+                        && **relative != RECORD_FILE
+                })
                 .map(|relative| relative.to_string()),
         );
         crate::unity_bridge::import_assets(&self.project, &imports)
@@ -1201,6 +1962,39 @@ impl SelfTest {
         }
     }
 
+    async fn probe_message_driver_capabilities(&mut self) {
+        let snippet = "bool HasUnityType(string fullName)\n\
+                       {\n\
+                           return System.AppDomain.CurrentDomain.GetAssemblies()\n\
+                               .Any(a => a.GetType(fullName, false) != null);\n\
+                       }\n\
+                       var physics3d = HasUnityType(\"UnityEngine.Collider\")\n\
+                           && HasUnityType(\"UnityEngine.Collision\")\n\
+                           && HasUnityType(\"UnityEngine.BoxCollider\");\n\
+                       var physics2d = HasUnityType(\"UnityEngine.Collider2D\")\n\
+                           && HasUnityType(\"UnityEngine.Collision2D\")\n\
+                           && HasUnityType(\"UnityEngine.BoxCollider2D\");\n\
+                       return \"physics3d=\" + (physics3d ? \"true\" : \"false\")\n\
+                           + \" physics2d=\" + (physics2d ? \"true\" : \"false\");";
+        match self.execute(snippet).await {
+            Ok(output) => {
+                let lower = output.to_ascii_lowercase();
+                self.message_driver_capabilities = MessageDriverCapabilities {
+                    physics3d: lower.contains("physics3d=true"),
+                    physics2d: lower.contains("physics2d=true"),
+                };
+                self.log(format!(
+                    "Unity message proxy modules: {}",
+                    self.message_driver_capabilities.label()
+                ));
+            }
+            Err(error) => {
+                self.message_driver_capabilities = MessageDriverCapabilities::default();
+                self.fail("message driver capability probe", error);
+            }
+        }
+    }
+
     /// B5 — probe the Enter Play Mode Options BEFORE the play transition and
     /// log which matrix branch this run exercises. Best-effort: on a probe
     /// failure the mode-aware assertions assume the classic reload path
@@ -1243,14 +2037,15 @@ impl SelfTest {
         // The play transition settles behind the status flip (classic mode:
         // the play-mode domain reload; no-reload mode: scene setup only).
         tokio::time::sleep(Duration::from_secs(2)).await;
-
-        self.execute(
-            "var go = new UnityEngine.GameObject(\"LocusHotReloadSelfTest\");\n\
-             go.AddComponent<LocusSelfTestSubject>();\n\
-             return \"spawned\";",
+        self.wait_for_semantic_unity_api_ready(
+            "play-mode transition",
+            UNITY_SEMANTIC_READY_TIMEOUT,
         )
-        .await
-        .map_err(|e| format!("spawning the test component failed: {e}"))?;
+        .await?;
+
+        self.execute(&spawn_test_objects_code(self.message_driver_capabilities))
+            .await
+            .map_err(|e| format!("spawning the test component failed: {e}"))?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.log("Test component is live in play mode.");
 
@@ -3453,6 +4248,52 @@ impl SelfTest {
             }
         }
 
+        // P48 — retyping an instance field decomposes into remove(placeholder)
+        // + add(store): the old int slot is parked and a fresh long field is
+        // virtualized, so the already-live instance reads the new field's
+        // default (the documented value-loss on a hot retype).
+        if self
+            .step_file("P48 instance field retype", SUBJECT_FILE, subject, |s| {
+                swap(s, "    private int _flux = 5;", "    private long _flux = 5;")?;
+                swap(
+                    s,
+                    "public int Flux() { return _flux; }",
+                    "public int Flux() { return (int)(_flux + 9990); }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P48 instance field retype",
+                "return LocusSelfTestSubject.Instance.Flux();",
+                "9990", // live instance: the freshly-virtualized long field defaults to 0
+            )
+            .await;
+        }
+
+        // P49 — a newly added const is inlined into the patch; a same-batch
+        // reader resolves it immediately (no pre-existing call site referenced
+        // it, so nothing stale survives).
+        if self
+            .step_file("P49 added const inlined", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Spark() { return 0; }",
+                    "    private const int SparkK = 88;\n    public int Spark() { return SparkK; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P49 added const inlined",
+                "return LocusSelfTestSubject.Instance.Spark();",
+                "88",
+            )
+            .await;
+        }
+
         // Hand the per-file ledgers to the negative phase: it restores files
         // to exactly these texts after each cold probe.
         self.negative_ledgers = NegativeLedgers {
@@ -3461,6 +4302,480 @@ impl SelfTest {
             iface_text: iface_ledger,
             partial_a_text: partial_a_ledger,
         };
+    }
+
+    async fn run_message_driver_tests(&mut self, messages: &mut String) {
+        self.log("Phase 4b — hot-added Unity message drivers");
+
+        self.expect_output(
+            "P46 baseline message corpus",
+            "return LocusSelfTestMessages.Instance != null && LocusSelfTestMessages.Instance.Marker() == 1 ? \"messages-ready\" : \"messages-missing\";",
+            "messages-ready",
+        )
+        .await;
+
+        // P46a — add the three parameterless per-frame messages after the type is
+        // already loaded. Unity will not discover them natively; Locus must drive
+        // them through its PlayerLoop driver.
+        let frame_name = "P46a added Update/LateUpdate/FixedUpdate";
+        if self
+            .step_file(frame_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public int Marker() { return 1; }\n",
+                    "    public int Marker() { return 1; }\n\n    void Update() { UpdateCount += 1; }\n    void LateUpdate() { LateUpdateCount += 1; }\n    void FixedUpdate() { FixedUpdateCount += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                frame_name,
+                "LocusSelfTestMessages.ResetFrameCounters();\n\
+                 await ctx.WaitSeconds(0.8f);\n\
+                 return LocusSelfTestMessages.UpdateCount > 0 && LocusSelfTestMessages.LateUpdateCount > 0 && LocusSelfTestMessages.FixedUpdateCount > 0\n\
+                     ? \"frame-drivers-ok\" : (\"frame-drivers-missing u=\" + LocusSelfTestMessages.UpdateCount + \" l=\" + LocusSelfTestMessages.LateUpdateCount + \" f=\" + LocusSelfTestMessages.FixedUpdateCount);",
+                "frame-drivers-ok",
+            )
+            .await;
+        }
+
+        let caps = self.message_driver_capabilities;
+        if caps.has_physics_proxy() {
+            // P46b — add physics/trigger message methods in a later patch to the
+            // SAME source file. This verifies component-proxy dispatch and also
+            // catches replace-by-source bugs where adding proxy drivers accidentally
+            // drops the earlier PlayerLoop drivers from the same file.
+            let proxy_name = "P46b added physics/trigger message proxy";
+            if self
+                .step_file(proxy_name, MESSAGE_FILE, messages, |s| {
+                    let replacement = format!(
+                        "    public int Marker() {{ return 1; }}\n\n{}",
+                        initial_proxy_methods(caps)
+                    );
+                    swap(s, "    public int Marker() { return 1; }\n", &replacement)
+                })
+                .await
+                .is_some()
+            {
+                if caps.physics3d {
+                    self.expect_output(
+                        "P46b 3D physics/trigger message proxy",
+                        physics3d_proxy_initial_assertion(),
+                        "proxy-3d-ok",
+                    )
+                    .await;
+                }
+                if caps.physics2d {
+                    self.expect_output(
+                        "P46b 2D physics/trigger message proxy",
+                        physics2d_proxy_initial_assertion(),
+                        "proxy-2d-ok",
+                    )
+                    .await;
+                }
+
+                // P46c/P46d — edit the same component-proxy message repeatedly.
+                // The proxy registration must bind to the newest shim exactly once,
+                // while unrelated proxy messages from the same source file stay live.
+                let proxy_reedit_name = "P46c repeated component-proxy edit replaces prior shim";
+                if self
+                    .step_file(proxy_reedit_name, MESSAGE_FILE, messages, |s| {
+                        if caps.physics3d {
+                            swap_line(
+                                s,
+                                "    void OnTriggerEnter(Collider other)",
+                                "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 30 : 3; TriggerStay3D += 3000; }",
+                            )?;
+                        }
+                        if caps.physics2d {
+                            swap_line(
+                                s,
+                                "    void OnTriggerEnter2D(Collider2D other)",
+                                "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 40 : 4; TriggerStay2D += 4000; }",
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .is_some()
+                {
+                    if caps.physics3d {
+                        self.expect_output(
+                            "P46c 3D repeated component-proxy edit replaces prior shim",
+                            physics3d_proxy_reedit_assertion(),
+                            "proxy-3d-reedit-ok",
+                        )
+                        .await;
+                    }
+                    if caps.physics2d {
+                        self.expect_output(
+                            "P46c 2D repeated component-proxy edit replaces prior shim",
+                            physics2d_proxy_reedit_assertion(),
+                            "proxy-2d-reedit-ok",
+                        )
+                        .await;
+                    }
+
+                    let proxy_second_reedit_name =
+                        "P46d second component-proxy edit remains single-bound";
+                    if self
+                        .step_file(proxy_second_reedit_name, MESSAGE_FILE, messages, |s| {
+                            if caps.physics3d {
+                                swap_line(
+                                    s,
+                                    "    void OnTriggerEnter(Collider other)",
+                                    "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 50 : 5; TriggerExit3D += 5000; }",
+                                )?;
+                            }
+                            if caps.physics2d {
+                                swap_line(
+                                    s,
+                                    "    void OnTriggerEnter2D(Collider2D other)",
+                                    "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 60 : 6; TriggerExit2D += 6000; }",
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .is_some()
+                    {
+                        if caps.physics3d {
+                            self.expect_output(
+                                "P46d 3D second component-proxy edit remains single-bound",
+                                physics3d_proxy_second_reedit_assertion(),
+                                "proxy-3d-second-reedit-ok",
+                            )
+                            .await;
+                        }
+                        if caps.physics2d {
+                            self.expect_output(
+                                "P46d 2D second component-proxy edit remains single-bound",
+                                physics2d_proxy_second_reedit_assertion(),
+                                "proxy-2d-second-reedit-ok",
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                self.expect_output(
+                    "P46e message drivers survive same-file proxy patch",
+                    "var before = LocusSelfTestMessages.FrameTotal();\n\
+                     await ctx.WaitSeconds(0.5f);\n\
+                     return LocusSelfTestMessages.FrameTotal() > before ? \"frame-drivers-still-live\" : \"frame-drivers-dropped\";",
+                    "frame-drivers-still-live",
+                )
+                .await;
+            }
+        } else {
+            self.log(
+                "  skipping physics/trigger proxy message tests; no 3D/2D physics module detected",
+            );
+        }
+
+        self.expect_output(
+            "P46f frame message drivers honor component enabled",
+            "var targets = UnityEngine.Object.FindObjectsByType<LocusSelfTestMessages>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.InstanceID);\n\
+             if (targets.Length == 0) return \"enabled-gate-missing-instance\";\n\
+             var before = LocusSelfTestMessages.FrameTotal();\n\
+             foreach (var target in targets) target.enabled = false;\n\
+             await ctx.WaitSeconds(0.35f);\n\
+             var disabled = LocusSelfTestMessages.FrameTotal();\n\
+             foreach (var target in targets) target.enabled = true;\n\
+             await ctx.WaitSeconds(0.35f);\n\
+             return disabled == before && LocusSelfTestMessages.FrameTotal() > disabled ? \"enabled-gate-ok\" : (\"enabled-gate-leaked before=\" + before + \" disabled=\" + disabled + \" after=\" + LocusSelfTestMessages.FrameTotal());",
+            "enabled-gate-ok",
+        )
+        .await;
+
+        // P46g — add lifecycle messages whose native timing already passed for
+        // this loaded component type. Locus should run each catch-up shim once on
+        // the existing live instance.
+        let lifecycle_name = "P46g added Awake/Start/OnValidate catch-up";
+        match self
+            .execute("LocusSelfTestLifecycleMessages.ResetLifecycleCounters(); return \"lifecycle-reset\";")
+            .await
+        {
+            Ok(output) if output.contains("lifecycle-reset") => {}
+            Ok(output) => self.fail(
+                lifecycle_name,
+                format!("counter reset returned unexpected output: {}", output.trim()),
+            ),
+            Err(error) => self.fail(lifecycle_name, format!("counter reset failed: {error}")),
+        }
+        if self
+            .step_file(lifecycle_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public int Marker() { return 2; }\n",
+                    "    public int Marker() { return 2; }\n\n    void Awake() { AwakeCatchUp += 1; }\n    void Start() { StartCatchUp += 1; }\n    void OnValidate() { ValidateCatchUp += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                lifecycle_name,
+                "return LocusSelfTestLifecycleMessages.AwakeCatchUp == 1 && LocusSelfTestLifecycleMessages.StartCatchUp == 1 && LocusSelfTestLifecycleMessages.ValidateCatchUp == 1\n\
+                     ? \"lifecycle-catchup-ok\" : (\"lifecycle-catchup-mismatch awake=\" + LocusSelfTestLifecycleMessages.AwakeCatchUp + \" start=\" + LocusSelfTestLifecycleMessages.StartCatchUp + \" validate=\" + LocusSelfTestLifecycleMessages.ValidateCatchUp);",
+                "lifecycle-catchup-ok",
+            )
+            .await;
+        }
+
+        // P46h — non-physics component proxies: parameterless mouse, int-argument
+        // animator IK, and lifecycle OnDestroy all forward through the proxy hub.
+        let utility_proxy_name = "P46h added non-physics message proxies";
+        if self
+            .step_file(utility_proxy_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }\n",
+                    "    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }\n\n    void OnMouseDown() { MouseDownCount += 1; }\n    void OnAnimatorIK(int layer) { AnimatorIkLayer = layer; }\n    void OnDestroy() { DestroyCount += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(utility_proxy_name, utility_proxy_assertion(), "utility-proxy-ok")
+                .await;
+        }
+    }
+
+    async fn run_hot_added_mono_behaviour_diagnostic(&mut self) {
+        self.log("Phase 4c — hot-added MonoBehaviour AddComponent diagnostic");
+
+        let name = "P47 hot-added MonoBehaviour AddComponent(Type)";
+        self.log(format!("— {name}"));
+        let source = r#"using UnityEngine;
+
+public class LocusSelfTestHotAddedBehaviour : MonoBehaviour
+{
+    public static int AwakeCount;
+    public static int EnableCount;
+    public static int UpdateCount;
+    public static string LastObjectName = "";
+
+    public int marker = 4701;
+
+    public static void ResetCounters()
+    {
+        AwakeCount = 0;
+        EnableCount = 0;
+        UpdateCount = 0;
+        LastObjectName = "";
+    }
+
+    void Awake()
+    {
+        AwakeCount += 1;
+        LastObjectName = gameObject.name;
+    }
+
+    void OnEnable()
+    {
+        EnableCount += 1;
+    }
+
+    void Update()
+    {
+        UpdateCount += 1;
+    }
+
+    public int Marker()
+    {
+        return marker;
+    }
+}
+"#;
+
+        let Some(summary) = self
+            .apply_texts(name, &[(HOT_ADDED_BEHAVIOUR_FILE, source)], &[])
+            .await
+        else {
+            return;
+        };
+        if summary.contains("new type") {
+            self.pass(
+                name,
+                format!(
+                    "hot patch loaded the new MonoBehaviour type ({})",
+                    squash(&summary)
+                ),
+            );
+        } else {
+            self.fail(
+                name,
+                format!(
+                    "hot patch did not report a loaded new type; summary: {}",
+                    squash(&summary)
+                ),
+            );
+        }
+
+        match self
+            .execute("return typeof(LocusSelfTestHotAddedBehaviour).FullName;")
+            .await
+        {
+            Ok(output) => self.pass(
+                "P47a unity_execute compile-scope diagnostic",
+                format!("strong type reference compiled: {}", squash(&output)),
+            ),
+            Err(error)
+                if error.contains("CS0246")
+                    || error.contains("could not be found")
+                    || error.contains("compilation") =>
+            {
+                self.pass(
+                    "P47a unity_execute compile-scope diagnostic",
+                    format!(
+                        "strong type reference is outside the snippet compile references: {}",
+                        squash(&error)
+                    ),
+                );
+            }
+            Err(error) => self.fail(
+                "P47a unity_execute compile-scope diagnostic",
+                format!("unexpected execute failure: {}", squash(&error)),
+            ),
+        }
+
+        let diagnostic = r#"var typeName = "LocusSelfTestHotAddedBehaviour";
+var assemblies = System.AppDomain.CurrentDomain.GetAssemblies();
+var hotAssemblies = assemblies
+    .Where(a => a.GetName().Name.StartsWith("__LocusHotPatch_"))
+    .Select(a => a.GetName().Name)
+    .OrderBy(n => n)
+    .ToArray();
+print("hot_patch_assemblies=" + string.Join(",", hotAssemblies));
+
+var t = assemblies
+    .Select(a => a.GetType(typeName, false))
+    .FirstOrDefault(x => x != null);
+print("type_found=" + (t != null));
+if (t == null)
+{
+    print("hot_component_status=gap");
+    return null;
+}
+
+print("type_full_name=" + t.FullName);
+print("type_assembly=" + t.Assembly.GetName().Name);
+print("type_location_empty=" + string.IsNullOrEmpty(t.Assembly.Location));
+var isMono = typeof(UnityEngine.MonoBehaviour).IsAssignableFrom(t);
+print("is_mono_behaviour=" + isMono);
+
+var reset = t.GetMethod("ResetCounters", BindingFlags.Public | BindingFlags.Static);
+reset?.Invoke(null, null);
+
+UnityEngine.GameObject go = null;
+UnityEngine.Component comp = null;
+bool addOk = false;
+bool markerOk = false;
+int awakeCount = -1;
+int enableCount = -1;
+int updateCount = -1;
+string lastObjectName = "";
+string monoScriptPath = "<not-run>";
+string serializedScript = "<not-run>";
+
+try
+{
+    go = new UnityEngine.GameObject("LocusHotAddedBehaviourProbe");
+    comp = go.AddComponent(t);
+    addOk = comp != null;
+    print("add_ok=" + addOk);
+    if (comp != null)
+    {
+        print("component_type=" + comp.GetType().FullName);
+        print("component_enabled=" + ((UnityEngine.Behaviour)comp).enabled);
+        var marker = t.GetMethod("Marker", BindingFlags.Public | BindingFlags.Instance)?.Invoke(comp, null);
+        markerOk = object.Equals(marker, 4701);
+        print("marker=" + (marker == null ? "<null>" : marker.ToString()));
+
+        try
+        {
+            var script = UnityEditor.MonoScript.FromMonoBehaviour((UnityEngine.MonoBehaviour)comp);
+            monoScriptPath = script == null ? "<null>" : UnityEditor.AssetDatabase.GetAssetPath(script);
+        }
+        catch (System.Exception ex)
+        {
+            monoScriptPath = "EX:" + ex.GetType().Name + ":" + ex.Message;
+        }
+        print("monoscript_path=" + monoScriptPath);
+
+        try
+        {
+            var serialized = new UnityEditor.SerializedObject(comp);
+            var scriptProperty = serialized.FindProperty("m_Script");
+            var scriptObject = scriptProperty == null ? null : scriptProperty.objectReferenceValue;
+            serializedScript = scriptObject == null ? "<null>" : scriptObject.name;
+        }
+        catch (System.Exception ex)
+        {
+            serializedScript = "EX:" + ex.GetType().Name + ":" + ex.Message;
+        }
+        print("serialized_m_script=" + serializedScript);
+    }
+}
+catch (System.Exception ex)
+{
+    print("add_exception=" + ex.GetType().Name + ":" + ex.Message);
+}
+
+await ctx.WaitFrames(4);
+
+if (t != null)
+{
+    awakeCount = System.Convert.ToInt32(t.GetField("AwakeCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    enableCount = System.Convert.ToInt32(t.GetField("EnableCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    updateCount = System.Convert.ToInt32(t.GetField("UpdateCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    lastObjectName = (string)(t.GetField("LastObjectName", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? "");
+    print("lifecycle_counts=awake:" + awakeCount + ",enable:" + enableCount + ",update:" + updateCount + ",name:" + lastObjectName);
+}
+
+if (go != null)
+{
+    UnityEngine.Object.Destroy(go);
+    await ctx.WaitFrame();
+}
+
+var status = t != null
+    && isMono
+    && addOk
+    && markerOk
+    && awakeCount > 0
+    && enableCount > 0
+    && updateCount > 0
+        ? "ok"
+        : "gap";
+print("hot_component_status=" + status);
+return null;"#;
+
+        match self.execute(diagnostic).await {
+            Ok(output) if output.contains("hot_component_status=ok") => {
+                let mono_script = output
+                    .lines()
+                    .find(|line| line.contains("monoscript_path="))
+                    .map(str::trim)
+                    .unwrap_or("monoscript_path=<missing>");
+                self.pass(
+                    "P47b runtime AddComponent diagnostic",
+                    format!(
+                        "AddComponent(Type), Marker, Awake/OnEnable/Update all worked; {mono_script}"
+                    ),
+                );
+            }
+            Ok(output) => self.fail(
+                "P47b runtime AddComponent diagnostic",
+                format!("hot-added component gap: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(
+                "P47b runtime AddComponent diagnostic",
+                format!("diagnostic snippet failed: {}", squash(&error)),
+            ),
+        }
     }
 
     /// Phase 2b — Release-only positive coverage for caller refresh. The
@@ -3837,7 +5152,10 @@ impl SelfTest {
             return true;
         }
 
-        match coordinator::set_code_optimization(&self.project, "release").await {
+        match self
+            .set_code_optimization_retrying("release", "Release-effective reassert")
+            .await
+        {
             Ok(value) => self.log(format!("  re-asserted codeOptimization → {value}")),
             Err(error) => self.log(format!("  re-assert failed: {error}")),
         }
@@ -4171,17 +5489,21 @@ impl SelfTest {
             .await;
         }
 
-        // N07 — Unity message names are discovered at real compiles only.
+        // N07 — unsupported Unity message names still stay cold. The supported
+        // add-after-load families (PlayerLoop pump + component proxy: physics,
+        // GUI/mouse, animator/particle/controller, lifecycle catch-ups) are
+        // covered positively in P46. OnBecameVisible depends on Camera/Renderer
+        // visibility timing and has no driver, so it stays cold.
         let mut text = neg.clone();
         if swap(
             &mut text,
-            "    public int Solid() { return 1; }\n",
-            "    public int Solid() { return 1; }\n    void Update() { }\n",
+            "    public int Solid() { return 1; }\n}\n",
+            "    public int Solid() { return 1; }\n    void OnBecameVisible() { }\n}\n",
         )
         .is_ok()
         {
             self.expect_cold(
-                "N07 Unity message added",
+                "N07 unsupported Unity message added",
                 NEG_FILE,
                 &text,
                 "new Unity message method",
@@ -4555,6 +5877,451 @@ impl SelfTest {
             .await;
         }
 
+        // ── extra cold surface (N30+) ────────────────────────────────────
+        // Each clones a dedicated baseline and mutates one type, so exactly
+        // one rejection reason fires. None of these files are touched by the
+        // positive phase, so the baseline IS the restore text (no ledger).
+
+        // N30 — class↔struct is a metadata type-kind change.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestKind",
+            "public struct LocusSelfTestKind",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N30 type kind changed (class to struct)",
+                COLD_FILE,
+                &text,
+                "type kind changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N31 — the static constructor already ran in the loaded domain.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "static LocusSelfTestStaticCtor() { Counter = 1; }",
+            "static LocusSelfTestStaticCtor() { Counter = 2; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N31 static constructor changed",
+                COLD_FILE,
+                &text,
+                "static constructor changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N32 — explicit interface implementations dispatch through the
+        // interface map; a detour cannot reach them.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "int ILocusSelfTestExplicit.Plan() { return 1; }",
+            "int ILocusSelfTestExplicit.Plan() { return 2; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N32 explicit interface impl changed",
+                COLD_FILE,
+                &text,
+                "explicit interface implementation changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N33 — appended enum members must carry an integer LITERAL; an
+        // expression cannot be resolved without a real compile.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }",
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2, R = 1 + 2 }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N33 enum appended non-literal value",
+                COLD_FILE,
+                &text,
+                "enum member value not resolvable",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N34 — an appended value that collides with an existing member is
+        // ambiguous at the inlined use sites.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }",
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2, R = 2 }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N34 enum appended conflicting value",
+                COLD_FILE,
+                &text,
+                "enum member value conflicts",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N35 — a removed enum cannot be verified (values are inlined).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }\n\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N35 enum removed",
+                COLD_FILE,
+                &text,
+                "enum removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N36 — a removed const was inlined at every use site.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "    public const int Cap = 5;\n", "").is_ok() {
+            self.expect_cold(
+                "N36 const removed",
+                COLD_FILE,
+                &text,
+                "const removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N37 — field modifiers live in immutable metadata.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "public int Field;", "public readonly int Field;").is_ok() {
+            self.expect_cold(
+                "N37 field modifiers changed",
+                COLD_FILE,
+                &text,
+                "field attributes or modifiers changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N38 — constructor surface changes (the parameterless ctor stays).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public LocusSelfTestCtorDrop(int seed) { Seed = seed; }\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N38 constructor removed",
+                COLD_FILE,
+                &text,
+                "constructor removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N39 — finalizer removal (N06/N19 cover added/changed).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "    ~LocusSelfTestFinDrop() { }\n", "").is_ok() {
+            self.expect_cold(
+                "N39 finalizer removed",
+                COLD_FILE,
+                &text,
+                "finalizer removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N40 — adding an operator: its call sites live outside the batch.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public int Mark() { return Value; }\n",
+            "    public int Mark() { return Value; }\n\n    public static LocusSelfTestOpHost operator +(LocusSelfTestOpHost a, LocusSelfTestOpHost b) { return a; }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N40 operator added",
+                COLD_FILE,
+                &text,
+                "member kind addition not hot-reloadable",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N41 — record types are rejected on PRESENCE. Created fresh and
+        // deleted so the C# 9 syntax never reaches a real compile (a cold
+        // verdict returns before the sidecar would build it).
+        let name = "N41 record type rejected";
+        self.log(format!("— {name}"));
+        match self.write_tracked(RECORD_FILE, RECORD_BASELINE).await {
+            Ok(()) => {
+                let verdict = self.hot_reload(Some(vec![RECORD_FILE.to_string()])).await;
+                let vtext = match &verdict {
+                    Ok(summary) => summary.clone(),
+                    Err(error) => error.clone(),
+                };
+                if vtext.contains("Hot reload not applicable")
+                    && vtext.contains("record types are not hot-reloadable")
+                {
+                    self.pass(name, "record classified cold on presence");
+                } else {
+                    self.fail(
+                        name,
+                        format!("expected the record cold verdict, got: {}", squash(&vtext)),
+                    );
+                }
+                if let Err(error) = self.delete_tracked(RECORD_FILE).await {
+                    self.fail(name, format!("cleanup of {RECORD_FILE} failed: {error}"));
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+
+        // N42–N46 — using-rehook (M6) gates: toggling a using forces the
+        // whole-file re-detour, which fails closed on the one member each
+        // file holds that cannot be re-detoured. (C74 Burst needs the Burst
+        // package; an "unsupported operator" is unreachable — every
+        // overloadable C# operator has a metadata name; a default-interface-
+        // method gate would need runtime DIM support. All three are left to
+        // the HotDiff unit tests.)
+        let mut text = USE_CONST_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseConst",
+            "using System.Text;\n\npublic class LocusSelfTestUseConst",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N42 using-rehook gate: non-literal const",
+                USE_CONST_FILE,
+                &text,
+                "a non-literal const value is inlined under the old bindings",
+                USE_CONST_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_STATIC_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseStatic",
+            "using System.Text;\n\npublic class LocusSelfTestUseStatic",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N43 using-rehook gate: non-literal static initializer",
+                USE_STATIC_FILE,
+                &text,
+                "a non-literal static initializer already ran under the old bindings",
+                USE_STATIC_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_GENERIC_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseGeneric",
+            "using System.Text;\n\npublic class LocusSelfTestUseGeneric",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N44 using-rehook gate: generic member",
+                USE_GENERIC_FILE,
+                &text,
+                "generic members cannot be re-detoured",
+                USE_GENERIC_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_EXPLICIT_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public interface ILocusSelfTestUseExpl",
+            "using System.Text;\n\npublic interface ILocusSelfTestUseExpl",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N45 using-rehook gate: explicit interface impl",
+                USE_EXPLICIT_FILE,
+                &text,
+                "an explicit interface implementation cannot be re-detoured",
+                USE_EXPLICIT_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_FINALIZER_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseFin",
+            "using System.Text;\n\npublic class LocusSelfTestUseFin",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N46 using-rehook gate: finalizer",
+                USE_FINALIZER_FILE,
+                &text,
+                "a finalizer cannot be re-detoured",
+                USE_FINALIZER_BASELINE,
+            )
+            .await;
+        }
+
+        // N47–N52 — partial-type cold boundaries (B6 v1). Body edits are HOT
+        // (P44/P45); these are the structural shapes the per-file diff cannot
+        // reason about across parts.
+
+        // N47 — a vanished partial part is not a type deletion (other parts
+        // may live elsewhere). Pass a replacement type, not a swap.
+        self.expect_cold(
+            "N47 partial part removed",
+            PARTIAL_COLD_FILE,
+            "public class LocusSelfTestPartialColdSpacer\n{\n    public int Mark() { return 1; }\n}\n",
+            "partial type part removed",
+            PARTIAL_COLD_BASELINE,
+        )
+        .await;
+
+        // N48 — a new partial declaration is ambiguous from one file.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public int Read() { return _value; }\n}\n",
+            "    public int Read() { return _value; }\n}\n\npublic partial class LocusSelfTestPartialColdNew\n{\n}\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N48 new partial type declaration",
+                PARTIAL_COLD_FILE,
+                &text,
+                "new partial type declaration",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N49 — the whole-file re-detour cannot cover a partial type's other
+        // parts, so a using change in a partial file fails closed.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public partial class LocusSelfTestPartialCold",
+            "using System.Text;\n\npublic partial class LocusSelfTestPartialCold",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N49 using changed in a partial file",
+                PARTIAL_COLD_FILE,
+                &text,
+                "using directives changed in a file with a partial type",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N50 — adding/dropping a part within one file changes how the
+        // compiler interleaves members.
+        let mut text = PARTIAL_COUNT_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "\npublic partial class LocusSelfTestPartialCount\n{\n    public int B() { return 2; }\n}\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N50 partial part count changed in file",
+                PARTIAL_COUNT_FILE,
+                &text,
+                "partial type part count changed in file",
+                PARTIAL_COUNT_BASELINE,
+            )
+            .await;
+        }
+
+        // N51 — a partial type's initializers compile into ctors that may
+        // live in other parts.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(&mut text, "private int _value = 10;", "private int _value = 20;").is_ok() {
+            self.expect_cold(
+                "N51 partial type initializer changed",
+                PARTIAL_COLD_FILE,
+                &text,
+                "partial type instance initializer changed",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N52 — a partial method whose defining and implementing halves land
+        // in the same (merged) file cannot be paired.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    partial void Hook();\n",
+            "    partial void Hook();\n    partial void Hook() { }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N52 partial method declared twice in this file",
+                PARTIAL_COLD_FILE,
+                &text,
+                "partial method declared twice in this file",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // Intentional integration-coverage gaps (covered by the HotDiff unit
+        // tests, not reproducible here): [BurstCompile] surface needs the Burst
+        // package; an "unsupported operator" is unreachable (every overloadable
+        // C# operator has a metadata name); the default-interface-method gate
+        // needs runtime DIM support the baseline corpus must not assume; and
+        // explicit-interface ADD/REMOVE cannot be isolated without first
+        // tripping another reason (a same-file contract change).
+        self.log(
+            "  note: Burst / unsupported-operator / default-interface-method gate variants are \
+             covered by HotDiff unit tests, not this suite",
+        );
+
         // N20 — an added member with NO reachable caller compiles to a shim
         // but detours nothing: the verdict must say the addition is parked,
         // not pretend nothing changed.
@@ -4862,7 +6629,10 @@ impl SelfTest {
         if original == "release" {
             return;
         }
-        match coordinator::set_code_optimization(&self.project, &original).await {
+        match self
+            .set_code_optimization_retrying(&original, "Code Optimization restore")
+            .await
+        {
             Ok(value) => {
                 self.log(format!("Code Optimization restored to {value}."));
             }
@@ -4929,6 +6699,7 @@ impl SelfTest {
             "preconditions",
             "editor connected in edit mode; features enabled",
         );
+        self.probe_message_driver_capabilities().await;
 
         // Force Release for this suite so the AggressiveInlining sample and
         // caller-refresh path run against Mono's actual inliner. Teardown
@@ -4936,7 +6707,10 @@ impl SelfTest {
         let (_, code_optimization) = coordinator::detect_code_optimization(&self.project).await;
         self.original_code_optimization = code_optimization.clone();
         if code_optimization.as_deref() != Some("release") {
-            match coordinator::set_code_optimization(&self.project, "release").await {
+            match self
+                .set_code_optimization_retrying("release", "preconditions Code Optimization")
+                .await
+            {
                 Ok(value) => {
                     self.release_mode = value == "release";
                     self.log(format!(
@@ -4981,9 +6755,12 @@ impl SelfTest {
 
         // Evolving source ledgers: every step edits from the CURRENT text.
         let mut subject = SUBJECT_BASELINE.to_string();
+        let mut messages = MESSAGE_BASELINE.to_string();
         let mut helper = HELPER_BASELINE.to_string();
 
         self.run_positive_tests(&mut subject, &mut helper).await;
+        self.run_message_driver_tests(&mut messages).await;
+        self.run_hot_added_mono_behaviour_diagnostic().await;
         self.run_release_inline_tests().await;
         self.run_release_inline_multifile_tests().await;
         self.run_inline_force_evaluate_check().await;
@@ -5036,6 +6813,7 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
             original_code_optimization: None,
             last_apply_inlined: false,
             last_apply_summary: String::new(),
+            message_driver_capabilities: MessageDriverCapabilities::default(),
         };
         test.run().await;
         RUNNING.store(false, Ordering::SeqCst);
