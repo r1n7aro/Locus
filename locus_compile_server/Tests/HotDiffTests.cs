@@ -1595,13 +1595,15 @@ namespace Game
     }
 
     [Fact]
-    public void New_unity_message_method_is_cold()
+    public void New_undriven_message_method_is_cold()
     {
+        // OnBecameVisible depends on Camera/Renderer visibility timing and has no
+        // driver, so a new one added after load stays cold.
         var result = Analyze(
             PlayerOld,
             PlayerOld.Replace(
                 "private void Helper(string name) { Debug.Log(name); }",
-                "private void Helper(string name) { Debug.Log(name); }\n        private void FixedUpdate() { }"));
+                "private void Helper(string name) { Debug.Log(name); }\n        private void OnBecameVisible() { }"));
 
         Assert.False(result.Hot);
         Assert.Contains(result.Reasons, r => r.Contains("new Unity message method"));
@@ -1625,6 +1627,175 @@ namespace Game
 
         Assert.False(result.Hot);
         Assert.Contains(result.Reasons, r => r.Contains("new Unity message method"));
+    }
+
+    [Theory]
+    [InlineData("LateUpdate")]
+    [InlineData("FixedUpdate")]
+    public void Added_playerloop_message_is_hot_and_records_pump(string message)
+    {
+        // PlayerOld already declares Update(); adding another parameterless
+        // per-frame callback is now hot — it materializes as a normal instance
+        // shim tagged with its PlayerLoop phase so the runtime pump drives it.
+        var result = Analyze(
+            PlayerOld,
+            PlayerOld.Replace(
+                "private void Helper(string name) { Debug.Log(name); }",
+                "private void Helper(string name) { Debug.Log(name); }\n        private void " + message + "() { }"));
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(message, added.Name);
+        Assert.Equal("player_loop", added.MessageDriverKind);
+        Assert.Equal("Game.Player", added.DeclaringType);
+        Assert.Empty(added.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Added_update_message_is_hot_and_records_pump()
+    {
+        const string oldText = "using UnityEngine; class P : MonoBehaviour { int _n; void Tick() { _n++; } }";
+        const string newText = "using UnityEngine; class P : MonoBehaviour { int _n; void Tick() { _n++; } void Update() { _n++; } }";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal("Update", added.Name);
+        Assert.Equal("player_loop", added.MessageDriverKind);
+    }
+
+    [Theory]
+    [InlineData("private void Update(int frame) { }")]   // parameterized: the engine drives only the no-arg Update
+    [InlineData("private static void Update() { }")]     // static: never a per-instance message
+    [InlineData("private int Update() { return 0; }")]   // non-void: not the message signature
+    [InlineData("protected virtual void Update() { }")]  // virtual: a static shim cannot carry the slot
+    public void Added_update_named_method_the_pump_cannot_drive_is_cold(string declaration)
+    {
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + declaration + " }");
+
+        Assert.False(result.Hot, string.Join("; ", result.Reasons));
+        Assert.DoesNotContain(result.ChangedMethods, m => m.MessageDriverKind.Length > 0);
+    }
+
+    [Theory]
+    [InlineData("OnTriggerEnter", "Collider")]
+    [InlineData("OnTriggerStay", "Collider")]
+    [InlineData("OnTriggerExit", "Collider")]
+    [InlineData("OnCollisionEnter", "Collision")]
+    [InlineData("OnCollisionExit", "Collision")]
+    [InlineData("OnTriggerEnter2D", "Collider2D")]
+    [InlineData("OnCollisionEnter2D", "Collision2D")]
+    [InlineData("OnCollisionStay2D", "Collision2D")]
+    public void Added_physics_message_with_exact_signature_is_hot_via_component_proxy(string message, string param)
+    {
+        // The engine never dispatches a message added after load, but a proxy
+        // MonoBehaviour on the target object can forward these physics events:
+        // the method becomes a normal instance shim tagged component_proxy.
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(
+            prefix + "}",
+            prefix + "void " + message + "(" + param + " other) { }" + " }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.True(added.Added);
+        Assert.Equal(message, added.Name);
+        Assert.Equal("component_proxy", added.MessageDriverKind);
+        Assert.Equal(new[] { param }, added.ParamTypeNames);
+    }
+
+    [Theory]
+    [InlineData("void OnTriggerEnter() { }")]                  // missing the Collider argument
+    [InlineData("void OnTriggerEnter(int other) { }")]         // wrong argument type
+    [InlineData("void OnTriggerEnter(Collision other) { }")]   // 3D trigger takes a Collider, not a Collision
+    [InlineData("void OnCollisionEnter(Collider other) { }")]  // collision takes a Collision, not a Collider
+    [InlineData("static void OnTriggerEnter(Collider other) { }")] // static: never a per-instance message
+    [InlineData("void OnTriggerEnter(Collider a, Collider b) { }")] // wrong arity
+    public void Added_physics_message_with_wrong_signature_is_cold(string declaration)
+    {
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + declaration + " }");
+
+        Assert.False(result.Hot, string.Join("; ", result.Reasons));
+        Assert.DoesNotContain(result.ChangedMethods, m => m.MessageDriverKind.Length > 0);
+    }
+
+    [Theory]
+    // batch 2: GUI / mouse
+    [InlineData("void OnGUI() { }", "OnGUI", "component_proxy")]
+    [InlineData("void OnMouseDown() { }", "OnMouseDown", "component_proxy")]
+    [InlineData("void OnMouseEnter() { }", "OnMouseEnter", "component_proxy")]
+    [InlineData("void OnMouseUpAsButton() { }", "OnMouseUpAsButton", "component_proxy")]
+    // batch 3: animator / particle (parameterless)
+    [InlineData("void OnAnimatorMove() { }", "OnAnimatorMove", "component_proxy")]
+    [InlineData("void OnParticleTrigger() { }", "OnParticleTrigger", "component_proxy")]
+    [InlineData("void OnParticleSystemStopped() { }", "OnParticleSystemStopped", "component_proxy")]
+    // lifecycle
+    [InlineData("void OnDestroy() { }", "OnDestroy", "component_proxy")]
+    [InlineData("void Awake() { }", "Awake", "catch_up")]
+    [InlineData("void Start() { }", "Start", "catch_up")]
+    [InlineData("void OnValidate() { }", "OnValidate", "catch_up")]
+    [InlineData("void Reset() { }", "Reset", "inert")]
+    public void Added_parameterless_driven_message_is_hot_with_expected_kind(string decl, string message, string kind)
+    {
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + decl + " }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.Equal(message, added.Name);
+        Assert.Equal(kind, added.MessageDriverKind);
+        Assert.Empty(added.ParamTypeNames);
+    }
+
+    [Theory]
+    [InlineData("void OnAnimatorIK(int layer) { }", "OnAnimatorIK", "Int32")]
+    [InlineData("void OnParticleCollision(GameObject go) { }", "OnParticleCollision", "GameObject")]
+    [InlineData("void OnControllerColliderHit(ControllerColliderHit hit) { }", "OnControllerColliderHit", "ControllerColliderHit")]
+    public void Added_arg_driven_message_is_hot_component_proxy(string decl, string message, string param)
+    {
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + decl + " }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.Equal(message, added.Name);
+        Assert.Equal("component_proxy", added.MessageDriverKind);
+        Assert.Equal(new[] { param }, added.ParamTypeNames);
+    }
+
+    [Fact]
+    public void Lifecycle_catch_up_message_carries_agent_note()
+    {
+        // Awake's native timing (load) has passed for existing instances, so it is
+        // hot only as a catch-up — the result must explain that to the agent.
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + "void Awake() { }" + " }");
+
+        var added = Assert.Single(result.ChangedMethods);
+        Assert.Equal("catch_up", added.MessageDriverKind);
+        Assert.Contains("Awake", added.MessageNote);
+        Assert.Contains("recompile", added.MessageNote);
+    }
+
+    [Theory]
+    [InlineData("void OnAnimatorIK() { }")]            // missing the int layer
+    [InlineData("void OnAnimatorIK(float layer) { }")] // wrong arg type
+    [InlineData("void OnParticleCollision() { }")]     // missing the GameObject
+    [InlineData("void OnGUI(int x) { }")]              // OnGUI takes no argument
+    [InlineData("void OnDestroy(int x) { }")]          // OnDestroy takes no argument
+    [InlineData("void Awake(int x) { }")]              // Awake takes no argument
+    public void Added_driven_message_with_wrong_signature_is_cold(string decl)
+    {
+        const string prefix = "using UnityEngine; class P : MonoBehaviour { void Tick() { } ";
+        var result = Analyze(prefix + "}", prefix + decl + " }");
+
+        Assert.False(result.Hot, string.Join("; ", result.Reasons));
+        Assert.DoesNotContain(result.ChangedMethods, m => m.MessageDriverKind.Length > 0);
     }
 
     [Fact]

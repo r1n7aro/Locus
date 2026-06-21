@@ -2172,6 +2172,155 @@ namespace StubE2E
     }
 
     [Fact]
+    public void Added_playerloop_message_emits_pump_and_drives_via_shim()
+    {
+        var service = new CompileService();
+        const string playerSource = @"
+namespace PumpE2E
+{
+    public class Player
+    {
+        public int Ticks;
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "PumpE2EPlayer", ("Assets/Player.cs", playerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string withUpdate = playerSource.Replace(
+            "public int Ticks;",
+            "public int Ticks;\n        public void Update() { Ticks += 1; }");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Player.cs", playerSource, withUpdate));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The driver registration carries the coordinates the runtime drives each
+        // frame: the original type (to enumerate live instances) and the static
+        // shim that holds the new body.
+        var pump = Assert.Single(result["messageDrivers"]!.AsArray())!;
+        Assert.Equal("player_loop", pump["kind"]!.GetValue<string>());
+        Assert.Equal("PumpE2E.Player", pump["declaringType"]!.GetValue<string>());
+        Assert.Equal("PumpE2E.Player__LocusShims", pump["shimType"]!.GetValue<string>());
+        Assert.Equal("Update", pump["shimMethod"]!.GetValue<string>());
+        Assert.Equal("Update", pump["message"]!.GetValue<string>());
+        Assert.Equal("", pump["paramType"]!.GetValue<string>());
+
+        // Adding a message detours nothing — the engine never called it, so
+        // there is no original method to redirect, only the new shim.
+        Assert.Empty(result["methods"]!.AsArray());
+
+        // The shim genuinely runs the new body against an instance the pump
+        // would hand it (the leading `self` parameter is the original type).
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("pump-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "PumpE2EPlayer" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type player = original.GetType("PumpE2E.Player", throwOnError: true)!;
+            object instance = Activator.CreateInstance(player)!;
+
+            Type shimType = patch.GetType("PumpE2E.Player__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("Update", BindingFlags.Public | BindingFlags.Static)!;
+            shim.Invoke(null, new[] { instance });
+            shim.Invoke(null, new[] { instance });
+
+            Assert.Equal(2, player.GetField("Ticks")!.GetValue(instance));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_proxy_message_emits_driver_and_two_arg_shim_forwards()
+    {
+        var service = new CompileService();
+        // OnAnimatorIK(int) exercises the two-argument proxy shim with a REAL,
+        // unambiguous engine parameter type (int) and no UnityEngine reference.
+        // (The sidecar classifies by syntactic name and does not verify
+        // MonoBehaviour-derivation or that a same-named custom type is the real
+        // UnityEngine type — the Unity runtime is the authority and validates both
+        // before forwarding. See Proxy_param_matched_by_simple_name... below.)
+        const string source = @"
+namespace ProxyE2E
+{
+    public class Mob
+    {
+        public int LastLayer;
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "ProxyE2EMob", ("Assets/Mob.cs", source));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string withIk = source.Replace(
+            "public int LastLayer;",
+            "public int LastLayer;\n        public void OnAnimatorIK(int layer) { LastLayer = layer; }");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Mob.cs", source, withIk));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var driver = Assert.Single(result["messageDrivers"]!.AsArray())!;
+        Assert.Equal("component_proxy", driver["kind"]!.GetValue<string>());
+        Assert.Equal("ProxyE2E.Mob", driver["declaringType"]!.GetValue<string>());
+        Assert.Equal("ProxyE2E.Mob__LocusShims", driver["shimType"]!.GetValue<string>());
+        Assert.Equal("OnAnimatorIK", driver["shimMethod"]!.GetValue<string>());
+        Assert.Equal("OnAnimatorIK", driver["message"]!.GetValue<string>());
+        Assert.Equal("Int32", driver["paramType"]!.GetValue<string>());
+
+        // The shim is `static void OnAnimatorIK(Mob self, int layer)` — the proxy
+        // forwards (instance, engine arg) to it.
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("proxy-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "ProxyE2EMob" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type mob = original.GetType("ProxyE2E.Mob", throwOnError: true)!;
+            object instance = Activator.CreateInstance(mob)!;
+
+            Type shimType = patch.GetType("ProxyE2E.Mob__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("OnAnimatorIK", BindingFlags.Public | BindingFlags.Static)!;
+            Assert.Equal(2, shim.GetParameters().Length);
+            shim.Invoke(null, new object[] { instance, 3 });
+
+            Assert.Equal(3, mob.GetField("LastLayer")!.GetValue(instance));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Proxy_param_matched_by_simple_name_sidecar_lenient_runtime_validates()
+    {
+        // The sidecar has no semantic model, so it classifies OnTriggerEnter(Collider)
+        // as a component_proxy by the SIMPLE NAME alone — even when `Collider` is a
+        // custom/aliased type, not UnityEngine.Collider. This is intentional: the
+        // Unity runtime (LocusBridge.WireComponentProxy) is the authority and rejects
+        // a same-named non-engine type, leaving it a plain method. This test pins the
+        // documented split so the leniency is deliberate, not an accident.
+        const string baseline = "namespace G { public class Collider { } public class P { } }";
+        const string added = "namespace G { public class Collider { } public class P { void OnTriggerEnter(Collider other) { } } }";
+        var result = HotDiff.Analyze(baseline, added,
+            new CSharpParseOptions(LanguageVersion.CSharp9));
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var m = Assert.Single(result.ChangedMethods);
+        Assert.Equal("component_proxy", m.MessageDriverKind);
+        Assert.Equal(new[] { "Collider" }, m.ParamTypeNames);
+    }
+
+    [Fact]
     public void Cold_change_reports_hot_false_with_reasons()
     {
         var service = new CompileService();
