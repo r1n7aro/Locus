@@ -591,8 +591,8 @@ export function useAppBootstrap() {
   }
 
   // -- Settings callbacks --
-  async function closeSettings() {
-    uiStore.setTab("chat");
+  // 设置项改动已通过各自事件即时生效；离开设置页时再做一次兜底刷新（原 closeSettings 的副作用）。
+  async function refreshAfterSettings() {
     await authStore.checkAuth();
     await modelStore.loadCodexAvailableModels();
     modelStore.resolveSelectedModel(true);
@@ -633,7 +633,7 @@ export function useAppBootstrap() {
     registerListeners,
     cleanup,
     applyWorkingDir,
-    closeSettings,
+    refreshAfterSettings,
     onOnboardingCompleted,
   };
 }

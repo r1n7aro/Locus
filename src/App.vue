@@ -125,7 +125,7 @@ const diffOverlay = provideDiffOverlay();
 // windows fall back to the dedicated inspector window.
 const locusAssetInspectorPanel = useLocusAssetInspectorPanel();
 setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow);
-const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, closeSettings, onOnboardingCompleted } = useAppBootstrap();
+const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, refreshAfterSettings, onOnboardingCompleted } = useAppBootstrap();
 const {
   handleUnityAssetDrag: handleMainUnityAssetDrag,
   handleUnityAssetDrop: handleMainUnityAssetDrop,
@@ -275,6 +275,11 @@ watch(() => uiStore.activeTab, (tab) => {
   if (tab !== "chat") return;
   void chatView.ensureLoaded();
 }, { immediate: true });
+
+// 离开设置页时做一次兜底刷新（顶栏切 Tab 不走 setTab 之外的逻辑，原 closeSettings 的副作用迁移到这里）。
+watch(() => uiStore.activeTab, (tab, prev) => {
+  if (prev === "settings" && tab !== "settings") void refreshAfterSettings();
+});
 
 watch(() => uiStore.collabMounted, (mounted) => {
   if (!mounted) return;
@@ -1061,7 +1066,6 @@ watch(() => projectStore.workingDir, () => {
           :all-models="modelStore.availableModels"
           :agents="agentStore.agents"
           :subagents="agentStore.subagents"
-          @close="closeSettings"
           @auth-changed="handleSettingsAuthChanged"
           @model-defaults-changed="modelStore.applyModelDefaults"
           @codex-transport-changed="modelStore.applyCodexModelConfig"
