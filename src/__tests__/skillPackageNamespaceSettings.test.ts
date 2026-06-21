@@ -9,13 +9,14 @@ function read(relPath: string) {
 }
 
 describe("skill package namespace settings", () => {
-  it("keeps optional namespace settings while default package creation uses short ids", () => {
+  it("keeps backend compatibility while removing the standalone settings entry", () => {
     const rustConfig = read("src-tauri/src/config.rs");
     const rustConfigRegistry = read("src-tauri/src/config_registry.rs");
     const rustSkill = read("src-tauri/src/commands/skill.rs");
     const rustApp = read("src-tauri/src/lib.rs");
     const settingsView = read("src/components/SettingsView.vue");
-    const knowledgeSettings = read("src/components/settings/KnowledgeSettings.vue");
+    const settingsState = read("src/composables/useSettingsState.ts");
+    const uiStore = read("src/stores/ui.ts");
     const knowledgeService = read("src/services/knowledge.ts");
     const skillCreateTool = read("tools/skill_create.json");
     const createSkillDoc = read("knowledge/skill/create-skill.md");
@@ -32,17 +33,11 @@ describe("skill package namespace settings", () => {
     expect(rustApp).toContain("commands::get_default_skill_package_namespace");
     expect(rustApp).toContain("commands::set_default_skill_package_namespace");
 
-    expect(settingsView).toContain("KnowledgeSettings");
-    expect(settingsView).toContain("activeCategory === 'knowledge'");
-    expect(knowledgeSettings).toContain("getDefaultSkillPackageNamespace");
-    expect(knowledgeSettings).toContain("setDefaultSkillPackageNamespace");
-    expect(knowledgeSettings).toContain("settings.knowledge.defaultSkillPackageNamespace");
-    expect(knowledgeSettings).toContain('<div class="settings-section">');
-    expect(knowledgeSettings).toContain('<p class="section-desc">{{ t("settings.knowledge.defaultSkillPackageNamespaceHint") }}</p>');
-    expect(knowledgeSettings).not.toContain("knowledgeList");
-    expect(knowledgeSettings).not.toContain("settings.knowledge.rootLabel");
-    expect(knowledgeSettings).not.toContain("settings.knowledge.typeBreakdown");
-    expect(knowledgeSettings).not.toContain("settings.knowledge.recentTitle");
+    expect(settingsView).not.toContain("KnowledgeSettings");
+    expect(settingsView).not.toContain("activeCategory === 'knowledge'");
+    expect(settingsView).not.toContain("settings.tab.knowledge");
+    expect(settingsState).not.toContain('"knowledge"');
+    expect(uiStore).not.toContain('"knowledge" | "archived"');
     expect(knowledgeService).toContain("get_default_skill_package_namespace");
     expect(knowledgeService).toContain("set_default_skill_package_namespace");
 
@@ -50,7 +45,9 @@ describe("skill package namespace settings", () => {
     expect(skillCreateTool).toContain("studio.tools.asset-audit");
     expect(createSkillDoc).toContain("short kebab-case package ids");
     expect(createSkillDoc).toContain("studio.tools.asset-audit");
-    expect(zh).toContain('"settings.knowledge.defaultSkillPackageNamespace"');
-    expect(en).toContain('"settings.knowledge.defaultSkillPackageNamespace"');
+    expect(zh).not.toContain('"settings.tab.knowledge"');
+    expect(en).not.toContain('"settings.tab.knowledge"');
+    expect(zh).not.toContain('"settings.knowledge.defaultSkillPackageNamespace"');
+    expect(en).not.toContain('"settings.knowledge.defaultSkillPackageNamespace"');
   });
 });

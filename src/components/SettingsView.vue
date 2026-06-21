@@ -26,7 +26,6 @@ import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
-import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
@@ -38,7 +37,6 @@ defineProps<{
 }>();
 
 const emit = defineEmits<{
-  close: [];
   authChanged: [];
   modelDefaultsChanged: [defaults: ModelDefaults];
   codexTransportChanged: [config: CodexModelConfig];
@@ -81,15 +79,7 @@ watch(
 <template>
   <div class="settings-panel">
     <div class="settings-sidebar">
-      <div class="sidebar-header">
-        <span class="sidebar-title">{{ t("settings.title") }}</span>
-        <button class="close-btn" @click="emit('close')" :title="t('settings.close')">
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
-          </svg>
-        </button>
-      </div>
-      <div class="sidebar-nav">
+      <div class="sidebar-nav" :class="{ 'is-cjk': locale === 'zh' }">
         <div class="sidebar-group-label">{{ t("settings.group.models") }}</div>
         <button
           class="sidebar-item"
@@ -162,16 +152,6 @@ watch(
             <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
           </svg>
           <span>{{ t("settings.tab.permissions") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'knowledge' }"
-          @click="activeCategory = 'knowledge'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M3 2.25A1.25 1.25 0 0 1 4.25 1h8.25A1.5 1.5 0 0 1 14 2.5v10A1.5 1.5 0 0 1 12.5 14H4.25A1.25 1.25 0 0 1 3 12.75V2.25zM4.25 2a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25H12.5a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H4.25zM5.5 4h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 4zm0 3h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 7z"/>
-          </svg>
-          <span>{{ t("settings.tab.knowledge") }}</span>
         </button>
         <div class="sidebar-group-label">{{ t("settings.group.general") }}</div>
         <button
@@ -358,10 +338,6 @@ watch(
         <TestingSettings />
       </template>
 
-      <template v-if="activeCategory === 'knowledge'">
-        <KnowledgeSettings />
-      </template>
-
       <template v-if="activeCategory === 'proxy'">
         <ProxySettings />
       </template>
@@ -443,39 +419,32 @@ watch(
   overflow: hidden;
 }
 
-:deep(.sidebar-header) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px 10px;
-  flex-shrink: 0;
-}
-
-:deep(.sidebar-title) {
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-}
-
 :deep(.sidebar-nav) {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 4px 8px 8px;
+  padding: 12px 8px 8px;
 }
 
 :deep(.sidebar-group-label) {
-  padding: 10px 10px 4px;
-  font-size: 10.5px;
+  padding: 12px 10px 5px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: var(--text-tertiary, var(--text-secondary));
+  letter-spacing: 0.5px;
+  /* 微染强调色：比子项更亮且带色相，分组标题一眼可辨；用 token 混合以适配 light/dark */
+  color: color-mix(in srgb, var(--accent-color) 55%, var(--text-secondary) 45%);
   user-select: none;
 }
 
 :deep(.sidebar-group-label:first-child) {
-  padding-top: 2px;
+  padding-top: 4px;
+}
+
+/* 中文等 CJK 文案：大写英文需要的字距会把汉字拉散，这里收紧字距并略放大以保持清晰 */
+:deep(.sidebar-nav.is-cjk .sidebar-group-label) {
+  font-size: 11.5px;
+  letter-spacing: 0;
 }
 
 :deep(.sidebar-item) {
@@ -524,27 +493,6 @@ watch(
   overflow-y: auto;
   min-width: 0;
   background: var(--panel-bg);
-}
-
-:deep(.close-btn) {
-  width: 28px;
-  height: 28px;
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-  box-shadow: none;
-  padding: 0;
-}
-
-:deep(.close-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
 }
 
 :deep(.settings-section) {
