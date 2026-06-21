@@ -1104,6 +1104,10 @@ public sealed class CompileService
         IReadOnlyDictionary<string, NewTypeRegistry.FileEntry> newTypeBaselines =
             _newTypeRegistry.SnapshotFor(request.Params?.DomainGeneration);
         var reeditFileAssemblies = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Feature #5: per-type override of reeditFileAssemblies for sibling types
+        // born into a play-mode-born file after its first batch (they live in
+        // their own assembly). Keyed by the sibling's metadata name.
+        var reeditTypeAssemblies = new Dictionary<string, string>(StringComparer.Ordinal);
         var fileByPathKey = new Dictionary<string, HotDiffFileDto>(StringComparer.Ordinal);
         foreach (HotDiffFileDto f in request.Files)
             if (!string.IsNullOrEmpty(f.Path))
@@ -1114,6 +1118,12 @@ public sealed class CompileService
         // first one — left un-pinned). Declared here because the redirect marks
         // are discovered in the diff loop below.
         var newTypeRegistrations = new List<KeyValuePair<string, NewTypeRegistry.FileEntry>>();
+        // Play-mode-born re-edits that REMOVED a previously hot-applied Unity
+        // message: the runtime drove it by the shim (not native dispatch), so it
+        // is silenced by CLEARING that driver. Collected through the diff loop and
+        // emitted as clear-marker message drivers after the rewrite (so the
+        // plugin's replace-by-source teardown removes the stale pump).
+        var bornDriverClears = new List<BornDriverClear>();
 
         foreach (HotDiffFileDto file in request.Files)
         {
@@ -1129,61 +1139,16 @@ public sealed class CompileService
                 continue;
             }
             // If this file's types live only in a prior hot-patch assembly,
-            // diff against that original text (not the empty coordinator
-            // baseline, which re-classifies the whole type as new every time).
-            // Three outcomes:
-            //  (1) a method-body / using-rehook change → redirect the bodies onto
-            //      the first assembly so EXISTING instances update;
-            //  (2) an unchanged re-send of a file that was only ever load_only'd
-            //      (the coordinator re-ships every dirty file against its empty
-            //      baseline each convergence batch) → a clean no-op: the empty
-            //      diff makes it contribute nothing, no fresh assembly, no cold;
-            //  (3) a structural change, OR a revert to the original text AFTER a
-            //      redirect (the live detour must be cleared), OR an unresolvable
-            //      first assembly → cold, so a recompile converges instead of a
-            //      false-positive load_only that strands instances on a stale
-            //      redirected body.
+            // re-route the diff against the first loaded text (not the empty
+            // coordinator baseline, which re-classifies the whole type as new
+            // every time). RouteBornReedit picks one of: a body / additions /
+            // structural HOT apply onto the first assembly, a clean no-op
+            // (unchanged re-send), or COLD (recompile to converge).
             if (newTypeBaselines.TryGetValue(NormalizePathKey(file.Path!), out NewTypeRegistry.FileEntry? bornEntry))
             {
-                bool canRedirect =
-                    request.ReferenceSessionImages &&
-                    _imageRegistry.Contains(request.Params?.DomainGeneration, bornEntry.OriginalAssembly);
-                HotDiffFileResult? reedit = canRedirect
-                    ? HotDiff.Analyze(bornEntry.OriginalText, file.NewText!, parseOptions)
-                    : null;
-
-                if (reedit != null && IsRedirectableReedit(reedit) && reedit.ChangedMethods.Count > 0)
-                {
-                    // (1) body / using-rehook redirect.
-                    diff = reedit;
-                    reeditFileAssemblies[file.Path!] = bornEntry.OriginalAssembly;
-                    // Record that a detour is now live on this file (committed on
-                    // accept), so a later revert to the original text is steered
-                    // cold (clears it) rather than passing as a stranding no-op.
-                    if (!bornEntry.Redirected)
-                        newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
-                            NormalizePathKey(file.Path!),
-                            new NewTypeRegistry.FileEntry
-                            {
-                                OriginalText = bornEntry.OriginalText,
-                                OriginalAssembly = bornEntry.OriginalAssembly,
-                                Redirected = true,
-                            }));
-                }
-                else if (reedit != null && IsRedirectableReedit(reedit) && !bornEntry.Redirected)
-                {
-                    // (2) unchanged re-send of a never-redirected file → no-op.
-                    diff = reedit;
-                }
-                else
-                {
-                    // (3) structural / revert-after-redirect / unresolvable.
-                    var cold = new HotDiffFileResult { Hot = false };
-                    cold.Reasons.Add(
-                        "play-mode-created type re-edited with a non-body change, or reverted after a hot " +
-                        "redirect; existing instances cannot be safely updated in place — recompile to converge");
-                    diff = cold;
-                }
+                diff = RouteBornReedit(
+                    file, bornEntry, request, parseOptions,
+                    reeditFileAssemblies, reeditTypeAssemblies, newTypeRegistrations, bornDriverClears);
             }
             if (forceDetours.TryGetValue(NormalizePathKey(file.Path!), out HashSet<string>? methodKeys))
                 ApplyForcedDetours(file.Path!, file.NewText, parseOptions, diff, methodKeys);
@@ -1295,7 +1260,8 @@ public sealed class CompileService
             allowUnsafe: request.Params?.AllowUnsafe ?? false,
             runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells),
             inlineClones: inlineClones,
-            reeditFileAssemblies: reeditFileAssemblies);
+            reeditFileAssemblies: reeditFileAssemblies,
+            reeditTypeAssemblies: reeditTypeAssemblies);
 
         // B6 fail-closed gate: every batch-declared partial type must
         // account, across its disk parts, for every member the ORIGINAL
@@ -1379,7 +1345,7 @@ public sealed class CompileService
                     .FirstOrDefault(r => r.MemberKey == memberKey)?.Entry;
                 if (shim == null)
                     continue;
-                messageDrivers.Add(new JsonObject
+                var driver = new JsonObject
                 {
                     ["kind"] = added.MessageDriverKind,
                     ["declaringType"] = added.DeclaringType,
@@ -1393,7 +1359,19 @@ public sealed class CompileService
                     // empty when the driver matches native behavior.
                     ["note"] = added.MessageNote,
                     ["sourcePath"] = filePath,
-                });
+                };
+                // Tier-2: an added message on a play-mode-born type drives instances
+                // that live ONLY in a hot-patch assembly. Pin it so the runtime
+                // resolves declaringType THERE (its default resolver skips
+                // __LocusHotPatch_ assemblies, exactly like the M2 method detour).
+                // ReeditAssemblyFor resolves PER TYPE — a late-born sibling (feature
+                // #5) and its NESTED types live in their OWN assembly, not the file's
+                // first one. Null (the ordinary compiled-type case) → the runtime
+                // uses the default cross-domain resolution, unchanged.
+                string? driverOriginalAssembly = batch.ReeditAssemblyFor(filePath, added.DeclaringType);
+                if (driverOriginalAssembly != null)
+                    driver["originalAssembly"] = driverOriginalAssembly;
+                messageDrivers.Add(driver);
             }
             foreach (PatchNewType newType in rewrite.NewTypes)
             {
@@ -1418,18 +1396,56 @@ public sealed class CompileService
             // Unity loaded the patch (below) — if that call is dropped (e.g. a
             // transport error), the entry is lost and the file's next re-edit
             // simply falls back to load_only, exactly as before this feature.
+            // An ALREADY-registered file is excluded: its re-edits route through
+            // RouteBornReedit (which re-commits the birth baseline) and must not
+            // re-birth here against the current text — that would erase the
+            // baseline and re-load the live type into a fresh assembly.
             if (rewrite.NewTypes.Any(t => t.IsTopLevel) &&
+                !newTypeBaselines.ContainsKey(NormalizePathKey(filePath)) &&
                 fileByPathKey.TryGetValue(NormalizePathKey(filePath), out HotDiffFileDto? bornFile) &&
                 string.IsNullOrWhiteSpace(bornFile.OldText))
             {
                 newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
                     NormalizePathKey(filePath),
-                    new NewTypeRegistry.FileEntry { OriginalText = bornFile.NewText! }));
+                    new NewTypeRegistry.FileEntry
+                    {
+                        OriginalText = bornFile.NewText!,
+                        // At birth the loaded text IS the live text — the baseline for
+                        // detecting members removed by a later re-edit.
+                        LastAppliedText = bornFile.NewText!,
+                    }));
             }
+        }
+
+        // Clear-markers (play-mode-born feature #1 / [P1] fix): a re-edit removed
+        // a Unity message that an earlier hot patch had wired to the runtime pump.
+        // The pump drives that message by the SHIM, not native dispatch, so the
+        // only way to stop it is to clear the driver. Emit a marker carrying the
+        // file as the touched source; the plugin's replace-by-source teardown
+        // clears every driver registered for the file and re-adds only those still
+        // present (this removed one is not). kind="clear"/empty shim keeps it out
+        // of the re-add loop, and a non-empty messageDrivers list keeps the Rust
+        // "nothing detourable" early-return from skipping Unity when the surviving
+        // payload (e.g. a parked field add) is otherwise empty.
+        foreach (BornDriverClear clear in bornDriverClears)
+        {
+            messageDrivers.Add(new JsonObject
+            {
+                ["kind"] = "clear",
+                ["declaringType"] = clear.DeclaringType,
+                ["shimType"] = "",
+                ["shimMethod"] = "",
+                ["message"] = clear.Message,
+                ["paramType"] = "",
+                ["note"] = "",
+                ["sourcePath"] = clear.SourcePath,
+                ["originalAssembly"] = clear.OriginalAssembly,
+            });
         }
 
         if (methods.Count == 0 && newTypes.Count == 0 &&
             fieldStoreRegistrations.Count == 0 &&
+            messageDrivers.Count == 0 &&
             shimRegistrations.All(r => r.Entry.Kind == "tombstone"))
         {
             // Nothing to detour and nothing new to load: pure deletions
@@ -1437,9 +1453,20 @@ public sealed class CompileService
             // correct, the members are merely unreachable) and/or pure
             // accessibility narrowing. Commit tombstones so later batches
             // fail deterministically on references; skip the pointless
-            // assembly.
+            // assembly. (A clear-marker keeps messageDrivers non-empty so a
+            // driver-clearing re-edit still ships to Unity, not a no-op.)
             if (!string.IsNullOrEmpty(generation))
+            {
                 CommitShimRegistrations(generation!, shimRegistrations);
+                // A play-mode-born re-edit that only removed a post-birth member /
+                // field produces this empty-patch no-op, but its registry re-commit
+                // (advancing LastAppliedText so the live baseline does not drift) is
+                // still pending — commit it here, since the emit path below is
+                // skipped. No new sibling can reach this branch (a load_only is not
+                // a no-op), so no after-emit assembly pin is owed.
+                if (newTypeRegistrations.Count > 0)
+                    _newTypeRegistry.Commit(generation!, newTypeRegistrations);
+            }
             var verdict = new JsonObject
             {
                 ["hot"] = true,
@@ -1512,6 +1539,14 @@ public sealed class CompileService
         foreach (var registration in newTypeRegistrations)
             if (string.IsNullOrEmpty(registration.Value.OriginalAssembly))
                 registration.Value.OriginalAssembly = assemblyName;
+        // Feature #5: a genuinely-new SIBLING was load_only'd into THIS assembly;
+        // pin it so the sibling's later re-edits redirect onto it. Existing
+        // siblings already carry their (different) assembly and are left alone.
+        foreach (var registration in newTypeRegistrations)
+            if (registration.Value.Siblings != null)
+                foreach (NewTypeRegistry.SiblingType sibling in registration.Value.Siblings.Values)
+                    if (string.IsNullOrEmpty(sibling.Assembly))
+                        sibling.Assembly = assemblyName;
 
         if (request.RegisterImage && !string.IsNullOrEmpty(generation))
         {
@@ -1921,29 +1956,424 @@ public sealed class CompileService
     private static string NormalizePathKey(string path) =>
         path.Replace('\\', '/').ToLowerInvariant();
 
-    /// <summary>A re-edit diff against a play-mode-born type's original text is
-    /// safe to apply in place when it touches NO structural surface: no new or
-    /// removed type/member, no field, signature or enum change, every changed
-    /// method non-added. That admits method-BODY edits, whole-file
-    /// using-directive rehooks (M6, which lists every detourable member as
-    /// changed), AND the empty diff of an unchanged re-send — all ABI-safe
-    /// because, with no field change, an existing instance's layout still
-    /// matches the rewritten body. The caller splits on ChangedMethods.Count:
-    /// non-empty → redirect; empty → no-op. A structural change (e.g. a
-    /// combined using+field edit, which has non-empty FieldChanges) fails this
-    /// and is steered cold.</summary>
-    private static bool IsRedirectableReedit(HotDiffFileResult diff)
+    /// <summary>A play-mode-born re-edit that REMOVED a Unity message an earlier
+    /// hot patch wired to the runtime pump: the pump drove it through the shim,
+    /// not native dispatch, so it is silenced by CLEARING the driver (a
+    /// clear-marker), not by an empty-body stub. Carries the file (the
+    /// replace-by-source key) and the first assembly.</summary>
+    private sealed class BornDriverClear
     {
-        return diff.Hot
-            && diff.SyntaxError == null
-            && diff.NewTypes.Count == 0
-            && diff.FieldChanges.Count == 0
-            && diff.RemovedMembers.Count == 0
-            && diff.RemovedTypes.Count == 0
-            && diff.EnumAdditions.Count == 0
-            && diff.RequiresCallerCheck.Count == 0
-            && diff.ChangedMethods.All(m => !m.Added);
+        public string SourcePath = "";
+        public string DeclaringType = "";
+        public string Message = "";
+        public string OriginalAssembly = "";
     }
+
+    /// <summary>Route a re-edit of a play-mode-born file (whose types live only
+    /// in a prior hot-patch assembly). The cumulative diff against the BIRTH text
+    /// drives the patch — body redirects, additions (M2/M4/driver), removals (M5
+    /// tombstone/stub), field add/remove/retype (M4), enum additions (H7e) — all
+    /// pinned to the first assembly so EXISTING instances update. A second diff
+    /// against the LAST APPLIED text catches what the birth diff cannot: a member
+    /// ADDED after birth and now removed (e.g. an Update() added by an earlier
+    /// patch, then deleted), which the birth diff never saw because the member
+    /// was never in OriginalText. SIBLING types added after the first batch
+    /// (feature #5) are folded in via their own per-type baseline and assembly.
+    /// Outcomes:
+    ///   • HOT — the cumulative diff, assemblies pinned per type, post-birth
+    ///     removals folded in (tombstones; removed messages → clear-markers),
+    ///     sibling additions load_only'd and registered, sibling re-edits
+    ///     redirected onto their own assembly;
+    ///   • NO-OP — an unchanged re-send of a never-touched file;
+    ///   • COLD — a shape change (base type / kind / record), a redirected body
+    ///     reverted to its birth version, a removal on a sibling type, or an
+    ///     unresolvable assembly.
+    /// Mutates <paramref name="reeditFileAssemblies"/> /
+    /// <paramref name="reeditTypeAssemblies"/> (detour origins),
+    /// <paramref name="newTypeRegistrations"/> (live-text re-commit) and
+    /// <paramref name="bornDriverClears"/> (removed-message clear-markers).</summary>
+    private HotDiffFileResult RouteBornReedit(
+        HotDiffFileDto file,
+        NewTypeRegistry.FileEntry bornEntry,
+        CompileHotPatchRequestDto request,
+        CSharpParseOptions parseOptions,
+        Dictionary<string, string> reeditFileAssemblies,
+        Dictionary<string, string> reeditTypeAssemblies,
+        List<KeyValuePair<string, NewTypeRegistry.FileEntry>> newTypeRegistrations,
+        List<BornDriverClear> bornDriverClears)
+    {
+        string pathKey = NormalizePathKey(file.Path!);
+        string? generation = request.Params?.DomainGeneration;
+
+        // The redirect target (first assembly) must still be referenceable — the
+        // patch's layout guard resolves the original type there.
+        bool canRedirect =
+            request.ReferenceSessionImages &&
+            _imageRegistry.Contains(generation, bornEntry.OriginalAssembly);
+        if (!canRedirect)
+            return ColdBornReedit("the first hot-patch assembly is no longer resolvable; recompile to converge");
+
+        HotDiffFileResult cumulative = HotDiff.Analyze(bornEntry.OriginalText, file.NewText!, parseOptions);
+
+        // Truly structural — base type / kind / record: HotDiff already classified
+        // the cumulative diff cold (no shim or store can express it).
+        if (!cumulative.Hot)
+            return ColdBornReedit(cumulative.Reasons.DefaultIfEmpty(
+                "the re-edit changes the type's shape; recompile to converge").First());
+
+        // Feature #5: SIBLING types. Fold already-born siblings' body/additive
+        // changes into `cumulative` (redirected onto their OWN assembly), collect
+        // genuinely-new ones (load_only this batch + register), and steer a sibling
+        // TYPE removal / birth-member removal cold (conservative). Post-birth-added
+        // sibling members removed are caught by the file live diff below — exactly
+        // like first-batch types.
+        var newSiblings = new List<string>();
+        HotDiffFileResult? siblingCold = HandleBornSiblings(
+            file, bornEntry, generation, cumulative, parseOptions, reeditTypeAssemblies, newSiblings);
+        if (siblingCold != null)
+            return siblingCold;
+
+        string liveBaseline = string.IsNullOrEmpty(bornEntry.LastAppliedText)
+            ? bornEntry.OriginalText
+            : bornEntry.LastAppliedText;
+        HotDiffFileResult live = HotDiff.Analyze(liveBaseline, file.NewText!, parseOptions);
+
+        HashSet<string> cumulativeKeys = CumulativeMemberKeys(cumulative);
+
+        // Members the LIVE text carried but the new text dropped, that the birth
+        // diff cannot see (post-birth additions never existed in OriginalText): a
+        // removed Unity MESSAGE → clear its driver; a removed plain member →
+        // tombstone. Birth-member removals are already in cumulative.RemovedMembers
+        // (skipped here via cumulativeKeys). SIBLING members are NOT skipped: the
+        // file live diff is the ONLY place a member ADDED after the sibling's birth
+        // and now removed surfaces (the sibling diff is against its FIXED BirthText,
+        // which never had it). They route through the same machinery — a removed
+        // sibling MESSAGE clears via a clear-marker (its driver was registered under
+        // this file path, so ClearSource(file) tears it down regardless of which
+        // assembly the type lives in), and the clear-marker's originalAssembly is
+        // resolved per-type. Defensive: only trust `live` when it is itself hot
+        // (LastAppliedText is always birth + hot changes, so a cold `live` cannot
+        // actually arise here).
+        var removedMagic = new List<HotDiffRemovedMember>();
+        var removedNormal = new List<HotDiffRemovedMember>();
+        bool removedLiveField = false;
+        bool revertToBirth = false;
+        if (live.Hot)
+        {
+            foreach (HotDiffRemovedMember removed in live.RemovedMembers)
+            {
+                string key = MemberSurfaceRegistry.MemberKey(
+                    removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic);
+                if (cumulativeKeys.Contains(key))
+                    continue; // a birth / sib-birth member — the cumulative diff handles it
+                if (removed.IsUnityMagic)
+                    removedMagic.Add(removed);
+                else
+                    removedNormal.Add(removed);
+            }
+
+            // A FIELD added after birth and now removed surfaces only in
+            // live.FieldChanges (Kind="removed"), never RemovedMembers. There is
+            // nothing to emit (the side store is simply abandoned, harmless — no
+            // live instance referenced it), but it must NOT pass as an unchanged
+            // re-send: routing it hot advances LastAppliedText so the baseline does
+            // not drift. A BIRTH / sib-birth field removal is in
+            // cumulative.FieldChanges (layout placeholder) — skip those.
+            var cumulativeFieldKeys = new HashSet<string>(
+                cumulative.FieldChanges.Select(FieldKey), StringComparer.Ordinal);
+            removedLiveField = live.FieldChanges.Any(f =>
+                string.Equals(f.Kind, "removed", StringComparison.Ordinal) &&
+                !cumulativeFieldKeys.Contains(FieldKey(f)));
+
+            // A redirected BODY reverted to its birth version: the live text
+            // changed a member that the new text returns to its birth body (so the
+            // cumulative/sibling diff shows no change for it — its key is absent
+            // from cumulativeKeys, which already folds in the merged sibling diff).
+            // A live detour cannot be un-redirected in place → recompile. Siblings
+            // are NOT excluded: a sibling body revert is exactly the case the
+            // sibling's fixed-BirthText diff misses, and like a first-batch revert
+            // it must go cold (the only removal we cannot do hot).
+            revertToBirth = live.ChangedMethods.Any(m =>
+                !m.Added &&
+                !cumulativeKeys.Contains(MemberSurfaceRegistry.MemberKey(
+                    m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic)));
+        }
+        if (revertToBirth)
+            return ColdBornReedit("a redirected method body was reverted to its birth version; recompile to converge");
+
+        bool hasRemovedLiveAdditions = removedMagic.Count > 0 || removedNormal.Count > 0 || removedLiveField;
+        bool cumulativeHasChange = CumulativeHasAnyChange(cumulative);
+
+        // (NO-OP) nothing to apply: an unchanged re-send — the new text equals the
+        // last applied text (an already-born sibling whose body is unchanged folds
+        // to an empty diff), or the birth text of a never-touched file. The
+        // coordinator re-ships every dirty file each convergence batch, so this
+        // MUST stay a clean no-op, never cold (the self-test replay relies on it).
+        // A genuine REVERT was already steered cold above (revertToBirth), and
+        // post-birth removals are folded in below — so an empty diff here is truly
+        // nothing to do. The Redirected flag is deliberately NOT consulted: a
+        // redirected file re-sending its applied text is a no-op, not a revert.
+        if (!cumulativeHasChange && !hasRemovedLiveAdditions)
+            return cumulative; // empty diff contributes nothing
+
+        // (HOT) the cumulative diff drives the patch; fold in post-birth removals.
+        // A play-mode-born type has NO compiled call sites (it lives only in a
+        // dynamic assembly), so the M3 caller scan is vacuous AND would cold on
+        // "no project assemblies". Drop the checks — by construction no compiled
+        // caller of this type can exist to break.
+        cumulative.RequiresCallerCheck.Clear();
+
+        foreach (HotDiffRemovedMember removed in removedNormal)
+            cumulative.RemovedMembers.Add(TombstoneOnly(removed));
+        foreach (HotDiffRemovedMember removed in removedMagic)
+        {
+            // A removed added MESSAGE needs ONLY a clear-marker (stop the pump) —
+            // no tombstone. A tombstone would force the rewriter to emit the
+            // (otherwise unchanged) born type into this patch assembly as a
+            // name-colliding duplicate of the first assembly's type; a pure clear
+            // instead compiles to an empty assembly whose sole job is to carry the
+            // clear-marker to Unity.
+            bornDriverClears.Add(new BornDriverClear
+            {
+                SourcePath = file.Path!,
+                DeclaringType = removed.DeclaringType,
+                Message = removed.Name,
+                // Per-type: a late-born sibling's message (and its nested types)
+                // lived in its OWN assembly (informational — the clear keys off
+                // sourcePath, but keep it consistent with how the driver was pinned).
+                OriginalAssembly = PatchBatchContext.ReeditTypeAssembly(reeditTypeAssemblies, removed.DeclaringType)
+                    ?? bornEntry.OriginalAssembly,
+            });
+        }
+
+        reeditFileAssemblies[file.Path!] = bornEntry.OriginalAssembly;
+        // Re-commit with the new live text and the sibling set. Redirected reflects
+        // whether any patch state REMAINS: a pure driver-clear back to the birth
+        // text leaves none, so a later unchanged re-send is a clean no-op.
+        // Committed on image accept; genuinely-new siblings get their assembly
+        // pinned after emit.
+        newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+            pathKey,
+            BuildBornRecommit(bornEntry, file.NewText!, cumulativeHasChange, newSiblings)));
+        return cumulative;
+    }
+
+    /// <summary>Feature #5: fold sibling top-level types into a born re-edit.
+    /// Returns a COLD result to abort, or null to proceed (mutating
+    /// <paramref name="cumulative"/>, <paramref name="reeditTypeAssemblies"/> and
+    /// <paramref name="newSiblings"/>):
+    ///   • a registered sibling missing from the new text → COLD (removed type);
+    ///   • a NewType already registered as a sibling → redirect: diff it against
+    ///     its OWN birth text, fold its hot changes into the cumulative diff, and
+    ///     pin its assembly (a sib-BIRTH member removal on it is conservatively
+    ///     COLD; a member added AFTER birth and removed is caught hot by the file
+    ///     live diff in the caller);
+    ///   • a NewType not yet registered → a genuinely-new sibling: leave it in
+    ///     cumulative.NewTypes (load_only this batch) and record it for
+    ///     registration.</summary>
+    private HotDiffFileResult? HandleBornSiblings(
+        HotDiffFileDto file,
+        NewTypeRegistry.FileEntry bornEntry,
+        string? generation,
+        HotDiffFileResult cumulative,
+        CSharpParseOptions parseOptions,
+        Dictionary<string, string> reeditTypeAssemblies,
+        List<string> newSiblings)
+    {
+        if (bornEntry.Siblings != null)
+        {
+            // A registered sibling that VANISHED from the new text is a removed
+            // type — its live instances cannot be cleaned up in place. Recompile.
+            HashSet<string> present = TopLevelTypeMetadataNames(file.NewText!, parseOptions);
+            foreach (string sib in bornEntry.Siblings.Keys)
+                if (!present.Contains(sib))
+                    return ColdBornReedit("a sibling type was removed from a play-mode-born file; recompile to converge");
+        }
+
+        if (cumulative.NewTypes.Count == 0)
+            return null;
+
+        var alreadyBorn = new List<string>();
+        foreach (string nt in cumulative.NewTypes)
+        {
+            // Only TOP-LEVEL types are tracked as siblings. A NESTED new type
+            // (metadata names nest with '+') belongs to its parent — it is
+            // load_only'd WITH the parent and matched via BelongsToType, never
+            // registered on its own (else the next re-edit's top-level-only
+            // presence check would mistake it for a removed sibling and cold).
+            if (nt.Contains('+'))
+                continue;
+            if (bornEntry.Siblings != null && bornEntry.Siblings.ContainsKey(nt))
+            {
+                alreadyBorn.Add(nt);
+            }
+            else
+            {
+                // Genuinely new: load_only this batch (stays in NewTypes), register.
+                newSiblings.Add(nt);
+            }
+        }
+        // Drop already-born siblings AND their nested types from the load_only set
+        // (they redirect via the sibling's own diff — re-loading would strand the
+        // sibling's live instances). Genuinely-new siblings and their nested types
+        // stay, to be load_only'd this batch.
+        cumulative.NewTypes.RemoveAll(nt => alreadyBorn.Any(sib => BelongsToType(nt, sib)));
+
+        // [P2] A remaining NESTED NewType whose top-level parent is NOT a
+        // genuinely-new sibling means a nested type was added to an ALREADY-LOADED
+        // type (a first-batch type, or an already-born sibling — the latter also
+        // colds in the loop below). You cannot add a nested type to a loaded type
+        // in place, and it would otherwise re-load every resend (cumulative.NewTypes
+        // never empties → never a clean no-op). Cold.
+        foreach (string nt in cumulative.NewTypes)
+        {
+            int plus = nt.IndexOf('+');
+            if (plus >= 0 && !newSiblings.Contains(nt.Substring(0, plus)))
+                return ColdBornReedit("a nested type was added to an existing play-mode-born type; recompile to converge");
+        }
+
+        foreach (string sib in alreadyBorn)
+        {
+            NewTypeRegistry.SiblingType entry = bornEntry.Siblings![sib];
+            if (!_imageRegistry.Contains(generation, entry.Assembly))
+                return ColdBornReedit("a sibling type's assembly is no longer resolvable; recompile to converge");
+
+            HotDiffFileResult sibDiff = HotDiff.Analyze(entry.BirthText, file.NewText!, parseOptions);
+            if (!sibDiff.Hot)
+                return ColdBornReedit("a sibling type changed shape; recompile to converge");
+            // Conservative boundary: a member/type REMOVAL or signature change on a
+            // sibling (which surfaces RemovedMembers/RemovedTypes) → recompile,
+            // rather than re-deriving the per-sibling clear-marker / tombstone logic.
+            if (sibDiff.RemovedMembers.Any(r => BelongsToType(r.DeclaringType, sib)) ||
+                sibDiff.RemovedTypes.Any(t => BelongsToType(t.MetadataName, sib)) ||
+                sibDiff.NewTypes.Any(n => BelongsToType(n, sib)))
+            {
+                return ColdBornReedit("a member was removed from, or a nested type added to, a sibling type; recompile to converge");
+            }
+
+            MergeSiblingInto(cumulative, sibDiff, sib);
+            reeditTypeAssemblies[sib] = entry.Assembly;
+        }
+        return null;
+    }
+
+    /// <summary>Merge a sibling's own-baseline diff entries (only those belonging
+    /// to <paramref name="sib"/>) into the file's cumulative diff, so the
+    /// whole-file rewrite redirects/extends the sibling onto its own assembly.</summary>
+    private static void MergeSiblingInto(HotDiffFileResult cumulative, HotDiffFileResult sibDiff, string sib)
+    {
+        cumulative.ChangedMethods.AddRange(sibDiff.ChangedMethods.Where(m => BelongsToType(m.DeclaringType, sib)));
+        cumulative.FieldChanges.AddRange(sibDiff.FieldChanges.Where(f => BelongsToType(f.DeclaringType, sib)));
+        cumulative.EnumAdditions.AddRange(sibDiff.EnumAdditions.Where(e => BelongsToType(e.EnumType, sib)));
+        foreach (string pt in sibDiff.PatchedTypes.Where(p => BelongsToType(p, sib)))
+            if (!cumulative.PatchedTypes.Contains(pt))
+                cumulative.PatchedTypes.Add(pt);
+    }
+
+    /// <summary>True when <paramref name="typeName"/> is the sibling type or one
+    /// of its nested types (metadata names nest with '+').</summary>
+    private static bool BelongsToType(string typeName, string sib) =>
+        string.Equals(typeName, sib, StringComparison.Ordinal) ||
+        typeName.StartsWith(sib + "+", StringComparison.Ordinal);
+
+    /// <summary>Metadata names of every TOP-LEVEL type (class/struct/interface/
+    /// record/enum) declared in <paramref name="text"/>.</summary>
+    private static HashSet<string> TopLevelTypeMetadataNames(string text, CSharpParseOptions parseOptions)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var root = (CompilationUnitSyntax)CSharpSyntaxTree.ParseText(text, parseOptions).GetRoot();
+        foreach (BaseTypeDeclarationSyntax decl in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+        {
+            if (decl.Ancestors().OfType<BaseTypeDeclarationSyntax>().Any())
+                continue; // nested
+            names.Add(HotDiff.MetadataName(decl));
+        }
+        return names;
+    }
+
+    /// <summary>Build the live-text re-commit for a born file, carrying the
+    /// sibling set forward: existing siblings keep their (pinned) assembly, and
+    /// each genuinely-new sibling is added with this file's birth text and an
+    /// EMPTY assembly to be pinned after emit.</summary>
+    private static NewTypeRegistry.FileEntry BuildBornRecommit(
+        NewTypeRegistry.FileEntry bornEntry, string newText, bool redirected, List<string> newSiblings)
+    {
+        Dictionary<string, NewTypeRegistry.SiblingType>? siblings = null;
+        if (bornEntry.Siblings != null || newSiblings.Count > 0)
+        {
+            siblings = new Dictionary<string, NewTypeRegistry.SiblingType>(StringComparer.Ordinal);
+            if (bornEntry.Siblings != null)
+                foreach (var kv in bornEntry.Siblings)
+                    siblings[kv.Key] = kv.Value; // already pinned; never re-pinned below
+            foreach (string sib in newSiblings)
+                siblings[sib] = new NewTypeRegistry.SiblingType { Assembly = "", BirthText = newText };
+        }
+        return new NewTypeRegistry.FileEntry
+        {
+            OriginalText = bornEntry.OriginalText,
+            OriginalAssembly = bornEntry.OriginalAssembly,
+            Redirected = redirected,
+            LastAppliedText = newText,
+            Siblings = siblings,
+        };
+    }
+
+    /// <summary>Member-identity keys the cumulative (birth) diff already knows
+    /// about — changed (added or not) and removed members. A live-diff removal or
+    /// change whose key is ABSENT was added after birth (removal) or reverted to
+    /// the birth body (change).</summary>
+    private static HashSet<string> CumulativeMemberKeys(HotDiffFileResult diff)
+    {
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (HotDiffMethod m in diff.ChangedMethods)
+            keys.Add(MemberSurfaceRegistry.MemberKey(m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic));
+        foreach (HotDiffRemovedMember r in diff.RemovedMembers)
+            keys.Add(MemberSurfaceRegistry.MemberKey(r.DeclaringType, r.Name, r.ParamTypeNames, r.IsStatic));
+        return keys;
+    }
+
+    /// <summary>Any hot-applicable change in the cumulative (birth) diff. An
+    /// all-false result with no post-birth removals is the unchanged-re-send
+    /// no-op.</summary>
+    private static bool CumulativeHasAnyChange(HotDiffFileResult diff)
+    {
+        return diff.ChangedMethods.Count > 0
+            || diff.NewTypes.Count > 0
+            || diff.RemovedMembers.Count > 0
+            || diff.RemovedTypes.Count > 0
+            || diff.FieldChanges.Count > 0
+            || diff.EnumAdditions.Count > 0
+            || diff.RequiresCallerCheck.Count > 0;
+    }
+
+    /// <summary>A post-birth-added member removed: tombstone it (so later
+    /// references fail deterministically) but DON'T re-materialize a magic stub —
+    /// a play-mode-born message was driven by the runtime pump (cleared
+    /// separately via a clear-marker), never by native dispatch, so a stub detour
+    /// would target a call the engine never makes.</summary>
+    private static HotDiffRemovedMember TombstoneOnly(HotDiffRemovedMember removed)
+    {
+        return new HotDiffRemovedMember
+        {
+            DeclaringType = removed.DeclaringType,
+            Name = removed.Name,
+            ParamTypeNames = removed.ParamTypeNames,
+            IsStatic = removed.IsStatic,
+            IsUnityMagic = false,
+            StubSource = null,
+        };
+    }
+
+    private static HotDiffFileResult ColdBornReedit(string reason)
+    {
+        var cold = new HotDiffFileResult { Hot = false };
+        cold.Reasons.Add(reason);
+        return cold;
+    }
+
+    /// <summary>Field identity across diffs (declaring type + name + staticness).</summary>
+    private static string FieldKey(HotDiffFieldChange f) =>
+        f.DeclaringType + "|field|" + f.Name + (f.IsStatic ? "|s" : "|i");
 
     /// <summary>When a partial type's instance fields are split across
     /// SEVERAL batch files, the patch type's field order is the source-merge

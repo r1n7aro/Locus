@@ -62,6 +62,41 @@ public sealed class NewTypeRegistry
         /// leaving instances on the redirected body. Set true (committed on
         /// accept) the first time a redirect is emitted for the file.</summary>
         public bool Redirected;
+
+        /// <summary>The most recent text successfully hot-applied for this file —
+        /// the baseline for detecting members/messages REMOVED since the last
+        /// apply. A play-mode-born type's POST-BIRTH additions (e.g. an added
+        /// Update()) are absent from <see cref="OriginalText"/>, so a diff against
+        /// the birth text can never reveal their later removal; a diff against this
+        /// live text can. Initialized to the birth text at first load; re-committed
+        /// to the new text on every hot apply / no-op. Empty (legacy entry) → the
+        /// handler falls back to <see cref="OriginalText"/>.</summary>
+        public string LastAppliedText = "";
+
+        /// <summary>Sibling TOP-LEVEL types born into this file AFTER the first
+        /// batch (feature #5). The first-batch types all live in
+        /// <see cref="OriginalAssembly"/> and diff against <see cref="OriginalText"/>;
+        /// a sibling added by a later re-edit lives in its OWN assembly and diffs
+        /// against the whole-file text AT ITS BIRTH (so its body/additive re-edits
+        /// redirect onto that assembly, exactly like a first-batch type). Keyed by
+        /// the sibling's metadata name; null when the file only has first-batch
+        /// types (the common case).</summary>
+        public Dictionary<string, SiblingType>? Siblings;
+    }
+
+    /// <summary>A sibling top-level type born into a file after its first batch:
+    /// it lives in its own hot-patch assembly (not the file's first one), so its
+    /// re-edits resolve and redirect THERE.</summary>
+    public sealed class SiblingType
+    {
+        /// <summary>The hot-patch assembly this sibling was load_only'd into — the
+        /// detour ORIGINAL side for its re-edits. Empty until pinned after emit.</summary>
+        public string Assembly = "";
+
+        /// <summary>The whole-file text when this sibling was born — the diff
+        /// baseline for redirecting/extending the sibling (a per-type diff is
+        /// filtered out of the whole-file diff against this text).</summary>
+        public string BirthText = "";
     }
 
     private string? _generation;

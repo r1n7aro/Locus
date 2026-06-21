@@ -1322,6 +1322,14 @@ public static class PatchRewriter
             }
         }
 
+        // Play-mode-born re-edit: this file's types live only in a prior
+        // hot-patch assembly, so every detour ORIGINAL side — body redirects
+        // (below), AND the deletion/removed-type magic-method stubs — must be
+        // pinned to it, or Unity's default resolver (which skips
+        // __LocusHotPatch_ assemblies) cannot find the live type to detour.
+        // batch.ReeditAssemblyFor(path, type) resolves the right assembly per
+        // type: a late-born sibling (feature #5) uses its own, not the file's.
+
         // ── deletions (M5) ───────────────────────────────────────────
         // Removed members stay untouched in the loaded original (in-flight
         // delegates/coroutines are legitimate callers) and tombstone in the
@@ -1377,6 +1385,7 @@ public static class PatchRewriter
                 IsStatic = removed.IsStatic,
                 IsCtor = false,
                 IsStub = true,
+                OriginalAssembly = batch.ReeditAssemblyFor(path, removed.DeclaringType),
             });
         }
 
@@ -1429,6 +1438,7 @@ public static class PatchRewriter
                     IsStatic = magic.IsStatic,
                     IsCtor = false,
                     IsStub = true,
+                    OriginalAssembly = batch.ReeditAssemblyFor(path, removedType.MetadataName),
                 });
             }
         }
@@ -1462,12 +1472,11 @@ public static class PatchRewriter
 
         // Detour map: changed (non-added) members, original → patch type,
         // plus kept members re-detoured for their re-added call sites (B1).
-        // Play-mode-born re-edit: when this file's types live only in a prior
-        // hot-patch assembly, pin the detour ORIGINAL side to it so Unity
-        // resolves and redirects the FIRST loaded type (existing instances) —
-        // its default resolver skips __LocusHotPatch_ assemblies. Null (the
-        // ordinary case) leaves resolution against the project assemblies.
-        batch.ReeditFileAssemblies.TryGetValue(path, out string? reeditOriginalAssembly);
+        // ReeditAssemblyFor pins the detour ORIGINAL side to the play-mode-born
+        // assembly (the file's first, or a late-born sibling's own — feature #5)
+        // so Unity resolves and redirects the FIRST loaded type (existing
+        // instances); null (the ordinary case) leaves resolution against the
+        // project assemblies.
         foreach (HotDiffMethod method in diff.ChangedMethods.Where(m => !m.Added).Concat(ensuredDetours))
         {
             result.Methods.Add(new PatchMethodMap
@@ -1479,7 +1488,7 @@ public static class PatchRewriter
                 ParamTypeSigs = method.ParamTypeSigs,
                 IsStatic = method.IsStatic,
                 IsCtor = method.IsCtor,
-                OriginalAssembly = reeditOriginalAssembly,
+                OriginalAssembly = batch.ReeditAssemblyFor(path, method.DeclaringType),
             });
         }
 

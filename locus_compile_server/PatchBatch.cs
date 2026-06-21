@@ -205,6 +205,38 @@ public sealed class PatchBatchContext
     public IReadOnlyDictionary<string, string> ReeditFileAssemblies =
         new Dictionary<string, string>(StringComparer.Ordinal);
 
+    /// <summary>Per-TYPE override of <see cref="ReeditFileAssemblies"/> (feature
+    /// #5): a sibling type born into a play-mode-born file AFTER its first batch
+    /// lives in its OWN assembly, not the file's first one. Keyed by the type's
+    /// metadata name. Empty for ordinary batches and for files whose types are all
+    /// first-batch.</summary>
+    public IReadOnlyDictionary<string, string> ReeditTypeAssemblies =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>The play-mode-born detour ORIGINAL side for a member of
+    /// <paramref name="declaringType"/> in <paramref name="path"/>: the sibling's
+    /// own assembly if the type was born late (feature #5), else the file's first
+    /// assembly, else null (an ordinary compiled type — default resolution).</summary>
+    public string? ReeditAssemblyFor(string path, string declaringType) =>
+        ReeditTypeAssembly(ReeditTypeAssemblies, declaringType)
+        ?? (ReeditFileAssemblies.TryGetValue(path, out string? fileAssembly) ? fileAssembly : null);
+
+    /// <summary>The late-born sibling assembly a <paramref name="declaringType"/>
+    /// resolves to, or null. Only TOP-LEVEL siblings are registered, so a NESTED
+    /// type (metadata names nest with '+') is matched to its parent sibling by
+    /// prefix — without this a nested type's detour/driver falls back to the file's
+    /// FIRST assembly, where the nested type does not exist (feature #5 / [P2]).</summary>
+    public static string? ReeditTypeAssembly(
+        IReadOnlyDictionary<string, string> typeAssemblies, string declaringType)
+    {
+        if (typeAssemblies.TryGetValue(declaringType, out string? typeAssembly))
+            return typeAssembly;
+        foreach (var pair in typeAssemblies)
+            if (declaringType.StartsWith(pair.Key + "+", StringComparison.Ordinal))
+                return pair.Value;
+        return null;
+    }
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -221,7 +253,8 @@ public sealed class PatchBatchContext
         bool allowUnsafe = false,
         AccessCaps? runtimeCaps = null,
         IReadOnlyList<InlineRedirectClone>? inlineClones = null,
-        IReadOnlyDictionary<string, string>? reeditFileAssemblies = null)
+        IReadOnlyDictionary<string, string>? reeditFileAssemblies = null,
+        IReadOnlyDictionary<string, string>? reeditTypeAssemblies = null)
     {
         // The binding model must RESOLVE what the emit will BIND: the emit
         // compilation has always carried IgnoreAccessibility (kept bodies
@@ -254,6 +287,8 @@ public sealed class PatchBatchContext
             StoreDiscriminator = storeDiscriminator,
             RuntimeCaps = runtimeCaps,
             ReeditFileAssemblies = reeditFileAssemblies
+                ?? new Dictionary<string, string>(StringComparer.Ordinal),
+            ReeditTypeAssemblies = reeditTypeAssemblies
                 ?? new Dictionary<string, string>(StringComparer.Ordinal),
         };
 
