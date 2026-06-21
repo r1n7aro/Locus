@@ -68,14 +68,45 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore native/.NET build outputs. On Windows the
-      // compile-server apphost.exe in obj/ can be locked by dotnet while
-      // Tauri dev rebuilds, and Node's fs watcher exits on EBUSY.
+      // 3. Tell Vite's file watcher to ignore large / churny trees that don't
+      //    need HMR. On Windows each watched directory costs one
+      //    ReadDirectoryChangesW handle; build churn (src-tauri/obj, dotnet,
+      //    parallel-agent worktrees) leaks them, and left unbounded the dev
+      //    server accrued ~46k handles within minutes of startup. The compile
+      //    -server apphost.exe in obj/ can also be locked by dotnet while
+      //    Tauri rebuilds, making Node's fs watcher exit on EBUSY.
+      //    node_modules & .git are already ignored by Vite's defaults; the
+      //    rest mirrors .gitignore.
       ignored: [
-        "**/src-tauri/**",
-        "**/testproject/**",
+        // native / .NET build outputs (locked & churny during tauri dev)
+        "**/src-tauri/**", // also covers src-tauri/gen managed runtimes (~1.4k dirs)
         "**/locus_compile_server/**/bin/**",
         "**/locus_compile_server/**/obj/**",
+        // workspace-only trees (see .gitignore)
+        "**/.claude/**", // parallel-agent worktrees + session data (~9k dirs)
+        "**/testproject/**",
+        "**/ref/**",
+        "**/plans/**",
+        "**/experiments/**",
+        "**/docs/**", // separate Mintlify site with its own node_modules
+        // caches / temp / artifacts
+        "**/.cache/**",
+        "**/.tmp/**",
+        "**/tmp/**",
+        "**/debug/**",
+        "**/.codex/**",
+        "**/codex-artifacts/**",
+        "**/.venv/**",
+        "**/.venv-docs/**",
+        // build output
+        "**/dist/**",
+        "**/dist-ssr/**",
+        "**/site/**",
+        // editor / logs
+        "**/.vscode/**",
+        "**/.idea/**",
+        "**/logs/**",
+        "**/*.log",
       ],
     },
   },
