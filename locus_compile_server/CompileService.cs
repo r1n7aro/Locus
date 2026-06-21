@@ -664,7 +664,7 @@ public sealed class CompileService
 
     private static JsonObject HotDiffMethodJson(HotDiffMethod method)
     {
-        return new JsonObject
+        var json = new JsonObject
         {
             ["declaringType"] = method.DeclaringType,
             ["name"] = method.Name,
@@ -673,6 +673,12 @@ public sealed class CompileService
             ["isCtor"] = method.IsCtor,
             ["added"] = method.Added,
         };
+        // A newly added Unity message drives via the runtime (pump or proxy)
+        // rather than a detour; surface the driver kind so analyze/hotDiff
+        // explains why an added message is hot.
+        if (method.MessageDriverKind.Length > 0)
+            json["messageDriverKind"] = method.MessageDriverKind;
+        return json;
     }
 
     private static Dictionary<string, HashSet<string>> ForceDetourMap(ForceDetourDto[]? forceDetours)
@@ -1112,6 +1118,7 @@ public sealed class CompileService
         var trees = new List<SyntaxTree>();
         var methods = new JsonArray();
         var newTypes = new JsonArray();
+        var messageDrivers = new JsonArray();
         var accessAssemblies = new HashSet<string>(StringComparer.Ordinal);
         var shimRegistrations = new List<ShimRegistration>();
         var fieldStoreRegistrations = new List<FieldStoreRegistration>();
@@ -1257,6 +1264,38 @@ public sealed class CompileService
                     method["isStub"] = true;
                 methods.Add(method);
             }
+            // M2 message drivers: a newly added Unity message that the engine
+            // never dispatches after load materialized as an ordinary instance
+            // shim above. Hand the runtime the shim coordinates plus the driver
+            // kind so it wires the right driver — a PlayerLoop pump (player_loop)
+            // or a forwarding proxy MonoBehaviour (component_proxy). Joined to the
+            // shim registration by member identity for the authoritative metadata.
+            foreach (HotDiffMethod added in diff.ChangedMethods)
+            {
+                if (!added.Added || added.MessageDriverKind.Length == 0)
+                    continue;
+                string memberKey = MemberSurfaceRegistry.MemberKey(
+                    added.DeclaringType, added.Name, added.ParamTypeNames, added.IsStatic);
+                MemberSurfaceRegistry.ShimEntry? shim = rewrite.ShimRegistrations
+                    .FirstOrDefault(r => r.MemberKey == memberKey)?.Entry;
+                if (shim == null)
+                    continue;
+                messageDrivers.Add(new JsonObject
+                {
+                    ["kind"] = added.MessageDriverKind,
+                    ["declaringType"] = added.DeclaringType,
+                    ["shimType"] = shim.ShimTypeMetadataName,
+                    ["shimMethod"] = shim.ShimMethod,
+                    ["message"] = added.Name,
+                    // The engine-delivered argument type (component_proxy with an
+                    // argument; empty for parameterless callbacks).
+                    ["paramType"] = added.ParamTypeNames.Length > 0 ? added.ParamTypeNames[0] : "",
+                    // Agent-facing caveat (lifecycle timing / approximate order);
+                    // empty when the driver matches native behavior.
+                    ["note"] = added.MessageNote,
+                    ["sourcePath"] = filePath,
+                });
+            }
             foreach (PatchNewType newType in rewrite.NewTypes)
             {
                 newTypes.Add(new JsonObject
@@ -1377,6 +1416,8 @@ public sealed class CompileService
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
+        if (messageDrivers.Count > 0)
+            result["messageDrivers"] = messageDrivers;
         if (callerScanNote != null)
             result["callerScan"] = callerScanNote;
         if (request.RuntimeCaps != null)
