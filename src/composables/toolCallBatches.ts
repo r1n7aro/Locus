@@ -471,6 +471,20 @@ function consumeDisplayMatch(
   return false;
 }
 
+/**
+ * Consume one tool-call's worth of match from `state`, returning whether the
+ * call (by id, or failing that by a remaining fingerprint instance) was
+ * present. Mutates `state` so repeated calls across a batch match by
+ * multiplicity rather than set membership — duplicate same-name/same-arg calls
+ * are each matched at most once. Pass a clone when the original must survive.
+ */
+export function consumeToolCallDisplayFromMatchState(
+  toolCall: ToolCallDisplay,
+  state: ToolCallMatchState,
+): boolean {
+  return consumeDisplayMatch(toolCall, state);
+}
+
 function filterToolCallInfoArray(
   toolCalls: ToolCallInfo[],
   state: ToolCallMatchState,

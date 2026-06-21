@@ -28,6 +28,7 @@ import {
   summarizeToolCallBatch,
 } from "../../composables/toolCallBatches";
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
+import { collectRenderedToolCalls, planPromotedToolVisibility } from "../../composables/toolRenderPlan";
 import {
   assertCanonicalRenderParts,
   compareAssistantRenderParts,
@@ -1186,13 +1187,28 @@ watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
   });
 });
 
+// Fail-open: only hide promoted history tool calls that the transient region
+// actually renders this tick. Anything transient drops stays in history, so the
+// trailing tool batch (the "last message") can never vanish from both regions.
+// `transientRenderedToolCalls` is defined alongside `transientRenderSegments`
+// below; the closure resolves it lazily so there is no initialization cycle
+// (transient rendering never reads the hidden state).
+const promotedToolVisibility = computed(() => {
+  if (!shouldHidePromotedHistoryToolCalls.value) return null;
+  return planPromotedToolVisibility({
+    promotedToolCalls: promotableHistoryToolCalls.value.toolCalls,
+    transientRenderedToolCalls: transientRenderedToolCalls.value,
+  });
+});
+
 const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {
-  if (!shouldHidePromotedHistoryToolCalls.value) {
+  const visibility = promotedToolVisibility.value;
+  if (!visibility) {
     return activeToolCallMatchState.value;
   }
   return mergeToolCallMatchStates(
     activeToolCallMatchState.value,
-    promotableHistoryToolCalls.value.toolCallMatchState,
+    visibility.hiddenMatchState,
   );
 });
 
@@ -2010,6 +2026,18 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
 
   return segments;
 });
+
+// The concrete tool calls the transient region renders this tick. Drives the
+// fail-open hide decision in `historyHiddenToolCallMatchState` above so history
+// only hides what transient actually shows.
+const transientRenderedToolCalls = computed(() =>
+  collectRenderedToolCalls(
+    transientRenderSegments.value.filter(
+      (segment): segment is Extract<TransientRenderSegment, { type: "toolCalls" }> =>
+        segment.type === "toolCalls",
+    ),
+  ),
+);
 
 function transientSegmentPaintState() {
   return transientRenderSegments.value.map((segment, index) => {
