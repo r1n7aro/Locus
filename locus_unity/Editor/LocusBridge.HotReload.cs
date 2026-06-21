@@ -32,13 +32,19 @@ namespace Locus
 
         private sealed class HotPatchApplyChange
         {
+            // Report identity (declaring type + signature), byte-identical with
+            // the Rust unity_method_key for the inlined-key round-trip.
             public string MethodKey;
+            // Detour-cache identity: MethodKey plus the resolved original
+            // assembly, so same-named methods in different assemblies do not
+            // share a cache slot (see DetourKey).
+            public string CacheKey;
             public HotPatchDetourEntry NewEntry;
             public HotPatchDetourEntry PreviousEntry;
         }
 
-        // Active detour per ORIGINAL method key. Re-patching the same method
-        // has one live redirect at a time; failed patch batches restore any
+        // Active detour per ORIGINAL (method, assembly) key. Re-patching the same
+        // method has one live redirect at a time; failed patch batches restore any
         // detours they temporarily superseded.
         private static readonly object _hotPatchLock = new object();
         private static readonly Dictionary<string, HotPatchDetourEntry> _hotMethodDetours =
@@ -627,11 +633,12 @@ namespace Locus
                     }
 
                     string methodKey = MethodKey(dto);
+                    string cacheKey = DetourKey(dto);
                     HotPatchDetourEntry previous;
-                    if (_hotMethodDetours.TryGetValue(methodKey, out previous))
+                    if (_hotMethodDetours.TryGetValue(cacheKey, out previous))
                     {
                         try { previous.Detour.Dispose(); } catch { }
-                        _hotMethodDetours.Remove(methodKey);
+                        _hotMethodDetours.Remove(cacheKey);
                     }
 
                     HotPatchDetourEntry entry;
@@ -651,16 +658,17 @@ namespace Locus
                     catch (Exception ex)
                     {
                         string restoreError;
-                        if (previous != null && !RestorePreviousDetour(methodKey, previous, out restoreError))
-                            Debug.LogError("[Locus] Failed to restore superseded hot patch for " + methodKey + ": " + restoreError);
+                        if (previous != null && !RestorePreviousDetour(cacheKey, previous, out restoreError))
+                            Debug.LogError("[Locus] Failed to restore superseded hot patch for " + cacheKey + ": " + restoreError);
                         RollbackHotPatch(applied);
                         return ErrorResponse(requestId, "detour failed for " + DescribeMethod(dto) + ": " + ex.Message);
                     }
 
-                    _hotMethodDetours[methodKey] = entry;
+                    _hotMethodDetours[cacheKey] = entry;
                     applied.Add(new HotPatchApplyChange
                     {
                         MethodKey = methodKey,
+                        CacheKey = cacheKey,
                         NewEntry = entry,
                         PreviousEntry = previous,
                     });
@@ -1109,19 +1117,19 @@ namespace Locus
                 HotPatchApplyChange change = applied[i];
                 try { change.NewEntry.Detour.Dispose(); } catch { }
                 HotPatchDetourEntry current;
-                if (_hotMethodDetours.TryGetValue(change.MethodKey, out current) && ReferenceEquals(current, change.NewEntry))
-                    _hotMethodDetours.Remove(change.MethodKey);
+                if (_hotMethodDetours.TryGetValue(change.CacheKey, out current) && ReferenceEquals(current, change.NewEntry))
+                    _hotMethodDetours.Remove(change.CacheKey);
 
                 if (change.PreviousEntry != null)
                 {
                     string restoreError;
-                    if (!RestorePreviousDetour(change.MethodKey, change.PreviousEntry, out restoreError))
-                        Debug.LogError("[Locus] Failed to restore superseded hot patch for " + change.MethodKey + ": " + restoreError);
+                    if (!RestorePreviousDetour(change.CacheKey, change.PreviousEntry, out restoreError))
+                        Debug.LogError("[Locus] Failed to restore superseded hot patch for " + change.CacheKey + ": " + restoreError);
                 }
             }
         }
 
-        private static bool RestorePreviousDetour(string methodKey, HotPatchDetourEntry previous, out string error)
+        private static bool RestorePreviousDetour(string cacheKey, HotPatchDetourEntry previous, out string error)
         {
             error = null;
             try
@@ -1130,7 +1138,7 @@ namespace Locus
                 IDisposable detour = CreateMethodDetour(previous.Original, previous.Patch, out engine);
                 previous.Detour = detour;
                 previous.Engine = engine;
-                _hotMethodDetours[methodKey] = previous;
+                _hotMethodDetours[cacheKey] = previous;
                 return true;
             }
             catch (Exception ex)
@@ -1245,6 +1253,22 @@ namespace Locus
             return dto.declaring_type + "|" + dto.name + "|" +
                 string.Join(",", dto.param_type_names ?? new string[0]) +
                 (dto.is_static ? "|s" : "|i");
+        }
+
+        /// <summary>The detour-cache key: <see cref="MethodKey"/> plus the
+        /// resolved ORIGINAL assembly. MethodKey alone (declaring type +
+        /// signature) is NOT unique across assemblies — a play-mode-born type and
+        /// a same-named compiled type (e.g. a new file redefining an existing
+        /// class) both resolve their own original, so caching detours by MethodKey
+        /// would let one method's patch evict/replace the other's. The assembly
+        /// suffix gives each (method, original assembly) its own cache slot, while
+        /// re-patches of the SAME original (a stable original_assembly) still
+        /// replace as before. MethodKey itself is left unchanged for the
+        /// inlined-key report, which must stay byte-identical with the Rust
+        /// unity_method_key round-trip.</summary>
+        private static string DetourKey(HotPatchMethodDto dto)
+        {
+            return MethodKey(dto) + "|" + (dto.original_assembly ?? "");
         }
 
         private static string DescribeMethod(HotPatchMethodDto dto)
