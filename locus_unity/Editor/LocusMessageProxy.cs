@@ -337,8 +337,14 @@ namespace Locus
                 Driver driver = Drivers[i];
                 if (!scanCache.TryGetValue(driver.DeclaringType, out UnityEngine.Object[] instances))
                 {
+#if UNITY_2022_2_OR_NEWER
                     instances = UnityEngine.Object.FindObjectsByType(
                         driver.DeclaringType, FindObjectsInactive.Include, FindObjectsSortMode.InstanceID);
+#else
+                    // Unity 2021 and earlier: FindObjectsOfType(Type, true) — includes
+                    // inactive and is InstanceID-sorted, matching the newer call above.
+                    instances = UnityEngine.Object.FindObjectsOfType(driver.DeclaringType, true);
+#endif
                     scanCache[driver.DeclaringType] = instances;
                 }
                 for (int j = 0; j < instances.Length; j++)
@@ -459,8 +465,14 @@ namespace Locus
             // Play-mode lifecycle (Awake/Start) must not run in edit mode.
             if (gate != CatchUpGate.Always && !Application.isPlaying)
                 return 0;
+#if UNITY_2022_2_OR_NEWER
             UnityEngine.Object[] instances = UnityEngine.Object.FindObjectsByType(
                 declaringType, FindObjectsInactive.Include, FindObjectsSortMode.InstanceID);
+#else
+            // Unity 2021 and earlier: FindObjectsOfType(Type, true) — includes inactive
+            // and is InstanceID-sorted, matching the newer call above.
+            UnityEngine.Object[] instances = UnityEngine.Object.FindObjectsOfType(declaringType, true);
+#endif
             int ran = 0;
             for (int i = 0; i < instances.Length; i++)
             {

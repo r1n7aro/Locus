@@ -324,8 +324,15 @@ namespace Locus
                 // Cache INCLUDING inactive: the per-instance isActiveAndEnabled gate
                 // in Drive decides each frame, so an object enabled at runtime is
                 // picked up immediately instead of waiting out the cache TTL.
+#if UNITY_2022_2_OR_NEWER
                 instances = UnityEngine.Object.FindObjectsByType(
                     type, FindObjectsInactive.Include, FindObjectsSortMode.InstanceID);
+#else
+                // Unity 2021 and earlier lack FindObjectsByType / FindObjectsInactive /
+                // FindObjectsSortMode. FindObjectsOfType(Type, true) is the behavior
+                // equivalent: includes inactive and is likewise sorted by InstanceID.
+                instances = UnityEngine.Object.FindObjectsOfType(type, true);
+#endif
                 InstanceCache[type] = instances;
                 LearnExecutionOrder(type, instances);
             }
