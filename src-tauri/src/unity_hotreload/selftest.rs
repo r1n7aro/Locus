@@ -491,6 +491,49 @@ public class LocusSelfTestSubject : MonoBehaviour
 }
 "#;
 
+// The play-mode-born fresh file (P09 + the Phenomenon-3 re-edit trichotomy,
+// P09b–P09e). Authored entirely DURING play mode — filtered out of the baseline
+// import in initialize_corpus — so it loads as a fresh type into a
+// __LocusHotPatch_ assembly (engine: load_only) and a re-edit exercises the
+// NewTypeRegistry routing in the compile server.
+//
+// A MonoBehaviour with OBSERVABLE INSTANCE STATE: `Beat` plus the Bump() body
+// (birth: `Beat += 10`) is the surface the re-edit scenarios mutate, and `Live`
+// retains one spawned instance so a later body edit can be observed on the SAME
+// pre-existing instance. Everything else is FIXED (no field/signature/member
+// change across edits) so a Bump() body edit stays a pure-body, redirectable
+// change. The static reflection helpers (Spawn/ReadBeat) give the Rust snippets
+// a stable entry point even though the type is invisible to snippet metadata,
+// and Bump() is invoked directly on the retained instance. The static Ping()
+// preserves P09's original through-Probe assertion.
+const FRESH_BASELINE: &str = r#"using UnityEngine;
+
+public class LocusSelfTestFresh : MonoBehaviour
+{
+    public static LocusSelfTestFresh Live;
+    public int Beat;
+
+    public static int Ping() { return 4242; }
+
+    // Bump() is the redirect target. BIRTH body: Beat += 10. P09c rewrites the
+    // body (Beat += 7) — a pure body change that must redirect onto the FIRST
+    // loaded assembly so this very instance updates.
+    public int Bump() { Beat += 10; return Beat; }
+
+    // Reflection entry points (stable across edits — never re-shaped):
+    // create+retain the instance and read Beat back. Bump() itself is invoked
+    // DIRECTLY on the retained instance from the test (never through a wrapper),
+    // so a live detour is always observed even under Release inlining.
+    public static int Spawn()
+    {
+        var go = new GameObject("LocusSelfTestFreshLive");
+        Live = go.AddComponent<LocusSelfTestFresh>();
+        return Live.Beat;
+    }
+    public static int ReadBeat() { return Live == null ? -1 : Live.Beat; }
+}
+"#;
+
 const MESSAGE_BASELINE: &str = r#"using UnityEngine;
 
 public class LocusSelfTestMessages : MonoBehaviour
@@ -1042,8 +1085,9 @@ fn remaining_or_timeout(
 
 fn spawn_test_objects_code(caps: MessageDriverCapabilities) -> String {
     let mut code = String::from(
-        "foreach (var existing in UnityEngine.Object.FindObjectsByType<UnityEngine.GameObject>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.None))\n\
+        "foreach (var found in UnityEngine.Object.FindObjectsOfType(typeof(UnityEngine.GameObject), true))\n\
          {\n\
+             var existing = found as UnityEngine.GameObject;\n\
              if (existing != null && existing.name.StartsWith(\"LocusHotReloadSelfTest\")) UnityEngine.Object.Destroy(existing);\n\
          }\n\
          await ctx.WaitFrames(2);\n\
@@ -1608,6 +1652,240 @@ impl SelfTest {
         }
     }
 
+    // ── play-mode-born (Phenomenon 3) reflection helpers ─────────────────
+    // The fresh type lives in a __LocusHotPatch_ assembly and is invisible to
+    // snippet metadata (the snippet compiles against the original Assembly-CSharp
+    // image, which never contains it), so every access goes through reflection —
+    // the same constraint and pattern as the P47 hot-added MonoBehaviour
+    // diagnostic. They reach the type by scanning loaded assemblies for it by
+    // name, then use its static entry points (Spawn/ReadBeat) and its `Live`
+    // field; Bump() is invoked directly on the retained instance.
+
+    /// Locate `LocusSelfTestFresh` across loaded assemblies and call its static
+    /// `Spawn()`, which creates and retains one instance in the type's `Live`
+    /// slot. Returns true iff the instance was established (Beat reads its 0
+    /// default). On any gap it logs and returns false so the caller can skip the
+    /// re-edit scenarios rather than emit misleading failures.
+    async fn spawn_fresh_instance(&mut self) -> bool {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_spawn=type-missing"); return null; }
+var spawn = t.GetMethod("Spawn", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+if (spawn == null) { print("fresh_spawn=spawn-missing"); return null; }
+var beat = System.Convert.ToInt32(spawn.Invoke(null, null));
+print("fresh_spawn=ok:" + beat);
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.contains("fresh_spawn=ok:0") => {
+                self.pass(
+                    "P09a play-mode-born instance spawned",
+                    "retained a live instance of the play-mode-born type (Beat=0)",
+                );
+                true
+            }
+            Ok(output) => {
+                self.fail(
+                    "P09a play-mode-born instance spawned",
+                    format!("could not retain a fresh instance: {}", squash(&output)),
+                );
+                false
+            }
+            Err(error) => {
+                self.fail(
+                    "P09a play-mode-born instance spawned",
+                    format!("spawn snippet failed: {}", squash(&error)),
+                );
+                false
+            }
+        }
+    }
+
+    /// Read the RETAINED fresh instance's `Beat` (via static `ReadBeat()`) and
+    /// assert it equals `expected`. This reads the SAME pre-existing instance —
+    /// the load-bearing observation for the body-redirect case.
+    async fn expect_fresh_beat(&mut self, name: &str, expected: i64) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_beat=type-missing"); return null; }
+var read = t.GetMethod("ReadBeat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+print("fresh_beat=" + System.Convert.ToInt32(read.Invoke(null, null)));
+return null;"#;
+        let want = format!("fresh_beat={expected}");
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == want) => {
+                self.pass(name, format!("retained instance reports Beat={expected}"));
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected '{want}', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(name, format!("beat snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// Invoke `Bump()` ONCE directly on the retained `Live` instance (read from
+    /// the static slot) and assert the returned new `Beat`. The call goes
+    /// through `MethodInfo.Invoke` on the instance method, so it always hits the
+    /// method's native entry point and observes a live detour — deliberately NOT
+    /// routed through a pre-JITed wrapper (e.g. BumpVia), which Release-mode Mono
+    /// could have inlined the call into and thereby bypassed the detour. Because
+    /// `Live` is an instance of the FIRST loaded assembly's type, a redirect
+    /// installed there takes effect, so the returned value distinguishes the new
+    /// body from the birth body.
+    async fn expect_fresh_bump(&mut self, name: &str, expected: i64) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_bump=type-missing"); return null; }
+var live = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).GetValue(null);
+if (live == null) { print("fresh_bump=live-missing"); return null; }
+var bump = t.GetMethod("Bump", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+print("fresh_bump=" + System.Convert.ToInt32(bump.Invoke(live, null)));
+return null;"#;
+        let want = format!("fresh_bump={expected}");
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == want) => {
+                self.pass(name, format!("retained instance bumped to Beat={expected}"));
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected '{want}', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(name, format!("bump snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// Phenomenon 3 — the play-mode-born re-edit trichotomy, asserted against a
+    /// LIVE editor with a retained instance of the play-mode-born type. Ordered
+    /// so the never-redirected no-op fires BEFORE the redirect (branch 2 in
+    /// HandleCompileHotPatch requires !Redirected), then the body redirect, then
+    /// the two cold guards. `fresh` is the file's current text ledger; on entry
+    /// the retained instance is at Beat=0 (P09a spawned it without bumping).
+    async fn run_play_mode_born_reedit_tests(&mut self, fresh: &mut String) {
+        // P09b — UNCHANGED re-send of a never-redirected play-mode-born file →
+        // clean HOT no-op (NOT cold). The live coordinator re-ships every dirty
+        // file against its empty baseline each convergence batch, so a
+        // load_only'd file recurs unchanged; that must not drag the batch cold.
+        // The empty re-diff contributes nothing — no detour, no fresh assembly —
+        // so the retained instance is untouched and still reads Beat=0.
+        let name = "P09b unchanged re-send is a hot no-op";
+        self.log(format!("— {name}"));
+        match self
+            .apply_texts(
+                name,
+                &[(FRESH_FILE, fresh.as_str())],
+                &[(FRESH_FILE, fresh.as_str())],
+            )
+            .await
+        {
+            Some(_) => {
+                self.pass(name, "unchanged re-send stayed hot (no cold verdict)");
+                // The no-op changed nothing: the retained instance is unmoved.
+                self.expect_fresh_beat("P09b instance unchanged by no-op", 0)
+                    .await;
+            }
+            None => { /* apply_texts already recorded the failure + reverted */ }
+        }
+
+        // P09c — CORE: a BODY edit redirects onto the FIRST loaded assembly's
+        // type, so the ALREADY-SPAWNED instance updates (not just new ones).
+        // Birth Bump() did Beat += 10; the redirect rewrites the body to
+        // Beat += 7. The retained instance sits at Beat=0; invoking Bump() once
+        // on it through the detour therefore reads 7. Were the fix absent, every
+        // re-edit would re-load into a fresh assembly and this pre-existing
+        // instance would keep running its BIRTH body (+= 10 → 10); 7-vs-10 is the
+        // distinguishing observation that the existing instance runs the NEW body.
+        let name = "P09c body re-edit updates the EXISTING instance";
+        self.log(format!("— {name}"));
+        // `original` is the never-redirected text; P09e reuses it verbatim as
+        // the "revert to original AFTER a redirect" input, so keep it intact.
+        let original = fresh.clone();
+        let mut redirected = false;
+        match swap(fresh, "Beat += 10; return Beat;", "Beat += 7; return Beat;") {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(FRESH_FILE, fresh.as_str())],
+                        &[(FRESH_FILE, original.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    redirected = true;
+                    // THE load-bearing assertion: the SAME pre-existing instance
+                    // runs the redirected body. 0 (birth Beat) + 7 (new body) = 7.
+                    self.expect_fresh_bump(
+                        "P09c existing instance runs the redirected body",
+                        7,
+                    )
+                    .await;
+                } else {
+                    *fresh = original.clone();
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+
+        // The two cold guards below only make sense once a redirect is live (the
+        // registry flag is Redirected=true): a structural edit must then be
+        // refused in place, and a revert-to-original must clear the detour cold
+        // rather than pass as a stranding no-op. If the redirect did not apply,
+        // skip them — without a live detour a revert-to-original is just an
+        // unchanged no-op (branch 2, hot), so asserting cold would be wrong.
+        if !redirected {
+            self.log(
+                "skipping P09d/P09e (cold guards): the P09c redirect did not apply, \
+                 so there is no live detour to guard",
+            );
+            *fresh = original;
+            return;
+        }
+        let post_redirect = fresh.clone();
+
+        // P09d — STRUCTURAL re-edit (adds a field) → COLD. An added field cannot
+        // be redirected onto live instances (their layout is fixed); a
+        // load_only there would strand them on a stale redirected body, so the
+        // verdict is cold and the reason names the play-mode-created type. The
+        // file is restored to the post-redirect text afterward (the registry
+        // still has Redirected=true, which P09e relies on).
+        let mut structural = post_redirect.clone();
+        if let Err(error) = swap(
+            &mut structural,
+            "    public int Beat;",
+            "    public int Beat;\n    public int Spare;",
+        ) {
+            self.fail("P09d structural re-edit is cold", error);
+        } else {
+            self.expect_cold(
+                "P09d structural re-edit is cold",
+                FRESH_FILE,
+                &structural,
+                "play-mode-created type",
+                &post_redirect,
+            )
+            .await;
+        }
+
+        // P09e — REVERT to the ORIGINAL text AFTER a redirect → COLD (the
+        // Codex-found false-positive the Redirected flag fixes). With a detour
+        // live, reverting leaves no changed methods, so the redirect cannot
+        // replace it; a load_only would falsely report "applied" while the live
+        // instance keeps the redirected body. The fix steers cold so a recompile
+        // converges. Restored to the post-redirect text so later phases see a
+        // consistent file.
+        self.expect_cold(
+            "P09e revert-after-redirect is cold",
+            FRESH_FILE,
+            &original,
+            "play-mode-created type",
+            &post_redirect,
+        )
+        .await;
+        *fresh = post_redirect;
+    }
+
     async fn revert_files(&mut self, reverts: &[(&str, &str)]) {
         for (relative, text) in reverts {
             if let Err(error) = self.write_tracked(relative, text).await {
@@ -1750,6 +2028,10 @@ impl SelfTest {
 
     async fn initialize_corpus(&mut self) -> Result<(), String> {
         self.log("Phase 1/7 — initializing the test corpus (edit mode)");
+
+        let dir = self.absolute(TEST_DIR);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::remove_file(self.absolute(&format!("{TEST_DIR}.meta"))).await;
 
         // Inside an edit session the imports queue instead of firing one by
         // one; the recompile below releases the session, flushes the queue
@@ -2508,21 +2790,34 @@ impl SelfTest {
 
         // P09 — brand-new file with a brand-new type (TI-C visibility),
         // observed through Probe (the type is invisible to snippets).
+        //
+        // The fresh file is authored ENTIRELY during play mode (this is the
+        // play-mode-born shape: it was filtered OUT of the baseline import in
+        // initialize_corpus, so its coordinator baseline is empty and it loads
+        // as a fresh type into a __LocusHotPatch_ assembly, engine: load_only).
+        // It is a MonoBehaviour carrying observable INSTANCE state (`Beat` +
+        // Bump()) plus a retained `Live` instance, so the re-edit scenarios
+        // below (P09b–P09e) can prove the Phenomenon-3 fix: a later BODY edit
+        // redirects onto the FIRST loaded assembly's type, updating the
+        // already-spawned instance — not just newly created ones. `fresh` is an
+        // owned ledger (like `subject`) so the re-edits mutate it incrementally.
+        // The static Ping() is kept for P09's original through-Probe assertion.
         let name = "P09 new file with new type";
         self.log(format!("— {name}"));
         let subject_snapshot = subject.clone();
-        let fresh = "public static class LocusSelfTestFresh { public static int Ping() { return 4242; } }\n";
+        let mut fresh = FRESH_BASELINE.to_string();
         let p09 = swap_line(
             subject,
             "    public int Probe()",
             "    public int Probe() { return LocusSelfTestFresh.Ping(); }",
         );
+        let mut fresh_live = false;
         match p09 {
             Ok(()) => {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(FRESH_FILE, fresh), (SUBJECT_FILE, subject.as_str())],
+                        &[(FRESH_FILE, fresh.as_str()), (SUBJECT_FILE, subject.as_str())],
                         // Reverting a brand-new file means an empty stand-in;
                         // the deletion pass would tombstone it anyway, so
                         // keep the file with a harmless body on failure.
@@ -2536,11 +2831,51 @@ impl SelfTest {
                         "4242",
                     )
                     .await;
+                    // Spawn and RETAIN one instance of the play-mode-born type
+                    // (held in its own static `Live` slot), so the body-redirect
+                    // scenario can read the SAME pre-existing instance after a
+                    // later edit. The type is invisible to snippet metadata
+                    // (never in the baseline assembly), so everything goes
+                    // through reflection — the P47 pattern. Spawn() does not
+                    // bump, so the retained instance starts at Beat=0; P09c later
+                    // runs exactly one Bump() on it through the redirected body.
+                    fresh_live = self.spawn_fresh_instance().await;
+                    if fresh_live {
+                        self.expect_fresh_beat(
+                            "P09a play-mode-born instance retained",
+                            0,
+                        )
+                        .await;
+                    }
                 } else {
                     *subject = subject_snapshot;
                 }
             }
             Err(error) => self.fail(name, error),
+        }
+
+        // ── Phenomenon 3 — play-mode-born re-edit trichotomy (P09b–P09e) ──
+        // A file authored entirely in play mode loads once as a fresh type.
+        // Re-editing it must route THREE ways (the compile-server fix; unit
+        // tests live in HotPatchTests.PlayModeBornReeditTests, multi-batch
+        // convergence in SelfTestReplayTests). These LIVE cases assert the
+        // distinguishing RUNTIME behavior the unit tests cannot: an EXISTING
+        // instance's observable state changes after a body re-edit.
+        //
+        // ⚠ self-test pending (实机待跑): authored against the live harness and
+        // cargo-check-clean, but not yet executed on real hardware. The shapes
+        // mirror P09 (which is exercised) and P47 (reflection on a
+        // play-mode-born MonoBehaviour), so they are expected to pass; flag any
+        // failure here as a real regression in the Phenomenon-3 routing rather
+        // than harness drift. Run via Settings > Code Analysis against a
+        // connected editor in play mode.
+        if fresh_live {
+            self.run_play_mode_born_reedit_tests(&mut fresh).await;
+        } else {
+            self.log(
+                "skipping P09b–P09e (play-mode-born re-edit trichotomy): \
+                 the retained fresh instance could not be established",
+            );
         }
 
         // P10 — property getter body edit.
@@ -4476,8 +4811,14 @@ impl SelfTest {
 
         self.expect_output(
             "P46f frame message drivers honor component enabled",
-            "var targets = UnityEngine.Object.FindObjectsByType<LocusSelfTestMessages>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.InstanceID);\n\
-             if (targets.Length == 0) return \"enabled-gate-missing-instance\";\n\
+            "var foundTargets = UnityEngine.Object.FindObjectsOfType(typeof(LocusSelfTestMessages), true);\n\
+             var targets = new System.Collections.Generic.List<LocusSelfTestMessages>();\n\
+             foreach (var foundTarget in foundTargets)\n\
+             {\n\
+                 var target = foundTarget as LocusSelfTestMessages;\n\
+                 if (target != null) targets.Add(target);\n\
+             }\n\
+             if (targets.Count == 0) return \"enabled-gate-missing-instance\";\n\
              var before = LocusSelfTestMessages.FrameTotal();\n\
              foreach (var target in targets) target.enabled = false;\n\
              await ctx.WaitSeconds(0.35f);\n\
@@ -6544,6 +6885,12 @@ return null;"#;
 
     async fn finalize(&mut self) {
         self.log("Phase 7/7 — leaving play mode and converging");
+        // The component-proxy coverage above edits real Unity physics message
+        // signatures into MESSAGE_FILE during play mode. Restore the baseline
+        // before the real Unity recompile so older editors with sparse module
+        // references can converge the corpus cleanly.
+        self.revert_files(&[(MESSAGE_FILE, MESSAGE_BASELINE)]).await;
+        self.log("Message test corpus restored before convergence.");
         self.log("Requesting play mode exit...");
         match tokio::time::timeout(
             EXIT_PLAY_MODE_TIMEOUT,
