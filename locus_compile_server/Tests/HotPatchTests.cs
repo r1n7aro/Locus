@@ -4330,3 +4330,227 @@ public static partial class Player__LocusShims
         Assert.Contains(result.ShimRegistrations, r => r.Entry.ShimMethod == "remove_Pump");
     }
 }
+
+/// <summary>Phenomenon 3 fix: a type authored entirely in Play Mode (empty
+/// coordinator baseline) re-edited without a recompile. Body edits redirect
+/// onto the first loaded assembly (existing instances update); structural or
+/// revert-to-original re-edits steer cold instead of a false-positive
+/// load_only that would leave live instances on a stale redirected body.</summary>
+public class PlayModeBornReeditTests
+{
+    private static string[] HostBclPaths() =>
+        ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Where(File.Exists)
+            .ToArray();
+
+    private static JsonObject ParamsFor() => new JsonObject
+    {
+        ["fingerprint"] = "born-test-" + Guid.NewGuid().ToString("N"),
+        ["domainGeneration"] = Guid.NewGuid().ToString("N"),
+        ["langVersion"] = "9",
+        ["referencePaths"] = new JsonArray(HostBclPaths().Select(p => (JsonNode)p).ToArray()),
+        ["defines"] = new JsonArray(),
+    };
+
+    // ── source fixtures ──────────────────────────────────────────────────
+
+    private const string BornV1 =
+@"namespace Born
+{
+    public sealed class Widget
+    {
+        public int Tick;
+        public int Value() { return Tick + 1; }
+    }
+}";
+
+    // Body-only change to BornV1 (Value's return).
+    private const string BornV2 =
+@"namespace Born
+{
+    public sealed class Widget
+    {
+        public int Tick;
+        public int Value() { return Tick + 2; }
+    }
+}";
+
+    // Structural change to BornV1 (adds a field).
+    private const string BornV1WithField =
+@"namespace Born
+{
+    public sealed class Widget
+    {
+        public int Tick;
+        public int Extra;
+        public int Value() { return Tick + 1; }
+    }
+}";
+
+    /// <summary>One hotPatch of a play-mode-born file: empty coordinator
+    /// baseline, image+registry committed inline (registerImage) and session
+    /// images referenced so a re-edit can resolve the first assembly's type.</summary>
+    private static JsonNode HotPatchBorn(CompileService service, JsonObject @params, string newText)
+    {
+        var request = new JsonObject
+        {
+            ["files"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "Widget.cs",
+                ["oldText"] = "",
+                ["newText"] = newText,
+            }),
+            ["params"] = @params.DeepClone(),
+            ["registerImage"] = true,
+            ["referenceSessionImages"] = true,
+        };
+        return service.HandleCompileHotPatch(request);
+    }
+
+    [Fact]
+    public void PlayModeBornType_first_load_is_load_only_then_body_reedit_redirects_onto_first_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-body-gen";
+
+        // First load: brand-new type, load_only (no detours), registered.
+        JsonNode v1 = HotPatchBorn(service, p, BornV1);
+        Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+        Assert.Empty(v1["methods"]!.AsArray());
+        var born = Assert.Single(v1["newTypes"]!.AsArray())!;
+        Assert.Equal("Born.Widget", born["metadataName"]!.GetValue<string>());
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+
+        // Body re-edit: redirected onto the FIRST assembly's type (so existing
+        // instances update), NOT re-loaded as a fresh new type.
+        JsonNode v2 = HotPatchBorn(service, p, BornV2);
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        Assert.Empty(v2["newTypes"]!.AsArray());
+        var detour = Assert.Single(v2["methods"]!.AsArray())!;
+        Assert.Equal("Born.Widget", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Value", detour["name"]!.GetValue<string>());
+        Assert.False(detour["isStatic"]!.GetValue<bool>());
+        Assert.Contains("__LocusPatch", detour["patchDeclaringType"]!.GetValue<string>());
+        // The detour ORIGINAL side is pinned to the first assembly — this is the
+        // whole fix: Unity resolves the first (live) type, not a default scan.
+        Assert.Equal(asm1, detour["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_revert_to_original_goes_cold_not_false_positive_load_only()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-revert-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+        HotPatchBorn(service, p, BornV2);          // body redirect (installs a detour)
+
+        // Reverting to the original text leaves no changed methods, so the
+        // redirect cannot replace the prior detour. Load_only would report a
+        // false-positive "applied" while live instances keep the redirected
+        // body; the fix returns COLD so a recompile converges instead.
+        JsonNode v3 = HotPatchBorn(service, p, BornV1);
+        Assert.False(v3["hot"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_structural_reedit_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-struct-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+
+        // Adding a field cannot be redirected onto the existing instances
+        // (their layout is fixed); steer cold rather than fragment into a new
+        // load_only assembly that silently leaves them behind.
+        JsonNode v2 = HotPatchBorn(service, p, BornV1WithField);
+        Assert.False(v2["hot"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_unchanged_resend_is_hot_noop_not_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-noop-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+
+        // The live coordinator re-ships every dirty file (against its empty
+        // baseline) each convergence batch, so a load_only'd file recurs
+        // UNCHANGED. A never-redirected file must stay a clean no-op — not cold,
+        // which would drag the whole batch cold (this is what the self-test
+        // replay exercises across ~30 batches).
+        JsonNode again = HotPatchBorn(service, p, BornV1);
+        Assert.True(again["hot"]!.GetValue<bool>(), again["files"]?.ToJsonString());
+    }
+
+    [Fact]
+    public void NewTypeRegistry_records_once_skips_empty_origin_and_clears_on_generation_change()
+    {
+        var reg = new NewTypeRegistry();
+        Assert.Empty(reg.SnapshotFor("g1"));
+        Assert.Empty(reg.SnapshotFor(null));
+
+        reg.Commit("g1", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry { OriginalText = "x", OriginalAssembly = "A1" }),
+            // An unresolved origin is never pinned (would fail the next resolution).
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "b.cs", new NewTypeRegistry.FileEntry { OriginalText = "y", OriginalAssembly = "" }),
+        });
+
+        var snap = reg.SnapshotFor("g1");
+        Assert.True(snap.ContainsKey("a.cs"));
+        Assert.Equal("A1", snap["a.cs"].OriginalAssembly);
+        Assert.False(snap.ContainsKey("b.cs"));
+        Assert.Empty(reg.SnapshotFor("g2"));   // wrong generation
+        Assert.Empty(reg.SnapshotFor(null));
+
+        // A new generation discards older entries (the domain reload that bumped
+        // it unloaded those assemblies).
+        reg.Commit("g2", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "c.cs", new NewTypeRegistry.FileEntry { OriginalText = "z", OriginalAssembly = "C1" }),
+        });
+        Assert.False(reg.SnapshotFor("g2").ContainsKey("a.cs"));
+        Assert.True(reg.SnapshotFor("g2").ContainsKey("c.cs"));
+        Assert.Empty(reg.SnapshotFor("g1"));
+    }
+
+    [Fact]
+    public void NewTypeRegistry_last_write_updates_redirected_flag_keeping_first_assembly()
+    {
+        var reg = new NewTypeRegistry();
+        reg.Commit("g", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry { OriginalText = "x", OriginalAssembly = "A1" }),
+        });
+        Assert.False(reg.SnapshotFor("g")["a.cs"].Redirected);
+
+        // A body redirect re-commits the entry with Redirected=true, preserving
+        // the FIRST assembly (the detour origin), so a later revert is steered
+        // cold instead of a stranding no-op.
+        reg.Commit("g", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry
+                {
+                    OriginalText = "x",
+                    OriginalAssembly = "A1",
+                    Redirected = true,
+                }),
+        });
+        var entry = reg.SnapshotFor("g")["a.cs"];
+        Assert.True(entry.Redirected);
+        Assert.Equal("A1", entry.OriginalAssembly);
+    }
+}
