@@ -360,12 +360,19 @@ public sealed class CompileService
     private readonly ImageRegistry _imageRegistry = new();
     private readonly MemberSurfaceRegistry _memberSurfaceRegistry = new();
     private readonly FieldStoreRegistry _fieldStoreRegistry = new();
+    private readonly NewTypeRegistry _newTypeRegistry = new();
 
     // Registrations of compiled-but-not-yet-accepted hot patches, keyed by
     // assembly name; committed into the registries when image/register
     // confirms Unity loaded the patch.
     private readonly object _pendingShimLock = new();
     private readonly Dictionary<string, (string Generation, List<ShimRegistration> Shims, List<FieldStoreRegistration> FieldStores)> _pendingShims =
+        new(StringComparer.Ordinal);
+
+    // Same deferral for play-mode-born new-type files (kept separate from the
+    // shim map so the shim path stays untouched): committed into the
+    // NewTypeRegistry when image/register confirms Unity loaded the patch.
+    private readonly Dictionary<string, (string Generation, List<KeyValuePair<string, NewTypeRegistry.FileEntry>> Entries)> _pendingNewTypes =
         new(StringComparer.Ordinal);
 
     private int _assemblyCounter;
@@ -473,6 +480,21 @@ public sealed class CompileService
         {
             CommitShimRegistrations(pending.Generation, pending.Shims);
             CommitFieldStoreRegistrations(pending.Generation, pending.FieldStores);
+        }
+
+        // Same acceptance gate for play-mode-born new-type files: only now is
+        // the type actually live in the running domain, so later re-edits may
+        // redirect onto it.
+        (string Generation, List<KeyValuePair<string, NewTypeRegistry.FileEntry>> Entries) pendingNewTypes = default;
+        lock (_pendingShimLock)
+        {
+            if (_pendingNewTypes.TryGetValue(request.AssemblyName!, out pendingNewTypes!))
+                _pendingNewTypes.Remove(request.AssemblyName!);
+        }
+        if (pendingNewTypes.Entries != null &&
+            string.Equals(pendingNewTypes.Generation, request.DomainGeneration, StringComparison.Ordinal))
+        {
+            _newTypeRegistry.Commit(pendingNewTypes.Generation, pendingNewTypes.Entries);
         }
 
         return new JsonObject
@@ -1074,6 +1096,25 @@ public sealed class CompileService
         bool anyCold = false;
         Dictionary<string, HashSet<string>> forceDetours = ForceDetourMap(request.ForceDetours);
 
+        // Play-mode-born new-type files registered by earlier batches of this
+        // generation: a re-edit re-diffs against the original loaded text (not
+        // the empty coordinator baseline) so a body change becomes a detour
+        // onto the FIRST loaded type. reeditFileAssemblies records, per file
+        // that took this path, that first assembly — the detour ORIGINAL side.
+        IReadOnlyDictionary<string, NewTypeRegistry.FileEntry> newTypeBaselines =
+            _newTypeRegistry.SnapshotFor(request.Params?.DomainGeneration);
+        var reeditFileAssemblies = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fileByPathKey = new Dictionary<string, HotDiffFileDto>(StringComparer.Ordinal);
+        foreach (HotDiffFileDto f in request.Files)
+            if (!string.IsNullOrEmpty(f.Path))
+                fileByPathKey[NormalizePathKey(f.Path!)] = f;
+        // New-type registry commits, collected through the batch and committed
+        // once the image is accepted: NEW play-mode-born files (assembly pinned
+        // after emit) and redirect marks (Redirected=true, assembly already the
+        // first one — left un-pinned). Declared here because the redirect marks
+        // are discovered in the diff loop below.
+        var newTypeRegistrations = new List<KeyValuePair<string, NewTypeRegistry.FileEntry>>();
+
         foreach (HotDiffFileDto file in request.Files)
         {
             if (string.IsNullOrEmpty(file.Path) || file.OldText == null || file.NewText == null)
@@ -1086,6 +1127,63 @@ public sealed class CompileService
                     syntaxErrors.Append('\n');
                 syntaxErrors.Append(diff.SyntaxError);
                 continue;
+            }
+            // If this file's types live only in a prior hot-patch assembly,
+            // diff against that original text (not the empty coordinator
+            // baseline, which re-classifies the whole type as new every time).
+            // Three outcomes:
+            //  (1) a method-body / using-rehook change → redirect the bodies onto
+            //      the first assembly so EXISTING instances update;
+            //  (2) an unchanged re-send of a file that was only ever load_only'd
+            //      (the coordinator re-ships every dirty file against its empty
+            //      baseline each convergence batch) → a clean no-op: the empty
+            //      diff makes it contribute nothing, no fresh assembly, no cold;
+            //  (3) a structural change, OR a revert to the original text AFTER a
+            //      redirect (the live detour must be cleared), OR an unresolvable
+            //      first assembly → cold, so a recompile converges instead of a
+            //      false-positive load_only that strands instances on a stale
+            //      redirected body.
+            if (newTypeBaselines.TryGetValue(NormalizePathKey(file.Path!), out NewTypeRegistry.FileEntry? bornEntry))
+            {
+                bool canRedirect =
+                    request.ReferenceSessionImages &&
+                    _imageRegistry.Contains(request.Params?.DomainGeneration, bornEntry.OriginalAssembly);
+                HotDiffFileResult? reedit = canRedirect
+                    ? HotDiff.Analyze(bornEntry.OriginalText, file.NewText!, parseOptions)
+                    : null;
+
+                if (reedit != null && IsRedirectableReedit(reedit) && reedit.ChangedMethods.Count > 0)
+                {
+                    // (1) body / using-rehook redirect.
+                    diff = reedit;
+                    reeditFileAssemblies[file.Path!] = bornEntry.OriginalAssembly;
+                    // Record that a detour is now live on this file (committed on
+                    // accept), so a later revert to the original text is steered
+                    // cold (clears it) rather than passing as a stranding no-op.
+                    if (!bornEntry.Redirected)
+                        newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                            NormalizePathKey(file.Path!),
+                            new NewTypeRegistry.FileEntry
+                            {
+                                OriginalText = bornEntry.OriginalText,
+                                OriginalAssembly = bornEntry.OriginalAssembly,
+                                Redirected = true,
+                            }));
+                }
+                else if (reedit != null && IsRedirectableReedit(reedit) && !bornEntry.Redirected)
+                {
+                    // (2) unchanged re-send of a never-redirected file → no-op.
+                    diff = reedit;
+                }
+                else
+                {
+                    // (3) structural / revert-after-redirect / unresolvable.
+                    var cold = new HotDiffFileResult { Hot = false };
+                    cold.Reasons.Add(
+                        "play-mode-created type re-edited with a non-body change, or reverted after a hot " +
+                        "redirect; existing instances cannot be safely updated in place — recompile to converge");
+                    diff = cold;
+                }
             }
             if (forceDetours.TryGetValue(NormalizePathKey(file.Path!), out HashSet<string>? methodKeys))
                 ApplyForcedDetours(file.Path!, file.NewText, parseOptions, diff, methodKeys);
@@ -1196,7 +1294,8 @@ public sealed class CompileService
             storeDiscriminator,
             allowUnsafe: request.Params?.AllowUnsafe ?? false,
             runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells),
-            inlineClones: inlineClones);
+            inlineClones: inlineClones,
+            reeditFileAssemblies: reeditFileAssemblies);
 
         // B6 fail-closed gate: every batch-declared partial type must
         // account, across its disk parts, for every member the ORIGINAL
@@ -1307,6 +1406,26 @@ public sealed class CompileService
                     ["isTopLevel"] = newType.IsTopLevel,
                 });
             }
+
+            // Register a brand-new FILE (empty coordinator baseline) that
+            // introduced a top-level type via load_only, so a later body-only
+            // re-edit redirects onto this assembly instead of re-loading the
+            // type afresh (which would leave live instances on the old body).
+            // Scoped to whole-new files: every type in them anchors to this one
+            // assembly, so the re-edit OriginalAssembly is unambiguous. Mixed
+            // files (a new type added beside compiled types) keep today's
+            // load_only behavior. Committed only once image/register confirms
+            // Unity loaded the patch (below) — if that call is dropped (e.g. a
+            // transport error), the entry is lost and the file's next re-edit
+            // simply falls back to load_only, exactly as before this feature.
+            if (rewrite.NewTypes.Any(t => t.IsTopLevel) &&
+                fileByPathKey.TryGetValue(NormalizePathKey(filePath), out HotDiffFileDto? bornFile) &&
+                string.IsNullOrWhiteSpace(bornFile.OldText))
+            {
+                newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                    NormalizePathKey(filePath),
+                    new NewTypeRegistry.FileEntry { OriginalText = bornFile.NewText! }));
+            }
         }
 
         if (methods.Count == 0 && newTypes.Count == 0 &&
@@ -1387,20 +1506,32 @@ public sealed class CompileService
             registration.Entry.ShimAssembly = assemblyName;
         foreach (FieldStoreRegistration registration in fieldStoreRegistrations)
             registration.Entry.StoreAssembly = assemblyName;
+        // Pin the just-emitted assembly as the detour ORIGINAL side for NEW
+        // play-mode-born files (the same emit-time bookkeeping as shims). Redirect
+        // marks already carry the first assembly (non-empty) and must keep it.
+        foreach (var registration in newTypeRegistrations)
+            if (string.IsNullOrEmpty(registration.Value.OriginalAssembly))
+                registration.Value.OriginalAssembly = assemblyName;
 
         if (request.RegisterImage && !string.IsNullOrEmpty(generation))
         {
             _imageRegistry.Register(generation!, assemblyName, bytes);
             CommitShimRegistrations(generation!, shimRegistrations);
             CommitFieldStoreRegistrations(generation!, fieldStoreRegistrations);
+            if (newTypeRegistrations.Count > 0)
+                _newTypeRegistry.Commit(generation!, newTypeRegistrations);
         }
-        else if ((shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0) &&
+        else if ((shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0 ||
+                  newTypeRegistrations.Count > 0) &&
                  !string.IsNullOrEmpty(generation))
         {
             lock (_pendingShimLock)
             {
-                _pendingShims[assemblyName] = (generation!, shimRegistrations, fieldStoreRegistrations);
-                // Keep the pending map bounded: entries for other
+                if (shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0)
+                    _pendingShims[assemblyName] = (generation!, shimRegistrations, fieldStoreRegistrations);
+                if (newTypeRegistrations.Count > 0)
+                    _pendingNewTypes[assemblyName] = (generation!, newTypeRegistrations);
+                // Keep the pending maps bounded: entries for other
                 // generations can never commit.
                 foreach (string stale in _pendingShims
                              .Where(p => p.Value.Generation != generation)
@@ -1408,6 +1539,13 @@ public sealed class CompileService
                              .ToList())
                 {
                     _pendingShims.Remove(stale);
+                }
+                foreach (string stale in _pendingNewTypes
+                             .Where(p => p.Value.Generation != generation)
+                             .Select(p => p.Key)
+                             .ToList())
+                {
+                    _pendingNewTypes.Remove(stale);
                 }
             }
         }
@@ -1782,6 +1920,30 @@ public sealed class CompileService
 
     private static string NormalizePathKey(string path) =>
         path.Replace('\\', '/').ToLowerInvariant();
+
+    /// <summary>A re-edit diff against a play-mode-born type's original text is
+    /// safe to apply in place when it touches NO structural surface: no new or
+    /// removed type/member, no field, signature or enum change, every changed
+    /// method non-added. That admits method-BODY edits, whole-file
+    /// using-directive rehooks (M6, which lists every detourable member as
+    /// changed), AND the empty diff of an unchanged re-send — all ABI-safe
+    /// because, with no field change, an existing instance's layout still
+    /// matches the rewritten body. The caller splits on ChangedMethods.Count:
+    /// non-empty → redirect; empty → no-op. A structural change (e.g. a
+    /// combined using+field edit, which has non-empty FieldChanges) fails this
+    /// and is steered cold.</summary>
+    private static bool IsRedirectableReedit(HotDiffFileResult diff)
+    {
+        return diff.Hot
+            && diff.SyntaxError == null
+            && diff.NewTypes.Count == 0
+            && diff.FieldChanges.Count == 0
+            && diff.RemovedMembers.Count == 0
+            && diff.RemovedTypes.Count == 0
+            && diff.EnumAdditions.Count == 0
+            && diff.RequiresCallerCheck.Count == 0
+            && diff.ChangedMethods.All(m => !m.Added);
+    }
 
     /// <summary>When a partial type's instance fields are split across
     /// SEVERAL batch files, the patch type's field order is the source-merge

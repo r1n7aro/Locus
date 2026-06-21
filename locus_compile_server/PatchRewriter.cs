@@ -1462,6 +1462,12 @@ public static class PatchRewriter
 
         // Detour map: changed (non-added) members, original → patch type,
         // plus kept members re-detoured for their re-added call sites (B1).
+        // Play-mode-born re-edit: when this file's types live only in a prior
+        // hot-patch assembly, pin the detour ORIGINAL side to it so Unity
+        // resolves and redirects the FIRST loaded type (existing instances) —
+        // its default resolver skips __LocusHotPatch_ assemblies. Null (the
+        // ordinary case) leaves resolution against the project assemblies.
+        batch.ReeditFileAssemblies.TryGetValue(path, out string? reeditOriginalAssembly);
         foreach (HotDiffMethod method in diff.ChangedMethods.Where(m => !m.Added).Concat(ensuredDetours))
         {
             result.Methods.Add(new PatchMethodMap
@@ -1473,6 +1479,7 @@ public static class PatchRewriter
                 ParamTypeSigs = method.ParamTypeSigs,
                 IsStatic = method.IsStatic,
                 IsCtor = method.IsCtor,
+                OriginalAssembly = reeditOriginalAssembly,
             });
         }
 

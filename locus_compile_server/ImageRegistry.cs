@@ -53,4 +53,18 @@ public sealed class ImageRegistry
     {
         return ReferencesFor(generation).Count;
     }
+
+    /// <summary>True when <paramref name="assemblyName"/> is registered for the
+    /// given generation — i.e. it is among <see cref="ReferencesFor"/> and a
+    /// patch that references session images can resolve types defined in it.</summary>
+    public bool Contains(string? generation, string assemblyName)
+    {
+        if (string.IsNullOrEmpty(generation) ||
+            !string.Equals(_generation, generation, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return _images.Any(image => string.Equals(image.AssemblyName, assemblyName, StringComparison.Ordinal));
+    }
 }

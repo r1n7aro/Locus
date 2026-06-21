@@ -197,6 +197,14 @@ public sealed class PatchBatchContext
     /// (C2′a); null = conservative (non-public body references stay cold).</summary>
     public AccessCaps? RuntimeCaps;
 
+    /// <summary>Files (keyed exactly as passed to <see cref="PatchRewriter.Rewrite"/>)
+    /// whose types live only in a prior hot-patch assembly (play-mode-born): the
+    /// value is that FIRST assembly. Redirections from such a file pin their
+    /// OriginalAssembly to it, so Unity detours the FIRST loaded type (existing
+    /// instances), not just newly created ones. Empty for ordinary batches.</summary>
+    public IReadOnlyDictionary<string, string> ReeditFileAssemblies =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
     public SemanticModel ModelFor(SyntaxTree tree) => Binding.GetSemanticModel(tree);
 
     /// <summary>
@@ -212,7 +220,8 @@ public sealed class PatchBatchContext
         string storeDiscriminator = "",
         bool allowUnsafe = false,
         AccessCaps? runtimeCaps = null,
-        IReadOnlyList<InlineRedirectClone>? inlineClones = null)
+        IReadOnlyList<InlineRedirectClone>? inlineClones = null,
+        IReadOnlyDictionary<string, string>? reeditFileAssemblies = null)
     {
         // The binding model must RESOLVE what the emit will BIND: the emit
         // compilation has always carried IgnoreAccessibility (kept bodies
@@ -244,6 +253,8 @@ public sealed class PatchBatchContext
                 ?? new Dictionary<string, FieldStoreRegistry.StoreEntry>(StringComparer.Ordinal),
             StoreDiscriminator = storeDiscriminator,
             RuntimeCaps = runtimeCaps,
+            ReeditFileAssemblies = reeditFileAssemblies
+                ?? new Dictionary<string, string>(StringComparer.Ordinal),
         };
 
         foreach (var (path, tree, diff) in files)
