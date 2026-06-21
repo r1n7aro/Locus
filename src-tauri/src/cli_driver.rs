@@ -26,6 +26,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_SUITE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_POLL_MS: u64 = 500;
 const DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 60_000;
+const POST_PLUGIN_INSTALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const UNITY_INTEGRATION_TEST_EVENT: &str = "unity-integration-test";
 
 /// Sentinel error returned through `run_driver` when the active UI run is
@@ -124,6 +125,27 @@ pub struct UnityIntegrationTestRunRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UnityIntegrationTestRunStarted {
     pub run_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginPrepareOutcome {
+    UpToDate,
+    Installed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticReadyRequirement {
+    UnityApi,
+    AssetModification,
+}
+
+impl SemanticReadyRequirement {
+    fn as_str(self) -> &'static str {
+        match self {
+            SemanticReadyRequirement::UnityApi => "unityApi",
+            SemanticReadyRequirement::AssetModification => "assetModification",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -625,9 +647,9 @@ async fn run_driver(
     let project = resolve_project_path(config.project_path.as_deref(), &workspace).await?;
     set_workspace_for_driver(&workspace, &project).await?;
     prepare_suite_environment(&project, &config, &sink)?;
-    check_or_install_plugin(&project, config.install_plugin, &sink).await?;
+    let plugin_outcome = check_or_install_plugin(&project, config.install_plugin, &sink).await?;
 
-    let status = ensure_connected(&project, &config, &sink, &mut cancel_rx).await?;
+    let status = ensure_connected(&project, &config, plugin_outcome, &sink, &mut cancel_rx).await?;
     let transport = resolve_active_transport(&project).await;
     sink.emit(
         "connected",
@@ -749,6 +771,7 @@ async fn run_driver(
                     &project,
                     *suite,
                     &config,
+                    plugin_outcome,
                     &sink,
                     &mut cancel_rx,
                     matches!(*suite, CliDriverSuite::HotReloadRelease),
@@ -764,6 +787,7 @@ async fn run_driver(
                 let edit_mode_result = if config.force_edit_mode {
                     ensure_edit_mode(
                         &project,
+                        *suite,
                         config.connect_timeout,
                         config.poll_interval,
                         &sink,
@@ -872,11 +896,11 @@ async fn check_or_install_plugin(
     project: &str,
     install: bool,
     sink: &DriverEventSink,
-) -> Result<(), String> {
+) -> Result<PluginPrepareOutcome, String> {
     match unity_bridge::check_plugin_status(project)? {
         PluginStatus::UpToDate => {
             sink.emit("plugin", json!({ "status": "upToDate" }));
-            Ok(())
+            Ok(PluginPrepareOutcome::UpToDate)
         }
         status if install => {
             sink.emit(
@@ -885,7 +909,7 @@ async fn check_or_install_plugin(
             );
             let hash = unity_bridge::install_or_update_plugin(project).await?;
             sink.emit("plugin", json!({ "status": "installed", "hash": hash }));
-            Ok(())
+            Ok(PluginPrepareOutcome::Installed)
         }
         status => Err(format!(
             "Unity plugin is {:?}; rerun with --install-plugin to update the project copy",
@@ -897,13 +921,31 @@ async fn check_or_install_plugin(
 async fn ensure_connected(
     project: &str,
     config: &CliDriverConfig,
+    plugin_outcome: PluginPrepareOutcome,
     sink: &DriverEventSink,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<UnityConnectionStatus, String> {
     let started = Instant::now();
+    let connect_timeout = connection_timeout_for_plugin_outcome(config, plugin_outcome);
+    let reload_aware_wait = plugin_outcome == PluginPrepareOutcome::Installed;
+    if reload_aware_wait {
+        unity_bridge::set_state_probe_enabled(true);
+        unity_bridge::start_unity_semantic_state_observer(project);
+        sink.emit(
+            "connection_wait_mode",
+            json!({
+                "reason": "pluginInstalled",
+                "connectTimeoutMs": connect_timeout.as_millis(),
+                "baseConnectTimeoutMs": config.connect_timeout.as_millis(),
+                "stateProbe": true,
+            }),
+        );
+    }
     let mut launched = false;
     let mut last_progress_at = Instant::now();
     let mut last_signature = String::new();
+    let mut last_semantic_signature = String::new();
+    let mut last_semantic_sample: Option<serde_json::Value> = None;
     let mut recent_samples: Vec<serde_json::Value> = Vec::new();
     let mut last_log = Instant::now()
         .checked_sub(Duration::from_secs(60))
@@ -925,6 +967,22 @@ async fn ensure_connected(
 
         if status.connected {
             return Ok(status);
+        }
+
+        let mut semantic_waiting = false;
+        if reload_aware_wait {
+            let semantic = unity_bridge::unity_semantic_state(project).await;
+            semantic_waiting = semantic_state_is_reload_wait(&semantic);
+            let semantic_sample = semantic_connection_wait_sample(&semantic);
+            last_semantic_sample = Some(semantic_sample.clone());
+            let semantic_signature = semantic_connection_wait_signature(&semantic);
+            if semantic_signature != last_semantic_signature {
+                last_semantic_signature = semantic_signature;
+                if semantic_waiting {
+                    last_progress_at = Instant::now();
+                }
+                sink.emit("connection_semantic_progress", semantic_sample);
+            }
         }
 
         if !launched
@@ -968,18 +1026,20 @@ async fn ensure_connected(
                     "processId": status.editor_process_id,
                     "channel": status.control_channel_state,
                     "lastError": status.last_error,
+                    "semantic": last_semantic_sample,
                 }),
             );
             last_log = Instant::now();
         }
 
-        if last_progress_at.elapsed() >= config.no_progress_timeout {
+        if !semantic_waiting && last_progress_at.elapsed() >= config.no_progress_timeout {
             sink.emit(
                 "connection_stalled",
                 json!({
                     "elapsedMs": started.elapsed().as_millis(),
                     "noProgressMs": last_progress_at.elapsed().as_millis(),
                     "recent": recent_samples,
+                    "semantic": last_semantic_sample,
                 }),
             );
             return Err(format!(
@@ -992,17 +1052,18 @@ async fn ensure_connected(
             ));
         }
 
-        if started.elapsed() >= config.connect_timeout {
+        if started.elapsed() >= connect_timeout {
             sink.emit(
                 "connection_timeout",
                 json!({
                     "elapsedMs": started.elapsed().as_millis(),
                     "recent": recent_samples,
+                    "semantic": last_semantic_sample,
                 }),
             );
             return Err(format!(
                 "Unity connection timed out after {}ms",
-                config.connect_timeout.as_millis()
+                connect_timeout.as_millis()
             ));
         }
         tokio::select! {
@@ -1034,6 +1095,171 @@ fn connection_wait_sample(started: Instant, status: &UnityConnectionStatus) -> s
         "processId": status.editor_process_id,
         "channel": &status.control_channel_state,
         "lastError": &status.last_error,
+    })
+}
+
+fn connection_timeout_for_plugin_outcome(
+    config: &CliDriverConfig,
+    plugin_outcome: PluginPrepareOutcome,
+) -> Duration {
+    match plugin_outcome {
+        PluginPrepareOutcome::Installed => config
+            .connect_timeout
+            .max(POST_PLUGIN_INSTALL_CONNECT_TIMEOUT),
+        PluginPrepareOutcome::UpToDate => config.connect_timeout,
+    }
+}
+
+fn semantic_state_is_reload_wait(state: &unity_bridge::SemanticState) -> bool {
+    matches!(state.phase.as_str(), "starting" | "reloading")
+        || state.safety.recommended_action == "wait_reload"
+}
+
+fn semantic_connection_wait_signature(state: &unity_bridge::SemanticState) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        state.phase,
+        state.source,
+        state.confidence,
+        state.reload_phase.as_deref().unwrap_or(""),
+        state.domain.phase,
+        state.editor_mode.value,
+        state.safety.can_call_unity_api,
+        state.safety.can_modify_assets_safely,
+        state.safety.recommended_action,
+        state.detail.as_deref().unwrap_or("")
+    )
+}
+
+fn semantic_connection_wait_sample(state: &unity_bridge::SemanticState) -> serde_json::Value {
+    json!({
+        "phase": &state.phase,
+        "source": &state.source,
+        "confidence": &state.confidence,
+        "transient": state.transient,
+        "needsUser": state.needs_user,
+        "detail": &state.detail,
+        "reloadPhase": &state.reload_phase,
+        "editorMode": &state.editor_mode.value,
+        "canCallUnityApi": state.safety.can_call_unity_api,
+        "canModifyAssetsSafely": state.safety.can_modify_assets_safely,
+        "recommendedAction": &state.safety.recommended_action,
+        "process": &state.process.state,
+        "processId": state.process.pid,
+        "channel": &state.channel.control_pipe,
+        "domain": &state.domain.phase,
+        "mainThread": &state.main_thread.state,
+    })
+}
+
+fn semantic_ready_requirement_satisfied(
+    state: &unity_bridge::SemanticState,
+    requirement: SemanticReadyRequirement,
+) -> bool {
+    match requirement {
+        SemanticReadyRequirement::UnityApi => state.safety.can_call_unity_api,
+        SemanticReadyRequirement::AssetModification => state.safety.can_modify_assets_safely,
+    }
+}
+
+async fn wait_for_semantic_ready(
+    project: &str,
+    suite: CliDriverSuite,
+    action: &'static str,
+    requirement: SemanticReadyRequirement,
+    timeout: Duration,
+    poll_interval: Duration,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<unity_bridge::SemanticState, String> {
+    unity_bridge::set_state_probe_enabled(true);
+    unity_bridge::start_unity_semantic_state_observer(project);
+    sink.emit(
+        "semantic_wait_start",
+        json!({
+            "suite": suite.as_str(),
+            "action": action,
+            "requirement": requirement.as_str(),
+            "timeoutMs": timeout.as_millis(),
+        }),
+    );
+
+    let started = Instant::now();
+    let mut last_signature = String::new();
+
+    loop {
+        if *cancel_rx.borrow() {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+
+        let semantic = unity_bridge::unity_semantic_state(project).await;
+        let ready = semantic_ready_requirement_satisfied(&semantic, requirement);
+        let sample = semantic_connection_wait_sample(&semantic);
+        let signature = format!(
+            "{}|{}",
+            ready,
+            semantic_connection_wait_signature(&semantic)
+        );
+        if signature != last_signature || ready {
+            last_signature = signature;
+            sink.emit(
+                "semantic_wait",
+                json!({
+                    "suite": suite.as_str(),
+                    "action": action,
+                    "requirement": requirement.as_str(),
+                    "ready": ready,
+                    "elapsedMs": started.elapsed().as_millis(),
+                    "state": sample.clone(),
+                }),
+            );
+        }
+        if ready {
+            return Ok(semantic);
+        }
+
+        if started.elapsed() >= timeout {
+            sink.emit(
+                "semantic_wait_timeout",
+                json!({
+                    "suite": suite.as_str(),
+                    "action": action,
+                    "requirement": requirement.as_str(),
+                    "elapsedMs": started.elapsed().as_millis(),
+                    "state": sample,
+                }),
+            );
+            return Err(format!(
+                "Unity semantic state was not ready for {action} within {}ms",
+                timeout.as_millis()
+            ));
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = cancel_rx.changed() => {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+        }
+    }
+}
+
+fn unity_reload_boundary_error(error: &str) -> bool {
+    matches!(error, "managed_reloading" | "domain_reload_interrupted")
+        || error.contains("managed_reloading")
+        || error.contains("domain_reload_interrupted")
+}
+
+fn remaining_or_timeout(
+    started: Instant,
+    timeout: Duration,
+    action: &'static str,
+) -> Result<Duration, String> {
+    timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+        format!(
+            "{action} did not become ready within {}ms",
+            timeout.as_millis()
+        )
     })
 }
 
@@ -1896,6 +2122,7 @@ async fn run_hot_reload_suite(
     project: &str,
     suite: CliDriverSuite,
     config: &CliDriverConfig,
+    plugin_outcome: PluginPrepareOutcome,
     sink: &DriverEventSink,
     cancel_rx: &mut watch::Receiver<bool>,
     force_release: bool,
@@ -1903,6 +2130,7 @@ async fn run_hot_reload_suite(
     crate::csharp_compile::set_enabled(true).await;
     crate::csharp_compile::warm_up_in_background();
     crate::unity_hotreload::set_enabled(true);
+    let semantic_ready_timeout = connection_timeout_for_plugin_outcome(config, plugin_outcome);
 
     if force_release {
         for desired in ["release", "debug"] {
@@ -1911,6 +2139,7 @@ async fn run_hot_reload_suite(
                 project,
                 suite,
                 config,
+                semantic_ready_timeout,
                 sink,
                 cancel_rx,
                 Some(desired),
@@ -1921,7 +2150,15 @@ async fn run_hot_reload_suite(
         Ok(())
     } else {
         run_hot_reload_selftest_once(
-            app_handle, project, suite, config, sink, cancel_rx, None, false,
+            app_handle,
+            project,
+            suite,
+            config,
+            semantic_ready_timeout,
+            sink,
+            cancel_rx,
+            None,
+            false,
         )
         .await
     }
@@ -1932,6 +2169,7 @@ async fn run_hot_reload_selftest_once(
     project: &str,
     suite: CliDriverSuite,
     config: &CliDriverConfig,
+    semantic_ready_timeout: Duration,
     sink: &DriverEventSink,
     cancel_rx: &mut watch::Receiver<bool>,
     desired_code_optimization: Option<&'static str>,
@@ -1940,7 +2178,8 @@ async fn run_hot_reload_selftest_once(
     if config.force_edit_mode {
         ensure_edit_mode(
             project,
-            config.connect_timeout,
+            suite,
+            semantic_ready_timeout,
             config.poll_interval,
             sink,
             cancel_rx,
@@ -1961,7 +2200,7 @@ async fn run_hot_reload_selftest_once(
             project,
             suite,
             desired,
-            config.connect_timeout,
+            semantic_ready_timeout,
             config.poll_interval,
             sink,
             cancel_rx,
@@ -1969,6 +2208,18 @@ async fn run_hot_reload_selftest_once(
         )
         .await?;
     }
+
+    wait_for_semantic_ready(
+        project,
+        suite,
+        "hot_reload_preflight",
+        SemanticReadyRequirement::AssetModification,
+        semantic_ready_timeout,
+        config.poll_interval,
+        sink,
+        cancel_rx,
+    )
+    .await?;
 
     let summary = run_event_selftest(
         app_handle,
@@ -1994,6 +2245,18 @@ async fn ensure_code_optimization(
     cancel_rx: &mut watch::Receiver<bool>,
     force_set: bool,
 ) -> Result<Option<String>, String> {
+    wait_for_semantic_ready(
+        project,
+        suite,
+        "code_optimization_probe",
+        SemanticReadyRequirement::AssetModification,
+        timeout,
+        poll_interval,
+        sink,
+        cancel_rx,
+    )
+    .await?;
+
     let (connected, before) =
         crate::unity_hotreload::coordinator::detect_code_optimization(project).await;
     sink.emit(
@@ -2011,8 +2274,37 @@ async fn ensure_code_optimization(
         return Ok(before);
     }
 
-    let reported =
-        crate::unity_hotreload::coordinator::set_code_optimization(project, desired).await?;
+    let started = Instant::now();
+    let reported = loop {
+        wait_for_semantic_ready(
+            project,
+            suite,
+            "code_optimization_set",
+            SemanticReadyRequirement::AssetModification,
+            remaining_or_timeout(started, timeout, "Unity Code Optimization preflight")?,
+            poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
+
+        match crate::unity_hotreload::coordinator::set_code_optimization(project, desired).await {
+            Ok(reported) => break reported,
+            Err(error) if unity_reload_boundary_error(&error) && started.elapsed() < timeout => {
+                sink.emit(
+                    "code_optimization",
+                    json!({
+                        "suite": suite.as_str(),
+                        "action": "retry_after_reload",
+                        "desired": desired,
+                        "error": error,
+                        "elapsedMs": started.elapsed().as_millis(),
+                    }),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    };
     sink.emit(
         "code_optimization",
         json!({
@@ -2100,21 +2392,75 @@ async fn wait_for_code_optimization(
 
 async fn ensure_edit_mode(
     project: &str,
+    suite: CliDriverSuite,
     timeout: Duration,
     poll_interval: Duration,
     sink: &DriverEventSink,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
+    wait_for_semantic_ready(
+        project,
+        suite,
+        "editor_mode_probe",
+        SemanticReadyRequirement::UnityApi,
+        timeout,
+        poll_interval,
+        sink,
+        cancel_rx,
+    )
+    .await?;
+
     let status = unity_bridge::query_unity_connection_status(project).await;
     if status.editor_status == UNITY_EDITOR_STATUS_EDITING {
+        wait_for_semantic_ready(
+            project,
+            suite,
+            "editor_mode_ready",
+            SemanticReadyRequirement::AssetModification,
+            timeout,
+            poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
         return Ok(());
     }
 
-    sink.emit(
-        "editor_mode",
-        json!({ "action": "set", "desiredStatus": UNITY_EDITOR_STATUS_EDITING }),
-    );
-    unity_bridge::set_editor_status(project, UNITY_EDITOR_STATUS_EDITING).await?;
+    let request_started = Instant::now();
+    loop {
+        sink.emit(
+            "editor_mode",
+            json!({ "action": "set", "desiredStatus": UNITY_EDITOR_STATUS_EDITING }),
+        );
+        match unity_bridge::set_editor_status(project, UNITY_EDITOR_STATUS_EDITING).await {
+            Ok(()) => break,
+            Err(error)
+                if unity_reload_boundary_error(&error) && request_started.elapsed() < timeout =>
+            {
+                sink.emit(
+                    "editor_mode",
+                    json!({
+                        "action": "retry_after_reload",
+                        "desiredStatus": UNITY_EDITOR_STATUS_EDITING,
+                        "error": error,
+                        "elapsedMs": request_started.elapsed().as_millis(),
+                    }),
+                );
+                wait_for_semantic_ready(
+                    project,
+                    suite,
+                    "editor_mode_retry",
+                    SemanticReadyRequirement::UnityApi,
+                    remaining_or_timeout(request_started, timeout, "Unity edit-mode request")?,
+                    poll_interval,
+                    sink,
+                    cancel_rx,
+                )
+                .await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     let started = Instant::now();
     loop {
@@ -2127,6 +2473,17 @@ async fn ensure_edit_mode(
                 "editor_mode",
                 json!({ "status": UNITY_EDITOR_STATUS_EDITING }),
             );
+            wait_for_semantic_ready(
+                project,
+                suite,
+                "editor_mode_ready",
+                SemanticReadyRequirement::AssetModification,
+                remaining_or_timeout(started, timeout, "Unity edit-mode stabilization")?,
+                poll_interval,
+                sink,
+                cancel_rx,
+            )
+            .await?;
             return Ok(());
         }
         if started.elapsed() >= timeout {
