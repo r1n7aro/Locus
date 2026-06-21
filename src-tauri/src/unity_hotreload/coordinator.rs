@@ -1135,6 +1135,23 @@ fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64
 /// reported messages it could NOT wire (`pump_failed_count > 0`). Both become live
 /// natively after a recompile, so the file is not marked applied here. Returns the
 /// agent-facing error when it must fail closed, `Ok(())` when the patch may stand.
+/// A "clear" driver is a MARKER, not a real driver: it tells the plugin to tear
+/// down a file's stale message-pump registrations (replace-by-source) when a
+/// play-mode-born re-edit removed a previously hot-applied Unity message. It
+/// wires nothing, so it must NOT count toward the pump-capability gate/preflight
+/// (an old plugin that cannot drive messages also never registered the one being
+/// cleared — clearing it is a harmless no-op there) nor the summary's added-
+/// message total. It DOES keep `message_drivers` non-empty so the patch still
+/// ships to Unity (where ClearSource runs) instead of being dropped as "nothing
+/// detourable".
+fn is_clear_marker(driver: &crate::csharp_compile::HotPatchMessageDriver) -> bool {
+    driver.kind == "clear"
+}
+
+fn has_real_message_drivers(drivers: &[crate::csharp_compile::HotPatchMessageDriver]) -> bool {
+    drivers.iter().any(|d| !is_clear_marker(d))
+}
+
 fn message_driver_gate(
     has_message_drivers: bool,
     pump_supported: bool,
@@ -1272,7 +1289,7 @@ async fn apply_compiled_hot_patch(
     // round-trip, so the caller routes straight to a recompile. The first, unlearned
     // message-driver patch still hits the post-response gate below (which records the
     // capability), so this only short-circuits once the answer is known.
-    if !message_drivers.is_empty()
+    if has_real_message_drivers(message_drivers)
         && known_pump_capability(&params.domain_generation) == Some(false)
     {
         message_driver_gate(true, false, 0)?;
@@ -1313,6 +1330,11 @@ async fn apply_compiled_hot_patch(
             "message": d.message,
             "param_type": d.param_type,
             "source_path": d.source_path,
+            // Tier-2: a play-mode-born type's added message drives instances in
+            // the FIRST hot-patch assembly. Older plugins ignore the unknown field
+            // and fall back to default resolution (which can't find a play-mode-born
+            // type) — the same compatibility discipline as the method-map field.
+            "original_assembly": d.original_assembly.as_deref().unwrap_or(""),
         })).collect::<Vec<_>>(),
     });
     if let Some(object) = payload.as_object_mut() {
@@ -1399,7 +1421,7 @@ async fn apply_compiled_hot_patch(
     // natively; returning Err routes the caller to queue_cold_paths instead of
     // marking the file applied / live.
     message_driver_gate(
-        !message_drivers.is_empty(),
+        has_real_message_drivers(message_drivers),
         loaded.pump_supported,
         loaded.pump_failed_count,
     )?;
@@ -2657,18 +2679,38 @@ pub async fn hot_reload(
             if !new_types.is_empty() {
                 summary.push_str(&format!(", {} new type(s) loaded", new_types.len()));
             }
-            if !message_drivers.is_empty() {
+            let real_driver_count = message_drivers
+                .iter()
+                .filter(|d| !is_clear_marker(d))
+                .count();
+            if real_driver_count > 0 {
                 // Hard failures already fail closed above, so the remainder is driven
                 // (pump/proxy/once-off catch-up) or benign-skipped. Report each
                 // skipped message by name (when the plugin sent them), and surface
                 // each distinct caveat note once so the agent understands why a driven
                 // message may not match native behavior.
-                let notes: Vec<&str> = message_drivers.iter().map(|d| d.note.as_str()).collect();
+                let notes: Vec<&str> = message_drivers
+                    .iter()
+                    .filter(|d| !is_clear_marker(d))
+                    .map(|d| d.note.as_str())
+                    .collect();
                 summary.push_str(&message_driver_summary(
-                    message_drivers.len(),
+                    real_driver_count,
                     pump_skipped_count,
                     &pump_skipped_messages,
                     &notes,
+                ));
+            }
+            // Clear-markers (feature #1): a play-mode-born re-edit removed a Unity
+            // message an earlier patch had wired to the pump. The behavior stops
+            // immediately (the plugin cleared the driver by source file).
+            let cleared_count = message_drivers
+                .iter()
+                .filter(|d| is_clear_marker(d))
+                .count();
+            if cleared_count > 0 {
+                summary.push_str(&format!(
+                    ".\n{cleared_count} removed Unity message(s) stopped (runtime driver cleared)"
                 ));
             }
             if !engine.is_empty() {
@@ -2769,6 +2811,31 @@ mod tests {
         let err = message_driver_gate(true, false, 0).unwrap_err();
         assert!(err.contains("can't drive"), "{err}");
         assert!(err.contains("unity_recompile"), "{err}");
+    }
+
+    #[test]
+    fn clear_markers_excluded_from_pump_capability_gate() {
+        fn driver(kind: &str) -> crate::csharp_compile::HotPatchMessageDriver {
+            serde_json::from_value(serde_json::json!({
+                "kind": kind,
+                "declaringType": "Born.Widget",
+                "shimType": "",
+                "shimMethod": "",
+                "message": "Update",
+                "sourcePath": "Widget.cs",
+            }))
+            .unwrap()
+        }
+        // A clear-marker is not a real driver: an old plugin (pump_supported=false)
+        // that never wired the message also has nothing to clear, so a clear-ONLY
+        // patch must NOT fail closed on the pump-capability gate.
+        let clear_only = vec![driver("clear")];
+        assert!(!has_real_message_drivers(&clear_only));
+        assert!(message_driver_gate(has_real_message_drivers(&clear_only), false, 0).is_ok());
+        // A real driver alongside a clear-marker still trips the gate on an old plugin.
+        let mixed = vec![driver("player_loop"), driver("clear")];
+        assert!(has_real_message_drivers(&mixed));
+        assert!(message_driver_gate(has_real_message_drivers(&mixed), false, 0).is_err());
     }
 
     #[test]

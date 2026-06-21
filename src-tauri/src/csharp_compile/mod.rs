@@ -454,7 +454,11 @@ pub struct HotPatchMethod {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HotPatchMessageDriver {
-    /// Driver kind: "player_loop" | "component_proxy".
+    /// Driver kind: "player_loop" | "component_proxy" | "catch_up" | "inert", or
+    /// "clear" — a marker (no shim) emitted when a play-mode-born re-edit REMOVED
+    /// a previously hot-applied message: it only carries `source_path` so the
+    /// plugin's replace-by-source teardown drops the stale driver. Clear-markers
+    /// are excluded from the pump-capability gate and the added-message summary.
     #[serde(default)]
     pub kind: String,
     /// Original declaring type (CLR metadata name) whose instances are driven.
@@ -478,6 +482,13 @@ pub struct HotPatchMessageDriver {
     /// driver matches native behavior. Surfaced in the hot-reload summary.
     #[serde(default)]
     pub note: String,
+    /// Tier-2: when set, the driven type lives in this specific assembly (a
+    /// play-mode-born type whose only definition is the FIRST hot-patch assembly).
+    /// The plugin then resolves `declaring_type` there, bypassing its usual skip
+    /// of `__LocusHotPatch_` assemblies — mirroring `HotPatchMethod.original_assembly`.
+    /// Absent for ordinary compiled types (the plugin uses default resolution).
+    #[serde(default)]
+    pub original_assembly: Option<String>,
 }
 
 /// A type that only exists in the edited text (TI-C / snippet visibility).
