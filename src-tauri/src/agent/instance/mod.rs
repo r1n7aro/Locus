@@ -3020,6 +3020,13 @@ impl AgentInstance {
                 // Asset-side code analysis tools work without the language
                 // server but honor their per-tool switches.
                 "unity_code_usages" => crate::code_tools::tool_enabled(tool_name.as_str()),
+                // Hot reload rides on the hot-reload feature plus the sidecar
+                // compiler; keep it out of the agent context entirely when
+                // either is off (calling it would only error and redirect to
+                // unity_recompile).
+                "unity_hot_reload" => {
+                    crate::unity_hotreload::is_enabled() && crate::csharp_compile::is_enabled()
+                }
                 _ => true,
             })
             .cloned()
