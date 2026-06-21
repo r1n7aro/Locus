@@ -2387,6 +2387,21 @@ pub async fn unity_recompile_run(workspace: State<'_, Arc<Workspace>>) -> Result
         .map_err(Into::into)
 }
 
+/// Test-page probe: write a throwaway harmless `.cs` into the current project's
+/// `Assets`, drive a real recompile, then delete it (and its `.meta`) and
+/// converge the deletion. Verifies a recompile actually converges — and whether
+/// the background hook let it happen without bringing Unity to the foreground.
+/// Returns a line-oriented report for the test page to render.
+#[tauri::command]
+pub async fn unity_recompile_probe_run(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::run_recompile_probe(&cwd)
+        .await
+        .map_err(Into::into)
+}
+
 /// Run a one-off C# snippet in the connected Unity Editor and return its
 /// string result. Thin host-driver wrapper over `unity_execute_code` (the
 /// same path the `unity_execute` tool and the hot-reload self-test use) so a

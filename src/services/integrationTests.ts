@@ -61,6 +61,24 @@ export function cancelUnityIntegrationTests(): Promise<void> {
   );
 }
 
+/**
+ * Run the stand-alone recompile probe: the backend writes a throwaway harmless
+ * `.cs` into the current project's `Assets`, drives a real recompile, then
+ * deletes it and converges the deletion. Resolves to a line-oriented report
+ * (`PASS`/`FAIL`/`WARN`-prefixed lines).
+ */
+export function runUnityRecompileProbe(): Promise<string> {
+  return ipcInvoke<string>(
+    "unity_recompile_probe_run",
+    {},
+    {
+      operation: "unityRecompileProbe",
+      notify: false,
+      throwOnError: true,
+    },
+  );
+}
+
 export function subscribeUnityIntegrationTests(
   handler: (payload: UnityIntegrationTestEvent) => void,
 ): Promise<RuntimeUnsubscribe> {

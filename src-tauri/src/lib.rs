@@ -1092,6 +1092,7 @@ pub fn run() {
             commands::install_unity_plugin,
             commands::launch_unity_project,
             commands::unity_recompile_run,
+            commands::unity_recompile_probe_run,
             commands::unity_execute_snippet_run,
             commands::send_unity_log,
             commands::select_unity_asset,

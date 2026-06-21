@@ -6,6 +6,7 @@ import { normalizeAppError } from "../../services/errors";
 import {
   cancelUnityIntegrationTests,
   runUnityIntegrationTests,
+  runUnityRecompileProbe,
   subscribeUnityIntegrationTests,
   type TypeIndexSampleMode,
   type UnityIntegrationSuite,
@@ -67,13 +68,17 @@ const forceEditMode = ref(true);
 const typeIndexSampleMode = ref<TypeIndexSampleMode>("sample32");
 const { copied: outputCopied, copyText: copyOutputText } = useCopyFeedback();
 
+// Stand-alone recompile probe (independent of the suite run above).
+const probeRunning = ref(false);
+const probeLines = ref<string[]>([]);
+
 let unsubscribeIntegrationTests: RuntimeUnsubscribe | null = null;
 
 const selectedSuiteIds = computed(() => suiteItems
   .filter((suite) => selectedSuites[suite.id])
   .map((suite) => suite.id));
 
-const canRun = computed(() => !running.value && selectedSuiteIds.value.length > 0);
+const canRun = computed(() => !running.value && !probeRunning.value && selectedSuiteIds.value.length > 0);
 
 const selectedItem = computed(() => suiteItems.find((suite) => suite.id === selectedDetailId.value) ?? suiteItems[0]);
 const selectedState = computed(() => suiteStates[selectedDetailId.value]);
@@ -142,9 +147,30 @@ async function runAllSuites() {
   await startRun(suites);
 }
 
+async function runProbe() {
+  if (probeRunning.value || running.value) return;
+  probeRunning.value = true;
+  probeLines.value = [t("settings.testing.probe.starting")];
+  try {
+    const report = await runUnityRecompileProbe();
+    probeLines.value = report.split("\n");
+  } catch (e) {
+    const err = normalizeAppError(e);
+    probeLines.value = [`FAIL ${err.message}`];
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "unityRecompileProbe",
+      replaceOperation: true,
+    });
+  } finally {
+    probeRunning.value = false;
+  }
+}
+
 async function startRun(suites: UnityIntegrationSuite[]) {
   if (suites.length === 0 || running.value) return;
 
+  currentRunId.value = "";
   resetSuiteStates(suites);
   autoFollow.value = true;
   cancelling.value = false;
@@ -161,7 +187,7 @@ async function startRun(suites: UnityIntegrationSuite[]) {
       connectTimeoutMs: 60_000,
       suiteTimeoutMs: 1_200_000,
       pollMs: 500,
-      noProgressTimeoutMs: 20_000,
+      noProgressTimeoutMs: 60_000,
     });
     currentRunId.value = started.runId;
   } catch (e) {
@@ -197,17 +223,52 @@ async function interruptRun() {
 function appendErrorLine(message: string) {
   const active = suiteItems.find((suite) => suiteStates[suite.id].status === "running");
   const target = active ? active.id : selectedDetailId.value;
-  const line = `ERROR ${message}`;
+  appendSuiteLine(target, `ERROR ${message}`);
+}
+
+function appendSuiteLine(target: UnityIntegrationSuite, line: string) {
   const previousLine = suiteLogs[target][suiteLogs[target].length - 1];
   if (previousLine === line) return;
   suiteLogs[target] = [...suiteLogs[target], line];
   if (target === selectedDetailId.value) scrollConsoleToBottom();
 }
 
+function failSuite(suite: UnityIntegrationSuite, message: string, failed = 1) {
+  const state = suiteStates[suite];
+  suiteStates[suite] = {
+    ...state,
+    status: "failed",
+    failed: Math.max(state.failed, failed),
+    detail: message,
+  };
+  if (message) appendSuiteLine(suite, `ERROR ${message}`);
+}
+
 function markActiveSuitesCancelled() {
   for (const suite of suiteItems) {
     const state = suiteStates[suite.id];
     if (state.status === "running" || state.status === "queued") {
+      suiteStates[suite.id] = { ...state, status: "cancelled" };
+    }
+  }
+}
+
+function markRunningSuitesMissingResult(nextSuite: UnityIntegrationSuite) {
+  for (const suite of suiteItems) {
+    if (suite.id === nextSuite) continue;
+    const state = suiteStates[suite.id];
+    if (state.status === "running") {
+      failSuite(suite.id, t("settings.testing.suiteMissingResult"));
+    }
+  }
+}
+
+function markOpenSuitesAfterFailure(message: string) {
+  for (const suite of suiteItems) {
+    const state = suiteStates[suite.id];
+    if (state.status === "running") {
+      failSuite(suite.id, message);
+    } else if (state.status === "queued") {
       suiteStates[suite.id] = { ...state, status: "cancelled" };
     }
   }
@@ -233,6 +294,7 @@ function handleIntegrationEvent(event: UnityIntegrationTestEvent) {
       return;
     case "suite_start":
       if (suite) {
+        markRunningSuitesMissingResult(suite);
         suiteStates[suite] = { ...suiteStates[suite], status: "running" };
         if (!cancelling.value) setRunStatus("running", t("settings.testing.runningSuite", labelForSuite(suite)));
         if (autoFollow.value) {
@@ -250,6 +312,18 @@ function handleIntegrationEvent(event: UnityIntegrationTestEvent) {
         }
       }
       return;
+    case "suite_no_progress":
+    case "suite_error": {
+      const message = stringPayload(event.payload, "message") || t("settings.testing.failed");
+      if (suite) {
+        const failed = Math.max(1, numberPayload(event.payload, "failed"));
+        failSuite(suite, message, failed);
+      } else {
+        appendErrorLine(message);
+      }
+      setRunStatus("failed", message);
+      return;
+    }
     case "suite_result":
       if (suite) {
         const passed = numberPayload(event.payload, "passed");
@@ -265,6 +339,7 @@ function handleIntegrationEvent(event: UnityIntegrationTestEvent) {
     case "error": {
       const message = stringPayload(event.payload, "message") || t("settings.testing.failed");
       appendErrorLine(message);
+      markOpenSuitesAfterFailure(message);
       setRunStatus("failed", message);
       running.value = false;
       cancelling.value = false;
@@ -307,6 +382,8 @@ function stringPayload(payload: Record<string, unknown>, key: string): string {
 }
 
 function resultDetail(payload: Record<string, unknown>): string {
+  const message = stringPayload(payload, "message");
+  if (message) return message;
   const checkedTargets = numberPayload(payload, "checkedTargets");
   const checkedProperties = numberPayload(payload, "checkedProperties");
   if (checkedTargets > 0 || checkedProperties > 0) {
@@ -394,7 +471,7 @@ onUnmounted(() => {
           <BaseButton :disabled="!canRun" @click="runSelectedSuites">
             {{ t("settings.testing.runSelected") }}
           </BaseButton>
-          <BaseButton variant="primary" @click="runAllSuites">
+          <BaseButton variant="primary" :disabled="probeRunning" @click="runAllSuites">
             {{ t("settings.testing.runAll") }}
           </BaseButton>
         </template>
@@ -473,6 +550,28 @@ onUnmounted(() => {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.testing.probe.title") }}</div>
+    <div class="test-card probe-card">
+      <p class="probe-desc">{{ t("settings.testing.probe.desc") }}</p>
+      <div class="probe-actions">
+        <BaseButton :disabled="running || probeRunning" @click="runProbe">
+          {{ probeRunning ? t("settings.testing.probe.running") : t("settings.testing.probe.run") }}
+        </BaseButton>
+      </div>
+      <div v-if="probeLines.length > 0" class="detail-output probe-output" role="log">
+        <div
+          v-for="(line, index) in probeLines"
+          :key="index"
+          class="output-line"
+          :class="lineClass(line)"
+        >
+          {{ line }}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.testing.options") }}</div>
     <div class="test-card">
       <label class="option-row">
@@ -507,6 +606,29 @@ onUnmounted(() => {
   border-radius: 10px;
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
   overflow: hidden;
+}
+
+.probe-card {
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.probe-desc {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.probe-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.probe-output {
+  min-height: auto;
+  max-height: 320px;
+  margin-top: 2px;
 }
 
 /* Run bar ------------------------------------------------------------------ */
