@@ -118,6 +118,14 @@ use super::coordinator;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+struct SelfTestRunningGuard;
+
+impl Drop for SelfTestRunningGuard {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 const EXIT_PLAY_MODE_TIMEOUT: Duration = Duration::from_secs(90);
 const UNITY_SEMANTIC_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UNITY_SEMANTIC_READY_POLL: Duration = Duration::from_millis(500);
@@ -1717,10 +1725,7 @@ return null;"#;
             Ok(output) if output.lines().any(|l| l.trim() == want) => {
                 self.pass(name, format!("retained instance reports Beat={expected}"));
             }
-            Ok(output) => self.fail(
-                name,
-                format!("expected '{want}', got: {}", squash(&output)),
-            ),
+            Ok(output) => self.fail(name, format!("expected '{want}', got: {}", squash(&output))),
             Err(error) => self.fail(name, format!("beat snippet failed: {}", squash(&error))),
         }
     }
@@ -1749,20 +1754,19 @@ return null;"#;
             Ok(output) if output.lines().any(|l| l.trim() == want) => {
                 self.pass(name, format!("retained instance bumped to Beat={expected}"));
             }
-            Ok(output) => self.fail(
-                name,
-                format!("expected '{want}', got: {}", squash(&output)),
-            ),
+            Ok(output) => self.fail(name, format!("expected '{want}', got: {}", squash(&output))),
             Err(error) => self.fail(name, format!("bump snippet failed: {}", squash(&error))),
         }
     }
 
-    /// Phenomenon 3 — the play-mode-born re-edit trichotomy, asserted against a
-    /// LIVE editor with a retained instance of the play-mode-born type. Ordered
-    /// so the never-redirected no-op fires BEFORE the redirect (branch 2 in
-    /// HandleCompileHotPatch requires !Redirected), then the body redirect, then
-    /// the two cold guards. `fresh` is the file's current text ledger; on entry
-    /// the retained instance is at Beat=0 (P09a spawned it without bumping).
+    /// Phenomenon 3 — the play-mode-born re-edit trichotomy plus the Tier-2
+    /// additions case, asserted against a LIVE editor with a retained instance of
+    /// the play-mode-born type. Ordered so the never-redirected no-op fires BEFORE
+    /// the redirect (branch 2 in HandleCompileHotPatch requires !Redirected), then
+    /// the body redirect, then the two cold guards, then (P09f) an ADDED Unity
+    /// message driven onto the same instance. `fresh` is the file's current text
+    /// ledger; on entry the retained instance is at Beat=0 (P09a spawned it
+    /// without bumping).
     async fn run_play_mode_born_reedit_tests(&mut self, fresh: &mut String) {
         // P09b — UNCHANGED re-send of a never-redirected play-mode-born file →
         // clean HOT no-op (NOT cold). The live coordinator re-ships every dirty
@@ -1816,11 +1820,8 @@ return null;"#;
                     redirected = true;
                     // THE load-bearing assertion: the SAME pre-existing instance
                     // runs the redirected body. 0 (birth Beat) + 7 (new body) = 7.
-                    self.expect_fresh_bump(
-                        "P09c existing instance runs the redirected body",
-                        7,
-                    )
-                    .await;
+                    self.expect_fresh_bump("P09c existing instance runs the redirected body", 7)
+                        .await;
                 } else {
                     *fresh = original.clone();
                 }
@@ -1828,15 +1829,14 @@ return null;"#;
             Err(error) => self.fail(name, error),
         }
 
-        // The two cold guards below only make sense once a redirect is live (the
-        // registry flag is Redirected=true): a structural edit must then be
-        // refused in place, and a revert-to-original must clear the detour cold
-        // rather than pass as a stranding no-op. If the redirect did not apply,
-        // skip them — without a live detour a revert-to-original is just an
-        // unchanged no-op (branch 2, hot), so asserting cold would be wrong.
+        // The revert cold guard below only makes sense once a redirect is live
+        // (the registry flag is Redirected=true): a revert-to-the-birth body must
+        // clear the detour cold rather than pass as a stranding no-op. If the
+        // redirect did not apply, skip it — without a live detour a revert is just
+        // an unchanged no-op (hot), so asserting cold would be wrong.
         if !redirected {
             self.log(
-                "skipping P09d/P09e (cold guards): the P09c redirect did not apply, \
+                "skipping P09e (cold guard): the P09c redirect did not apply, \
                  so there is no live detour to guard",
             );
             *fresh = original;
@@ -1844,46 +1844,166 @@ return null;"#;
         }
         let post_redirect = fresh.clone();
 
-        // P09d — STRUCTURAL re-edit (adds a field) → COLD. An added field cannot
-        // be redirected onto live instances (their layout is fixed); a
-        // load_only there would strand them on a stale redirected body, so the
-        // verdict is cold and the reason names the play-mode-created type. The
-        // file is restored to the post-redirect text afterward (the registry
-        // still has Redirected=true, which P09e relies on).
-        let mut structural = post_redirect.clone();
-        if let Err(error) = swap(
-            &mut structural,
-            "    public int Beat;",
-            "    public int Beat;\n    public int Spare;",
-        ) {
-            self.fail("P09d structural re-edit is cold", error);
-        } else {
-            self.expect_cold(
-                "P09d structural re-edit is cold",
-                FRESH_FILE,
-                &structural,
-                "play-mode-created type",
-                &post_redirect,
-            )
-            .await;
-        }
+        // (Member REMOVAL of a play-mode-born type is now HOT — feature #1 — so the
+        // former P09d cold-removal probe was retired. P09g below exercises the
+        // hottest removal: deleting an added Unity message clears its pump driver.)
 
-        // P09e — REVERT to the ORIGINAL text AFTER a redirect → COLD (the
-        // Codex-found false-positive the Redirected flag fixes). With a detour
-        // live, reverting leaves no changed methods, so the redirect cannot
-        // replace it; a load_only would falsely report "applied" while the live
-        // instance keeps the redirected body. The fix steers cold so a recompile
-        // converges. Restored to the post-redirect text so later phases see a
-        // consistent file.
+        // P09e — REVERT a redirected BODY to its birth version → COLD. With a
+        // detour live (Bump redirected to += 7), reverting Bump to its birth body
+        // (+= 10) leaves the cumulative birth-diff empty, so the live-text diff is
+        // what reveals the revert; a live detour cannot be un-redirected in place,
+        // so the fix steers cold for a recompile (a load_only would falsely report
+        // "applied" while the instance keeps the redirected body). Restored to the
+        // post-redirect text so later phases see a consistent file.
         self.expect_cold(
             "P09e revert-after-redirect is cold",
             FRESH_FILE,
             &original,
-            "play-mode-created type",
+            "reverted to its birth version",
             &post_redirect,
         )
         .await;
-        *fresh = post_redirect;
+        *fresh = post_redirect.clone();
+
+        // P09f — TIER-2: ADD a Unity message (Update) to the play-mode-born type.
+        // Tier-1 steered any addition COLD; Tier-2 keeps it HOT and wires a
+        // player_loop driver pinned to the FIRST hot-patch assembly, so the pump
+        // resolves the type THERE (its default resolver skips __LocusHotPatch_
+        // assemblies) and drives the message on the ALREADY-RETAINED instance.
+        // The added body does `Beat += 100`; after the apply the pump must grow
+        // the SAME instance's Beat each frame. Were the addition mis-pinned (or
+        // cold), the existing instance would never receive Update — the
+        // distinguishing observation. `Live` is undisturbed by the addition (the
+        // new body lives in a side shim, the type's layout is unchanged), so the
+        // pre-existing Beat (7 after P09c) is the baseline the growth starts from.
+        let name = "P09f added Unity message drives the EXISTING instance";
+        self.log(format!("— {name}"));
+        let mut with_update = post_redirect.clone();
+        match swap(
+            &mut with_update,
+            "    public int Bump() { Beat += 7; return Beat; }",
+            "    public int Bump() { Beat += 7; return Beat; }\n\n    public void Update() { Beat += 100; }",
+        ) {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(FRESH_FILE, with_update.as_str())],
+                        &[(FRESH_FILE, post_redirect.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    *fresh = with_update;
+                    // THE load-bearing assertion: the pump fires the added Update
+                    // on the retained instance, so its Beat keeps climbing.
+                    self.expect_fresh_pumped(
+                        "P09f pump drives added Update on the retained instance",
+                    )
+                    .await;
+
+                    // P09g — feature #1 / [P1] fix: REMOVE the added Update. The
+                    // pump drove it through the shim (not native dispatch), so the
+                    // only way to stop it is to CLEAR the driver. The birth-text
+                    // diff can't see Update removed (it was added AFTER birth), so
+                    // the live-text diff catches it and emits a clear-marker; the
+                    // plugin tears the driver down (replace-by-source). Were the
+                    // bug unfixed, the desktop would report "nothing to apply"
+                    // while the stale pump kept growing Beat — so the retained
+                    // instance's Beat must now STOP climbing.
+                    let name = "P09g removing the added Update clears its pump driver";
+                    self.log(format!("— {name}"));
+                    let applied_clear = self
+                        .apply_texts(
+                            name,
+                            &[(FRESH_FILE, post_redirect.as_str())],
+                            &[(FRESH_FILE, fresh.as_str())],
+                        )
+                        .await;
+                    if applied_clear.is_some() {
+                        *fresh = post_redirect.clone();
+                        self.expect_fresh_not_pumped(
+                            "P09g pump stopped after the added Update was removed",
+                        )
+                        .await;
+                    }
+                } else {
+                    *fresh = post_redirect;
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+    }
+
+    /// Read the retained `Live` instance's `Beat`, let a few frames pass, then
+    /// read it again and assert it GREW — proving a hot-added per-frame Unity
+    /// message (Update, body `Beat += 100`) is being pumped onto this EXISTING
+    /// instance of a play-mode-born type. All through reflection (the type is
+    /// invisible to snippet metadata), with `ctx.WaitSeconds` to advance frames
+    /// (the same way the compiled-type P46 frame-driver assertions wait).
+    async fn expect_fresh_pumped(&mut self, name: &str) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_pump=type-missing"); return null; }
+var liveField = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+var live = liveField.GetValue(null);
+if (live == null) { print("fresh_pump=live-missing"); return null; }
+var beatField = t.GetField("Beat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+int before = System.Convert.ToInt32(beatField.GetValue(live));
+await ctx.WaitSeconds(0.8f);
+int after = System.Convert.ToInt32(beatField.GetValue(live));
+print(after > before ? "fresh_pump=driven" : ("fresh_pump=stalled before=" + before + " after=" + after));
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == "fresh_pump=driven") => {
+                self.pass(
+                    name,
+                    "retained instance's Beat advanced — added Update is pumped",
+                );
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected 'fresh_pump=driven', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(name, format!("pump snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// The inverse of `expect_fresh_pumped`: read the retained instance's `Beat`,
+    /// let a few frames pass, and assert it did NOT grow —
+    /// proving a previously hot-added Unity message (Update) STOPPED being pumped
+    /// after the re-edit removed it (the clear-marker tore the driver down). Two
+    /// idle reads with `WaitSeconds` between, exactly mirroring the pumped probe.
+    async fn expect_fresh_not_pumped(&mut self, name: &str) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_pump=type-missing"); return null; }
+var liveField = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+var live = liveField.GetValue(null);
+if (live == null) { print("fresh_pump=live-missing"); return null; }
+var beatField = t.GetField("Beat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+int before = System.Convert.ToInt32(beatField.GetValue(live));
+await ctx.WaitSeconds(0.8f);
+int after = System.Convert.ToInt32(beatField.GetValue(live));
+print(after == before ? "fresh_pump=stopped" : ("fresh_pump=still-growing before=" + before + " after=" + after));
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == "fresh_pump=stopped") => {
+                self.pass(
+                    name,
+                    "retained instance's Beat held steady — the cleared Update is no longer pumped",
+                );
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected 'fresh_pump=stopped', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(
+                name,
+                format!("pump-stop snippet failed: {}", squash(&error)),
+            ),
+        }
     }
 
     async fn revert_files(&mut self, reverts: &[(&str, &str)]) {
@@ -2797,10 +2917,12 @@ return null;"#;
         // as a fresh type into a __LocusHotPatch_ assembly, engine: load_only).
         // It is a MonoBehaviour carrying observable INSTANCE state (`Beat` +
         // Bump()) plus a retained `Live` instance, so the re-edit scenarios
-        // below (P09b–P09e) can prove the Phenomenon-3 fix: a later BODY edit
+        // below (P09b–P09f) can prove the Phenomenon-3 fix: a later BODY edit
         // redirects onto the FIRST loaded assembly's type, updating the
-        // already-spawned instance — not just newly created ones. `fresh` is an
-        // owned ledger (like `subject`) so the re-edits mutate it incrementally.
+        // already-spawned instance — not just newly created ones; and (Tier-2)
+        // an ADDED Unity message drives that same instance via a pinned pump.
+        // `fresh` is an owned ledger (like `subject`) so the re-edits mutate it
+        // incrementally.
         // The static Ping() is kept for P09's original through-Probe assertion.
         let name = "P09 new file with new type";
         self.log(format!("— {name}"));
@@ -2817,7 +2939,10 @@ return null;"#;
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(FRESH_FILE, fresh.as_str()), (SUBJECT_FILE, subject.as_str())],
+                        &[
+                            (FRESH_FILE, fresh.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
                         // Reverting a brand-new file means an empty stand-in;
                         // the deletion pass would tombstone it anyway, so
                         // keep the file with a harmless body on failure.
@@ -2841,11 +2966,8 @@ return null;"#;
                     // runs exactly one Bump() on it through the redirected body.
                     fresh_live = self.spawn_fresh_instance().await;
                     if fresh_live {
-                        self.expect_fresh_beat(
-                            "P09a play-mode-born instance retained",
-                            0,
-                        )
-                        .await;
+                        self.expect_fresh_beat("P09a play-mode-born instance retained", 0)
+                            .await;
                     }
                 } else {
                     *subject = subject_snapshot;
@@ -2854,26 +2976,29 @@ return null;"#;
             Err(error) => self.fail(name, error),
         }
 
-        // ── Phenomenon 3 — play-mode-born re-edit trichotomy (P09b–P09e) ──
+        // ── Phenomenon 3 — play-mode-born re-edit trichotomy + Tier-2 (P09b–P09f) ──
         // A file authored entirely in play mode loads once as a fresh type.
-        // Re-editing it must route THREE ways (the compile-server fix; unit
-        // tests live in HotPatchTests.PlayModeBornReeditTests, multi-batch
-        // convergence in SelfTestReplayTests). These LIVE cases assert the
-        // distinguishing RUNTIME behavior the unit tests cannot: an EXISTING
-        // instance's observable state changes after a body re-edit.
+        // Re-editing it routes: body change → redirect (P09c), unchanged → no-op
+        // (P09b), structural removal/revert → cold (P09d/e), and (Tier-2)
+        // additions → hot via the M2/M4/driver machinery pinned to the first
+        // assembly (P09f adds a Unity message). Unit tests live in
+        // HotPatchTests.PlayModeBornReeditTests, multi-batch convergence in
+        // SelfTestReplayTests. These LIVE cases assert the distinguishing RUNTIME
+        // behavior the unit tests cannot: an EXISTING instance's observable state
+        // changes after a body re-edit, and after an added Unity message.
         //
         // ⚠ self-test pending (实机待跑): authored against the live harness and
         // cargo-check-clean, but not yet executed on real hardware. The shapes
-        // mirror P09 (which is exercised) and P47 (reflection on a
-        // play-mode-born MonoBehaviour), so they are expected to pass; flag any
-        // failure here as a real regression in the Phenomenon-3 routing rather
-        // than harness drift. Run via Settings > Code Analysis against a
-        // connected editor in play mode.
+        // mirror P09 (which is exercised), P47 (reflection on a play-mode-born
+        // MonoBehaviour) and P46 (frame-driver pump observation), so they are
+        // expected to pass; flag any failure here as a real regression in the
+        // Phenomenon-3 / Tier-2 routing rather than harness drift. Run via
+        // Settings > Code Analysis against a connected editor in play mode.
         if fresh_live {
             self.run_play_mode_born_reedit_tests(&mut fresh).await;
         } else {
             self.log(
-                "skipping P09b–P09e (play-mode-born re-edit trichotomy): \
+                "skipping P09b–P09f (play-mode-born re-edit trichotomy + Tier-2): \
                  the retained fresh instance could not be established",
             );
         }
@@ -4589,7 +4714,11 @@ return null;"#;
         // default (the documented value-loss on a hot retype).
         if self
             .step_file("P48 instance field retype", SUBJECT_FILE, subject, |s| {
-                swap(s, "    private int _flux = 5;", "    private long _flux = 5;")?;
+                swap(
+                    s,
+                    "    private int _flux = 5;",
+                    "    private long _flux = 5;",
+                )?;
                 swap(
                     s,
                     "public int Flux() { return _flux; }",
@@ -6620,7 +6749,13 @@ return null;"#;
         // N51 — a partial type's initializers compile into ctors that may
         // live in other parts.
         let mut text = PARTIAL_COLD_BASELINE.to_string();
-        if swap(&mut text, "private int _value = 10;", "private int _value = 20;").is_ok() {
+        if swap(
+            &mut text,
+            "private int _value = 10;",
+            "private int _value = 20;",
+        )
+        .is_ok()
+        {
             self.expect_cold(
                 "N51 partial type initializer changed",
                 PARTIAL_COLD_FILE,
@@ -7146,24 +7281,22 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
         return Err("the hot-reload self-test is already running".to_string());
     }
 
-    tauri::async_runtime::spawn(async move {
-        let mut test = SelfTest {
-            app,
-            project: project_path,
-            passed: 0,
-            failed: 0,
-            negative_ledgers: NegativeLedgers::default(),
-            domain_reload_on_play: None,
-            epmo_enabled: None,
-            editor_patch_live: false,
-            release_mode: false,
-            original_code_optimization: None,
-            last_apply_inlined: false,
-            last_apply_summary: String::new(),
-            message_driver_capabilities: MessageDriverCapabilities::default(),
-        };
-        test.run().await;
-        RUNNING.store(false, Ordering::SeqCst);
-    });
+    let _running_guard = SelfTestRunningGuard;
+    let mut test = SelfTest {
+        app,
+        project: project_path,
+        passed: 0,
+        failed: 0,
+        negative_ledgers: NegativeLedgers::default(),
+        domain_reload_on_play: None,
+        epmo_enabled: None,
+        editor_patch_live: false,
+        release_mode: false,
+        original_code_optimization: None,
+        last_apply_inlined: false,
+        last_apply_summary: String::new(),
+        message_driver_capabilities: MessageDriverCapabilities::default(),
+    };
+    test.run().await;
     Ok(())
 }
