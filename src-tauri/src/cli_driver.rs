@@ -809,6 +809,7 @@ async fn run_driver(
                 return Err(error);
             }
             let message = error;
+            let stop_run = should_stop_after_suite_error(&message);
             sink.emit(
                 "suite_error",
                 json!({
@@ -817,15 +818,14 @@ async fn run_driver(
                 }),
             );
             suite_failures.push(format!("{}: {message}", suite.as_str()));
+            if stop_run {
+                return Err(format_suite_failures(&suite_failures));
+            }
         }
     }
 
     if !suite_failures.is_empty() {
-        return Err(format!(
-            "{} Unity integration test suite(s) failed: {}",
-            suite_failures.len(),
-            suite_failures.join("; ")
-        ));
+        return Err(format_suite_failures(&suite_failures));
     }
 
     sink.emit("finished", json!({ "ok": true }));
@@ -1536,6 +1536,22 @@ fn emit_suite_failure(sink: &DriverEventSink, suite: CliDriverSuite, error: &str
             "message": error,
         }),
     );
+}
+
+fn should_stop_after_suite_error(error: &str) -> bool {
+    error.contains(" timed out after ")
+        || error.contains(" made no event progress for ")
+        || error.contains(" event stream closed")
+        || error.contains(" failed to start:")
+        || error.contains(" task failed:")
+}
+
+fn format_suite_failures(suite_failures: &[String]) -> String {
+    format!(
+        "{} Unity integration test suite(s) failed: {}",
+        suite_failures.len(),
+        suite_failures.join("; ")
+    )
 }
 
 /// Per-check accumulator for the execute suite. Mirrors the self-test `pass`/
@@ -2560,7 +2576,13 @@ where
                     start_task.abort();
                 }
                 app_handle.unlisten(listener);
-                return Err(format!("Suite {} timed out after {}ms", suite.as_str(), timeout.as_millis()));
+                let message = format!(
+                    "Suite {} timed out after {}ms",
+                    suite.as_str(),
+                    timeout.as_millis()
+                );
+                emit_suite_failure(sink, suite, &message);
+                return Err(message);
             }
             _ = cancel_rx.changed() => {
                 if !start_done {
@@ -2574,6 +2596,11 @@ where
                     start_task.abort();
                 }
                 app_handle.unlisten(listener);
+                let message = format!(
+                    "Suite {} made no event progress for {}ms",
+                    suite.as_str(),
+                    no_progress_timeout.as_millis()
+                );
                 sink.emit(
                     "suite_no_progress",
                     json!({
@@ -2582,13 +2609,11 @@ where
                         "line": last_event_line,
                         "passed": last_event_passed,
                         "failed": last_event_failed,
+                        "message": message.clone(),
                     }),
                 );
-                return Err(format!(
-                    "Suite {} made no event progress for {}ms",
-                    suite.as_str(),
-                    no_progress_timeout.as_millis()
-                ));
+                emit_suite_failure(sink, suite, &message);
+                return Err(message);
             }
             result = &mut start_task, if !start_done => {
                 start_done = true;
@@ -2596,18 +2621,25 @@ where
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         app_handle.unlisten(listener);
-                        return Err(format!("Suite {} failed to start: {}", suite.as_str(), error));
+                        let message =
+                            format!("Suite {} failed to start: {}", suite.as_str(), error);
+                        emit_suite_failure(sink, suite, &message);
+                        return Err(message);
                     }
                     Err(error) => {
                         app_handle.unlisten(listener);
-                        return Err(format!("Suite {} task failed: {}", suite.as_str(), error));
+                        let message = format!("Suite {} task failed: {}", suite.as_str(), error);
+                        emit_suite_failure(sink, suite, &message);
+                        return Err(message);
                     }
                 }
             }
             maybe_event = rx.recv() => {
                 let Some(event) = maybe_event else {
                     app_handle.unlisten(listener);
-                    return Err(format!("Suite {} event stream closed", suite.as_str()));
+                    let message = format!("Suite {} event stream closed", suite.as_str());
+                    emit_suite_failure(sink, suite, &message);
+                    return Err(message);
                 };
                 no_progress_sleep
                     .as_mut()

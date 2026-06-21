@@ -64,6 +64,9 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("crate::unity_hotreload::selftest::run");
     expect(driver).toContain("let mut suite_failures = Vec::new();");
     expect(driver).toContain('"suite_error"');
+    expect(driver).toContain('"suite_no_progress"');
+    expect(driver).toContain("should_stop_after_suite_error");
+    expect(driver).toContain("format_suite_failures");
     expect(driver).toContain("Unity integration test suite(s) failed");
     expect(driver).toContain("LOCUS_DRIVER_JSON");
     expect(driver).not.toContain("remote-debugging-port");
@@ -94,6 +97,11 @@ describe("Locus Unity CLI driver", () => {
     expect(service).toContain('"execute"');
     expect(settings).toContain('id: "execute"');
     expect(settings).toContain("typeIndexSampleMode");
+    expect(settings).toContain("currentRunId.value = \"\";");
+    expect(settings).toContain("noProgressTimeoutMs: 60_000");
+    expect(settings).toContain('case "suite_no_progress":');
+    expect(settings).toContain('case "suite_error":');
+    expect(settings).toContain("markRunningSuitesMissingResult");
     expect(settings).toContain('"sample32"');
     expect(settings).toContain('"all"');
     expect(settings).not.toContain("@tauri-apps/plugin-dialog");
@@ -103,6 +111,15 @@ describe("Locus Unity CLI driver", () => {
     expect(typeIndex).toContain("TypeIndexSampleMode");
     expect(typeIndex).toContain("Sample32");
     expect(typeIndex).toContain("All");
+  });
+
+  it("keeps the Hot Reload self-test owned by the driver task", () => {
+    const selftest = read("src-tauri/src/unity_hotreload/selftest.rs");
+
+    expect(selftest).toContain("struct SelfTestRunningGuard;");
+    expect(selftest).toContain("impl Drop for SelfTestRunningGuard");
+    expect(selftest).toContain("test.run().await;");
+    expect(selftest).not.toContain("tauri::async_runtime::spawn(async move");
   });
 
   it("guards the Type Index suite against transient Unity reload windows", () => {
