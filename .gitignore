@@ -14,6 +14,7 @@ lerna-debug.log*
 codex-artifacts/
 tmp/
 debug/
+target-check/
 
 node_modules
 dist
