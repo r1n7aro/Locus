@@ -3,6 +3,7 @@ using UnityEditor.Compilation;
 
 using System;
 using System.Collections.Generic;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
@@ -423,10 +424,30 @@ namespace Locus
             public bool is_static;
             public bool is_ctor;
 
+            // The edited file this detour came from — used to clear that file's
+            // stale message-pump registrations before re-adding (replace-by-source).
+            public string source_path;
+
             // When non-empty, the "original" method lives in this exact
             // assembly — an earlier patch's shim being re-edited. Resolution
             // then bypasses the usual skip of __LocusHotPatch_ assemblies.
             public string original_assembly;
+        }
+
+        // A newly added Unity message the engine never dispatches after load. The
+        // runtime wires a driver by `kind`: "player_loop" (Update/LateUpdate/
+        // FixedUpdate, driven each frame by a pump) or "component_proxy" (physics/
+        // trigger events forwarded by a proxy MonoBehaviour on the target object).
+        [Serializable]
+        private sealed class MessageDriverDto
+        {
+            public string kind;             // "player_loop" | "component_proxy"
+            public string declaring_type;   // original type whose live instances are driven
+            public string shim_type;        // static shim class in the patch assembly
+            public string shim_method;      // shim method (leading parameter is the instance)
+            public string message;          // e.g. "Update", "OnTriggerEnter"
+            public string param_type;       // engine arg type for component_proxy ("Collider"); empty for player_loop
+            public string source_path;      // edited file (for replace-by-source teardown)
         }
 
         [Serializable]
@@ -437,6 +458,10 @@ namespace Locus
             public string assembly_path;
             public string domain_generation;
             public HotPatchMethodDto[] methods;
+
+            // Newly added Unity messages the engine never discovers after load,
+            // each tagged with a driver kind. Absent on older sidecars.
+            public MessageDriverDto[] message_drivers;
 
             // Experimental (Phase B, default off): when true, inline-risk
             // classification may JIT a synthetic caller stub to force Mono to
@@ -464,6 +489,22 @@ namespace Locus
             // heuristic). Lets the desktop word convergence by confidence; older
             // desktops ignore the unknown field.
             public string[] inlined_sources;
+
+            // Message-driver capability echo. The desktop fails closed (recompile)
+            // when it sent message_drivers but pump_supported is absent/false — so a
+            // plugin that can't drive added messages never reports them live.
+            // pump_skipped_count = added messages the runtime did NOT drive (not a
+            // MonoBehaviour, parameter not the real engine type, edit-time-only, or a
+            // catch-up with no live instance). pump_skipped_messages carries each
+            // one's "message — reason" so the desktop reports them by name instead of
+            // a single vague count; older desktops ignore the unknown field.
+            public bool pump_supported;
+            public int pumped_count;
+            public int pump_skipped_count;
+            public string[] pump_skipped_messages;
+            // Hard wiring failures (type/shim missing, unbindable shim). When > 0
+            // the desktop fails closed to a recompile rather than reporting success.
+            public int pump_failed_count;
         }
 
         /// <summary>
@@ -522,7 +563,7 @@ namespace Locus
             {
                 try
                 {
-                    tcs.SetResult(ApplyHotPatchOnMainThread(requestId, patchId, assemblyBytes, request.methods, request.inline_force_evaluate));
+                    tcs.SetResult(ApplyHotPatchOnMainThread(requestId, patchId, assemblyBytes, request.methods, request.message_drivers, request.inline_force_evaluate));
                 }
                 catch (Exception ex)
                 {
@@ -537,6 +578,7 @@ namespace Locus
             string patchId,
             byte[] assemblyBytes,
             HotPatchMethodDto[] methods,
+            MessageDriverDto[] messageDrivers,
             bool forceEvaluateInline)
         {
             // Release-first: apply detours regardless of Code Optimization. In
@@ -555,6 +597,9 @@ namespace Locus
 
             var applied = new List<HotPatchApplyChange>(methods.Length);
             string engineSummary = null;
+            int pumpedCount = 0;
+            var pumpSkippedDetails = new List<string>();
+            int pumpFailedCount = 0;
 
             lock (_hotPatchLock)
             {
@@ -636,6 +681,11 @@ namespace Locus
                     RollbackHotPatch(applied);
                     return ErrorResponse(requestId, "shim verification failed: " + shimError);
                 }
+
+                // Newly added Unity messages the engine never discovers after
+                // load: wire each to its driver (PlayerLoop pump or component
+                // proxy) by kind, replacing any prior registration per source file.
+                RegisterMessageDrivers(methods, messageDrivers, patchAssembly, out pumpedCount, pumpSkippedDetails, out pumpFailedCount);
             }
 
             // Release-first: a method Unity inlined keeps a live detour, but its
@@ -674,10 +724,303 @@ namespace Locus
                 detour_engine = engineSummary ?? "load_only",
                 inlined_method_keys = inlinedKeys.ToArray(),
                 inlined_sources = inlinedSources.ToArray(),
+                // Tells the desktop this plugin can drive added Unity messages, so
+                // an add-a-message patch is not falsely reported live. driven /
+                // skipped (benign) / failed (hard) let the desktop fail closed on a
+                // real wiring failure instead of reporting a false "driven".
+                pump_supported = true,
+                pumped_count = pumpedCount,
+                pump_skipped_count = pumpSkippedDetails.Count,
+                pump_skipped_messages = pumpSkippedDetails.ToArray(),
+                pump_failed_count = pumpFailedCount,
             };
             Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId
                 + (inlinedKeys.Count > 0 ? " (" + inlinedKeys.Count + " inlined in Release)" : ""));
             return OkResponse(requestId, JsonUtility.ToJson(response));
+        }
+
+        /// <summary>Wire newly added Unity messages to their runtime driver, by
+        /// <c>kind</c>: a PlayerLoop pump (player_loop), a proxy MonoBehaviour on
+        /// the target object (component_proxy), a one-shot run on existing instances
+        /// (catch_up), or compiled-but-dormant (inert). First clear every
+        /// registration from the source files this patch touched (replace-by-source),
+        /// then register what remains, each bound through a compiled delegate.
+        ///
+        /// The sidecar classifies by syntactic name (no semantic model), so the
+        /// RUNTIME is the authority and reports three outcomes:
+        ///  • driven  — actually wired (pump/proxy) or run (catch_up);
+        ///  • skipped — not driven (the declaring type is not a MonoBehaviour, the
+        ///    parameter is not the engine's event type — a same-named custom/aliased
+        ///    type, an edit-time-only callback, or a catch-up with no live instance),
+        ///    so it stays a harmless plain method. Each skip's "message — reason" is
+        ///    collected into <paramref name="skipped"/> so the desktop reports it by
+        ///    name rather than as a single vague count;
+        ///  • failed  — a coordinate that should resolve does not (type/shim missing
+        ///    or an unbindable shim), so the desktop fails closed to a recompile
+        ///    instead of reporting a false "driven".</summary>
+        private static void RegisterMessageDrivers(
+            HotPatchMethodDto[] methods, MessageDriverDto[] drivers, Assembly patchAssembly,
+            out int driven, List<string> skipped, out int failed)
+        {
+            driven = 0;
+            failed = 0;
+
+            // Replace-by-source: clear stale registrations (pump AND proxy) for
+            // every file this patch touched (through a detour OR a driver entry)
+            // before re-adding what is still present.
+            var touched = new HashSet<string>(StringComparer.Ordinal);
+            if (methods != null)
+            {
+                foreach (HotPatchMethodDto m in methods)
+                {
+                    if (m != null && !string.IsNullOrEmpty(m.source_path))
+                        touched.Add(m.source_path);
+                }
+            }
+            if (drivers != null)
+            {
+                foreach (MessageDriverDto d in drivers)
+                {
+                    if (d != null && !string.IsNullOrEmpty(d.source_path))
+                        touched.Add(d.source_path);
+                }
+            }
+            foreach (string path in touched)
+            {
+                LocusMessagePump.ClearSource(path);
+                LocusMessageProxyHub.ClearSource(path);
+            }
+
+            if (drivers == null)
+                return;
+
+            foreach (MessageDriverDto driver in drivers)
+            {
+                if (driver == null || string.IsNullOrEmpty(driver.shim_type) || string.IsNullOrEmpty(driver.shim_method))
+                    continue;
+
+                Type declaringType = ResolveHotPatchOriginalType(driver.declaring_type);
+                if (declaringType == null)
+                {
+                    failed++;
+                    Debug.LogWarning("[Locus] message driver: type " + driver.declaring_type
+                        + " not found in domain; '" + driver.message + "' could not be wired.");
+                    continue;
+                }
+
+                Type shimType = patchAssembly.GetType(driver.shim_type, false);
+                // Shims are emitted public static; NonPublic is defensive against a
+                // future visibility change so the lookup never silently misses.
+                MethodInfo shim = shimType?.GetMethod(driver.shim_method,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (shim == null)
+                {
+                    failed++;
+                    Debug.LogWarning("[Locus] message driver: shim " + driver.shim_type + "." + driver.shim_method
+                        + " not found; '" + driver.message + "' could not be wired.");
+                    continue;
+                }
+
+                // Outcome: +1 driven, 0 skipped (benign — not a Unity message, or
+                // nothing live to drive yet), -1 failed (hard). `reason` explains a
+                // skip so the desktop can report it by name, not a vague count.
+                int outcome;
+                string reason = "";
+                switch (driver.kind)
+                {
+                    case "component_proxy":
+                        outcome = WireComponentProxy(driver, declaringType, shim, out reason);
+                        break;
+                    case "catch_up":
+                    {
+                        // Lifecycle catch-up: run `static void M(T self)` once on each
+                        // existing instance now (native timing already passed), gated to
+                        // match the message — Awake/Start are play-mode only (Start also
+                        // enabled-only); OnValidate is an editor-time callback.
+                        Action<object> invoke = BuildShimInvoker(shim);
+                        if (invoke == null)
+                        {
+                            outcome = -1;   // unbindable shim — hard failure
+                            break;
+                        }
+                        CatchUpGate gate;
+                        switch (driver.message)
+                        {
+                            case "OnValidate": gate = CatchUpGate.Always; break;
+                            case "Start": gate = CatchUpGate.PlayingEnabled; break;
+                            default: gate = CatchUpGate.PlayingActive; break;   // Awake (+ any future lifecycle)
+                        }
+                        int ran = LocusMessageCatchUp.RunOnce(declaringType, invoke, gate);
+                        if (ran < 0)
+                        {
+                            outcome = 0;
+                            reason = "declaring type is not a MonoBehaviour";
+                        }
+                        else if (ran == 0)
+                        {
+                            // Real message, but nothing eligible ran — don't report it as
+                            // "driven". Distinguish edit-mode (the lifecycle message is
+                            // deferred) from simply having no live instance.
+                            outcome = 0;
+                            reason = (gate != CatchUpGate.Always && !Application.isPlaying)
+                                ? "edit mode — " + driver.message + " is play-mode lifecycle; enter play mode and re-apply, or recompile"
+                                : "no live instance to catch up (new instances need a recompile)";
+                        }
+                        else
+                        {
+                            outcome = 1;
+                        }
+                        break;
+                    }
+                    case "inert":
+                        // Compiled but not driven at runtime (e.g. Reset). Benign; the
+                        // agent was told why via the result note.
+                        outcome = 0;
+                        reason = "edit-time only (no runtime trigger)";
+                        break;
+                    default:
+                    {
+                        // "player_loop": shim is `static void M(T self)`.
+                        Action<object> invoke = BuildShimInvoker(shim);
+                        if (invoke == null)
+                        {
+                            outcome = -1;   // unbindable shim — hard failure
+                        }
+                        else if (LocusMessagePump.Register(driver.message, declaringType, driver.source_path, invoke))
+                        {
+                            outcome = 1;
+                        }
+                        else
+                        {
+                            outcome = 0;
+                            reason = "declaring type is not a MonoBehaviour";
+                        }
+                        break;
+                    }
+                }
+
+                if (outcome > 0)
+                    driven++;
+                else if (outcome == 0)
+                    skipped.Add(driver.message + " — " + (reason.Length > 0 ? reason : "left as a plain method"));
+                else
+                    failed++;
+            }
+        }
+
+        // Engine-delivered argument type for each parameterized component-proxy
+        // message. The sidecar only matched the simple name, so the runtime checks
+        // the shim's parameter is REALLY this type before forwarding. Parameterless
+        // messages (OnGUI, mouse, OnDestroy, …) are absent — the shim is M(self).
+        private static readonly Dictionary<string, Type> ProxyArgTypes = new Dictionary<string, Type>(StringComparer.Ordinal)
+        {
+            { "OnTriggerEnter", typeof(Collider) },
+            { "OnTriggerStay", typeof(Collider) },
+            { "OnTriggerExit", typeof(Collider) },
+            { "OnCollisionEnter", typeof(Collision) },
+            { "OnCollisionStay", typeof(Collision) },
+            { "OnCollisionExit", typeof(Collision) },
+            { "OnTriggerEnter2D", typeof(Collider2D) },
+            { "OnTriggerStay2D", typeof(Collider2D) },
+            { "OnTriggerExit2D", typeof(Collider2D) },
+            { "OnCollisionEnter2D", typeof(Collision2D) },
+            { "OnCollisionStay2D", typeof(Collision2D) },
+            { "OnCollisionExit2D", typeof(Collision2D) },
+            { "OnAnimatorIK", typeof(int) },
+            { "OnParticleCollision", typeof(GameObject) },
+            { "OnControllerColliderHit", typeof(ControllerColliderHit) },
+        };
+
+        /// <summary>Validate and register a component-proxy driver. Returns +1 driven,
+        /// 0 skipped (not a Unity message — non-MonoBehaviour, or the parameter is not
+        /// the engine event type; <paramref name="reason"/> says which), -1 failed (the
+        /// shim shape cannot be bound).</summary>
+        private static int WireComponentProxy(MessageDriverDto driver, Type declaringType, MethodInfo shim, out string reason)
+        {
+            reason = "";
+            // The sidecar matched only the parameter's simple name, so a same-named
+            // custom/aliased type would slip through and throw on cast at the first
+            // event. Verify the shim's argument is the REAL engine type; if not, this
+            // is not the Unity message — leave it as a harmless plain method.
+            if (ProxyArgTypes.TryGetValue(driver.message, out Type expectedArg))
+            {
+                ParameterInfo[] ps = shim.GetParameters();
+                if (ps.Length != 2 || ps[1].ParameterType != expectedArg)
+                {
+                    reason = "parameter is not " + expectedArg.FullName + " (a same-named custom type) — left as a plain method";
+                    Debug.LogWarning("[Locus] message driver: '" + driver.message + "' parameter is not "
+                        + expectedArg.FullName + "; not a Unity message — left as a plain method.");
+                    return 0;
+                }
+            }
+            // Proxy shim is `static void M(T self [, EngineArg arg])`.
+            Action<object, object> invoke = BuildProxyInvoker(shim);
+            if (invoke == null)
+                return -1;
+            if (LocusMessageProxyHub.Register(driver.message, declaringType, driver.source_path, invoke))
+                return 1;
+            reason = "declaring type is not a MonoBehaviour";
+            return 0;
+        }
+
+        /// <summary>Compile <c>(object o) =&gt; Shim((T)o)</c> for a static shim
+        /// whose single parameter is the instance type — a direct delegate call
+        /// each frame instead of a reflection Invoke. Null if the shim is not the
+        /// expected single-parameter shape or cannot be compiled.</summary>
+        private static Action<object> BuildShimInvoker(MethodInfo shim)
+        {
+            ParameterInfo[] parameters = shim.GetParameters();
+            if (parameters.Length != 1)
+                return null;
+            try
+            {
+                ParameterExpression instance = Expression.Parameter(typeof(object), "instance");
+                MethodCallExpression call = Expression.Call(
+                    shim, Expression.Convert(instance, parameters[0].ParameterType));
+                return Expression.Lambda<Action<object>>(call, instance).Compile();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] message driver: could not bind shim " + shim.Name + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>Compile an <c>Action&lt;object, object&gt;</c> for a component-proxy
+        /// shim: a one-parameter shim <c>M(T self)</c> ignores the engine arg (the
+        /// parameterless messages — OnGUI, mouse, …), a two-parameter shim
+        /// <c>M(T self, A arg)</c> uses it (OnTriggerEnter(Collider), …). Null if
+        /// the shim is neither shape or cannot be compiled.</summary>
+        private static Action<object, object> BuildProxyInvoker(MethodInfo shim)
+        {
+            ParameterInfo[] parameters = shim.GetParameters();
+            try
+            {
+                ParameterExpression self = Expression.Parameter(typeof(object), "self");
+                ParameterExpression arg = Expression.Parameter(typeof(object), "arg");
+                MethodCallExpression call;
+                if (parameters.Length == 1)
+                {
+                    call = Expression.Call(shim, Expression.Convert(self, parameters[0].ParameterType));
+                }
+                else if (parameters.Length == 2)
+                {
+                    call = Expression.Call(
+                        shim,
+                        Expression.Convert(self, parameters[0].ParameterType),
+                        Expression.Convert(arg, parameters[1].ParameterType));
+                }
+                else
+                {
+                    return null;
+                }
+                return Expression.Lambda<Action<object, object>>(call, self, arg).Compile();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] message driver: could not bind shim " + shim.Name + ": " + ex.Message);
+                return null;
+            }
         }
 
         /// <summary>Force-JIT every method of the patch's shim/store classes
