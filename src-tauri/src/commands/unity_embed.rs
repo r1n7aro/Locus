@@ -3598,7 +3598,8 @@ mod windows_impl {
         } else {
             hwnd
         };
-        let mut focus_targets = vec![foreground_target, hwnd, GetForegroundWindow()];
+        let foreground_before = GetForegroundWindow();
+        let mut focus_targets = vec![foreground_target, hwnd, foreground_before];
         unsafe {
             collect_descendant_windows(hwnd, &mut focus_targets);
         }
@@ -3606,7 +3607,12 @@ mod windows_impl {
         let current_thread = GetCurrentThreadId();
         let attached_threads = attach_input_threads(current_thread, &focus_targets);
 
-        if is_valid_window(foreground_target) {
+        // Only force the foreground when the target does not already own it.
+        // Re-foregrounding on every click churns activation — and bounces a
+        // WS_EX_NOACTIVATE overlay between blur and focus — which the editor
+        // renders as a flicker. When the target is already foreground the focus
+        // routing below is enough to land the caret.
+        if is_valid_window(foreground_target) && foreground_target != foreground_before {
             let _ = BringWindowToTop(foreground_target);
             let _ = SetForegroundWindow(foreground_target);
             let _ = SetActiveWindow(foreground_target);
