@@ -1790,11 +1790,21 @@ fn split_query_tokens_lossy(q: &str) -> Vec<String> {
 }
 
 fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
+    // `prefix.len()` is a BYTE offset. The old `value.split_at(prefix.len())`
+    // panicked when that offset landed inside a multi-byte UTF-8 char — e.g. a
+    // bare CJK query term like "中文资" (3×3 bytes) where byte 7 is mid-
+    // codepoint. That panic fired while the asset-DB mutex was held by the
+    // search command, poisoning the lock and bricking every later asset query
+    // until restart (issue #97). `str::get` returns `None` on a non-char-
+    // boundary instead of panicking, so a CJK term simply isn't a `fileID:`
+    // token. A successful ASCII-case-insensitive match also guarantees the
+    // first `prefix.len()` bytes are ASCII, so the tail slice is on a boundary.
+    let head = value.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&value[prefix.len()..])
+    } else {
+        None
     }
-    let (head, tail) = value.split_at(prefix.len());
-    head.eq_ignore_ascii_case(prefix).then_some(tail)
 }
 
 fn unquote_query_value(raw: &str) -> Result<String, String> {
@@ -3872,6 +3882,80 @@ mod tests {
         let rows = search_assets_for_command(&conn, "ui hero", &[AssetRoot::Assets], 20).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "Assets/UI/Hero.prefab");
+    }
+
+    #[test]
+    fn strip_prefix_ci_is_utf8_boundary_safe() {
+        // Regression for issue #97. The asset lock got poisoned because this
+        // helper did `value.split_at("fileid:".len())` (byte offset 7); a bare
+        // CJK term of 3+ chars (9+ bytes) put byte 7 mid-codepoint and panicked
+        // while the search command held the asset-DB mutex.
+        assert_eq!(strip_prefix_ci("中文资", "fileid:"), None); // 9 bytes, byte 7 mid-char
+        assert_eq!(strip_prefix_ci("中文资产名", "fileid:"), None); // 15 bytes
+        assert_eq!(strip_prefix_ci("中文", "fileid:"), None); // 6 bytes, < prefix
+        assert_eq!(strip_prefix_ci("", "fileid:"), None);
+        // ASCII case-insensitive matching is unchanged, even with a CJK tail.
+        assert_eq!(strip_prefix_ci("fileID:42", "fileid:"), Some("42"));
+        assert_eq!(strip_prefix_ci("FILEID:中文", "fileid:"), Some("中文"));
+        assert_eq!(strip_prefix_ci("guid:中文", "guid:"), Some("中文"));
+        assert_eq!(strip_prefix_ci("notfileid", "fileid:"), None);
+    }
+
+    #[test]
+    fn parse_query_handles_multibyte_bare_term_without_panicking() {
+        // The asset @-mention search funnels the raw term through the lenient
+        // parser; a 3+ char CJK name must come out as a bare term, not a panic.
+        let parsed = parse_query_lenient("敌人战士");
+        assert!(parsed.predicates.is_empty());
+        assert_eq!(parsed.bare_terms, vec!["敌人战士".to_string()]);
+
+        // Mixed with a real predicate, the CJK token still routes to bare.
+        let parsed = parse_query_lenient("t:prefab 敌人战士");
+        assert_eq!(parsed.bare_terms, vec!["敌人战士".to_string()]);
+        assert_eq!(parsed.predicates.len(), 1);
+
+        // The strict parser shares the same helper and must reject (not panic).
+        assert!(parse_query("敌人战士").is_err());
+    }
+
+    #[test]
+    fn search_assets_for_command_finds_multibyte_chinese_asset() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_assets(
+            &mut conn,
+            &[
+                test_asset("Assets/角色/敌人战士.prefab", AssetKind::Prefab, ""),
+                test_asset("Assets/UI/Hero.prefab", AssetKind::Prefab, ""),
+            ],
+        );
+
+        // 3-char substring → FTS5 trigram branch (the exact length that used to
+        // panic). Must return the CJK-named asset only.
+        let rows = search_assets_for_command(&conn, "敌人战", &[AssetRoot::Assets], 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "Assets/角色/敌人战士.prefab");
+
+        // Full 4-char name also matches.
+        let rows = search_assets_for_command(&conn, "敌人战士", &[AssetRoot::Assets], 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "Assets/角色/敌人战士.prefab");
+    }
+
+    #[test]
+    fn search_assets_for_command_finds_short_chinese_via_like_fallback() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_assets(
+            &mut conn,
+            &[
+                test_asset("Assets/道具/血瓶.prefab", AssetKind::Prefab, ""),
+                test_asset("Assets/UI/Hero.prefab", AssetKind::Prefab, ""),
+            ],
+        );
+
+        // 2 CJK chars is below the trigram floor → path_lower LIKE fallback.
+        let rows = search_assets_for_command(&conn, "血瓶", &[AssetRoot::Assets], 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "Assets/道具/血瓶.prefab");
     }
 
     #[test]

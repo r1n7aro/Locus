@@ -6,8 +6,15 @@ pub fn extract_guid(content: &[u8]) -> Option<Guid> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("guid:") {
             let hex = rest.trim();
-            if hex.len() >= 32 {
-                return parse_guid_hex(&hex[..32]);
+            // `&hex[..32]` panics when byte 32 falls inside a multi-byte UTF-8
+            // char (a hand-edited / corrupted .meta with CJK after `guid:`).
+            // That panic fires inside the watcher reconcile transaction while
+            // the asset-DB mutex is held, poisoning it (same failure class as
+            // issue #97). `get(..32)` returns `None` on a non-char-boundary or
+            // when the value is shorter than 32 bytes; `parse_guid_hex` then
+            // rejects any non-hex content anyway.
+            if let Some(hex32) = hex.get(..32) {
+                return parse_guid_hex(hex32);
             }
         }
     }
@@ -84,6 +91,25 @@ mod tests {
     fn test_extract_guid_invalid_hex() {
         let content = b"guid: zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n";
         assert!(extract_guid(content).is_none());
+    }
+
+    #[test]
+    fn test_extract_guid_ignores_multibyte_value_without_panicking() {
+        // A hand-edited / corrupted .meta with CJK after `guid:`. The old
+        // `&hex[..32]` slice panicked when byte 32 landed mid-codepoint — the
+        // same UTF-8-boundary failure class as issue #97, here firing inside
+        // the watcher reconcile while the asset-DB mutex was held. Must return
+        // None, never panic.
+        let content = format!("guid: {}\n", "中".repeat(11)); // 33 bytes, byte 32 mid-char
+        assert!(extract_guid(content.as_bytes()).is_none());
+
+        // A short multibyte value (< 32 bytes) is also safely rejected.
+        assert!(extract_guid("guid: 中文资产\n".as_bytes()).is_none());
+
+        // A valid 32-hex guid still parses even with trailing multibyte junk.
+        let guid = extract_guid("guid: 00112233445566778899aabbccddeeff中\n".as_bytes()).unwrap();
+        assert_eq!(guid[0], 0x00);
+        assert_eq!(guid[15], 0xff);
     }
 
     #[test]
