@@ -320,7 +320,12 @@ namespace Locus
             try
             {
                 var group = EditorUserBuildSettings.selectedBuildTargetGroup;
+#if UNITY_2021_2_OR_NEWER
+                string raw = PlayerSettings.GetScriptingDefineSymbols(
+                    UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(group));
+#else
                 string raw = PlayerSettings.GetScriptingDefineSymbolsForGroup(group);
+#endif
                 if (!string.IsNullOrEmpty(raw))
                 {
                     string[] customSymbols = raw.Split(';');
@@ -1033,7 +1038,7 @@ namespace Locus
         {
             double now = EditorApplication.timeSinceStartup;
             UnityEngine.Object selection = Selection.activeObject;
-            int selectionInstanceId = selection != null ? selection.GetInstanceID() : 0;
+            int selectionInstanceId = LocusObjectIdentity.InstanceId(selection);
             bool selectionChanged = selectionInstanceId != _lastEditorUpdateSelectionInstanceId;
             if (!selectionChanged && _lastEditorUpdateEventAt >= 0 && now - _lastEditorUpdateEventAt < EditorUpdateEventIntervalSeconds)
                 return;

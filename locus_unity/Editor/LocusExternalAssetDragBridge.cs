@@ -331,7 +331,7 @@ namespace Locus
             if (go == null)
                 return false;
 
-            if (go.GetInstanceID() == _lastDragPerformInitialSceneObjectId)
+            if (LocusObjectIdentity.InstanceId(go) == _lastDragPerformInitialSceneObjectId)
                 return false;
 
             if (_lastDragPerformObjectReferences.Length == 0 && _lastDragPerformPaths.Length == 0)
@@ -353,7 +353,7 @@ namespace Locus
         private static int SceneInstanceObjectId(Object obj)
         {
             GameObject go = SceneInstanceGameObject(obj);
-            return go != null ? go.GetInstanceID() : 0;
+            return LocusObjectIdentity.InstanceId(go);
         }
 
         private static GameObject SceneInstanceGameObject(Object obj)

@@ -268,7 +268,7 @@ namespace Locus
                         objectCache[objectKey] = obj;
                     }
 
-                    int groupKey = obj.GetInstanceID();
+                    int groupKey = LocusObjectIdentity.InstanceId(obj);
                     List<ResolvedViewBindingWrite> group;
                     if (!groups.TryGetValue(groupKey, out group))
                     {

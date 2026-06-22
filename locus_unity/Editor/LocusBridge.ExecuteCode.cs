@@ -391,8 +391,15 @@ namespace Locus
 
             try
             {
+#if UNITY_2021_2_OR_NEWER
+                apiCompatibilityLevel =
+                    PlayerSettings.GetApiCompatibilityLevel(
+                        UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(
+                            EditorUserBuildSettings.selectedBuildTargetGroup));
+#else
                 apiCompatibilityLevel =
                     PlayerSettings.GetApiCompatibilityLevel(EditorUserBuildSettings.selectedBuildTargetGroup);
+#endif
                 return true;
             }
             catch

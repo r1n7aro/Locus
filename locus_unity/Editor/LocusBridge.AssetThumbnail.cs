@@ -261,7 +261,6 @@ namespace Locus
             if (asset == null)
                 throw new InvalidOperationException("Asset was not found: " + assetPath);
 
-            int instanceId = asset.GetInstanceID();
             int frame = 0;
             double startedAt = EditorApplication.timeSinceStartup;
             EditorApplication.CallbackFunction poll = null;
@@ -278,7 +277,7 @@ namespace Locus
                         return;
                     }
 
-                    bool stillLoading = AssetPreview.IsLoadingAssetPreview(instanceId);
+                    bool stillLoading = LocusObjectIdentity.IsLoadingAssetPreview(asset);
                     bool timedOut = frame >= AssetThumbnailMaxFrames
                         || EditorApplication.timeSinceStartup - startedAt >= AssetThumbnailMaxSeconds;
                     if (timedOut || (!stillLoading && frame >= 8))
