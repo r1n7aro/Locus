@@ -66,6 +66,22 @@ unsafe fn string_from_raw(ptr: *const u8, len: i32) -> String {
     String::from_utf8_lossy(slice_from_raw(ptr, len)).into_owned()
 }
 
+/// Normalize a Windows named-pipe name to the full `\\.\pipe\…` path that
+/// tokio's `ServerOptions::create` and `ClientOptions::open` both require. The
+/// managed caller passes the bare name (e.g. `locus_unity_native_…` or
+/// `locus_tauri_unity_embed_…`), so accept either form. Used by both the broker
+/// server (`imp::init`) and the overlay client (`overlay::connect`) — keeping it
+/// in one place stops the two transports from drifting apart.
+#[cfg(windows)]
+fn normalize_pipe_name(pipe_name: String) -> String {
+    let value = pipe_name.trim().to_string();
+    if value.starts_with(r"\\.\pipe\") {
+        value
+    } else {
+        format!(r"\\.\pipe\{}", value.trim_start_matches('\\'))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Windows implementation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1195,17 +1211,8 @@ mod imp {
 
     // ── FFI entry points (called from C# on the editor threads) ─────────────
 
-    fn normalize_pipe_name(pipe_name: String) -> String {
-        let value = pipe_name.trim().to_string();
-        if value.starts_with(r"\\.\pipe\") {
-            value
-        } else {
-            format!(r"\\.\pipe\{}", value.trim_start_matches('\\'))
-        }
-    }
-
     pub fn init(project: String, pipe_name: String, protocol_version: i32) -> i32 {
-        let pipe_name = normalize_pipe_name(pipe_name);
+        let pipe_name = super::normalize_pipe_name(pipe_name);
         if BROKER.get().is_some() {
             // Already running (e.g. re-called after a domain reload). Keep the
             // live pipe + queue; the managed side re-registers via state pushes.
@@ -1851,10 +1858,15 @@ mod overlay {
     /// Idempotent: a second call (e.g. after a domain reload) keeps the live
     /// connection. Returns 0 on success, -1 on a bad pipe name.
     pub fn connect(pipe_name: String) -> i32 {
-        let pipe_name = pipe_name.trim().to_string();
-        if pipe_name.is_empty() {
+        if pipe_name.trim().is_empty() {
             return -1;
         }
+        // The managed caller hands us the bare control-pipe name (no prefix),
+        // but `ClientOptions::open` needs the full `\\.\pipe\…` path. Normalize
+        // exactly like the broker server so the client actually connects instead
+        // of looping forever — otherwise pushes are silently buffered and the
+        // overlay never mounts (the editor placeholder stays up).
+        let pipe_name = super::normalize_pipe_name(pipe_name);
         if OVERLAY.get().is_some() {
             return 0;
         }
