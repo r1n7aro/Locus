@@ -1,12 +1,12 @@
 {
-  "version": "0.5.0",
+  "version": "0.5.1",
   "releasedAt": "2026-06-22",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,11 +29,19 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.0 (2026-06-22)",
+      "summary": "Locus v0.5.1 (2026-06-22)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
         {
-          "title": "新增",
+          "title": "v0.5.1（修复）",
+          "items": [
+            "grep 工具改为流式搜索，不再将整个文件读入内存，仅按路径顺序保留前若干个匹配；模式过于宽泛时会提前停止，并说明返回的是不完整、不确定的结果子集。",
+            "修复在 Unity 嵌入式窗口中点击输入框时的焦点闪烁：仅在目标窗口尚未持有前台时才强制前置，避免覆盖层在失焦与聚焦之间反复跳动。",
+            "修复 Native Plugin 覆盖层因控制管道名未规范化为完整管道路径而无法连接、覆盖层始终无法挂载的问题。"
+          ]
+        },
+        {
+          "title": "v0.5.0（新增）",
           "items": [
             "编辑器热更新已实现：Agent 现在能在运行时修改 C# 脚本并实时应用逻辑，能力覆盖主流商业热更新插件。",
             "Unity IPC 连接已从 C# 插件迁移到使用 Rust 编写的 Native Plugin，可在域重载、Unity 主线程阻塞期间保持连接稳定，并实时上报 Unity 状态。",
@@ -44,7 +52,7 @@
           ]
         },
         {
-          "title": "修复",
+          "title": "v0.5.0（修复）",
           "items": [
             "资产数据库的性能与正确性优化。",
             "修复消息记录在某些情况下隐藏最后一条工具调用的问题。",
@@ -55,11 +63,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -69,11 +77,19 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.0 (2026-06-22)",
+      "summary": "Locus v0.5.1 (2026-06-22)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
         {
-          "title": "Added",
+          "title": "v0.5.1 (Fixed)",
+          "items": [
+            "The grep tool now streams search results instead of reading whole files into memory and keeps only the first N matches in path order; on very broad patterns it stops early and reports that the results are an incomplete, non-deterministic subset.",
+            "Fixed a focus flicker when clicking the input box in the embedded Unity window; the window is only force-activated when it doesn't already hold the foreground, so the overlay no longer bounces between blur and focus.",
+            "Fixed the native-plugin overlay failing to mount because its control-pipe name wasn't normalized to the full pipe path, so the client never connected."
+          ]
+        },
+        {
+          "title": "v0.5.0 (Added)",
           "items": [
             "Editor hot reload is now available: the agent can modify C# scripts at runtime and apply the new logic live, matching the capabilities of mainstream commercial hot-reload plugins.",
             "The Unity IPC connection has moved from the C# plugin to a native plugin written in Rust, which keeps the connection stable across domain reloads and while Unity's main thread is blocked, and reports Unity state in real time.",
@@ -84,7 +100,7 @@
           ]
         },
         {
-          "title": "Fixed",
+          "title": "v0.5.0 (Fixed)",
           "items": [
             "Asset database performance and correctness improvements.",
             "Fixed a case where the message history could hide the last tool call.",
@@ -95,11 +111,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.0 (2026-06-22)"
+description: "Locus v0.5.1 (2026-06-22)"
 sidebarTitle: "Latest Version"
-version: "0.5.0"
+version: "0.5.1"
 releasedAt: "2026-06-22"
 channel: "stable"
 updateTitle: "Update available"
@@ -11,13 +11,19 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.0/locus_0.5.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
 
-### Added
+### v0.5.1 (Fixed)
+
+- The grep tool now streams search results instead of reading whole files into memory and keeps only the first N matches in path order; on very broad patterns it stops early and reports that the results are an incomplete, non-deterministic subset.
+- Fixed a focus flicker when clicking the input box in the embedded Unity window; the window is only force-activated when it doesn't already hold the foreground, so the overlay no longer bounces between blur and focus.
+- Fixed the native-plugin overlay failing to mount because its control-pipe name wasn't normalized to the full pipe path, so the client never connected.
+
+### v0.5.0 (Added)
 
 - Editor hot reload is now available: the agent can modify C# scripts at runtime and apply the new logic live, matching the capabilities of mainstream commercial hot-reload plugins.
 - The Unity IPC connection has moved from the C# plugin to a native plugin written in Rust, which keeps the connection stable across domain reloads and while Unity's main thread is blocked, and reports Unity state in real time.
@@ -26,7 +32,7 @@ changelogUrl: "/en/overview/latest-version"
 - Settings has a new Testing page. This release involves significant architectural changes that may cause compatibility regressions, so if you run into problems you can run these tests for reference.
 - Exposed more APIs to the View Package.
 
-### Fixed
+### v0.5.0 (Fixed)
 
 - Asset database performance and correctness improvements.
 - Fixed a case where the message history could hide the last tool call.
