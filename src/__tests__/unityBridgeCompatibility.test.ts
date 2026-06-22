@@ -56,7 +56,7 @@ describe("unityBridgeCompatibility", () => {
     expect(pump).toMatch(/if \(_activeRunStatesSession != null\)\s+PumpRunStates\(\);/);
     expect(pump).toMatch(/if \(HasActiveExecuteCodeAsyncRuntime\(\)\)\s+PumpExecuteCodeAsyncRuntime\(\);/);
     expect(pump).toMatch(/if \(desktopConnected\)\s+MaybeSendEditorUpdateEvent\(\);/);
-    expect(editorUpdate).toContain("int selectionInstanceId = selection != null ? selection.GetInstanceID() : 0;");
+    expect(editorUpdate).toContain("int selectionInstanceId = LocusObjectIdentity.InstanceId(selection);");
     expect(editorUpdate).toContain("RefreshCachedEditorState();");
     expect(bridge).toContain("private static bool HasAnyDesktopConnection()");
     expect(bridge).toContain("return IsNativeBridgeActive;");
