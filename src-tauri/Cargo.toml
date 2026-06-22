@@ -38,6 +38,8 @@ uuid = { version = "1.22.0", features = ["v4", "serde"] }
 futures = "0.3.32"
 walkdir = "2.5.0"
 ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks"], default-features = false }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
