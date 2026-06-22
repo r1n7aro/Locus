@@ -1080,6 +1080,73 @@ fn push_default_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
     }
 }
 
+#[derive(Deserialize)]
+struct UnityHubEditorsCache {
+    #[serde(default)]
+    data: Vec<UnityHubEditorEntry>,
+}
+
+#[derive(Deserialize)]
+struct UnityHubEditorEntry {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    location: Vec<String>,
+}
+
+/// Unity Hub records every editor it manages — including ones installed outside
+/// `Program Files` — in `editors-v2.json`. Return the `data[].location[]` paths
+/// whose `version` matches, in file order.
+fn parse_unity_hub_editor_locations(cache_json: &str, version: &str) -> Vec<PathBuf> {
+    let version = version.trim();
+    let Ok(cache) = serde_json::from_str::<UnityHubEditorsCache>(cache_json) else {
+        return Vec::new();
+    };
+
+    let mut locations = Vec::new();
+    for entry in cache.data {
+        if entry.version.trim() != version {
+            continue;
+        }
+        for location in entry.location {
+            let trimmed = location.trim();
+            if !trimmed.is_empty() {
+                locations.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    locations
+}
+
+/// Location of the Unity Hub editor cache. `dirs::config_dir()` maps to the
+/// directory Unity Hub actually writes to on each platform: `%APPDATA%`
+/// (Roaming) on Windows, `~/Library/Application Support` on macOS, `~/.config`
+/// on Linux.
+fn unity_hub_editors_cache_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("UnityHub").join("editors-v2.json"))
+}
+
+/// Fall back to the Unity Hub editor cache so editors installed in non-default
+/// locations (e.g. `D:\Apps\Unity`, `F:\UnityEditor`) are still discovered.
+fn push_unity_hub_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
+    let Some(cache_path) = unity_hub_editors_cache_path() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&cache_path) else {
+        return;
+    };
+
+    for location in parse_unity_hub_editor_locations(&content, version) {
+        // Windows/Linux record the executable directly; macOS records the
+        // `Unity.app` bundle directory, which the install-root helper expands.
+        if location.is_dir() {
+            push_editor_install_root_candidates(paths, location);
+        } else {
+            push_unique_path(paths, location);
+        }
+    }
+}
+
 pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String> {
     let version = version.trim();
     if version.is_empty() {
@@ -1090,6 +1157,7 @@ pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String>
     push_env_editor_candidates(&mut candidates);
     push_windows_registry_editor_candidates(&mut candidates, version);
     push_default_editor_candidates(&mut candidates, version);
+    push_unity_hub_editor_candidates(&mut candidates, version);
 
     for candidate in &candidates {
         if candidate.is_file() {
@@ -4703,10 +4771,10 @@ mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
         is_transient_broker_error, native_background_hook_markers_present,
-        pipe_response_transient_broker_error, read_project_unity_version, relative_asset_paths,
-        requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
-        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
-        UnityEditorProcessState,
+        parse_unity_hub_editor_locations, pipe_response_transient_broker_error,
+        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
+        rewrite_run_states_output_for_size, PipeResponse, UnityBackgroundHookState,
+        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
     };
     use serde_json::json;
 
@@ -4940,5 +5008,56 @@ mod tests {
         assert!(error.contains("print_lines: 90000"));
         assert!(error.contains("result was not saved"));
         assert!(!project.path().join("Library").join("Locus").exists());
+    }
+
+    const UNITY_HUB_EDITORS_SAMPLE: &str = r#"{
+      "schema_version": "2",
+      "data": [
+        {"version":"2022.3.2f1","location":["E:\\Unity 2022.3.2f1\\Editor\\Unity.exe"],"manual":true,"architecture":"x86_64","buildPlatforms":[],"requiresUlf":false},
+        {"version":"6000.3.14f1","location":["E:/Unity 6.3/Editor/Unity.exe"],"manual":true,"architecture":"x86_64"},
+        {"version":"2021.3.45f1","location":["F:\\UnityEditor\\2021.3.45f1\\Editor\\Unity.exe"],"manual":true}
+      ]
+    }"#;
+
+    #[test]
+    fn unity_hub_locations_match_version_including_non_default_drives() {
+        use std::path::PathBuf;
+        // Editor installed on a non-default drive is still resolved.
+        assert_eq!(
+            parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2021.3.45f1"),
+            vec![PathBuf::from(r"F:\UnityEditor\2021.3.45f1\Editor\Unity.exe")]
+        );
+        // ProjectVersion.txt parsing may leave surrounding whitespace.
+        assert_eq!(
+            parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "  2022.3.2f1 "),
+            vec![PathBuf::from(r"E:\Unity 2022.3.2f1\Editor\Unity.exe")]
+        );
+        // Forward-slash locations (common for Unity 6 manual adds) are preserved.
+        assert_eq!(
+            parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "6000.3.14f1"),
+            vec![PathBuf::from("E:/Unity 6.3/Editor/Unity.exe")]
+        );
+    }
+
+    #[test]
+    fn unity_hub_locations_ignore_unknown_versions_and_invalid_cache() {
+        assert!(parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2019.4.0f1").is_empty());
+        assert!(parse_unity_hub_editor_locations("not json", "2022.3.2f1").is_empty());
+        assert!(parse_unity_hub_editor_locations("{}", "2022.3.2f1").is_empty());
+        assert!(parse_unity_hub_editor_locations(r#"{"data":[]}"#, "2022.3.2f1").is_empty());
+    }
+
+    #[test]
+    fn unity_hub_locations_skip_blank_paths_and_collect_all_matches() {
+        let cache = r#"{"data":[
+            {"version":"2022.3.2f1","location":["","   "]},
+            {"version":"2022.3.2f1","location":["D:\\Apps\\Unity\\Hub\\Editor\\2022.3.2f1\\Editor\\Unity.exe"]}
+        ]}"#;
+        assert_eq!(
+            parse_unity_hub_editor_locations(cache, "2022.3.2f1"),
+            vec![std::path::PathBuf::from(
+                r"D:\Apps\Unity\Hub\Editor\2022.3.2f1\Editor\Unity.exe"
+            )]
+        );
     }
 }
