@@ -1,12 +1,12 @@
 {
-  "version": "0.5.1",
-  "releasedAt": "2026-06-22",
+  "version": "0.5.2",
+  "releasedAt": "2026-06-23",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,29 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.1 (2026-06-22)",
+      "summary": "Locus v0.5.2 (2026-06-23)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.2（新增）",
+          "items": [
+            "`unity_code_usages` 的成员查询改为读取资产扫描阶段建立的序列化成员绑定索引：现在能捕获仅按类型串命名（`m_Target: {fileID: 0}`、无 GUID）的断裂/未绑定 UnityEvent 调用，并在整个项目范围内解析 AnimationEvent 函数名，而不再每次查询都重新扫描引用它的场景/预制件以及每个 `.anim` 片段。更新后首次启动会重建一次资产数据库（schema v12）。",
+            "Unity 编辑器解析新增回退到 Unity Hub 安装缓存（`editors-v2.json`），安装在非默认盘符（例如 `D:\\` 或 `F:\\`）的编辑器现在也能被正确识别。"
+          ]
+        },
+        {
+          "title": "v0.5.2（修复）",
+          "items": [
+            "Unity 6.5（6000.5）兼容：`GetInstanceID()` 与 `IsLoadingAssetPreview(int)` 变为错误，32 位 InstanceID 被 64 位 EntityId 取代。新增 `LocusObjectIdentity` 垫片，将 EntityId 折叠回低 32 位（保留原有 InstanceID 与通信协议），并按编辑器版本门控已弃用的 build-target API。旧版本编辑器不受影响。(#95)",
+            "修复中文（CJK）输入导致的资产数据库锁中毒：当搜索词为纯中文，或 `.meta` 文件在 `guid:` 后含中文时，按字节偏移切分会落在多字节字符内部并触发 panic，而该 panic 发生在持有资产数据库锁期间，导致此后所有资产查询失效直至重启。现已改为按字符边界切分。(#97)"
+          ]
+        },
+        {
+          "title": "v0.5.2（移除）",
+          "items": [
+            "`unity_code_usages` 成员模式不再上报序列化类型串指向其他类的 UnityEvent 调用；现在仅匹配精确的类短名或绑定的脚本 GUID。"
+          ]
+        },
         {
           "title": "v0.5.1（修复）",
           "items": [
@@ -63,11 +83,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -77,9 +97,29 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.1 (2026-06-22)",
+      "summary": "Locus v0.5.2 (2026-06-23)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.2 (Added)",
+          "items": [
+            "`unity_code_usages` member lookups now read from a serialized member-binding index built during asset scanning, so they catch broken/unbound UnityEvent calls named only by a type string (`m_Target: {fileID: 0}`, no GUID) and resolve AnimationEvent function names across the whole project, instead of re-scanning the referencing scenes/prefabs and every `.anim` clip on each query. The asset database rebuilds once on first launch after updating (schema v12).",
+            "Unity editor resolution now falls back to the Unity Hub install cache (`editors-v2.json`), so editors installed on non-default drives (for example `D:\\` or `F:\\`) are found."
+          ]
+        },
+        {
+          "title": "v0.5.2 (Fixed)",
+          "items": [
+            "Unity 6.5 (6000.5) compatibility: `GetInstanceID()` and `IsLoadingAssetPreview(int)` became errors and the 32-bit InstanceID was replaced by the 64-bit EntityId. A `LocusObjectIdentity` shim folds the EntityId back to its low 32 bits (keeping the existing InstanceID and wire protocol), and the deprecated build-target APIs are gated by editor version. Older editors are unaffected. (#95)",
+            "Fixed asset-database lock poisoning on CJK input: a bare CJK search term, or a `.meta` file with CJK text after `guid:`, sliced inside a multi-byte character and panicked while the asset-database lock was held, which broke every later asset query until restart. Slicing now happens on character boundaries. (#97)"
+          ]
+        },
+        {
+          "title": "v0.5.2 (Removed)",
+          "items": [
+            "`unity_code_usages` member mode no longer reports a UnityEvent call whose serialized type name points to a different class; it now matches only the exact class short-name or the bound script GUID."
+          ]
+        },
         {
           "title": "v0.5.1 (Fixed)",
           "items": [
@@ -111,11 +151,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

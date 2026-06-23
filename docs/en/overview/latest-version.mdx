@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.1 (2026-06-22)"
+description: "Locus v0.5.2 (2026-06-23)"
 sidebarTitle: "Latest Version"
-version: "0.5.1"
-releasedAt: "2026-06-22"
+version: "0.5.2"
+releasedAt: "2026-06-23"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,25 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.1/locus_0.5.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.2 (Added)
+
+- `unity_code_usages` member lookups now read from a serialized member-binding index built during asset scanning, so they catch broken/unbound UnityEvent calls named only by a type string (`m_Target: {fileID: 0}`, no GUID) and resolve AnimationEvent function names across the whole project, instead of re-scanning the referencing scenes/prefabs and every `.anim` clip on each query. The asset database rebuilds once on first launch after updating (schema v12).
+- Unity editor resolution now falls back to the Unity Hub install cache (`editors-v2.json`), so editors installed on non-default drives (for example `D:\` or `F:\`) are found.
+
+### v0.5.2 (Fixed)
+
+- Unity 6.5 (6000.5) compatibility: `GetInstanceID()` and `IsLoadingAssetPreview(int)` became errors and the 32-bit InstanceID was replaced by the 64-bit EntityId. A `LocusObjectIdentity` shim folds the EntityId back to its low 32 bits (keeping the existing InstanceID and wire protocol), and the deprecated build-target APIs are gated by editor version. Older editors are unaffected. (#95)
+- Fixed asset-database lock poisoning on CJK input: a bare CJK search term, or a `.meta` file with CJK text after `guid:`, sliced inside a multi-byte character and panicked while the asset-database lock was held, which broke every later asset query until restart. Slicing now happens on character boundaries. (#97)
+
+### v0.5.2 (Removed)
+
+- `unity_code_usages` member mode no longer reports a UnityEvent call whose serialized type name points to a different class; it now matches only the exact class short-name or the bound script GUID.
 
 ### v0.5.1 (Fixed)
 

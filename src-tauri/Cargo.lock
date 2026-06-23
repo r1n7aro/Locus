@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "locus"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aisdk",
  "anyhow",
