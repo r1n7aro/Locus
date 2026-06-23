@@ -54,7 +54,6 @@ fn rel_display(root: &Path, path: &Path) -> String {
 // ─── unity_code_usages ──────────────────────────────────────────────────────
 
 const MAX_CANDIDATE_FILES: usize = 500;
-const MAX_ANIM_FILES: usize = 3000;
 
 pub(super) fn unity_code_usages() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_CODE_USAGES);
@@ -143,8 +142,10 @@ fn run_code_usages(
         return err("Could not read a GUID from the script's .meta file.");
     };
 
-    // Assets that reference the script GUID, via the asset reference graph.
-    let candidates: Vec<String> = {
+    // Assets that reference the script GUID, via the asset reference graph,
+    // plus (in member mode) the indexed serialized member bindings. All DB
+    // access stays inside this one guard scope; the lock releases afterwards.
+    let (candidates, member_hits): (Vec<String>, Vec<crate::asset_db::MemberBindingHit>) = {
         let Some(app_handle) = app_handle.as_ref() else {
             return err("App context unavailable for asset database access.");
         };
@@ -188,14 +189,29 @@ fn run_code_usages(
             }
         }
         paths.sort();
-        paths
+
+        let member_hits = match member {
+            Some(member) => match db.get_member_bindings(member, &class_name.to_lowercase(), &guid)
+            {
+                Ok(hits) => hits,
+                Err(error) => return err(format!("Failed to query member bindings: {error}")),
+            },
+            None => Vec::new(),
+        };
+        (paths, member_hits)
     };
 
     match member {
         None => format_attach_points(&root, &candidates, &guid, &class_name, max_results),
-        Some(member) => {
-            format_member_usages(&root, &candidates, &guid, &class_name, member, max_results)
-        }
+        Some(member) => format_member_usages(
+            &root,
+            &candidates,
+            &guid,
+            &class_name,
+            member,
+            &member_hits,
+            max_results,
+        ),
     }
 }
 
@@ -278,19 +294,26 @@ fn format_attach_points(
 }
 
 /// Serialized member usages: UnityEvent bindings, serialized field values and
-/// AnimationEvent function names.
+/// AnimationEvent function names. UnityEvent/anim bindings come pre-resolved
+/// from the indexed `member_bindings` table (`member_hits`, already ordered by
+/// path then line); only the serialized-field-value match still scans the
+/// referencing assets directly, since field values aren't indexed.
 fn format_member_usages(
     root: &Path,
     candidates: &[String],
     guid: &Guid,
     class_name: &str,
     member: &str,
+    member_hits: &[crate::asset_db::MemberBindingHit],
     max_results: usize,
 ) -> ToolResult {
     let mut entries: Vec<(String, u32, String)> = Vec::new();
     let mut files_scanned = 0usize;
     let mut files_truncated = false;
 
+    // Serialized field values (`member: value` inside one of this script's own
+    // component blocks) are not indexed, so scan the referencing assets for
+    // them. UnityEvent bindings and AnimationEvents are handled by the DB below.
     for path in candidates {
         if files_scanned >= MAX_CANDIDATE_FILES {
             files_truncated = true;
@@ -305,15 +328,11 @@ fn format_member_usages(
         let docs = crate::unity_yaml::parse_yaml_docs(&bytes);
 
         let mut go_names: HashMap<i64, &str> = HashMap::new();
-        let mut component_go: HashMap<i64, i64> = HashMap::new();
         for doc in &docs {
             if doc.class_id == 1 {
                 if let Some(name) = doc.m_name.as_deref() {
                     go_names.insert(doc.file_id, name);
                 }
-            }
-            if let Some(go_id) = doc.m_game_object_id {
-                component_go.insert(doc.file_id, go_id);
             }
         }
         // Line ranges of this script's own component blocks (for field hits).
@@ -332,70 +351,6 @@ fn format_member_usages(
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             let item = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-
-            // UnityEvent persistent call.
-            if let Some(rest) = item.strip_prefix("m_MethodName: ") {
-                if rest.trim() != member {
-                    continue;
-                }
-                let mut target_type: Option<String> = None;
-                let mut target_id: Option<i64> = None;
-                for back in (index.saturating_sub(8)..index).rev() {
-                    let back_line = lines[back].trim_start();
-                    let back_item = back_line.strip_prefix("- ").unwrap_or(back_line);
-                    if target_type.is_none() {
-                        if let Some(type_name) =
-                            back_item.strip_prefix("m_TargetAssemblyTypeName: ")
-                        {
-                            let class = type_name
-                                .split(',')
-                                .next()
-                                .unwrap_or(type_name)
-                                .trim()
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                            if !class.is_empty() {
-                                target_type = Some(class);
-                            }
-                        }
-                    }
-                    if back_item.starts_with("m_Target:") {
-                        target_id = extract_file_id(back_item);
-                        break;
-                    }
-                }
-                let target_is_ours = match (&target_type, target_id) {
-                    (Some(type_name), _) if type_name == class_name => true,
-                    (_, Some(id)) => docs
-                        .iter()
-                        .any(|doc| doc.file_id == id && doc.m_script_guid.as_ref() == Some(guid)),
-                    _ => false,
-                };
-                let go_name = target_id
-                    .and_then(|id| component_go.get(&id))
-                    .and_then(|go_id| go_names.get(go_id));
-                let annotation = if target_is_ours {
-                    match go_name {
-                        Some(name) => format!("target: this script, GameObject '{name}'"),
-                        None => "target: this script".to_string(),
-                    }
-                } else {
-                    match &target_type {
-                        Some(type_name) => {
-                            format!("target: '{type_name}' — different script, verify")
-                        }
-                        None => "target: unresolved".to_string(),
-                    }
-                };
-                entries.push((
-                    path.clone(),
-                    index as u32 + 1,
-                    format!("[UnityEvent] m_MethodName: {member} ({annotation})"),
-                ));
-                continue;
-            }
 
             // Serialized field inside one of this script's component blocks.
             if let Some(rest) = item.strip_prefix(member) {
@@ -423,35 +378,45 @@ fn format_member_usages(
         }
     }
 
-    // AnimationEvents live in .anim clips, which never reference the script
-    // GUID — walk them separately.
-    let (anim_files, anim_truncated) = collect_files_by_ext(&root.join("Assets"), "anim");
-    let anim_scanned = anim_files.len();
-    for anim in &anim_files {
-        let Ok(text) = std::fs::read_to_string(anim) else {
-            continue;
+    // UnityEvent persistent calls + AnimationEvents, resolved once from the
+    // indexed `member_bindings` table. Covers broken/unbound bindings named
+    // only by type string (no GUID, so the reference graph never sees them) and
+    // animation events project-wide — replacing the old per-query anim scan and
+    // scene/prefab/asset sweep.
+    for hit in member_hits {
+        let desc = if hit.binding_kind == 1 {
+            format!("[AnimationEvent] functionName: {member} (receiver resolved at runtime)")
+        } else if hit.target_is_ours {
+            let go = if hit.target_go_name.is_empty() {
+                String::new()
+            } else {
+                format!(", GameObject '{}'", hit.target_go_name)
+            };
+            format!("[UnityEvent] m_MethodName: {member} (target: this script{go})")
+        } else if matches!(hit.target_file_id, None | Some(0)) {
+            format!(
+                "[UnityEvent] m_MethodName: {member} (target: '{}' by type name, m_Target unset — broken/unbound binding)",
+                hit.target_type_full
+            )
+        } else {
+            format!(
+                "[UnityEvent] m_MethodName: {member} (target: '{}' by type name)",
+                hit.target_type_full
+            )
         };
-        for (index, line) in text.lines().enumerate() {
-            let trimmed = line.trim_start();
-            let item = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-            if let Some(rest) = item.strip_prefix("functionName: ") {
-                if rest.trim() == member {
-                    entries.push((
-                        rel_display(&root, anim),
-                        index as u32 + 1,
-                        format!("[AnimationEvent] functionName: {member} (receiver resolved at runtime)"),
-                    ));
-                }
-            }
-        }
+        entries.push((hit.path.clone(), hit.line, desc));
     }
 
     if entries.is_empty() {
         return ok(format!(
-            "No serialized usages of '{class_name}.{member}' found in {} referencing asset(s) and {anim_scanned} .anim clip(s). Code references are not covered here — use code_find_references for those.",
+            "No serialized usages of '{class_name}.{member}' found in {} referencing asset(s) or indexed UnityEvent/AnimationEvent bindings. Code references are not covered here — use code_find_references for those.",
             candidates.len().min(files_scanned)
         ));
     }
+
+    // Field-value entries (scan order) and binding entries (SQL order) are
+    // interleaved by path; sort by (path, line) for stable grouped output.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     let total = entries.len();
     let mut output = format!(
@@ -464,22 +429,7 @@ fn format_member_usages(
             "\n(Only the first {MAX_CANDIDATE_FILES} referencing assets were scanned.)\n"
         ));
     }
-    if anim_truncated {
-        output.push_str(&format!(
-            "\n(Only the first {MAX_ANIM_FILES} .anim clips were scanned.)\n"
-        ));
-    }
     ok(output)
-}
-
-fn extract_file_id(line: &str) -> Option<i64> {
-    let start = line.find("fileID:")? + "fileID:".len();
-    let rest = line[start..].trim_start();
-    let digits: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    digits.parse().ok()
 }
 
 fn push_grouped_entries(output: &mut String, entries: &[(String, u32, String)], cap: usize) {
@@ -502,43 +452,6 @@ fn push_grouped_entries(output: &mut String, entries: &[(String, u32, String)], 
             entries.len()
         ));
     }
-}
-
-/// Recursively collect files with the given extension under `dir` (skipping
-/// dot-directories), capped at `MAX_ANIM_FILES`. Returns (files, truncated).
-fn collect_files_by_ext(dir: &Path, ext: &str) -> (Vec<PathBuf>, bool) {
-    let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    let mut truncated = false;
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if path.is_dir() {
-                if !name.starts_with('.') {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case(ext))
-                .unwrap_or(false)
-            {
-                if files.len() >= MAX_ANIM_FILES {
-                    truncated = true;
-                    return (files, truncated);
-                }
-                files.push(path);
-            }
-        }
-    }
-    (files, truncated)
 }
 
 // ─── project string-ref validation (folded into code_diagnostics) ──────────
