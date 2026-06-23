@@ -81,7 +81,7 @@ struct TransformWorldState {
 }
 
 pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
-    parse_yaml_docs_impl(content, false).0
+    parse_yaml_docs_impl(content, false, false).0 .0
 }
 
 /// Single-pass variant that additionally captures every guid-bearing flow map
@@ -91,18 +91,44 @@ pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
 /// standalone reference extractor back to back (and keeps the two from ever
 /// disagreeing about document boundaries or field context).
 pub fn parse_yaml_docs_with_refs(content: &[u8]) -> (Vec<YamlDoc>, Vec<references::RawYamlRef>) {
-    parse_yaml_docs_impl(content, true)
+    parse_yaml_docs_impl(content, true, false).0
+}
+
+/// Like [`parse_yaml_docs_with_refs`] but also captures raw serialized member
+/// bindings (UnityEvent persistent calls + AnimationEvent function names) in
+/// the same line scan. Indexing callers turn these into `member_bindings`
+/// rows; everyone else keeps using the cheaper two-element variant.
+pub fn parse_yaml_docs_with_refs_and_bindings(
+    content: &[u8],
+) -> (
+    Vec<YamlDoc>,
+    Vec<references::RawYamlRef>,
+    Vec<references::RawMemberBinding>,
+) {
+    let ((docs, raw_refs), bindings) = parse_yaml_docs_impl(content, true, true);
+    (docs, raw_refs, bindings)
 }
 
 fn parse_yaml_docs_impl(
     content: &[u8],
     collect_refs: bool,
-) -> (Vec<YamlDoc>, Vec<references::RawYamlRef>) {
+    collect_bindings: bool,
+) -> (
+    (Vec<YamlDoc>, Vec<references::RawYamlRef>),
+    Vec<references::RawMemberBinding>,
+) {
     let text = String::from_utf8_lossy(content);
 
     let mut docs: Vec<YamlDoc> = Vec::new();
     let mut raw_refs: Vec<references::RawYamlRef> = Vec::new();
     let mut raw_seen: references::RawRefSeen = HashSet::new();
+    let mut raw_bindings: Vec<references::RawMemberBinding> = Vec::new();
+    // Per persistent-call accumulators: a UnityEvent call serializes
+    // `m_Target` then `m_TargetAssemblyTypeName` ahead of `m_MethodName`, so we
+    // stash the most recent of each and flush them when `m_MethodName` lands,
+    // then clear so the next call in the list starts fresh.
+    let mut cur_pc_target_file_id: Option<i64> = None;
+    let mut cur_pc_type_name: Option<String> = None;
     let mut cur_class_id: Option<i32> = None;
     let mut cur_file_id: i64 = 0;
     let mut cur_type_name: Option<String> = None;
@@ -297,6 +323,8 @@ fn parse_yaml_docs_impl(
             cur_m_enabled = None;
             cur_transform_root_order = None;
             cur_transform_children.clear();
+            cur_pc_target_file_id = None;
+            cur_pc_type_name = None;
             cur_line_start = i;
             first_key = true;
             last_field = None;
@@ -402,6 +430,50 @@ fn parse_yaml_docs_impl(
                     }
                 }
             }
+            // Serialized member bindings (UnityEvent persistent calls +
+            // AnimationEvent function names). The call's `m_Target` and
+            // `m_TargetAssemblyTypeName` precede its `m_MethodName`, so stash
+            // them and emit when the method name (or an anim functionName,
+            // which has no target) lands. See `RawMemberBinding`.
+            if collect_bindings {
+                if f == "m_Target" {
+                    // `m_Target: {fileID: N}` — single-line flow map; record the
+                    // fileID (None when malformed). Each call resets this.
+                    cur_pc_target_file_id = Some(extract_internal_file_id(trimmed).unwrap_or(0));
+                } else if f == "m_TargetAssemblyTypeName" {
+                    cur_pc_type_name = extract_plain_value(trimmed, "m_TargetAssemblyTypeName:");
+                } else if f == "m_MethodName" {
+                    if let Some(method) = extract_plain_value(trimmed, "m_MethodName:") {
+                        raw_bindings.push(references::RawMemberBinding {
+                            src_doc_file_id: cur_file_id,
+                            binding_kind: 0,
+                            method_name: method,
+                            target_type_name: cur_pc_type_name.take(),
+                            target_file_id: cur_pc_target_file_id.take(),
+                            line: (i + 1) as u32,
+                        });
+                    } else {
+                        cur_pc_type_name = None;
+                        cur_pc_target_file_id = None;
+                    }
+                } else if f == "functionName" && cur_class_id == Some(74) {
+                    // AnimationEvent.functionName lives only in AnimationClip
+                    // (class 74) docs. Gate on it so a coincidental serialized
+                    // field named `functionName` in a MonoBehaviour / custom
+                    // asset is not indexed as a class-agnostic AnimationEvent
+                    // (kind 1 is returned unconditionally by get_member_bindings).
+                    if let Some(method) = extract_plain_value(trimmed, "functionName:") {
+                        raw_bindings.push(references::RawMemberBinding {
+                            src_doc_file_id: cur_file_id,
+                            binding_kind: 1,
+                            method_name: method,
+                            target_type_name: None,
+                            target_file_id: None,
+                            line: (i + 1) as u32,
+                        });
+                    }
+                }
+            }
             last_field = Some(f.to_string());
         } else if (cur_class_id == Some(4) || cur_class_id == Some(224))
             && last_field.as_deref() == Some("m_Children")
@@ -450,7 +522,7 @@ fn parse_yaml_docs_impl(
     }
 
     flush_doc!(line_count);
-    (docs, raw_refs)
+    ((docs, raw_refs), raw_bindings)
 }
 
 pub fn build_world_transform_map(

@@ -7,6 +7,7 @@ pub mod types;
 pub mod watcher;
 
 pub use db::AssetSearchRowDb;
+pub use db::MemberBindingHit;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -239,6 +240,7 @@ type YamlParseOk = (
     Vec<crate::unity_yaml::YamlDoc>,
     [u8; 16],
     Option<Guid>,
+    Vec<crate::unity_yaml::MemberBinding>,
 );
 
 /// Read + parse one yaml asset for the full-scan pipeline. Pure function of
@@ -277,10 +279,12 @@ fn parse_yaml_asset_entry(
         }
     };
 
-    // Single pass: docs and raw refs come from one line scan, then the refs
-    // are resolved against the docs in place.
-    let (docs, raw_refs) = crate::unity_yaml::parse_yaml_docs_with_refs(&content);
+    // Single pass: docs, raw refs and raw member bindings come from one line
+    // scan, then refs and bindings are resolved against the docs in place.
+    let (docs, raw_refs, raw_bindings) =
+        crate::unity_yaml::parse_yaml_docs_with_refs_and_bindings(&content);
     let refs = crate::unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(guid_to_path));
+    let member_bindings = crate::unity_yaml::build_bindings_from_docs(&docs, raw_bindings);
     let content_hash = hash128(&content);
     let main_script_guid = if entry.ext.eq_ignore_ascii_case("asset") {
         docs.iter()
@@ -296,6 +300,7 @@ fn parse_yaml_asset_entry(
         docs,
         content_hash,
         main_script_guid,
+        member_bindings,
     ))
 }
 
@@ -751,8 +756,9 @@ impl AssetDb {
         let yaml_count = yaml_results.len();
         let mut edges: Vec<RefEdge> = Vec::with_capacity(yaml_count * 16);
         let mut asset_objects: Vec<AssetObject> = Vec::new();
+        let mut member_bindings: Vec<MemberBindingRow> = Vec::new();
 
-        for (entry, src_guid, extracted_refs, docs, content_hash, main_script_guid) in
+        for (entry, src_guid, extracted_refs, docs, content_hash, main_script_guid, bindings) in
             yaml_results.into_iter()
         {
             let mut updated_node: Option<AssetNode> = None;
@@ -809,6 +815,20 @@ impl AssetDb {
                     class_id_hint: r.class_id_hint,
                     field_hint: r.field_hint, // move
                     ref_path: r.ref_path,     // move
+                });
+            }
+
+            for b in bindings {
+                member_bindings.push(MemberBindingRow {
+                    src_guid,
+                    binding_kind: b.binding_kind,
+                    method_name: b.method_name,
+                    target_type_full: b.target_type_full,
+                    target_type_short_lower: b.target_type_short_lower,
+                    target_file_id: b.target_file_id,
+                    target_script_guid: b.target_script_guid,
+                    target_go_name: b.target_go_name,
+                    line: b.line,
                 });
             }
 
@@ -1024,6 +1044,9 @@ impl AssetDb {
                 let t_edges = t0.elapsed();
 
                 ensure_scan_not_cancelled(cancel)?;
+                db::batch_insert_member_bindings(&tx, &member_bindings)?;
+
+                ensure_scan_not_cancelled(cancel)?;
                 let t0 = std::time::Instant::now();
                 db::create_secondary_indexes(&tx)?;
                 let t_idx_create = t0.elapsed();
@@ -1156,6 +1179,20 @@ impl AssetDb {
 
     pub fn get_direct_refs(&self, guid: &Guid) -> Result<Vec<RefEdge>, String> {
         db::get_direct_refs(&self.conn, guid)
+    }
+
+    /// Indexed serialized member bindings (UnityEvent persistent calls +
+    /// AnimationEvent function names) whose method/function name matches
+    /// `member`. Used by `unity_code_usages` member mode instead of
+    /// per-query filesystem scans. `class_short_lower` and `script_guid`
+    /// scope the UnityEvent matches to this script.
+    pub fn get_member_bindings(
+        &self,
+        member: &str,
+        class_short_lower: &str,
+        script_guid: &Guid,
+    ) -> Result<Vec<db::MemberBindingHit>, String> {
+        db::get_member_bindings(&self.conn, member, class_short_lower, script_guid)
     }
 
     pub fn get_direct_deps_for_object(

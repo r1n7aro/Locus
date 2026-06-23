@@ -23,6 +23,50 @@ pub struct RawYamlRef {
 /// raw ref, matching the old two-pass extractor.
 pub(super) type RawRefSeen = HashSet<(Guid, Option<i64>, Option<String>, i64)>;
 
+/// A serialized member binding captured during the single YAML parse pass,
+/// before the target component/GameObject is resolved. Produced by
+/// `parser::parse_yaml_docs_with_refs_and_bindings`; resolve into a
+/// [`MemberBinding`] with [`build_bindings_from_docs`].
+#[derive(Debug, Clone)]
+pub struct RawMemberBinding {
+    /// fileID of the document the binding lives in (`cur_file_id`).
+    pub src_doc_file_id: i64,
+    /// 0 = UnityEvent persistent call, 1 = AnimationEvent.
+    pub binding_kind: u8,
+    /// `m_MethodName` / `functionName` value, exact case preserved.
+    pub method_name: String,
+    /// Raw `m_TargetAssemblyTypeName` value (may include `, Assembly`); `None`
+    /// for anim events.
+    pub target_type_name: Option<String>,
+    /// `m_Target` fileID; `None` for anim events. `Some(0)` => unbound.
+    pub target_file_id: Option<i64>,
+    /// 1-based source line of the method-name / functionName field.
+    pub line: u32,
+}
+
+/// A resolved member binding, ready to become a `member_bindings` row (the
+/// containing asset's `src_guid` is stamped on by the DB layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberBinding {
+    /// 0 = UnityEvent persistent call, 1 = AnimationEvent.
+    pub binding_kind: u8,
+    pub method_name: String,
+    /// Namespace + class from `m_TargetAssemblyTypeName` (assembly suffix
+    /// stripped); empty when there is no type name.
+    pub target_type_full: String,
+    /// Last `.`-segment of `target_type_full`, lowercased; empty if none.
+    pub target_type_short_lower: String,
+    /// `m_Target` fileID; `Some(0)` / `None` => broken/unbound.
+    pub target_file_id: Option<i64>,
+    /// Resolved `m_Script` GUID of the target component, when determinable from
+    /// the same asset's docs; else `None`.
+    pub target_script_guid: Option<Guid>,
+    /// Resolved GameObject name for annotation; empty if unknown.
+    pub target_go_name: String,
+    /// 1-based source line of the method-name / functionName field.
+    pub line: u32,
+}
+
 pub fn extract_refs(content: &[u8]) -> Vec<ExtractedRef> {
     extract_refs_with_resolver(content, None)
 }
@@ -121,6 +165,68 @@ pub fn build_refs_from_docs(
                 class_id_hint: raw.class_id_hint,
                 field_hint: raw.field_hint,
                 ref_path,
+            }
+        })
+        .collect()
+}
+
+/// Resolve raw member bindings into [`MemberBinding`]s. `docs` must come from
+/// the same parse that produced `raw` (see
+/// `parse_yaml_docs_with_refs_and_bindings`). For a bound UnityEvent call the
+/// target component's `m_Script` GUID and host GameObject name are recovered
+/// from `docs` the same way `build_refs_from_docs` builds its maps; anim
+/// events and unresolvable targets carry empty target fields.
+pub fn build_bindings_from_docs(docs: &[YamlDoc], raw: Vec<RawMemberBinding>) -> Vec<MemberBinding> {
+    let doc_map: HashMap<i64, &YamlDoc> = docs.iter().map(|d| (d.file_id, d)).collect();
+
+    // GameObject fileID -> m_Name, and component fileID -> its GameObject id,
+    // mirroring how `code_unity` resolved the annotation before the move.
+    let go_names: HashMap<i64, &str> = docs
+        .iter()
+        .filter(|d| d.class_id == 1)
+        .filter_map(|d| d.m_name.as_deref().map(|n| (d.file_id, n)))
+        .collect();
+
+    raw.into_iter()
+        .map(|r| {
+            let (target_type_full, target_type_short_lower) = match r.target_type_name {
+                Some(ref name) => {
+                    let full = name.split(',').next().unwrap_or(name).trim().to_string();
+                    let short_lower = full
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    (full, short_lower)
+                }
+                None => (String::new(), String::new()),
+            };
+
+            // Resolve the target component (and its GameObject) only for bound
+            // calls — a real, non-zero fileID pointing at a doc in this asset.
+            let mut target_script_guid: Option<Guid> = None;
+            let mut target_go_name = String::new();
+            if let Some(fid) = r.target_file_id.filter(|id| *id != 0) {
+                if let Some(doc) = doc_map.get(&fid) {
+                    target_script_guid = doc.m_script_guid;
+                    if let Some(name) = doc
+                        .m_game_object_id
+                        .and_then(|go_id| go_names.get(&go_id))
+                    {
+                        target_go_name = name.to_string();
+                    }
+                }
+            }
+
+            MemberBinding {
+                binding_kind: r.binding_kind,
+                method_name: r.method_name,
+                target_type_full,
+                target_type_short_lower,
+                target_file_id: r.target_file_id,
+                target_script_guid,
+                target_go_name,
+                line: r.line,
             }
         })
         .collect()

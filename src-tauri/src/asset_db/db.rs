@@ -19,7 +19,12 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// `asset_objects`; the FTS table stores just the trigram index keyed by the
 /// shared rowid, full-scan wipes use the O(1) `'delete-all'` command, and
 /// the readable `object_key` column is gone — old DBs must be rebuilt.
-pub const ASSET_DB_VERSION: u32 = 11;
+///
+/// v12: new `member_bindings` table indexing serialized UnityEvent persistent
+/// calls (`m_MethodName` + `m_TargetAssemblyTypeName` + `m_Target` fileID) and
+/// AnimationEvent `functionName`s, so `unity_code_usages` member mode resolves
+/// them with one indexed query instead of three per-query filesystem scans.
+pub const ASSET_DB_VERSION: u32 = 12;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -213,6 +218,18 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             tokenize = 'trigram',
             content = '',
             contentless_delete = 1
+        );
+
+        CREATE TABLE IF NOT EXISTS member_bindings (
+            src_guid BLOB NOT NULL,
+            binding_kind INTEGER NOT NULL,
+            method_name TEXT NOT NULL,
+            target_type_full TEXT NOT NULL,
+            target_type_short_lower TEXT NOT NULL,
+            target_file_id INTEGER,
+            target_script_guid BLOB,
+            target_go_name TEXT NOT NULL,
+            line INTEGER NOT NULL
         );",
     )
     .map_err(|e| format!("Failed to create tables: {}", e))?;
@@ -320,6 +337,11 @@ const SECONDARY_INDEX_DDL: &[(&str, &str)] = &[
         "idx_script_inheritance_terms_guid",
         "CREATE INDEX IF NOT EXISTS idx_script_inheritance_terms_guid
             ON script_inheritance_terms(script_guid)",
+    ),
+    (
+        "idx_member_bindings_method",
+        "CREATE INDEX IF NOT EXISTS idx_member_bindings_method
+            ON member_bindings(method_name)",
     ),
 ];
 
@@ -491,6 +513,7 @@ pub fn clear_all_in_tx(tx: &Transaction) -> Result<(), String> {
          DELETE FROM assets;
          DELETE FROM files;
          DELETE FROM script_inheritance_terms;
+         DELETE FROM member_bindings;
          DELETE FROM asset_scan_metrics;
          DELETE FROM linked_asset_roots;",
     )
@@ -1338,6 +1361,84 @@ pub fn batch_insert_edges(tx: &Transaction, edges: &[RefEdge]) -> Result<u64, St
     Ok(count)
 }
 
+/// Multi-row insert chunk for `member_bindings` (9 bind params per row).
+const MEMBER_BINDING_INSERT_CHUNK_ROWS: usize = 64;
+
+pub fn batch_insert_member_bindings(
+    tx: &Transaction,
+    bindings: &[MemberBindingRow],
+) -> Result<u64, String> {
+    let mut chunks = bindings.chunks_exact(MEMBER_BINDING_INSERT_CHUNK_ROWS);
+    if bindings.len() >= MEMBER_BINDING_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .take(MEMBER_BINDING_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO member_bindings
+             (src_guid, binding_kind, method_name, target_type_full,
+              target_type_short_lower, target_file_id, target_script_guid,
+              target_go_name, line)
+             VALUES {}",
+            row_values
+        );
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare member binding batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, b) in chunk.iter().enumerate() {
+                let base = i * 9;
+                stmt.raw_bind_parameter(base + 1, b.src_guid.as_slice())
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, b.binding_kind as i64))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 3, b.method_name.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 4, b.target_type_full.as_str()))
+                    .and_then(|_| {
+                        stmt.raw_bind_parameter(base + 5, b.target_type_short_lower.as_str())
+                    })
+                    .and_then(|_| stmt.raw_bind_parameter(base + 6, b.target_file_id))
+                    .and_then(|_| {
+                        stmt.raw_bind_parameter(base + 7, b.target_script_guid.map(|g| g.to_vec()))
+                    })
+                    .and_then(|_| stmt.raw_bind_parameter(base + 8, b.target_go_name.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 9, b.line as i64))
+                    .map_err(|e| format!("Failed to bind member binding batch insert: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert member binding batch: {}", e))?;
+        }
+    }
+
+    let mut count = (bindings.len() - chunks.remainder().len()) as u64;
+    if !chunks.remainder().is_empty() {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO member_bindings
+                 (src_guid, binding_kind, method_name, target_type_full,
+                  target_type_short_lower, target_file_id, target_script_guid,
+                  target_go_name, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .map_err(|e| format!("Failed to prepare member binding insert: {}", e))?;
+        for b in chunks.remainder() {
+            let rows = stmt
+                .execute(params![
+                    b.src_guid.as_slice(),
+                    b.binding_kind as i64,
+                    b.method_name,
+                    b.target_type_full,
+                    b.target_type_short_lower,
+                    b.target_file_id,
+                    b.target_script_guid.map(|g| g.to_vec()),
+                    b.target_go_name,
+                    b.line as i64,
+                ])
+                .map_err(|e| format!("Failed to insert member binding: {}", e))?;
+            count += rows as u64;
+        }
+    }
+    Ok(count)
+}
+
 pub fn get_direct_deps(conn: &Connection, guid: &Guid) -> Result<Vec<RefEdge>, String> {
     let mut stmt = conn
         .prepare_cached(
@@ -1558,6 +1659,75 @@ pub fn resolve_path_and_kind_by_guid(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(format!("Failed to resolve path and kind: {}", e)),
     }
+}
+
+/// One matched `member_bindings` row joined to its host asset path. Produced by
+/// [`get_member_bindings`] for `unity_code_usages` member mode.
+#[derive(Debug, Clone)]
+pub struct MemberBindingHit {
+    pub path: String,
+    pub line: u32,
+    /// 0 = UnityEvent persistent call, 1 = AnimationEvent.
+    pub binding_kind: u8,
+    pub target_type_full: String,
+    /// `m_Target` fileID; `Some(0)` / `None` => broken/unbound.
+    pub target_file_id: Option<i64>,
+    /// True when the bound target's `m_Script` GUID equals the queried script.
+    pub target_is_ours: bool,
+    pub target_go_name: String,
+}
+
+/// Resolve serialized member bindings of `member` for one script. A binding
+/// matches when its method/function name equals `member` AND it is either an
+/// AnimationEvent (receiver resolved at runtime, class-agnostic), a UnityEvent
+/// call bound to this exact script GUID, or a UnityEvent call naming this
+/// class by `m_TargetAssemblyTypeName` short name. The short-name OR preserves
+/// the precision of the old project-wide sweep; the GUID match is exact for
+/// bound calls.
+pub fn get_member_bindings(
+    conn: &Connection,
+    member: &str,
+    class_short_lower: &str,
+    script_guid: &Guid,
+) -> Result<Vec<MemberBindingHit>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT a.path, b.line, b.binding_kind, b.target_type_full, b.target_file_id,
+                    (b.target_script_guid = ?3) AS is_ours, b.target_go_name
+             FROM member_bindings b
+             JOIN assets a ON a.guid = b.src_guid
+             WHERE b.method_name = ?1
+               AND (
+                   b.binding_kind = 1
+                   OR b.target_script_guid = ?3
+                   OR b.target_type_short_lower = ?2
+               )
+             ORDER BY a.path, b.line",
+        )
+        .map_err(|e| format!("Failed to prepare member binding query: {}", e))?;
+
+    let rows = stmt
+        .query_map(
+            params![member, class_short_lower, script_guid.as_slice()],
+            |row| {
+                Ok(MemberBindingHit {
+                    path: row.get(0)?,
+                    line: row.get::<_, i64>(1)? as u32,
+                    binding_kind: row.get::<_, i64>(2)? as u8,
+                    target_type_full: row.get(3)?,
+                    target_file_id: row.get(4)?,
+                    target_is_ours: row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+                    target_go_name: row.get(6)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Failed to query member bindings: {}", e))?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        hits.push(row.map_err(|e| format!("Failed to read member binding: {}", e))?);
+    }
+    Ok(hits)
 }
 
 pub fn walk_deps(conn: &Connection, root: &Guid, max_depth: u32) -> Result<Vec<Guid>, String> {
@@ -2906,6 +3076,8 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
         asset_fts::delete_by_asset_guid(&tx, g)?;
         tx.execute("DELETE FROM edges WHERE src_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete outgoing edges: {}", e))?;
+        tx.execute("DELETE FROM member_bindings WHERE src_guid = ?1", params![g])
+            .map_err(|e| format!("Failed to delete member bindings: {}", e))?;
         tx.execute(
             "DELETE FROM asset_object_type_terms
              WHERE object_key IN (
@@ -2937,6 +3109,7 @@ pub fn atomic_update_asset(
     asset: &AssetNode,
     objects: &[AssetObject],
     new_edges: &[RefEdge],
+    new_member_bindings: &[MemberBindingRow],
     file_records: &[(String, FileRole, u64, u64, [u8; 16])],
 ) -> Result<(), String> {
     let tx = conn
@@ -2950,6 +3123,11 @@ pub fn atomic_update_asset(
         params![asset.guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete old edges: {}", e))?;
+    tx.execute(
+        "DELETE FROM member_bindings WHERE src_guid = ?1",
+        params![asset.guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete old member bindings: {}", e))?;
     asset_fts::delete_by_asset_guid(&tx, asset.guid.as_slice())?;
     tx.execute(
         "DELETE FROM asset_object_type_terms
@@ -3030,6 +3208,33 @@ pub fn atomic_update_asset(
                 edge.ref_path,
             ])
             .map_err(|e| format!("Failed to insert edge: {}", e))?;
+        }
+    }
+
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO member_bindings
+                 (src_guid, binding_kind, method_name, target_type_full,
+                  target_type_short_lower, target_file_id, target_script_guid,
+                  target_go_name, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .map_err(|e| format!("Failed to prepare member binding insert: {}", e))?;
+
+        for b in new_member_bindings {
+            stmt.execute(params![
+                b.src_guid.as_slice(),
+                b.binding_kind as i64,
+                b.method_name,
+                b.target_type_full,
+                b.target_type_short_lower,
+                b.target_file_id,
+                b.target_script_guid.map(|g| g.to_vec()),
+                b.target_go_name,
+                b.line as i64,
+            ])
+            .map_err(|e| format!("Failed to insert member binding: {}", e))?;
         }
     }
 
@@ -3717,6 +3922,7 @@ mod tests {
             &fresh,
             &[],
             &[],
+            &[],
             &[(
                 meta_path.clone(),
                 FileRole::Meta,
@@ -3781,7 +3987,7 @@ mod tests {
             "eventchannel scriptableobject",
         );
 
-        atomic_update_asset(&mut conn, &asset, &[sub_a.clone(), sub_b], &[], &[]).unwrap();
+        atomic_update_asset(&mut conn, &asset, &[sub_a.clone(), sub_b], &[], &[], &[]).unwrap();
 
         let fts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {
@@ -3794,7 +4000,7 @@ mod tests {
         let mut renamed = sub_a;
         renamed.name = "Heal Event".to_string();
         renamed.name_lower = "heal event".to_string();
-        atomic_update_asset(&mut conn, &asset, &[renamed], &[], &[]).unwrap();
+        atomic_update_asset(&mut conn, &asset, &[renamed], &[], &[], &[]).unwrap();
 
         let fts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {

@@ -1000,6 +1000,7 @@ fn process_dirty_asset(
     let kind;
     let mut content_hash = [0u8; 16];
     let mut edges: Vec<RefEdge> = Vec::new();
+    let mut member_bindings: Vec<MemberBindingRow> = Vec::new();
     let mut asset_mtime = meta_mtime;
     let mut asset_size = 0u64;
     let mut stored_script_meta: Option<db::StoredScriptMetadata> = None;
@@ -1009,10 +1010,11 @@ fn process_dirty_asset(
     if asset_is_file && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
-        // Single parse pass produces both the docs and the raw refs; the
-        // referenced guids are then resolved with one targeted DB batch
-        // instead of a third line scan over the file.
-        let (docs, raw_refs) = unity_yaml::parse_yaml_docs_with_refs(&content);
+        // Single parse pass produces the docs, the raw refs and the raw member
+        // bindings; the referenced guids are then resolved with one targeted DB
+        // batch instead of extra line scans over the file.
+        let (docs, raw_refs, raw_bindings) =
+            unity_yaml::parse_yaml_docs_with_refs_and_bindings(&content);
         let guid_to_path = {
             let mut ref_guids: Vec<Guid> = raw_refs.iter().map(|r| r.dst_guid).collect();
             ref_guids.sort_unstable();
@@ -1060,6 +1062,21 @@ fn process_dirty_asset(
                 class_id_hint: r.class_id_hint,
                 field_hint: r.field_hint,
                 ref_path: r.ref_path,
+            })
+            .collect();
+
+        member_bindings = unity_yaml::build_bindings_from_docs(&docs, raw_bindings)
+            .into_iter()
+            .map(|b| MemberBindingRow {
+                src_guid: guid,
+                binding_kind: b.binding_kind,
+                method_name: b.method_name,
+                target_type_full: b.target_type_full,
+                target_type_short_lower: b.target_type_short_lower,
+                target_file_id: b.target_file_id,
+                target_script_guid: b.target_script_guid,
+                target_go_name: b.target_go_name,
+                line: b.line,
             })
             .collect();
 
@@ -1243,6 +1260,7 @@ fn process_dirty_asset(
             &node,
             &asset_objects,
             &edges,
+            &member_bindings,
             &file_records,
         )?;
         if ext == "cs" {
@@ -2816,6 +2834,7 @@ mod tests {
             &node,
             &[],
             &[],
+            &[],
             &[(
                 format!("{}.meta", asset_path),
                 FileRole::Meta,
@@ -2877,6 +2896,7 @@ mod tests {
         db::atomic_update_asset(
             &mut graph.conn,
             &stale_node,
+            &[],
             &[],
             &[],
             &[(
@@ -3125,6 +3145,7 @@ mod tests {
         db::atomic_update_asset(
             &mut graph.conn,
             &node,
+            &[],
             &[],
             &[],
             &[

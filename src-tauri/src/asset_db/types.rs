@@ -260,6 +260,31 @@ pub struct ExtractedRef {
     pub ref_path: Option<String>,
 }
 
+/// One `member_bindings` row: a resolved serialized UnityEvent persistent call
+/// or AnimationEvent function name, stamped with the GUID of the asset that
+/// contains it. The non-`src_guid` fields mirror
+/// `crate::unity_yaml::MemberBinding`.
+#[derive(Debug, Clone)]
+pub struct MemberBindingRow {
+    pub src_guid: Guid,
+    /// 0 = UnityEvent persistent call, 1 = AnimationEvent.
+    pub binding_kind: u8,
+    pub method_name: String,
+    /// Namespace + class from `m_TargetAssemblyTypeName` (assembly suffix
+    /// stripped); empty when there is no type name (anim / none).
+    pub target_type_full: String,
+    /// Last `.`-segment of `target_type_full`, lowercased; empty if none.
+    pub target_type_short_lower: String,
+    /// `m_Target` fileID; `Some(0)` / `None` => broken/unbound.
+    pub target_file_id: Option<i64>,
+    /// Resolved `m_Script` GUID of the target component, when determinable.
+    pub target_script_guid: Option<Guid>,
+    /// Resolved GameObject name for annotation; empty if unknown.
+    pub target_go_name: String,
+    /// 1-based source line of the method-name / functionName field.
+    pub line: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrefabSourceRef {
     pub guid: Guid,

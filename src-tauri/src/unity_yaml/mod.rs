@@ -21,6 +21,8 @@ mod parser;
 mod prefab;
 mod references;
 #[cfg(test)]
+mod binding_tests;
+#[cfg(test)]
 mod tests;
 mod tokenizer;
 
@@ -28,13 +30,16 @@ pub use parser::{
     build_go_tree, build_hierarchy_path_map, build_internal_id_map, build_world_transform_map,
     collect_guids_from_lines, collect_guids_from_ranges, find_go_by_path, format_doc_state_lines,
     format_hierarchy_tree, get_components_for_go, is_hierarchical_file, parse_yaml_docs,
-    parse_yaml_docs_with_refs, resolve_references_in_lines,
+    parse_yaml_docs_with_refs, parse_yaml_docs_with_refs_and_bindings, resolve_references_in_lines,
     resolve_references_in_lines_skipping_fields, HierarchyNode, TransformWorldInfo, YamlDoc,
 };
 
 pub use prefab::{extract_prefab_instance_irs, extract_stripped_mappings};
 
-pub use references::{build_refs_from_docs, extract_refs, extract_refs_with_resolver, RawYamlRef};
+pub use references::{
+    build_bindings_from_docs, build_refs_from_docs, extract_refs, extract_refs_with_resolver,
+    MemberBinding, RawMemberBinding, RawYamlRef,
+};
 
 pub use aggregation::{
     format_hierarchy_search_results, format_hierarchy_summary,
