@@ -100,6 +100,36 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.effortSupported).toBe(true);
   });
 
+  it("includes current Anthropic models with context windows", () => {
+    const authStore = useAuthStore();
+    authStore.isAuthenticated = true;
+    const modelStore = useModelStore();
+
+    expect(modelStore.availableModels[0]?.id).toBe("claude-opus-4.8");
+    expect(modelStore.availableModels.some((model) => model.id.includes("fable"))).toBe(false);
+    expect(modelStore.availableModels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "claude-opus-4.8",
+          name: "Claude Opus 4.8[1m]",
+          contextWindow: 1_000_000,
+        }),
+        expect.objectContaining({
+          id: "claude-haiku-4.5",
+          name: "Claude Haiku 4.5",
+          contextWindow: 200_000,
+        }),
+      ]),
+    );
+  });
+
+  it("uses Claude model effort metadata from the catalog", () => {
+    const modelStore = useModelStore();
+
+    modelStore.selectedModelId = "claude-opus-4.8";
+    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+  });
+
   it("keeps codex mini limited to medium and high on OpenAI Responses endpoints", () => {
     const modelStore = useModelStore();
 
@@ -188,12 +218,14 @@ describe("useModelStore OpenAI effort mapping", () => {
     const modelStore = useModelStore();
 
     await modelStore.loadLastEffort();
-    modelStore.selectEffort("high");
+    // Select a non-default effort so the change actually triggers persistence
+    // (the global default is now "high", so selecting "high" would be a no-op).
+    modelStore.selectEffort("low");
     await nextTick();
 
-    expect(modelStore.defaultEffort).toBe("high");
+    expect(modelStore.defaultEffort).toBe("low");
     expect(modelStore.hasUserDefaultEffort).toBe(true);
-    expect(modelServiceMocks.saveLastEffort).toHaveBeenCalledWith("high");
+    expect(modelServiceMocks.saveLastEffort).toHaveBeenCalledWith("low");
   });
 
   it("does not persist context effort changes from session or agent selection", async () => {

@@ -20,8 +20,12 @@ pub(super) fn session_unity_state() -> &'static SessionUnityStateStore {
 pub fn resolve_openrouter_model(model: &str) -> String {
     let short = model.strip_prefix("openrouter/").unwrap_or(model);
     match short {
+        "claude-fable-5" => "anthropic/claude-fable-5".to_string(),
+        "claude-opus-4.8" => "anthropic/claude-opus-4.8".to_string(),
+        "claude-opus-4.7" => "anthropic/claude-opus-4.7".to_string(),
         "claude-sonnet-4.6" => "anthropic/claude-sonnet-4.6".to_string(),
         "claude-opus-4.6" => "anthropic/claude-opus-4.6".to_string(),
+        "claude-haiku-4.5" => "anthropic/claude-haiku-4.5".to_string(),
         "glm-5" => "z-ai/glm-5".to_string(),
         "minimax-m2.5" => "minimax/minimax-m2.5".to_string(),
         other => other.to_string(),
@@ -44,11 +48,14 @@ fn matches_versioned_model(model: &str, base: &str) -> bool {
 const OPENAI_CODEX_CONTEXT_LIMIT: u32 = 258_400;
 
 pub(super) fn model_context_limit(model: &str) -> u32 {
-    let m = model.strip_prefix("openrouter/").unwrap_or(model);
+    let raw = model.trim().to_ascii_lowercase();
+    let is_claude_code = raw.starts_with("claude_code/");
+    let m = raw.strip_prefix("openrouter/").unwrap_or(&raw);
     let m = m.strip_prefix("claude_code/").unwrap_or(m);
     let m = m.strip_prefix("anthropic/").unwrap_or(m);
     let m = m.strip_prefix("openai/").unwrap_or(m);
-    let m = m.to_ascii_lowercase();
+    let has_1m_suffix = m.ends_with("[1m]");
+    let m = m.strip_suffix("[1m]").unwrap_or(m);
     // Locus follows the effective context budget currently surfaced by Codex
     // for ChatGPT subscription models, not the larger public API model-page
     // limits. Codex-family variants (-spark, -mini, dated snapshots) share the
@@ -62,7 +69,20 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
         OPENAI_CODEX_CONTEXT_LIMIT
     } else if m.contains("gpt-5") {
         400_000
-    } else if m.contains("claude-sonnet-4.6") || m.contains("claude-opus-4.6") {
+    } else if has_1m_suffix
+        || m.contains("claude-fable-5")
+        || m.contains("claude-mythos-5")
+        || m.contains("claude-mythos-preview")
+        || (!is_claude_code
+            && (m.contains("claude-opus-4.8")
+                || m.contains("claude-opus-4-8")
+                || m.contains("claude-opus-4.7")
+                || m.contains("claude-opus-4-7")
+                || m.contains("claude-opus-4.6")
+                || m.contains("claude-opus-4-6")
+                || m.contains("claude-sonnet-4.6")
+                || m.contains("claude-sonnet-4-6")))
+    {
         1_000_000
     } else if m.contains("claude-opus-4-1") || m.contains("claude-opus-4-20250514") {
         200_000
@@ -140,6 +160,13 @@ mod tests {
             model_context_limit("openrouter/claude-sonnet-4.6"),
             1_000_000
         );
+        assert_eq!(model_context_limit("anthropic/claude-opus-4-8"), 1_000_000);
+        assert_eq!(model_context_limit("openrouter/claude-haiku-4.5"), 200_000);
+        assert_eq!(
+            model_context_limit("claude_code/claude-opus-4.6[1m]"),
+            1_000_000
+        );
+        assert_eq!(model_context_limit("claude_code/claude-opus-4.6"), 200_000);
         assert_eq!(model_context_limit("minimax-m2.5"), 196_608);
         assert_eq!(model_context_limit("unknown-model"), 128_000);
     }

@@ -339,7 +339,7 @@ impl AppConfig {
         println!("[Locus] config not found in any path, creating defaults");
 
         let model = std::env::var("LOCUS_MODEL")
-            .unwrap_or_else(|_| "openrouter/claude-sonnet-4.6".to_string());
+            .unwrap_or_else(|_| "openrouter/claude-opus-4.8".to_string());
 
         let base_url = std::env::var("LOCUS_BASE_URL").ok();
 

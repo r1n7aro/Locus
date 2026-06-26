@@ -13,15 +13,144 @@ import type {
 } from "../types";
 import { filterVisibleModels } from "../config/providerVisibility";
 
+const CLAUDE_CONTEXT_1M = 1_000_000;
+const CLAUDE_CONTEXT_200K = 200_000;
+const CLAUDE_STANDARD_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "max"];
+const CLAUDE_XHIGH_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
+
 const builtinModels: ModelOption[] = [
-  { id: "openrouter/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "openrouter" },
-  { id: "openrouter/claude-opus-4.6", name: "Claude Opus 4.6", provider: "openrouter" },
+  {
+    id: "openrouter/claude-opus-4.8",
+    name: "Claude Opus 4.8[1m]",
+    provider: "openrouter",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "openrouter/claude-sonnet-4.6",
+    name: "Claude Sonnet 4.6[1m]",
+    provider: "openrouter",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "openrouter/claude-haiku-4.5",
+    name: "Claude Haiku 4.5",
+    provider: "openrouter",
+    contextWindow: CLAUDE_CONTEXT_200K,
+  },
+  {
+    id: "openrouter/claude-opus-4.7",
+    name: "Claude Opus 4.7[1m]",
+    provider: "openrouter",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "openrouter/claude-opus-4.6",
+    name: "Claude Opus 4.6[1m]",
+    provider: "openrouter",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
   { id: "openrouter/glm-5", name: "GLM 5", provider: "openrouter" },
   { id: "openrouter/minimax-m2.5", name: "MiniMax M2.5", provider: "openrouter" },
-  { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic" },
-  { id: "claude-opus-4.6", name: "Claude Opus 4.6", provider: "anthropic" },
-  { id: "claude_code/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "claude_code" },
-  { id: "claude_code/claude-opus-4.6", name: "Claude Opus 4.6", provider: "claude_code" },
+  {
+    id: "claude-opus-4.8",
+    name: "Claude Opus 4.8[1m]",
+    provider: "anthropic",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude-sonnet-4.6",
+    name: "Claude Sonnet 4.6[1m]",
+    provider: "anthropic",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "claude-haiku-4.5",
+    name: "Claude Haiku 4.5",
+    provider: "anthropic",
+    contextWindow: CLAUDE_CONTEXT_200K,
+  },
+  {
+    id: "claude-opus-4.7",
+    name: "Claude Opus 4.7[1m]",
+    provider: "anthropic",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude-opus-4.6",
+    name: "Claude Opus 4.6[1m]",
+    provider: "anthropic",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-opus-4.8[1m]",
+    name: "Claude Opus 4.8[1m]",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-opus-4.8",
+    name: "Claude Opus 4.8",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_200K,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-sonnet-4.6[1m]",
+    name: "Claude Sonnet 4.6[1m]",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-sonnet-4.6",
+    name: "Claude Sonnet 4.6",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_200K,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-haiku-4.5",
+    name: "Claude Haiku 4.5",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_200K,
+  },
+  {
+    id: "claude_code/claude-opus-4.7[1m]",
+    name: "Claude Opus 4.7[1m]",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-opus-4.7",
+    name: "Claude Opus 4.7",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_200K,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-opus-4.6[1m]",
+    name: "Claude Opus 4.6[1m]",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-opus-4.6",
+    name: "Claude Opus 4.6",
+    provider: "claude_code",
+    contextWindow: CLAUDE_CONTEXT_200K,
+    supportedEfforts: CLAUDE_STANDARD_EFFORTS,
+  },
 ];
 
 const codexFallbackModels: ModelOption[] = [
@@ -151,8 +280,8 @@ export const useModelStore = defineStore("model", () => {
   const codexTransport = ref<CodexTransportMode>("websocket");
   const selectedModelId = ref("");
   const lastModelId = ref("");
-  const effort = ref<EffortLevel>("medium");
-  const defaultEffort = ref<EffortLevel>("medium");
+  const effort = ref<EffortLevel>("high");
+  const defaultEffort = ref<EffortLevel>("high");
   const hasUserDefaultEffort = ref(false);
   const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
   let effortPersistenceReady = false;
@@ -217,11 +346,11 @@ export const useModelStore = defineStore("model", () => {
       if (!endpoint || endpoint.reasoningParamFormat === "none") return [];
       return normalizeCustomReasoningEfforts(endpoint.supportedReasoningEfforts);
     }
+    const catalogEfforts = selectedModelOption.value?.supportedEfforts ?? [];
+    if (catalogEfforts.length > 0) return catalogEfforts;
     if (m.includes("claude")) return ["none", "low", "medium", "high"];
     const openAiModel = selectedOpenAiReasoningModel.value;
     if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return [];
-    const catalogEfforts = selectedModelOption.value?.supportedEfforts ?? [];
-    if (catalogEfforts.length > 0) return catalogEfforts;
     return openAiReasoningLevels(openAiModel);
   });
 

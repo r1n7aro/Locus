@@ -493,6 +493,7 @@ export interface ModelOption {
     | "claude_code"
     | "openai_codex"
     | "custom";
+  contextWindow?: number;
   defaultEffort?: EffortLevel | null;
   supportedEfforts?: EffortLevel[];
   additionalSpeedTiers?: string[];

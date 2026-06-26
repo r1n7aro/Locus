@@ -41,6 +41,6 @@ describe("useModelStore reset behavior", () => {
     modelStore.resolveSelectedModel(true);
 
     expect(modelStore.lastModelId).toBe("");
-    expect(modelStore.selectedModelId).toBe("openrouter/claude-sonnet-4.6");
+    expect(modelStore.selectedModelId).toBe("openrouter/claude-opus-4.8");
   });
 });
