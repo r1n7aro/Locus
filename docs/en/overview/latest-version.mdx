@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.2 (2026-06-23)"
+description: "Locus v0.5.3 (2026-06-27)"
 sidebarTitle: "Latest Version"
-version: "0.5.2"
-releasedAt: "2026-06-23"
+version: "0.5.3"
+releasedAt: "2026-06-27"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,21 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.3 (Added)
+
+- **Tuanjie (Unity China fork) support**: Locus now discovers, launches, and connects to the Tuanjie editor (`Tuanjie.exe`) alongside standard Unity — covering process matching, the native engine module and its PDB, and window-title detection. Standard Unity installs are unaffected.
+- **Claude subscription support**: Sign in to a Claude subscription or import an existing Claude Code / Codex CLI login (including a custom endpoint), and see remaining subscription quota in the Anthropic panel.
+- **Gateway-truncation diagnostics**: Failed Anthropic requests now log transport facts and the upstream JSON parse offset, and when a 400 looks like a mid-transit truncation Locus saves the exact request bytes plus a runnable `curl` so the failure can be reproduced and reported. (#48)
+
+### v0.5.3 (Removed)
+
+- Removed the "Claude subscription paused" disclaimer modal and its notice; the subscription sign-in flow replaces it.
 
 ### v0.5.2 (Added)
 

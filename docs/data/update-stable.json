@@ -1,12 +1,12 @@
 {
-  "version": "0.5.2",
-  "releasedAt": "2026-06-23",
+  "version": "0.5.3",
+  "releasedAt": "2026-06-27",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,23 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.2 (2026-06-23)",
+      "summary": "Locus v0.5.3 (2026-06-27)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.3（新增）",
+          "items": [
+            "**团结引擎（Unity 中国版）支持**：Locus 现在能像识别标准 Unity 一样发现、启动并连接团结引擎编辑器（`Tuanjie.exe`），覆盖进程匹配、原生引擎模块及其 PDB、窗口标题识别。标准 Unity 安装不受影响。",
+            "**新增 Claude 订阅支持**：可登录 Claude 订阅账号，或导入已有的 Claude Code / Codex CLI 登录态（含自定义端点），并在 Anthropic 面板查看订阅剩余额度。",
+            "**网关截断诊断**：Anthropic 请求失败时会记录传输层信息与上游 JSON 解析偏移；当 400 错误疑似为传输中途截断时，Locus 会保存完整的请求字节和一条可直接运行的 `curl`，便于复现并反馈问题。(#48)"
+          ]
+        },
+        {
+          "title": "v0.5.3（移除）",
+          "items": [
+            "移除「Claude 订阅已暂停」的提示弹窗及其说明；订阅登录流程已将其取代。"
+          ]
+        },
         {
           "title": "v0.5.2（新增）",
           "items": [
@@ -83,11 +97,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -97,9 +111,23 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.2 (2026-06-23)",
+      "summary": "Locus v0.5.3 (2026-06-27)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.3 (Added)",
+          "items": [
+            "**Tuanjie (Unity China fork) support**: Locus now discovers, launches, and connects to the Tuanjie editor (`Tuanjie.exe`) alongside standard Unity — covering process matching, the native engine module and its PDB, and window-title detection. Standard Unity installs are unaffected.",
+            "**Claude subscription support**: Sign in to a Claude subscription or import an existing Claude Code / Codex CLI login (including a custom endpoint), and see remaining subscription quota in the Anthropic panel.",
+            "**Gateway-truncation diagnostics**: Failed Anthropic requests now log transport facts and the upstream JSON parse offset, and when a 400 looks like a mid-transit truncation Locus saves the exact request bytes plus a runnable `curl` so the failure can be reproduced and reported. (#48)"
+          ]
+        },
+        {
+          "title": "v0.5.3 (Removed)",
+          "items": [
+            "Removed the \"Claude subscription paused\" disclaimer modal and its notice; the subscription sign-in flow replaces it."
+          ]
+        },
         {
           "title": "v0.5.2 (Added)",
           "items": [
@@ -151,11 +179,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.2/locus_0.5.2_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
