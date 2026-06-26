@@ -2306,9 +2306,17 @@ mod imp {
         let symbol_dir = Path::new(&module_path)
             .parent()
             .ok_or("engine module has no parent dir")?;
-        let pdb = symbol_dir.join("unity_x64.pdb");
+        // Unity ships `unity_x64.pdb`; Tuanjie ships `Tuanjie_x64.pdb` next to its
+        // renamed engine module. Derive the name from the resolved module so Unity
+        // keeps resolving exactly `unity_x64.pdb`.
+        let pdb_name = Path::new(&module_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(crate::unity_bridge::flavor::engine_pdb_name_for_module)
+            .unwrap_or("unity_x64.pdb");
+        let pdb = symbol_dir.join(pdb_name);
         if !pdb.is_file() {
-            return Err(format!("unity_x64.pdb missing: {}", pdb.display()));
+            return Err(format!("{pdb_name} missing: {}", pdb.display()));
         }
 
         let _guard = dbghelp_lock().lock().map_err(|_| "dbghelp lock poisoned")?;

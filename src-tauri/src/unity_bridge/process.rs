@@ -523,7 +523,9 @@ fn probe_editor_instance_manifest(
     {
         Some(expected) if normalized_image != expected => return None,
         Some(_) => {}
-        None if !normalized_image.ends_with("\\unity.exe") => return None,
+        None if !crate::unity_bridge::flavor::path_ends_with_editor_exe(&normalized_image) => {
+            return None
+        }
         None => {}
     }
     if let (Some(created_ms), Some(modified_ms)) = (facts.created_at_unix_ms, manifest_modified_ms)
@@ -877,7 +879,8 @@ mod probe_native {
         (ticks / 10_000).checked_sub(FILETIME_UNIX_EPOCH_DIFF_MS)
     }
 
-    /// Lists process ids whose executable name is `Unity.exe`.
+    /// Lists process ids whose executable name is a known editor image
+    /// (`Unity.exe`, or Tuanjie's `Tuanjie.exe`).
     pub(super) fn unity_editor_process_ids() -> Result<Vec<u32>, String> {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot as isize == -1 {
@@ -901,7 +904,9 @@ mod probe_native {
         }
 
         loop {
-            if wide_to_string(&entry.sz_exe_file).eq_ignore_ascii_case("unity.exe") {
+            if crate::unity_bridge::flavor::is_editor_process_image(&wide_to_string(
+                &entry.sz_exe_file,
+            )) {
                 process_ids.push(entry.th32_process_id);
             }
             if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {

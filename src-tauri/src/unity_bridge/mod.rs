@@ -1,5 +1,6 @@
 mod background_hook;
 mod capture;
+mod flavor;
 mod focus;
 mod native_selftest;
 mod plugin;
@@ -21,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
+
+use flavor::EditorFlavor;
 
 pub use background_hook::{UnityBackgroundHookState, UnityBackgroundHookStatus};
 pub use capture::{capture_viewport, UnityViewportCapture};
@@ -949,8 +952,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn push_editor_install_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) {
     #[cfg(target_os = "windows")]
     {
-        push_unique_path(paths, root.join("Editor").join("Unity.exe"));
-        push_unique_path(paths, root.join("Unity.exe"));
+        // Unity first (byte-for-byte unchanged), then Tuanjie's renamed
+        // executable in the identical layout. A given install root only ever
+        // contains one flavor's exe, so the other flavor's candidate is silently
+        // skipped by the `is_file()` check in `resolve_unity_editor_executable`.
+        for flavor in EditorFlavor::ALL {
+            push_unique_path(paths, root.join("Editor").join(flavor.editor_exe_file_name()));
+            push_unique_path(paths, root.join(flavor.editor_exe_file_name()));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1147,6 +1156,106 @@ fn push_unity_hub_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
     }
 }
 
+/// Install roots managed by Tuanjie Hub, read from its `secondaryInstallPath.json`
+/// (a JSON string such as `"F:\\tuanjie"`). Empty when the Hub is not installed.
+/// Tuanjie Hub stores config under `%APPDATA%\TuanjieHub`, parallel to Unity Hub's
+/// `%APPDATA%\UnityHub`, and does NOT use an `editors-v2.json` cache.
+#[cfg(target_os = "windows")]
+fn tuanjie_hub_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(config_dir) = dirs::config_dir() else {
+        return roots;
+    };
+    let path = config_dir
+        .join("TuanjieHub")
+        .join("secondaryInstallPath.json");
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(root) = serde_json::from_str::<String>(content.trim()) {
+            let trimmed = root.trim();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    roots
+}
+
+/// Read the editor executable from the "Tuanjie <version>" Windows uninstall
+/// entry's `DisplayIcon` (e.g. `F:\tuanjie\2022.3.62t10\Editor\Tuanjie.exe`).
+/// Tuanjie does not register under `Unity Technologies\Installer`, so this is the
+/// registry-side discovery path for the fork.
+#[cfg(target_os = "windows")]
+fn push_tuanjie_registry_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let target_display_name = format!("Tuanjie {version}");
+    let uninstall_paths = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+    let hives = [
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+        RegKey::predef(HKEY_CURRENT_USER),
+    ];
+
+    for hive in hives {
+        for uninstall_path in uninstall_paths {
+            let Ok(uninstall) = hive.open_subkey(uninstall_path) else {
+                continue;
+            };
+            for entry_name in uninstall.enum_keys().flatten() {
+                let Ok(entry) = uninstall.open_subkey(&entry_name) else {
+                    continue;
+                };
+                let display_name = entry
+                    .get_value::<String, _>("DisplayName")
+                    .unwrap_or_default();
+                if display_name.trim() != target_display_name {
+                    continue;
+                }
+                let Ok(display_icon) = entry.get_value::<String, _>("DisplayIcon") else {
+                    continue;
+                };
+                // DisplayIcon may be quoted and/or carry a trailing ",<index>".
+                let icon = display_icon.trim().trim_matches('"');
+                let exe = icon.split(',').next().unwrap_or(icon).trim();
+                if !exe.is_empty() {
+                    push_unique_path(paths, PathBuf::from(exe));
+                }
+            }
+        }
+    }
+}
+
+/// Tuanjie (团结引擎, the Unity China fork) is invisible to every Unity-specific
+/// discovery source: it is not under `Unity Technologies\Installer`, not in
+/// `%ProgramFiles%\Unity\Hub`, and not in Unity Hub's `editors-v2.json`. Add the
+/// fork's own locations here. Called AFTER all Unity sources so a standard Unity
+/// install always resolves first and is never affected.
+#[cfg(target_os = "windows")]
+fn push_tuanjie_editor_candidates(paths: &mut Vec<PathBuf>, version: &str) {
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        push_editor_install_root_candidates(
+            paths,
+            PathBuf::from(program_files)
+                .join("Tuanjie")
+                .join("Hub")
+                .join("Editor")
+                .join(version),
+        );
+    }
+
+    for root in tuanjie_hub_install_roots() {
+        push_editor_install_root_candidates(paths, root.join(version));
+    }
+
+    push_tuanjie_registry_editor_candidates(paths, version);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn push_tuanjie_editor_candidates(_paths: &mut Vec<PathBuf>, _version: &str) {}
+
 pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String> {
     let version = version.trim();
     if version.is_empty() {
@@ -1158,6 +1267,8 @@ pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String>
     push_windows_registry_editor_candidates(&mut candidates, version);
     push_default_editor_candidates(&mut candidates, version);
     push_unity_hub_editor_candidates(&mut candidates, version);
+    // Tuanjie fork sources, after every Unity source so Unity always wins.
+    push_tuanjie_editor_candidates(&mut candidates, version);
 
     for candidate in &candidates {
         if candidate.is_file() {
@@ -1170,9 +1281,14 @@ pub fn resolve_unity_editor_executable(version: &str) -> Result<PathBuf, String>
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join("; ");
+    let editor_label = if flavor::is_tuanjie_version(version) {
+        "Tuanjie Editor"
+    } else {
+        "Unity Editor"
+    };
     Err(format!(
-        "Unity Editor {} was not found. Checked: {}",
-        version, checked
+        "{} {} was not found. Checked: {}",
+        editor_label, version, checked
     ))
 }
 

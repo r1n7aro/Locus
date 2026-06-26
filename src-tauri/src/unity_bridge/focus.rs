@@ -79,7 +79,7 @@ pub fn bring_unity_to_foreground() -> Option<isize> {
                 let len = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
                 if len > 0 {
                     let title_str = String::from_utf16_lossy(&title[..len as usize]);
-                    if title_str.contains("Unity") && title_str.contains("Editor") {
+                    if crate::unity_bridge::flavor::is_editor_window_title(&title_str) {
                         activate_hwnd(hwnd);
                         return 0;
                     }

@@ -491,7 +491,9 @@ mod windows_impl {
                 module.path
             )
         })?;
-        let pdb_path = symbol_dir.join("unity_x64.pdb");
+        let pdb_path = symbol_dir.join(crate::unity_bridge::flavor::engine_pdb_name_for_module(
+            &module.name,
+        ));
         if !pdb_path.is_file() {
             return Err(format!("Unity PDB is missing: {}", pdb_path.display()));
         }
@@ -581,10 +583,14 @@ mod windows_impl {
         let mut exe_module = None;
         while has_entry {
             let name = wide_to_string(&entry.szModule);
-            if name.eq_ignore_ascii_case("Unity.dll") {
+            // DLL form first (preferred), then the EXE that statically links the
+            // engine. Unity matches exactly as before; Tuanjie's renamed module
+            // is also accepted. A live editor only ever loads one flavor, so this
+            // never changes which module is picked for a standard Unity editor.
+            if crate::unity_bridge::flavor::is_engine_module_dll(&name) {
                 return Ok(module_info_from_entry(name, &entry));
             }
-            if name.eq_ignore_ascii_case("Unity.exe") {
+            if crate::unity_bridge::flavor::is_engine_module_exe(&name) {
                 exe_module = Some(module_info_from_entry(name, &entry));
             }
             has_entry = unsafe { Module32NextW(snapshot.raw(), &mut entry) != 0 };
