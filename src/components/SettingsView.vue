@@ -26,7 +26,6 @@ import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
-import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
 
@@ -50,9 +49,9 @@ const {
   claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
-  oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
-  codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
-  showDisclaimer, requestOAuthLogin, requestCodexLogin, cancelDisclaimer,
+  oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
+  codexStep, codexStatus, codexQuota, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits,
+  requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
   fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
@@ -252,6 +251,7 @@ watch(
           :is-loading="isLoading"
           :oauth-step="oauthStep"
           :oauth-code="oauthCode"
+          :anthropic-quota="anthropicQuota"
           :codex-step="codexStep"
           :codex-status="codexStatus"
           :codex-quota="codexQuota"
@@ -273,12 +273,15 @@ watch(
           @save-key="saveKey"
           @delete-key="deleteKey"
           @handle-keydown="handleKeydown"
-          @start-o-auth-login="requestOAuthLogin"
+          @start-o-auth-login="startOAuthLogin"
           @submit-o-auth-code="submitOAuthCode"
           @cancel-o-auth="cancelOAuth"
           @oauth-logout="oauthLogout"
+          @import-claude-code-o-auth="importClaudeCodeOAuth"
           @handle-o-auth-keydown="handleOAuthKeydown"
+          @refresh-anthropic-quota="loadAnthropicRateLimits"
           @start-codex-login="requestCodexLogin"
+          @import-codex-cli="importCodexCli"
           @cancel-codex-login="cancelCodexLogin"
           @codex-logout="codexLogout"
           @retry-codex-validation="retryCodexValidation"
@@ -391,10 +394,6 @@ watch(
       @test="testEndpoint"
     />
 
-    <SubscriptionDisclaimerModal
-      :open="showDisclaimer"
-      @cancel="cancelDisclaimer"
-    />
   </div>
 </template>
 

@@ -10,6 +10,7 @@ const modelServiceMocks = vi.hoisted(() => ({
   getAuthUrl: vi.fn(),
   exchangeAuthCode: vi.fn(),
   authLogout: vi.fn(),
+  importClaudeCodeOAuth: vi.fn(),
   codexStatus: vi.fn(),
   codexRateLimits: vi.fn(),
   codexStartLogin: vi.fn(),
@@ -41,6 +42,7 @@ vi.mock("../services/auth", () => ({
   getAuthUrl: modelServiceMocks.getAuthUrl,
   exchangeAuthCode: modelServiceMocks.exchangeAuthCode,
   authLogout: modelServiceMocks.authLogout,
+  importClaudeCodeOAuth: modelServiceMocks.importClaudeCodeOAuth,
   codexStatus: modelServiceMocks.codexStatus,
   codexRateLimits: modelServiceMocks.codexRateLimits,
   codexStartLogin: modelServiceMocks.codexStartLogin,
@@ -155,6 +157,48 @@ describe("custom endpoint persistence", () => {
     state.startAddEndpoint();
 
     expect(state.editingEndpoint.value?.contextLength).toBe(256000);
+  });
+
+  it("imports Claude Code custom endpoint into custom endpoints", async () => {
+    const emitted: unknown[][] = [];
+    const state = useSettingsState(((...args: unknown[]) => {
+      emitted.push(args);
+    }) as never);
+    const imported = endpoint({
+      id: "claude-code-import",
+      name: "Claude Code",
+      apiModel: "claude-opus-4-8",
+      endpoint: "https://proxy.example/v1",
+      apiFormat: "anthropic_messages",
+      apiKey: "sk-cc",
+      contextLength: 1_000_000,
+      reasoningParamFormat: "anthropic_thinking",
+      replayReasoningContent: false,
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+    });
+    modelServiceMocks.importClaudeCodeOAuth.mockResolvedValueOnce({
+      kind: "custom_endpoint",
+      source: "Claude Code settings.json",
+      hasRefreshToken: false,
+      customEndpoint: imported,
+    });
+    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([imported]);
+
+    await state.importClaudeCodeOAuth();
+
+    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: "claude-code-import",
+        name: "Claude Code",
+        apiModel: "claude-opus-4-8",
+        endpoint: "https://proxy.example/v1",
+        apiFormat: "anthropic_messages",
+        apiKey: "sk-cc",
+      }),
+    ]);
+    expect(modelServiceMocks.getProviders).not.toHaveBeenCalled();
+    expect(state.customEndpoints.value).toEqual([imported]);
+    expect(emitted).toContainEqual(["customEndpointsChanged", [imported]]);
   });
 
   it("starts new OpenAI Chat endpoints with reasoning content replay enabled", () => {

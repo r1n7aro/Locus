@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod anthropic_usage;
 pub mod chat_completions;
 pub mod claude_code_cli;
 pub mod codex;

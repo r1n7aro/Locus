@@ -152,6 +152,95 @@ fn extract_account_id(access_token: &str, id_token: Option<&str>) -> Option<Stri
     extract_account_id_from_jwt(access_token)
 }
 
+/// Decode the base64url-encoded payload of a `header.payload.signature` JWT and
+/// return the `exp` claim (seconds since epoch) converted to milliseconds. The
+/// decode mirrors `extract_account_id_from_jwt`. Returns `None` when the token
+/// is malformed or has no numeric `exp`.
+fn extract_jwt_exp_millis(token: &str) -> Option<i64> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let padding = (4 - parts[1].len() % 4) % 4;
+    let padded = format!("{}{}", parts[1], "=".repeat(padding));
+
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(&padded)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+
+    claims
+        .get("exp")
+        .and_then(serde_json::Value::as_i64)
+        .map(|exp_secs| exp_secs * 1000)
+}
+
+/// Tokens extracted from a Codex CLI `auth.json`. Returned by
+/// [`parse_codex_cli_auth`] so the field extraction can be unit-tested without
+/// touching the keychain. `api_key_only` flags the case where the file holds a
+/// non-empty `OPENAI_API_KEY` but no OAuth tokens (Codex CLI in API-key mode).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImportedCodexTokens {
+    access_token: String,
+    refresh_token: String,
+    id_token: Option<String>,
+    account_id: Option<String>,
+    api_key_only: bool,
+}
+
+fn json_str_field(obj: &serde_json::Value, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Pure extraction of the relevant fields from a parsed Codex CLI `auth.json`.
+/// Accepts the standard `{ "tokens": { ... } }` shape, falls back to tokens at
+/// the document root, and tolerates a non-null `OPENAI_API_KEY` (API-key mode).
+/// Returns `None` only when the JSON value is not an object.
+fn parse_codex_cli_auth(value: &serde_json::Value) -> Option<ImportedCodexTokens> {
+    if !value.is_object() {
+        return None;
+    }
+
+    // Prefer the nested `tokens` object; fall back to the document root so we
+    // tolerate format drift where the tokens live at the top level.
+    let tokens_obj = value.get("tokens").filter(|v| v.is_object());
+    let source = tokens_obj.unwrap_or(value);
+
+    let access_token = json_str_field(source, "access_token").unwrap_or_default();
+    let refresh_token = json_str_field(source, "refresh_token").unwrap_or_default();
+    let id_token = json_str_field(source, "id_token");
+    // The account id can live next to the tokens or, depending on CLI version,
+    // at the document root.
+    let account_id =
+        json_str_field(source, "account_id").or_else(|| json_str_field(value, "account_id"));
+
+    let api_key_only = access_token.is_empty()
+        && refresh_token.is_empty()
+        && json_str_field(value, "OPENAI_API_KEY").is_some();
+
+    Some(ImportedCodexTokens {
+        access_token,
+        refresh_token,
+        id_token,
+        account_id,
+        api_key_only,
+    })
+}
+
+/// Resolve the Codex CLI `auth.json` path: honor `CODEX_HOME` first, else
+/// `~/.codex`.
+fn codex_cli_auth_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("auth.json"))
+}
+
 fn extract_refresh_token_error_code(body: &str) -> Option<String> {
     if body.trim().is_empty() {
         return None;
@@ -293,6 +382,70 @@ impl CodexAuthState {
             return Err("Not authenticated".to_string());
         }
         self.refresh().await?;
+        Ok(self.status())
+    }
+
+    /// Import the ChatGPT-subscription OAuth tokens that the OpenAI Codex CLI
+    /// persists at `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) into
+    /// Locus's Codex auth state, so a user who already ran `codex login` can
+    /// reuse that session without the device-code flow.
+    ///
+    /// Codex CLI uses the same OAuth `CLIENT_ID` as Locus, so the imported
+    /// refresh token works against the existing [`Self::refresh`] path.
+    ///
+    /// Caveat: OpenAI refresh tokens can rotate. Once Locus refreshes the
+    /// imported token, the Codex CLI's own stored refresh token may be
+    /// invalidated — inherent to importing a shared, possibly-rotating
+    /// credential. Re-importing is idempotent and overwrites the stored tokens.
+    pub async fn import_codex_cli_tokens(&mut self) -> Result<CodexStatus, String> {
+        let path = codex_cli_auth_path()
+            .ok_or_else(|| "无法解析 Codex CLI 凭据路径（找不到 home 目录）。".to_string())?;
+
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err("未找到 Codex CLI 登录凭据，请先运行 `codex login`。".to_string());
+            }
+            Err(err) => {
+                return Err(format!("读取 Codex CLI 凭据失败：{err}"));
+            }
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&contents)
+            .map_err(|err| format!("解析 Codex CLI 凭据失败：{err}"))?;
+
+        let imported = parse_codex_cli_auth(&value)
+            .ok_or_else(|| "Codex CLI 凭据格式无法识别。".to_string())?;
+
+        if imported.access_token.is_empty() && imported.refresh_token.is_empty() {
+            if imported.api_key_only {
+                return Err("检测到 Codex CLI 使用 API key 模式，暂不支持导入；请用 ChatGPT 登录（codex login）后再导入。".to_string());
+            }
+            return Err("Codex CLI 凭据为空。".to_string());
+        }
+
+        let account_id = imported
+            .account_id
+            .clone()
+            .or_else(|| extract_account_id(&imported.access_token, imported.id_token.as_deref()));
+
+        // Codex CLI's auth.json does not store an expiry; derive it from the
+        // access token's `exp` claim. If that is unavailable, treat the token as
+        // already expired so the first `access_token()` call refreshes it.
+        let expires_at = extract_jwt_exp_millis(&imported.access_token)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+        self.tokens = Some(CodexTokenData {
+            access_token: imported.access_token,
+            refresh_token: imported.refresh_token,
+            expires_at,
+            account_id,
+            validation_failed: false,
+            validation_error: None,
+        });
+        self.save_tokens()?;
+
+        eprintln!("[Codex] imported tokens from Codex CLI auth.json");
         Ok(self.status())
     }
 
@@ -618,7 +771,86 @@ impl CodexAuthState {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_refresh_token_error_code, refresh_failure_invalidates_login};
+    use super::{
+        extract_jwt_exp_millis, extract_refresh_token_error_code, parse_codex_cli_auth,
+        refresh_failure_invalidates_login,
+    };
+
+    /// Build a syntactically valid `header.payload.signature` JWT whose payload
+    /// is the base64url encoding of `payload_json`. Header/signature are dummy.
+    fn make_jwt(payload_json: &str) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn parse_codex_cli_auth_reads_standard_tokens_shape() {
+        let value = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "id-jwt",
+                "access_token": "  access-jwt  ",
+                "refresh_token": "refresh-opaque",
+                "account_id": "acct-123"
+            },
+            "last_refresh": "2026-06-27T00:00:00Z"
+        });
+
+        let parsed = parse_codex_cli_auth(&value).expect("object");
+        assert_eq!(parsed.access_token, "access-jwt");
+        assert_eq!(parsed.refresh_token, "refresh-opaque");
+        assert_eq!(parsed.id_token.as_deref(), Some("id-jwt"));
+        assert_eq!(parsed.account_id.as_deref(), Some("acct-123"));
+        assert!(!parsed.api_key_only);
+    }
+
+    #[test]
+    fn parse_codex_cli_auth_flags_api_key_only_mode() {
+        let value = serde_json::json!({
+            "OPENAI_API_KEY": "sk-abc123",
+            "tokens": null
+        });
+
+        let parsed = parse_codex_cli_auth(&value).expect("object");
+        assert!(parsed.access_token.is_empty());
+        assert!(parsed.refresh_token.is_empty());
+        assert!(parsed.api_key_only);
+    }
+
+    #[test]
+    fn parse_codex_cli_auth_supports_top_level_fallback() {
+        let value = serde_json::json!({
+            "access_token": "root-access",
+            "refresh_token": "root-refresh",
+            "account_id": "root-acct"
+        });
+
+        let parsed = parse_codex_cli_auth(&value).expect("object");
+        assert_eq!(parsed.access_token, "root-access");
+        assert_eq!(parsed.refresh_token, "root-refresh");
+        assert_eq!(parsed.account_id.as_deref(), Some("root-acct"));
+        assert!(!parsed.api_key_only);
+    }
+
+    #[test]
+    fn parse_codex_cli_auth_rejects_non_object() {
+        assert!(parse_codex_cli_auth(&serde_json::json!("nope")).is_none());
+        assert!(parse_codex_cli_auth(&serde_json::json!(["a", "b"])).is_none());
+    }
+
+    #[test]
+    fn extract_jwt_exp_millis_reads_exp_claim() {
+        let token = make_jwt(r#"{"exp": 1700000000}"#);
+        assert_eq!(extract_jwt_exp_millis(&token), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn extract_jwt_exp_millis_handles_missing_or_malformed() {
+        assert_eq!(extract_jwt_exp_millis(&make_jwt(r#"{"sub":"x"}"#)), None);
+        assert_eq!(extract_jwt_exp_millis("not-a-jwt"), None);
+        assert_eq!(extract_jwt_exp_millis("a.b"), None);
+    }
 
     #[test]
     fn refresh_failure_only_invalidates_login_for_401_known_refresh_token_codes() {

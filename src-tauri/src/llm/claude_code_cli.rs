@@ -245,7 +245,7 @@ pub fn claude_cli_login_status() -> (ClaudeCliLoginState, String) {
     fallback
 }
 
-fn claude_config_dir() -> Option<PathBuf> {
+pub(crate) fn claude_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
@@ -288,7 +288,49 @@ fn settings_has_api_key_helper(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How long a resolved (or unresolved) Claude Code CLI location stays cached.
+/// Short enough that a freshly installed/removed CLI is picked up promptly,
+/// long enough to spare `get_providers` (settings refresh, key save/delete,
+/// connectivity test, import) from re-spawning `claude --version` every call.
+const CLI_DISCOVERY_TTL: Duration = Duration::from_secs(30);
+
+struct CliDiscoveryCache {
+    path: Option<PathBuf>,
+    resolved_at: Instant,
+}
+
+fn cli_discovery_cache() -> &'static std::sync::Mutex<Option<CliDiscoveryCache>> {
+    static CACHE: OnceLock<std::sync::Mutex<Option<CliDiscoveryCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Locate the Claude Code CLI, memoizing the result for [`CLI_DISCOVERY_TTL`].
+///
+/// Discovery probes candidate paths by spawning `claude --version`
+/// ([`is_usable_claude_cli`]), which is costly on Windows. Caching keeps the hot
+/// `get_providers` path from re-spawning it on every settings interaction.
 pub fn find_claude_cli() -> Option<PathBuf> {
+    if let Ok(guard) = cli_discovery_cache().lock() {
+        if let Some(cache) = guard.as_ref() {
+            if cache.resolved_at.elapsed() < CLI_DISCOVERY_TTL {
+                return cache.path.clone();
+            }
+        }
+    }
+
+    let resolved = discover_claude_cli();
+
+    if let Ok(mut guard) = cli_discovery_cache().lock() {
+        *guard = Some(CliDiscoveryCache {
+            path: resolved.clone(),
+            resolved_at: Instant::now(),
+        });
+    }
+
+    resolved
+}
+
+fn discover_claude_cli() -> Option<PathBuf> {
     for candidate in path_candidates().into_iter().chain(extra_candidates()) {
         if candidate.is_file() && is_usable_claude_cli(&candidate) {
             return Some(candidate);
@@ -1542,11 +1584,19 @@ fn save_debug_response(
 fn normalize_claude_model(model: &str) -> String {
     let trimmed = model.trim();
     let short = trimmed.strip_prefix("claude_code/").unwrap_or(trimmed);
-    match short {
-        "claude-sonnet-4.6" => "claude-sonnet-4-6".to_string(),
-        "claude-opus-4.6" => "claude-opus-4-6".to_string(),
-        other => other.to_string(),
-    }
+    let (base, suffix) = short
+        .strip_suffix("[1m]")
+        .map(|base| (base, "[1m]"))
+        .unwrap_or((short, ""));
+    let normalized = match base {
+        "claude-opus-4.8" => "claude-opus-4-8",
+        "claude-opus-4.7" => "claude-opus-4-7",
+        "claude-sonnet-4.6" => "claude-sonnet-4-6",
+        "claude-opus-4.6" => "claude-opus-4-6",
+        "claude-haiku-4.5" => "claude-haiku-4-5",
+        other => other,
+    };
+    format!("{}{}", normalized, suffix)
 }
 
 fn is_usable_claude_cli(path: &Path) -> bool {

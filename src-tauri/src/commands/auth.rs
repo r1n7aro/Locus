@@ -5,8 +5,9 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::auth::codex::{CodexAuthState, CodexLoginInfo, CodexPollResult, CodexStatus};
-use crate::auth::{AuthState, AuthStatus, AuthUrlInfo};
+use crate::auth::{AuthState, AuthStatus, AuthUrlInfo, ClaudeCodeTokenImportResult};
 use crate::keychain;
+use crate::llm::anthropic_usage::AnthropicRateLimitsResponse;
 use crate::llm::codex_usage::CodexRateLimitsResponse;
 
 use crate::error::AppError;
@@ -59,6 +60,42 @@ pub async fn auth_logout(
     let mut auth = auth.lock().await;
     auth.logout();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn import_claude_code_oauth(
+    auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
+) -> Result<ClaudeCodeTokenImportResult, AppError> {
+    let mut auth = auth.lock().await;
+    auth.import_claude_code_oauth_tokens()
+        .await
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn anthropic_rate_limits(
+    auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
+) -> Result<AnthropicRateLimitsResponse, AppError> {
+    let access_token = {
+        let mut guard = auth.lock().await;
+        guard.access_token().await.map_err(AppError::from)?
+    };
+
+    match crate::llm::anthropic_usage::fetch_anthropic_rate_limits(&access_token).await {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_unauthorized() => {
+            let access_token = {
+                let mut guard = auth.lock().await;
+                guard.refresh().await.map_err(AppError::from)?;
+                guard.access_token().await.map_err(AppError::from)?
+            };
+
+            crate::llm::anthropic_usage::fetch_anthropic_rate_limits(&access_token)
+                .await
+                .map_err(|err| AppError::from(err.to_string()))
+        }
+        Err(error) => Err(AppError::from(error.to_string())),
+    }
 }
 
 #[tauri::command]
@@ -366,6 +403,18 @@ pub async fn codex_poll_login(
 pub async fn codex_logout(codex: State<'_, CodexAuthStateHandle>) -> Result<(), AppError> {
     codex.lock().await.logout();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn import_codex_cli(
+    codex: State<'_, CodexAuthStateHandle>,
+) -> Result<CodexStatus, AppError> {
+    codex
+        .lock()
+        .await
+        .import_codex_cli_tokens()
+        .await
+        .map_err(AppError::from)
 }
 
 #[tauri::command]

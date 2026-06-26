@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import { computed } from "vue";
 import { locale, t } from "../../i18n";
@@ -8,7 +9,14 @@ import type {
   ApiFormat,
   CodexTransportMode,
 } from "../../types";
-import type { CodexQuotaState, CodexQuotaWindowState, CodexStatusState, ProviderStatus } from "../../composables/useSettingsState";
+import type {
+  AnthropicQuotaState,
+  AnthropicQuotaWindowState,
+  CodexQuotaState,
+  CodexQuotaWindowState,
+  CodexStatusState,
+  ProviderStatus,
+} from "../../composables/useSettingsState";
 import { visibleProviderOrder } from "../../config/providerVisibility";
 import type { DynamicToolLoadingMode } from "../../services/system";
 
@@ -27,6 +35,7 @@ const props = defineProps<{
   isLoading: boolean;
   oauthStep: "idle" | "waiting_code" | "exchanging";
   oauthCode: string;
+  anthropicQuota: AnthropicQuotaState;
   codexStep: "idle" | "opening" | "waiting" | "success";
   codexStatus: CodexStatusState;
   codexQuota: CodexQuotaState;
@@ -56,8 +65,11 @@ const emit = defineEmits<{
   submitOAuthCode: [];
   cancelOAuth: [];
   oauthLogout: [];
+  importClaudeCodeOAuth: [];
   handleOAuthKeydown: [e: KeyboardEvent];
+  refreshAnthropicQuota: [];
   startCodexLogin: [];
+  importCodexCli: [];
   cancelCodexLogin: [];
   codexLogout: [];
   retryCodexValidation: [];
@@ -190,6 +202,28 @@ function formatQuotaPercent(value: number): string {
   return Math.round(Math.max(0, Math.min(100, value))).toString();
 }
 
+function formatAnthropicQuotaWindowLabel(window: AnthropicQuotaWindowState): string {
+  switch (window.limitId) {
+    case "five_hour":
+      return t("settings.anthropic.quotaFiveHour");
+    case "seven_day":
+      return t("settings.anthropic.quotaWeeklyAll");
+    case "seven_day_sonnet":
+      return t("settings.anthropic.quotaSonnetOnly");
+    case "seven_day_opus":
+      return t("settings.anthropic.quotaOpusOnly");
+    case "seven_day_oauth_apps":
+      return t("settings.anthropic.quotaOauthApps");
+    case "extra_usage":
+      return t("settings.anthropic.quotaExtraUsage");
+    default:
+      if (window.limitId.startsWith("weekly_scoped") && window.limitName) {
+        return t("settings.anthropic.quotaWeeklyModel", window.limitName);
+      }
+      return window.limitId;
+  }
+}
+
 function formatQuotaWindowLabel(window: CodexQuotaWindowState): string {
   const minutes = window.windowMinutes;
   let label: string;
@@ -230,7 +264,7 @@ function formatQuotaReset(resetsAt: number | null): string {
   return `${dateLabel} ${timeLabel}`;
 }
 
-function quotaBarStyle(window: CodexQuotaWindowState) {
+function quotaBarStyle(window: CodexQuotaWindowState | AnthropicQuotaWindowState) {
   return {
     width: `${formatQuotaPercent(window.remainingPercent)}%`,
   };
@@ -304,8 +338,12 @@ function quotaCreditsLabel() {
           <span class="provider-name">Anthropic (OAuth)</span>
           <span class="provider-desc">{{ providerMeta('anthropic').desc }}</span>
         </div>
-        <span class="provider-status">
-          {{ t("settings.anthropic.disabledStatus") }}
+        <span class="provider-status" :class="{ active: anthropicProvider?.hasKey }">
+          {{
+            anthropicProvider?.hasKey
+              ? t("settings.anthropic.loggedIn")
+              : t("settings.anthropic.disabledStatus")
+          }}
         </span>
       </div>
 
@@ -318,12 +356,107 @@ function quotaCreditsLabel() {
           }}
         </span>
         <div class="provider-actions">
-          <button class="action-btn" @click="emit('startOAuthLogin')" :disabled="isLoading">
-            {{ t("settings.anthropic.detailsBtn") }}
-          </button>
-          <button v-if="anthropicProvider?.hasKey" class="action-btn danger" @click="emit('oauthLogout')" :disabled="isLoading">
+          <BaseButton
+            v-if="!anthropicProvider?.hasKey && oauthStep === 'idle'"
+            variant="neutral"
+            size="sm"
+            :disabled="isLoading"
+            @click="emit('startOAuthLogin')"
+          >
+            {{ t("settings.anthropic.loginBtn") }}
+          </BaseButton>
+          <BaseButton
+            v-if="!anthropicProvider?.hasKey && oauthStep === 'idle'"
+            variant="neutral"
+            size="sm"
+            :disabled="isLoading"
+            @click="emit('importClaudeCodeOAuth')"
+          >
+            {{ t("settings.anthropic.importClaudeCode") }}
+          </BaseButton>
+          <BaseButton
+            v-if="anthropicProvider?.hasKey"
+            variant="danger"
+            size="sm"
+            :disabled="isLoading"
+            @click="emit('oauthLogout')"
+          >
             {{ t("settings.anthropic.logout") }}
-          </button>
+          </BaseButton>
+        </div>
+      </div>
+
+      <div
+        v-if="anthropicProvider?.hasKey"
+        class="provider-detail codex-quota-detail"
+      >
+        <div class="codex-quota-copy">
+          <span class="key-hint codex-quota-label">{{ t("settings.anthropic.quotaLabel") }}</span>
+          <div v-if="anthropicQuota.windows.length > 0" class="codex-quota-list">
+            <div
+              v-for="window in anthropicQuota.windows"
+              :key="window.id"
+              class="codex-quota-row"
+            >
+              <span class="codex-quota-name">{{ formatAnthropicQuotaWindowLabel(window) }}</span>
+              <span class="codex-quota-track" aria-hidden="true">
+                <span class="codex-quota-fill" :style="quotaBarStyle(window)"></span>
+              </span>
+              <span class="codex-quota-percent">
+                {{ t("settings.codex.quotaPercent", formatQuotaPercent(window.remainingPercent)) }}
+              </span>
+              <span v-if="formatQuotaReset(window.resetsAt)" class="codex-quota-reset">
+                {{ formatQuotaReset(window.resetsAt) }}
+              </span>
+            </div>
+            <span v-if="anthropicQuota.error" class="oauth-hint codex-validation-error">
+              {{ anthropicQuota.error }}
+            </span>
+          </div>
+          <span v-else-if="anthropicQuota.loading" class="oauth-hint">{{ t("settings.anthropic.quotaLoading") }}</span>
+          <span v-else-if="anthropicQuota.error" class="oauth-hint codex-validation-error">
+            {{ anthropicQuota.error }}
+          </span>
+          <span v-else class="oauth-hint">{{ t("settings.anthropic.quotaUnavailable") }}</span>
+        </div>
+        <div class="provider-actions">
+          <BaseButton
+            variant="neutral"
+            size="sm"
+            type="button"
+            :disabled="anthropicQuota.loading"
+            @click="emit('refreshAnthropicQuota')"
+          >
+            {{ anthropicQuota.loading ? t("settings.anthropic.quotaRefreshing") : t("settings.anthropic.refreshQuota") }}
+          </BaseButton>
+        </div>
+      </div>
+
+      <div
+        v-if="!anthropicProvider?.hasKey && (oauthStep === 'waiting_code' || oauthStep === 'exchanging')"
+        class="edit-form"
+      >
+        <div class="oauth-instruction">{{ t("settings.anthropic.instruction") }}</div>
+        <div class="edit-row">
+          <input
+            class="key-input"
+            type="text"
+            :value="oauthCode"
+            :placeholder="t('settings.anthropic.codePlaceholder')"
+            :disabled="isLoading"
+            @input="emit('update:oauthCode', ($event.target as HTMLInputElement).value)"
+            @keydown="emit('handleOAuthKeydown', $event)"
+          />
+          <BaseButton variant="primary" size="md" :disabled="isLoading" @click="emit('submitOAuthCode')">
+            {{
+              oauthStep === "exchanging"
+                ? t("settings.anthropic.verifying")
+                : t("settings.anthropic.confirm")
+            }}
+          </BaseButton>
+          <BaseButton variant="neutral" size="md" :disabled="isLoading" @click="emit('cancelOAuth')">
+            {{ t("settings.anthropic.cancel") }}
+          </BaseButton>
         </div>
       </div>
     </div>
@@ -374,8 +507,9 @@ function quotaCreditsLabel() {
           <span v-else class="oauth-hint">{{ t("settings.claudeCode.testHint") }}</span>
         </div>
         <div class="provider-actions">
-          <button
-            class="test-btn"
+          <BaseButton
+            variant="neutral"
+            size="sm"
             type="button"
             :disabled="!claudeCodeProvider?.hasKey || claudeCodeTestStatus === 'testing'"
             @click="emit('testClaudeCode')"
@@ -383,7 +517,7 @@ function quotaCreditsLabel() {
             {{ claudeCodeTestStatus === 'testing'
               ? t("settings.claudeCode.testing")
               : t("settings.claudeCode.test") }}
-          </button>
+          </BaseButton>
         </div>
       </div>
     </div>
@@ -425,15 +559,16 @@ function quotaCreditsLabel() {
           </span>
         </div>
         <div class="provider-actions">
-          <button
+          <BaseButton
             v-if="codexStatus.validationFailed"
-            class="action-btn"
+            variant="neutral"
+            size="sm"
             :disabled="codexRetrying"
             @click="emit('retryCodexValidation')"
           >
             {{ codexRetrying ? t("settings.codex.retrying") : t("settings.codex.retryValidation") }}
-          </button>
-          <button class="action-btn danger" @click="emit('codexLogout')">{{ t("settings.codex.logout") }}</button>
+          </BaseButton>
+          <BaseButton variant="danger" size="sm" @click="emit('codexLogout')">{{ t("settings.codex.logout") }}</BaseButton>
         </div>
       </div>
 
@@ -472,29 +607,37 @@ function quotaCreditsLabel() {
           <span v-else class="oauth-hint">{{ t("settings.codex.quotaUnavailable") }}</span>
         </div>
         <div class="provider-actions">
-          <button
-            class="action-btn"
+          <BaseButton
+            variant="neutral"
+            size="sm"
             type="button"
             :disabled="codexQuota.loading"
             @click="emit('refreshCodexQuota')"
           >
             {{ codexQuota.loading ? t("settings.codex.quotaRefreshing") : t("settings.codex.refreshQuota") }}
-          </button>
+          </BaseButton>
         </div>
       </div>
 
       <div v-if="!codexStatus.authenticated && codexStep === 'idle'" class="provider-detail">
-        <button class="oauth-login-btn" @click="emit('startCodexLogin')" :disabled="isLoading">
-          {{ t("settings.codex.loginBtn") }}
-        </button>
-        <span class="oauth-hint">{{ t("settings.codex.hint") }}</span>
+        <span class="key-hint">{{ t("settings.codex.hint") }}</span>
+        <div class="provider-actions">
+          <BaseButton variant="neutral" size="sm" :disabled="isLoading" @click="emit('startCodexLogin')">
+            {{ t("settings.codex.loginBtn") }}
+          </BaseButton>
+          <BaseButton variant="neutral" size="sm" :disabled="isLoading" @click="emit('importCodexCli')">
+            {{ t("settings.codex.importCli") }}
+          </BaseButton>
+        </div>
       </div>
 
       <div v-else-if="!codexStatus.authenticated && codexStep === 'opening'" class="provider-detail">
-        <button class="oauth-login-btn" type="button" disabled>
-          {{ t("settings.codex.opening") }}
-        </button>
-        <span class="oauth-hint">{{ t("settings.codex.hint") }}</span>
+        <span class="key-hint">{{ t("settings.codex.hint") }}</span>
+        <div class="provider-actions">
+          <BaseButton variant="neutral" size="sm" type="button" disabled>
+            {{ t("settings.codex.opening") }}
+          </BaseButton>
+        </div>
       </div>
 
       <div v-else-if="!codexStatus.authenticated && codexStep === 'waiting'" class="edit-form">
@@ -517,7 +660,7 @@ function quotaCreditsLabel() {
         <div class="codex-poll-row">
           <span class="codex-spinner"></span>
           <span class="oauth-hint">{{ t("settings.codex.waiting") }}</span>
-          <button class="cancel-btn" style="margin-left:auto" @click="emit('cancelCodexLogin')">{{ t("settings.codex.cancel") }}</button>
+          <BaseButton variant="neutral" size="sm" style="margin-left:auto" @click="emit('cancelCodexLogin')">{{ t("settings.codex.cancel") }}</BaseButton>
         </div>
       </div>
 
@@ -561,15 +704,15 @@ function quotaCreditsLabel() {
         <div v-if="provider.hasKey && editingProvider !== provider.id" class="provider-detail">
           <span class="key-hint mono">{{ provider.keyHint }}</span>
           <div class="provider-actions">
-            <button class="action-btn" @click="emit('startEdit', provider.id)">{{ t("settings.provider.edit") }}</button>
-            <button class="action-btn danger" @click="emit('deleteKey', provider.id)">{{ t("settings.provider.delete") }}</button>
+            <BaseButton variant="neutral" size="sm" @click="emit('startEdit', provider.id)">{{ t("settings.provider.edit") }}</BaseButton>
+            <BaseButton variant="danger" size="sm" @click="emit('deleteKey', provider.id)">{{ t("settings.provider.delete") }}</BaseButton>
           </div>
         </div>
 
         <div v-if="!provider.hasKey && editingProvider !== provider.id" class="provider-detail">
-          <button class="add-key-btn" @click="emit('startEdit', provider.id)">
+          <BaseButton variant="neutral" size="sm" @click="emit('startEdit', provider.id)">
             {{ t("settings.provider.addKey") }}
-          </button>
+          </BaseButton>
           <a
             v-if="providerMeta(provider.id).url"
             :href="providerMeta(provider.id).url"
@@ -589,14 +732,15 @@ function quotaCreditsLabel() {
               autofocus
               @keydown="(e) => emit('handleKeydown', e, provider.id)"
             />
-            <button
-              class="save-btn"
+            <BaseButton
+              variant="primary"
+              size="md"
               :disabled="isLoading || !editKey.trim()"
               @click="emit('saveKey', provider.id)"
             >
               {{ isLoading ? '...' : t("settings.provider.save") }}
-            </button>
-            <button class="cancel-btn" @click="emit('cancelEdit')">{{ t("settings.provider.cancel") }}</button>
+            </BaseButton>
+            <BaseButton variant="neutral" size="md" @click="emit('cancelEdit')">{{ t("settings.provider.cancel") }}</BaseButton>
           </div>
           <a
             v-if="providerMeta(provider.id).url"
@@ -629,37 +773,40 @@ function quotaCreditsLabel() {
         <div class="provider-detail">
           <span class="key-hint mono">{{ ep.apiKey ? ep.apiKey.slice(0, 8) + '...' : '(no key)' }}</span>
           <div class="provider-actions">
-            <button
-              class="action-btn"
+            <BaseButton
+              variant="neutral"
+              size="sm"
               type="button"
               :disabled="customEndpointSaving"
               @click="emit('startEditEndpoint', ep)"
             >
               {{ t("settings.custom.edit") }}
-            </button>
-            <button
-              class="action-btn danger"
+            </BaseButton>
+            <BaseButton
+              variant="danger"
+              size="sm"
               type="button"
               :disabled="customEndpointSaving"
               @click="emit('deleteEndpoint', ep.id)"
             >
               {{ t("settings.custom.delete") }}
-            </button>
+            </BaseButton>
           </div>
         </div>
       </div>
     </div>
     <p v-else class="section-desc" style="opacity:0.5;">{{ t("settings.custom.noEndpoints") }}</p>
 
-    <button
-      class="add-key-btn"
+    <BaseButton
+      variant="neutral"
+      size="sm"
       style="margin-top: 8px;"
       type="button"
       :disabled="customEndpointSaving"
       @click="emit('startAddEndpoint')"
     >
       + {{ t("settings.custom.add") }}
-    </button>
+    </BaseButton>
   </div>
   </div>
 </template>
@@ -892,57 +1039,6 @@ function quotaCreditsLabel() {
   color: var(--text-secondary);
 }
 
-.action-btn,
-.cancel-btn,
-.test-btn {
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.action-btn {
-  padding: 4px 10px;
-}
-
-.action-btn:hover,
-.cancel-btn:hover,
-.test-btn:hover:not(:disabled) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
-.action-btn.danger:hover {
-  color: var(--status-danger-fg);
-  border-color: var(--status-danger-border);
-  background: var(--status-danger-bg);
-}
-
-.add-key-btn {
-  padding: 6px 12px;
-  border-radius: 6px;
-  border: 1px dashed var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-}
-
-.add-key-btn:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
 .get-key-link,
 .codex-url {
   font-size: 11px;
@@ -992,42 +1088,6 @@ function quotaCreditsLabel() {
 .key-input:focus {
   border-color: var(--accent-border);
   background: color-mix(in srgb, var(--input-bg) 88%, var(--accent-soft) 12%);
-}
-
-.save-btn,
-.oauth-login-btn {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--accent-color);
-  background: var(--accent-color);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 0.15s ease, opacity 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-.oauth-login-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 14px;
-}
-
-.save-btn:hover:not(:disabled),
-.oauth-login-btn:hover:not(:disabled) {
-  filter: brightness(1.06);
-}
-
-.save-btn:disabled,
-.oauth-login-btn:disabled,
-.test-btn:disabled,
-.action-btn:disabled,
-.add-key-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 .oauth-hint {
@@ -1171,9 +1231,7 @@ function quotaCreditsLabel() {
   }
 
   .provider-status,
-  .provider-actions,
-  .save-btn,
-  .cancel-btn {
+  .provider-actions {
     align-self: flex-start;
   }
 }

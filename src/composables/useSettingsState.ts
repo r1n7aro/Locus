@@ -4,19 +4,24 @@ import { resetAllConfig } from "../services/project";
 import {
   getProviders,
   testClaudeCodeCli,
+  importClaudeCodeOAuth as serviceImportClaudeCodeOAuth,
   saveProviderKey,
   deleteProviderKey,
   getAuthUrl,
   exchangeAuthCode,
   authLogout,
+  anthropicRateLimits as fetchAnthropicRateLimits,
   codexStatus as fetchCodexStatus,
   codexRateLimits as fetchCodexRateLimits,
   codexStartLogin,
   codexPollLogin,
   codexLogout as serviceCodexLogout,
   codexRetryAuth as serviceCodexRetryAuth,
+  importCodexCli as serviceImportCodexCli,
 } from "../services/auth";
 import type {
+  AnthropicRateLimitWindow as RemoteAnthropicRateLimitWindow,
+  AnthropicRateLimitsResponse,
   CodexRateLimitSnapshot,
   CodexRateLimitWindow as RemoteCodexRateLimitWindow,
   CodexRateLimitsResponse,
@@ -108,6 +113,24 @@ export interface CodexQuotaState {
   planType: string | null;
 }
 
+export interface AnthropicQuotaWindowState {
+  id: string;
+  limitId: string;
+  limitName: string | null;
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes: number | null;
+  resetsAt: number | null;
+}
+
+export interface AnthropicQuotaState {
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
+  fetchedAtMs: number | null;
+  windows: AnthropicQuotaWindowState[];
+}
+
 type SettingsEmit = {
   (e: "authChanged"): void;
   (e: "modelDefaultsChanged", defaults: ModelDefaults): void;
@@ -126,6 +149,16 @@ export function useSettingsState(emit: SettingsEmit) {
       windows: [],
       credits: null,
       planType: null,
+    };
+  }
+
+  function emptyAnthropicQuota(): AnthropicQuotaState {
+    return {
+      loading: false,
+      loaded: false,
+      error: null,
+      fetchedAtMs: null,
+      windows: [],
     };
   }
 
@@ -153,7 +186,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   function normalizeRateLimitWindow(
-    window: RemoteCodexRateLimitWindow | null | undefined,
+    window: RemoteCodexRateLimitWindow | RemoteAnthropicRateLimitWindow | null | undefined,
     fallbackRemaining: number,
   ): Pick<CodexQuotaWindowState, "usedPercent" | "remainingPercent" | "windowMinutes" | "resetsAt"> | null {
     if (!window) return null;
@@ -223,6 +256,31 @@ export function useSettingsState(emit: SettingsEmit) {
     };
   }
 
+  function normalizeAnthropicQuota(response?: AnthropicRateLimitsResponse | null): AnthropicQuotaState {
+    if (!response) return emptyAnthropicQuota();
+
+    const windows = (response.windows ?? [])
+      .map((window): AnthropicQuotaWindowState | null => {
+        const normalized = normalizeRateLimitWindow(window, 100);
+        if (!normalized) return null;
+        return {
+          id: window.limitId,
+          limitId: window.limitId,
+          limitName: window.limitName ?? null,
+          ...normalized,
+        };
+      })
+      .filter((window): window is AnthropicQuotaWindowState => !!window);
+
+    return {
+      loading: false,
+      loaded: true,
+      error: null,
+      fetchedAtMs: response.fetchedAtMs,
+      windows,
+    };
+  }
+
   // ── General ──────────────────────────────────────────────────────────
   const resetConfirm = ref(false);
 
@@ -262,6 +320,7 @@ export function useSettingsState(emit: SettingsEmit) {
     isLoading.value = false;
     oauthStep.value = "idle";
     oauthCode.value = "";
+    anthropicQuota.value = emptyAnthropicQuota();
     stopCodexPolling();
     resetCodexCopyState();
     codexStep.value = "idle";
@@ -273,8 +332,6 @@ export function useSettingsState(emit: SettingsEmit) {
     codexUrl.value = "";
     codexDeviceAuthId.value = "";
     codexInterval.value = 5;
-    showDisclaimer.value = false;
-    disclaimerTarget.value = null;
     modelDefaults.value = emptyDefaults;
     modelSaveMsg.value = "";
     toolPermissions.value = {};
@@ -408,6 +465,35 @@ export function useSettingsState(emit: SettingsEmit) {
   // ── OAuth ────────────────────────────────────────────────────────────
   const oauthStep = ref<"idle" | "waiting_code" | "exchanging">("idle");
   const oauthCode = ref("");
+  const anthropicQuota = ref<AnthropicQuotaState>(emptyAnthropicQuota());
+
+  function hasAnthropicLogin(): boolean {
+    return providers.value.some((provider) => provider.id === "anthropic" && provider.hasKey);
+  }
+
+  async function loadAnthropicRateLimits() {
+    if (!hasAnthropicLogin()) {
+      anthropicQuota.value = emptyAnthropicQuota();
+      return;
+    }
+
+    anthropicQuota.value = {
+      ...anthropicQuota.value,
+      loading: true,
+      error: null,
+    };
+
+    try {
+      anthropicQuota.value = normalizeAnthropicQuota(await fetchAnthropicRateLimits());
+    } catch (e) {
+      const err = normalizeAppError(e);
+      anthropicQuota.value = {
+        ...anthropicQuota.value,
+        loading: false,
+        error: err.message,
+      };
+    }
+  }
 
   async function startOAuthLogin() {
     errorMsg.value = "";
@@ -443,6 +529,7 @@ export function useSettingsState(emit: SettingsEmit) {
       oauthStep.value = "idle";
       oauthCode.value = "";
       await loadProviders();
+      await loadAnthropicRateLimits();
       emit("authChanged");
       setTimeout(() => { successMsg.value = ""; }, 3000);
     } catch (e) {
@@ -469,6 +556,7 @@ export function useSettingsState(emit: SettingsEmit) {
     try {
       await authLogout();
       await loadProviders();
+      anthropicQuota.value = emptyAnthropicQuota();
       emit("authChanged");
       successMsg.value = t("settings.anthropic.logoutSuccess");
       setTimeout(() => { successMsg.value = ""; }, 2000);
@@ -477,6 +565,36 @@ export function useSettingsState(emit: SettingsEmit) {
       useNotificationStore().addNotice("error", t("settings.anthropic.logoutFailed", err.message), {
         code: err.code,
         operation: "oauthLogout",
+      });
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function importClaudeCodeOAuth() {
+    isLoading.value = true;
+    errorMsg.value = "";
+    successMsg.value = "";
+    try {
+      const result = await serviceImportClaudeCodeOAuth();
+      if (result.kind === "custom_endpoint") {
+        if (!result.customEndpoint) {
+          throw new Error("Claude Code custom endpoint payload is missing");
+        }
+        await saveImportedClaudeCodeCustomEndpoint(result.customEndpoint);
+        successMsg.value = t("settings.anthropic.importCustomEndpointSuccess");
+      } else {
+        await loadProviders();
+        await loadAnthropicRateLimits();
+        emit("authChanged");
+        successMsg.value = t("settings.anthropic.importSuccess");
+      }
+      setTimeout(() => { successMsg.value = ""; }, 3000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.anthropic.importFailed", err.message), {
+        code: err.code,
+        operation: "importClaudeCodeOAuth",
       });
     } finally {
       isLoading.value = false;
@@ -703,6 +821,28 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
+  async function importCodexCli() {
+    isLoading.value = true;
+    try {
+      const result = await serviceImportCodexCli();
+      codexStatus.value = normalizeCodexStatus(result);
+      if (codexStatus.value.authenticated && !codexStatus.value.validationFailed) {
+        void loadCodexRateLimits();
+      }
+      emit("authChanged");
+      successMsg.value = t("settings.codex.importSuccess");
+      setTimeout(() => { successMsg.value = ""; }, 3000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.importFailed", err.message), {
+        code: err.code,
+        operation: "importCodexCli",
+      });
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
   async function copyCode() {
     await copyCodexText(codexUserCode.value);
   }
@@ -729,31 +869,8 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
-  // ── Subscription disclaimer ─────────────────────────────────────────
-  const showDisclaimer = ref(false);
-  const disclaimerTarget = ref<"anthropic" | null>(null);
-
-  function requestOAuthLogin() {
-    disclaimerTarget.value = "anthropic";
-    oauthStep.value = "idle";
-    oauthCode.value = "";
-    errorMsg.value = "";
-    successMsg.value = "";
-    showDisclaimer.value = true;
-  }
-
   function requestCodexLogin() {
     void startCodexLogin();
-  }
-
-  function confirmDisclaimer() {
-    showDisclaimer.value = false;
-    disclaimerTarget.value = null;
-  }
-
-  function cancelDisclaimer() {
-    showDisclaimer.value = false;
-    disclaimerTarget.value = null;
   }
 
   // ── Model defaults ──────────────────────────────────────────────────
@@ -1034,6 +1151,22 @@ export function useSettingsState(emit: SettingsEmit) {
     return run;
   }
 
+  async function saveImportedClaudeCodeCustomEndpoint(endpoint: CustomEndpoint) {
+    const ep = normalizeCustomEndpoint(endpoint);
+    await enqueueCustomEndpointMutation(async () => {
+      const list = [...customEndpoints.value];
+      const idx = list.findIndex((existing) => existing.id === ep.id);
+      if (idx >= 0) {
+        list[idx] = ep;
+      } else {
+        list.push(ep);
+      }
+
+      await saveCustomEndpoints(list);
+      await reloadCustomEndpointsAfterMutation();
+    });
+  }
+
   function newEmptyEndpoint(): CustomEndpoint {
     const apiFormat: ApiFormat = "openai_chat";
     return {
@@ -1176,6 +1309,9 @@ export function useSettingsState(emit: SettingsEmit) {
 
     if (cachedProviders) providers.value = cachedProviders;
     else await loadProviders();
+    if (hasAnthropicLogin()) {
+      void loadAnthropicRateLimits();
+    }
     await loadDynamicToolLoadingMode();
 
     if (cachedCodex) codexStatus.value = normalizeCodexStatus(cachedCodex);
@@ -1244,7 +1380,10 @@ export function useSettingsState(emit: SettingsEmit) {
     submitOAuthCode,
     cancelOAuth,
     oauthLogout,
+    importClaudeCodeOAuth,
     handleOAuthKeydown,
+    anthropicQuota,
+    loadAnthropicRateLimits,
 
     // codex
     codexStep,
@@ -1264,17 +1403,12 @@ export function useSettingsState(emit: SettingsEmit) {
     pollCodex,
     cancelCodexLogin,
     codexLogout,
+    importCodexCli,
     retryCodexValidation,
     copyCode,
     setCodexTransportMode,
 
-    // subscription disclaimer
-    showDisclaimer,
-    disclaimerTarget,
-    requestOAuthLogin,
     requestCodexLogin,
-    confirmDisclaimer,
-    cancelDisclaimer,
 
     // model defaults
     modelDefaults,

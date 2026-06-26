@@ -4,18 +4,33 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::commands::{
+    ApiFormat, CustomEndpoint, CustomEndpointServerTools, CustomReasoningParamFormat,
+};
 use crate::keychain;
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CLAUDE_AI_AUTH_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
-const REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
-const SCOPE: &str = "org:create_api_key user:profile user:inference";
+const CLAUDE_AI_AUTH_URL: &str = "https://claude.com/cai/oauth/authorize";
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+const CLAUDE_AI_SCOPE: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const CLIENT_METADATA_FILE: &str = "claude_client_metadata.json";
 
 const REFRESH_BUFFER_SECS: i64 = 60;
+/// Far-future expiry stamped on imported credentials that carry no refresh token
+/// (e.g. a long-lived `CLAUDE_CODE_OAUTH_TOKEN` minted by `claude setup-token`).
+/// Such tokens cannot be refreshed, so a short synthetic expiry would later push
+/// `access_token()` into `refresh()` which — finding no refresh token — wipes the
+/// credential. A far-future expiry keeps the token usable until the server itself
+/// rejects it (401). 2100-01-01 UTC.
+const NON_REFRESHABLE_TOKEN_EXPIRY_SECS: i64 = 4_102_444_800;
+const CLAUDE_CODE_IMPORTED_ENDPOINT_ID: &str = "claude-code-import";
+const CLAUDE_CODE_IMPORTED_ENDPOINT_NAME: &str = "Claude Code";
+const DEFAULT_CLAUDE_CODE_CUSTOM_ENDPOINT_BASE: &str = "https://api.anthropic.com/v1";
+const DEFAULT_CLAUDE_CODE_CUSTOM_MODEL: &str = "claude-opus-4-8";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenData {
@@ -51,10 +66,30 @@ pub struct AuthUrlInfo {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodeTokenImportKind {
+    Oauth,
+    CustomEndpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCodeTokenImportResult {
+    pub kind: ClaudeCodeTokenImportKind,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    pub has_refresh_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_endpoint: Option<CustomEndpoint>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
     expires_in: i64,
 }
 
@@ -223,7 +258,7 @@ impl AuthState {
         let now = chrono::Utc::now().timestamp();
         let tokens = TokenData {
             access_token: token_resp.access_token,
-            refresh_token: token_resp.refresh_token,
+            refresh_token: token_resp.refresh_token.unwrap_or_default(),
             expires_at: now + token_resp.expires_in,
         };
 
@@ -240,13 +275,17 @@ impl AuthState {
             .as_ref()
             .map(|t| t.refresh_token.clone())
             .ok_or_else(|| "No refresh token available".to_string())?;
+        if refresh_token.trim().is_empty() {
+            return Err("No refresh token available. Please re-login.".to_string());
+        }
 
         let client = crate::network::default_reqwest_client()?;
 
         let body = serde_json::json!({
             "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
+            "refresh_token": refresh_token.clone(),
             "client_id": CLIENT_ID,
+            "scope": CLAUDE_AI_SCOPE,
         });
 
         let resp = client
@@ -260,8 +299,6 @@ impl AuthState {
         let status = resp.status();
         if !status.is_success() {
             let error_body = resp.text().await.unwrap_or_default();
-            self.tokens = None;
-            let _ = keychain::delete_secret(keychain::KEY_CLAUDE_TOKENS);
             return Err(format!(
                 "Token refresh failed ({}): {}. Please re-login.",
                 status, error_body
@@ -276,7 +313,7 @@ impl AuthState {
         let now = chrono::Utc::now().timestamp();
         self.tokens = Some(TokenData {
             access_token: token_resp.access_token,
-            refresh_token: token_resp.refresh_token,
+            refresh_token: token_resp.refresh_token.unwrap_or(refresh_token),
             expires_at: now + token_resp.expires_in,
         });
 
@@ -293,6 +330,64 @@ impl AuthState {
         let _ = keychain::delete_secret(keychain::KEY_CLAUDE_TOKENS);
         let _ = self.save_client_metadata();
         eprintln!("[Auth] logged out, tokens cleared from keychain");
+    }
+
+    pub async fn import_claude_code_oauth_tokens(
+        &mut self,
+    ) -> Result<ClaudeCodeTokenImportResult, String> {
+        if let Some((source, custom_endpoint)) = load_claude_code_custom_endpoint()? {
+            return Ok(ClaudeCodeTokenImportResult {
+                kind: ClaudeCodeTokenImportKind::CustomEndpoint,
+                source,
+                expires_at: None,
+                has_refresh_token: false,
+                custom_endpoint: Some(custom_endpoint),
+            });
+        }
+
+        if let Some((source, imported)) = load_claude_code_oauth_credentials()? {
+            if imported.access_token.trim().is_empty() && imported.refresh_token.trim().is_empty() {
+                return Err("Claude Code OAuth credentials are empty".to_string());
+            }
+
+            if imported.access_token.trim().is_empty() {
+                return Err(
+                    "Claude Code OAuth credentials only include a refresh token. Run `claude` to refresh the access token, then import again."
+                        .to_string(),
+                );
+            }
+
+            let expires_at = imported
+                .expires_at
+                .unwrap_or(NON_REFRESHABLE_TOKEN_EXPIRY_SECS);
+            let now = chrono::Utc::now().timestamp();
+            if expires_at <= now + REFRESH_BUFFER_SECS {
+                return Err(
+                    "Claude Code OAuth access token is expired. Run `claude` to refresh or login again, then import again."
+                        .to_string(),
+                );
+            }
+
+            self.tokens = Some(TokenData {
+                access_token: imported.access_token,
+                refresh_token: String::new(),
+                expires_at,
+            });
+            self.save_tokens()?;
+
+            return Ok(ClaudeCodeTokenImportResult {
+                kind: ClaudeCodeTokenImportKind::Oauth,
+                source,
+                expires_at: Some(expires_at),
+                has_refresh_token: false,
+                custom_endpoint: None,
+            });
+        }
+
+        Err(
+            "No Claude Code OAuth credentials or custom endpoint configuration found. Run `claude` and complete /login first."
+                .to_string(),
+        )
     }
 
     fn save_tokens(&self) -> Result<(), String> {
@@ -443,7 +538,7 @@ fn build_authorize_url(challenge: &str, state: &str) -> AuthUrlInfo {
         CLAUDE_AI_AUTH_URL,
         CLIENT_ID,
         percent_encode(REDIRECT_URI),
-        percent_encode(SCOPE),
+        percent_encode(CLAUDE_AI_SCOPE),
         challenge,
         state,
     );
@@ -464,6 +559,368 @@ fn parse_authorization_code(code: &str) -> Result<(String, String), String> {
     }
 
     Ok((actual_code.to_string(), state.to_string()))
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImportedClaudeCodeOAuth {
+    access_token: String,
+    refresh_token: String,
+    expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImportedClaudeCodeCustomEndpoint {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    api_model: Option<String>,
+}
+
+fn load_claude_code_custom_endpoint() -> Result<Option<(String, CustomEndpoint)>, String> {
+    if let Some(config) = claude_code_custom_endpoint_from_process_env() {
+        return Ok(Some((
+            "Claude Code environment variables".to_string(),
+            build_claude_code_custom_endpoint(config),
+        )));
+    }
+
+    if let Some(dir) = crate::llm::claude_code_cli::claude_config_dir() {
+        let path = dir.join("settings.json");
+        if let Some(config) = load_claude_code_custom_endpoint_file(&path)? {
+            return Ok(Some((
+                format!("Claude Code {}", path.display()),
+                build_claude_code_custom_endpoint(config),
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn claude_code_custom_endpoint_from_process_env() -> Option<ImportedClaudeCodeCustomEndpoint> {
+    let base_url = env_string("ANTHROPIC_BASE_URL");
+    let api_key = env_string("ANTHROPIC_AUTH_TOKEN")
+        .map(strip_bearer_prefix)
+        .and_then(nonempty_string)
+        .or_else(|| env_string("ANTHROPIC_API_KEY"));
+    let api_model = env_string("ANTHROPIC_MODEL");
+
+    if base_url.is_none() && api_key.is_none() {
+        return None;
+    }
+
+    Some(ImportedClaudeCodeCustomEndpoint {
+        base_url,
+        api_key,
+        api_model,
+    })
+}
+
+fn load_claude_code_custom_endpoint_file(
+    path: &Path,
+) -> Result<Option<ImportedClaudeCodeCustomEndpoint>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "Failed to read Claude Code settings file {}: {}",
+                path.display(),
+                err
+            ));
+        }
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|err| format!("Failed to parse Claude Code settings JSON: {}", err))?;
+    Ok(parse_claude_code_custom_endpoint_settings(&value))
+}
+
+fn parse_claude_code_custom_endpoint_settings(
+    value: &serde_json::Value,
+) -> Option<ImportedClaudeCodeCustomEndpoint> {
+    let env = value.get("env");
+    let base_url = json_string(value, &["base_url", "baseUrl"])
+        .or_else(|| env.and_then(|env| json_string(env, &["ANTHROPIC_BASE_URL"])));
+    let api_key = env
+        .and_then(|env| json_string(env, &["ANTHROPIC_AUTH_TOKEN"]))
+        .map(strip_bearer_prefix)
+        .and_then(nonempty_string)
+        .or_else(|| env.and_then(|env| json_string(env, &["ANTHROPIC_API_KEY"])))
+        .or_else(|| json_string(value, &["apiKey", "api_key"]));
+    let api_model = env
+        .and_then(|env| json_string(env, &["ANTHROPIC_MODEL"]))
+        .or_else(|| json_string(value, &["apiModel", "api_model", "model"]));
+
+    if base_url.is_none() && api_key.is_none() {
+        return None;
+    }
+
+    Some(ImportedClaudeCodeCustomEndpoint {
+        base_url,
+        api_key,
+        api_model,
+    })
+}
+
+fn build_claude_code_custom_endpoint(config: ImportedClaudeCodeCustomEndpoint) -> CustomEndpoint {
+    let api_model = normalize_imported_claude_model(config.api_model);
+    CustomEndpoint {
+        id: CLAUDE_CODE_IMPORTED_ENDPOINT_ID.to_string(),
+        name: CLAUDE_CODE_IMPORTED_ENDPOINT_NAME.to_string(),
+        api_model: api_model.clone(),
+        endpoint: normalize_anthropic_messages_base_url(config.base_url),
+        api_format: ApiFormat::AnthropicMessages,
+        api_key: config.api_key.unwrap_or_default(),
+        context_length: imported_claude_context_length(&api_model),
+        beta_flags: Vec::new(),
+        supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        reasoning_param_format: Some(CustomReasoningParamFormat::AnthropicThinking),
+        replay_reasoning_content: Some(false),
+        server_tools: CustomEndpointServerTools { web_search: false },
+        supports_tool_lazy_loading: false,
+        supports_vision: true,
+    }
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(nonempty_string)
+}
+
+fn nonempty_string(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn strip_bearer_prefix(value: String) -> String {
+    let trimmed = value.trim();
+    if trimmed
+        .get(..7)
+        .map(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+        .unwrap_or(false)
+    {
+        trimmed[7..].trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_anthropic_messages_base_url(base_url: Option<String>) -> String {
+    let mut normalized = base_url
+        .and_then(nonempty_string)
+        .unwrap_or_else(|| DEFAULT_CLAUDE_CODE_CUSTOM_ENDPOINT_BASE.to_string())
+        .trim_end_matches('/')
+        .to_string();
+
+    if normalized
+        .to_ascii_lowercase()
+        .trim_end_matches('/')
+        .ends_with("/messages")
+    {
+        let without_messages = normalized
+            .trim_end_matches('/')
+            .strip_suffix("/messages")
+            .unwrap_or(&normalized)
+            .trim_end_matches('/')
+            .to_string();
+        normalized = without_messages;
+    }
+
+    if endpoint_has_version_suffix(&normalized) {
+        normalized
+    } else {
+        format!("{}/v1", normalized.trim_end_matches('/'))
+    }
+}
+
+fn endpoint_has_version_suffix(endpoint: &str) -> bool {
+    let path = url::Url::parse(endpoint)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| endpoint.to_string());
+    let last = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    last.len() > 1
+        && last
+            .strip_prefix('v')
+            .map(|digits| digits.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
+}
+
+fn normalize_imported_claude_model(model: Option<String>) -> String {
+    let raw = model
+        .and_then(nonempty_string)
+        .unwrap_or_else(|| DEFAULT_CLAUDE_CODE_CUSTOM_MODEL.to_string());
+    let without_provider = raw
+        .strip_prefix("anthropic/")
+        .or_else(|| raw.strip_prefix("openrouter/"))
+        .or_else(|| raw.strip_prefix("claude_code/"))
+        .unwrap_or(&raw);
+    let without_context = without_provider
+        .strip_suffix("[1m]")
+        .unwrap_or(without_provider)
+        .trim();
+
+    match without_context {
+        "opus" => DEFAULT_CLAUDE_CODE_CUSTOM_MODEL.to_string(),
+        "sonnet" => "claude-sonnet-4-6".to_string(),
+        "haiku" => "claude-haiku-4-5".to_string(),
+        "claude-opus-4.8" => "claude-opus-4-8".to_string(),
+        "claude-opus-4.7" => "claude-opus-4-7".to_string(),
+        "claude-sonnet-4.6" => "claude-sonnet-4-6".to_string(),
+        "claude-opus-4.6" => "claude-opus-4-6".to_string(),
+        "claude-haiku-4.5" => "claude-haiku-4-5".to_string(),
+        other if other.is_empty() => DEFAULT_CLAUDE_CODE_CUSTOM_MODEL.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn imported_claude_context_length(model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("claude-opus-4-8")
+        || m.contains("claude-opus-4.8")
+        || m.contains("claude-opus-4-7")
+        || m.contains("claude-opus-4.7")
+        || m.contains("claude-opus-4-6")
+        || m.contains("claude-opus-4.6")
+        || m.contains("claude-sonnet-4-6")
+        || m.contains("claude-sonnet-4.6")
+    {
+        1_000_000
+    } else if m.contains("claude")
+        || m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("haiku")
+    {
+        200_000
+    } else {
+        256_000
+    }
+}
+
+fn load_claude_code_oauth_credentials() -> Result<Option<(String, ImportedClaudeCodeOAuth)>, String>
+{
+    if let Some(dir) = crate::llm::claude_code_cli::claude_config_dir() {
+        let path = dir.join(".credentials.json");
+        if let Some(credentials) = load_claude_code_oauth_credentials_file(&path)? {
+            return Ok(Some((
+                format!("Claude Code {}", path.display()),
+                credentials,
+            )));
+        }
+    }
+
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(Some((
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                ImportedClaudeCodeOAuth {
+                    access_token: token,
+                    refresh_token: String::new(),
+                    // Unknown expiry — `setup-token` bearers are long-lived. Leave
+                    // it to the import path to stamp the non-refreshable far-future
+                    // expiry rather than a synthetic 1h window that self-destructs.
+                    expires_at: None,
+                },
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn load_claude_code_oauth_credentials_file(
+    path: &Path,
+) -> Result<Option<ImportedClaudeCodeOAuth>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "Failed to read Claude Code credentials file {}: {}",
+                path.display(),
+                err
+            ));
+        }
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|err| format!("Failed to parse Claude Code credentials JSON: {}", err))?;
+    Ok(parse_claude_code_oauth_credentials(&value))
+}
+
+fn parse_claude_code_oauth_credentials(
+    value: &serde_json::Value,
+) -> Option<ImportedClaudeCodeOAuth> {
+    let oauth = value.get("claudeAiOauth")?;
+    let access_token = json_string(oauth, &["accessToken", "access_token"]).unwrap_or_default();
+    let refresh_token = json_string(oauth, &["refreshToken", "refresh_token"]).unwrap_or_default();
+    if access_token.is_empty() && refresh_token.is_empty() {
+        return None;
+    }
+    Some(ImportedClaudeCodeOAuth {
+        access_token,
+        refresh_token,
+        expires_at: json_expiry_seconds(
+            oauth,
+            &[
+                "expiresAt",
+                "expires_at",
+                "accessTokenExpiresAt",
+                "access_token_expires_at",
+                "expiry",
+                "expiration",
+            ],
+        ),
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_expiry_seconds(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        let Some(raw) = value.get(*key) else {
+            continue;
+        };
+        if let Some(num) = raw.as_i64() {
+            return Some(normalize_epoch_seconds(num));
+        }
+        if let Some(num) = raw.as_u64().and_then(|value| i64::try_from(value).ok()) {
+            return Some(normalize_epoch_seconds(num));
+        }
+        if let Some(text) = raw
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(num) = text.parse::<i64>() {
+                return Some(normalize_epoch_seconds(num));
+            }
+            if let Ok(date) = chrono::DateTime::parse_from_rfc3339(text) {
+                return Some(date.timestamp());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_epoch_seconds(value: i64) -> i64 {
+    if value > 10_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
 }
 
 fn generate_device_id() -> String {
@@ -522,6 +979,122 @@ mod tests {
 
         assert!(!pending_state.is_empty());
         assert!(info.url.contains(&format!("&state={}", pending_state)));
+    }
+
+    #[test]
+    fn parses_claude_code_oauth_credentials() {
+        let value = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "access-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": 1_700_000_000_000i64
+            }
+        });
+
+        let parsed = parse_claude_code_oauth_credentials(&value).expect("credentials");
+
+        assert_eq!(parsed.access_token, "access-token");
+        assert_eq!(parsed.refresh_token, "refresh-token");
+        assert_eq!(parsed.expires_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn parses_claude_code_oauth_credentials_with_refresh_only() {
+        let value = serde_json::json!({
+            "claudeAiOauth": {
+                "refreshToken": "refresh-token"
+            }
+        });
+
+        let parsed = parse_claude_code_oauth_credentials(&value).expect("credentials");
+
+        assert!(parsed.access_token.is_empty());
+        assert_eq!(parsed.refresh_token, "refresh-token");
+    }
+
+    #[test]
+    fn ignores_claude_code_credentials_without_tokens() {
+        let value = serde_json::json!({
+            "claudeAiOauth": {
+                "tokenType": "Bearer"
+            }
+        });
+
+        assert!(parse_claude_code_oauth_credentials(&value).is_none());
+    }
+
+    #[test]
+    fn parses_claude_code_custom_endpoint_from_settings_env() {
+        let value = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                "ANTHROPIC_AUTH_TOKEN": "Bearer sk-proxy",
+                "ANTHROPIC_MODEL": "claude-opus-4.8"
+            }
+        });
+
+        let endpoint = build_claude_code_custom_endpoint(
+            parse_claude_code_custom_endpoint_settings(&value).expect("custom endpoint"),
+        );
+
+        assert_eq!(endpoint.id, "claude-code-import");
+        assert_eq!(endpoint.name, "Claude Code");
+        assert_eq!(endpoint.endpoint, "http://127.0.0.1:15721/v1");
+        assert_eq!(endpoint.api_key, "sk-proxy");
+        assert_eq!(endpoint.api_model, "claude-opus-4-8");
+        assert_eq!(endpoint.context_length, 1_000_000);
+        assert_eq!(endpoint.api_format, ApiFormat::AnthropicMessages);
+        assert_eq!(
+            endpoint.reasoning_param_format,
+            Some(CustomReasoningParamFormat::AnthropicThinking)
+        );
+    }
+
+    #[test]
+    fn parses_claude_code_custom_endpoint_from_ccswitch_top_level_fields() {
+        let value = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "ANTHROPIC_MODEL": "claude-sonnet-4.6"
+            },
+            "apiKey": "sk-kimi",
+            "base_url": "https://api.kimi.com/coding/v1"
+        });
+
+        let endpoint = build_claude_code_custom_endpoint(
+            parse_claude_code_custom_endpoint_settings(&value).expect("custom endpoint"),
+        );
+
+        assert_eq!(endpoint.endpoint, "https://api.kimi.com/coding/v1");
+        assert_eq!(endpoint.api_key, "sk-kimi");
+        assert_eq!(endpoint.api_model, "claude-sonnet-4-6");
+        assert_eq!(endpoint.context_length, 1_000_000);
+    }
+
+    #[test]
+    fn defaults_claude_code_custom_endpoint_to_opus_4_8() {
+        let endpoint = build_claude_code_custom_endpoint(ImportedClaudeCodeCustomEndpoint {
+            api_key: Some("sk-official".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(endpoint.endpoint, "https://api.anthropic.com/v1");
+        assert_eq!(endpoint.api_key, "sk-official");
+        assert_eq!(endpoint.api_model, "claude-opus-4-8");
+        assert_eq!(endpoint.context_length, 1_000_000);
+    }
+
+    #[test]
+    fn normalizes_claude_code_custom_endpoint_messages_url() {
+        let endpoint = build_claude_code_custom_endpoint(ImportedClaudeCodeCustomEndpoint {
+            base_url: Some("https://proxy.example/v1/messages".to_string()),
+            api_key: Some("sk-proxy".to_string()),
+            api_model: Some("claude_code/claude-opus-4.8[1m]".to_string()),
+        });
+
+        assert_eq!(endpoint.endpoint, "https://proxy.example/v1");
+        assert_eq!(endpoint.api_model, "claude-opus-4-8");
     }
 
     #[tokio::test]

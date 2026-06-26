@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import type { AuthStatus } from "../types";
+import type { AuthStatus, CustomEndpoint } from "../types";
 
 export interface ProviderStatus {
   id: string;
@@ -9,6 +9,14 @@ export interface ProviderStatus {
   /** Auth state for providers managing credentials outside Locus (claude_code):
    *  false = installed but not logged in; absent = unknown / not applicable. */
   loggedIn?: boolean;
+}
+
+export interface ClaudeCodeTokenImportResult {
+  kind: "oauth" | "custom_endpoint";
+  source: string;
+  expiresAt?: number | null;
+  hasRefreshToken: boolean;
+  customEndpoint?: CustomEndpoint | null;
 }
 
 export interface CodexStatus {
@@ -47,6 +55,20 @@ export interface CodexRateLimitsResponse {
   rateLimitsByLimitId: Record<string, CodexRateLimitSnapshot>;
 }
 
+export interface AnthropicRateLimitWindow {
+  limitId: string;
+  limitName?: string | null;
+  usedPercent: number;
+  remainingPercent: number;
+  windowMinutes?: number | null;
+  resetsAt?: number | null;
+}
+
+export interface AnthropicRateLimitsResponse {
+  fetchedAtMs: number;
+  windows: AnthropicRateLimitWindow[];
+}
+
 export interface CodexLoginInfo {
   userCode: string;
   url: string;
@@ -73,6 +95,14 @@ export function exchangeAuthCode(code: string): Promise<boolean> {
 
 export function authLogout(): Promise<void> {
   return ipcInvoke("auth_logout");
+}
+
+export function importClaudeCodeOAuth(): Promise<ClaudeCodeTokenImportResult> {
+  return ipcInvoke<ClaudeCodeTokenImportResult>("import_claude_code_oauth");
+}
+
+export function anthropicRateLimits(): Promise<AnthropicRateLimitsResponse> {
+  return ipcInvoke<AnthropicRateLimitsResponse>("anthropic_rate_limits");
 }
 
 export function saveApiKey(key: string): Promise<boolean> {
@@ -111,6 +141,10 @@ export function codexPollLogin(deviceAuthId: string, userCode: string): Promise<
 
 export function codexLogout(): Promise<void> {
   return ipcInvoke("codex_logout");
+}
+
+export function importCodexCli(): Promise<CodexStatus> {
+  return ipcInvoke<CodexStatus>("import_codex_cli");
 }
 
 export function codexRetryAuth(): Promise<CodexStatus> {
