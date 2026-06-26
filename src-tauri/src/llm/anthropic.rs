@@ -34,7 +34,7 @@ pub struct WebSearchHit {
     pub url: String,
 }
 
-const BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24";
+const BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20";
 const API_VERSION: &str = "2023-06-01";
 const API_BASE: &str = "https://api.anthropic.com";
 
@@ -97,6 +97,9 @@ fn stream_response_header_summary(response: &reqwest::Response) -> String {
         "x-request-id",
         "request-id",
         "cf-ray",
+        "via",
+        "x-cache",
+        "eo-log-uuid",
     ];
 
     let headers = response.headers();
@@ -115,6 +118,65 @@ fn stream_response_header_summary(response: &reqwest::Response) -> String {
         "(none)".to_string()
     } else {
         summary
+    }
+}
+
+/// Pull the byte offset out of an upstream `... at line 1 column N` JSON parse
+/// error. Used to compare where the upstream stopped parsing against the size of
+/// the body this client actually sent (#48 truncation diagnostics).
+fn extract_json_parse_error_column(error_body: &str) -> Option<usize> {
+    let marker = "column ";
+    let start = error_body.find(marker)? + marker.len();
+    let digits: String = error_body[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Log transport-level facts for a non-success HTTP response: the upstream peer,
+/// negotiated protocol, elapsed time, the size of the request body this client
+/// sent, and — for body-parse 400s — how far into that body the upstream got
+/// before failing. A parse failure far short of the local body size points at
+/// truncation in transit rather than a malformed local payload (#48).
+#[allow(clippy::too_many_arguments)]
+fn log_non_success_diagnostics(
+    tag: &str,
+    status: reqwest::StatusCode,
+    remote_addr: &str,
+    http_version: &str,
+    elapsed_ms: u128,
+    compact_body_len: usize,
+    tool_count: usize,
+    model: &str,
+    response_headers: &str,
+    error_body: &str,
+) {
+    eprintln!(
+        "[{}] HTTP {} from {} proto={} elapsed={}ms request_body={} bytes (compact) tools={} model={}",
+        tag,
+        status.as_u16(),
+        remote_addr,
+        http_version,
+        elapsed_ms,
+        compact_body_len,
+        tool_count,
+        model
+    );
+    eprintln!("[{}] response headers: {}", tag, response_headers);
+
+    if error_body.contains("Failed to parse the request body as JSON") {
+        if let Some(col) = extract_json_parse_error_column(error_body) {
+            let pct = if compact_body_len > 0 {
+                col.min(compact_body_len) * 100 / compact_body_len
+            } else {
+                0
+            };
+            eprintln!(
+                "[{}] upstream stopped parsing at column {} (~{}% of the {}-byte request body this client sent). The local body is well-formed JSON, so the upstream most likely received a truncated copy — consistent with truncation in transit rather than a malformed local payload.",
+                tag, col, pct, compact_body_len
+            );
+        }
     }
 }
 
@@ -615,13 +677,20 @@ where
     };
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+    // Compact body matches the bytes reqwest actually sends (`.json()` serializes
+    // compact). Its length shares the same offset scale as the `line 1 column N`
+    // position an upstream JSON parser reports, so it is the number to compare
+    // against when diagnosing mid-transit truncation (#48).
+    let compact_body = serde_json::to_string(&body).unwrap_or_default();
+    let compact_body_len = compact_body.len();
 
     eprintln!(
-        "[{}] POST model={} messages={} tools={}",
+        "[{}] POST model={} messages={} tools={} body_bytes={}",
         tag,
         model,
         history.len(),
-        tool_count
+        tool_count,
+        compact_body_len
     );
 
     let api_url = format!("{}/messages", base_url.trim_end_matches('/'));
@@ -665,6 +734,7 @@ where
         for (key, value) in &headers {
             req = req.header(key.as_str(), value.as_str());
         }
+        let started = std::time::Instant::now();
         match req.json(&body).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -683,9 +753,57 @@ where
                     .await;
                 }
 
+                // Capture transport-level facts before `text()` consumes `resp`.
+                let http_version = format!("{:?}", resp.version());
+                let remote_addr = resp
+                    .remote_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let response_headers = stream_response_header_summary(&resp);
+
                 let is_retryable =
                     status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error();
                 let error_body = resp.text().await.unwrap_or_default();
+                let elapsed_ms = started.elapsed().as_millis();
+
+                log_non_success_diagnostics(
+                    tag,
+                    status,
+                    &remote_addr,
+                    &http_version,
+                    elapsed_ms,
+                    compact_body_len,
+                    tool_count,
+                    model,
+                    &response_headers,
+                    &error_body,
+                );
+
+                // When the failure looks like the gateway-truncation class (#48),
+                // drop a copy-pasteable curl plus the exact request bytes so the
+                // user (or the endpoint operator) can reproduce it directly.
+                if status.as_u16() == 400
+                    && error_body.contains("Failed to parse the request body as JSON")
+                {
+                    let note = format!(
+                        "HTTP 400 from {} proto={}; upstream JSON parse error{}; local request body = {} bytes (compact). The .body.json file holds the exact bytes this client sent.",
+                        remote_addr,
+                        http_version,
+                        extract_json_parse_error_column(&error_body)
+                            .map(|col| format!(" at column {}", col))
+                            .unwrap_or_default(),
+                        compact_body_len
+                    );
+                    if let Some(path) =
+                        super::debug::save_repro_curl(tag, &api_url, &headers, &compact_body, &note)
+                    {
+                        eprintln!(
+                            "[{}] saved reproduction (curl + request body) to: {}",
+                            tag,
+                            path.display()
+                        );
+                    }
+                }
 
                 if is_retryable && attempt < MAX_RETRIES {
                     let delay = BASE_DELAY_MS * 2u64.pow(attempt);
@@ -1196,10 +1314,15 @@ fn build_thinking_params(
     model: &str,
     thinking_level: Option<&str>,
 ) -> (Option<ThinkingParam>, Option<serde_json::Value>, u32) {
-    let is_adaptive = model.contains("sonnet-4.6")
-        || model.contains("sonnet-4-6")
-        || model.contains("opus-4.6")
-        || model.contains("opus-4-6");
+    let normalized_model = model.to_ascii_lowercase().replace('.', "-");
+    let is_fable = normalized_model.contains("claude-fable-5");
+    let is_adaptive = is_fable
+        || normalized_model.contains("claude-mythos-5")
+        || normalized_model.contains("claude-mythos-preview")
+        || normalized_model.contains("sonnet-4-6")
+        || normalized_model.contains("opus-4-8")
+        || normalized_model.contains("opus-4-7")
+        || normalized_model.contains("opus-4-6");
 
     let level = match thinking_level {
         Some(l) if !l.is_empty() => l,
@@ -1209,6 +1332,10 @@ fn build_thinking_params(
         _ => return (None, None, 16384),
     };
 
+    if level == "none" && is_fable {
+        return (Some(ThinkingParam::Adaptive), None, 32000);
+    }
+
     if level == "none" {
         return (Some(ThinkingParam::Disabled), None, 8192);
     }
@@ -1216,11 +1343,21 @@ fn build_thinking_params(
     if is_adaptive {
         // https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
         let output_config = match level {
-            "low" | "medium" | "high" => Some(serde_json::json!({ "effort": level })),
-            "max" => Some(serde_json::json!({ "effort": "high" })),
+            "low" | "medium" | "high" | "xhigh" | "max" => {
+                Some(serde_json::json!({ "effort": level }))
+            }
             _ => None,
         };
-        (Some(ThinkingParam::Adaptive), output_config, 32000)
+        // xhigh/max run long on Opus 4.7/4.8 — a 32k output cap truncates
+        // mid-task, so give those tiers the headroom the docs call for (these
+        // models support up to 128k output; the OAuth path streams, so the
+        // larger cap carries no HTTP-timeout risk).
+        let max_tokens = if matches!(level, "xhigh" | "max") {
+            64000
+        } else {
+            32000
+        };
+        (Some(ThinkingParam::Adaptive), output_config, max_tokens)
     } else {
         let (budget_tokens, max_tokens) = match level {
             "low" => (2048, 8192),
@@ -1528,8 +1665,11 @@ fn build_oauth_system_blocks(system_parts: &[&str]) -> serde_json::Value {
 
 fn normalize_anthropic_model(model: &str) -> &str {
     match model {
+        "claude-opus-4.8" => "claude-opus-4-8",
+        "claude-opus-4.7" => "claude-opus-4-7",
         "claude-sonnet-4.6" => "claude-sonnet-4-6",
         "claude-opus-4.6" => "claude-opus-4-6",
+        "claude-haiku-4.5" => "claude-haiku-4-5",
         other => other,
     }
 }
@@ -2127,10 +2267,11 @@ struct MessageDelta {
 mod tests {
     use super::{
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
-        build_oauth_system_blocks, build_text_blocks, convert_tools_to_oauth_sdk_like_anthropic,
-        next_sse_separator, resolve_native_beta_flags, rewrite_oauth_tool_use_blocks,
-        sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions, AnthropicMessage,
-        HistoryContentBlock, NativeChatRequest, NativeSystemBlock, ThinkingParam, CACHE_TTL,
+        build_oauth_system_blocks, build_text_blocks, build_thinking_params,
+        convert_tools_to_oauth_sdk_like_anthropic, next_sse_separator, resolve_native_beta_flags,
+        rewrite_oauth_tool_use_blocks, sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions,
+        AnthropicMessage, HistoryContentBlock, NativeChatRequest, NativeSystemBlock, ThinkingParam,
+        CACHE_TTL,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use serde_json::json;
@@ -2192,6 +2333,25 @@ mod tests {
             serde_json::to_string(&ThinkingParam::Disabled).unwrap(),
             r#"{"type":"disabled"}"#
         );
+    }
+
+    #[test]
+    fn current_claude_models_use_adaptive_effort_params() {
+        let (thinking, output_config, max_tokens) =
+            build_thinking_params("claude-opus-4-8", Some("xhigh"));
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "adaptive" })
+        );
+        assert_eq!(output_config, Some(json!({ "effort": "xhigh" })));
+        assert_eq!(max_tokens, 64000);
+
+        let (thinking, output_config, _) = build_thinking_params("claude-fable-5", Some("none"));
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "adaptive" })
+        );
+        assert_eq!(output_config, None);
     }
 
     #[test]

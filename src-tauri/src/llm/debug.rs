@@ -96,6 +96,84 @@ pub fn save_request(provider: &str, url: &str, headers: &[(&str, &str)], body: &
     }
 }
 
+/// Persist a copy-pasteable reproduction of a failing request: the exact compact
+/// request bytes (`<ts>_<seq>.body.json`) plus a runnable `curl` script
+/// (`<ts>_<seq>.repro.sh`) that POSTs those bytes back to the same endpoint.
+///
+/// Intended for the gateway-truncation failure class (issue #48): because the
+/// body file holds the precise bytes this client emitted, the `line 1 column N`
+/// offset an upstream parser reports lines up exactly, making it trivial to
+/// confirm where the request was cut.
+///
+/// Secrets are never written: `Authorization` / `x-api-key` are replaced with a
+/// `<YOUR_API_KEY>` placeholder the user fills in before running. Returns the
+/// path to the curl script, or `None` if writing failed.
+pub fn save_repro_curl(
+    provider: &str,
+    url: &str,
+    headers: &[(String, String)],
+    compact_body: &str,
+    note: &str,
+) -> Option<PathBuf> {
+    let dir = debug_dir_for(provider);
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let body_filename = format!("{}_{:04}.body.json", ts, seq);
+    let curl_filename = format!("{}_{:04}.repro.sh", ts, seq);
+    let body_path = dir.join(&body_filename);
+    let curl_path = dir.join(&curl_filename);
+
+    if let Err(e) = std::fs::write(&body_path, compact_body) {
+        eprintln!("[debug] failed to write {:?}: {}", body_path, e);
+        return None;
+    }
+
+    // curl.exe on Windows bypasses the PowerShell `curl` -> Invoke-WebRequest alias.
+    let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+    let mut cmd = format!("{} -sS -X POST '{}'", curl_bin, single_quote(url));
+    for (key, value) in headers {
+        let value = if key.eq_ignore_ascii_case("authorization") {
+            "Bearer <YOUR_API_KEY>".to_string()
+        } else if key.eq_ignore_ascii_case("x-api-key") {
+            "<YOUR_API_KEY>".to_string()
+        } else {
+            value.clone()
+        };
+        cmd.push_str(&format!(" -H '{}: {}'", key, single_quote(&value)));
+    }
+    // Keep the `@` inside the quotes so PowerShell does not treat it as a splat.
+    cmd.push_str(&format!(
+        " --data-binary '@{}'",
+        single_quote(&body_path.to_string_lossy())
+    ));
+
+    let content = format!(
+        "# Reproduce the failing request (issue #48 truncation diagnostics)\n\
+         # {note}\n\
+         # 1) Replace <YOUR_API_KEY> with your real API key.\n\
+         # 2) Run in Git Bash / WSL / macOS / Linux, or paste the curl.exe line into PowerShell.\n\
+         #    (Do not use legacy cmd.exe: it does not understand single quotes.)\n\
+         # Request body (exact bytes this client sent): {body_filename}\n\
+         \n\
+         {cmd}\n",
+        note = note,
+        body_filename = body_filename,
+        cmd = cmd,
+    );
+
+    if let Err(e) = std::fs::write(&curl_path, content) {
+        eprintln!("[debug] failed to write {:?}: {}", curl_path, e);
+        return None;
+    }
+
+    Some(curl_path)
+}
+
+/// Escape single quotes for embedding inside a single-quoted shell string.
+fn single_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{default_debug_base_dir, repo_debug_base_dir};
