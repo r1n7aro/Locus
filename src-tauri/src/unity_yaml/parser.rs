@@ -197,8 +197,13 @@ fn parse_yaml_docs_impl(
         if has_guid && field == "m_SourcePrefab" && class_id == Some(1001) {
             if let Some(guid_str) = extract_value(ct, "guid:") {
                 let hex = guid_str.trim().trim_end_matches(',');
-                if hex.len() >= 32 {
-                    *source_prefab_guid = parse_guid_hex(&hex[..32]);
+                // `get(..32)` instead of `[..32]`: byte 32 can land inside a
+                // multi-byte UTF-8 char in a corrupt/hand-edited file and the
+                // indexed slice would panic (issue #97 class, same fix as
+                // `meta_parser::extract_guid`). `None` covers both short and
+                // non-boundary values; `parse_guid_hex` rejects non-hex anyway.
+                if let Some(hex32) = hex.get(..32) {
+                    *source_prefab_guid = parse_guid_hex(hex32);
                 }
             }
         }
@@ -1795,8 +1800,11 @@ pub fn collect_guids_from_lines(lines: &[&str], start: usize, end: usize) -> Vec
         while let Some(idx) = line[pos..].find("guid:") {
             let after = pos + idx + 5; // skip "guid:"
             let rest = line[after..].trim_start();
-            if rest.len() >= 32 {
-                let hex = &rest[..32];
+            // `get(..32)` instead of a length check + `[..32]`: any line
+            // containing `guid:` reaches this (including string values like
+            // `value: 'guid: <CJK text>'`), and byte 32 landing mid-codepoint
+            // would panic the indexed slice (issue #97 class).
+            if let Some(hex) = rest.get(..32) {
                 if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                     if let Some(guid) = parse_guid_hex(hex) {
                         if guid != [0u8; 16] && seen.insert(guid) {

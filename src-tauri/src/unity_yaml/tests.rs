@@ -4,9 +4,10 @@ use super::references::extract_refs;
 use super::tokenizer::parse_doc_header_full;
 use super::{
     build_go_tree, build_hierarchy_path_map, build_internal_id_map, build_world_transform_map,
-    find_go_by_path, format_doc_state_lines, format_hierarchy_search_results,
-    format_hierarchy_summary, format_hierarchy_summary_with_options, format_hierarchy_tree,
-    format_override_summary, format_prefab_instance_detail, get_components_for_go, parse_yaml_docs,
+    collect_guids_from_lines, find_go_by_path, format_doc_state_lines,
+    format_hierarchy_search_results, format_hierarchy_summary,
+    format_hierarchy_summary_with_options, format_hierarchy_tree, format_override_summary,
+    format_prefab_instance_detail, get_components_for_go, parse_yaml_docs,
     resolve_references_in_lines, resolve_references_in_lines_skipping_fields,
     summarize_prefab_instance, HierarchyNode, HierarchySearchOptions, HierarchySummaryOptions,
     DEFAULT_HIERARCHY_MAX_NODES,
@@ -1841,4 +1842,70 @@ PrefabInstance:
     assert_eq!(file.component_index.get(&400).map(Vec::len), Some(2));
     // PrefabInstance 600 owns 1 doc: itself.
     assert_eq!(file.component_index.get(&600).map(Vec::len), Some(1));
+}
+
+#[test]
+fn test_single_quoted_names_are_unquoted() {
+    // Unity's emitter single-quotes any name that needs quoting at all
+    // (leading `[`/`-`/`>`, colons, trailing spaces) — real projects use such
+    // names routinely (`'[Managers]'`, organizer objects like
+    // `'--------- AUDIO --- '`). The quotes are YAML syntax, not part of the
+    // name; `''` is the single-quote escape for a literal `'`.
+    let yaml = b"--- !u!1 &100\nGameObject:\n  m_Name: '[Managers] '\n--- !u!1 &200\nGameObject:\n  m_Name: 'It''s'\n--- !u!1 &300\nGameObject:\n  m_Name: '>'\n";
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs[0].m_name.as_deref(), Some("[Managers] "));
+    assert_eq!(docs[1].m_name.as_deref(), Some("It's"));
+    assert_eq!(docs[2].m_name.as_deref(), Some(">"));
+
+    // A PrefabInstance renamed via an m_Name modification goes through the
+    // same value extraction and must unquote identically.
+    let pi_yaml = b"--- !u!1001 &900\nPrefabInstance:\n  m_Modification:\n    m_Modifications:\n    - target: {fileID: 400000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      propertyPath: m_Name\n      value: '[Spawner] '\n      objectReference: {fileID: 0}\n";
+    let docs = parse_yaml_docs(pi_yaml);
+    assert_eq!(docs[0].m_name.as_deref(), Some("[Spawner] "));
+}
+
+#[test]
+fn test_collect_guids_ignores_multibyte_after_guid_marker() {
+    // Any line containing `guid:` reaches the collector — including plain
+    // string values such as `value: 'guid: <CJK text>'`. When byte 32 after
+    // the marker lands mid-codepoint the old `&rest[..32]` slice panicked
+    // (issue #97 UTF-8-boundary class, same fix as `meta_parser`). Must
+    // skip the junk, never panic, and still collect real guids.
+    let cjk_long = format!("  value: 'guid: {}'", "中".repeat(11)); // 33 bytes after the marker
+    let cjk_short = "  note: 'guid: 中文资产'";
+    let valid =
+        "  m_Script: {fileID: 11500000, guid: aabbccdd11223344aabbccdd11223344, type: 3}";
+    let lines: Vec<&str> = vec![cjk_long.as_str(), cjk_short, valid];
+
+    let guids = collect_guids_from_lines(&lines, 0, lines.len());
+
+    assert_eq!(guids.len(), 1);
+    assert_eq!(guid_to_hex(&guids[0]), "aabbccdd11223344aabbccdd11223344");
+}
+
+#[test]
+fn test_parse_yaml_docs_ignores_multibyte_source_prefab_guid() {
+    // Corrupt/hand-edited PrefabInstance whose m_SourcePrefab guid is CJK
+    // text: byte 32 lands mid-codepoint and the old `&hex[..32]` slice
+    // panicked (issue #97 class). The doc must parse with no
+    // source_prefab_guid instead.
+    let yaml = format!(
+        "--- !u!1001 &9999\nPrefabInstance:\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n",
+        "中".repeat(11)
+    );
+
+    let docs = parse_yaml_docs(yaml.as_bytes());
+
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].source_prefab_guid, None);
+
+    // Same field arriving as a wrapped multi-line flow map takes the
+    // brace-joined path through the identical helper — must also not panic.
+    let wrapped = format!(
+        "--- !u!1001 &9999\nPrefabInstance:\n  m_SourcePrefab: {{fileID: 100100000, guid: {},\n    type: 3}}\n",
+        "中".repeat(11)
+    );
+    let docs = parse_yaml_docs(wrapped.as_bytes());
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].source_prefab_guid, None);
 }

@@ -80,6 +80,18 @@ pub(super) fn extract_plain_value(line: &str, key: &str) -> Option<String> {
 }
 
 fn decode_yaml_string(s: &str) -> String {
+    // Single-quoted scalar — Unity's emitter quotes in this style whenever a
+    // string needs quoting at all (`m_Name: '[Managers] '`, `m_Name: '>'`,
+    // trailing spaces, leading `-`/`:`), so this is the common quoted form in
+    // real projects. The only escape in single-quoted YAML is `''` → `'`;
+    // backslashes are literal, so skip the escape loop below.
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        let inner = &s[1..s.len() - 1];
+        if inner.contains("''") {
+            return inner.replace("''", "'");
+        }
+        return inner.to_string();
+    }
     let inner = if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         &s[1..s.len() - 1]
     } else {
