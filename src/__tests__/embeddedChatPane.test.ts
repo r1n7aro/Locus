@@ -37,7 +37,8 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain("<ChatTranscript");
     expect(pane).toContain("const viewportStates = new Map<string, SessionScrollState>()");
     expect(pane).toContain("const toolHandoffViewportQuiet = ref(false);");
-    expect(pane).toContain("watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });");
+    expect(pane).toContain("() => props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(\",\"),");
+    expect(pane).not.toContain("watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });");
     expect(pane).toContain("@tool-handoff-quiet-change=\"handleToolHandoffQuietChange\"");
     expect(pane).toContain("@scroll=\"handleTranscriptScroll\"");
     expect(pane).toContain("@user-scroll-intent=\"markTranscriptUserScrollIntent\"");

@@ -303,7 +303,7 @@ function nowMs(): number {
   return Date.now();
 }
 
-function diagnosticsEnabled(): boolean {
+function readDiagnosticsEnabled(): boolean {
   if (typeof window === "undefined") return false;
 
   try {
@@ -318,6 +318,26 @@ function diagnosticsEnabled(): boolean {
   } catch {
     return false;
   }
+}
+
+// Enablement is probed on hot paths (per stream delta, per scroll event), so
+// the query/sessionStorage lookup is cached for a short window. Toggling the
+// sessionStorage flag at runtime takes effect within DIAGNOSTICS_CACHE_TTL_MS.
+const DIAGNOSTICS_CACHE_TTL_MS = 1000;
+let cachedDiagnosticsEnabled = false;
+let cachedDiagnosticsEnabledAt = Number.NEGATIVE_INFINITY;
+
+function diagnosticsEnabled(): boolean {
+  const now = Date.now();
+  if (now - cachedDiagnosticsEnabledAt >= DIAGNOSTICS_CACHE_TTL_MS) {
+    cachedDiagnosticsEnabled = readDiagnosticsEnabled();
+    cachedDiagnosticsEnabledAt = now;
+  }
+  return cachedDiagnosticsEnabled;
+}
+
+export function resetLayoutDiagnosticsCacheForTest() {
+  cachedDiagnosticsEnabledAt = Number.NEGATIVE_INFINITY;
 }
 
 export function isLayoutDiagnosticsEnabled(): boolean {

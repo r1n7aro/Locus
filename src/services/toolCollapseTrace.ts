@@ -81,8 +81,29 @@ function sessionTraceMode(): ToolCollapseTraceMode | null {
   }
 }
 
+// Trace checks sit on hot render paths (per stream delta, per watch tick), so
+// the query/sessionStorage lookup is cached for a short window instead of
+// re-parsing the URL on every call. Toggling the sessionStorage flag at
+// runtime takes effect within TRACE_MODE_CACHE_TTL_MS.
+const TRACE_MODE_CACHE_TTL_MS = 1000;
+let cachedTraceMode: ToolCollapseTraceMode | null = null;
+let cachedTraceModeAt = Number.NEGATIVE_INFINITY;
+
+function resolveTraceMode(): ToolCollapseTraceMode | null {
+  const now = Date.now();
+  if (now - cachedTraceModeAt >= TRACE_MODE_CACHE_TTL_MS) {
+    cachedTraceMode = queryTraceMode() ?? sessionTraceMode();
+    cachedTraceModeAt = now;
+  }
+  return cachedTraceMode;
+}
+
+export function resetToolCollapseTraceCacheForTest() {
+  cachedTraceModeAt = Number.NEGATIVE_INFINITY;
+}
+
 function shouldTraceEvent(event: string) {
-  const mode = queryTraceMode() ?? sessionTraceMode();
+  const mode = resolveTraceMode();
   if (mode === "all") return true;
   if (mode === "handoff") return TOOL_COLLAPSE_HANDOFF_EVENTS.has(event);
   if (mode === "waiting") return event === "waitingLayoutStateChanged";
@@ -109,17 +130,20 @@ export function previewTraceText(text: string, maxLength = 80) {
   return `${compact.slice(0, maxLength - 1)}…`;
 }
 
+// Pass a thunk for details that are expensive to build (full-text previews,
+// per-message snapshots) so disabled traces cost nothing beyond the mode check.
 export function logToolCollapseTrace(
   scope: string,
   event: string,
-  detail?: Record<string, unknown>,
+  detail?: Record<string, unknown> | (() => Record<string, unknown>),
 ) {
   if (!shouldTraceEvent(event)) return;
 
+  const resolvedDetail = typeof detail === "function" ? detail() : detail;
   const prefix = `[tool-collapse][+${elapsedMs()}ms][${scope}] ${event}`;
-  if (!detail || Object.keys(detail).length === 0) {
+  if (!resolvedDetail || Object.keys(resolvedDetail).length === 0) {
     console.info(prefix);
     return;
   }
-  console.info(prefix, detail);
+  console.info(prefix, resolvedDetail);
 }

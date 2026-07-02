@@ -287,17 +287,53 @@ export function resolveToolCallDisplayShape(
   }
 }
 
+// Fingerprints are recomputed on hot paths (per messages-array replacement
+// during an active tool handoff), and normalizing arguments means JSON.parse
+// plus a stable re-serialize of potentially large payloads (a Write call
+// carries the whole file). Cache per tool-call object; entries revalidate on
+// name/arguments/nested-fingerprint identity so in-place mutations still miss.
+interface ToolCallFingerprintCacheEntry {
+  name: string;
+  argumentsText: string;
+  nested: string;
+  fingerprint: string;
+}
+
+const toolCallFingerprintCache = new WeakMap<object, ToolCallFingerprintCacheEntry>();
+
+function getCachedToolCallFingerprint(
+  toolCall: { name: string; arguments: string },
+  nestedJoined: string,
+): string {
+  const cached = toolCallFingerprintCache.get(toolCall);
+  if (
+    cached
+    && cached.name === toolCall.name
+    && cached.argumentsText === toolCall.arguments
+    && cached.nested === nestedJoined
+  ) {
+    return cached.fingerprint;
+  }
+  const display = resolveToolCallDisplayShape(toolCall);
+  const fingerprint = `${display.name}\u241f${normalizeToolCallArgumentsForTool(display.name, display.arguments)}\u241f${nestedJoined}`;
+  toolCallFingerprintCache.set(toolCall, {
+    name: toolCall.name,
+    argumentsText: toolCall.arguments,
+    nested: nestedJoined,
+    fingerprint,
+  });
+  return fingerprint;
+}
+
 export function getToolCallInfoFingerprint(toolCall: Pick<ToolCallInfo, "name" | "arguments" | "nestedToolCalls">): string {
   const nestedFingerprints = toolCall.nestedToolCalls?.map((nestedToolCall) => getToolCallInfoFingerprint(nestedToolCall)) ?? [];
-  const display = resolveToolCallDisplayShape(toolCall);
-  return `${display.name}\u241f${normalizeToolCallArgumentsForTool(display.name, display.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
+  return getCachedToolCallFingerprint(toolCall, nestedFingerprints.join("\u241e"));
 }
 
 export function getToolCallDisplayFingerprint(toolCall: Pick<ToolCallDisplay, "name" | "arguments" | "nestedToolCalls">): string {
   const nestedFingerprints =
     toolCall.nestedToolCalls?.map((nestedToolCall) => getToolCallDisplayFingerprint(nestedToolCall)) ?? [];
-  const display = resolveToolCallDisplayShape(toolCall);
-  return `${display.name}\u241f${normalizeToolCallArgumentsForTool(display.name, display.arguments)}\u241f${nestedFingerprints.join("\u241e")}`;
+  return getCachedToolCallFingerprint(toolCall, nestedFingerprints.join("\u241e"));
 }
 
 function normalizeToolCallArgumentsForTool(toolName: string, argumentsText: string): string {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isToolCollapseTraceEnabled } from "../services/toolCollapseTrace";
+import { isToolCollapseTraceEnabled, resetToolCollapseTraceCacheForTest } from "../services/toolCollapseTrace";
 
 function createStorageMock() {
   const store = new Map<string, string>();
@@ -24,6 +24,7 @@ describe("tool collapse trace enablement", () => {
     vi.stubGlobal("window", { location: { search: "" } });
     vi.stubGlobal("localStorage", createStorageMock());
     vi.stubGlobal("sessionStorage", createStorageMock());
+    resetToolCollapseTraceCacheForTest();
   });
 
   afterEach(() => {

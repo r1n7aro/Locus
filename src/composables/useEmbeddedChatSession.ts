@@ -605,8 +605,17 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
         const sourceToolCalls = targetIds
           ? state.activeToolCalls.filter((toolCall) => targetIds.has(toolCall.id))
           : state.activeToolCalls;
-        for (const message of buildToolResultMessages(sourceToolCalls)) {
-          state.messages = replaceMessageById(state.messages, message);
+        // Apply the whole batch as a single messages-array replacement:
+        // every replacement re-runs the transcript's O(messages) grouping
+        // pipeline, so per-result replacements multiply that cost by the
+        // batch size.
+        const toolResultMessages = buildToolResultMessages(sourceToolCalls);
+        if (toolResultMessages.length > 0) {
+          let next = state.messages;
+          for (const message of toolResultMessages) {
+            next = replaceMessageById(next, message);
+          }
+          state.messages = next;
         }
       }
       break;

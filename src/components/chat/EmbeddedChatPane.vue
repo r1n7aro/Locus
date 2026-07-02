@@ -555,9 +555,18 @@ watch(
 
 watch(() => props.messages.length, () => reconcileViewport());
 watch(displayedStreamingText, () => reconcileViewport());
-watch(() => props.thinkingText, () => reconcileViewport());
+// The transient thinking block renders as a fixed-height chip, so only its
+// appearance/disappearance affects layout — not each streamed delta.
+watch(() => !!props.thinkingText, () => reconcileViewport());
 watch(() => props.isThinking, () => reconcileViewport());
-watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });
+// Reconcile on tool-call identity/status changes only. A deep watch here would
+// re-traverse every tool call (including large streamed output strings) and
+// force a synchronous layout read on each output delta; growth-driven height
+// changes are already covered by the transcript ResizeObserver.
+watch(
+  () => props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","),
+  () => reconcileViewport(),
+);
 watch(
   () => props.isStreaming,
   (nextStreaming, previousStreaming) => {

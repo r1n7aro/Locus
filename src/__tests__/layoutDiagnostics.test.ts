@@ -11,6 +11,7 @@ import {
   compareToolBlockLayoutSnapshots,
   compareTranscriptLayoutSnapshots,
   isLayoutDiagnosticsEnabled,
+  resetLayoutDiagnosticsCacheForTest,
 } from "../services/layoutDiagnostics";
 
 function createStorageMock() {
@@ -173,6 +174,7 @@ describe("layoutDiagnostics", () => {
       vi.stubGlobal("window", { location: { search: "" } });
       vi.stubGlobal("localStorage", createStorageMock());
       vi.stubGlobal("sessionStorage", createStorageMock());
+      resetLayoutDiagnosticsCacheForTest();
     });
 
     afterEach(() => {

@@ -284,10 +284,12 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("canonicalLiveRenderParts.value.some((part) => part.kind === \"text\" || part.kind === \"toolCall\")");
     expect(transcript).toContain("const activeToolCallMatchState = computed<ToolCallMatchState>(() => {");
     expect(transcript).toContain("return toolCallHandoff.value?.toolCallMatchState ?? {");
-    expect(transcript).toContain("const baseGroupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(activeToolCallMatchState.value));");
+    expect(transcript).toContain("const baseGroupedMessages = computed<MessageGroup[]>(() =>");
+    expect(transcript).toContain("buildGroupedMessages(activeToolCallMatchState.value),");
     expect(transcript).toContain("const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {");
     expect(transcript).toContain("return mergeToolCallMatchStates(");
-    expect(transcript).toContain("const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));");
+    expect(transcript).toContain("const groupedMessages = computed<MessageGroup[]>(() => {");
+    expect(transcript).toContain("buildGroupedMessages(hiddenMatchState),");
     expect(transcript).toContain("toolCallTreeHasAnyIds(message.toolCalls, toolCallHandoff.value!.toolCallMatchState)");
     expect(transcript).toContain("function shouldReleaseToolCallHandoffToHistory(");
     expect(transcript).toContain("function hasVisibleUserMessageAfterToolCallMatch(");
