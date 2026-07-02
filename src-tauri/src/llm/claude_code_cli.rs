@@ -1589,6 +1589,8 @@ fn normalize_claude_model(model: &str) -> String {
         .map(|base| (base, "[1m]"))
         .unwrap_or((short, ""));
     let normalized = match base {
+        "sonnet" => "claude-sonnet-5",
+        "fable" => "claude-fable-5",
         "claude-opus-4.8" => "claude-opus-4-8",
         "claude-opus-4.7" => "claude-opus-4-7",
         "claude-sonnet-4.6" => "claude-sonnet-4-6",
@@ -1695,6 +1697,16 @@ mod tests {
         assert_eq!(
             strip_mcp_tool_prefix("mcp__other__tool", "locus"),
             "mcp__other__tool"
+        );
+    }
+
+    #[test]
+    fn normalize_claude_model_maps_current_aliases_and_ids() {
+        assert_eq!(normalize_claude_model("sonnet"), "claude-sonnet-5");
+        assert_eq!(normalize_claude_model("fable"), "claude-fable-5");
+        assert_eq!(
+            normalize_claude_model("claude_code/claude-opus-4.8[1m]"),
+            "claude-opus-4-8[1m]"
         );
     }
 

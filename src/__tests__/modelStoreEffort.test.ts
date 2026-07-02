@@ -105,22 +105,42 @@ describe("useModelStore OpenAI effort mapping", () => {
     authStore.isAuthenticated = true;
     const modelStore = useModelStore();
 
-    expect(modelStore.availableModels[0]?.id).toBe("claude-opus-4.8");
-    expect(modelStore.availableModels.some((model) => model.id.includes("fable"))).toBe(false);
+    expect(
+      modelStore.availableModels
+        .map((model) => model.id)
+        .filter((id) => id.startsWith("claude-")),
+    ).toEqual(["claude-fable-5", "claude-opus-4.8", "claude-sonnet-5", "claude-opus-4.6"]);
     expect(modelStore.availableModels).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          id: "claude-fable-5",
+          name: "Claude Fable 5[1m]",
+          contextWindow: 1_000_000,
+        }),
         expect.objectContaining({
           id: "claude-opus-4.8",
           name: "Claude Opus 4.8[1m]",
           contextWindow: 1_000_000,
         }),
         expect.objectContaining({
-          id: "claude-haiku-4.5",
-          name: "Claude Haiku 4.5",
-          contextWindow: 200_000,
+          id: "claude-sonnet-5",
+          name: "Claude Sonnet 5[1m]",
+          contextWindow: 1_000_000,
+        }),
+        expect.objectContaining({
+          id: "claude-opus-4.6",
+          name: "Claude Opus 4.6[1m]",
+          contextWindow: 1_000_000,
         }),
       ]),
     );
+    expect(modelStore.availableModels.some((model) => model.id === "claude-sonnet-4.6")).toBe(
+      false,
+    );
+    expect(modelStore.availableModels.some((model) => model.id === "claude-haiku-4.5")).toBe(
+      false,
+    );
+    expect(modelStore.availableModels.some((model) => model.id === "claude-opus-4.7")).toBe(false);
   });
 
   it("uses Claude model effort metadata from the catalog", () => {
@@ -128,6 +148,23 @@ describe("useModelStore OpenAI effort mapping", () => {
 
     modelStore.selectedModelId = "claude-opus-4.8";
     expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+
+    modelStore.selectedModelId = "claude-sonnet-5";
+    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+
+    modelStore.selectedModelId = "claude-fable-5";
+    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+  });
+
+  it("keeps Claude Code 1m model ids unchanged when selected", () => {
+    const modelStore = useModelStore();
+
+    modelStore.selectModel("claude_code/claude-opus-4.8[1m]");
+
+    expect(modelStore.selectedModelId).toBe("claude_code/claude-opus-4.8[1m]");
+    expect(modelServiceMocks.saveLastModel).toHaveBeenCalledWith(
+      "claude_code/claude-opus-4.8[1m]",
+    );
   });
 
   it("keeps codex mini limited to medium and high on OpenAI Responses endpoints", () => {

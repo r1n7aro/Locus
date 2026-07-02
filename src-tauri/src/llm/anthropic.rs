@@ -1316,9 +1316,12 @@ fn build_thinking_params(
 ) -> (Option<ThinkingParam>, Option<serde_json::Value>, u32) {
     let normalized_model = model.to_ascii_lowercase().replace('.', "-");
     let is_fable = normalized_model.contains("claude-fable-5");
-    let is_adaptive = is_fable
+    let is_sonnet_5 = normalized_model.contains("claude-sonnet-5");
+    let is_always_adaptive = is_fable
+        || is_sonnet_5
         || normalized_model.contains("claude-mythos-5")
-        || normalized_model.contains("claude-mythos-preview")
+        || normalized_model.contains("claude-mythos-preview");
+    let is_adaptive = is_always_adaptive
         || normalized_model.contains("sonnet-4-6")
         || normalized_model.contains("opus-4-8")
         || normalized_model.contains("opus-4-7")
@@ -1332,7 +1335,7 @@ fn build_thinking_params(
         _ => return (None, None, 16384),
     };
 
-    if level == "none" && is_fable {
+    if level == "none" && is_always_adaptive {
         return (Some(ThinkingParam::Adaptive), None, 32000);
     }
 
@@ -2352,6 +2355,22 @@ mod tests {
             json!({ "type": "adaptive" })
         );
         assert_eq!(output_config, None);
+
+        let (thinking, output_config, _) = build_thinking_params("claude-sonnet-5", Some("none"));
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "adaptive" })
+        );
+        assert_eq!(output_config, None);
+
+        let (thinking, output_config, max_tokens) =
+            build_thinking_params("claude-sonnet-5", Some("xhigh"));
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "adaptive" })
+        );
+        assert_eq!(output_config, Some(json!({ "effort": "xhigh" })));
+        assert_eq!(max_tokens, 64000);
     }
 
     #[test]

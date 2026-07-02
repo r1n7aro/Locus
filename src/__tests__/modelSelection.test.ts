@@ -3,8 +3,8 @@ import { pickPreferredModelId } from "../stores/modelSelection";
 import type { ModelDefaults, ModelOption } from "../types";
 
 const models: ModelOption[] = [
-  { id: "openrouter/claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "openrouter" },
-  { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", provider: "anthropic" },
+  { id: "openrouter/claude-fable-5", name: "Claude Fable 5", provider: "openrouter" },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", provider: "anthropic" },
   { id: "openai/gpt-5.5", name: "GPT-5.5", provider: "openai_codex" },
   { id: "openai/gpt-5.4", name: "GPT-5.4", provider: "openai_codex" },
 ];
@@ -24,7 +24,7 @@ describe("pickPreferredModelId", () => {
       pickPreferredModelId(
         models,
         defaults({ mainModel: "openai/gpt-5.5" }),
-        "claude-sonnet-4.6",
+        "claude-sonnet-5",
       ),
     ).toBe("openai/gpt-5.5");
   });
@@ -34,20 +34,38 @@ describe("pickPreferredModelId", () => {
       pickPreferredModelId(
         models,
         defaults({ mainModel: "custom/missing" }),
-        "claude-sonnet-4.6",
+        "claude-sonnet-5",
       ),
-    ).toBe("claude-sonnet-4.6");
+    ).toBe("claude-sonnet-5");
   });
 
   it("uses the first available model when nothing is remembered", () => {
     expect(
       pickPreferredModelId(models, defaults(), ""),
-    ).toBe("openrouter/claude-sonnet-4.6");
+    ).toBe("openrouter/claude-fable-5");
+  });
+
+  it("prefers catalog default over display order when nothing is remembered", () => {
+    expect(
+      pickPreferredModelId(
+        [
+          { id: "openrouter/claude-fable-5", name: "Claude Fable 5", provider: "openrouter" },
+          {
+            id: "openrouter/claude-opus-4.8",
+            name: "Claude Opus 4.8",
+            provider: "openrouter",
+            isDefault: true,
+          },
+        ],
+        defaults(),
+        "",
+      ),
+    ).toBe("openrouter/claude-opus-4.8");
   });
 
   it("returns empty when there are no available models", () => {
     expect(
-      pickPreferredModelId([], defaults({ mainModel: "openai/gpt-5.5" }), "claude-sonnet-4.6"),
+      pickPreferredModelId([], defaults({ mainModel: "openai/gpt-5.5" }), "claude-sonnet-5"),
     ).toBe("");
   });
 });

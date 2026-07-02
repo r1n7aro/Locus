@@ -21,6 +21,7 @@ pub fn resolve_openrouter_model(model: &str) -> String {
     let short = model.strip_prefix("openrouter/").unwrap_or(model);
     match short {
         "claude-fable-5" => "anthropic/claude-fable-5".to_string(),
+        "claude-sonnet-5" => "anthropic/claude-sonnet-5".to_string(),
         "claude-opus-4.8" => "anthropic/claude-opus-4.8".to_string(),
         "claude-opus-4.7" => "anthropic/claude-opus-4.7".to_string(),
         "claude-sonnet-4.6" => "anthropic/claude-sonnet-4.6".to_string(),
@@ -73,6 +74,7 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
         || m.contains("claude-fable-5")
         || m.contains("claude-mythos-5")
         || m.contains("claude-mythos-preview")
+        || m.contains("claude-sonnet-5")
         || (!is_claude_code
             && (m.contains("claude-opus-4.8")
                 || m.contains("claude-opus-4-8")
@@ -109,7 +111,10 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable_llm_error, model_context_limit, OPENAI_CODEX_CONTEXT_LIMIT};
+    use super::{
+        is_retryable_llm_error, model_context_limit, resolve_openrouter_model,
+        OPENAI_CODEX_CONTEXT_LIMIT,
+    };
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
@@ -156,6 +161,12 @@ mod tests {
 
     #[test]
     fn keeps_non_openai_limits_unchanged() {
+        assert_eq!(model_context_limit("openrouter/claude-fable-5"), 1_000_000);
+        assert_eq!(model_context_limit("anthropic/claude-sonnet-5"), 1_000_000);
+        assert_eq!(
+            model_context_limit("claude_code/claude-sonnet-5"),
+            1_000_000
+        );
         assert_eq!(
             model_context_limit("openrouter/claude-sonnet-4.6"),
             1_000_000
@@ -169,6 +180,18 @@ mod tests {
         assert_eq!(model_context_limit("claude_code/claude-opus-4.6"), 200_000);
         assert_eq!(model_context_limit("minimax-m2.5"), 196_608);
         assert_eq!(model_context_limit("unknown-model"), 128_000);
+    }
+
+    #[test]
+    fn resolves_current_openrouter_claude_short_ids() {
+        assert_eq!(
+            resolve_openrouter_model("openrouter/claude-sonnet-5"),
+            "anthropic/claude-sonnet-5"
+        );
+        assert_eq!(
+            resolve_openrouter_model("openrouter/claude-fable-5"),
+            "anthropic/claude-fable-5"
+        );
     }
 
     #[test]

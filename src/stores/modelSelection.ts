@@ -17,5 +17,10 @@ export function pickPreferredModelId(
     return lastModelId;
   }
 
+  const defaultModel = models.find((model) => model.isDefault);
+  if (defaultModel) {
+    return defaultModel.id;
+  }
+
   return models[0]?.id ?? "";
 }
