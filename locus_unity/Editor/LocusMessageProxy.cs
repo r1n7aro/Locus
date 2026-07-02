@@ -406,7 +406,21 @@ namespace Locus
                 {
                     if (handled.Contains((goEntry.Key, typeEntry.Key)))
                         continue;
+                    // AddComponent returns null when the target GameObject is
+                    // being destroyed (or the engine rejects the component);
+                    // dereferencing it would throw out of Reconcile and abort
+                    // the whole wiring pass. Skip the object — the next
+                    // Reconcile (scene events / re-registration) retries.
                     var proxy = (LocusProxyBase)goEntry.Key.AddComponent(typeEntry.Key);
+                    if (proxy == null)
+                    {
+                        // Deliberately not reading go.name here: the usual null
+                        // cause is a GameObject mid-destruction, whose members
+                        // themselves throw.
+                        Debug.LogWarning("[Locus] Message proxy AddComponent returned null ("
+                            + typeEntry.Key.Name + "); skipped — the next Reconcile retries.");
+                        continue;
+                    }
                     proxy.hideFlags = HideFlags.HideAndDontSave;
                     proxy.SetForwarders(typeEntry.Value);
                     _proxies.Add(proxy);

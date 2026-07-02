@@ -103,14 +103,26 @@ namespace Locus
         private const string SessionKey_CompileAwaitingReload = "Locus_CompileAwaitingReload";
         private const string SessionKey_ConvergedSerial = "Locus_ConvergedSerial";
         private const string SessionKey_EditorSessionId = "Locus_EditorSessionId";
-        // Set when request_recompile issues a compilation, cleared by the next
-        // OnCompilationFinished (any compile). While true, a domain reload is
+        // Set when request_recompile issues a compilation, cleared by the first
+        // OnCompilationFinished whose compilation STARTED at or after the
+        // request (see the epoch pair below). While true, a domain reload is
         // loading an EARLIER compile's assemblies — not the requested one's — so
         // OnAfterAssemblyReload must not advance ConvergedSerial or complete the
         // request: a stale reload would otherwise converge edits that belong to
         // the still-running requested compile, reporting them applied before they
         // are loaded.
         private const string SessionKey_RecompilePendingCompile = "Locus_RecompilePendingCompile";
+        // Monotonic count of compilations that ever STARTED this editor process
+        // (SessionState: survives domain reloads, resets with the process).
+        // RecompileTargetEpoch is stamped by request_recompile with the epoch
+        // its compilation will carry (started + 1 at request time): a compile
+        // finishing while started < target predates the request — a user
+        // Ctrl+R already in flight when the request arrived — and its finish
+        // must neither clear RecompilePendingCompile nor complete the request,
+        // or its reload converges edits that only the queued follow-up compile
+        // will build (the desktop would report them applied prematurely).
+        private const string SessionKey_CompileEpochStarted = "Locus_CompileEpochStarted";
+        private const string SessionKey_RecompileTargetEpoch = "Locus_RecompileTargetEpoch";
 
         private static volatile bool _recompileRequested;
         private static volatile string _lastCompileResult;
@@ -450,6 +462,7 @@ namespace Locus
             EditorApplication.quitting += OnQuitting;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+            CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
         }
@@ -608,6 +621,16 @@ namespace Locus
 
         // ───────────────── Compilation events ─────────────────
 
+        private static void OnCompilationStarted(object context)
+        {
+            // Epoch for the request/finish pairing — see
+            // SessionKey_CompileEpochStarted. SessionState survives the domain
+            // reload between a pre-request compile and the requested one.
+            SessionState.SetInt(
+                SessionKey_CompileEpochStarted,
+                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1);
+        }
+
         private static void OnAssemblyCompilationFinished(string assemblyPath, CompilerMessage[] messages)
         {
             // Collect errors for EVERY compilation, not just Locus-requested
@@ -631,15 +654,26 @@ namespace Locus
         {
             InvalidateCompilationCaches();
 
-            // Compilation did fire — cancel the "no compilation" check
-            _recompileCheckFrames = -1;
-
-            // A requested compile (if any) has now finished: its reload is the
-            // one allowed to converge. Clear the in-flight marker for EVERY
-            // compile finish — the flag was set when this request was issued, so
-            // the first finish after it is the requested compile (or a coalesced
-            // superset). This frees OnAfterAssemblyReload to converge again.
-            SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
+            // Whether THIS finish belongs to the requested compile (or a later
+            // superset): a compile that STARTED before the request — a user
+            // Ctrl+R already in flight when request_recompile arrived — finishes
+            // with started < target and must not clear the in-flight marker nor
+            // complete the request; the requested compile is still queued behind
+            // it. With no request in play, target is stale-or-zero and this is
+            // trivially true (any finish behaves as before).
+            bool requestedCompileFinished =
+                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) >=
+                SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0);
+            if (requestedCompileFinished)
+            {
+                // The requested compile (if any) has now finished: its reload is
+                // the one allowed to converge. This frees OnAfterAssemblyReload
+                // to converge again. Only NOW is the "no compilation started"
+                // watchdog satisfied — a pre-request compile finishing must not
+                // disarm it (the requested compile may still never start).
+                SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
+                _recompileCheckFrames = -1;
+            }
 
             // Snapshot + reset the per-cycle error set (collected for every
             // compilation by OnAssemblyCompilationFinished) so success/failure
@@ -666,7 +700,20 @@ namespace Locus
             // domain reload would consume it and falsely report convergence.
             SessionState.SetBool(SessionKey_CompileAwaitingReload, succeeded);
 
-            if (!_recompileRequested)
+            // Completion attribution is epoch-gated the same way: a pre-request
+            // compile's finish must not consume the request (its success/errors
+            // describe the WRONG compile) — the requested compile's own finish
+            // completes it. The request is anchored on the PERSISTENT
+            // RecompileInProgress flag, not only the volatile _recompileRequested:
+            // when a pre-request compile reloads the domain before the requested
+            // one runs, the volatile is lost, but the requested compile's finish
+            // in the NEW domain must still attribute its errors to the request
+            // (otherwise a failed follow-up leaves the result at "pending" until
+            // the desktop times out, and a later unrelated reload would complete
+            // it as a false "ok").
+            bool requestActive = _recompileRequested
+                || SessionState.GetBool(SessionKey_RecompileInProgress, false);
+            if (!requestActive || !requestedCompileFinished)
                 return;
 
             _recompileRequested = false;
@@ -951,7 +998,14 @@ namespace Locus
                 if (_recompileCheckFrames >= RecompileCheckDelayFrames)
                 {
                     _recompileCheckFrames = -1;
-                    if (_recompileRequested && !EditorApplication.isCompiling)
+                    // "Never started" now means the REQUESTED epoch never
+                    // started: a pre-request compile finishing inside this
+                    // window no longer consumes the request (see the epoch
+                    // gate), so also require the target epoch to still be
+                    // unreached before declaring a no-compile failure.
+                    if (_recompileRequested && !EditorApplication.isCompiling &&
+                        SessionState.GetInt(SessionKey_CompileEpochStarted, 0) <
+                            SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0))
                     {
                         // Unity never started compilation — no script changes detected
                         _recompileRequested = false;
@@ -1488,11 +1542,19 @@ namespace Locus
                             // fails to compile. Refresh imports them first.
                             AssetDatabase.Refresh();
                             _domainReloadCheckFrames = -1;
+                            // Stamp the target epoch BEFORE issuing the request:
+                            // the requested compilation is the next one to start
+                            // (a compile already in flight has already counted
+                            // its own start, so the request queues behind it).
+                            int targetEpoch =
+                                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1;
                             CompilationPipeline.RequestScriptCompilation();
-                            // Mark the requested compile in-flight: until its
-                            // OnCompilationFinished fires, any domain reload is an
-                            // earlier compile's and must not complete this request
-                            // or advance the convergence serial.
+                            // Mark the requested compile in-flight: until a
+                            // compilation that STARTED at or after the request
+                            // finishes, any domain reload is an earlier compile's
+                            // and must not complete this request or advance the
+                            // convergence serial.
+                            SessionState.SetInt(SessionKey_RecompileTargetEpoch, targetEpoch);
                             SessionState.SetBool(SessionKey_RecompilePendingCompile, true);
 
                             _recompileCheckFrames = 0;

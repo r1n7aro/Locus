@@ -614,6 +614,16 @@ namespace Locus
             var pumpSkippedDetails = new List<string>();
             int pumpFailedCount = 0;
 
+            // Any THROW past this point can leave committed detours behind: the
+            // explicit failure paths below roll back before returning, but a
+            // shim verifier / inline-classification / serialization throw would
+            // bubble to the caller's catch-all as an error response WITHOUT a
+            // rollback. The desktop treats an error response as "rolled back"
+            // and only counts a failure — an applied-but-error'd patch would
+            // under-account the live-patch ledger that the sidecar swap gate
+            // and the lost-session gate key on. Roll back before reporting.
+            try
+            {
             lock (_hotPatchLock)
             {
                 foreach (HotPatchMethodDto dto in methods)
@@ -700,7 +710,23 @@ namespace Locus
                 // Newly added Unity messages the engine never discovers after
                 // load: wire each to its driver (PlayerLoop pump or component
                 // proxy) by kind, replacing any prior registration per source file.
-                RegisterMessageDrivers(methods, messageDrivers, patchAssembly, out pumpedCount, pumpSkippedDetails, out pumpFailedCount);
+                try
+                {
+                    RegisterMessageDrivers(methods, messageDrivers, patchAssembly, out pumpedCount, pumpSkippedDetails, out pumpFailedCount);
+                }
+                catch (Exception ex)
+                {
+                    // Driver wiring must never turn an APPLIED patch into an
+                    // error response: the detours above are committed and the
+                    // error path does not roll them back, so the desktop would
+                    // under-account live patches (its sidecar-swap and
+                    // lost-session gates key on that ledger). Count it as a
+                    // hard wiring failure instead — the response stays ok and
+                    // the desktop's message-driver gate fails closed to a
+                    // recompile.
+                    pumpFailedCount++;
+                    Debug.LogError("[Locus] Hot patch message-driver wiring threw: " + ex);
+                }
             }
 
             // Release-first: a method Unity inlined keeps a live detour, but its
@@ -752,6 +778,12 @@ namespace Locus
             Debug.Log("[Locus] Hot patch applied: " + applied.Count + " method(s), patch " + patchId
                 + (inlinedKeys.Count > 0 ? " (" + inlinedKeys.Count + " inlined in Release)" : ""));
             return OkResponse(requestId, JsonUtility.ToJson(response));
+            }
+            catch (Exception ex)
+            {
+                RollbackHotPatch(applied);
+                return ErrorResponse(requestId, "hot patch apply failed (rolled back): " + ex);
+            }
         }
 
         /// <summary>Wire newly added Unity messages to their runtime driver, by
