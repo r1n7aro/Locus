@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { formatDebugConsoleEntriesForLogExport } from "../services/debugConsole";
+import {
+  buildForwardPayload,
+  formatDebugConsoleEntriesForLogExport,
+} from "../services/debugConsole";
 import type { DebugConsoleEntry } from "../types";
 
 describe("debug console export", () => {
@@ -40,5 +43,36 @@ describe("debug console export", () => {
       "    continued",
       "",
     ].join("\n"));
+  });
+});
+
+describe("debug console file forwarding", () => {
+  const baseEntry: DebugConsoleEntry = {
+    id: "frontend-1",
+    timestampMs: 1750000000000,
+    level: "warn",
+    source: "frontend",
+    module: "stores/chat",
+    target: "stores/chat",
+    message: "boom",
+  };
+
+  it("maps entries to the backend payload shape", () => {
+    expect(buildForwardPayload([baseEntry])).toEqual([
+      {
+        timestampMs: 1750000000000,
+        level: "warn",
+        module: "stores/chat",
+        message: "boom",
+      },
+    ]);
+  });
+
+  it("truncates oversized messages before forwarding", () => {
+    const payload = buildForwardPayload(
+      [{ ...baseEntry, message: "x".repeat(50) }],
+      10,
+    );
+    expect(payload[0]?.message).toBe(`${"x".repeat(10)} …(truncated)`);
   });
 });

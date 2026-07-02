@@ -35,6 +35,7 @@ pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
 mod feishu_docs;
+pub mod file_log;
 pub mod keychain;
 pub mod knowledge_index;
 pub mod knowledge_store;
@@ -311,6 +312,15 @@ pub fn run() {
             .unwrap_or(false),
     ));
     let log_store = Arc::new(logging::AppLogStore::new(logging::DEFAULT_LOG_CAPACITY));
+    match file_log::FileLogSink::init_default() {
+        Ok(sink) => {
+            log_store.attach_file_sink(sink.clone());
+            file_log::install_panic_hook(sink);
+        }
+        Err(error) => {
+            std::eprintln!("[FileLog] persistent file logging disabled: {error}");
+        }
+    }
     logging::init_tracing(shared_debug_flag.clone(), log_store.clone());
     startup_trace.mark("tracing_ready");
     let binary_cache: Arc<binary_cache::BinaryCache> = Arc::new(binary_cache::BinaryCache::new());
@@ -1305,7 +1315,8 @@ pub fn run() {
             commands::get_tool_permissions,
             commands::save_tool_permissions,
             commands::reset_all_config,
-            commands::save_plan_artifact,
+            commands::get_session_plan_state,
+            commands::set_session_plan_mode,
             commands::get_system_fonts,
             commands::get_system_locale,
             commands::get_close_behavior,
@@ -1358,6 +1369,8 @@ pub fn run() {
             commands::get_log_entries,
             commands::clear_log_entries,
             commands::save_log_export,
+            commands::append_frontend_logs,
+            commands::reveal_log_file,
             commands::unity_embed_status,
             commands::unity_embed_open_frontend_window,
             commands::unity_embed_set_mouse_activation_suppressed,

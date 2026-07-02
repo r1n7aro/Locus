@@ -5,6 +5,10 @@ import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 const MAX_ENTRIES = 2_000;
 const BACKEND_EVENT_NAME = "app-log";
+const FORWARD_FLUSH_DELAY_MS = 400;
+const FORWARD_MAX_BATCH = 128;
+const FORWARD_MAX_PENDING = 1_000;
+const FORWARD_MAX_MESSAGE_CHARS = 16_000;
 
 const listeners = new Set<() => void>();
 const entryIds = new Set<string>();
@@ -78,6 +82,73 @@ export async function saveDebugConsoleLogExport(
 ): Promise<string> {
   const content = formatDebugConsoleEntriesForLogExport(logEntries);
   return invoke<string>("save_log_export", { filePath, content });
+}
+
+export interface ForwardedLogLine {
+  timestampMs: number;
+  level: string;
+  module: string;
+  message: string;
+}
+
+export function buildForwardPayload(
+  batch: readonly DebugConsoleEntry[],
+  maxMessageChars = FORWARD_MAX_MESSAGE_CHARS,
+): ForwardedLogLine[] {
+  return batch.map((entry) => ({
+    timestampMs: entry.timestampMs,
+    level: entry.level,
+    module: entry.module,
+    message:
+      entry.message.length > maxMessageChars
+        ? `${entry.message.slice(0, maxMessageChars)} …(truncated)`
+        : entry.message,
+  }));
+}
+
+// Frontend console lines are mirrored into the backend's persistent log file
+// (best-effort, batched) so crash/freeze reports include the JS side too.
+const forwardQueue: DebugConsoleEntry[] = [];
+let forwardTimer: ReturnType<typeof setTimeout> | null = null;
+let forwardInFlight = false;
+let forwardDropped = 0;
+
+function scheduleForwardFlush() {
+  if (forwardTimer !== null) return;
+  forwardTimer = setTimeout(() => {
+    forwardTimer = null;
+    void flushForwardQueue();
+  }, FORWARD_FLUSH_DELAY_MS);
+}
+
+function queueForwardToFile(entry: DebugConsoleEntry) {
+  if (!hasTauriWindowRuntime()) return;
+  if (forwardQueue.length >= FORWARD_MAX_PENDING) {
+    forwardQueue.shift();
+    forwardDropped += 1;
+  }
+  forwardQueue.push(entry);
+  scheduleForwardFlush();
+}
+
+async function flushForwardQueue() {
+  if (forwardInFlight || forwardQueue.length === 0) return;
+  forwardInFlight = true;
+  const batch = forwardQueue.splice(0, FORWARD_MAX_BATCH);
+  const droppedCount = forwardDropped;
+  forwardDropped = 0;
+  try {
+    await invoke("append_frontend_logs", {
+      entries: buildForwardPayload(batch),
+      droppedCount,
+    });
+  } catch {
+    // Swallow: logging must never spam the console (a console.error here
+    // would re-enter this pipeline) and the backend may simply be gone.
+  } finally {
+    forwardInFlight = false;
+    if (forwardQueue.length > 0) scheduleForwardFlush();
+  }
 }
 
 function pushEntries(batch: DebugConsoleEntry[]) {
@@ -196,17 +267,17 @@ function captureConsole(method: ConsoleMethod, args: unknown[]) {
   const displayArgs = normalized.hasExplicitModule ? args : [`[${normalized.module}]`, ...args];
   originalConsole[method](...displayArgs);
 
-  pushEntries([
-    {
-      id: `frontend-${nextFrontendId++}`,
-      timestampMs: Date.now(),
-      level: mapConsoleMethodToLevel(method),
-      source: "frontend",
-      module: normalized.module,
-      target: normalized.module,
-      message: normalized.message,
-    },
-  ]);
+  const entry: DebugConsoleEntry = {
+    id: `frontend-${nextFrontendId++}`,
+    timestampMs: Date.now(),
+    level: mapConsoleMethodToLevel(method),
+    source: "frontend",
+    module: normalized.module,
+    target: normalized.module,
+    message: normalized.message,
+  };
+  pushEntries([entry]);
+  queueForwardToFile(entry);
 }
 
 function installConsoleCapture() {
@@ -282,4 +353,12 @@ export function teardownDebugConsole() {
   backendUnlisten?.();
   backendUnlisten = null;
   backendReady = false;
+  if (forwardTimer !== null) {
+    clearTimeout(forwardTimer);
+    forwardTimer = null;
+  }
+}
+
+export async function revealLogFile(): Promise<string> {
+  return invoke<string>("reveal_log_file");
 }

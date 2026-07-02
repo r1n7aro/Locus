@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
@@ -83,6 +83,7 @@ pub struct AppLogStore {
     next_id: AtomicU64,
     entries: Mutex<VecDeque<AppLogEntry>>,
     app_handle: Mutex<Option<AppHandle>>,
+    file_sink: OnceLock<Arc<crate::file_log::FileLogSink>>,
 }
 
 impl AppLogStore {
@@ -92,6 +93,7 @@ impl AppLogStore {
             next_id: AtomicU64::new(1),
             entries: Mutex::new(VecDeque::with_capacity(capacity.min(64))),
             app_handle: Mutex::new(None),
+            file_sink: OnceLock::new(),
         }
     }
 
@@ -99,6 +101,14 @@ impl AppLogStore {
         if let Ok(mut slot) = self.app_handle.lock() {
             *slot = Some(app_handle);
         }
+    }
+
+    pub fn attach_file_sink(&self, sink: Arc<crate::file_log::FileLogSink>) {
+        let _ = self.file_sink.set(sink);
+    }
+
+    pub fn file_sink(&self) -> Option<&Arc<crate::file_log::FileLogSink>> {
+        self.file_sink.get()
     }
 
     pub fn clear(&self) {
@@ -135,6 +145,10 @@ impl AppLogStore {
             target: display_target,
             message,
         };
+
+        if let Some(sink) = self.file_sink.get() {
+            sink.enqueue(entry.clone());
+        }
 
         if let Ok(mut entries) = self.entries.lock() {
             if entries.len() >= self.capacity {
