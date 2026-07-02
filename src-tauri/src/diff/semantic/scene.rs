@@ -478,7 +478,15 @@ pub(crate) fn prefab_instance_is_unchanged(
 ) -> bool {
     match (old_ir, new_ir) {
         (Some(old), Some(new)) => {
-            old.property_overrides.len() == new.property_overrides.len()
+            // Instance-level identity first: swapping the source prefab
+            // (m_SourcePrefab GUID) or reparenting (m_TransformParent) is a
+            // real change even when the override list is structurally
+            // identical — without these two checks such edits were skipped
+            // as "unchanged" and never reached the semantic diff.
+            old.source_prefab_guid == new.source_prefab_guid
+                && old.source_prefab_file_id == new.source_prefab_file_id
+                && old.transform_parent == new.transform_parent
+                && old.property_overrides.len() == new.property_overrides.len()
                 && old.removed_components.len() == new.removed_components.len()
                 && old
                     .property_overrides
@@ -486,6 +494,7 @@ pub(crate) fn prefab_instance_is_unchanged(
                     .zip(&new.property_overrides)
                     .all(|(a, b)| {
                         a.target.source_file_id == b.target.source_file_id
+                            && a.target.guid == b.target.guid
                             && a.property_path == b.property_path
                             && a.value == b.value
                             && a.object_ref.as_ref().map(|r| (r.source_file_id, r.guid))
@@ -495,10 +504,54 @@ pub(crate) fn prefab_instance_is_unchanged(
                     .removed_components
                     .iter()
                     .zip(&new.removed_components)
-                    .all(|(a, b)| a.target.source_file_id == b.target.source_file_id)
+                    .all(|(a, b)| {
+                        a.target.source_file_id == b.target.source_file_id
+                            && a.target.guid == b.target.guid
+                    })
         }
         _ => false, // added/removed — not unchanged
     }
+}
+
+/// True when every doc owned by `file_id` (the GameObject itself plus its
+/// components, per the component index) is byte-identical between the two
+/// sides. Sufficient for "every semantic panel would compare unchanged":
+/// component pairing keys derive from class ids, script GUIDs and document
+/// order, so pairwise-identical doc sequences produce identical panels on
+/// both sides. False negatives (e.g. reordered but identical docs) are fine
+/// — the full panel build then reaches the same verdict, just slower.
+fn scene_target_docs_identical(
+    file_id: i64,
+    old_all_docs: &[YamlDoc],
+    new_all_docs: &[YamlDoc],
+    old_lines: &[String],
+    new_lines: &[String],
+    old_component_index: &HashMap<i64, Vec<usize>>,
+    new_component_index: &HashMap<i64, Vec<usize>>,
+) -> bool {
+    let (Some(old_docs), Some(new_docs)) = (
+        old_component_index.get(&file_id),
+        new_component_index.get(&file_id),
+    ) else {
+        return false;
+    };
+    if old_docs.len() != new_docs.len() {
+        return false;
+    }
+    old_docs.iter().zip(new_docs).all(|(&old_idx, &new_idx)| {
+        let (Some(old), Some(new)) = (old_all_docs.get(old_idx), new_all_docs.get(new_idx)) else {
+            return false;
+        };
+        old.class_id == new.class_id
+            && old.is_stripped == new.is_stripped
+            && doc_line_slice(old, old_lines) == doc_line_slice(new, new_lines)
+    })
+}
+
+fn doc_line_slice<'a>(doc: &YamlDoc, lines: &'a [String]) -> &'a [String] {
+    let start = doc.line_start.min(lines.len());
+    let end = doc.line_end.min(lines.len()).max(start);
+    &lines[start..end]
 }
 
 pub(crate) fn build_prefab_instance_local_infos(
@@ -2119,6 +2172,29 @@ fn build_scene_target_parallel(
         .new_entries
         .get(&file_id)
         .or_else(|| shared.old_entries.get(&file_id))?;
+
+    // Cheap unchanged short-circuit: when every doc this GameObject owns is
+    // byte-identical between sides, the panels below would all compare
+    // "unchanged" and the target would be dropped at the end anyway. On a
+    // large scene with a sparse edit this skips the field-tree + list-match
+    // work for the vast majority of targets. Prefab instances have their own
+    // IR-level gate further down.
+    if entry.object_kind == "gameObject"
+        && old_doc.is_some()
+        && new_doc.is_some()
+        && scene_target_docs_identical(
+            file_id,
+            shared.old_all_docs,
+            shared.new_all_docs,
+            shared.old_lines,
+            shared.new_lines,
+            shared.old_component_index,
+            shared.new_component_index,
+        )
+    {
+        return None;
+    }
+
     let target_id = if entry.object_kind == "prefabInstance" {
         format!("pi:{}", file_id)
     } else {
@@ -2348,6 +2424,24 @@ fn build_scene_target(
     let entry = new_entries
         .get(&file_id)
         .or_else(|| old_entries.get(&file_id))?;
+
+    // Same unchanged short-circuit as `build_scene_target_parallel`.
+    if entry.object_kind == "gameObject"
+        && old_doc.is_some()
+        && new_doc.is_some()
+        && scene_target_docs_identical(
+            file_id,
+            old_all_docs,
+            new_all_docs,
+            old_lines,
+            new_lines,
+            old_component_index,
+            new_component_index,
+        )
+    {
+        return None;
+    }
+
     let target_id = if entry.object_kind == "prefabInstance" {
         format!("pi:{}", file_id)
     } else {
@@ -3230,6 +3324,104 @@ mod tests {
             batch_reader: None,
             script_cache: ScriptInfoCache::default(),
         }
+    }
+
+    #[test]
+    fn scene_target_docs_identical_detects_component_changes() {
+        // The unchanged-target short-circuit must never skip a target whose
+        // docs differ; false negatives only cost the slower full build.
+        fn parse(content: &str) -> (Vec<YamlDoc>, Vec<String>, HashMap<i64, Vec<usize>>) {
+            let docs = parse_yaml_docs(content.as_bytes());
+            let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
+            let index = build_component_index(&docs);
+            (docs, lines, index)
+        }
+
+        let base = "%YAML 1.1\n--- !u!1 &100\nGameObject:\n  m_Name: Player\n--- !u!4 &200\nTransform:\n  m_GameObject: {fileID: 100}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n";
+        let field_changed = "%YAML 1.1\n--- !u!1 &100\nGameObject:\n  m_Name: Player\n--- !u!4 &200\nTransform:\n  m_GameObject: {fileID: 100}\n  m_LocalPosition: {x: 1, y: 0, z: 0}\n";
+        let component_added = "%YAML 1.1\n--- !u!1 &100\nGameObject:\n  m_Name: Player\n--- !u!4 &200\nTransform:\n  m_GameObject: {fileID: 100}\n  m_LocalPosition: {x: 0, y: 0, z: 0}\n--- !u!114 &300\nMonoBehaviour:\n  m_GameObject: {fileID: 100}\n  m_Enabled: 1\n";
+
+        let (old_docs, old_lines, old_index) = parse(base);
+        let (same_docs, same_lines, same_index) = parse(base);
+        let (changed_docs, changed_lines, changed_index) = parse(field_changed);
+        let (added_docs, added_lines, added_index) = parse(component_added);
+
+        assert!(scene_target_docs_identical(
+            100, &old_docs, &same_docs, &old_lines, &same_lines, &old_index, &same_index,
+        ));
+        assert!(!scene_target_docs_identical(
+            100,
+            &old_docs,
+            &changed_docs,
+            &old_lines,
+            &changed_lines,
+            &old_index,
+            &changed_index,
+        ));
+        assert!(!scene_target_docs_identical(
+            100,
+            &old_docs,
+            &added_docs,
+            &old_lines,
+            &added_lines,
+            &old_index,
+            &added_index,
+        ));
+    }
+
+    #[test]
+    fn prefab_instance_source_swap_and_reparent_are_not_unchanged() {
+        // Regression: swapping the source prefab (m_SourcePrefab GUID) or
+        // reparenting the instance (m_TransformParent) while the override
+        // list stays structurally identical used to pass the
+        // `prefab_instance_is_unchanged` fast path, so the edit never
+        // reached the semantic diff.
+        fn pi_yaml(source_guid: &str, parent: i64) -> String {
+            format!(
+                r#"--- !u!1001 &9000
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    m_TransformParent: {{fileID: {parent}}}
+    m_Modifications:
+    - target: {{fileID: 8679921383154817045, guid: cccccccccccccccccccccccccccccccc, type: 3}}
+      propertyPath: m_LocalPosition.x
+      value: 0
+      objectReference: {{fileID: 0}}
+    m_RemovedComponents: []
+  m_SourcePrefab: {{fileID: 100100000, guid: {source_guid}, type: 3}}
+"#
+            )
+        }
+
+        fn ir_for(content: &str) -> PrefabInstanceIR {
+            let docs = parse_yaml_docs(content.as_bytes());
+            let lines: Vec<&str> = content.lines().collect();
+            extract_prefab_instance_irs(&docs, &lines)
+                .into_iter()
+                .next()
+                .expect("prefab instance IR")
+        }
+
+        let base = ir_for(&pi_yaml("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0));
+        let same = ir_for(&pi_yaml("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0));
+        let source_swapped = ir_for(&pi_yaml("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 0));
+        let reparented = ir_for(&pi_yaml("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 777));
+
+        assert!(
+            prefab_instance_is_unchanged(Some(&base), Some(&same)),
+            "identical IRs must stay on the fast path"
+        );
+        assert!(
+            !prefab_instance_is_unchanged(Some(&base), Some(&source_swapped)),
+            "m_SourcePrefab GUID swap is a real change"
+        );
+        assert!(
+            !prefab_instance_is_unchanged(Some(&base), Some(&reparented)),
+            "m_TransformParent change is a real change"
+        );
+        assert!(!prefab_instance_is_unchanged(Some(&base), None));
     }
 
     #[test]
