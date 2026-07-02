@@ -494,6 +494,13 @@ public static class HotDiff
         // intact); the merged views below are detached synthetic nodes.
         bool genericContext = newTypeParts.Any(IsGenericContext);
         bool burstContext = oldTypeParts.Any(HasBurstCompileAttribute) || newTypeParts.Any(HasBurstCompileAttribute);
+        // Ref-struct context likewise comes from the real parts. A ref struct
+        // cannot be an extension receiver, so an ADDED instance member's shim
+        // would take `self` BY VALUE (PatchRewriter.BuildSelfParameter) and
+        // silently drop every mutation — added instance members fail closed.
+        // Plain body edits are unaffected (the detour keeps the original
+        // receiver), and struct FIELD changes are already cold upstream.
+        bool refStructContext = newTypeParts.Any(p => p.Modifiers.Any(SyntaxKind.RefKeyword));
 
         // B6: same-file parts merge into ONE member-level view (members
         // concatenated in source order) so every member diff below sees the
@@ -548,14 +555,14 @@ public static class HotDiff
 
             if (!oldMembers.TryGetValue(pair.Key, out MemberDeclarationSyntax? oldMember))
             {
-                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, result))
+                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, refStructContext, result))
                     return;
                 patched = true;
                 continue;
             }
 
             int reasonsBefore = result.Reasons.Count;
-            bool changed = DiffMember(metadataName, oldMember, newMember, genericContext, burstContext, result);
+            bool changed = DiffMember(metadataName, oldMember, newMember, genericContext, burstContext, refStructContext, result);
             if (result.Reasons.Count > reasonsBefore)
                 return;
             patched |= changed;
@@ -825,7 +832,26 @@ public static class HotDiff
         foreach (UsingDirectiveSyntax usingDirective in oldRoot.Usings)
             sb.AppendLine(usingDirective.NormalizeWhitespace().ToFullString().Trim());
         if (ns.Length > 0)
+        {
             sb.AppendLine("namespace " + ns + " {");
+            // Namespace-scoped directives (SA1200-style files declare ALL
+            // their usings inside the namespace) stay in scope for the stub:
+            // without them the stub's Unity message signatures (Collider,
+            // Collision, …) fail to resolve. Every directive declared in a
+            // namespace enclosing the removed type is re-emitted inside the
+            // flattened stub namespace — the lookup chain (ns → ancestors →
+            // global) is preserved.
+            foreach (BaseNamespaceDeclarationSyntax nsDecl in
+                oldRoot.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>())
+            {
+                string full = FullNamespaceName(nsDecl);
+                if (ns == full || ns.StartsWith(full + ".", StringComparison.Ordinal))
+                {
+                    foreach (UsingDirectiveSyntax u in nsDecl.Usings)
+                        sb.AppendLine(u.NormalizeWhitespace().ToFullString().Trim());
+                }
+            }
+        }
         sb.AppendLine("internal sealed class " + className);
         sb.AppendLine("{");
         foreach (MethodDeclarationSyntax stub in stubs)
@@ -1617,8 +1643,24 @@ public static class HotDiff
         MemberDeclarationSyntax member,
         bool genericContext,
         bool burstContext,
+        bool refStructContext,
         HotDiffFileResult result)
     {
+        // A ref struct cannot be an extension receiver, so an added instance
+        // member's shim takes `self` BY VALUE (BuildSelfParameter's RefLike
+        // branch) — every mutation the member makes to the receiver would be
+        // silently dropped at materialized call sites. Statics carry no
+        // receiver and pass through; operators/conversions are static by
+        // definition. This also covers the ADD half of a signature change
+        // (remove+add decomposition) on a ref struct.
+        if (refStructContext &&
+            (member is BaseMethodDeclarationSyntax || member is BasePropertyDeclarationSyntax) &&
+            !member.Modifiers.Any(SyntaxKind.StaticKeyword))
+        {
+            result.Reasons.Add("ref struct instance member added: " + metadataName + "." + DisplayName(member) +
+                " (a shim receives a ref struct by value and would drop mutations; use unity_recompile)");
+            return false;
+        }
         switch (member)
         {
             case ConstructorDeclarationSyntax:
@@ -2109,6 +2151,7 @@ public static class HotDiff
         MemberDeclarationSyntax newMember,
         bool genericContext,
         bool burstContext,
+        bool refStructContext,
         HotDiffFileResult result)
     {
         if (HeaderText(oldMember) != HeaderText(newMember))
@@ -2132,7 +2175,7 @@ public static class HotDiff
                 }
                 if (!ClassifyRemovedMember(metadataName, oldMember, genericContext, burstContext, result))
                     return false;
-                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, result))
+                if (!ClassifyAddedMember(metadataName, newMember, genericContext, burstContext, refStructContext, result))
                     return false;
                 return true;
             }
@@ -2183,16 +2226,30 @@ public static class HotDiff
                     result.Reasons.Add("explicit interface implementation changed: " + metadataName + "." + newMethod.Identifier.Text);
                     return false;
                 }
-                if (newMethod.Body == null && newMethod.ExpressionBody == null)
+                bool newBodyMissing = newMethod.Body == null && newMethod.ExpressionBody == null;
+                bool oldBodyMissing = oldMethod.Body == null && oldMethod.ExpressionBody == null;
+                if (newBodyMissing || oldBodyMissing)
                 {
-                    // abstract/extern: no body to patch, header equality
-                    // already ensured — nothing to do.
+                    // Bodies DIFFER (equal bodies returned above), so exactly
+                    // one side has one. Under an equal header only a PARTIAL
+                    // implementation can gain or lose its body — abstract and
+                    // extern bodies are equal-empty and never reach here, and
+                    // a non-partial declaration losing its body would not even
+                    // compile. Losing the body must fail closed (the compiled
+                    // original keeps running — a silent no-op misreports);
+                    // gaining one has no original to detour (the compiler
+                    // elided the defining-only declaration and its call
+                    // sites), so routing it as a body edit would fail the
+                    // apply with a misleading resolve error.
+                    result.Reasons.Add(
+                        "partial method implementation " + (newBodyMissing ? "removed" : "added") + ": " +
+                        metadataName + "." + newMethod.Identifier.Text + " (use unity_recompile)");
                     return false;
                 }
                 if (genericContext || (newMethod.TypeParameterList?.Parameters.Count ?? 0) > 0)
                 {
                     return DecomposeGenericBodyChange(
-                        metadataName, oldMethod, newMethod, genericContext, burstContext, result);
+                        metadataName, oldMethod, newMethod, genericContext, burstContext, refStructContext, result);
                 }
                 AddMethod(
                     result, metadataName, newMethod.Identifier.Text, ParamTypeNames(newMethod.ParameterList),
@@ -2395,6 +2452,7 @@ public static class HotDiff
         MethodDeclarationSyntax newMethod,
         bool genericContext,
         bool burstContext,
+        bool refStructContext,
         HotDiffFileResult result)
     {
         if (UnityMagicMethods.Contains(newMethod.Identifier.Text))
@@ -2407,7 +2465,7 @@ public static class HotDiff
         int checksBefore = result.RequiresCallerCheck.Count;
         if (!ClassifyRemovedMember(metadataName, oldMethod, genericContext, burstContext, result))
             return false;
-        if (!ClassifyAddedMember(metadataName, newMethod, genericContext, burstContext, result))
+        if (!ClassifyAddedMember(metadataName, newMethod, genericContext, burstContext, refStructContext, result))
             return false;
 
         // The caller check came from the REMOVE half; relabel so a cold
@@ -2754,11 +2812,49 @@ public static class HotDiff
         return string.Join("\n", lists.Select(TokenText));
     }
 
+    /// <summary>The full dotted name of a (possibly nested) namespace
+    /// declaration, composing ancestor declarations. Token-level text (no
+    /// trivia): `namespace A . B` and a nested `namespace A { namespace B`
+    /// both yield "A.B", so a pure whitespace/nesting-style rewrite never
+    /// reads as a different scope.</summary>
+    private static string FullNamespaceName(BaseNamespaceDeclarationSyntax ns)
+    {
+        string name = NamespaceNameText(ns.Name);
+        for (SyntaxNode? parent = ns.Parent; parent != null; parent = parent.Parent)
+        {
+            if (parent is BaseNamespaceDeclarationSyntax outer)
+                name = NamespaceNameText(outer.Name) + "." + name;
+        }
+        return name;
+    }
+
+    private static string NamespaceNameText(NameSyntax name)
+    {
+        return string.Concat(name.DescendantTokens().Select(token => token.Text));
+    }
+
     private static string UsingAndExternText(CompilationUnitSyntax root)
     {
         var parts = new List<string>();
         parts.AddRange(root.Externs.Select(TokenText));
         parts.AddRange(root.Usings.Select(TokenText));
+        // Namespace-scoped directives (`namespace N { using X; }`, the
+        // StyleCop SA1200 style) bind exactly like top-level ones for that
+        // namespace's members. Missing them made a pure namespace-using edit
+        // an EMPTY diff (silently reported as applied) and let a member edit
+        // rebind under the new directives while unchanged members kept the
+        // old ones — precisely the split M6 exists to prevent. Each directive
+        // is prefixed with its FULL namespace chain (token-level, trivia-free)
+        // so MOVING one between scopes — including two same-simple-named
+        // namespaces (A.X vs B.X) — registers as a change, while a pure
+        // whitespace/nesting-style rewrite of the namespace header does not.
+        foreach (BaseNamespaceDeclarationSyntax ns in
+            root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>())
+        {
+            string scope = FullNamespaceName(ns);
+            parts.AddRange(ns.Externs.Select(e => scope + "::" + TokenText(e)));
+            parts.AddRange(ns.Usings.Select(u => scope + "::" + TokenText(u)));
+        }
         return string.Join("\n", parts);
     }
 

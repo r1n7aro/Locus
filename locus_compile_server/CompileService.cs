@@ -2051,9 +2051,10 @@ public sealed class CompileService
         // sibling MESSAGE clears via a clear-marker (its driver was registered under
         // this file path, so ClearSource(file) tears it down regardless of which
         // assembly the type lives in), and the clear-marker's originalAssembly is
-        // resolved per-type. Defensive: only trust `live` when it is itself hot
-        // (LastAppliedText is always birth + hot changes, so a cold `live` cannot
-        // actually arise here).
+        // resolved per-type. This detection only runs on a HOT live diff — a hot
+        // change does not guarantee a hot reverse (an H7e enum append, an added
+        // const or auto-property reverts through a COLD form), and a cold live
+        // baseline is unverifiable: see the else below.
         var removedMagic = new List<HotDiffRemovedMember>();
         var removedNormal = new List<HotDiffRemovedMember>();
         bool removedLiveField = false;
@@ -2097,6 +2098,24 @@ public sealed class CompileService
                 !m.Added &&
                 !cumulativeKeys.Contains(MemberSurfaceRegistry.MemberKey(
                     m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic)));
+        }
+        else
+        {
+            // The live diff itself went COLD. A hot change does not guarantee a
+            // hot REVERSE: an H7e enum append, an added const, or an added
+            // auto-property in LastAppliedText hits a cold form when the new
+            // text drops or reverts it. The removal/revert detection above only
+            // runs on a hot live diff, so proceeding here would route on the
+            // cumulative diff alone — misreporting a no-op (a ghost message
+            // pump keeps running), skipping clear-markers/tombstones, and
+            // (because LastAppliedText never advances) never self-healing on
+            // later batches. Fail closed; the recompile rebuilds disk truth.
+            // A clean unchanged re-send never lands here: Analyze(X, X) is
+            // trivially hot-empty.
+            return ColdBornReedit(
+                "the change against the last applied state cannot be verified (" +
+                live.Reasons.DefaultIfEmpty("live diff went cold").First() +
+                "); recompile to converge");
         }
         if (revertToBirth)
             return ColdBornReedit("a redirected method body was reverted to its birth version; recompile to converge");

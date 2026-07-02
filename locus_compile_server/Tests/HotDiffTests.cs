@@ -468,6 +468,89 @@ namespace Game
         Assert.Contains(result.Reasons, r => r.Contains("generic type field layout changed"));
     }
 
+    // ── ref structs: added instance members would shim `self` by value ──
+
+    [Fact]
+    public void Ref_struct_added_instance_method_is_cold()
+    {
+        var result = Analyze(
+            "ref struct S { public int Pos; public void M() { } }",
+            "ref struct S { public int Pos; public void M() { } public void Advance() { Pos++; } }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("ref struct instance member added"));
+    }
+
+    [Fact]
+    public void Ref_struct_added_instance_property_is_cold()
+    {
+        var result = Analyze(
+            "ref struct S { public int Pos; public void M() { } }",
+            "ref struct S { public int Pos; public void M() { } public int Doubled => Pos * 2; }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("ref struct instance member added"));
+    }
+
+    [Fact]
+    public void Ref_struct_added_static_method_is_hot()
+    {
+        var result = Analyze(
+            "ref struct S { public int Pos; public void M() { } }",
+            "ref struct S { public int Pos; public void M() { } public static int Zero() { return 0; } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Contains(result.ChangedMethods, m => m.Name == "Zero" && m.Added && m.IsStatic);
+    }
+
+    [Fact]
+    public void Ref_struct_method_body_change_stays_hot()
+    {
+        var result = Analyze(
+            "ref struct S { public int Pos; public void M() { Pos = 1; } }",
+            "ref struct S { public int Pos; public void M() { Pos = 2; } }");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var method = Assert.Single(result.ChangedMethods);
+        Assert.Equal("M", method.Name);
+        Assert.False(method.Added);
+    }
+
+    [Fact]
+    public void Ref_struct_instance_signature_change_is_cold()
+    {
+        var result = Analyze(
+            "ref struct S { public int Pos; public void M() { Pos = 1; } }",
+            "ref struct S { public int Pos; public int M() { Pos = 1; return Pos; } }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("ref struct instance member added"));
+    }
+
+    // ── partial methods: implementations cannot appear or vanish hot ──
+
+    [Fact]
+    public void Partial_method_implementation_removed_is_cold()
+    {
+        var result = Analyze(
+            "partial class A { partial void Hook() { Helper(); } void Helper() { } }",
+            "partial class A { partial void Hook(); void Helper() { } }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial method implementation removed"));
+    }
+
+    [Fact]
+    public void Partial_method_implementation_added_is_cold()
+    {
+        var result = Analyze(
+            "partial class A { partial void Hook(); void Helper() { } }",
+            "partial class A { partial void Hook() { Helper(); } void Helper() { } }");
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("partial method implementation added"));
+    }
+
     [Fact]
     public void Const_added_is_hot()
     {
@@ -631,6 +714,68 @@ class C
         var names = result.ChangedMethods.Select(m => m.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.Equal(new[] { "Helper", "M", "get_Value", "set_Value" }, names);
         Assert.All(result.ChangedMethods, m => Assert.False(m.Added));
+    }
+
+    [Fact]
+    public void Namespace_scoped_using_change_rehooks_every_detourable_member()
+    {
+        const string oldText = @"
+namespace Game
+{
+    using System;
+    class C
+    {
+        int _v;
+        public void M() { _v = 1; }
+        private int Helper() { return _v; }
+    }
+}";
+        string newText = oldText.Replace(
+            "using System;", "using System;\n    using System.Collections.Generic;");
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var names = result.ChangedMethods.Select(m => m.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+        Assert.Equal(new[] { "Helper", "M" }, names);
+    }
+
+    [Fact]
+    public void Namespace_scoped_using_removal_is_not_an_empty_diff()
+    {
+        const string oldText = "namespace Game\n{\n    using System.Text;\n    class C { void M() { } }\n}";
+        const string newText = "namespace Game\n{\n    class C { void M() { } }\n}";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal("M", Assert.Single(result.ChangedMethods).Name);
+    }
+
+    [Fact]
+    public void Using_moved_between_scopes_registers_as_a_change()
+    {
+        // Moving a directive between the compilation unit and a namespace
+        // changes lookup priority — it must rehook, not fold to an empty diff.
+        const string oldText = "using System.Text;\nnamespace Game\n{\n    class C { void M() { } }\n}";
+        const string newText = "namespace Game\n{\n    using System.Text;\n    class C { void M() { } }\n}";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        Assert.Equal("M", Assert.Single(result.ChangedMethods).Name);
+    }
+
+    [Fact]
+    public void Namespace_scoped_using_change_with_non_literal_const_is_cold()
+    {
+        const string oldText = "namespace Game\n{\n    class C { const int Max = int.MaxValue; void M() { } }\n}";
+        const string newText = "namespace Game\n{\n    using System;\n    class C { const int Max = int.MaxValue; void M() { } }\n}";
+
+        var result = Analyze(oldText, newText);
+
+        Assert.False(result.Hot);
+        Assert.Contains(result.Reasons, r => r.Contains("non-literal const"));
     }
 
     [Fact]
@@ -1151,6 +1296,36 @@ namespace Game
         Assert.Contains(removed.MagicMethods, m => m.Name == "Update");
         Assert.Contains(removed.MagicMethods, m => m.Name == "OnDisable");
         Assert.Contains("using UnityEngine;", removed.StubSource);
+    }
+
+    [Fact]
+    public void Removed_type_stub_carries_namespace_scoped_usings()
+    {
+        // SA1200-style file: the using lives INSIDE the namespace. The stub's
+        // magic-method signatures (Collision) only resolve if the stub source
+        // re-emits it.
+        const string oldText = @"
+namespace Game
+{
+    using UnityEngine;
+
+    public class Mover : MonoBehaviour
+    {
+        public void Update() { }
+        public void OnCollisionEnter(Collision c) { }
+    }
+}";
+        var result = Analyze(oldText, "");
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var removed = Assert.Single(result.RemovedTypes);
+        Assert.NotNull(removed.StubSource);
+        Assert.Contains("using UnityEngine;", removed.StubSource);
+        // Emitted inside the namespace block, after its opening brace.
+        Assert.True(
+            removed.StubSource!.IndexOf("namespace Game", StringComparison.Ordinal) <
+            removed.StubSource.IndexOf("using UnityEngine;", StringComparison.Ordinal),
+            removed.StubSource);
     }
 
     [Fact]

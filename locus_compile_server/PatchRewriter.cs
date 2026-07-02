@@ -761,6 +761,17 @@ public static class PatchRewriter
                     continue;
                 }
 
+                // An Expression<> lambda cannot hold the store access: the
+                // instance form is a ref-return (CS8156 inside a tree) and
+                // either form changes the tree's shape. A pointed cold beats
+                // leaking the raw compiler diagnostic.
+                if (InsideExpressionTreeLambda(model, node))
+                {
+                    result.ColdReason = "added field referenced inside an expression tree: " +
+                        fieldInfo.Name + " (an Expression<> lambda cannot reference materialized surface; use unity_recompile)";
+                    return result;
+                }
+
                 AddedFieldInfo capturedField = fieldInfo;
                 ShimTarget? enclosingAddedMember = EnclosingAddedTarget(node);
                 dynamicReplacements[node] = rewrittenNode =>
@@ -967,6 +978,16 @@ public static class PatchRewriter
                     continue;
                 }
 
+                // Inside an Expression<> lambda the call is DATA (a MethodInfo
+                // node in the tree), not IL: redirecting it to the patch copy
+                // would silently change the tree's shape for providers and
+                // split its identity from the post-convergence tree. Skip the
+                // redirect — the original call stays hot via its normal detour
+                // (the same acceptance as the inexpressible receivers below)
+                // and the queued recompile converges the inline risk.
+                if (InsideExpressionTreeLambda(model, invocation))
+                    continue;
+
                 PatchedMethodTarget capturedTarget = target;
                 if (!target.HasSelf)
                 {
@@ -1007,6 +1028,16 @@ public static class PatchRewriter
                 result.ColdReason =
                     "added member called through ?. (conditional access): " + target.DeclaringTypeMetadataName +
                     "." + target.MethodName + " — rewrite the call without ?. or use unity_recompile";
+                return result;
+            }
+
+            // An Expression<> lambda cannot call the shim without changing the
+            // tree's shape (the added member does not exist in metadata).
+            if (InsideExpressionTreeLambda(model, invocation))
+            {
+                result.ColdReason =
+                    "added member called inside an expression tree: " + target.DeclaringTypeMetadataName +
+                    "." + target.MethodName + " (an Expression<> lambda cannot reference materialized surface; use unity_recompile)";
                 return result;
             }
 
@@ -1052,6 +1083,17 @@ public static class PatchRewriter
                         SyntaxFactory.Literal(groupTarget.MethodName))
                     .WithTriviaFrom(nameofInvocation);
                 continue;
+            }
+
+            // A method group of an added member inside an Expression<> lambda:
+            // the lambda-wrapping rewrite would nest a quoted lambda into the
+            // tree — a different shape from the method-group conversion.
+            if (InsideExpressionTreeLambda(model, node))
+            {
+                result.ColdReason =
+                    "added member referenced inside an expression tree: " + groupTarget.DeclaringTypeMetadataName +
+                    "." + groupTarget.MethodName + " (an Expression<> lambda cannot reference materialized surface; use unity_recompile)";
+                return result;
             }
 
             if (model.GetTypeInfo(node).ConvertedType is not INamedTypeSymbol delegateType ||
@@ -2741,6 +2783,36 @@ public static class PatchRewriter
         return expression;
     }
 
+    /// <summary>True when <paramref name="node"/> sits inside a lambda the
+    /// compiler lowers to an expression TREE (its conversion target is
+    /// System.Linq.Expressions.Expression&lt;TDelegate&gt;), walking every
+    /// enclosing lambda up to the member (an inner delegate lambda can nest
+    /// inside an outer tree lambda). Materialized shim / store / patch-copy
+    /// references inside a tree change its SHAPE (MethodInfo identity,
+    /// provider translation) — and a ref-returning store access is not even
+    /// legal tree content (CS8156) — so tree contexts either skip the rewrite
+    /// (patched-method redirects: the original call stays hot via its detour)
+    /// or fail closed with a pointed reason (added surface: the tree cannot
+    /// reference it at all). Identity-preserving rewrites (type renames,
+    /// static-state requalification, enum cast literals) stay exempt: their
+    /// tree meaning is unchanged.</summary>
+    private static bool InsideExpressionTreeLambda(SemanticModel model, SyntaxNode node)
+    {
+        for (SyntaxNode? current = node.Parent; current != null; current = current.Parent)
+        {
+            if (current is AnonymousFunctionExpressionSyntax lambda &&
+                model.GetTypeInfo(lambda).ConvertedType is INamedTypeSymbol converted &&
+                converted.MetadataName == "Expression`1" &&
+                converted.ContainingNamespace?.ToDisplayString() == "System.Linq.Expressions")
+            {
+                return true;
+            }
+            if (current is MemberDeclarationSyntax)
+                break;
+        }
+        return false;
+    }
+
     /// <summary>Rewrite every reference that binds to an accessor ADDED by
     /// this batch (B2). Reads become `Shims.get_X(recv, …)`, statement
     /// assignments become `Shims.set_X(recv, …, value)`, compound statement
@@ -2872,6 +2944,14 @@ public static class PatchRewriter
             {
                 return "added property used in a pattern: " + display +
                     " (property patterns bind to original metadata; use unity_recompile)";
+            }
+            // Accessor materialization (get_/set_ shim calls or the lvalue
+            // store) changes an expression tree's shape; the instance store
+            // form is a ref-return and not legal tree content at all.
+            if (InsideExpressionTreeLambda(model, node))
+            {
+                return "added member referenced inside an expression tree: " + display +
+                    " (an Expression<> lambda cannot reference materialized surface; use unity_recompile)";
             }
 
             var reference = (ExpressionSyntax)node;

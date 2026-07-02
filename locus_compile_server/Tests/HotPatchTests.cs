@@ -2661,6 +2661,156 @@ namespace RelaxE2E
         }
     }
 
+    // ── expression-tree contexts: skip redirects, cold added surface ──
+
+    private const string TreeCorpus = @"
+namespace TreeE2E
+{
+    public static class Lib
+    {
+        public static int Bonus() { return 2; }
+    }
+    public static class Caller
+    {
+        public static int Run()
+        {
+            System.Linq.Expressions.Expression<System.Func<int>> e = () => Lib.Bonus();
+            return Lib.Bonus() + e.Compile()();
+        }
+    }
+}";
+
+    [Fact]
+    public void Patched_method_redirect_is_skipped_inside_expression_trees()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "TreeRedirectOriginal", TreeCorpus);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = TreeCorpus
+            .Replace("public static int Bonus() { return 2; }",
+                     "public static int Bonus() { return 20; }")
+            .Replace("return Lib.Bonus() + e.Compile()();",
+                     "int pad = 0;\n            return Lib.Bonus() + e.Compile()() + pad;");
+        JsonNode result = HotPatch(service, compileParams, ("Tree.cs", TreeCorpus, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The DIRECT call redirects to the patch copy (20); the call inside
+        // the Expression<> lambda keeps the tree's shape and still targets the
+        // ORIGINAL method (2, hot live via its detour) — not 40, which would
+        // mean the redirect leaked into the tree.
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("tree-e2e-" + Guid.NewGuid().ToString("N"), isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(File.ReadAllBytes(originalPath)));
+            context.Resolving += (_, name) => name.Name == "TreeRedirectOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+            Type caller = patch.GetType("TreeE2E.Caller__LocusPatch", throwOnError: true)!;
+            object? value = caller.GetMethod("Run")!.Invoke(null, null);
+            Assert.Equal(22, value);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_member_called_inside_expression_tree_is_cold()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "TreeAddOriginal", TreeCorpus);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = TreeCorpus
+            .Replace("public static int Bonus() { return 2; }",
+                     "public static int Bonus() { return 2; }\n        public static int Extra() { return 5; }")
+            .Replace("() => Lib.Bonus()", "() => Lib.Extra()");
+        JsonNode result = HotPatch(service, compileParams, ("Tree.cs", TreeCorpus, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.Contains("inside an expression tree", result["files"]!.ToJsonString());
+    }
+
+    [Fact]
+    public void Added_member_in_plain_delegate_lambda_stays_hot()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "TreeDelegateOriginal", TreeCorpus);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = TreeCorpus
+            .Replace("public static int Bonus() { return 2; }",
+                     "public static int Bonus() { return 2; }\n        public static int Extra() { return 5; }")
+            .Replace("System.Linq.Expressions.Expression<System.Func<int>> e = () => Lib.Bonus();",
+                     "System.Func<int> e = () => Lib.Extra();")
+            .Replace("return Lib.Bonus() + e.Compile()();",
+                     "return Lib.Bonus() + e();");
+        JsonNode result = HotPatch(service, compileParams, ("Tree.cs", TreeCorpus, newText));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void Added_field_referenced_inside_expression_tree_is_cold()
+    {
+        const string src = @"
+namespace TreeE2E
+{
+    public class Holder
+    {
+        public int Grab()
+        {
+            System.Linq.Expressions.Expression<System.Func<int>> e = () => 1;
+            return e.Compile()();
+        }
+    }
+}";
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "TreeFieldOriginal", src);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = src
+            .Replace("public int Grab()", "private int _extra = 3;\n        public int Grab()")
+            .Replace("() => 1", "() => _extra");
+        JsonNode result = HotPatch(service, compileParams, ("Holder.cs", src, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.Contains("added field referenced inside an expression tree", result["files"]!.ToJsonString());
+    }
+
+    [Fact]
+    public void Added_property_referenced_inside_expression_tree_is_cold()
+    {
+        const string src = @"
+namespace TreeE2E
+{
+    public class Holder
+    {
+        public int Grab()
+        {
+            System.Linq.Expressions.Expression<System.Func<int>> e = () => 1;
+            return e.Compile()();
+        }
+    }
+}";
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "TreePropOriginal", src);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        string newText = src
+            .Replace("public int Grab()", "public int Doubled { get { return 4; } }\n        public int Grab()")
+            .Replace("() => 1", "() => Doubled");
+        JsonNode result = HotPatch(service, compileParams, ("Holder.cs", src, newText));
+
+        Assert.False(result["hot"]!.GetValue<bool>(), result.ToJsonString());
+        Assert.Contains("inside an expression tree", result["files"]!.ToJsonString());
+    }
+
     [Fact]
     public void Added_member_reading_private_field_goes_hot_with_green_caps()
     {
@@ -5010,6 +5160,56 @@ public class PlayModeBornReeditTests
         Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
         var detour = Assert.Single(v2["methods"]!.AsArray())!;
         Assert.Equal("Pick", detour["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_enum_member_added_then_full_revert_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-enum-revert-gen";
+
+        HotPatchBorn(service, p, BornEnum);   // birth (Hue { Red, Green })
+        string withBlue = BornEnum
+            .Replace("public enum Hue { Red, Green }", "public enum Hue { Red, Green, Blue }")
+            .Replace("public int Pick() { return (int)Hue.Red; }",
+                     "public int Pick() { return (int)Hue.Blue; }");
+        HotPatchBorn(service, p, withBlue);   // hot: enum append + body redirect
+
+        // Reverting to the BIRTH text drops the appended enum member. The live
+        // diff (last-applied → new) hits the cold "enum changed" form, so the
+        // removal/revert detection cannot run; routing on the (empty) cumulative
+        // diff alone would misreport a no-op and freeze LastAppliedText forever.
+        // The whole file must fail closed instead.
+        JsonNode v3 = HotPatchBorn(service, p, BornEnum);
+        Assert.False(v3["hot"]!.GetValue<bool>(), v3.ToJsonString());
+        Assert.Contains("cannot be verified", v3["files"]!.ToJsonString());
+    }
+
+    [Fact]
+    public void PlayModeBornType_enum_member_removed_with_body_edit_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-enum-partial-revert-gen";
+
+        HotPatchBorn(service, p, BornEnum);   // birth
+        string withBlue = BornEnum
+            .Replace("public enum Hue { Red, Green }", "public enum Hue { Red, Green, Blue }")
+            .Replace("public int Pick() { return (int)Hue.Red; }",
+                     "public int Pick() { return (int)Hue.Blue; }");
+        HotPatchBorn(service, p, withBlue);   // hot
+
+        // Dropping ONLY the appended enum member while keeping a body change:
+        // the cumulative diff is non-empty (Pick still differs from birth), so
+        // pre-fix this walked HOT with the enum removal silently unverified.
+        // The cold live diff must take the whole file cold.
+        string dropBlueKeepEdit = BornEnum.Replace(
+            "public int Pick() { return (int)Hue.Red; }",
+            "public int Pick() { return (int)Hue.Green; }");
+        JsonNode v3 = HotPatchBorn(service, p, dropBlueKeepEdit);
+        Assert.False(v3["hot"]!.GetValue<bool>(), v3.ToJsonString());
+        Assert.Contains("cannot be verified", v3["files"]!.ToJsonString());
     }
 
     // ── Feature #5: a sibling type added to a play-mode-born file ─────────
