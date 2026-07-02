@@ -25,6 +25,13 @@ struct PendingEdit {
     /// converges, so this lets write/edit report only the new, unapplied
     /// delta after an already-hot-applied file is edited again.
     applied_text: Option<String>,
+    /// Monotonic per-project write sequence (`ProjectState::edit_seq`) stamped
+    /// on every write/edit that touches the file. An OBSERVED convergence
+    /// (monitor sample) only clears entries whose last write predates the
+    /// previous sample — an edit racing the sample window stays pending
+    /// (over-report; the next convergence sweeps it) instead of being swept
+    /// as if the compile had included it.
+    seq: u64,
 }
 
 /// C0 access-probe result for one domain generation (cells + primitives +
@@ -59,6 +66,23 @@ struct ProjectState {
     /// that races ahead of the connect baseline is never mistaken for a
     /// startup-compiled survivor — that would under-report.
     pending_survived_exit: bool,
+    /// Monotonic counter bumped by every tracked .cs write; stamps
+    /// `PendingEdit::seq`.
+    edit_seq: u64,
+    /// `edit_seq` as of the PREVIOUS reload-state sample. An observed
+    /// convergence clears only pending entries at or below it: anything
+    /// written after that sample cannot be proven part of the compile the
+    /// serial reports (a compile that started even earlier can still slip
+    /// through — shrinking the window to one poll is the best a serial-only
+    /// signal allows; a compile-in-flight echo in get_reload_state could
+    /// tighten it further).
+    seq_at_last_sample: u64,
+    /// `edit_seq` as of the last observed editor exit. The survived-exit
+    /// convergence (relaunch whose startup recompile loaded the survivors)
+    /// clears only entries at or below it — edits written after the exit are
+    /// certainly on disk for that startup compile too, but keeping them
+    /// pending only over-reports, which is the safe direction.
+    exit_seq: u64,
     /// C0 capability matrix, probed once per domain generation (the probe
     /// assembly and the measured Mono both die with the domain).
     access_probe: Option<AccessProbeCacheEntry>,
@@ -158,6 +182,23 @@ async fn record_patch_applied(project_path: &str, assembly_bytes: u64, code_entr
         let mut projects = projects().lock().await;
         let state = projects.entry(project_key(project_path)).or_default();
         state.patches_applied += 1;
+        state.active_patches += 1;
+        state.active_patch_bytes += assembly_bytes;
+        state.active_patch_code += code_entries;
+    }
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Record a hot patch whose apply outcome is UNKNOWN (the Unity round-trip
+/// timed out or the pipe dropped after send): count the live-detour tallies —
+/// the detours may well be live, and the sidecar swap gate plus the
+/// lost-session gate must stay conservative — without claiming a successful
+/// apply in the monotonic total. Over-counting a patch Unity never loaded is
+/// benign: the next convergence (which the caller queues) zeroes the tallies.
+async fn record_patch_assumed_applied(project_path: &str, assembly_bytes: u64, code_entries: u64) {
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
         state.active_patches += 1;
         state.active_patch_bytes += assembly_bytes;
         state.active_patch_code += code_entries;
@@ -326,6 +367,62 @@ async fn try_converge(project_path: &str, why: &str) {
         Ok(_) => eprintln!("[HotReload] auto-convergence completed ({why})"),
         Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
     }
+}
+
+/// Locus stopped WATCHING this project (workspace switch/close): nothing will
+/// observe that editor's exit or its compiles anymore, so a frozen live-patch
+/// ledger would poison the sidecar swap gate and the lost-session clear
+/// condition indefinitely. Hand off in the background:
+///   • editor reachable in EDIT mode → silent convergence recompile — the
+///     detours die with a real compile and the ledger settles truthfully;
+///   • editor reachable but PLAYING → leave the ledger conservative (the
+///     detours are genuinely live; a later switch-back resumes observation and
+///     the play-exit trigger still fires then);
+///   • editor unreachable → dead-editor bookkeeping (`on_editor_exited`): keeps
+///     pending/cold evidence, zeroes the dead detour tallies, marks survivors.
+pub fn on_monitor_stopped_background(project_path: String) {
+    tauri::async_runtime::spawn(async move {
+        if !super::is_enabled() {
+            // Live patches only exist while the feature is on; with it off the
+            // ledger is already empty — nothing to hand off.
+            return;
+        }
+        let has_ledger = {
+            let projects = projects().lock().await;
+            projects
+                .get(&project_key(&project_path))
+                .map(|state| state.active_patches > 0 || !state.cold_paths.is_empty())
+                .unwrap_or(false)
+        };
+        if !has_ledger {
+            return;
+        }
+        // One retry across a short gap before declaring the editor gone: a
+        // transient pipe blip at the exact stop instant would otherwise zero a
+        // LIVE editor's detour tallies (under-account; a later apply fails
+        // visibly, but avoid it when one more look resolves it).
+        let mut connected_status = crate::unity_bridge::query_unity_status(&project_path).await;
+        if !connected_status.0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            connected_status = crate::unity_bridge::query_unity_status(&project_path).await;
+        }
+        let (connected, status, _) = connected_status;
+        if connected {
+            if crate::unity_bridge::is_play_mode_status(status) {
+                eprintln!(
+                    "[HotReload] monitor stopped with live patches while playing; keeping the \
+                     ledger conservative until the project is observed again"
+                );
+                return;
+            }
+            try_converge(&project_path, "monitor stopped").await;
+            return;
+        }
+        eprintln!(
+            "[HotReload] monitor stopped and the editor is unreachable; treating it as exited"
+        );
+        on_editor_exited(&project_path).await;
+    });
 }
 
 /// Reconstruct the `MethodKey` string the Unity plugin builds per detour
@@ -558,13 +655,19 @@ pub async fn note_cs_written(project_path: &str, file_path: &str, prior_content:
 
     let mut projects = projects().lock().await;
     let state = projects.entry(project_key(project_path)).or_default();
+    state.edit_seq += 1;
+    let seq = state.edit_seq;
     state
         .pending
         .entry(file_key(&absolute_path))
+        // Baseline stays the FIRST-touch content; only the write sequence
+        // advances (observed convergence keys on the LAST write).
+        .and_modify(|edit| edit.seq = seq)
         .or_insert_with(|| PendingEdit {
             absolute_path,
             baseline: prior_content,
             applied_text: None,
+            seq,
         });
     drop(projects);
     crate::csharp_compile::emit_status_in_background();
@@ -613,7 +716,15 @@ async fn is_pending_edit_unapplied(edit: &PendingEdit) -> bool {
         Err(_) => return true,
     };
     if current == edit.baseline {
-        return false;
+        // Back at the compiled baseline. If a hot patch was applied for OTHER
+        // content in between, the Editor still runs that applied body — the
+        // detour cannot be undone in place, so the file is NOT converged until
+        // a real compile restores disk truth (hot_reload queues it cold).
+        return edit
+            .applied_text
+            .as_ref()
+            .map(|applied| applied != &edit.baseline)
+            .unwrap_or(false);
     }
     !edit
         .applied_text
@@ -846,9 +957,28 @@ pub async fn format_pending_edit_status(
 /// A real compile converged (recompile completed / domain reloaded): disk is
 /// the new truth, detours are gone with the old domain.
 pub async fn on_recompile_converged(project_path: &str) {
+    // The explicit path (a recompile Locus itself drove to completion):
+    // everything tracked is on disk before the compile starts, so the whole
+    // pending set converges unbounded.
+    converge_tracked_edits(project_path, None).await;
+}
+
+/// Shared convergence: clear tracked edits (all of them, or only those whose
+/// last write is at or below `pending_seq_bound`), reset the reload trackers,
+/// and run the domain-reload cleanup. The bound exists for OBSERVED
+/// convergence — a Unity-initiated compile whose completion the monitor merely
+/// sampled: an edit written inside the sampling window cannot be proven part
+/// of that compile, so it stays pending (over-report; the next convergence
+/// sweeps it). Cold paths always clear in full: a queued cold file whose edit
+/// survived the compile re-queues itself on the next hot_reload attempt (its
+/// pending entry is what carries the evidence).
+async fn converge_tracked_edits(project_path: &str, pending_seq_bound: Option<u64>) {
     let mut projects = projects().lock().await;
     if let Some(state) = projects.get_mut(&project_key(project_path)) {
-        state.pending.clear();
+        match pending_seq_bound {
+            None => state.pending.clear(),
+            Some(bound) => state.pending.retain(|_, edit| edit.seq > bound),
+        }
         state.cold_paths.clear();
         // The old domain died with the recompile; the next observation
         // re-seeds the session/generation/serial trackers.
@@ -999,13 +1129,13 @@ pub async fn observe_reload_state(
     domain_generation: String,
     converged_serial: i64,
 ) {
-    let decision = {
+    let (decision, converge_bound) = {
         let projects = projects().lock().await;
         let state = projects.get(&project_key(project_path));
         let survived_exit = state
             .map(|state| state.pending_survived_exit)
             .unwrap_or(false);
-        classify_reload(
+        let decision = classify_reload(
             state.and_then(|state| state.last_session_id.as_deref()),
             state.and_then(|state| state.last_domain_generation.as_deref()),
             state.and_then(|state| state.last_converged_serial),
@@ -1013,7 +1143,22 @@ pub async fn observe_reload_state(
             &domain_generation,
             converged_serial,
             survived_exit,
-        )
+        );
+        // An OBSERVED convergence only clears edits whose last write predates
+        // the moment we can tie to the compile: the previous sample for a
+        // same-session serial move, the recorded exit for a survived-exit
+        // relaunch. Later writes stay pending (over-report, swept by the next
+        // convergence) instead of being cleared as if compiled.
+        let converge_bound = state
+            .map(|state| {
+                if survived_exit {
+                    state.exit_seq
+                } else {
+                    state.seq_at_last_sample
+                }
+            })
+            .unwrap_or(0);
+        (decision, converge_bound)
     };
 
     match decision {
@@ -1021,7 +1166,7 @@ pub async fn observe_reload_state(
             eprintln!(
                 "[HotReload] editor converged (session {session_id}, serial {converged_serial}); clearing tracked edits"
             );
-            on_recompile_converged(project_path).await;
+            converge_tracked_edits(project_path, Some(converge_bound)).await;
         }
         ReloadDecision::Reloaded => {
             eprintln!(
@@ -1039,6 +1184,10 @@ pub async fn observe_reload_state(
     state.last_session_id = Some(session_id);
     state.last_domain_generation = Some(domain_generation);
     state.last_converged_serial = Some(converged_serial);
+    // Edits written up to THIS sample are provably older than whatever the
+    // next sample's serial move compiled — the next observed convergence
+    // clears exactly them.
+    state.seq_at_last_sample = state.edit_seq;
     // The survived-exit hint is for the first sample of the relaunched instance
     // only (consulted above). Past it, this instance's own serial moves drive
     // convergence, so clear it — otherwise a later edit made before the next
@@ -1065,6 +1214,9 @@ pub async fn on_editor_exited(project_path: &str) {
         // a moved serial (serial > 0) rather than stranding a stale count. A
         // failed startup compile leaves serial 0, so they correctly stay pending.
         state.pending_survived_exit = !state.pending.is_empty() || !state.cold_paths.is_empty();
+        // The survived-exit convergence clears edits up to this point; anything
+        // written after the exit stays pending (over-report — safe direction).
+        state.exit_seq = state.edit_seq;
         state.last_session_id = None;
         state.last_domain_generation = None;
         state.last_converged_serial = None;
@@ -1271,6 +1423,11 @@ struct AppliedHotPatch {
     /// summary can name them instead of showing a bare count. Empty from older
     /// plugins (then only the count is reported).
     pump_skipped_messages: Vec<String>,
+    /// The plugin accepted the patch (detours live, accounted) but its response
+    /// payload was missing or malformed, so the inline/pump echoes above are
+    /// DEFAULTS, not observations. The caller queues the batch for a
+    /// convergence recompile instead of reporting "live" on unverified state.
+    response_unparseable: bool,
 }
 
 async fn apply_compiled_hot_patch(
@@ -1352,6 +1509,9 @@ async fn apply_compiled_hot_patch(
     }
     let payload = payload.to_string();
 
+    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
+    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
+
     let resp = match crate::unity_bridge::send_message_with_timeout(
         project_path,
         "hot_patch_loaded",
@@ -1362,7 +1522,17 @@ async fn apply_compiled_hot_patch(
     {
         Ok(resp) => resp,
         Err(error) => {
+            // Outcome UNKNOWN: Unity may have applied the detours and only the
+            // response was lost (timeout / pipe drop). Count the live tallies
+            // conservatively — the sidecar swap gate and the lost-session gate
+            // key on them — and arm convergence; the caller queues the batch
+            // cold, so a recompile restores certainty either way. The image is
+            // deliberately NOT registered: referencing a maybe-never-loaded
+            // assembly from a later batch fails visibly at apply (fail-closed),
+            // while registering it would hide the uncertainty.
+            record_patch_assumed_applied(project_path, assembly_bytes, code_entries).await;
             record_patch_failure(project_path).await;
+            note_patch_applied(project_path).await;
             return Err(format!(
                 "Unity did not accept the hot patch ({error}); use unity_recompile."
             ));
@@ -1370,6 +1540,9 @@ async fn apply_compiled_hot_patch(
     };
 
     if !resp.ok {
+        // The plugin rejected and ROLLED BACK the whole patch (resolve /
+        // signature / shim / driver-wiring failures restore the previous
+        // detours), so nothing stays live to account for.
         record_patch_failure(project_path).await;
         let error = resp
             .error
@@ -1405,29 +1578,24 @@ async fn apply_compiled_hot_patch(
         // patch claimed a driver it could not honor — fail closed to a recompile.
         pump_failed_count: u64,
     }
-    let loaded = resp
+    // resp.ok means the detours ARE live. Parse the payload separately: a
+    // missing/malformed message must not silently read as "nothing inlined,
+    // no pump" — that under-reports Release inline state (the pump dimension
+    // fails closed via default false, but the inline dimension would fail
+    // OPEN). The caller sees `response_unparseable` and queues the batch for
+    // convergence instead of trusting the defaults.
+    let parsed = resp
         .message
         .as_deref()
-        .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
-        .unwrap_or_default();
+        .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok());
+    let response_unparseable = parsed.is_none();
+    let loaded = parsed.unwrap_or_default();
 
-    // Learn the plugin's pump capability for this generation so the next
-    // message-driver patch can preflight instead of applying-then-failing-closed.
-    remember_pump_capability(&params.domain_generation, loaded.pump_supported);
-
-    // Fail closed if this patch adds Unity messages the plugin cannot honor: an
-    // older plugin that ignores `message_drivers` and load-onlys the patch, or one
-    // that reported messages it could not wire. A recompile makes them live
-    // natively; returning Err routes the caller to queue_cold_paths instead of
-    // marking the file applied / live.
-    message_driver_gate(
-        has_real_message_drivers(message_drivers),
-        loaded.pump_supported,
-        loaded.pump_failed_count,
-    )?;
-
-    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
-    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
+    // The patch is live in the Editor: account for it and register its image
+    // BEFORE any policy gate below can return Err. An applied-but-unaccounted
+    // patch would let the sidecar swap gate and the lost-session gate see zero
+    // active patches — exactly the state split they exist to prevent — and
+    // would leave H6 convergence unarmed for a patch that is running.
     record_patch_applied(project_path, assembly_bytes, code_entries).await;
     note_patch_applied(project_path).await;
 
@@ -1442,6 +1610,26 @@ async fn apply_compiled_hot_patch(
         Ok(()) => None,
         Err(error) => Some(error),
     };
+
+    // Learn the plugin's pump capability for this generation so the next
+    // message-driver patch can preflight instead of applying-then-failing-closed.
+    // An unparseable response teaches nothing (recording the default `false`
+    // would wrongly lock a capable plugin out for the whole generation).
+    if !response_unparseable {
+        remember_pump_capability(&params.domain_generation, loaded.pump_supported);
+    }
+
+    // Fail closed if this patch adds Unity messages the plugin cannot honor: an
+    // older plugin that ignores `message_drivers` and load-onlys the patch, or one
+    // that reported messages it could not wire. A recompile makes them live
+    // natively; returning Err routes the caller to queue_cold_paths. The ledger
+    // above is already consistent (detours live and accounted), so this gate
+    // only decides how the outcome is REPORTED.
+    message_driver_gate(
+        has_real_message_drivers(message_drivers),
+        loaded.pump_supported,
+        loaded.pump_failed_count,
+    )?;
 
     let index_types: Vec<crate::unity_type_index::UnityTypeIndexEntry> = new_types
         .iter()
@@ -1476,6 +1664,7 @@ async fn apply_compiled_hot_patch(
         image_register_error,
         pump_skipped_count: loaded.pump_skipped_count,
         pump_skipped_messages: loaded.pump_skipped_messages,
+        response_unparseable,
     })
 }
 
@@ -1751,6 +1940,19 @@ async fn try_inline_caller_refresh(
                     report
                         .notes
                         .push("caller refresh produced no detourable methods".to_string());
+                    break;
+                }
+                // The sidecar can have died and respawned during THIS round's
+                // query/compile (after the top-of-round gate), blanking the
+                // session registries — the freshly built refresh patch could
+                // then carry a value-splitting field store. Re-check before
+                // shipping it to Unity (mirrors the main apply path's
+                // pre-apply re-check).
+                if super::session_registry_lost() {
+                    report.notes.push(
+                        "caller refresh stopped: compile-server session lost to a restart"
+                            .to_string(),
+                    );
                     break;
                 }
                 match apply_compiled_hot_patch(
@@ -2434,6 +2636,7 @@ pub async fn hot_reload(
     let mut files: Vec<(String, String, String)> = Vec::new(); // (path, old, new)
     let mut changed_keys: Vec<String> = Vec::new();
     let mut changed_current_texts: Vec<(String, String)> = Vec::new();
+    let mut reverted_keys: Vec<String> = Vec::new();
     for (key, edit) in &edits {
         let current = match tokio::fs::read_to_string(&edit.absolute_path).await {
             Ok(text) => text,
@@ -2448,6 +2651,19 @@ pub async fn hot_reload(
             }
         };
         if current == edit.baseline {
+            // Back at the compiled baseline. If a hot patch was applied for
+            // other content in between, the Editor still RUNS that applied
+            // body — a detour cannot be undone in place, so the file needs
+            // the convergence recompile that restores disk truth. Silently
+            // skipping it here read as "converged" while runtime ≠ disk.
+            if edit
+                .applied_text
+                .as_ref()
+                .map(|applied| applied != &edit.baseline)
+                .unwrap_or(false)
+            {
+                reverted_keys.push(key.clone());
+            }
             continue;
         }
         files.push((edit.absolute_path.clone(), edit.baseline.clone(), current));
@@ -2455,11 +2671,25 @@ pub async fn hot_reload(
         changed_current_texts.push((key.clone(), files.last().unwrap().2.clone()));
     }
 
+    let reverted_note = if reverted_keys.is_empty() {
+        None
+    } else {
+        queue_cold_paths(project_path, &reverted_keys).await;
+        crate::csharp_compile::emit_status_in_background();
+        Some(format!(
+            "{} file(s) were hot-applied earlier and have since been reverted to their compiled \
+             baseline on disk; the running Editor still executes the applied bodies. Queued for \
+             unity_recompile to restore disk truth.",
+            reverted_keys.len()
+        ))
+    };
+
     if files.is_empty() {
-        return Ok(
-            "All tracked edits are back at their compiled baseline; nothing to hot reload."
+        return Ok(match reverted_note {
+            Some(note) => note,
+            None => "All tracked edits are back at their compiled baseline; nothing to hot reload."
                 .to_string(),
-        );
+        });
     }
 
     // A prior request already saw the sidecar restart with patches live: its
@@ -2534,6 +2764,9 @@ pub async fn hot_reload(
                 "Run unity_recompile to apply them ({queued} file(s) queued). Hot-applied edits \
                  from earlier patches stay live until then."
             ));
+            if let Some(note) = &reverted_note {
+                lines.push(note.clone());
+            }
             Ok(lines.join("\n"))
         }
         crate::csharp_compile::HotPatchOutcome::Noop {
@@ -2543,10 +2776,13 @@ pub async fn hot_reload(
             mark_changed_keys_applied(project_path, &changed_current_texts).await;
             crate::csharp_compile::emit_status_in_background();
             if deletions_noted == 0 {
-                return Ok(
+                let mut summary =
                     "No effective code change (comments/formatting only); nothing to hot reload."
-                        .to_string(),
-                );
+                        .to_string();
+                if let Some(note) = &reverted_note {
+                    summary.push_str(&format!("\n{note}"));
+                }
+                return Ok(summary);
             }
             let mut summary = format!(
                 "Deletion applied: {deletions_noted} removed member(s) recorded. The loaded code \
@@ -2555,6 +2791,9 @@ pub async fn hot_reload(
             );
             if let Some(note) = caller_scan_note {
                 summary.push_str(&format!("\nCall-site check: {note}."));
+            }
+            if let Some(note) = &reverted_note {
+                summary.push_str(&format!("\n{note}"));
             }
             Ok(summary)
         }
@@ -2621,6 +2860,18 @@ pub async fn hot_reload(
             let image_register_error = applied.image_register_error;
             let pump_skipped_count = applied.pump_skipped_count;
             let pump_skipped_messages = applied.pump_skipped_messages;
+            let response_unparseable = applied.response_unparseable;
+
+            // The plugin applied the patch but its response payload could not
+            // be parsed: the inline/pump echoes are defaults, not observations.
+            // Queue the whole batch for convergence — a Release inline bypass
+            // could be hiding behind the defaults, and "live" must not be
+            // reported on unverified state (the pump dimension already fails
+            // closed; this closes the inline dimension the same way).
+            if response_unparseable {
+                queue_cold_paths(project_path, &changed_keys).await;
+                crate::csharp_compile::emit_status_in_background();
+            }
 
             // Phase D rollout observability: count the force-evaluate-attributable
             // classifications (StubInlined = the force-JIT stub moved Mono's bit;
@@ -2743,7 +2994,12 @@ pub async fn hot_reload(
                     summary.push_str(&format!("\nInline caller refresh: {note}."));
                 }
             }
-            if inlined_method_keys.is_empty() {
+            if response_unparseable {
+                summary.push_str(
+                    ".\nThe plugin's response could not be parsed, so inline/pump state is \
+                     UNVERIFIED — the batch is queued for convergence; run unity_recompile.",
+                );
+            } else if inlined_method_keys.is_empty() {
                 summary.push_str(
                     ".\nChanges are live in the running Editor — no recompile, no domain reload, \
                      state preserved. The files are on disk, so the next unity_recompile or domain \
@@ -2786,6 +3042,9 @@ pub async fn hot_reload(
                         action,
                     ));
                 }
+            }
+            if let Some(note) = &reverted_note {
+                summary.push_str(&format!("\n{note}"));
             }
 
             Ok(summary)
@@ -3263,12 +3522,17 @@ mod tests {
         async fn seed(project: &str, path: &str, baseline: &str) {
             let mut projects = projects().lock().await;
             let state = projects.entry(project_key(project)).or_default();
+            // Mirror note_cs_written: every seeded write advances the sequence
+            // (the observed-convergence bound keys on it).
+            state.edit_seq += 1;
+            let seq = state.edit_seq;
             state.pending.insert(
                 file_key(path),
                 PendingEdit {
                     absolute_path: path.to_string(),
                     baseline: baseline.to_string(),
                     applied_text: None,
+                    seq,
                 },
             );
         }
@@ -3359,6 +3623,122 @@ mod tests {
             unapplied_in_project(&project).await,
             0,
             "the new instance's first successful compile converges them"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn observed_convergence_keeps_edits_written_after_the_last_sample() {
+        let dir = std::env::temp_dir().join(format!(
+            "locus-observe-race-{}",
+            std::process::id() as u64
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        ));
+        let assets = dir.join("Assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let file = assets.join("Race.cs");
+        let file_path = file.to_string_lossy().to_string();
+        let project = dir.to_string_lossy().to_string();
+
+        async fn seed(project: &str, path: &str, baseline: &str) {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(project)).or_default();
+            state.edit_seq += 1;
+            let seq = state.edit_seq;
+            state.pending.insert(
+                file_key(path),
+                PendingEdit {
+                    absolute_path: path.to_string(),
+                    baseline: baseline.to_string(),
+                    applied_text: None,
+                    seq,
+                },
+            );
+        }
+
+        // Baseline sample, THEN an edit, THEN the serial moves: the compile
+        // behind that serial cannot be proven to include the raced edit, so
+        // it must stay pending (over-report; the next convergence sweeps it) —
+        // pre-fix, the unconditional clear swept it as if compiled.
+        observe_reload_state(&project, "s1".to_string(), "g1".to_string(), 0).await;
+        std::fs::write(&file, "v1").unwrap();
+        seed(&project, &file_path, "v0").await;
+        observe_reload_state(&project, "s1".to_string(), "g2".to_string(), 1).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "an edit inside the sampling window survives the observed convergence"
+        );
+
+        // The next sample records it; the next serial move sweeps it.
+        observe_reload_state(&project, "s1".to_string(), "g2".to_string(), 1).await;
+        observe_reload_state(&project, "s1".to_string(), "g3".to_string(), 2).await;
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "the following observed convergence clears it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn applied_then_reverted_file_counts_unapplied() {
+        let dir = std::env::temp_dir().join(format!(
+            "locus-revert-applied-{}",
+            std::process::id() as u64
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        ));
+        let assets = dir.join("Assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let file = assets.join("Revert.cs");
+        let file_path = file.to_string_lossy().to_string();
+        let project = dir.to_string_lossy().to_string();
+
+        // Hot-applied (applied_text == disk): nothing unapplied.
+        std::fs::write(&file, "v1").unwrap();
+        {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(&project)).or_default();
+            state.pending.insert(
+                file_key(&file_path),
+                PendingEdit {
+                    absolute_path: file_path.clone(),
+                    baseline: "v0".to_string(),
+                    applied_text: Some("v1".to_string()),
+                    seq: 1,
+                },
+            );
+        }
+        assert_eq!(unapplied_in_project(&project).await, 0, "hot-applied text is settled");
+
+        // Reverting the DISK to the baseline does not undo the live detour —
+        // the Editor still runs v1 — so the file must count as unapplied
+        // (pre-fix it read as converged and the stale detour hid silently).
+        std::fs::write(&file, "v0").unwrap();
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            1,
+            "a revert after a hot apply needs a convergence recompile"
+        );
+
+        // A never-applied edit reverted to baseline is genuinely clean.
+        {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(&project)).or_default();
+            state.pending.get_mut(&file_key(&file_path)).unwrap().applied_text = None;
+        }
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "a never-applied revert stays clean"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

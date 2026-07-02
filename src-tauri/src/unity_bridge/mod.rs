@@ -4672,6 +4672,9 @@ pub async fn start_unity_monitor(
     monitor: &UnityMonitorHandle,
 ) {
     stop_unity_monitor(monitor).await;
+    if let Ok(mut slot) = MONITORED_PROJECT.lock() {
+        *slot = Some(project_path.clone());
+    }
     set_event_app_handle(app_handle.clone());
 
     let pipe_name = get_native_pipe_name(&project_path);
@@ -4815,15 +4818,15 @@ pub async fn start_unity_monitor(
                 }
             }
 
-            if recompile_waiting && !connected {
-                if let Some(process_info) = last_detected_editor_process
-                    .clone()
-                    .filter(|info| info.process_id.is_some())
-                {
-                    apply_unity_process_info(&mut status, process_info);
-                    sync_background_hook_for_status(&mut status, &project_path).await;
-                }
-            } else if disconnected_transition {
+            // The exit-liveness check runs on the disconnect TRANSITION even
+            // while a recompile is waiting: a crash during the compile window
+            // is the most common crash point, and this transition tick is the
+            // only one that fires — swallowing it froze the dead editor's
+            // active-patch tallies forever (poisoning the sidecar swap gate
+            // and the lost-session clear condition). A domain-reload pipe drop
+            // keeps the process alive, so the liveness refresh distinguishes
+            // the two and the normal recompile flow is unaffected.
+            if disconnected_transition {
                 if let Some(process_info) = process::refresh_known_project_editor_process_liveness(
                     &project_path,
                     last_detected_editor_process.clone(),
@@ -4841,7 +4844,20 @@ pub async fn start_unity_monitor(
                         // the next reload-state sample converges them then (or
                         // keeps them if that compile fails).
                         crate::unity_hotreload::coordinator::on_editor_exited(&project_path).await;
+                    } else if recompile_waiting {
+                        // Alive mid-recompile: keep the hook sync the
+                        // recompile-waiting branch below would have run on this
+                        // same tick before the exit check took precedence.
+                        sync_background_hook_for_status(&mut status, &project_path).await;
                     }
+                }
+            } else if recompile_waiting && !connected {
+                if let Some(process_info) = last_detected_editor_process
+                    .clone()
+                    .filter(|info| info.process_id.is_some())
+                {
+                    apply_unity_process_info(&mut status, process_info);
+                    sync_background_hook_for_status(&mut status, &project_path).await;
                 }
             }
 
@@ -4874,10 +4890,23 @@ pub async fn start_unity_monitor(
     monitor.lock().await.replace(handle);
 }
 
+/// The project the running monitor watches. `stop_unity_monitor` reads (and
+/// clears) it to hand the abandoned project's hot-reload ledger off — once the
+/// monitor is gone, nothing would ever observe that editor's exit or compiles,
+/// so live-patch tallies would freeze and poison the sidecar's global gates.
+static MONITORED_PROJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
     if let Some(handle) = monitor.lock().await.take() {
         handle.abort();
         eprintln!("[Locus] Unity connection monitor stopped");
+        let abandoned = MONITORED_PROJECT
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(project) = abandoned {
+            crate::unity_hotreload::coordinator::on_monitor_stopped_background(project);
+        }
     }
     state_probe::stop_all_observers();
 }
