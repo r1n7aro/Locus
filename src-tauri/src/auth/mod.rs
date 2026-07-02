@@ -1,10 +1,22 @@
 pub mod codex;
 
+#[cfg(windows)]
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+#[cfg(windows)]
+use base64::engine::general_purpose::STANDARD;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+#[cfg(windows)]
+use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
 use crate::commands::{
     ApiFormat, CustomEndpoint, CustomEndpointServerTools, CustomReasoningParamFormat,
@@ -568,6 +580,13 @@ struct ImportedClaudeCodeOAuth {
     expires_at: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct ScoredImportedClaudeCodeOAuth {
+    score: i32,
+    expires_at: i64,
+    credentials: ImportedClaudeCodeOAuth,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ImportedClaudeCodeCustomEndpoint {
     base_url: Option<String>,
@@ -767,7 +786,8 @@ fn normalize_imported_claude_model(model: Option<String>) -> String {
 
     match without_context {
         "opus" => DEFAULT_CLAUDE_CODE_CUSTOM_MODEL.to_string(),
-        "sonnet" => "claude-sonnet-4-6".to_string(),
+        "sonnet" => "claude-sonnet-5".to_string(),
+        "fable" => "claude-fable-5".to_string(),
         "haiku" => "claude-haiku-4-5".to_string(),
         "claude-opus-4.8" => "claude-opus-4-8".to_string(),
         "claude-opus-4.7" => "claude-opus-4-7".to_string(),
@@ -783,6 +803,8 @@ fn imported_claude_context_length(model: &str) -> u32 {
     let m = model.to_ascii_lowercase();
     if m.contains("claude-opus-4-8")
         || m.contains("claude-opus-4.8")
+        || m.contains("claude-fable-5")
+        || m.contains("claude-sonnet-5")
         || m.contains("claude-opus-4-7")
         || m.contains("claude-opus-4.7")
         || m.contains("claude-opus-4-6")
@@ -831,6 +853,10 @@ fn load_claude_code_oauth_credentials() -> Result<Option<(String, ImportedClaude
         }
     }
 
+    if let Some((source, credentials)) = load_claude_desktop_oauth_credentials()? {
+        return Ok(Some((source, credentials)));
+    }
+
     Ok(None)
 }
 
@@ -876,6 +902,276 @@ fn parse_claude_code_oauth_credentials(
                 "expiration",
             ],
         ),
+    })
+}
+
+fn load_claude_desktop_oauth_credentials(
+) -> Result<Option<(String, ImportedClaudeCodeOAuth)>, String> {
+    for dir in claude_desktop_data_dirs() {
+        if let Some(credentials) = load_claude_desktop_oauth_credentials_dir(&dir)? {
+            return Ok(Some((
+                format!("Claude Desktop {}", dir.join("config.json").display()),
+                credentials,
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn claude_desktop_data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        let packages = local_app_data.join("Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("Claude_") {
+                    dirs.push(
+                        entry
+                            .path()
+                            .join("LocalCache")
+                            .join("Roaming")
+                            .join("Claude"),
+                    );
+                }
+            }
+        }
+
+        dirs.push(local_app_data.join("Claude"));
+        dirs.push(local_app_data.join("Claude-3p"));
+    }
+
+    if let Some(app_data) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        dirs.push(app_data.join("Claude"));
+        dirs.push(app_data.join("Claude-3p"));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    dirs.into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn claude_desktop_data_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn load_claude_desktop_oauth_credentials_dir(
+    dir: &Path,
+) -> Result<Option<ImportedClaudeCodeOAuth>, String> {
+    let config_path = dir.join("config.json");
+    let local_state_path = dir.join("Local State");
+    let raw_config = match std::fs::read_to_string(&config_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "Failed to read Claude Desktop config file {}: {}",
+                config_path.display(),
+                err
+            ));
+        }
+    };
+
+    let config = serde_json::from_str::<serde_json::Value>(&raw_config)
+        .map_err(|err| format!("Failed to parse Claude Desktop config JSON: {}", err))?;
+    let Some(encrypted_cache) = json_string(&config, &["oauth:tokenCache"]) else {
+        return Ok(None);
+    };
+
+    let raw_local_state = std::fs::read_to_string(&local_state_path).map_err(|err| {
+        format!(
+            "Failed to read Claude Desktop Local State file {}: {}",
+            local_state_path.display(),
+            err
+        )
+    })?;
+    let local_state = serde_json::from_str::<serde_json::Value>(&raw_local_state)
+        .map_err(|err| format!("Failed to parse Claude Desktop Local State JSON: {}", err))?;
+
+    let decrypted = decrypt_claude_desktop_token_cache(&encrypted_cache, &local_state)?;
+    let cache = serde_json::from_slice::<serde_json::Value>(&decrypted)
+        .map_err(|err| format!("Failed to parse Claude Desktop OAuth token cache: {}", err))?;
+    Ok(parse_claude_desktop_oauth_token_cache(&cache))
+}
+
+#[cfg(windows)]
+fn decrypt_claude_desktop_token_cache(
+    encrypted_cache: &str,
+    local_state: &serde_json::Value,
+) -> Result<Vec<u8>, String> {
+    let encrypted_key = local_state
+        .get("os_crypt")
+        .and_then(|value| json_string(value, &["encrypted_key"]))
+        .ok_or_else(|| {
+            "Claude Desktop Local State is missing os_crypt.encrypted_key".to_string()
+        })?;
+    let encrypted_key_bytes = STANDARD
+        .decode(encrypted_key)
+        .map_err(|err| format!("Failed to decode Claude Desktop encrypted key: {}", err))?;
+    let dpapi_payload = encrypted_key_bytes
+        .strip_prefix(b"DPAPI")
+        .ok_or_else(|| "Claude Desktop encrypted key does not use DPAPI prefix".to_string())?;
+    let key = windows_unprotect_data(dpapi_payload)?;
+
+    let blob = STANDARD
+        .decode(encrypted_cache)
+        .map_err(|err| format!("Failed to decode Claude Desktop OAuth token cache: {}", err))?;
+    decrypt_chromium_aes_gcm_blob(&key, &blob)
+}
+
+#[cfg(not(windows))]
+fn decrypt_claude_desktop_token_cache(
+    _encrypted_cache: &str,
+    _local_state: &serde_json::Value,
+) -> Result<Vec<u8>, String> {
+    Err("Claude Desktop OAuth import is currently only implemented on Windows".to_string())
+}
+
+#[cfg(windows)]
+fn windows_unprotect_data(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+
+    unsafe {
+        CryptUnprotectData(&mut input, None, None, None, None, 0, &mut output)
+            .map_err(|err| format!("Failed to decrypt Claude Desktop DPAPI key: {}", err))?;
+        let decrypted = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+        Ok(decrypted)
+    }
+}
+
+#[cfg(windows)]
+fn decrypt_chromium_aes_gcm_blob(key: &[u8], blob: &[u8]) -> Result<Vec<u8>, String> {
+    let payload = blob
+        .strip_prefix(b"v10")
+        .or_else(|| blob.strip_prefix(b"v11"))
+        .ok_or_else(|| {
+            "Claude Desktop OAuth token cache uses an unsupported encryption prefix".to_string()
+        })?;
+    if payload.len() <= 12 + 16 {
+        return Err("Claude Desktop OAuth token cache is too short".to_string());
+    }
+
+    let (nonce, ciphertext_and_tag) = payload.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "Claude Desktop OAuth token cache key is invalid".to_string())?;
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext_and_tag)
+        .map_err(|err| {
+            format!(
+                "Failed to decrypt Claude Desktop OAuth token cache: {}",
+                err
+            )
+        })
+}
+
+fn parse_claude_desktop_oauth_token_cache(
+    value: &serde_json::Value,
+) -> Option<ImportedClaudeCodeOAuth> {
+    let object = value.as_object()?;
+    let now = chrono::Utc::now().timestamp();
+    let mut best: Option<ScoredImportedClaudeCodeOAuth> = None;
+
+    for (cache_key, entry) in object {
+        let Some(credentials) = parse_claude_desktop_oauth_token_entry(entry) else {
+            continue;
+        };
+        let Some(candidate) = score_claude_desktop_oauth_candidate(cache_key, credentials, now)
+        else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|current| {
+                candidate.score > current.score
+                    || (candidate.score == current.score
+                        && candidate.expires_at > current.expires_at)
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some(candidate);
+        }
+    }
+
+    best.map(|candidate| candidate.credentials)
+}
+
+fn parse_claude_desktop_oauth_token_entry(
+    value: &serde_json::Value,
+) -> Option<ImportedClaudeCodeOAuth> {
+    let access_token =
+        json_string(value, &["token", "accessToken", "access_token"]).unwrap_or_default();
+    let refresh_token = json_string(value, &["refreshToken", "refresh_token"]).unwrap_or_default();
+    if access_token.is_empty() && refresh_token.is_empty() {
+        return None;
+    }
+
+    Some(ImportedClaudeCodeOAuth {
+        access_token,
+        refresh_token,
+        expires_at: json_expiry_seconds(
+            value,
+            &[
+                "expiresAt",
+                "expires_at",
+                "accessTokenExpiresAt",
+                "access_token_expires_at",
+                "expiry",
+                "expiration",
+            ],
+        ),
+    })
+}
+
+fn score_claude_desktop_oauth_candidate(
+    cache_key: &str,
+    credentials: ImportedClaudeCodeOAuth,
+    now: i64,
+) -> Option<ScoredImportedClaudeCodeOAuth> {
+    let lower = cache_key.to_ascii_lowercase();
+    if !lower.contains("https://api.anthropic.com") || !lower.contains("user:inference") {
+        return None;
+    }
+
+    let expires_at = credentials
+        .expires_at
+        .unwrap_or(NON_REFRESHABLE_TOKEN_EXPIRY_SECS);
+    if expires_at <= now + REFRESH_BUFFER_SECS {
+        return None;
+    }
+
+    let mut score = 0;
+    if lower.contains(&CLIENT_ID.to_ascii_lowercase()) {
+        score += 1_000;
+    }
+    if lower.contains("user:sessions:claude_code") {
+        score += 500;
+    }
+    if lower.contains("user:profile") {
+        score += 100;
+    }
+    if lower.contains("user:file_upload") {
+        score += 50;
+    }
+    if lower.contains("user:mcp_servers") {
+        score += 25;
+    }
+    if !credentials.refresh_token.is_empty() {
+        score += 5;
+    }
+
+    Some(ScoredImportedClaudeCodeOAuth {
+        score,
+        expires_at,
+        credentials,
     })
 }
 
@@ -1024,6 +1320,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_claude_desktop_oauth_token_cache() {
+        let future_ms = 4_102_444_800_000i64;
+        let value = serde_json::json!({
+            "other-client:https://api.anthropic.com:user:inference user:office": {
+                "token": "office-token",
+                "expiresAt": future_ms
+            },
+            format!("{}:org:https://api.anthropic.com:user:inference user:file_upload user:profile user:sessions:claude_code", CLIENT_ID): {
+                "token": "code-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": future_ms
+            },
+            format!("{}:org:https://api.anthropic.com:user:inference user:file_upload user:profile", CLIENT_ID): {
+                "token": "profile-token",
+                "refreshToken": "profile-refresh-token",
+                "expiresAt": future_ms
+            }
+        });
+
+        let parsed = parse_claude_desktop_oauth_token_cache(&value).expect("desktop token");
+
+        assert_eq!(parsed.access_token, "code-token");
+        assert_eq!(parsed.refresh_token, "refresh-token");
+        assert_eq!(parsed.expires_at, Some(4_102_444_800));
+    }
+
+    #[test]
+    fn ignores_expired_claude_desktop_oauth_token_cache_entries() {
+        let expired_ms = 1_700_000_000_000i64;
+        let value = serde_json::json!({
+            format!("{}:org:https://api.anthropic.com:user:inference user:profile user:sessions:claude_code", CLIENT_ID): {
+                "token": "expired-token",
+                "expiresAt": expired_ms
+            }
+        });
+
+        assert!(parse_claude_desktop_oauth_token_cache(&value).is_none());
+    }
+
+    #[test]
     fn parses_claude_code_custom_endpoint_from_settings_env() {
         let value = serde_json::json!({
             "env": {
@@ -1095,6 +1431,25 @@ mod tests {
 
         assert_eq!(endpoint.endpoint, "https://proxy.example/v1");
         assert_eq!(endpoint.api_model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn maps_claude_code_custom_endpoint_aliases_to_current_models() {
+        let sonnet = build_claude_code_custom_endpoint(ImportedClaudeCodeCustomEndpoint {
+            api_key: Some("sk-proxy".to_string()),
+            api_model: Some("sonnet".to_string()),
+            ..Default::default()
+        });
+        let fable = build_claude_code_custom_endpoint(ImportedClaudeCodeCustomEndpoint {
+            api_key: Some("sk-proxy".to_string()),
+            api_model: Some("fable".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(sonnet.api_model, "claude-sonnet-5");
+        assert_eq!(sonnet.context_length, 1_000_000);
+        assert_eq!(fable.api_model, "claude-fable-5");
+        assert_eq!(fable.context_length, 1_000_000);
     }
 
     #[tokio::test]
