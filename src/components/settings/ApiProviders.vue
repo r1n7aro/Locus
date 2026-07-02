@@ -9,6 +9,7 @@ import type {
   ApiFormat,
   CodexTransportMode,
 } from "../../types";
+import { formatModelDisplayName } from "../../utils/modelDisplay";
 import type {
   AnthropicQuotaState,
   AnthropicQuotaWindowState,
@@ -295,7 +296,7 @@ function quotaCreditsLabel() {
             v-for="m in group.models"
             :key="m.id"
             class="available-model-tag"
-          >{{ m.name }}</span>
+          >{{ formatModelDisplayName(m.name) }}</span>
         </div>
       </div>
     </div>

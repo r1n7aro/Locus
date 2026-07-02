@@ -2,6 +2,7 @@
 import { t } from "../../i18n";
 import type { ModelOption, ModelDefaults, AgentInfo } from "../../types";
 import { isProviderVisible, visibleProviderOrder } from "../../config/providerVisibility";
+import { formatModelDisplayName } from "../../utils/modelDisplay";
 
 interface ModelGroup {
   provider: string;
@@ -87,7 +88,7 @@ function updateClaudeCodeEnabled(value: boolean) {
       <select :value="modelDefaults.mainModel" class="model-select" @change="updateMainModel(($event.target as HTMLSelectElement).value)">
         <option value="">{{ t("settings.models.mainDefault") }}</option>
         <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ m.name }}</option>
+          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
         </optgroup>
       </select>
     </div>
@@ -100,7 +101,7 @@ function updateClaudeCodeEnabled(value: boolean) {
       <select :value="modelDefaults.planModel" class="model-select" @change="updatePlanModel(($event.target as HTMLSelectElement).value)">
         <option value="">{{ t("settings.models.planDefault") }}</option>
         <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ m.name }}</option>
+          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
         </optgroup>
       </select>
     </div>
@@ -139,7 +140,7 @@ function updateClaudeCodeEnabled(value: boolean) {
         >
           <option value="">{{ t("settings.models.subagentDefault") }}</option>
           <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-            <option v-for="m in group.models" :key="m.id" :value="m.id">{{ m.name }}</option>
+            <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
           </optgroup>
         </select>
       </div>

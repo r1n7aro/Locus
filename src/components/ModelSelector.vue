@@ -4,6 +4,7 @@ import { ref, computed, onMounted, onUnmounted } from "vue";
 import type { ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
+import { formatModelDisplayName } from "../utils/modelDisplay";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -23,10 +24,11 @@ const selectedModel = () => props.models.find((m) => m.id === props.selectedId);
 const selectedDisplayName = computed(() => {
   const sel = selectedModel();
   if (!sel) return "Model";
-  const duplicated = props.models.some((m) => m.id !== sel.id && m.name === sel.name);
-  if (!duplicated) return sel.name;
+  const displayName = modelDisplayName(sel);
+  const duplicated = props.models.some((m) => m.id !== sel.id && modelDisplayName(m) === displayName);
+  if (!duplicated) return displayName;
   const prefix = providerShortLabels.value[sel.provider] || sel.provider;
-  return `${prefix} / ${sel.name}`;
+  return `${prefix} / ${displayName}`;
 });
 
 const providerLabels = computed<Record<string, string>>(() => ({
@@ -82,6 +84,10 @@ function select(id: string) {
   open.value = false;
 }
 
+function modelDisplayName(model: ModelOption): string {
+  return formatModelDisplayName(model.name);
+}
+
 function onClickOutside(e: MouseEvent) {
   if (selectorRef.value && !selectorRef.value.contains(e.target as Node)) {
     open.value = false;
@@ -119,7 +125,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
             :class="{ active: model.id === selectedId }"
             @click="select(model.id)"
           >
-            <div class="model-option-name">{{ model.name }}</div>
+            <div class="model-option-name">{{ modelDisplayName(model) }}</div>
           </div>
         </template>
       </div>

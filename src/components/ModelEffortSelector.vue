@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import type { EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
+import { formatModelDisplayName } from "../utils/modelDisplay";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -57,10 +58,11 @@ const selectedModel = computed(() =>
 const selectedDisplayName = computed(() => {
   const selected = selectedModel.value;
   if (!selected) return "Model";
-  const duplicated = props.models.some((model) => model.id !== selected.id && model.name === selected.name);
-  if (!duplicated) return selected.name;
+  const displayName = modelDisplayName(selected);
+  const duplicated = props.models.some((model) => model.id !== selected.id && modelDisplayName(model) === displayName);
+  if (!duplicated) return displayName;
   const prefix = providerShortLabels.value[selected.provider] || selected.provider;
-  return `${prefix} / ${selected.name}`;
+  return `${prefix} / ${displayName}`;
 });
 
 const levels = computed<LevelOption[]>(() => {
@@ -131,6 +133,10 @@ function selectModel(id: string) {
   open.value = false;
 }
 
+function modelDisplayName(model: ModelOption): string {
+  return formatModelDisplayName(model.name);
+}
+
 function selectEffort(level: EffortLevel) {
   emit("selectEffort", level);
   open.value = false;
@@ -187,7 +193,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
               :class="{ active: model.id === selectedId }"
               @click="selectModel(model.id)"
             >
-              <span class="model-effort-option-name">{{ model.name }}</span>
+              <span class="model-effort-option-name">{{ modelDisplayName(model) }}</span>
             </button>
           </template>
         </div>
