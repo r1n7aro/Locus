@@ -945,6 +945,13 @@ export type StreamEvent = { runId: string } & (
       messages: ChatMessage[];
     }
   | {
+      /** Sticky plan-mode transition (entered via /plan, exited via approved exit_plan_mode or the badge toggle). */
+      type: "planModeChanged";
+      sessionId: string;
+      active: boolean;
+      planFilePath?: string | null;
+    }
+  | {
       type: "cancelled";
       sessionId: string;
       messageId?: string | null;
@@ -1051,10 +1058,18 @@ export interface UnityEditorStatusChangeToolConfirmDisplay {
   requestedStatus: string;
 }
 
+/** exit_plan_mode approval dialog: full plan text plus the plan file location. */
+export interface PlanApprovalConfirmDisplay {
+  kind: "planApproval";
+  plan: string;
+  planFilePath: string;
+}
+
 export type ToolConfirmDisplay =
   | BasicToolConfirmDisplay
   | KnowledgeToolConfirmPreview
-  | UnityEditorStatusChangeToolConfirmDisplay;
+  | UnityEditorStatusChangeToolConfirmDisplay
+  | PlanApprovalConfirmDisplay;
 
 /**
  * Skill trigger mode:
