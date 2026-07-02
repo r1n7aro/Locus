@@ -24,7 +24,12 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// calls (`m_MethodName` + `m_TargetAssemblyTypeName` + `m_Target` fileID) and
 /// AnimationEvent `functionName`s, so `unity_code_usages` member mode resolves
 /// them with one indexed query instead of three per-query filesystem scans.
-pub const ASSET_DB_VERSION: u32 = 12;
+///
+/// v13: the YAML tokenizer now unquotes single-quoted scalars (Unity's only
+/// quoting style — `m_Name: '[Managers] '`), so indexed object names, FTS
+/// terms, ref paths and binding annotations parsed by older builds carry
+/// literal `'` quotes and must be re-derived.
+pub const ASSET_DB_VERSION: u32 = 13;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -3409,6 +3414,76 @@ pub fn get_all_file_mtime_records(conn: &Connection) -> Result<Vec<FileMtimeReco
         result.push(row.map_err(|e| format!("Failed to read file mtime record row: {}", e))?);
     }
     Ok(result)
+}
+
+/// Freshness columns of one `assets` row, keyed by path (unique via
+/// `idx_assets_path`). Read by the watcher's unchanged-content fast path
+/// before it commits to a full parse + row rewrite.
+#[derive(Debug, Clone)]
+pub struct StoredAssetFreshness {
+    pub guid: Guid,
+    pub content_hash: [u8; 16],
+    pub meta_hash: [u8; 16],
+    pub exists_on_disk: bool,
+}
+
+pub fn get_stored_asset_freshness(
+    conn: &Connection,
+    rel_path: &str,
+) -> Result<Option<StoredAssetFreshness>, String> {
+    let result = conn.query_row(
+        "SELECT guid, content_hash, meta_hash, exists_on_disk FROM assets WHERE path = ?1",
+        params![rel_path],
+        |row| {
+            let guid_blob: Vec<u8> = row.get(0)?;
+            let content_hash_blob: Vec<u8> = row.get(1)?;
+            let meta_hash_blob: Vec<u8> = row.get(2)?;
+            let exists: i32 = row.get(3)?;
+            Ok(StoredAssetFreshness {
+                guid: blob_to_guid(&guid_blob),
+                content_hash: blob_to_guid(&content_hash_blob),
+                meta_hash: blob_to_guid(&meta_hash_blob),
+                exists_on_disk: exists != 0,
+            })
+        },
+    );
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to read stored asset freshness: {}", e)),
+    }
+}
+
+/// Refresh only the timestamp bookkeeping for an asset whose content and
+/// meta bytes are byte-identical to the stored rows (the watcher's
+/// unchanged-content fast path). Without this the 60 s mtime sweep would
+/// re-flag the path forever: the disk mtime moved forward while the stored
+/// one stayed behind. Sizes and hashes stay untouched — byte-identical
+/// content implies identical sizes.
+pub fn touch_asset_freshness_mtimes(
+    conn: &Connection,
+    guid: &Guid,
+    rel_path: &str,
+    node_mtime_ns: u64,
+    meta_mtime_ns: u64,
+    asset_mtime_ns: u64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE assets SET mtime_ns = ?2 WHERE guid = ?1",
+        params![guid.as_slice(), node_mtime_ns as i64],
+    )
+    .map_err(|e| format!("Failed to touch asset mtime: {}", e))?;
+    conn.execute(
+        "UPDATE files SET mtime_ns = ?2 WHERE path = ?1",
+        params![format!("{}.meta", rel_path), meta_mtime_ns as i64],
+    )
+    .map_err(|e| format!("Failed to touch meta file mtime: {}", e))?;
+    conn.execute(
+        "UPDATE files SET mtime_ns = ?2 WHERE path = ?1",
+        params![rel_path, asset_mtime_ns as i64],
+    )
+    .map_err(|e| format!("Failed to touch asset file mtime: {}", e))?;
+    Ok(())
 }
 
 #[allow(dead_code)]

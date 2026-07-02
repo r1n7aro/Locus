@@ -413,6 +413,10 @@ async fn run_ref_graph_scan_job(
                 &root,
                 graph,
                 &cancel_token,
+                // The full scan just read and hashed every indexed file;
+                // this reconcile only needs to catch mid-scan edits, which
+                // mtime/size detects without a second full content pass.
+                false,
                 |progress| {
                     if cancel_for_reconcile_progress.load(Ordering::Relaxed) {
                         return;

@@ -332,7 +332,10 @@ fn enqueue_with_activity(
     reason: QueueEnqueueReason,
     source_path: Option<String>,
 ) -> bool {
-    let added = queue.enqueue(rel_path.clone());
+    // Script cascades re-derive rows from *unchanged* asset bytes, so they
+    // must bypass `process_dirty_asset`'s unchanged-content fast path.
+    let force_full = matches!(reason, QueueEnqueueReason::ScriptCascade);
+    let added = queue.enqueue(rel_path.clone(), force_full);
     if added {
         activity.record(rel_path, reason, source_path);
     }
@@ -347,6 +350,12 @@ pub struct DirtyQueue {
 struct DirtyQueueInner {
     set: HashSet<String>,
     queue: VecDeque<String>,
+    /// Paths whose next processing must bypass the unchanged-content fast
+    /// path. Script cascades land here: the enqueued asset's bytes are
+    /// unchanged, but its derived rows (object search terms, ref paths)
+    /// depend on the changed script's metadata. A forced enqueue of an
+    /// already-queued path upgrades the pending item.
+    force_full: HashSet<String>,
 }
 
 impl DirtyQueue {
@@ -355,13 +364,17 @@ impl DirtyQueue {
             inner: Mutex::new(DirtyQueueInner {
                 set: HashSet::new(),
                 queue: VecDeque::new(),
+                force_full: HashSet::new(),
             }),
             condvar: Condvar::new(),
         }
     }
 
-    pub fn enqueue(&self, rel_path: String) -> bool {
+    pub fn enqueue(&self, rel_path: String, force_full: bool) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        if force_full {
+            inner.force_full.insert(rel_path.clone());
+        }
         if inner.set.contains(&rel_path) {
             return false;
         }
@@ -371,7 +384,7 @@ impl DirtyQueue {
         true
     }
 
-    pub fn dequeue(&self, stop: &AtomicBool) -> Option<String> {
+    pub fn dequeue(&self, stop: &AtomicBool) -> Option<(String, bool)> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -379,7 +392,8 @@ impl DirtyQueue {
             }
             if let Some(path) = inner.queue.pop_front() {
                 inner.set.remove(&path);
-                return Some(path);
+                let force_full = inner.force_full.remove(&path);
+                return Some((path, force_full));
             }
             let (guard, _) = self
                 .condvar
@@ -389,11 +403,12 @@ impl DirtyQueue {
         }
     }
 
-    fn try_dequeue(&self) -> Option<String> {
+    fn try_dequeue(&self) -> Option<(String, bool)> {
         let mut inner = self.inner.lock().unwrap();
         let path = inner.queue.pop_front()?;
         inner.set.remove(&path);
-        Some(path)
+        let force_full = inner.force_full.remove(&path);
+        Some((path, force_full))
     }
 
     pub fn len(&self) -> usize {
@@ -415,16 +430,18 @@ fn is_unity_asset_path(rel_path: &str) -> bool {
         .to_string_lossy()
         .to_lowercase();
 
+    // YAML assets must come from `P1_EXTENSIONS`, the same list the scanner
+    // and `process_dirty_asset` index from. A hardcoded subset here silently
+    // drops content-only saves of the missing kinds (`.mixer`, `.playable`,
+    // `.preset`, … — Unity does not touch the `.meta` on content edits), so
+    // they were only picked up by the 60 s mtime sweep.
+    if is_yaml_asset_ext(&ext) {
+        return true;
+    }
+
     matches!(
         ext.as_str(),
-        "unity"
-            | "prefab"
-            | "asset"
-            | "mat"
-            | "anim"
-            | "controller"
-            | "cs"
-            | "png"
+        "cs" | "png"
             | "jpg"
             | "jpeg"
             | "tga"
@@ -919,11 +936,15 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
+/// `force_full` bypasses the unchanged-content fast path; pass `true` for
+/// script-cascade items whose derived rows must be re-computed even though
+/// the asset's own bytes did not change.
 fn process_dirty_asset(
     asset_rel_path: &str,
     project_root: &Path,
     graph_state: &Arc<Mutex<Option<AssetDb>>>,
     stop: &AtomicBool,
+    force_full: bool,
 ) -> Result<Vec<QueueEnqueueRequest>, String> {
     if stop.load(Ordering::Relaxed) {
         return Ok(Vec::new());
@@ -1010,6 +1031,57 @@ fn process_dirty_asset(
     if asset_is_file && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
+        content_hash = hash128(&content);
+
+        // Unchanged-content fast path: one editor save fires several OS
+        // events (temp write + rename + meta touch) and the mtime sweep
+        // re-flags touched-but-identical files; without this gate each of
+        // those re-parses and rewrites the full row set of large scenes.
+        // Content and meta bytes matching the stored row means every
+        // derived row except the script-metadata-dependent ones is already
+        // correct — and those arrive with `force_full` via script cascades.
+        if !force_full {
+            let stored = {
+                let guard = graph_state
+                    .lock()
+                    .map_err(|e| format!("Lock error: {}", e))?;
+                match guard.as_ref() {
+                    Some(graph) => db::get_stored_asset_freshness(&graph.conn, asset_rel_path)?,
+                    None => None,
+                }
+            };
+            if let Some(stored) = stored {
+                if stored.guid == guid
+                    && stored.exists_on_disk
+                    && stored.content_hash == content_hash
+                    && stored.meta_hash == meta_hash
+                {
+                    // Only timestamps can have moved; refresh them so the
+                    // 60 s sweep stops re-flagging this path, then skip the
+                    // parse + row rewrite entirely.
+                    let asset_mtime = std::fs::metadata(&asset_abs)
+                        .ok()
+                        .as_ref()
+                        .map(scanner::get_mtime_ns)
+                        .unwrap_or(0);
+                    let mut guard = graph_state
+                        .lock()
+                        .map_err(|e| format!("Lock error: {}", e))?;
+                    if let Some(ref mut graph) = *guard {
+                        db::touch_asset_freshness_mtimes(
+                            &graph.conn,
+                            &guid,
+                            asset_rel_path,
+                            asset_mtime.max(meta_mtime),
+                            meta_mtime,
+                            asset_mtime,
+                        )?;
+                    }
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
         // Single parse pass produces the docs, the raw refs and the raw member
         // bindings; the referenced guids are then resolved with one targeted DB
         // batch instead of extra line scans over the file.
@@ -1032,7 +1104,6 @@ fn process_dirty_asset(
             }
         };
         let refs = unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(&guid_to_path));
-        content_hash = hash128(&content);
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
         asset_size = metadata.map(|m| m.len()).unwrap_or(0);
@@ -1319,7 +1390,7 @@ fn worker_loop(
             continue;
         }
 
-        let rel_path = match queue.dequeue(&stop) {
+        let (rel_path, force_full) = match queue.dequeue(&stop) {
             Some(p) => p,
             None => continue,
         };
@@ -1341,7 +1412,7 @@ fn worker_loop(
             break;
         }
 
-        match process_dirty_asset(&rel_path, &project_root, &state, &stop) {
+        match process_dirty_asset(&rel_path, &project_root, &state, &stop, force_full) {
             Ok(extra_paths) => {
                 for extra_path in extra_paths {
                     enqueue_with_activity(
@@ -1951,10 +2022,16 @@ pub fn reconcile_loaded_db_with_cancel(
     )
 }
 
+/// `verify_hashes: false` limits the dirty probe to mtime/size. Pass `false`
+/// when the DB content was derived moments ago (the post-full-scan reconcile:
+/// re-hashing every meta/yaml/cs the scan just hashed is a second full read
+/// of the project); pass `true` when the DB may be stale relative to disk in
+/// ways mtime/size can miss (startup against a days-old cache).
 pub fn reconcile_loaded_db_with_cancel_and_progress<F>(
     project_root: &Path,
     graph: AssetDb,
     stop: &AtomicBool,
+    verify_hashes: bool,
     on_progress: F,
 ) -> Result<(AssetDb, StartupReconcileStats), String>
 where
@@ -1966,7 +2043,7 @@ where
         stop,
         MtimeScanOptions {
             discover_new_meta: true,
-            verify_hashes: true,
+            verify_hashes,
         },
         Some(&on_progress),
     )
@@ -2110,7 +2187,7 @@ fn reconcile_graph_state_with_options(
                     // sees an empty queue can't conclude "all idle" while
                     // this worker is between dequeue and processing.
                     in_flight.fetch_add(1, Ordering::AcqRel);
-                    let Some(rel_path) = queue.try_dequeue() else {
+                    let Some((rel_path, force_full)) = queue.try_dequeue() else {
                         let remaining = in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
                         if remaining == 0 && queue.len() == 0 {
                             break;
@@ -2119,7 +2196,7 @@ fn reconcile_graph_state_with_options(
                         continue;
                     };
 
-                    match process_dirty_asset(&rel_path, project_root, &state, stop) {
+                    match process_dirty_asset(&rel_path, project_root, &state, stop, force_full) {
                         Ok(cascade_paths) => {
                             for request in cascade_paths {
                                 if enqueue_with_activity(
@@ -2452,6 +2529,25 @@ mod tests {
     }
 
     #[test]
+    fn event_filter_accepts_every_indexed_yaml_extension() {
+        // Parity guard: `is_unity_asset_path` gates which OS events reach the
+        // dirty queue, `P1_EXTENSIONS` defines what the scanner indexes. A
+        // filter that lags the scanner list (as it once did for `.mixer`,
+        // `.playable`, `.preset`, …) silently defers content-only saves of
+        // those kinds to the 60 s mtime sweep.
+        for ext in scanner::P1_EXTENSIONS {
+            let rel_path = format!("Assets/Sub/File.{ext}");
+            assert!(
+                is_unity_asset_path(&rel_path),
+                "P1 extension .{ext} must pass the watcher event filter"
+            );
+        }
+        // Non-indexed chatter must still be rejected.
+        assert!(!is_unity_asset_path("Assets/Sub/File.tmp"));
+        assert!(!is_unity_asset_path("Assets/Sub/File.unity.bak"));
+    }
+
+    #[test]
     fn watcher_maps_external_events_from_symlinked_asset_root() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let root = temp.path().join("project");
@@ -2627,7 +2723,7 @@ mod tests {
             dunce::canonicalize(&external).expect("canonical external target")
         );
         let mut queued_paths = Vec::new();
-        while let Some(path) = queue.try_dequeue() {
+        while let Some((path, _)) = queue.try_dequeue() {
             queued_paths.push(path);
         }
         assert!(queued_paths
@@ -2677,7 +2773,7 @@ mod tests {
         );
 
         let mut queued_paths = Vec::new();
-        while let Some(path) = queue.try_dequeue() {
+        while let Some((path, _)) = queue.try_dequeue() {
             queued_paths.push(path);
         }
         assert!(queued_paths
@@ -2761,7 +2857,7 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(
             queue.dequeue(&AtomicBool::new(false)),
-            Some(asset_path.to_string())
+            Some((asset_path.to_string(), false))
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2916,8 +3012,9 @@ mod tests {
         mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.dequeue(&stop), Some(asset_path.to_string()));
-        process_dirty_asset(asset_path, &root, &state, &stop).expect("process stale resync");
+        assert_eq!(queue.dequeue(&stop), Some((asset_path.to_string(), false)));
+        process_dirty_asset(asset_path, &root, &state, &stop, false)
+            .expect("process stale resync");
 
         mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
         assert_eq!(queue.len(), 0);
@@ -3083,7 +3180,10 @@ mod tests {
         let graph = scan_test_graph(&root);
         let state = Arc::new(Mutex::new(Some(graph)));
         let stop = AtomicBool::new(false);
-        process_dirty_asset("Assets/Prefabs/Root.prefab", &root, &state, &stop)
+        // `force_full: true` — the prefab's bytes are unchanged since the
+        // scan, so this re-index only happens in production as a script
+        // cascade, which bypasses the unchanged-content fast path.
+        process_dirty_asset("Assets/Prefabs/Root.prefab", &root, &state, &stop, true)
             .expect("process prefab");
 
         let guard = state.lock().expect("lock graph");
@@ -3097,6 +3197,58 @@ mod tests {
             script_edge.ref_path.as_deref(),
             Some("Root/FooBehaviour/m_Script")
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unchanged_content_fast_path_refreshes_mtime_bookkeeping() {
+        // A touched-but-identical file (multi-event editor save, mtime
+        // resync) takes the unchanged-content fast path, which must still
+        // refresh the stored mtimes — otherwise the 60 s sweep re-flags the
+        // path on every round, forever.
+        let root =
+            std::env::temp_dir().join(format!("locus-watcher-fastpath-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets/Prefabs")).expect("create temp assets");
+        let content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n";
+        write_asset(
+            &root,
+            "Assets/Prefabs/Hero.prefab",
+            content,
+            "aaaabbbbccccddddeeeeffff00001111",
+        );
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(false);
+
+        // Rewrite identical bytes: content hash unchanged, disk mtime moves.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("Assets/Prefabs/Hero.prefab"), content)
+            .expect("rewrite identical content");
+
+        process_dirty_asset("Assets/Prefabs/Hero.prefab", &root, &state, &stop, false)
+            .expect("process unchanged asset");
+
+        // Stored mtimes were refreshed, so the sweep has nothing to flag.
+        let queue = DirtyQueue::new();
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, false);
+        assert_eq!(
+            queue.len(),
+            0,
+            "sweep must not re-flag a path the fast path just reconciled"
+        );
+
+        // The skip must leave the indexed rows fully queryable.
+        let guard = state.lock().expect("lock graph");
+        let graph = guard.as_ref().expect("graph exists");
+        let freshness =
+            db::get_stored_asset_freshness(&graph.conn, "Assets/Prefabs/Hero.prefab")
+                .expect("read freshness")
+                .expect("asset row exists");
+        assert!(freshness.exists_on_disk);
+        assert_eq!(freshness.content_hash, hash128(content));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3178,7 +3330,7 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(
             queue.dequeue(&AtomicBool::new(false)),
-            Some(asset_path.to_string())
+            Some((asset_path.to_string(), false))
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3201,7 +3353,7 @@ mod tests {
         let state = Arc::new(Mutex::new(Some(graph)));
         let stop = AtomicBool::new(true);
 
-        process_dirty_asset(asset_path, &root, &state, &stop).expect("stopped processing");
+        process_dirty_asset(asset_path, &root, &state, &stop, false).expect("stopped processing");
 
         let guard = state.lock().expect("lock state");
         let graph = guard.as_ref().expect("graph still present");
@@ -3289,8 +3441,8 @@ mod tests {
         assert_eq!(before["Assets/Note.txt"], (AssetKind::MetaOnly, true));
         assert_eq!(before["Assets/Folder"], (AssetKind::MetaOnly, true));
 
-        process_dirty_asset("Assets/Note.txt", &root, &state, &stop).expect("process txt");
-        process_dirty_asset("Assets/Folder", &root, &state, &stop).expect("process folder");
+        process_dirty_asset("Assets/Note.txt", &root, &state, &stop, false).expect("process txt");
+        process_dirty_asset("Assets/Folder", &root, &state, &stop, false).expect("process folder");
 
         let after = snapshot(&state);
         assert_eq!(after["Assets/Note.txt"], (AssetKind::MetaOnly, true));
@@ -3328,7 +3480,7 @@ mod tests {
         assert_eq!(queued, 2);
 
         let mut paths = Vec::new();
-        while let Some(path) = queue.try_dequeue() {
+        while let Some((path, _)) = queue.try_dequeue() {
             paths.push(path);
         }
         paths.sort();
