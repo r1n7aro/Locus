@@ -170,6 +170,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "todowrite",
     "task",
     "ask_user_question",
+    "exit_plan_mode",
     // Unity editor actions.
     "unity_execute",
     "unity_recompile",

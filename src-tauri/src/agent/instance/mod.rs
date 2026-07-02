@@ -241,6 +241,21 @@ pub struct AgentInstance {
     document_skill_tool_names: Mutex<HashSet<String>>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    /// Run-scoped view of the session's sticky plan mode. Initialized from
+    /// the session store at run start and flipped live by exit_plan_mode
+    /// approval so enforcement inside the same run follows the transition.
+    plan_runtime: Mutex<Option<PlanRuntime>>,
+}
+
+/// Plan-mode enforcement profile for the current run.
+#[derive(Debug, Clone)]
+enum PlanRuntime {
+    /// Main planning agent: read-only enforcement plus write access to the
+    /// session plan file; exit_plan_mode is offered to the model.
+    Main { plan_file: std::path::PathBuf },
+    /// Subagent spawned while the parent session plans: strictly read-only,
+    /// no plan file, no exit_plan_mode.
+    Subagent,
 }
 
 /// Knowledge document the session is scoped to (the document open next to an
@@ -2960,11 +2975,203 @@ impl AgentInstance {
             document_skill_tool_names: Mutex::new(HashSet::new()),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
+            plan_runtime: Mutex::new(None),
         }
     }
 
     pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
         self.partial_assistant.clone()
+    }
+
+    /// Marks this instance as a subagent whose parent session is in plan
+    /// mode: every run gets strict read-only enforcement. Must be called
+    /// before `run`.
+    pub fn mark_plan_readonly_subagent(&self) {
+        self.set_plan_runtime(Some(PlanRuntime::Subagent));
+    }
+
+    fn plan_runtime_snapshot(&self) -> Option<PlanRuntime> {
+        self.plan_runtime
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(None)
+    }
+
+    fn set_plan_runtime(&self, value: Option<PlanRuntime>) {
+        if let Ok(mut guard) = self.plan_runtime.lock() {
+            *guard = value;
+        }
+    }
+
+    fn is_plan_readonly_subagent(&self) -> bool {
+        matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Subagent))
+    }
+
+    /// Whether the main planning profile is active (drives exit_plan_mode
+    /// injection into the request tool list and the plan-file write grant).
+    fn plan_mode_main_active(&self) -> bool {
+        matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Main { .. }))
+    }
+
+    fn resolve_plan_file_path(
+        &self,
+        app_handle: &AppHandle,
+    ) -> Result<std::path::PathBuf, String> {
+        crate::commands::plan_file_path_for_session(app_handle, &self.working_dir, &self.session_id)
+    }
+
+    /// Enters sticky plan mode for this session if `mode` requests it and the
+    /// session is not already planning. Used both at run start and when a
+    /// queued `/plan` message is drained into an active run so enforcement
+    /// follows immediately.
+    fn maybe_enter_plan_mode(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        mode: &str,
+    ) -> Result<(), String> {
+        if mode != "plan" || self.is_plan_readonly_subagent() || self.plan_mode_main_active() {
+            return Ok(());
+        }
+        store.set_plan_mode_active(&self.session_id, true)?;
+        self.activate_main_plan_runtime(app_handle)?;
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::PlanModeChanged {
+                session_id: self.session_id.clone(),
+                active: true,
+                plan_file_path: self
+                    .resolve_plan_file_path(app_handle)
+                    .ok()
+                    .map(|path| path.to_string_lossy().to_string()),
+            },
+        );
+        Ok(())
+    }
+
+    fn activate_main_plan_runtime(&self, app_handle: &AppHandle) -> Result<(), String> {
+        let plan_file = self.resolve_plan_file_path(app_handle)?;
+        if let Some(parent) = plan_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create plan directory: {}", e))?;
+        }
+        self.set_plan_runtime(Some(PlanRuntime::Main { plan_file }));
+        Ok(())
+    }
+
+    /// Renders the sticky plan-mode reminder with the session plan file
+    /// block. The exists-branch doubles as the re-entry instruction set.
+    fn render_plan_reminder(plan_file: &std::path::Path) -> String {
+        let display = plan_file.to_string_lossy();
+        let info = if plan_file.is_file() {
+            format!(
+                "A plan file already exists at {display} from earlier planning in this session.\nBefore any new planning: read it and evaluate it against the current request — refine it if this continues the same task, or overwrite it if the task is different. Always update the plan file before calling exit_plan_mode."
+            )
+        } else {
+            format!("No plan file exists yet. Create your plan at {display} using the write tool.")
+        };
+        crate::prompt::plan::PLAN_REMINDER.replace("{plan_file_info}", &info)
+    }
+
+    /// One-shot notice for the first user message after leaving plan mode.
+    fn render_plan_exited_notice(&self, app_handle: &AppHandle) -> String {
+        let block = self
+            .resolve_plan_file_path(app_handle)
+            .ok()
+            .filter(|path| path.is_file())
+            .map(|path| {
+                format!(
+                    " The plan file from the planning phase is at {} — refer back to it during implementation.",
+                    path.to_string_lossy()
+                )
+            })
+            .unwrap_or_default();
+        crate::prompt::plan::PLAN_EXITED.replace("{plan_file_block}", &block)
+    }
+
+    /// Compares a tool call's `filePath` argument against the plan file,
+    /// tolerating relative paths, separator style, and case differences.
+    fn args_target_plan_file(
+        &self,
+        args: &serde_json::Value,
+        plan_file: &std::path::Path,
+    ) -> bool {
+        let Some(raw) = args
+            .get("filePath")
+            .or_else(|| args.get("file_path"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let candidate = std::path::Path::new(raw);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            std::path::Path::new(&self.working_dir).join(candidate)
+        };
+        Self::normalize_plan_path_for_compare(&resolved)
+            == Self::normalize_plan_path_for_compare(plan_file)
+    }
+
+    /// Unlike `normalize_path_for_compare`, canonicalizes first: the model
+    /// may echo the plan file path with `..` segments or 8.3 short names.
+    fn normalize_plan_path_for_compare(path: &std::path::Path) -> String {
+        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canonical
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+
+    /// Returns the rejection message when a tool call violates plan-mode
+    /// enforcement. Read-only tools always pass; the main planning agent may
+    /// additionally edit the plan file, fetch the web, and delegate to
+    /// (forced read-only) subagents. unity_recompile stays allowed via
+    /// is_readonly_tool: it validates plan feasibility through compile
+    /// diagnostics without touching sources.
+    fn plan_mode_tool_violation(
+        &self,
+        runtime: &PlanRuntime,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        if Self::is_readonly_tool(tool_name) {
+            return None;
+        }
+        match runtime {
+            PlanRuntime::Main { plan_file } => match tool_name {
+                // Network reads don't mutate the system; planning may need docs.
+                "web_fetch" => None,
+                // Subagents inherit read-only enforcement (see run_subagent_task).
+                "task" => None,
+                // Intercepted before enforcement; listed for completeness.
+                "exit_plan_mode" => None,
+                "write" | "edit" => {
+                    if self.args_target_plan_file(args, plan_file) {
+                        None
+                    } else {
+                        Some(format!(
+                            "Tool '{}' is only allowed for the plan file ({}) in plan mode. Every other file is read-only until the plan is approved via exit_plan_mode.",
+                            tool_name,
+                            plan_file.to_string_lossy()
+                        ))
+                    }
+                }
+                _ => Some(format!(
+                    "Tool '{}' is not allowed in plan mode. Plan mode is read-only apart from the plan file; present your plan with exit_plan_mode to start making changes.",
+                    tool_name
+                )),
+            },
+            PlanRuntime::Subagent => Some(format!(
+                "Tool '{}' is not allowed: the parent session is in plan mode, so this subagent is strictly read-only.",
+                tool_name
+            )),
+        }
     }
 
     pub fn set_knowledge_focus(&mut self, focus: Option<KnowledgeFocusDoc>) {
@@ -3336,6 +3543,11 @@ impl AgentInstance {
         push_unique_tool_name(&mut names, "tool_load");
         if dynamic_mode != crate::config::DynamicToolLoadingMode::Direct {
             push_unique_tool_name(&mut names, "tool_call");
+        }
+        // exit_plan_mode is offered to the model ONLY while the session is in
+        // plan mode; outside plan mode it must not appear in the tool list.
+        if self.plan_mode_main_active() {
+            push_unique_tool_name(&mut names, "exit_plan_mode");
         }
 
         let mut allowed_sorted: Vec<_> = allowed.into_iter().collect();
@@ -6766,9 +6978,14 @@ impl AgentInstance {
         format!("skill/{}.md", normalized_dir_name)
     }
 
+    /// Builds the persisted user-message suffix. Plan-mode context is
+    /// injected here and ONLY here: the sticky reminder while planning, the
+    /// subagent variant for plan-scoped children, and the one-shot exited
+    /// notice on the first message after leaving plan mode.
     fn build_user_prompt_suffix(
         &self,
-        mode: &str,
+        app_handle: &AppHandle,
+        store: &SessionStore,
         user_intent: Option<&crate::session::models::UserIntentPayload>,
     ) -> Option<String> {
         let mut parts = Vec::new();
@@ -6778,8 +6995,23 @@ impl AgentInstance {
                 parts.push(skill_reminder);
             }
         }
-        if mode == "plan" {
-            parts.push(crate::prompt::plan::PLAN_REMINDER.to_string());
+        match self.plan_runtime_snapshot() {
+            Some(PlanRuntime::Main { plan_file }) => {
+                parts.push(Self::render_plan_reminder(&plan_file));
+            }
+            Some(PlanRuntime::Subagent) => {
+                parts.push(crate::prompt::plan::PLAN_REMINDER_SUBAGENT.to_string());
+            }
+            None => match store.take_plan_exited_notice(&self.session_id) {
+                Ok(true) => parts.push(self.render_plan_exited_notice(app_handle)),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] failed to read plan exited notice: {}",
+                        self.id, error
+                    );
+                }
+            },
         }
 
         if parts.is_empty() {
@@ -6843,8 +7075,11 @@ impl AgentInstance {
                     .transpose()
                     .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
                 let effective_mode = Self::pending_input_mode(&input);
+                // A queued /plan message entering an active run must flip
+                // enforcement before its reminder is rendered.
+                self.maybe_enter_plan_mode(app_handle, store, run_id, &effective_mode)?;
                 let user_prompt_suffix =
-                    self.build_user_prompt_suffix(&effective_mode, input.user_intent.as_ref());
+                    self.build_user_prompt_suffix(app_handle, store, input.user_intent.as_ref());
                 let first_user_message_id = store.first_user_message_id(&self.session_id)?;
                 let current_prompt_prefix = if first_user_message_id.is_none() {
                     env_prompt_prefix
@@ -7273,6 +7508,21 @@ impl AgentInstance {
             return Ok(String::new());
         }
 
+        // ── Sticky plan mode ─────────────────────────────────────────────
+        // The session store is the source of truth: plan mode persists
+        // across runs until exit_plan_mode is approved or the user turns it
+        // off. A user message tagged mode=="plan" (the /plan command)
+        // enters it. Subagents keep the profile their parent assigned.
+        if !self.is_plan_readonly_subagent() {
+            let plan_state = store.get_plan_mode_state(&self.session_id)?;
+            if plan_state.active {
+                self.activate_main_plan_runtime(app_handle)?;
+            } else {
+                self.set_plan_runtime(None);
+                self.maybe_enter_plan_mode(app_handle, store, &run_id, initial_mode)?;
+            }
+        }
+
         if self.is_cancel_requested() {
             self.emit_cancelled(app_handle, store, &run_id, None);
             return Ok(String::new());
@@ -7369,7 +7619,8 @@ impl AgentInstance {
 
         let persist_user_message_started_at = Instant::now();
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
-        let user_prompt_suffix = self.build_user_prompt_suffix(initial_mode, user_intent.as_ref());
+        let user_prompt_suffix =
+            self.build_user_prompt_suffix(app_handle, store, user_intent.as_ref());
         let first_user_message_id = store.first_user_message_id(&self.session_id)?;
         let current_prompt_prefix = if first_user_message_id.is_none() {
             env_prompt_prefix.as_deref()
@@ -8980,6 +9231,9 @@ impl AgentInstance {
                 | "unity_yaml_list"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
+                // Deliberate: recompile rebuilds scripts and reloads the
+                // domain but never modifies sources — plan mode keeps it so
+                // plans can be validated against compile diagnostics.
                 | "unity_recompile"
                 | "code_find_references"
                 | "code_goto_definition"
@@ -9417,6 +9671,27 @@ impl AgentInstance {
             self.id, tool_name, global_mode, tool_mode, assessment.reasons
         );
 
+        self.await_tool_confirm_decision(
+            app_handle,
+            tool_call_id,
+            tool_name,
+            assessment.display,
+            run_id,
+        )
+        .await
+    }
+
+    /// Emits a ToolConfirm event and blocks until the user answers (or the
+    /// run is cancelled). Shared by the permission confirm flow and the
+    /// plan-approval dialog.
+    async fn await_tool_confirm_decision(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        tool_name: &str,
+        display: crate::commands::ToolConfirmDisplay,
+        run_id: &str,
+    ) -> ToolConfirmDecision {
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
         let wait_target = self.user_wait_target(run_id);
@@ -9441,7 +9716,7 @@ impl AgentInstance {
                 session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
-                display: assessment.display,
+                display,
             },
         );
 
@@ -9491,6 +9766,104 @@ impl AgentInstance {
                     self.id, tool_name, question_id
                 );
                 ToolConfirmDecision::Deny { feedback: None }
+            }
+        }
+    }
+
+    /// exit_plan_mode: presents the plan file for user approval. Always asks
+    /// — plan approval is the product's core gate and is NOT bypassed by the
+    /// auto permission mode. On approval the sticky session flag and the
+    /// run-local enforcement flip together, the exited notice is armed for
+    /// the next user message, and the tool result echoes the approved plan.
+    async fn execute_exit_plan_mode(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        tool_call_id: &str,
+        run_id: &str,
+    ) -> ExecutedToolResult {
+        let plan_file = match self.plan_runtime_snapshot() {
+            Some(PlanRuntime::Main { plan_file }) => plan_file,
+            Some(PlanRuntime::Subagent) => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: "exit_plan_mode is not available to subagents. Return your findings as your final message instead.".to_string(),
+                    is_error: true,
+                });
+            }
+            None => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.".to_string(),
+                    is_error: true,
+                });
+            }
+        };
+
+        let plan = std::fs::read_to_string(&plan_file).unwrap_or_default();
+        if plan.trim().is_empty() {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "No plan file found at {}. Write your plan to this file with the write tool before calling exit_plan_mode.",
+                    plan_file.to_string_lossy()
+                ),
+                is_error: true,
+            });
+        }
+
+        let display = crate::commands::ToolConfirmDisplay::PlanApproval(
+            crate::commands::PlanApprovalConfirmDisplay {
+                plan: plan.clone(),
+                plan_file_path: plan_file.to_string_lossy().to_string(),
+            },
+        );
+        let decision = self
+            .await_tool_confirm_decision(app_handle, tool_call_id, "exit_plan_mode", display, run_id)
+            .await;
+
+        match decision {
+            ToolConfirmDecision::Allow => {
+                if let Err(error) = store.set_plan_mode_active(&self.session_id, false) {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!("Failed to persist plan mode exit: {}", error),
+                        is_error: true,
+                    });
+                }
+                self.set_plan_runtime(None);
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::PlanModeChanged {
+                        session_id: self.session_id.clone(),
+                        active: false,
+                        plan_file_path: Some(plan_file.to_string_lossy().to_string()),
+                    },
+                );
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!(
+                        "User has approved your plan. You can now start coding. Start with updating your todo list if applicable.\n\nYour plan has been saved to: {}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{}",
+                        plan_file.to_string_lossy(),
+                        plan
+                    ),
+                    is_error: false,
+                })
+            }
+            ToolConfirmDecision::Deny { feedback } => {
+                let output = match feedback {
+                    Some(feedback) => format!(
+                        "The user rejected the plan and wants changes before implementation can begin. Stay in plan mode, address the feedback, update the plan file, then call exit_plan_mode again.\nUser feedback: {}",
+                        feedback
+                    ),
+                    None => "The user rejected the plan. Stay in plan mode; refine the plan file or ask clarifying questions before requesting approval again.".to_string(),
+                };
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                })
+            }
+            ToolConfirmDecision::PreflightError { output } => {
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                })
             }
         }
     }
@@ -9720,6 +10093,14 @@ impl AgentInstance {
             .await;
         }
 
+        // exit_plan_mode is not part of any agent's configured tool list —
+        // it is injected per-request while planning and intercepted here.
+        if tc.name == "exit_plan_mode" {
+            return self
+                .execute_exit_plan_mode(app_handle, store, &tc.id, run_id)
+                .await;
+        }
+
         if !self
             .is_allowed_tool_for_active_skills(&tc.name, active_skill_tool_names)
             .await
@@ -9730,31 +10111,43 @@ impl AgentInstance {
             });
         }
 
-        // Plan mode enforcement: block non-readonly tools
-        if mode == "plan" && !Self::is_readonly_tool(&tc.name) {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: format!(
-                    "Tool '{}' is not allowed in plan mode. Plan mode is read-only.",
-                    tc.name
-                ),
-                is_error: true,
-            });
+        // Plan mode enforcement: read-only apart from the plan file. Follows
+        // the live runtime state (not the run's initial mode) so an
+        // exit_plan_mode approval mid-run lifts it immediately.
+        let plan_runtime = self.plan_runtime_snapshot();
+        if let Some(runtime) = plan_runtime.as_ref() {
+            if let Some(error) = self.plan_mode_tool_violation(runtime, &tc.name, args) {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
         }
 
+        // The plan file lives outside the workspace by design; a write/edit
+        // that plan enforcement just granted must not be rejected by the
+        // workspace boundary.
+        let plan_file_write_grant = matches!(tc.name.as_str(), "write" | "edit")
+            && matches!(
+                plan_runtime.as_ref(),
+                Some(PlanRuntime::Main { plan_file }) if self.args_target_plan_file(args, plan_file)
+            );
         let file_workspace_boundary_enabled = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.file_tool_workspace_boundary_enabled())
             .unwrap_or(false);
-        if let Some(error) = Self::validate_tool_path_requirements(
-            &self.working_dir,
-            &tc.name,
-            args,
-            file_workspace_boundary_enabled,
-        ) {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: error,
-                is_error: true,
-            });
+        if !plan_file_write_grant {
+            if let Some(error) = Self::validate_tool_path_requirements(
+                &self.working_dir,
+                &tc.name,
+                args,
+                file_workspace_boundary_enabled,
+            ) {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
         }
 
         if let Some(error) = self.validate_knowledge_tool_routing(&tc.name, args) {
@@ -14048,6 +14441,12 @@ impl AgentInstance {
             run_id.to_string(),
             tool_call_id.to_string(),
         ));
+        // Plan mode propagates to children: a subagent spawned while the
+        // parent plans runs strictly read-only (no plan file, no
+        // exit_plan_mode) so `task` cannot become a plan-mode bypass.
+        if self.plan_runtime_snapshot().is_some() {
+            child.mark_plan_readonly_subagent();
+        }
 
         match child
             .run(app_handle, store, prompt, None, None, "build", None)
@@ -18164,5 +18563,163 @@ Search, install, audit, and export a plugin.
         );
         assert!(value.get("document").is_none());
         assert!(value.get("directory").is_none());
+    }
+
+    // ── Sticky plan mode ─────────────────────────────────────────────────
+
+    fn main_plan_runtime(plan_file: &str) -> super::PlanRuntime {
+        super::PlanRuntime::Main {
+            plan_file: std::path::PathBuf::from(plan_file),
+        }
+    }
+
+    #[test]
+    fn plan_mode_main_allows_readonly_planfile_webfetch_and_task() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
+
+        for tool in [
+            "read",
+            "grep",
+            "list",
+            "ask_user_question",
+            "unity_recompile",
+            "todowrite",
+            "web_fetch",
+            "task",
+            "exit_plan_mode",
+        ] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_none(),
+                "tool '{}' should be allowed in main plan mode",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_main_blocks_mutating_tools_and_foreign_writes() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
+
+        for tool in ["bash", "unity_execute", "knowledge_create", "view_run"] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_some(),
+                "tool '{}' should be blocked in plan mode",
+                tool
+            );
+        }
+
+        let foreign_write = serde_json::json!({ "filePath": "C:/Project/Assets/Foo.cs" });
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "write", &foreign_write)
+            .is_some());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "edit", &foreign_write)
+            .is_some());
+
+        let plan_write = serde_json::json!({ "filePath": "C:/Data/plan/proj/sess.md" });
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "write", &plan_write)
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "edit", &plan_write)
+            .is_none());
+    }
+
+    #[test]
+    fn plan_mode_subagent_blocks_every_non_readonly_tool() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = super::PlanRuntime::Subagent;
+
+        for tool in ["write", "edit", "bash", "task", "web_fetch", "exit_plan_mode"] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_some(),
+                "tool '{}' should be blocked for plan-mode subagents",
+                tool
+            );
+        }
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "read", &serde_json::json!({}))
+            .is_none());
+    }
+
+    #[test]
+    fn plan_file_match_tolerates_separators_case_and_relative_paths() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let plan_file = std::path::PathBuf::from("C:/Data/plan/proj/sess.md");
+
+        assert!(instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "C:\\Data\\plan\\proj\\SESS.md" }),
+            &plan_file,
+        ));
+        assert!(!instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "C:/Data/plan/proj/other.md" }),
+            &plan_file,
+        ));
+        assert!(!instance.args_target_plan_file(&serde_json::json!({}), &plan_file));
+
+        // Relative paths resolve against the working dir, so a relative
+        // "plans.md" inside the project never matches the external plan file.
+        assert!(!instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "plan/proj/sess.md" }),
+            &plan_file,
+        ));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_tool_is_offered_only_while_planning() {
+        let instance = test_agent_instance_with_tools_and_mode(
+            "C:/Project".to_string(),
+            vec!["read".to_string(), "write".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            !names.iter().any(|name| name == "exit_plan_mode"),
+            "exit_plan_mode must not be offered outside plan mode"
+        );
+
+        instance.set_plan_runtime(Some(main_plan_runtime("C:/Data/plan/proj/sess.md")));
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            names.iter().any(|name| name == "exit_plan_mode"),
+            "exit_plan_mode must be offered while the main agent plans"
+        );
+
+        // Subagents plan read-only without the exit tool.
+        instance.set_plan_runtime(Some(super::PlanRuntime::Subagent));
+        let names = instance.build_request_tool_names().await;
+        assert!(!names.iter().any(|name| name == "exit_plan_mode"));
+
+        // Exiting plan mode removes it again mid-run.
+        instance.set_plan_runtime(None);
+        let names = instance.build_request_tool_names().await;
+        assert!(!names.iter().any(|name| name == "exit_plan_mode"));
+    }
+
+    #[test]
+    fn plan_reminder_renders_file_info_and_turn_contract() {
+        let missing = std::env::temp_dir().join("locus-test-plan-does-not-exist.md");
+        let rendered = AgentInstance::render_plan_reminder(&missing);
+        assert!(!rendered.contains("{plan_file_info}"));
+        assert!(rendered.contains("No plan file exists yet."));
+        assert!(rendered.contains(&missing.to_string_lossy().to_string()));
+        assert!(rendered.contains("exit_plan_mode"));
+        assert!(rendered.contains("ask_user_question"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("sess.md");
+        std::fs::write(&existing, "# Plan\n- step").expect("write plan");
+        let rendered = AgentInstance::render_plan_reminder(&existing);
+        assert!(rendered.contains("A plan file already exists"));
+        assert!(rendered.contains("refine it if this continues the same task"));
     }
 }

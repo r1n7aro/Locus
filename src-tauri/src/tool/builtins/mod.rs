@@ -81,6 +81,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(config_query_tool());
     registry.register_builtin(tool_load_tool());
     registry.register_builtin(tool_call_tool());
+    registry.register_builtin(exit_plan_mode_tool());
 }
 
 pub(super) fn should_skip_generated_root_entry(root: &Path, path: &Path) -> bool {
@@ -99,6 +100,30 @@ pub(super) fn should_skip_generated_root_entry(root: &Path, path: &Path) -> bool
         lower.as_str(),
         "library" | "temp" | "obj" | "logs" | "usersettings" | "memorycaptures" | "recordings"
     ) || lower.starts_with("build")
+}
+
+/// Only offered to the LLM while the session is in plan mode (the agent loop
+/// appends it to the request tool list); execution is intercepted by the
+/// agent loop, which owns the approval dialog and the plan-mode state flip.
+fn exit_plan_mode_tool() -> ToolDef {
+    let execute: ToolExecuteFn = std::sync::Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            ToolResult {
+                output: "Error: exit_plan_mode tool should be intercepted by agent loop"
+                    .to_string(),
+                is_error: true,
+            }
+        })
+    });
+
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::EXIT_PLAN_MODE);
+    ToolDef {
+        name: "exit_plan_mode".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
 }
 
 fn config_query_tool() -> ToolDef {

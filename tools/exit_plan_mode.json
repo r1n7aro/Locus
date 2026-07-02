@@ -1,0 +1,7 @@
+{
+  "description": "Use this tool when you are in plan mode, have finished writing your plan to the plan file, and are ready for user approval.\n\nHow this tool works:\n- You should already have written the full plan to the plan file given in the plan mode reminder. This tool takes NO plan content parameter — it reads the plan from that file.\n- It presents the plan to the user for review. If the user approves, plan mode ends and you can start implementing. If the user rejects, you stay in plan mode; address their feedback and refine the plan file.\n\nWhen to use:\n- Only when the task required planning the implementation steps of work that writes code or changes the system. For research tasks where you are only gathering information or understanding the codebase, do NOT use this tool — just answer.\n- Only after you have resolved open questions (use ask_user_question in earlier phases) and finished writing the plan file.\n\nDo NOT ask for plan approval via text or ask_user_question — requesting approval is exactly what this tool does.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

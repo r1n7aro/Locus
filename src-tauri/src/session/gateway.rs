@@ -37,6 +37,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::UndoAvailable { session_id, .. }
         | StreamEvent::CompactStart { session_id, .. }
         | StreamEvent::CompactDone { session_id, .. }
+        | StreamEvent::PlanModeChanged { session_id, .. }
         | StreamEvent::Cancelled { session_id, .. }
         | StreamEvent::Error { session_id, .. } => session_id,
     }
@@ -67,6 +68,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::UndoAvailable { .. } => "undoAvailable",
         StreamEvent::CompactStart { .. } => "compactStart",
         StreamEvent::CompactDone { .. } => "compactDone",
+        StreamEvent::PlanModeChanged { .. } => "planModeChanged",
         StreamEvent::Cancelled { .. } => "cancelled",
         StreamEvent::Error { .. } => "error",
     }
@@ -99,7 +101,8 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         StreamEvent::KnowledgeProposal { .. }
         | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputDeleted { .. }
-        | StreamEvent::PendingInputAccepted { .. } => None,
+        | StreamEvent::PendingInputAccepted { .. }
+        | StreamEvent::PlanModeChanged { .. } => None,
     }
 }
 

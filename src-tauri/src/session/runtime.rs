@@ -246,6 +246,7 @@ fn runtime_status_for_event(event: &StreamEvent) -> Option<&'static str> {
         | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputDeleted { .. }
         | StreamEvent::PendingInputAccepted { .. }
+        | StreamEvent::PlanModeChanged { .. }
         | StreamEvent::Done { .. }
         | StreamEvent::Cancelled { .. }
         | StreamEvent::Error { .. } => None,
@@ -277,6 +278,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::UndoAvailable { session_id, .. }
         | StreamEvent::CompactStart { session_id, .. }
         | StreamEvent::CompactDone { session_id, .. }
+        | StreamEvent::PlanModeChanged { session_id, .. }
         | StreamEvent::Cancelled { session_id, .. }
         | StreamEvent::Error { session_id, .. } => session_id,
     }
@@ -504,6 +506,7 @@ fn apply_event_to_snapshot(
         | StreamEvent::KnowledgeProposal { .. }
         | StreamEvent::UsageUpdate { .. }
         | StreamEvent::UndoAvailable { .. }
+        | StreamEvent::PlanModeChanged { .. }
         | StreamEvent::Done { .. }
         | StreamEvent::Cancelled { .. }
         | StreamEvent::Error { .. } => {}

@@ -13,6 +13,14 @@ pub struct SessionSummary {
     pub runtime_status: Option<SessionRuntimeStatus>,
 }
 
+/// Sticky Claude Code-style plan mode state for a session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeState {
+    pub active: bool,
+    pub exited_pending_notice: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRuntimeStatus {

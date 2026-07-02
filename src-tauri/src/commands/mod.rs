@@ -257,6 +257,15 @@ pub enum StreamEvent {
         tool_call_id: String,
         display: ToolConfirmDisplay,
     },
+    /// Sticky plan-mode transitions (entered via /plan or a plan-tagged
+    /// message; exited via approved exit_plan_mode or the user toggle).
+    #[serde(rename_all = "camelCase")]
+    PlanModeChanged {
+        session_id: String,
+        active: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_file_path: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     InputAnswered {
         session_id: String,
@@ -402,12 +411,22 @@ pub struct UnityEditorStatusChangeConfirmDisplay {
     pub requested_status: String,
 }
 
+/// Plan-approval dialog payload for exit_plan_mode: the full plan text plus
+/// the plan file location.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanApprovalConfirmDisplay {
+    pub plan: String,
+    pub plan_file_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ToolConfirmDisplay {
     Basic(BasicToolConfirmDisplay),
     Knowledge(KnowledgeToolConfirmPreview),
     UnityEditorStatusChange(UnityEditorStatusChangeConfirmDisplay),
+    PlanApproval(PlanApprovalConfirmDisplay),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

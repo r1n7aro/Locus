@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use super::models::{
     AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole,
-    SessionDetail, SessionEventRecord, SessionRunSummary, SessionRuntimeSnapshot, SessionSummary,
-    TodoItem, TodoSnapshot, ToolCallInfo,
+    PlanModeState, SessionDetail, SessionEventRecord, SessionRunSummary, SessionRuntimeSnapshot,
+    SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use super::runtime::SessionRuntimeRegistry;
 use crate::commands::TokenUsage;
@@ -503,7 +503,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 19;
+    const SCHEMA_VERSION: i32 = 20;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::new_with_tool_results_root(data_dir, data_dir.join("temp").join("tool-results"))
@@ -712,7 +712,23 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 19, "add a new migration block above");
+        if current < 20 {
+            Self::migrate(conn, 20, "add sticky plan mode state to sessions", |conn| {
+                if !Self::table_has_column(conn, "sessions", "plan_mode_active")? {
+                    conn.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN plan_mode_active INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                if !Self::table_has_column(conn, "sessions", "plan_exited_pending_notice")? {
+                    conn.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN plan_exited_pending_notice INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 20, "add a new migration block above");
         Ok(())
     }
 
@@ -728,6 +744,8 @@ impl SessionStore {
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
                 latest_todo_run_id TEXT,
+                plan_mode_active INTEGER NOT NULL DEFAULT 0,
+                plan_exited_pending_notice INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1897,6 +1915,73 @@ impl SessionStore {
             }
         }
         Ok(sessions)
+    }
+
+    /// Sticky plan-mode state for a session. `active` gates the read-only
+    /// enforcement, the plan reminder injection and the exit_plan_mode tool;
+    /// `exited_pending_notice` marks that the next persisted user message
+    /// should carry the one-shot "exited plan mode" reminder.
+    pub fn get_plan_mode_state(&self, session_id: &str) -> Result<PlanModeState, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT plan_mode_active, plan_exited_pending_notice FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| {
+                Ok(PlanModeState {
+                    active: row.get::<_, i64>(0)? != 0,
+                    exited_pending_notice: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .map_err(|e| format!("Failed to read plan mode state: {}", e))
+    }
+
+    /// Flips the sticky plan-mode flag. Turning it off after it was on arms
+    /// the one-shot exited notice so the next user message tells the model
+    /// it may edit again (and where the plan file lives).
+    pub fn set_plan_mode_active(
+        &self,
+        session_id: &str,
+        active: bool,
+    ) -> Result<PlanModeState, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let was_active: i64 = conn
+            .query_row(
+                "SELECT plan_mode_active FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read plan mode state: {}", e))?;
+        let exited_notice = if active { 0 } else { was_active };
+        conn.execute(
+            "UPDATE sessions SET plan_mode_active = ?1, plan_exited_pending_notice = ?2, updated_at = ?3 WHERE id = ?4",
+            params![active as i64, exited_notice, Self::now_ts(), session_id],
+        )
+        .map_err(|e| format!("Failed to update plan mode state: {}", e))?;
+        Ok(PlanModeState {
+            active,
+            exited_pending_notice: exited_notice != 0,
+        })
+    }
+
+    /// Reads and clears the one-shot exited-plan-mode notice.
+    pub fn take_plan_exited_notice(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let pending: i64 = conn
+            .query_row(
+                "SELECT plan_exited_pending_notice FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read plan exited notice: {}", e))?;
+        if pending != 0 {
+            conn.execute(
+                "UPDATE sessions SET plan_exited_pending_notice = 0 WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| format!("Failed to clear plan exited notice: {}", e))?;
+        }
+        Ok(pending != 0)
     }
 
     pub fn load_session(&self, id: &str) -> Result<SessionDetail, String> {
@@ -3976,6 +4061,60 @@ mod tests {
                 &KnowledgeProposalStatus::Invalidated,
             )
         );
+    }
+
+    #[test]
+    fn plan_mode_state_toggles_and_arms_one_shot_exited_notice() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("plan test", None, None, "chat", Some("dev"))
+            .expect("create session");
+
+        let initial = store
+            .get_plan_mode_state(&session_id)
+            .expect("read initial state");
+        assert!(!initial.active);
+        assert!(!initial.exited_pending_notice);
+
+        store
+            .set_plan_mode_active(&session_id, true)
+            .expect("enter plan mode");
+        let entered = store.get_plan_mode_state(&session_id).expect("read state");
+        assert!(entered.active);
+        assert!(!entered.exited_pending_notice);
+
+        // Re-entering while already active must not arm the notice.
+        store
+            .set_plan_mode_active(&session_id, true)
+            .expect("re-enter plan mode");
+        assert!(!store
+            .get_plan_mode_state(&session_id)
+            .expect("read state")
+            .exited_pending_notice);
+
+        store
+            .set_plan_mode_active(&session_id, false)
+            .expect("exit plan mode");
+        let exited = store.get_plan_mode_state(&session_id).expect("read state");
+        assert!(!exited.active);
+        assert!(exited.exited_pending_notice);
+
+        // The notice is one-shot.
+        assert!(store
+            .take_plan_exited_notice(&session_id)
+            .expect("take notice"));
+        assert!(!store
+            .take_plan_exited_notice(&session_id)
+            .expect("take notice again"));
+
+        // Exiting while already inactive must not re-arm it.
+        store
+            .set_plan_mode_active(&session_id, false)
+            .expect("exit again");
+        assert!(!store
+            .take_plan_exited_notice(&session_id)
+            .expect("no notice"));
     }
 
     #[test]
