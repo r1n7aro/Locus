@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.3 (2026-06-27)"
+description: "Locus v0.5.4 (2026-07-02)"
 sidebarTitle: "Latest Version"
-version: "0.5.3"
-releasedAt: "2026-06-27"
+version: "0.5.4"
+releasedAt: "2026-07-02"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,31 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.4 (Added)
+
+- **Sticky plan mode.** Plan mode is now a persistent, per-session read-only mode: the agent researches and writes the plan but cannot edit files or run non-read-only tools until you approve it from an in-chat card. A status bar shows plan mode is active with a one-click exit, and subagents spawned during planning inherit the read-only restriction.
+- **Main log written to a file.** Locus mirrors its log (including the frontend console) to a rotating file at `%APPDATA%\locus\logs\locus.log`, flushed on crash. Console settings has a new "Locate Log File" button.
+- **Model catalog refresh.** Added Fable 5 and Sonnet 5 (1M context) and made Opus 4.8 the default; removed the older Sonnet 4.6, Haiku 4.5, and Opus 4.7 entries.
+
+### v0.5.4 (Fixed)
+
+- Model names no longer show the internal `[1m]` context-window marker in the pickers.
+- Unity YAML parsing no longer panics on a multi-byte character right after a GUID, and single-quoted scalar names are unquoted correctly.
+- Scene diffing now detects prefab source swaps and reparenting instead of reporting them unchanged, and skips rebuilding byte-identical scene targets.
+- Faster asset re-scans: unchanged files are no longer re-parsed during watcher reconciliation, and the asset database rebuilds once on first launch after updating (schema v13).
+- Smoother response streaming: cached diagnostics/trace checks, shallower tool-call watches, batched tool-result updates, and stabilized message groups cut redundant transcript work.
+- Hot reload now fails closed on unsafe edits: ref-struct instance members, members referenced inside expression trees, namespace-scoped `using` changes, and cold-diff reverts.
+- Hardened the Unity hot-reload bridge: applied detours roll back on apply failure, recompile completion is gated on a compile epoch so pre-request compiles can't finish the request, components are skipped on GameObjects being destroyed, and convergence races / monitor-stop handoff are fixed.
+
+### v0.5.4 (Removed)
+
+- Removed the old one-shot "plan → continue implementation" confirmation card; it's replaced by the sticky, approval-gated plan mode above.
 
 ### v0.5.3 (Added)
 

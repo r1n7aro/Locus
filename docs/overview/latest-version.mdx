@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.5.3 (2026-06-27)"
+description: "Locus v0.5.4 (2026-07-02)"
 sidebarTitle: "当前版本"
-version: "0.5.3"
-releasedAt: "2026-06-27"
+version: "0.5.4"
+releasedAt: "2026-07-02"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,31 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.5.4（新增）
+
+- **粘性计划模式。** 计划模式现在是按会话持续的只读模式：Agent 可调研并撰写计划，但在你于对话卡片上批准前不能编辑文件或调用非只读工具。顶部状态栏显示计划模式已启用并提供一键退出；计划期间派生的子代理同样继承只读限制。
+- **主日志落盘。** Locus 会把日志（含前端控制台）同时写入滚动文件 `%APPDATA%\locus\logs\locus.log`，崩溃时刷盘。控制台设置新增「定位日志文件」按钮。
+- **模型目录更新。** 新增 Fable 5 与 Sonnet 5（1M 上下文），并将 Opus 4.8 设为默认；移除较旧的 Sonnet 4.6、Haiku 4.5 与 Opus 4.7。
+
+### v0.5.4（修复）
+
+- 模型选择器不再显示内部的 `[1m]` 上下文窗口标记。
+- 解析 Unity YAML 时，GUID 后紧跟多字节字符不再触发 panic；单引号包裹的标量名称现在能被正确去引号。
+- 场景 diff 现在能识别预制体换源与重新挂父级（不再误判为未变化），并跳过逐字节相同的场景目标重建。
+- 更快的资产重扫：watcher 对账时不再重新解析未变化的文件；更新后首次启动会重建一次资产数据库（schema v13）。
+- 更顺畅的流式输出：缓存诊断/trace 判定、改用更浅的工具调用 watch、批量应用工具结果、稳定消息分组，减少 transcript 的冗余计算。
+- 热更新对不安全的改动改为 fail-closed：ref struct 的实例成员、在表达式树内引用的成员、命名空间级 `using` 变更，以及冷 diff 回退。
+- 加固 Unity 热更新桥接：应用失败时回滚已下的 detour；重编译完成以编译 epoch 门控，避免请求前的编译误判完成；对正在销毁的 GameObject 跳过组件；并修复收敛竞态与 monitor 停止时的账本交接。
+
+### v0.5.4（移除）
+
+- 移除旧的一次性「计划 → 继续实现」确认卡片；由上述粘性、需批准的计划模式取代。
 
 ### v0.5.3（新增）
 
