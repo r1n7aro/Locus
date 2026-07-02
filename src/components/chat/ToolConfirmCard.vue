@@ -5,6 +5,7 @@ import type {
   BasicToolConfirmDisplay,
   KnowledgeToolConfirmPreview,
   PendingToolConfirm,
+  PlanApprovalConfirmDisplay,
   UnityEditorStatusChangeToolConfirmDisplay,
 } from "../../types";
 import { t } from "../../i18n";
@@ -44,6 +45,12 @@ function isUnityEditorStatusChangeDisplay(
   return display.kind === "unityEditorStatusChange";
 }
 
+function isPlanApprovalDisplay(
+  display: PendingToolConfirm["display"],
+): display is PlanApprovalConfirmDisplay {
+  return display.kind === "planApproval";
+}
+
 const knowledgeDisplay = computed(() =>
   isKnowledgePreview(props.toolConfirm.display) ? props.toolConfirm.display : null,
 );
@@ -64,23 +71,29 @@ const unityStatusChangeDisplay = computed(() =>
     : null,
 );
 
-const title = computed(() =>
-  unityStatusChangeDisplay.value
-    ? titleForUnityEditorStatusChange(unityStatusChangeDisplay.value.requestedStatus)
-    : t("chat.toolConfirm.title"),
+const planApprovalDisplay = computed(() =>
+  isPlanApprovalDisplay(props.toolConfirm.display) ? props.toolConfirm.display : null,
 );
 
-const allowLabel = computed(() =>
-  unityStatusChangeDisplay.value
-    ? t("chat.toolConfirm.unityStatus.confirm")
-    : t("chat.toolConfirm.allow"),
-);
+const title = computed(() => {
+  if (unityStatusChangeDisplay.value) {
+    return titleForUnityEditorStatusChange(unityStatusChangeDisplay.value.requestedStatus);
+  }
+  if (planApprovalDisplay.value) return t("chat.plan.approvalTitle");
+  return t("chat.toolConfirm.title");
+});
 
-const denyLabel = computed(() =>
-  unityStatusChangeDisplay.value
-    ? t("chat.toolConfirm.unityStatus.cancel")
-    : t("chat.toolConfirm.deny"),
-);
+const allowLabel = computed(() => {
+  if (unityStatusChangeDisplay.value) return t("chat.toolConfirm.unityStatus.confirm");
+  if (planApprovalDisplay.value) return t("chat.plan.approve");
+  return t("chat.toolConfirm.allow");
+});
+
+const denyLabel = computed(() => {
+  if (unityStatusChangeDisplay.value) return t("chat.toolConfirm.unityStatus.cancel");
+  if (planApprovalDisplay.value) return t("chat.plan.reject");
+  return t("chat.toolConfirm.deny");
+});
 
 function formatToolArgs(raw: string): string {
   try {
@@ -153,7 +166,17 @@ const unityStatusRows = computed(() => {
         </dl>
       </div>
     </template>
-    <ToolConfirmFeedbackForm v-if="basicDisplay" @submit="emit('answer', $event)" />
+    <template v-else-if="planApprovalDisplay">
+      <div class="tool-confirm-body">
+        <div class="plan-approval-path">{{ planApprovalDisplay.planFilePath }}</div>
+        <pre class="plan-approval-content">{{ planApprovalDisplay.plan }}</pre>
+        <div class="plan-approval-hint">{{ t("chat.plan.approvalHint") }}</div>
+      </div>
+    </template>
+    <ToolConfirmFeedbackForm
+      v-if="basicDisplay || planApprovalDisplay"
+      @submit="emit('answer', $event)"
+    />
     <div class="tool-confirm-actions">
       <BaseButton class="tool-confirm-btn" variant="primary" size="md" @click="emit('answer', 'allow')">{{ allowLabel }}</BaseButton>
       <BaseButton class="tool-confirm-btn" size="md" @click="emit('answer', 'deny')">{{ denyLabel }}</BaseButton>
@@ -162,6 +185,34 @@ const unityStatusRows = computed(() => {
 </template>
 
 <style scoped>
+.plan-approval-path {
+  margin-bottom: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
+  word-break: break-all;
+}
+
+.plan-approval-content {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 86%, var(--sidebar-bg) 14%);
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.plan-approval-hint {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 .tool-confirm-card.is-unity-status-change {
   border-color: color-mix(in srgb, var(--border-color) 86%, var(--accent-color) 14%);
   background: color-mix(in srgb, var(--panel-bg) 88%, var(--sidebar-bg) 12%);

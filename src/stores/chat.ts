@@ -385,13 +385,37 @@ export const useChatStore = defineStore("chat", () => {
     };
   });
 
-  // Plan run tracking (bound to runId + sessionId to avoid stale state)
-  const pendingPlanRun = ref<{
-    runId: string | null;  // null until first stream event arrives
-    sessionId: string;
-    agentId: string;
-    requestText: string;
-  } | null>(null);
+  // Sticky Claude Code-style plan mode per session. The backend session
+  // store is the source of truth; this map mirrors it for badges and is
+  // synced via the planModeChanged stream event + explicit loads.
+  const sessionPlanModes = ref<Map<string, boolean>>(new Map());
+  const activeSessionPlanMode = computed(() =>
+    activeSessionId.value ? sessionPlanModes.value.get(activeSessionId.value) ?? false : false,
+  );
+
+  function setSessionPlanModeLocal(sessionId: string, active: boolean) {
+    const next = new Map(sessionPlanModes.value);
+    if (active) {
+      next.set(sessionId, true);
+    } else {
+      next.delete(sessionId);
+    }
+    sessionPlanModes.value = next;
+  }
+
+  async function refreshSessionPlanState(sessionId: string) {
+    try {
+      const state = await sessionService.getSessionPlanState(sessionId);
+      setSessionPlanModeLocal(sessionId, state.active);
+    } catch (e) {
+      console.warn("[plan] failed to load session plan state:", e);
+    }
+  }
+
+  async function setSessionPlanMode(sessionId: string, active: boolean) {
+    const state = await sessionService.setSessionPlanMode(sessionId, active);
+    setSessionPlanModeLocal(sessionId, state.active);
+  }
 
   let pendingSessionId: string | null = null;
   let pendingMessageSeq = 0;
@@ -508,6 +532,10 @@ export const useChatStore = defineStore("chat", () => {
     options: { persist?: boolean } = {},
   ) {
     activeSessionId.value = sessionId;
+    if (sessionId) {
+      // Sticky plan mode badge follows the backend session store.
+      void refreshSessionPlanState(sessionId);
+    }
     if (options.persist !== false) {
       persistActiveSessionSelection(sessionId);
     }
@@ -1104,7 +1132,6 @@ export const useChatStore = defineStore("chat", () => {
       }
       if (activeSessionId.value === sessionId) {
         currentRunId.value = null;
-        pendingPlanRun.value = null;
         isStreaming.value = false;
         resetStreamRuntimeState();
         shouldReloadActiveSession = true;
@@ -1294,8 +1321,17 @@ export const useChatStore = defineStore("chat", () => {
           const sourceToolCalls = targetIds
             ? activeToolCalls.value.filter((toolCall) => targetIds.has(toolCall.id))
             : activeToolCalls.value;
-          for (const message of buildToolResultMessages(sourceToolCalls)) {
-            messages.value = replaceMessageById(messages.value, message);
+          // Apply the whole batch as a single messages-array replacement:
+          // every replacement re-runs the transcript's O(messages) grouping
+          // pipeline, so per-result replacements multiply that cost by the
+          // batch size.
+          const toolResultMessages = buildToolResultMessages(sourceToolCalls);
+          if (toolResultMessages.length > 0) {
+            let next = messages.value;
+            for (const message of toolResultMessages) {
+              next = replaceMessageById(next, message);
+            }
+            messages.value = next;
           }
         }
         break;
@@ -1472,14 +1508,6 @@ export const useChatStore = defineStore("chat", () => {
         isStreaming.value = true;
       }
 
-      if (
-        pendingPlanRun.value &&
-        !pendingPlanRun.value.runId &&
-        pendingPlanRun.value.sessionId === event.sessionId
-      ) {
-        pendingPlanRun.value.runId = event.runId;
-      }
-
       logChatStreamDebug("accepted runStart", {
         sessionId: event.sessionId,
         runId: event.runId,
@@ -1497,6 +1525,13 @@ export const useChatStore = defineStore("chat", () => {
       if (event.sessionId === activeSessionId.value) {
         applyMutation({ type: "upsertMessage", message: event.message });
       }
+      return true;
+    }
+
+    // Handled before run-id gating: plan transitions can be emitted outside
+    // a tracked run (the /plan toggle command uses a synthetic run id).
+    if (event.type === "planModeChanged") {
+      setSessionPlanModeLocal(event.sessionId, event.active);
       return true;
     }
 
@@ -1730,22 +1765,6 @@ export const useChatStore = defineStore("chat", () => {
       void loadSessionStatePreservingFailedUserDraft(event.sessionId);
     }
 
-    if (event.type === "done") {
-      // Save plan artifact on successful plan completion
-      if (
-        pendingPlanRun.value &&
-        pendingPlanRun.value.runId === event.runId &&
-        pendingPlanRun.value.sessionId === event.sessionId
-      ) {
-        sessionService.savePlanArtifact(
-          pendingPlanRun.value.sessionId,
-          pendingPlanRun.value.agentId,
-          pendingPlanRun.value.requestText,
-          event.fullText,
-        ).catch((e) => console.warn("[plan] save artifact failed:", e));
-      }
-    }
-
     if (event.type === "done" || event.type === "cancelled") {
       const queued = localQueuedInputsForRun(
         event.sessionId,
@@ -1814,7 +1833,6 @@ export const useChatStore = defineStore("chat", () => {
     setActiveSessionSelection(id, { persist: options.persist });
     activeSessionType.value = sessions.value.find((session) => session.id === id)?.sessionType ?? null;
     currentRunId.value = sessionRunIds.value.get(id) ?? null;
-    pendingPlanRun.value = null;
     resetStreamRuntimeState();
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
@@ -1875,7 +1893,6 @@ export const useChatStore = defineStore("chat", () => {
     thinkingPanelContent.value = "";
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
-    pendingPlanRun.value = null;
     useAgentStore().resetToDefault();
 
     // Clear chat changes for the old session
@@ -1918,7 +1935,6 @@ export const useChatStore = defineStore("chat", () => {
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
     sessionAgentId.value = null;
-    pendingPlanRun.value = null;
     useAgentStore().resetToDefault();
     const chatChangesStore = useChatChangesStore();
     chatChangesStore.clear(oldSessionId);
@@ -2280,12 +2296,9 @@ export const useChatStore = defineStore("chat", () => {
       pendingManagedUnboundSession = false;
       managedStreamingSessionIds.add(sid);
       if (overrides?.mode === "plan") {
-        pendingPlanRun.value = {
-          runId,
-          sessionId: sid,
-          agentId: agentStore.selectedAgentId || "",
-          requestText: overrides.displayText ?? text,
-        };
+        // Optimistic: the backend enters sticky plan mode when it sees the
+        // plan-tagged message; the planModeChanged event confirms it.
+        setSessionPlanModeLocal(sid, true);
       }
       if (!activeSessionId.value || activeSessionId.value === sid) {
         setActiveSessionSelection(sid);
@@ -2511,9 +2524,6 @@ export const useChatStore = defineStore("chat", () => {
     if (trackedRunId && cancelRequestedRunIds.get(sessionId) === trackedRunId) return;
     if (trackedRunId) {
       cancelRequestedRunIds.set(sessionId, trackedRunId);
-    }
-    if (pendingPlanRun.value?.sessionId === sessionId) {
-      pendingPlanRun.value = null;
     }
     try {
       await sessionService.cancelChat(sessionId);
@@ -2812,8 +2822,10 @@ export const useChatStore = defineStore("chat", () => {
     sessionAgentId,
     toolPermissionMode,
     sessionAgentLocked,
-    pendingPlanRun,
-    clearPendingPlan: () => { pendingPlanRun.value = null; },
+    sessionPlanModes,
+    activeSessionPlanMode,
+    refreshSessionPlanState,
+    setSessionPlanMode,
     handleStreamEvent,
     refreshSessions,
     loadToolPermissionMode,

@@ -215,11 +215,19 @@ export function saveRawContext(
   return ipcInvoke<string>("save_raw_context", { sessionId, filePath, includeSystemPrompt });
 }
 
-export function savePlanArtifact(
+export interface SessionPlanState {
+  active: boolean;
+  planFilePath: string;
+  planFileExists: boolean;
+}
+
+export function getSessionPlanState(sessionId: string): Promise<SessionPlanState> {
+  return ipcInvoke<SessionPlanState>("get_session_plan_state", { sessionId });
+}
+
+export function setSessionPlanMode(
   sessionId: string,
-  agentId: string,
-  requestText: string,
-  responseText: string,
-): Promise<string> {
-  return ipcInvoke<string>("save_plan_artifact", { sessionId, agentId, requestText, responseText });
+  active: boolean,
+): Promise<SessionPlanState> {
+  return ipcInvoke<SessionPlanState>("set_session_plan_mode", { sessionId, active });
 }

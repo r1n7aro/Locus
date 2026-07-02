@@ -83,6 +83,9 @@ function summarizeToolConfirmDisplay(display: ToolConfirmDisplay): string {
   if (display.kind === "unityEditorStatusChange") {
     return summarizeUnityStatusChange(display.requestedStatus);
   }
+  if (display.kind === "planApproval") {
+    return t("chat.plan.approvalTitle");
+  }
   return summarizeText(display.path);
 }
 

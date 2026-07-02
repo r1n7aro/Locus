@@ -10,6 +10,7 @@ import MarkdownRenderer from "./MarkdownRenderer.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { formatModelDisplayName } from "../utils/modelDisplay";
 
 const props = defineProps<{
   workingDir: string;
@@ -31,7 +32,7 @@ const { state: displaySettings } = useDisplaySettings();
 
 const currentModelName = computed(() => {
   const m = props.models.find(m => m.id === props.selectedModelId);
-  return m?.name || "Model";
+  return m ? modelDisplayName(m) : "Model";
 });
 
 function toggleModelDropdown() {
@@ -41,6 +42,10 @@ function toggleModelDropdown() {
 function selectModel(id: string) {
   emit("selectModel", id);
   modelDropdownOpen.value = false;
+}
+
+function modelDisplayName(model: ModelOption): string {
+  return formatModelDisplayName(model.name);
 }
 
 function onModelClickOutside(e: MouseEvent) {
@@ -157,6 +162,7 @@ const toolConfirmTitle = computed(() => {
     const label = t(key);
     return label === key ? t("chat.toolConfirm.unityStatus.title") : label;
   }
+  if (display.kind === "planApproval") return t("chat.plan.approvalTitle");
 
   const docType = t(`chat.toolConfirm.knowledge.docType.${display.docType}`);
   const suffix = display.targetKind === "directory" ? "Directory" : "Document";
@@ -182,6 +188,10 @@ const toolConfirmRows = computed<TerminalMetaRow[]>(() => {
       { label: t("chat.toolConfirm.unityStatus.current"), value: statusLabel(display.currentStatus) },
       { label: t("chat.toolConfirm.unityStatus.requested"), value: statusLabel(display.requestedStatus) },
     ];
+  }
+
+  if (display.kind === "planApproval") {
+    return [{ label: "plan", value: display.planFilePath }];
   }
 
   const rows: TerminalMetaRow[] = [
@@ -223,6 +233,10 @@ const toolConfirmPreviewText = computed(() => {
 
   if (display.kind === "basic") {
     return formatToolConfirmArguments(display.arguments);
+  }
+
+  if (display.kind === "planApproval") {
+    return truncatePreview(display.plan, 1600);
   }
 
   if (display.kind === "knowledge") {
@@ -976,7 +990,7 @@ defineExpose({ pushOutput });
                 class="term-model-option"
                 :class="{ active: m.id === props.selectedModelId }"
                 @click="selectModel(m.id)"
-              >{{ m.name }}</div>
+              >{{ modelDisplayName(m) }}</div>
             </div>
           </Transition>
         </div>

@@ -28,6 +28,9 @@ export function titleForPendingToolConfirm(toolConfirm: PendingToolConfirm): str
   if (toolConfirm.display.kind === "unityEditorStatusChange") {
     return titleForUnityEditorStatusChange(toolConfirm.display.requestedStatus);
   }
+  if (toolConfirm.display.kind === "planApproval") {
+    return t("chat.plan.approvalTitle");
+  }
   return toolConfirm.display.toolName;
 }
 
@@ -41,6 +44,9 @@ export function subtitleForPendingToolConfirm(toolConfirm: PendingToolConfirm): 
       editorStatusLabelForToolConfirm(toolConfirm.display.currentStatus),
       editorStatusLabelForToolConfirm(toolConfirm.display.requestedStatus),
     );
+  }
+  if (toolConfirm.display.kind === "planApproval") {
+    return toolConfirm.display.planFilePath;
   }
   return toolConfirm.display.toolName;
 }
