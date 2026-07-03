@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
@@ -9,9 +9,22 @@ use crate::knowledge_store::KnowledgeType;
 use crate::session::store::SessionStore;
 use crate::vcs::undo::{
     ChangedFile, UndoConflict, UndoEntry, UndoPerformError, UndoPerformOptions,
+    UndoRevertFileError,
 };
 use crate::workspace::Workspace;
 use crate::UndoManagerHandle;
+
+/// Broadcast after a single file is reverted so every webview (main window,
+/// diff review window) can invalidate stale diff payloads for that file.
+pub const UNDO_FILE_REVERTED_EVENT: &str = "undo-file-reverted";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoFileRevertedEvent {
+    pub working_dir: String,
+    pub session_id: String,
+    pub files: Vec<ChangedFile>,
+}
 
 const MAX_INCREMENTAL_KNOWLEDGE_UNDO_DOCS: usize = 8;
 
@@ -402,6 +415,81 @@ pub async fn undo_perform_to_message(
     );
 
     Ok(result.entry)
+}
+
+/// Revert a single file to the pre-round snapshot anchoring the panel diff.
+///
+/// Unlike `undo_perform` this acts like a manual user edit: the undo stack,
+/// snapshot refs, and chat history stay untouched. Without `force`, the
+/// command fails with code `undo.file_dirty` when the file was modified again
+/// after the recorded rounds; the caller confirms and retries with `force`.
+#[tauri::command]
+pub async fn undo_revert_file(
+    session_id: String,
+    assistant_message_id: String,
+    path: String,
+    old_path: Option<String>,
+    status: String,
+    force: Option<bool>,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    undo_manager: State<'_, UndoManagerHandle>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<Vec<ChangedFile>, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let file = ChangedFile {
+        status,
+        path,
+        old_path,
+    };
+    let restored = match undo_manager
+        .revert_file(
+            &session_id,
+            &assistant_message_id,
+            &working_dir,
+            &file,
+            force.unwrap_or(false),
+        )
+        .await
+    {
+        Ok(files) => files,
+        Err(UndoRevertFileError::Dirty(files)) => {
+            return Err(AppError::new(
+                "undo.file_dirty",
+                "This file was modified again after the agent finished; reverting rolls those extra changes back too.",
+            )
+            .detail(format_dirty_detail(&files))
+            .operation("undo_revert_file"));
+        }
+        Err(UndoRevertFileError::Other(msg)) => return Err(msg.into()),
+    };
+
+    // Same post-restore bookkeeping as round-level undo (knowledge index and
+    // view tree stay in sync); the session transcript is not touched.
+    sync_knowledge_after_undo(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        &restored,
+    )
+    .await;
+    if undo_touches_view_tree(&restored) {
+        crate::view::emit_view_tree_changed(&app_handle);
+    }
+
+    let event = UndoFileRevertedEvent {
+        working_dir: working_dir.clone(),
+        session_id: session_id.clone(),
+        files: restored.clone(),
+    };
+    if let Err(error) = app_handle.emit(UNDO_FILE_REVERTED_EVENT, event) {
+        eprintln!(
+            "[undo_revert_file] failed to emit file reverted event for session {}: {}",
+            session_id, error
+        );
+    }
+
+    Ok(restored)
 }
 
 #[tauri::command]

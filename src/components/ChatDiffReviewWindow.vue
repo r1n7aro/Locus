@@ -2,10 +2,11 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { ExternalLink, X } from "lucide";
+import { ExternalLink, Undo2, X } from "lucide";
 import type { FileDiffPayload, FileDiffRequest } from "../types";
 import { diffSingleFile, invalidateDiffCache, parseDiffRequestKey } from "../services/diff";
 import { openFileExternal } from "../services/unity";
+import { undoRevertFile, UNDO_FILE_DIRTY_ERROR_CODE } from "../services/undo";
 import { normalizeAppError } from "../services/errors";
 import {
   CHAT_DIFF_REVIEW_WINDOW_EVENT,
@@ -166,6 +167,84 @@ async function toggleFullTextCompare() {
   }, { preferTextTab: true });
 }
 
+// ── Per-file revert with confirmation ──
+
+const showRevertConfirm = ref(false);
+const showRevertDirtyConfirm = ref(false);
+const revertDirtyDetail = ref<string | null>(null);
+const revertError = ref<string | null>(null);
+const isRevertingFile = ref(false);
+
+const canRevertFile = computed(() =>
+  !!payload.value
+  && currentRequest.value?.source === "chatCheckpoint"
+  && !!currentRequest.value.sessionId
+  && !!currentRequest.value.assistantMessageId,
+);
+
+const revertDirtyLines = computed(() =>
+  (revertDirtyDetail.value ?? "")
+    .split("\n")
+    .map((line) => line.replace(/^-\s*/, "").trim())
+    .filter((line) => line.length > 0),
+);
+
+function onRevertFileClick() {
+  if (!canRevertFile.value || isRevertingFile.value || loading.value) return;
+  revertDirtyDetail.value = null;
+  revertError.value = null;
+  showRevertDirtyConfirm.value = false;
+  showRevertConfirm.value = true;
+}
+
+function cancelRevertFile() {
+  if (isRevertingFile.value) return;
+  showRevertConfirm.value = false;
+  showRevertDirtyConfirm.value = false;
+  revertDirtyDetail.value = null;
+  revertError.value = null;
+}
+
+async function confirmRevertFile(force = false) {
+  const request = currentRequest.value;
+  const currentPayload = payload.value;
+  if (!request?.sessionId || !request.assistantMessageId || !currentPayload || isRevertingFile.value) {
+    return;
+  }
+  isRevertingFile.value = true;
+  revertError.value = null;
+  try {
+    await undoRevertFile(
+      request.sessionId,
+      request.assistantMessageId,
+      {
+        path: currentPayload.filePath,
+        oldPath: currentPayload.oldPath ?? undefined,
+        status: currentPayload.status ?? "M",
+      },
+      force,
+    );
+    showRevertConfirm.value = false;
+    showRevertDirtyConfirm.value = false;
+    revertDirtyDetail.value = null;
+    // Reload the diff against the reverted worktree; the main window catches
+    // up via the undo-file-reverted broadcast.
+    await loadRequest(request, { invalidateKey: currentPayload.key });
+  } catch (cause) {
+    const err = normalizeAppError(cause);
+    if (!force && err.code === UNDO_FILE_DIRTY_ERROR_CODE) {
+      // Modified again after the round: ask before rolling that back too.
+      revertDirtyDetail.value = err.detail ?? null;
+      showRevertConfirm.value = false;
+      showRevertDirtyConfirm.value = true;
+    } else {
+      revertError.value = err.message;
+    }
+  } finally {
+    isRevertingFile.value = false;
+  }
+}
+
 async function closeWindow() {
   try {
     await appWindow.close();
@@ -239,6 +318,17 @@ onUnmounted(() => {
           <span>{{ t("common.openInEditor") }}</span>
         </button>
         <button
+          v-if="canRevertFile"
+          type="button"
+          class="chat-diff-review-action"
+          :disabled="loading || isRevertingFile"
+          :title="t('chat.changes.revertFile')"
+          @click="onRevertFileClick"
+        >
+          <LucideIcon :icon="Undo2" :size="13" />
+          <span>{{ isRevertingFile ? t("chat.changes.reverting") : t("chat.changes.revertFile") }}</span>
+        </button>
+        <button
           v-if="canToggleFullTextCompare"
           type="button"
           class="chat-diff-review-action"
@@ -279,6 +369,40 @@ onUnmounted(() => {
       </div>
       <div v-else class="chat-diff-review-error">
         {{ error || t("chat.changes.reviewMissing") }}
+      </div>
+    </div>
+
+    <!-- Per-file revert confirm dialog -->
+    <div v-if="showRevertConfirm && payload" class="revert-confirm-backdrop" @click.self="cancelRevertFile">
+      <div class="revert-confirm-dialog">
+        <p class="revert-confirm-message">{{ t('chat.changes.revertFileConfirm', payload.filePath) }}</p>
+        <p v-if="revertError" class="revert-confirm-error">{{ revertError }}</p>
+        <div class="revert-confirm-actions">
+          <button type="button" class="revert-confirm-cancel" :disabled="isRevertingFile" @click="cancelRevertFile">{{ t('chat.changes.cancel') }}</button>
+          <button type="button" class="revert-confirm-ok" :disabled="isRevertingFile" @click="confirmRevertFile()">
+            {{ isRevertingFile ? t('chat.changes.reverting') : t('chat.changes.revertFileOk') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-file revert dirty confirm dialog (modified again after the round) -->
+    <div v-if="showRevertDirtyConfirm && payload" class="revert-confirm-backdrop" @click.self="cancelRevertFile">
+      <div class="revert-confirm-dialog">
+        <p class="revert-confirm-message">{{ t('chat.changes.revertFileConfirm', payload.filePath) }}</p>
+        <div class="revert-dirty-warning">
+          <p class="revert-dirty-message">{{ t('chat.changes.revertFileDirtyMessage') }}</p>
+          <div v-if="revertDirtyLines.length > 0" class="revert-dirty-files">
+            <div v-for="(line, idx) in revertDirtyLines" :key="idx" class="revert-dirty-file">{{ line }}</div>
+          </div>
+        </div>
+        <p v-if="revertError" class="revert-confirm-error">{{ revertError }}</p>
+        <div class="revert-confirm-actions">
+          <button type="button" class="revert-confirm-cancel" :disabled="isRevertingFile" @click="cancelRevertFile">{{ t('chat.changes.cancel') }}</button>
+          <button type="button" class="revert-confirm-ok" :disabled="isRevertingFile" @click="confirmRevertFile(true)">
+            {{ isRevertingFile ? t('chat.changes.reverting') : t('chat.changes.revertFileForce') }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -513,5 +637,106 @@ onUnmounted(() => {
   border-radius: inherit;
   background: var(--accent-color);
   transition: width 0.15s ease;
+}
+
+/* Per-file revert confirm (mirrors the changes panel confirm dialog) */
+.revert-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.revert-confirm-dialog {
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 20px 24px;
+  max-width: 420px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+
+.revert-confirm-message {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: var(--text-color);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.revert-confirm-error {
+  margin: 0 0 16px;
+  font-size: 12px;
+  color: var(--status-danger-fg);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.revert-dirty-warning {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-border, var(--border-color));
+  border-radius: 6px;
+  background: var(--warning-bg, var(--bg-color));
+}
+
+.revert-dirty-message {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--warning-text, var(--text-color));
+  line-height: 1.5;
+}
+
+.revert-dirty-files {
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  word-break: break-word;
+  font-family: var(--font-mono-identifier);
+}
+
+.revert-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.revert-confirm-cancel,
+.revert-confirm-ok {
+  padding: 5px 16px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid var(--border-color);
+}
+
+.revert-confirm-cancel {
+  background: none;
+  color: var(--text-color);
+}
+
+.revert-confirm-ok {
+  background: var(--status-danger-fg);
+  color: var(--bg-color);
+  border-color: var(--status-danger-fg);
+}
+
+.revert-confirm-cancel:disabled,
+.revert-confirm-ok:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.revert-confirm-cancel:not(:disabled):hover {
+  background: var(--hover-bg);
+}
+
+.revert-confirm-ok:not(:disabled):hover {
+  filter: brightness(0.92);
 }
 </style>

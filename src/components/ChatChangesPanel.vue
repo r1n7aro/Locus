@@ -4,14 +4,16 @@ import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useProjectStore } from "../stores/project";
 import { useUiStore } from "../stores/ui";
-import { diffSingleFile, createRequestToken, isTokenStale } from "../services/diff";
+import { diffSingleFile, createRequestToken, invalidateDiffCacheForFiles, isTokenStale } from "../services/diff";
 import { normalizeAppError } from "../services/errors";
+import { undoRevertFile, UNDO_FILE_DIRTY_ERROR_CODE } from "../services/undo";
 import { findUndoRestoreUserMessage } from "../services/chatUndo";
 import { selectUnityAsset, openFileExternal } from "../services/unity";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
+import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import type { ChangedFile, GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
@@ -461,6 +463,128 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   ev.stopPropagation();
   openFileExternal(path);
 }
+
+// ── Per-file revert with confirmation ──
+
+const revertTarget = ref<DisplayItem | null>(null);
+const showRevertConfirm = ref(false);
+const showRevertDirtyConfirm = ref(false);
+const revertDirtyDetail = ref<string | null>(null);
+const isRevertingFile = ref(false);
+
+const revertDirtyLines = computed(() =>
+  (revertDirtyDetail.value ?? "")
+    .split("\n")
+    .map((line) => line.replace(/^-\s*/, "").trim())
+    .filter((line) => line.length > 0),
+);
+
+function onRevertFileClick(ev: MouseEvent, item: DisplayItem) {
+  ev.stopPropagation();
+  if (isRevertingFile.value) return;
+  revertTarget.value = item;
+  revertDirtyDetail.value = null;
+  showRevertDirtyConfirm.value = false;
+  showRevertConfirm.value = true;
+}
+
+function cancelRevertFile() {
+  if (isRevertingFile.value) return;
+  showRevertConfirm.value = false;
+  showRevertDirtyConfirm.value = false;
+  revertTarget.value = null;
+  revertDirtyDetail.value = null;
+}
+
+async function confirmRevertFile(force = false) {
+  const item = revertTarget.value;
+  const sessionId = chatStore.activeSessionId;
+  if (!item || !sessionId || isRevertingFile.value) return;
+  isRevertingFile.value = true;
+  try {
+    const restored = await undoRevertFile(
+      sessionId,
+      item.assistantMessageId,
+      {
+        path: item.fileChange.path,
+        oldPath: item.fileChange.oldPath ?? undefined,
+        status: item.fileChange.status,
+      },
+      force,
+    );
+    // Immediate local refresh; the backend's undo-file-reverted broadcast
+    // repeats these steps idempotently (and updates other webviews).
+    invalidateDiffCacheForFiles(
+      restored.flatMap((f) => (f.oldPath ? [f.path, f.oldPath] : [f.path])),
+    );
+    await changesStore.loadChanges(sessionId, { allowAutoOpen: false });
+    notificationStore.addNotice(
+      "success",
+      t("chat.changes.revertFileSuccess", item.fileChange.path),
+      { operation: "undoRevertFile" },
+    );
+    showRevertConfirm.value = false;
+    showRevertDirtyConfirm.value = false;
+    revertTarget.value = null;
+    revertDirtyDetail.value = null;
+  } catch (e) {
+    const err = normalizeAppError(e);
+    if (!force && err.code === UNDO_FILE_DIRTY_ERROR_CODE) {
+      // Modified again after the round: ask before rolling that back too.
+      revertDirtyDetail.value = err.detail ?? null;
+      showRevertConfirm.value = false;
+      showRevertDirtyConfirm.value = true;
+    } else {
+      notificationStore.addNotice("error", err.message, {
+        code: err.code,
+        operation: "undoRevertFile",
+      });
+      showRevertConfirm.value = false;
+      showRevertDirtyConfirm.value = false;
+      revertTarget.value = null;
+      revertDirtyDetail.value = null;
+    }
+  } finally {
+    isRevertingFile.value = false;
+  }
+}
+
+// ── File row context menu ──
+
+const fileCtxMenu = ref<{ x: number; y: number; item: DisplayItem } | null>(null);
+
+function onFileRowContextMenu(ev: MouseEvent, item: DisplayItem) {
+  clearHover();
+  fileCtxMenu.value = { x: ev.clientX, y: ev.clientY, item };
+}
+
+function closeFileCtxMenu() {
+  fileCtxMenu.value = null;
+}
+
+function ctxViewDiff() {
+  const item = fileCtxMenu.value?.item;
+  closeFileCtxMenu();
+  if (item) void onItemClick(item);
+}
+
+function ctxSelectInUnity(ev: MouseEvent) {
+  const item = fileCtxMenu.value?.item;
+  closeFileCtxMenu();
+  if (item) onSelectInUnity(ev, item.fileChange.path);
+}
+
+function ctxOpenInEditor(ev: MouseEvent) {
+  const item = fileCtxMenu.value?.item;
+  closeFileCtxMenu();
+  if (item) onOpenInEditor(ev, item.fileChange.path);
+}
+
+function ctxRevertFile(ev: MouseEvent) {
+  const item = fileCtxMenu.value?.item;
+  closeFileCtxMenu();
+  if (item) onRevertFileClick(ev, item);
+}
 </script>
 
 <template>
@@ -560,6 +684,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             class="file-row changes-file-row"
             @mouseenter="onItemMouseEnter($event, row.file.displayItem)"
             @mouseleave="onItemMouseLeave"
+            @contextmenu.prevent="onFileRowContextMenu($event, row.file.displayItem)"
           >
             <button
               type="button"
@@ -592,6 +717,16 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
               >
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
               </button>
+              <button
+                v-if="!chatStore.isStreaming"
+                type="button"
+                class="file-action-btn"
+                :disabled="isRevertingFile"
+                :title="t('chat.changes.revertFile')"
+                @click="onRevertFileClick($event, row.file.displayItem)"
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 3.8 3 7l3.2 3.2"/><path d="M3 7h6.3a3.7 3.7 0 0 1 0 7.4H8"/></svg>
+              </button>
             </span>
           </div>
         </div>
@@ -603,6 +738,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
           class="file-row changes-file-row"
           @mouseenter="onItemMouseEnter($event, item)"
           @mouseleave="onItemMouseLeave"
+          @contextmenu.prevent="onFileRowContextMenu($event, item)"
         >
           <button
             type="button"
@@ -635,10 +771,61 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             >
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
             </button>
+            <button
+              v-if="!chatStore.isStreaming"
+              type="button"
+              class="file-action-btn"
+              :disabled="isRevertingFile"
+              :title="t('chat.changes.revertFile')"
+              @click="onRevertFileClick($event, item)"
+            >
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 3.8 3 7l3.2 3.2"/><path d="M3 7h6.3a3.7 3.7 0 0 1 0 7.4H8"/></svg>
+            </button>
           </span>
         </div>
       </template>
     </div>
+
+    <BaseContextMenu
+      v-if="fileCtxMenu"
+      class="changes-ctx-menu"
+      :x="fileCtxMenu.x"
+      :y="fileCtxMenu.y"
+      :min-width="150"
+      :aria-label="t('chat.changes.fileMenu')"
+      @close="closeFileCtxMenu"
+    >
+      <button type="button" class="changes-ctx-item" @click="ctxViewDiff">
+        {{ t("chat.changes.viewDiff") }}
+      </button>
+      <button
+        v-if="projectStore.unityConnected"
+        type="button"
+        class="changes-ctx-item"
+        @click="ctxSelectInUnity($event)"
+      >
+        {{ t("common.selectInUnity") }}
+      </button>
+      <button
+        v-if="canOpenInEditor(fileCtxMenu.item.fileChange.path)"
+        type="button"
+        class="changes-ctx-item"
+        @click="ctxOpenInEditor($event)"
+      >
+        {{ t("common.openInEditor") }}
+      </button>
+      <template v-if="!chatStore.isStreaming">
+        <div class="ctx-sep" aria-hidden="true"></div>
+        <button
+          type="button"
+          class="changes-ctx-item danger"
+          :disabled="isRevertingFile"
+          @click="ctxRevertFile($event)"
+        >
+          {{ t("chat.changes.revertFile") }}
+        </button>
+      </template>
+    </BaseContextMenu>
 
     <!-- Undo footer -->
     <div v-if="displayItems.length > 0 && !chatStore.isStreaming" class="panel-footer">
@@ -692,6 +879,42 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             <button type="button" class="confirm-cancel" :disabled="isUndoing" @click="cancelUndo">{{ t('chat.changes.cancel') }}</button>
             <button type="button" class="confirm-ok" :disabled="isUndoing" @click="confirmUndo(true)">
               {{ isUndoing ? t('chat.changes.undoing') : t('chat.changes.undoConflictForce') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Per-file revert confirm dialog -->
+    <Transition name="confirm-fade">
+      <div v-if="showRevertConfirm && revertTarget" class="confirm-backdrop" @click.self="cancelRevertFile">
+        <div class="confirm-dialog">
+          <p class="confirm-message">{{ t('chat.changes.revertFileConfirm', revertTarget.fileChange.path) }}</p>
+          <div class="confirm-actions">
+            <button type="button" class="confirm-cancel" :disabled="isRevertingFile" @click="cancelRevertFile">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" :disabled="isRevertingFile" @click="confirmRevertFile()">
+              {{ isRevertingFile ? t('chat.changes.reverting') : t('chat.changes.revertFileOk') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Per-file revert dirty confirm dialog (modified again after the round) -->
+    <Transition name="confirm-fade">
+      <div v-if="showRevertDirtyConfirm && revertTarget" class="confirm-backdrop" @click.self="cancelRevertFile">
+        <div class="confirm-dialog">
+          <p class="confirm-message">{{ t('chat.changes.revertFileConfirm', revertTarget.fileChange.path) }}</p>
+          <div class="dirty-warning">
+            <p class="dirty-message">{{ t('chat.changes.revertFileDirtyMessage') }}</p>
+            <div v-if="revertDirtyLines.length > 0" class="dirty-files">
+              <div v-for="(line, idx) in revertDirtyLines" :key="idx" class="dirty-file">{{ line }}</div>
+            </div>
+          </div>
+          <div class="confirm-actions">
+            <button type="button" class="confirm-cancel" :disabled="isRevertingFile" @click="cancelRevertFile">{{ t('chat.changes.cancel') }}</button>
+            <button type="button" class="confirm-ok" :disabled="isRevertingFile" @click="confirmRevertFile(true)">
+              {{ isRevertingFile ? t('chat.changes.reverting') : t('chat.changes.revertFileForce') }}
             </button>
           </div>
         </div>

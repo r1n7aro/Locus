@@ -10,8 +10,16 @@ import {
   type ChatChangeRound,
   type ChatMergedFileItem,
 } from "../services/chatChanges";
-import type { FileDiffPayload } from "../types";
+import { invalidateDiffCacheForFiles, refetchDiffByKey } from "../services/diff";
+import { getLocusRuntime } from "../services/locusRuntime";
+import type { ChangedFile, FileDiffPayload } from "../types";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+
+export interface UndoFileRevertedEvent {
+  workingDir: string;
+  sessionId: string;
+  files: ChangedFile[];
+}
 
 export interface ChatChangesSessionState {
   panelVisible: boolean;
@@ -309,6 +317,46 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
       triggerRef(sessions);
     },
   );
+
+  /**
+   * A single file was reverted to its pre-round state (possibly from another
+   * webview, e.g. the diff review window): drop stale diff payloads for it,
+   * refresh the inline diff when it shows that file, and reload the panel.
+   * All steps are idempotent, so overlapping with the initiator's own refresh
+   * is harmless.
+   */
+  function handleUndoFileReverted(event: UndoFileRevertedEvent) {
+    const paths: string[] = [];
+    for (const file of event.files) {
+      paths.push(file.path);
+      if (file.oldPath) paths.push(file.oldPath);
+    }
+    invalidateDiffCacheForFiles(paths);
+
+    const inline = inlineDiffPayload.value;
+    if (
+      inline &&
+      (paths.includes(inline.filePath) || (!!inline.oldPath && paths.includes(inline.oldPath)))
+    ) {
+      void refetchDiffByKey(inline.key)
+        .then((updated) => {
+          if (updated && inlineDiffPayload.value?.key === inline.key) {
+            inlineDiffPayload.value = updated;
+          }
+        })
+        .catch((e) => {
+          console.warn("[chat-changes] failed to refresh inline diff after file revert", e);
+        });
+    }
+
+    void loadChanges(event.sessionId, { allowAutoOpen: false });
+  }
+
+  void getLocusRuntime()
+    .subscribe<UndoFileRevertedEvent>("undo-file-reverted", handleUndoFileReverted)
+    .catch((e) => {
+      console.warn("[chat-changes] failed to subscribe to undo-file-reverted", e);
+    });
 
   return {
     // State

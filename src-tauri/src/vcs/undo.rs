@@ -90,6 +90,14 @@ pub enum UndoPerformError {
     Other(String),
 }
 
+#[derive(Debug)]
+pub enum UndoRevertFileError {
+    /// The file was modified again after the recorded rounds ended (by the
+    /// user or another process); confirming rolls those extra changes back too.
+    Dirty(Vec<ChangedFile>),
+    Other(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct UndoPerformResult {
     pub entry: UndoEntry,
@@ -844,6 +852,83 @@ impl UndoManager {
         })
     }
 
+    /// Restore a single file to the pre-round snapshot of the entry anchoring
+    /// the changes-panel diff (the same baseline the diff renders as its old
+    /// side). `file` carries the panel's net change row: `path` is the final
+    /// path, `old_path` the pre-range path when the merged range renamed it.
+    ///
+    /// This is deliberately equivalent to a manual user edit: the undo stack,
+    /// snapshot refs, and chat history are left untouched, so a later
+    /// round-level undo still sees the entry (and will report the reverted
+    /// file as externally modified in its dirty preflight).
+    pub async fn revert_file(
+        &self,
+        session_id: &str,
+        assistant_message_id: &str,
+        working_dir: &str,
+        file: &ChangedFile,
+        force: bool,
+    ) -> Result<Vec<ChangedFile>, UndoRevertFileError> {
+        // Exclusive guard: never interleave with in-flight rounds or undos.
+        let workspace_lock = self.workspace_lock(working_dir).await;
+        let _workspace_guard = workspace_lock.write_owned().await;
+
+        let checkpoint = {
+            let stacks = self.stacks.lock().await;
+            let stack = stacks.get(session_id).ok_or_else(|| {
+                UndoRevertFileError::Other("no undo history for this session".to_string())
+            })?;
+            let target = stack
+                .iter()
+                .find(|e| !e.consumed && e.assistant_message_id == assistant_message_id)
+                .ok_or_else(|| {
+                    UndoRevertFileError::Other(
+                        "undo entry not found for this message".to_string(),
+                    )
+                })?;
+            if !target.working_dir.is_empty()
+                && normalize_path_key(&target.working_dir) != normalize_path_key(working_dir)
+            {
+                return Err(UndoRevertFileError::Other(format!(
+                    "undo entry belongs to a different workspace: {}",
+                    target.working_dir
+                )));
+            }
+            target.checkpoint.clone()
+        };
+
+        if !force {
+            // Reuse the round-level dirty computation (last-writer-wins per
+            // path) and keep only lines touching this file: any difference
+            // between the recorded post-round state and the worktree means
+            // edits made outside the rounds, which need explicit confirmation.
+            let mut file_keys = HashSet::new();
+            collect_changed_file_keys(file, &mut file_keys);
+            let dirty: Vec<ChangedFile> = self
+                .compute_dirty_files(session_id, assistant_message_id, working_dir)
+                .await
+                .map_err(UndoRevertFileError::Other)?
+                .into_iter()
+                .filter(|candidate| changed_file_overlaps(&file_keys, candidate))
+                .collect();
+            if !dirty.is_empty() {
+                return Err(UndoRevertFileError::Dirty(dirty));
+            }
+        }
+
+        let files = vec![file.clone()];
+        GitProvider::restore_files(
+            working_dir,
+            &checkpoint.id,
+            checkpoint.index_tree_id.as_deref(),
+            &files,
+        )
+        .await
+        .map_err(UndoRevertFileError::Other)?;
+
+        Ok(files)
+    }
+
     pub async fn check_conflicts(
         &self,
         session_id: &str,
@@ -927,7 +1012,10 @@ impl UndoManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_stacks, UndoManager, UndoPerformError, UndoPerformOptions};
+    use super::{
+        load_stacks, ChangedFile, UndoManager, UndoPerformError, UndoPerformOptions,
+        UndoRevertFileError,
+    };
     use crate::process_util::command;
     use crate::vcs::GitProvider;
     use std::path::{Path, PathBuf};
@@ -1564,6 +1652,373 @@ mod tests {
         assert_eq!(live[0].checkpoint.created_at, now);
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    fn changed(status: &str, path: &str) -> ChangedFile {
+        ChangedFile {
+            status: status.to_string(),
+            path: path.to_string(),
+            old_path: None,
+        }
+    }
+
+    fn renamed(old_path: &str, path: &str) -> ChangedFile {
+        ChangedFile {
+            status: "R".to_string(),
+            path: path.to_string(),
+            old_path: Some(old_path.to_string()),
+        }
+    }
+
+    /// Run one recorded round that applies `mutate` to the repo.
+    async fn record_round(
+        manager: &UndoManager,
+        repo: &Path,
+        repo_str: &str,
+        session_id: &str,
+        message_id: &str,
+        mutate: impl FnOnce(&Path),
+    ) {
+        let round = manager
+            .before_round(repo_str, message_id)
+            .await
+            .expect("before_round")
+            .expect("checkpoint");
+        mutate(repo);
+        assert!(manager
+            .after_round(session_id, message_id, Some(message_id), round, false, repo_str)
+            .await
+            .expect("after_round"));
+    }
+
+    #[tokio::test]
+    async fn revert_file_restores_modified_file_and_keeps_entry() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-modified");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            write_file(&repo.join("tracked.txt"), "base\nagent\n");
+        })
+        .await;
+
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("M", "tracked.txt"), false)
+            .await
+            .expect("revert_file should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("tracked after revert")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+        // Stack and refs are untouched: per-file revert acts like a user edit.
+        assert_eq!(manager.list_entries("s").await.len(), 1);
+        let refs = GitProvider::list_undo_ref_entry_ids(&repo_str)
+            .await
+            .expect("list refs");
+        assert_eq!(refs.len(), 1, "refs should stay pinned, got {:?}", refs);
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_deletes_file_added_in_round() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-added");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            write_file(&repo.join("new.txt"), "agent file\n");
+        })
+        .await;
+
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("A", "new.txt"), false)
+            .await
+            .expect("revert_file should succeed");
+
+        assert!(
+            !repo.join("new.txt").exists(),
+            "added file should be removed"
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_restores_file_deleted_in_round() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-deleted");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        write_file(&repo.join("doomed.txt"), "keep me\n");
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            std::fs::remove_file(repo.join("doomed.txt")).expect("delete file");
+        })
+        .await;
+
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("D", "doomed.txt"), false)
+            .await
+            .expect("revert_file should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("doomed.txt"))
+                .expect("deleted file restored")
+                .replace("\r\n", "\n"),
+            "keep me\n",
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_undoes_rename() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-renamed");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            std::fs::rename(repo.join("tracked.txt"), repo.join("renamed.txt"))
+                .expect("rename file");
+        })
+        .await;
+
+        manager
+            .revert_file(
+                "s",
+                "m1",
+                &repo_str,
+                &renamed("tracked.txt", "renamed.txt"),
+                false,
+            )
+            .await
+            .expect("revert_file should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("old path restored")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+        assert!(
+            !repo.join("renamed.txt").exists(),
+            "new path should be removed"
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_undoes_cross_round_rename_chain_from_net_row() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-rename-chain");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            std::fs::rename(repo.join("tracked.txt"), repo.join("mid.txt")).expect("rename 1");
+        })
+        .await;
+        record_round(&manager, &repo, &repo_str, "s", "m2", |repo| {
+            std::fs::rename(repo.join("mid.txt"), repo.join("final.txt")).expect("rename 2");
+        })
+        .await;
+
+        // The panel merges a→b→c into one net row (path=final, oldPath=first)
+        // anchored at the first round that touched the file.
+        manager
+            .revert_file(
+                "s",
+                "m1",
+                &repo_str,
+                &renamed("tracked.txt", "final.txt"),
+                false,
+            )
+            .await
+            .expect("revert_file should succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("original path restored")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+        assert!(!repo.join("mid.txt").exists(), "intermediate name stays gone");
+        assert!(!repo.join("final.txt").exists(), "final name should be removed");
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_reports_dirty_when_modified_after_round_and_force_overrides() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-dirty");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            write_file(&repo.join("tracked.txt"), "base\nagent\n");
+            write_file(&repo.join("other.txt"), "agent other\n");
+        })
+        .await;
+
+        // External edit after the round ended.
+        write_file(&repo.join("tracked.txt"), "base\nagent\nuser-extra\n");
+
+        let err = manager
+            .revert_file("s", "m1", &repo_str, &changed("M", "tracked.txt"), false)
+            .await
+            .expect_err("revert should report dirty");
+        match err {
+            UndoRevertFileError::Dirty(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "tracked.txt");
+            }
+            other => panic!("expected dirty error, got {:?}", other),
+        }
+
+        // Dirtiness elsewhere must not block reverting an untouched file.
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("A", "other.txt"), false)
+            .await
+            .expect("revert of clean file should succeed despite other dirty file");
+        assert!(!repo.join("other.txt").exists());
+
+        // Force rolls the external edit back together with the round's change.
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("M", "tracked.txt"), true)
+            .await
+            .expect("forced revert should succeed");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("tracked after forced revert")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn round_undo_after_file_revert_reports_dirty_then_succeeds() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-then-round-undo");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            write_file(&repo.join("tracked.txt"), "base\nagent\n");
+        })
+        .await;
+
+        manager
+            .revert_file("s", "m1", &repo_str, &changed("M", "tracked.txt"), false)
+            .await
+            .expect("revert_file should succeed");
+
+        // The per-file revert counts as an external edit for the round-level
+        // dirty preflight, so a later full undo asks for confirmation…
+        let dirty = manager
+            .check_dirty("s", "m1", &repo_str)
+            .await
+            .expect("check_dirty");
+        assert_eq!(
+            dirty.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["tracked.txt"],
+        );
+
+        // …and proceeds idempotently once accepted.
+        manager
+            .perform_undo_checked(
+                "s",
+                "m1",
+                &repo_str,
+                UndoPerformOptions {
+                    force: false,
+                    accept_dirty: true,
+                },
+            )
+            .await
+            .expect("round undo should succeed after per-file revert");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt"))
+                .expect("tracked after round undo")
+                .replace("\r\n", "\n"),
+            "base\n",
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_unknown_entry_and_other_workspace() {
+        if !git_available() {
+            return;
+        }
+
+        let repo_a = setup_repo("revert-file-ws-a");
+        let repo_b = setup_repo("revert-file-ws-b");
+        let repo_a_str = repo_a.to_string_lossy().to_string();
+        let repo_b_str = repo_b.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo_a, &repo_a_str, "s", "m1", |repo| {
+            write_file(&repo.join("tracked.txt"), "base\nagent\n");
+        })
+        .await;
+
+        let err = manager
+            .revert_file("s", "missing", &repo_a_str, &changed("M", "tracked.txt"), false)
+            .await
+            .expect_err("unknown message must fail");
+        match err {
+            UndoRevertFileError::Other(msg) => {
+                assert!(msg.contains("not found"), "got: {}", msg)
+            }
+            other => panic!("expected other error, got {:?}", other),
+        }
+
+        let err = manager
+            .revert_file("s", "m1", &repo_b_str, &changed("M", "tracked.txt"), false)
+            .await
+            .expect_err("revert against another workspace must fail");
+        match err {
+            UndoRevertFileError::Other(msg) => {
+                assert!(msg.contains("different workspace"), "got: {}", msg)
+            }
+            other => panic!("expected other error, got {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&repo_a).expect("cleanup repo a");
+        std::fs::remove_dir_all(&repo_b).expect("cleanup repo b");
     }
 
     #[tokio::test]
