@@ -501,7 +501,10 @@ fn build_api_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<serde
                                     "type": "function",
                                     "function": {
                                         "name": tc.name,
-                                        "arguments": tc.arguments,
+                                        "arguments": super::normalize_tool_call_arguments(
+                                            &tc.name,
+                                            &tc.arguments,
+                                        ),
                                     }
                                 })
                             })
@@ -967,6 +970,34 @@ mod tests {
         assert_eq!(
             messages[4]["content"][0]["cache_control"],
             serde_json::json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn assistant_messages_replay_empty_tool_call_arguments_as_empty_object() {
+        let messages = build_api_messages(
+            "",
+            &[chat_message(
+                MessageRole::Assistant,
+                "Need a tool.",
+                Some(vec![ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "capture_unity_screenshot".to_string(),
+                    arguments: String::new(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            )],
+        );
+
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!("{}")
         );
     }
 
