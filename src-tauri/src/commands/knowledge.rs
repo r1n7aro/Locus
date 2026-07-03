@@ -2665,24 +2665,65 @@ fn validate_workspace_relative_path(file_path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Lexically join a workspace-relative path onto the canonicalized workspace
+/// root: `.` segments drop, `..` pops (rejecting escapes above the root), and
+/// symlinks are intentionally NOT resolved. A symlink the user placed inside
+/// the workspace is workspace content even when its target lives elsewhere;
+/// the OS resolves the link when the file is opened (issue #100).
+fn join_workspace_path_lexically(
+    workspace_root: &std::path::Path,
+    file_path: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    use std::path::Component;
+
+    let mut resolved = workspace_root.to_path_buf();
+    let mut depth: usize = 0;
+    for component in std::path::Path::new(file_path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                resolved.push(part);
+                depth += 1;
+            }
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err("Path resolves outside workspace".to_string().into());
+                }
+                resolved.pop();
+                depth -= 1;
+            }
+            // Unreachable after validate_workspace_relative_path, kept as
+            // defense in depth so this helper never yields an outside path.
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("Invalid path: must be a relative workspace path"
+                    .to_string()
+                    .into());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn validate_workspace_path(
     file_path: &str,
     working_dir: &str,
 ) -> Result<std::path::PathBuf, AppError> {
     validate_workspace_relative_path(file_path)?;
 
-    let full = std::path::Path::new(working_dir).join(file_path);
-    let canonical =
-        dunce::canonicalize(&full).map_err(|e| format!("Failed to resolve path: {}", e))?;
-
-    // Ensure the resolved path is still within the workspace
+    // Canonicalize only the workspace root (case / 8.3 short-name cleanup).
+    // The requested path is joined lexically without following symlinks, so a
+    // link pointing outside the workspace stays addressed by its literal
+    // in-workspace path instead of being rejected as "outside workspace".
     let ws_canonical = dunce::canonicalize(working_dir)
         .map_err(|e| format!("Failed to resolve workspace: {}", e))?;
-    if !canonical.starts_with(&ws_canonical) {
-        return Err("Path resolves outside workspace".to_string().into());
-    }
+    let full = join_workspace_path_lexically(&ws_canonical, file_path)?;
 
-    Ok(canonical)
+    // Existence check must not follow links either: `symlink_metadata`
+    // succeeds for a link whose target is missing, matching what the user
+    // sees in the workspace tree.
+    std::fs::symlink_metadata(&full).map_err(|e| format!("Failed to resolve path: {}", e))?;
+
+    Ok(full)
 }
 
 fn is_absolute_local_path(file_path: &str) -> bool {
@@ -2712,26 +2753,19 @@ fn resolve_workspace_reveal_path(
 
     let workspace_canonical = dunce::canonicalize(working_dir)
         .map_err(|e| format!("Failed to resolve workspace: {}", e))?;
-    let full = std::path::Path::new(working_dir).join(file_path);
+    // Lexical join (no symlink resolution): reveal targets a symlink itself,
+    // not its target, so links to files outside the workspace stay revealable.
+    let full = join_workspace_path_lexically(&workspace_canonical, file_path)?;
 
-    if full.exists() {
-        let canonical =
-            dunce::canonicalize(&full).map_err(|e| format!("Failed to resolve path: {}", e))?;
-        if !canonical.starts_with(&workspace_canonical) {
-            return Err("Path resolves outside workspace".to_string().into());
-        }
-        return Ok(canonical);
-    }
-
-    let mut candidate = full.parent();
+    // Walk up to the nearest existing path. `symlink_metadata` keeps dangling
+    // links revealable (the link entry exists even when its target is gone).
+    let mut candidate = Some(full.as_path());
     while let Some(path) = candidate {
-        if path.exists() {
-            let canonical =
-                dunce::canonicalize(path).map_err(|e| format!("Failed to resolve path: {}", e))?;
-            if !canonical.starts_with(&workspace_canonical) {
-                return Err("Path resolves outside workspace".to_string().into());
-            }
-            return Ok(canonical);
+        if !path.starts_with(&workspace_canonical) {
+            break;
+        }
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Ok(path.to_path_buf());
         }
         candidate = path.parent();
     }
@@ -4257,6 +4291,157 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved, dunce::canonicalize(assets_dir).unwrap());
+    }
+
+    #[test]
+    fn join_workspace_path_lexically_normalizes_dot_segments() {
+        let root = std::path::Path::new("C:\\ws");
+        assert_eq!(
+            join_workspace_path_lexically(root, "Assets/./Sub/../Player.cs").unwrap(),
+            root.join("Assets").join("Player.cs"),
+        );
+    }
+
+    #[test]
+    fn join_workspace_path_lexically_rejects_escape_above_root() {
+        let root = std::path::Path::new("C:\\ws");
+        let err = join_workspace_path_lexically(root, "Assets/../../outside.txt").unwrap_err();
+        assert!(
+            err.message.contains("outside workspace"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_workspace_path_returns_literal_path_for_existing_file() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let file_path = temp.path().join("Assets").join("Player.cs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "class Player {}").unwrap();
+
+        let resolved = validate_workspace_path("Assets/Player.cs", &working_dir).unwrap();
+
+        let ws_canonical = dunce::canonicalize(temp.path()).unwrap();
+        assert_eq!(resolved, ws_canonical.join("Assets").join("Player.cs"));
+    }
+
+    #[test]
+    fn validate_workspace_path_rejects_missing_file() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        let err = validate_workspace_path("Assets/Missing.cs", &working_dir).unwrap_err();
+
+        assert!(
+            err.message.contains("Failed to resolve path"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_workspace_path_rejects_parent_traversal() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        let err = validate_workspace_path("../outside.txt", &working_dir).unwrap_err();
+
+        assert!(
+            err.message.contains("relative workspace path"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// Create a directory junction (works without admin rights on Windows).
+    /// Returns false when creation is unavailable in this environment.
+    #[cfg(windows)]
+    fn try_create_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_workspace_path_allows_junction_to_outside_directory() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        std::fs::write(external.path().join("Linked.cs"), "class Linked {}").unwrap();
+
+        let link = workspace.path().join("LinkedDir");
+        if !try_create_junction(&link, external.path()) {
+            eprintln!("skipping: cannot create junctions in this environment");
+            return;
+        }
+
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let resolved = validate_workspace_path("LinkedDir/Linked.cs", &working_dir).unwrap();
+
+        // The literal in-workspace path is returned; the link target is left
+        // for the OS/editor to resolve on open.
+        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        assert_eq!(resolved, ws_canonical.join("LinkedDir").join("Linked.cs"));
+
+        let revealed =
+            resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
+        assert_eq!(revealed, ws_canonical.join("LinkedDir").join("Linked.cs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_workspace_reveal_path_falls_back_to_junction_when_target_is_gone() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        std::fs::write(external.path().join("Linked.cs"), "class Linked {}").unwrap();
+
+        let link = workspace.path().join("LinkedDir");
+        if !try_create_junction(&link, external.path()) {
+            eprintln!("skipping: cannot create junctions in this environment");
+            return;
+        }
+        // Make the junction dangling.
+        std::fs::remove_dir_all(external.path()).unwrap();
+
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let revealed =
+            resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
+
+        // The file inside the dead junction is unreachable, but the junction
+        // entry itself still exists and stays revealable.
+        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        assert_eq!(revealed, ws_canonical.join("LinkedDir"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_workspace_path_allows_file_symlink_to_outside_target() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let target = external.path().join("Real.cs");
+        std::fs::write(&target, "class Real {}").unwrap();
+
+        let link = workspace.path().join("Link.cs");
+        // File symlinks need admin rights or developer mode; skip when denied.
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            eprintln!("skipping: file symlinks unavailable (needs developer mode or admin)");
+            return;
+        }
+
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let resolved = validate_workspace_path("Link.cs", &working_dir).unwrap();
+
+        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        assert_eq!(resolved, ws_canonical.join("Link.cs"));
+
+        let revealed = resolve_workspace_reveal_path("Link.cs", &working_dir).unwrap();
+        assert_eq!(revealed, ws_canonical.join("Link.cs"));
     }
 
     #[test]
