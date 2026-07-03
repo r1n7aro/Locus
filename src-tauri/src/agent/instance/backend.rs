@@ -209,10 +209,90 @@ mod tests {
             r#"Responses API error (400 Bad Request): invalid request"#
         ));
     }
+
+    #[test]
+    fn retries_api_5xx_and_429_status_errors_across_endpoints() {
+        // Custom OpenAI-compatible endpoints (issue #101): flaky providers
+        // answer 5xx/429 and the agent loop must classify those as retryable.
+        assert!(is_retryable_llm_error(
+            r#"Custom Chat API error (500 Internal Server Error): {"error":{"message":"upstream broke"}}"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Custom Chat API error (502 Bad Gateway): <html>bad gateway</html>"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Custom Chat API error (503 Service Unavailable): busy"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Custom Chat API error (429 Too Many Requests): {"error":{"message":"rate limited"}}"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Responses API error (429 Too Many Requests): slow down"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Custom(Anthropic) API error (529): {"error":{"type":"overloaded_error"}}"#
+        ));
+        assert!(is_retryable_llm_error(
+            r#"Anthropic API error (503 Service Unavailable): upstream capacity"#
+        ));
+    }
+
+    #[test]
+    fn never_retries_non_429_4xx_status_errors() {
+        // issue #94: a 400 must not loop. The first case carries a keyword
+        // ("connection") that the transport heuristics would match — the
+        // explicit 4xx status has to win over that.
+        assert!(!is_retryable_llm_error(
+            r#"Custom Chat API error (400 Bad Request): {"error":{"message":"invalid connection parameter"}}"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Custom Chat API error (400 Bad Request): {"error":{"message":"bad request"}}"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Custom Chat API error (401 Unauthorized): invalid api key"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Custom Chat API error (403 Forbidden): quota exceeded"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Custom Chat API error (404 Not Found): no such model"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Custom(Anthropic) API error (400 Bad Request): {"error":{"type":"invalid_request_error"}}"#
+        ));
+        assert!(!is_retryable_llm_error(
+            r#"Anthropic API error (401 Unauthorized): {"error":{"type":"authentication_error"}}"#
+        ));
+    }
+
+    #[test]
+    fn keyword_heuristics_still_apply_without_a_status_shape() {
+        // Errors that don't carry the "<tag> API error (NNN" shape keep the
+        // historical keyword classification.
+        assert!(is_retryable_llm_error("Stream read error: connection reset"));
+        assert!(is_retryable_llm_error(
+            "Request failed: error sending request"
+        ));
+        assert!(!is_retryable_llm_error("tool loop aborted by user"));
+    }
 }
 
 /// Retry only when the transport failed before we can trust the streamed payload.
 pub(super) fn is_retryable_llm_error(error: &str) -> bool {
+    // HTTP status failures carry an explicit verdict, so let it override the
+    // keyword heuristics below: a non-429 4xx means the endpoint rejected
+    // this exact request (bad request/auth/model — issue #94's 400s) and
+    // replaying it can only fail the same way, while 5xx/529/429 are
+    // transient upstream states worth another attempt.
+    if let Some(status) = api_error_status(error) {
+        if (400..500).contains(&status) && status != 429 {
+            return false;
+        }
+        if status >= 500 || status == 429 {
+            return true;
+        }
+    }
+
     error.contains("Stream read error")
         || error.contains("Stream read timed out")
         || error.contains("Stream ended without response.completed")
@@ -232,6 +312,24 @@ pub(super) fn is_retryable_llm_error(error: &str) -> bool {
         // reqwest transport errors (no partial output)
         || error.contains("error sending request")
         || error.contains("Request failed:")
+}
+
+/// Extract `NNN` from error strings shaped like `<tag> API error (NNN ...): body`,
+/// the format every HTTP transport in `llm::*` uses for status failures
+/// ("Custom Chat", "Responses", "Anthropic", "Custom(Anthropic)"). Returns
+/// `None` for strings that don't lead with that shape.
+fn api_error_status(error: &str) -> Option<u16> {
+    const MARKER: &str = " api error (";
+    let lower = error.to_ascii_lowercase();
+    let idx = lower.find(MARKER)?;
+    let digits: String = lower[idx + MARKER.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() != 3 {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn is_retryable_responses_api_status_error(error: &str) -> bool {

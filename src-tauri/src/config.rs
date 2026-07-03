@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -19,6 +19,24 @@ mod serde_atomic_bool {
         let b = bool::deserialize(d)?;
         Ok(Arc::new(AtomicBool::new(b)))
     }
+}
+
+mod serde_atomic_u32 {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Arc<AtomicU32>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(v.load(Ordering::Relaxed))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<AtomicU32>, D::Error> {
+        let v = u32::deserialize(d)?;
+        Ok(Arc::new(AtomicU32::new(v)))
+    }
+}
+
+fn default_llm_retry_max_attempts() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(crate::llm::retry::DEFAULT_MAX_RETRIES))
 }
 
 fn default_debug_flag() -> Arc<AtomicBool> {
@@ -316,6 +334,16 @@ pub struct AppConfig {
         with = "serde_code_analysis_tools"
     )]
     pub code_analysis_tools: Arc<Mutex<CodeAnalysisToolsConfig>>,
+    /// Automatic retries per LLM HTTP request after a retryable failure
+    /// (connect error, timeout, HTTP 5xx / 429) before any output has
+    /// streamed. `0` disables automatic retries; values are clamped to
+    /// `llm::retry::MAX_RETRIES_LIMIT`. Mirrored into `llm::retry` at
+    /// startup and on change.
+    #[serde(
+        default = "default_llm_retry_max_attempts",
+        with = "serde_atomic_u32"
+    )]
+    pub llm_retry_max_attempts: Arc<AtomicU32>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -366,6 +394,7 @@ impl AppConfig {
             unity_native_bridge_enabled: default_unity_native_bridge_enabled(),
             unity_inline_force_evaluate_enabled: default_unity_inline_force_evaluate_enabled(),
             code_analysis_tools: default_code_analysis_tools(),
+            llm_retry_max_attempts: default_llm_retry_max_attempts(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -606,6 +635,16 @@ impl AppConfig {
     pub fn set_unity_background_hook_enabled(&self, value: bool) -> Result<(), String> {
         self.unity_background_hook_enabled
             .store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn llm_retry_max_attempts(&self) -> u32 {
+        crate::llm::retry::clamp_max_retries(self.llm_retry_max_attempts.load(Ordering::Relaxed))
+    }
+
+    pub fn set_llm_retry_max_attempts(&self, value: u32) -> Result<(), String> {
+        self.llm_retry_max_attempts
+            .store(crate::llm::retry::clamp_max_retries(value), Ordering::Relaxed);
         self.persist()
     }
 
@@ -1076,5 +1115,46 @@ mod tests {
 
         let reloaded = AppConfig::load_from_path(&config_path);
         assert!(!reloaded.unity_background_hook_enabled());
+    }
+
+    #[test]
+    fn llm_retry_max_attempts_defaults_to_three() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        // A config that predates the field keeps the historical retry count.
+        assert_eq!(config.llm_retry_max_attempts(), 3);
+    }
+
+    #[test]
+    fn llm_retry_max_attempts_persists_zero_and_clamps_large_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_llm_retry_max_attempts(0)
+            .expect("persist retry opt-out");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.llm_retry_max_attempts(), 0);
+
+        config
+            .set_llm_retry_max_attempts(99)
+            .expect("persist clamped retry count");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(
+            reloaded.llm_retry_max_attempts(),
+            crate::llm::retry::MAX_RETRIES_LIMIT
+        );
     }
 }

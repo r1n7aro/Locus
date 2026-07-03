@@ -65,12 +65,12 @@ where
         super::debug::save_request("openai_responses", &api_url, &headers, &raw_request);
     }
 
-    const MAX_RETRIES: u32 = 3;
+    let max_retries = super::retry::max_retries();
     const BASE_DELAY_MS: u64 = 1000;
     let mut last_error = String::new();
     let mut response = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=max_retries {
         let mut req = client
             .post(&api_url)
             .header("Content-Type", "application/json")
@@ -82,6 +82,8 @@ where
             Ok(resp) => {
                 let status = resp.status();
                 if is_retryable_response_status(status) {
+                    let retry_after_secs =
+                        super::retry::retry_after_secs_from_headers(resp.headers());
                     let error_body = resp.text().await.unwrap_or_default();
                     last_error = format!("Responses API error ({}): {}", status, error_body);
                     if debug {
@@ -90,13 +92,14 @@ where
                             status, error_body
                         );
                     }
-                    if attempt < MAX_RETRIES {
-                        let delay = BASE_DELAY_MS * 2u64.pow(attempt);
+                    if attempt < max_retries {
+                        let delay =
+                            super::retry::status_retry_delay_ms(status, retry_after_secs, attempt);
                         eprintln!(
                             "[Responses] HTTP {} (attempt {}/{}, retrying in {}ms)",
                             status.as_u16(),
                             attempt + 1,
-                            MAX_RETRIES + 1,
+                            max_retries + 1,
                             delay
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -110,13 +113,13 @@ where
             Err(e) => {
                 let is_retryable = e.is_connect() || e.is_timeout();
                 last_error = format!("Request failed: {}", e);
-                if is_retryable && attempt < MAX_RETRIES {
+                if is_retryable && attempt < max_retries {
                     let delay = BASE_DELAY_MS * 2u64.pow(attempt);
                     eprintln!(
                         "[Responses] {} (attempt {}/{}, retrying in {}ms)",
                         last_error,
                         attempt + 1,
-                        MAX_RETRIES + 1,
+                        max_retries + 1,
                         delay
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -855,7 +858,7 @@ where
 }
 
 fn is_retryable_response_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error()
+    super::retry::is_retryable_http_status(status)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,6 +1133,33 @@ mod tests {
     }
 
     #[test]
+    fn build_input_messages_replay_tool_call_arguments_verbatim() {
+        // The Responses API path serves the Codex backend, which round-trips
+        // its own arguments unchanged. Keep the replay byte-for-byte verbatim
+        // (no "" -> "{}" normalization) so a proven-good pipeline stays
+        // untouched; see issue #94 for the Chat Completions-side rationale.
+        let input = build_input_messages(&[assistant_message_with_tool_calls(
+            "assistant-1",
+            "",
+            None,
+            vec![ToolCallInfo {
+                id: "call_1".to_string(),
+                name: "capture_unity_screenshot".to_string(),
+                arguments: String::new(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: None,
+                recorded_output: None,
+                nested_tool_calls: None,
+            }],
+        )]);
+
+        assert_eq!(input[0]["type"], serde_json::json!("function_call"));
+        assert_eq!(input[0]["arguments"], serde_json::json!(""));
+    }
+
+    #[test]
     fn build_request_body_includes_low_text_verbosity_for_gpt5_models() {
         let body = build_request_body(
             "gpt-5.4",
@@ -1324,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_response_statuses_cover_5xx_only() {
+    fn retryable_response_statuses_cover_5xx_and_429() {
         assert!(is_retryable_response_status(
             StatusCode::INTERNAL_SERVER_ERROR
         ));
@@ -1336,7 +1366,11 @@ mod tests {
         assert!(is_retryable_response_status(
             StatusCode::from_u16(529).expect("529 should be a valid extension status")
         ));
-        assert!(!is_retryable_response_status(StatusCode::TOO_MANY_REQUESTS));
+        // Since issue #101 rate limits retry too: they honor Retry-After and
+        // back off harder, but they no longer fail the run outright.
+        assert!(is_retryable_response_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_response_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_response_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_response_status(StatusCode::NOT_FOUND));
     }
 }

@@ -1422,6 +1422,27 @@ pub async fn set_debug_mode(
 }
 
 #[tauri::command]
+pub async fn get_llm_retry_max_attempts(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.llm_retry_max_attempts())
+}
+
+/// Persist the automatic LLM retry count (0 = disabled, clamped to 10) and
+/// mirror it into the live `llm::retry` global the transports read.
+#[tauri::command]
+pub async fn set_llm_retry_max_attempts(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_llm_retry_max_attempts(value)
+        .map_err(AppError::from)?;
+    crate::llm::retry::set_max_retries(value);
+    Ok(config.llm_retry_max_attempts())
+}
+
+#[tauri::command]
 pub async fn get_file_tool_workspace_boundary(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<bool, AppError> {

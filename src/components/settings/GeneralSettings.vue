@@ -9,11 +9,13 @@ import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/p
 import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
 import {
   getCloseBehavior,
+  getLlmRetryMaxAttempts,
   getPythonRuntimeState,
   getUnityBackgroundHookEnabled,
   getUnityBackgroundHookStatus,
   savePythonRuntimeSelection,
   setCloseBehavior,
+  setLlmRetryMaxAttempts,
   setUnityBackgroundHookEnabled,
   type AppCloseBehavior,
 } from "../../services/system";
@@ -59,6 +61,10 @@ const debugBusy = ref(false);
 const closeBehavior = ref<AppCloseBehavior>("exit");
 const closeBehaviorReady = ref(false);
 const closeBehaviorBusy = ref(false);
+const LLM_RETRY_MAX = 10;
+const llmRetryMaxAttempts = ref(3);
+const llmRetryReady = ref(false);
+const llmRetryBusy = ref(false);
 const unityBackgroundHookEnabled = ref(true);
 const unityBackgroundHookReady = ref(false);
 const unityBackgroundHookBusy = ref(false);
@@ -102,6 +108,13 @@ const debugStatusLabel = computed(() => {
   return debugEnabled.value
     ? t("settings.general.debugModeOn")
     : t("settings.general.debugModeOff");
+});
+
+const llmRetryStatusLabel = computed(() => {
+  if (!llmRetryReady.value) return t("common.loading");
+  return llmRetryMaxAttempts.value === 0
+    ? t("settings.general.llmRetryOff")
+    : t("settings.general.llmRetryTimes", String(llmRetryMaxAttempts.value));
 });
 
 const unityBackgroundHookStatusLabel = computed(() => {
@@ -168,6 +181,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 
 onMounted(() => {
   void refreshDebugMode();
+  void refreshLlmRetryMaxAttempts();
   void refreshUnityBackgroundHook();
   void refreshCloseBehavior();
   void refreshStorageInfo();
@@ -205,6 +219,47 @@ async function toggleDebug() {
     });
   } finally {
     debugBusy.value = false;
+  }
+}
+
+async function refreshLlmRetryMaxAttempts() {
+  try {
+    llmRetryMaxAttempts.value = await getLlmRetryMaxAttempts();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadLlmRetryMaxAttempts",
+    });
+  } finally {
+    llmRetryReady.value = true;
+  }
+}
+
+async function onLlmRetryChange(event: Event) {
+  if (!llmRetryReady.value || llmRetryBusy.value) return;
+  const input = event.target as HTMLInputElement;
+  const parsed = Number.parseInt(input.value, 10);
+  const next = Number.isFinite(parsed)
+    ? Math.min(LLM_RETRY_MAX, Math.max(0, parsed))
+    : llmRetryMaxAttempts.value;
+  input.value = String(next);
+  if (next === llmRetryMaxAttempts.value) return;
+  const previous = llmRetryMaxAttempts.value;
+  llmRetryMaxAttempts.value = next;
+  llmRetryBusy.value = true;
+  try {
+    llmRetryMaxAttempts.value = await setLlmRetryMaxAttempts(next);
+  } catch (e) {
+    llmRetryMaxAttempts.value = previous;
+    input.value = String(previous);
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveLlmRetryMaxAttempts",
+    });
+  } finally {
+    llmRetryBusy.value = false;
   }
 }
 
@@ -644,6 +699,25 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.llmRetry") }}</div>
+    <p class="section-desc">{{ t("settings.general.llmRetryDesc") }}</p>
+    <div class="llm-retry-row" :aria-busy="!llmRetryReady">
+      <input
+        class="llm-retry-input"
+        type="number"
+        min="0"
+        :max="LLM_RETRY_MAX"
+        step="1"
+        :value="llmRetryMaxAttempts"
+        :disabled="!llmRetryReady || llmRetryBusy"
+        :aria-label="t('settings.general.llmRetry')"
+        @change="onLlmRetryChange"
+      />
+      <span class="debug-toggle-label">{{ llmRetryStatusLabel }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.general.unityBackgroundHook") }}</div>
     <p class="section-desc">{{ t("settings.general.unityBackgroundHookDesc") }}</p>
     <label class="debug-toggle" :aria-busy="!unityBackgroundHookReady">
@@ -886,6 +960,25 @@ async function selectPythonRuntime(selectedId: string) {
 }
 .debug-toggle-label {
   font-size: 13px;
+}
+.llm-retry-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-color);
+}
+.llm-retry-input {
+  width: 72px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font-size: 13px;
+}
+.llm-retry-input:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 .close-behavior-segmented {
   width: fit-content;

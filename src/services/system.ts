@@ -61,6 +61,14 @@ export function setDynamicToolLoadingMode(value: DynamicToolLoadingMode): Promis
   });
 }
 
+export function getLlmRetryMaxAttempts(): Promise<number> {
+  return ipcInvoke<number>("get_llm_retry_max_attempts");
+}
+
+export function setLlmRetryMaxAttempts(value: number): Promise<number> {
+  return ipcInvoke<number>("set_llm_retry_max_attempts", { value });
+}
+
 export function getUnityBackgroundHookEnabled(): Promise<boolean> {
   return ipcInvoke<boolean>("get_unity_background_hook_enabled");
 }

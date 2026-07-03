@@ -85,13 +85,13 @@ where
         super::debug::save_request("custom_chat_completions", &api_url, &headers, &raw_request);
     }
 
-    const MAX_RETRIES: u32 = 3;
+    let max_retries = super::retry::max_retries();
     const BASE_DELAY_MS: u64 = 1000;
 
     let mut last_error = String::new();
     let mut response = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=max_retries {
         let mut req = client
             .post(&api_url)
             .header("Content-Type", "application/json")
@@ -102,8 +102,50 @@ where
 
         match req.send().await {
             Ok(resp) => {
-                response = Some(resp);
-                break;
+                let status = resp.status();
+                if status.is_success() {
+                    response = Some(resp);
+                    break;
+                }
+
+                // Non-2xx before any stream output exists: decide retry from
+                // the status line. Reading the body both surfaces the server's
+                // error message and drains the connection so the pool can
+                // reuse it across attempts.
+                let retry_after_secs = super::retry::retry_after_secs_from_headers(resp.headers());
+                let error_body = resp.text().await.unwrap_or_default();
+                let error = format!("{} API error ({}): {}", tag, status, error_body);
+
+                if debug {
+                    eprintln!(
+                        "[DEBUG][{}] API error (status={}):\n{}",
+                        tag, status, error_body
+                    );
+                    if status.is_client_error() {
+                        // A 4xx means the endpoint rejected this request body
+                        // (issue #94), so dump a truncated copy for diagnosis.
+                        // Auth material lives in headers, never in the body.
+                        dump_rejected_request_body(tag, status, &raw_request);
+                    }
+                }
+
+                if super::retry::is_retryable_http_status(status) && attempt < max_retries {
+                    let delay =
+                        super::retry::status_retry_delay_ms(status, retry_after_secs, attempt);
+                    eprintln!(
+                        "[{}] HTTP {} (attempt {}/{}, retrying in {}ms...)",
+                        tag,
+                        status.as_u16(),
+                        attempt + 1,
+                        max_retries + 1,
+                        delay
+                    );
+                    last_error = error;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+
+                return Err(error);
             }
             Err(e) => {
                 let mut error_chain = format!("Request failed: {}", e);
@@ -114,14 +156,14 @@ where
                 }
 
                 let is_retryable = e.is_connect() || e.is_timeout();
-                if is_retryable && attempt < MAX_RETRIES {
+                if is_retryable && attempt < max_retries {
                     let delay = BASE_DELAY_MS * 2u64.pow(attempt);
                     eprintln!(
                         "[{}] {} (attempt {}/{}, retrying in {}ms...)",
                         tag,
                         error_chain,
                         attempt + 1,
-                        MAX_RETRIES + 1,
+                        max_retries + 1,
                         delay
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -134,18 +176,6 @@ where
     }
 
     let response = response.ok_or(last_error)?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
-        if debug {
-            eprintln!(
-                "[DEBUG][{}] API error (status={}):\n{}",
-                tag, status, error_body
-            );
-        }
-        return Err(format!("{} API error ({}): {}", tag, status, error_body));
-    }
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -221,6 +251,33 @@ where
         raw_request,
         raw_response,
     )
+}
+
+/// Cap on the request-body preview dumped to stderr when the endpoint
+/// rejects a request with a 4xx (debug mode only).
+const REQUEST_DUMP_MAX_CHARS: usize = 4096;
+
+/// Debug-only stderr dump of the request body a 4xx rejected, truncated to a
+/// few KB. The body carries no credentials (Authorization is a header), so
+/// this is safe to log; it never reaches the user-visible error string.
+fn dump_rejected_request_body(tag: &str, status: reqwest::StatusCode, raw_request: &str) {
+    let truncated: String = raw_request.chars().take(REQUEST_DUMP_MAX_CHARS).collect();
+    let suffix = if truncated.len() < raw_request.len() {
+        format!(
+            "\n... (truncated, {} of {} bytes shown)",
+            truncated.len(),
+            raw_request.len()
+        )
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "[DEBUG][{}] request body rejected with HTTP {}:\n{}{}",
+        tag,
+        status.as_u16(),
+        truncated,
+        suffix
+    );
 }
 
 fn detect_flavor(model: &str, base_url: &str) -> ChatCompletionsFlavor {
@@ -610,7 +667,7 @@ fn build_tool_call_values(tool_calls: &[ToolCallInfo]) -> Vec<serde_json::Value>
                 "type": "function",
                 "function": {
                     "name": tc.name,
-                    "arguments": tc.arguments,
+                    "arguments": super::normalize_tool_call_arguments(&tc.name, &tc.arguments),
                 }
             })
         })
@@ -1421,6 +1478,25 @@ mod tests {
             false,
         );
         assert!(disabled[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn generic_messages_replay_empty_tool_call_arguments_as_empty_object() {
+        let mut assistant = assistant_message_with_tool_and_thinking();
+        assistant.tool_calls.as_mut().unwrap()[0].arguments = String::new();
+
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::Generic,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!("{}")
+        );
     }
 
     #[test]
