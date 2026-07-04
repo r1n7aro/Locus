@@ -19,6 +19,9 @@ English | [简体中文](README.zh-CN.md)
 `Locus for Unity` is an open-source AI Agent for Unity projects.
 
 - **In-editor operations**: write C# code, read and modify Unity objects and assets, and complete the full feature development workflow
+- **Built-in hot reload**: apply C# changes instantly without domain reloads, keeping Play Mode state intact
+- **Create editor UI with modern web tech**: build Unity editor interfaces with Vue.js through the `/view` command, free of IMGUI's constraints
+- **Rider-grade static analysis**: surface compiler-grade errors and warnings through built-in Roslyn semantic analysis the moment code changes
 - **Runtime analysis and debugging**: autonomously operate and capture runtime state to help fix bugs and optimize performance
 - **Automated knowledge system**: automatically summarize conversation requirements into design documents and preserve project understanding in long-term memory
 - **Visual version control**: provide a visual version control interface with semantic diff analysis and conflict handling for Unity YAML assets
@@ -32,12 +35,14 @@ Locus is a standalone Rust + Tauri + Vue.js application that runs as an independ
 
 - We designed a proprietary intermediate representation that lets agents progressively read large scenes and assets, along with retrieval tools that help agents quickly locate target objects
 - With Roslyn, Locus can JIT-compile and execute C# code inside the Unity Editor to make semantic asset edits. Locus also includes agent-side version management handling so users can review and revert asset and code changes the agent makes during a conversation
+- Locus ships with built-in C# hot reload on par with commercial plugins. The agent's changes take effect without recompiling the assembly or running a domain reload, so Play Mode state is preserved — and the apply state is fully visible to the agent, which can confirm immediately whether a change actually landed
+- Locus runs Roslyn semantic analysis in its own process, providing go-to-definition, find-references, hover info, and live diagnostics. The agent sees compiler-grade errors and warnings the moment it changes code, without waiting for Unity to compile; diagnostic coverage is close to Rider's live inspections, including finding where a field is referenced from UnityEvents, AnimationEvents, and scenes
 - Built on Rust's parallel ecosystem, Locus performs highly parallel asset database scans, enabling fast semantic parsing for large scenes and reference queries for arbitrary assets. The Unity Editor API only provides dependency queries
 - Locus includes an automated knowledge system. The agent summarizes fragmented conversation requests into design documents and saves working understanding into memory, reducing repeated project exploration
 - Documents in the knowledge system support configurable AI maintenance modes and maintenance rules, plus L0/L1/L2 injection control inside context. Users can customize progressive expansion behavior, use native lexical and syntactic retrieval across large document sets, and choose and download embedding runtimes
 - We built C# state-machine tools so the agent can sample internal state through reflection at specific frames or events during runtime, output frame-by-frame tables, and dynamically debug multi-frame behavior
 - Locus provides a graphical version control interface and supports semantic diff review and conflict resolution for Unity YAML files
-- Locus uses Vue.js to deliver a modern frontend experience with better UX than the limited controls provided by the Unity Editor API, then embeds it into the Unity window through Windows APIs
+- Locus uses Vue.js to deliver a modern frontend experience with better UX than the limited controls provided by the Unity Editor API, then embeds it into the Unity window through Windows APIs. Through the `/view` command, the agent can also build Unity editor UI with Vue.js — full HTML and CSS, free of IMGUI's constraints, with data binding and interpreted C# execution built in
 
 If Locus were implemented inside the Unity Editor, or designed as an MCP server, most of these capabilities would be difficult to deliver and some would be nearly impossible technically.
 
