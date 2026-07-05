@@ -7,6 +7,7 @@ import { gitExecute } from "../services/git";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import StreamingMarkdownRenderer from "./chat/StreamingMarkdownRenderer.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
@@ -868,7 +869,7 @@ defineExpose({ pushOutput });
       </template>
 
       <div v-if="streamingText" class="term-line term-line-ai term-streaming">
-        <MarkdownRenderer :content="streamingText" />
+        <StreamingMarkdownRenderer :content="streamingText" />
       </div>
 
       <div

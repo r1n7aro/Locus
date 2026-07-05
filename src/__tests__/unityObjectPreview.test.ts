@@ -467,13 +467,14 @@ describe("unityObjectPreview", () => {
 
   it("routes markdown Unity refs through the public preview component without replacing delegated actions", () => {
     const renderer = read("src/components/MarkdownRenderer.vue");
+    const engine = read("src/composables/markdownEngine.ts");
     const inject = read("src/composables/markdownInject.ts");
 
     expect(inject).toContain('data-md-unity-object-preview="true"');
     expect(inject).toContain("md-unity-object-ref");
     expect(renderer).toContain("import UnityObjectPreview from \"./unity-preview/UnityObjectPreview.vue\"");
     expect(renderer).toContain("injectUnityObjectFenceRefs");
-    expect(renderer).toContain("isMarkdownUnityObjectFenceLanguage(normalizedLang)");
+    expect(engine).toContain("isMarkdownUnityObjectFenceLanguage(normalizedLang)");
     expect(renderer).toContain("function mountMarkdownUnityObjectPreviews()");
     expect(renderer).toContain("[data-md-unity-object-preview='true']");
     expect(renderer).toContain("data-md-unity-passive");

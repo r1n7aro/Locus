@@ -2,15 +2,12 @@
 <script setup lang="ts">
 import { computed, getCurrentInstance, h, nextTick, onBeforeUnmount, ref, render, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Marked } from "marked";
-import { markedHighlight } from "marked-highlight";
-import hljs from "../hljs";
 import {
   markdownImageDirectSrc,
   prepareMarkdownImages,
   shouldResolveMarkdownImageSource,
 } from "../composables/markdownImages";
-import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
+import { escapeMarkdownHtml, markdownEngine } from "../composables/markdownEngine";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import {
   collectInlineCodePathCandidates,
@@ -20,14 +17,11 @@ import {
   injectUnityPropertyFenceRefs,
   injectViewRefs,
   injectWorkspaceMentions,
-  isMarkdownUnityObjectFenceLanguage,
-  isMarkdownUnityPropertyFenceLanguage,
   normalizeMarkdownPathStatusKey,
   type MarkdownPathStatus,
 } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
-import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 import {
   armLocusFilePointerDrag,
   armUnityReferencePointerDrag,
@@ -71,13 +65,6 @@ const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
 let markdownViewRefLoadRun = 0;
 let markdownInlinePathStatusLoadRun = 0;
 let markdownInlinePathStatusKey = "";
-
-function escapeHtml(source: string): string {
-  return source
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
 
 function escapeRegExp(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -164,42 +151,9 @@ function highlightHtml(html: string, terms: string[]): string {
   return root.innerHTML;
 }
 
-const md = new Marked(
-  markedHighlight({
-    langPrefix: "hljs language-",
-    highlight(code: string, lang: string) {
-      const normalizedLang = lang.trim().toLowerCase();
-      if (
-        isMarkdownUnityObjectFenceLanguage(normalizedLang)
-        || isMarkdownUnityPropertyFenceLanguage(normalizedLang)
-      ) {
-        return escapeHtml(code);
-      }
-      if (normalizedLang === "tree") {
-        return renderHighlightedCodeLines(escapeHtml(code), false);
-      }
-
-      let highlighted = escapeHtml(code);
-      if (normalizedLang && hljs.getLanguage(normalizedLang)) {
-        highlighted = hljs.highlight(code, { language: normalizedLang }).value;
-      }
-      return renderHighlightedCodeLines(highlighted);
-    },
-  }),
-  {
-    breaks: true,
-    gfm: true,
-    hooks: {
-      postprocess(html) {
-        return wrapMarkdownTables(html);
-      },
-    },
-  }
-);
-
 const parsedMarkdownHtml = computed(() => {
   if (!props.content) return "";
-  return md.parse(normalizeMarkdownForRender(props.content)) as string;
+  return markdownEngine.parse(normalizeMarkdownForRender(props.content)) as string;
 });
 
 function markdownPathStatusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
@@ -283,7 +237,7 @@ const renderedHtml = computed(() => {
     }
     return sanitizeRenderedMarkdownHtml(html);
   } catch {
-    return sanitizeRenderedMarkdownHtml(escapeHtml(props.content));
+    return sanitizeRenderedMarkdownHtml(escapeMarkdownHtml(props.content));
   }
 });
 

@@ -51,6 +51,7 @@ import {
   traceTranscriptPaintOcclusion,
 } from "../../services/layoutDiagnostics";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
+import StreamingMarkdownRenderer from "./StreamingMarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
@@ -2991,7 +2992,7 @@ function openImage(src: string) {
                   </div>
                 </div>
 
-                <MarkdownRenderer
+                <StreamingMarkdownRenderer
                   v-else-if="segment.type === 'content'"
                   data-render-part-kind="text"
                   data-render-part-scope="transient"
