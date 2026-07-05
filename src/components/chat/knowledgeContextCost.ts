@@ -1,9 +1,8 @@
 import type { InjectedPromptItem } from "../../types";
-import {
-  estimatePromptTokens,
-  estimateToolPrompt,
-  toolMetaLoadMode,
-} from "../agent/agentPromptDashboard";
+import { estimateToolPrompt, toolMetaLoadMode } from "../agent/agentPromptDashboard";
+import { estimateTextTokens } from "../../utils/tokenEstimate";
+
+export { estimateTextTokens };
 
 const KNOWLEDGE_TOOL_NAMES = new Set([
   "knowledge_list",
@@ -42,10 +41,6 @@ export function isDirectKnowledgeToolItem(
   if (item.kind !== "tools") return false;
   return KNOWLEDGE_TOOL_NAMES.has(toolNameFromItem(item))
     && toolMetaLoadMode(item.meta) === "direct";
-}
-
-export function estimateTextTokens(text: string): number {
-  return estimatePromptTokens(text.length);
 }
 
 export function estimateKnowledgeContextCostTokens(

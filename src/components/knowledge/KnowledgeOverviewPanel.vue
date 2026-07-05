@@ -10,6 +10,7 @@ import { t } from "../../i18n";
 import { listAgentInjectedItems } from "../../services/agent";
 import { useAgentStore } from "../../stores/agent";
 import type { ExplorerNode } from "../../composables/useKnowledgeState";
+import { estimateTextTokens } from "../../utils/tokenEstimate";
 import BaseButton from "../ui/BaseButton.vue";
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
@@ -110,11 +111,6 @@ function treeHasUnityReferenceFolder(nodes: ExplorerNode[]): boolean {
     if (treeHasUnityReferenceFolder(node.children)) return true;
   }
   return false;
-}
-
-function estimateTextTokens(text: string): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / 4);
 }
 
 function promptTypeLabel(type: KnowledgeDocumentType): string {

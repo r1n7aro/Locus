@@ -5,6 +5,7 @@ import { listAgentInjectedItems } from "../../services/agent";
 import { normalizeAppError } from "../../services/errors";
 import { useAgentStore } from "../../stores/agent";
 import type { InjectedPromptItem } from "../../types";
+import { estimateTextTokens } from "../../utils/tokenEstimate";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import BaseButton from "../ui/BaseButton.vue";
 
@@ -93,11 +94,6 @@ const selectedItem = computed(() =>
   ?? knowledgeItems.value[0]
   ?? null,
 );
-
-function estimateTextTokens(text: string): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / 4);
-}
 
 const totalEstimatedTokens = computed(() =>
   knowledgeItems.value.reduce((total, item) => total + estimateTextTokens(item.content), 0),

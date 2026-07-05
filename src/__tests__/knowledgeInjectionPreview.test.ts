@@ -32,7 +32,7 @@ describe("Knowledge injection preview", () => {
   it("shows a single estimated token line instead of the old summary strip", () => {
     const panel = read("src/components/knowledge/KnowledgeInjectionPreviewPanel.vue");
 
-    expect(panel).toContain("function estimateTextTokens(text: string): number");
+    expect(panel).toContain('import { estimateTextTokens } from "../../utils/tokenEstimate"');
     expect(panel).toContain('t("knowledge.injectionPreview.estimatedTokens")');
     expect(panel).not.toContain('class="injection-meta-strip"');
     expect(panel).not.toContain('knowledge.injectionPreview.subtitle');
@@ -40,7 +40,7 @@ describe("Knowledge injection preview", () => {
 
   it("builds the runtime knowledge prompt with the final section layout", () => {
     const runtime = read("src-tauri/src/agent/instance/mod.rs");
-    const markdownRenderer = read("src/components/MarkdownRenderer.vue");
+    const markdownEngine = read("src/composables/markdownEngine.ts");
     const markdownCodeLines = read("src/composables/markdownCodeLines.ts");
 
     expect(runtime).toContain('"## Knowledge\\n\\n{}"');
@@ -52,8 +52,8 @@ describe("Knowledge injection preview", () => {
     expect(runtime).toContain('"### L2 Full Documents');
     expect(runtime).toContain('"## L3 Rules');
     expect(runtime).toContain('knowledge_rule::');
-    expect(markdownRenderer).toContain('normalizedLang === "tree"');
-    expect(markdownRenderer).toContain('renderHighlightedCodeLines(escapeHtml(code), false)');
+    expect(markdownEngine).toContain('normalizedLang === "tree"');
+    expect(markdownEngine).toContain('renderHighlightedCodeLines(escapeMarkdownHtml(code), false)');
     expect(markdownCodeLines).toContain('code-line code-line-tree');
     expect(runtime).not.toContain("Knowledge-related guidance and runtime context are concentrated here.");
     expect(runtime).not.toContain('"### Index"');
