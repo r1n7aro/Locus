@@ -164,6 +164,27 @@ export function invalidateDiffCache(key: string) {
 }
 
 /**
+ * Drop every cached/in-flight diff whose filePath or oldPath matches one of
+ * the given workspace-relative paths (e.g. after a per-file revert changed
+ * the worktree side of the diff).
+ */
+export function invalidateDiffCacheForFiles(paths: readonly string[]) {
+  if (paths.length === 0) return;
+  const targets = new Set(paths);
+  const matches = (key: string) => {
+    const request = parseDiffRequestKey(key);
+    if (!request) return false;
+    return targets.has(request.filePath) || (!!request.oldPath && targets.has(request.oldPath));
+  };
+  for (const key of [...cache.keys()]) {
+    if (matches(key)) cache.delete(key);
+  }
+  for (const key of [...inflight.keys()]) {
+    if (matches(key)) inflight.delete(key);
+  }
+}
+
+/**
  * Re-fetch a diff by its cache key (invalidates cache first).
  * Returns the new payload or null if the key cannot be parsed.
  */
