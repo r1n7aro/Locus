@@ -69,6 +69,22 @@ export function setLlmRetryMaxAttempts(value: number): Promise<number> {
   return ipcInvoke<number>("set_llm_retry_max_attempts", { value });
 }
 
+export function getSubagentMaxDepth(): Promise<number> {
+  return ipcInvoke<number>("get_subagent_max_depth");
+}
+
+export function setSubagentMaxDepth(value: number): Promise<number> {
+  return ipcInvoke<number>("set_subagent_max_depth", { value });
+}
+
+export function getSubagentMaxConcurrent(): Promise<number> {
+  return ipcInvoke<number>("get_subagent_max_concurrent");
+}
+
+export function setSubagentMaxConcurrent(value: number): Promise<number> {
+  return ipcInvoke<number>("set_subagent_max_concurrent", { value });
+}
+
 export function getUnityBackgroundHookEnabled(): Promise<boolean> {
   return ipcInvoke<boolean>("get_unity_background_hook_enabled");
 }

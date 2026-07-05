@@ -17,3 +17,5 @@ When to use the task tool:
 When NOT to use the task tool:
 - For simple, directed codebase searches (e.g. for a specific file/class/function) use grep, list, or read directly
 - If you only need to read 1-2 specific files for an ongoing task, use read directly
+
+Limits: subagent nesting depth and the number of concurrently running subagents are capped (defaults: depth 1, meaning subagents cannot spawn subagents of their own, and 3 concurrent). Subagents at the depth cap do not get the task tool at all; a call past the concurrency cap fails with an error stating the current limit. Both caps are user-configurable in Locus Settings > General.

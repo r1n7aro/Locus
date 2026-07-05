@@ -1443,6 +1443,46 @@ pub async fn set_llm_retry_max_attempts(
 }
 
 #[tauri::command]
+pub async fn get_subagent_max_depth(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.subagent_max_depth())
+}
+
+/// Persist the `task` subagent nesting-depth cap (clamped to 1..=8; 1 means
+/// subagents cannot spawn further subagents).
+#[tauri::command]
+pub async fn set_subagent_max_depth(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_subagent_max_depth(value)
+        .map_err(AppError::from)?;
+    Ok(config.subagent_max_depth())
+}
+
+#[tauri::command]
+pub async fn get_subagent_max_concurrent(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.subagent_max_concurrent())
+}
+
+/// Persist the concurrent `task` subagent cap per top-level agent tree
+/// (clamped to 1..=16).
+#[tauri::command]
+pub async fn set_subagent_max_concurrent(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_subagent_max_concurrent(value)
+        .map_err(AppError::from)?;
+    Ok(config.subagent_max_concurrent())
+}
+
+#[tauri::command]
 pub async fn get_file_tool_workspace_boundary(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<bool, AppError> {

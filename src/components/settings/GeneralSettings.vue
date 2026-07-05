@@ -11,11 +11,15 @@ import {
   getCloseBehavior,
   getLlmRetryMaxAttempts,
   getPythonRuntimeState,
+  getSubagentMaxConcurrent,
+  getSubagentMaxDepth,
   getUnityBackgroundHookEnabled,
   getUnityBackgroundHookStatus,
   savePythonRuntimeSelection,
   setCloseBehavior,
   setLlmRetryMaxAttempts,
+  setSubagentMaxConcurrent,
+  setSubagentMaxDepth,
   setUnityBackgroundHookEnabled,
   type AppCloseBehavior,
 } from "../../services/system";
@@ -65,6 +69,12 @@ const LLM_RETRY_MAX = 10;
 const llmRetryMaxAttempts = ref(3);
 const llmRetryReady = ref(false);
 const llmRetryBusy = ref(false);
+const SUBAGENT_DEPTH_MAX = 8;
+const SUBAGENT_CONCURRENT_MAX = 16;
+const subagentMaxDepth = ref(1);
+const subagentMaxConcurrent = ref(3);
+const subagentLimitsReady = ref(false);
+const subagentLimitsBusy = ref(false);
 const unityBackgroundHookEnabled = ref(true);
 const unityBackgroundHookReady = ref(false);
 const unityBackgroundHookBusy = ref(false);
@@ -115,6 +125,15 @@ const llmRetryStatusLabel = computed(() => {
   return llmRetryMaxAttempts.value === 0
     ? t("settings.general.llmRetryOff")
     : t("settings.general.llmRetryTimes", String(llmRetryMaxAttempts.value));
+});
+
+const subagentLimitsStatusLabel = computed(() => {
+  if (!subagentLimitsReady.value) return t("common.loading");
+  return t(
+    "settings.general.subagentLimitsStatus",
+    String(subagentMaxDepth.value),
+    String(subagentMaxConcurrent.value),
+  );
 });
 
 const unityBackgroundHookStatusLabel = computed(() => {
@@ -182,6 +201,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 onMounted(() => {
   void refreshDebugMode();
   void refreshLlmRetryMaxAttempts();
+  void refreshSubagentLimits();
   void refreshUnityBackgroundHook();
   void refreshCloseBehavior();
   void refreshStorageInfo();
@@ -260,6 +280,79 @@ async function onLlmRetryChange(event: Event) {
     });
   } finally {
     llmRetryBusy.value = false;
+  }
+}
+
+async function refreshSubagentLimits() {
+  try {
+    const [depth, concurrent] = await Promise.all([
+      getSubagentMaxDepth(),
+      getSubagentMaxConcurrent(),
+    ]);
+    subagentMaxDepth.value = depth;
+    subagentMaxConcurrent.value = concurrent;
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadSubagentLimits",
+    });
+  } finally {
+    subagentLimitsReady.value = true;
+  }
+}
+
+async function onSubagentDepthChange(event: Event) {
+  if (!subagentLimitsReady.value || subagentLimitsBusy.value) return;
+  const input = event.target as HTMLInputElement;
+  const parsed = Number.parseInt(input.value, 10);
+  const next = Number.isFinite(parsed)
+    ? Math.min(SUBAGENT_DEPTH_MAX, Math.max(1, parsed))
+    : subagentMaxDepth.value;
+  input.value = String(next);
+  if (next === subagentMaxDepth.value) return;
+  const previous = subagentMaxDepth.value;
+  subagentMaxDepth.value = next;
+  subagentLimitsBusy.value = true;
+  try {
+    subagentMaxDepth.value = await setSubagentMaxDepth(next);
+  } catch (e) {
+    subagentMaxDepth.value = previous;
+    input.value = String(previous);
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveSubagentMaxDepth",
+    });
+  } finally {
+    subagentLimitsBusy.value = false;
+  }
+}
+
+async function onSubagentConcurrentChange(event: Event) {
+  if (!subagentLimitsReady.value || subagentLimitsBusy.value) return;
+  const input = event.target as HTMLInputElement;
+  const parsed = Number.parseInt(input.value, 10);
+  const next = Number.isFinite(parsed)
+    ? Math.min(SUBAGENT_CONCURRENT_MAX, Math.max(1, parsed))
+    : subagentMaxConcurrent.value;
+  input.value = String(next);
+  if (next === subagentMaxConcurrent.value) return;
+  const previous = subagentMaxConcurrent.value;
+  subagentMaxConcurrent.value = next;
+  subagentLimitsBusy.value = true;
+  try {
+    subagentMaxConcurrent.value = await setSubagentMaxConcurrent(next);
+  } catch (e) {
+    subagentMaxConcurrent.value = previous;
+    input.value = String(previous);
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "saveSubagentMaxConcurrent",
+    });
+  } finally {
+    subagentLimitsBusy.value = false;
   }
 }
 
@@ -714,6 +807,38 @@ async function selectPythonRuntime(selectedId: string) {
         @change="onLlmRetryChange"
       />
       <span class="debug-toggle-label">{{ llmRetryStatusLabel }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.subagentLimits") }}</div>
+    <p class="section-desc">{{ t("settings.general.subagentLimitsDesc") }}</p>
+    <div class="llm-retry-row" :aria-busy="!subagentLimitsReady">
+      <span class="debug-toggle-label">{{ t("settings.general.subagentMaxDepth") }}</span>
+      <input
+        class="llm-retry-input"
+        type="number"
+        min="1"
+        :max="SUBAGENT_DEPTH_MAX"
+        step="1"
+        :value="subagentMaxDepth"
+        :disabled="!subagentLimitsReady || subagentLimitsBusy"
+        :aria-label="t('settings.general.subagentMaxDepth')"
+        @change="onSubagentDepthChange"
+      />
+      <span class="debug-toggle-label">{{ t("settings.general.subagentMaxConcurrent") }}</span>
+      <input
+        class="llm-retry-input"
+        type="number"
+        min="1"
+        :max="SUBAGENT_CONCURRENT_MAX"
+        step="1"
+        :value="subagentMaxConcurrent"
+        :disabled="!subagentLimitsReady || subagentLimitsBusy"
+        :aria-label="t('settings.general.subagentMaxConcurrent')"
+        @change="onSubagentConcurrentChange"
+      />
+      <span class="debug-toggle-label">{{ subagentLimitsStatusLabel }}</span>
     </div>
   </div>
 

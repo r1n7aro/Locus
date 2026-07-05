@@ -39,6 +39,35 @@ fn default_llm_retry_max_attempts() -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(crate::llm::retry::DEFAULT_MAX_RETRIES))
 }
 
+fn default_llm_strip_inline_think_tags() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
+/// Default `task` subagent nesting depth: the top-level agent may spawn
+/// subagents, but those subagents may not spawn further subagents.
+pub const DEFAULT_SUBAGENT_MAX_DEPTH: u32 = 1;
+pub const SUBAGENT_MAX_DEPTH_LIMIT: u32 = 8;
+/// Default cap on `task` subagents running at the same time within one
+/// top-level agent tree.
+pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: u32 = 3;
+pub const SUBAGENT_MAX_CONCURRENT_LIMIT: u32 = 16;
+
+fn clamp_subagent_max_depth(value: u32) -> u32 {
+    value.clamp(1, SUBAGENT_MAX_DEPTH_LIMIT)
+}
+
+fn clamp_subagent_max_concurrent(value: u32) -> u32 {
+    value.clamp(1, SUBAGENT_MAX_CONCURRENT_LIMIT)
+}
+
+fn default_subagent_max_depth() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(DEFAULT_SUBAGENT_MAX_DEPTH))
+}
+
+fn default_subagent_max_concurrent() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(DEFAULT_SUBAGENT_MAX_CONCURRENT))
+}
+
 fn default_debug_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
@@ -344,6 +373,33 @@ pub struct AppConfig {
         with = "serde_atomic_u32"
     )]
     pub llm_retry_max_attempts: Arc<AtomicU32>,
+    /// Reroute literal `<think>`/`<thinking>` prefixes of streamed content
+    /// into the thinking channel on the OpenAI-compatible transports
+    /// (`llm::chat_completions`, `llm::openrouter`). Third-party endpoints
+    /// without a reasoning parser inline reasoning as text tags; without
+    /// rerouting it floods the transcript and the streaming markdown
+    /// renderer. Mirrored into `llm::think_tag_filter` at startup and on
+    /// change. Default on.
+    #[serde(
+        default = "default_llm_strip_inline_think_tags",
+        with = "serde_atomic_bool"
+    )]
+    pub llm_strip_inline_think_tags: Arc<AtomicBool>,
+    /// Maximum `task` subagent nesting depth. 1 (default) lets the top-level
+    /// agent spawn subagents while subagents themselves cannot; a `task` call
+    /// past the cap fails with an error tool result. Clamped to
+    /// 1..=SUBAGENT_MAX_DEPTH_LIMIT on read and write.
+    #[serde(default = "default_subagent_max_depth", with = "serde_atomic_u32")]
+    pub subagent_max_depth: Arc<AtomicU32>,
+    /// Maximum `task` subagents running at once within one top-level agent
+    /// tree (default 3). Excess calls fail with an error tool result instead
+    /// of queueing. Clamped to 1..=SUBAGENT_MAX_CONCURRENT_LIMIT on read and
+    /// write.
+    #[serde(
+        default = "default_subagent_max_concurrent",
+        with = "serde_atomic_u32"
+    )]
+    pub subagent_max_concurrent: Arc<AtomicU32>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -395,6 +451,9 @@ impl AppConfig {
             unity_inline_force_evaluate_enabled: default_unity_inline_force_evaluate_enabled(),
             code_analysis_tools: default_code_analysis_tools(),
             llm_retry_max_attempts: default_llm_retry_max_attempts(),
+            llm_strip_inline_think_tags: default_llm_strip_inline_think_tags(),
+            subagent_max_depth: default_subagent_max_depth(),
+            subagent_max_concurrent: default_subagent_max_concurrent(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
         };
 
@@ -645,6 +704,30 @@ impl AppConfig {
     pub fn set_llm_retry_max_attempts(&self, value: u32) -> Result<(), String> {
         self.llm_retry_max_attempts
             .store(crate::llm::retry::clamp_max_retries(value), Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn llm_strip_inline_think_tags(&self) -> bool {
+        self.llm_strip_inline_think_tags.load(Ordering::Relaxed)
+    }
+
+    pub fn subagent_max_depth(&self) -> u32 {
+        clamp_subagent_max_depth(self.subagent_max_depth.load(Ordering::Relaxed))
+    }
+
+    pub fn set_subagent_max_depth(&self, value: u32) -> Result<(), String> {
+        self.subagent_max_depth
+            .store(clamp_subagent_max_depth(value), Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn subagent_max_concurrent(&self) -> u32 {
+        clamp_subagent_max_concurrent(self.subagent_max_concurrent.load(Ordering::Relaxed))
+    }
+
+    pub fn set_subagent_max_concurrent(&self, value: u32) -> Result<(), String> {
+        self.subagent_max_concurrent
+            .store(clamp_subagent_max_concurrent(value), Ordering::Relaxed);
         self.persist()
     }
 
@@ -1155,6 +1238,59 @@ mod tests {
         assert_eq!(
             reloaded.llm_retry_max_attempts(),
             crate::llm::retry::MAX_RETRIES_LIMIT
+        );
+    }
+
+    #[test]
+    fn subagent_limits_default_for_legacy_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(config.subagent_max_depth(), DEFAULT_SUBAGENT_MAX_DEPTH);
+        assert_eq!(
+            config.subagent_max_concurrent(),
+            DEFAULT_SUBAGENT_MAX_CONCURRENT
+        );
+    }
+
+    #[test]
+    fn subagent_limits_persist_and_clamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+
+        config
+            .set_subagent_max_depth(3)
+            .expect("persist subagent depth");
+        config
+            .set_subagent_max_concurrent(5)
+            .expect("persist subagent concurrency");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.subagent_max_depth(), 3);
+        assert_eq!(reloaded.subagent_max_concurrent(), 5);
+
+        // 0 and oversized values clamp into range instead of persisting raw.
+        config
+            .set_subagent_max_depth(0)
+            .expect("persist clamped depth");
+        config
+            .set_subagent_max_concurrent(999)
+            .expect("persist clamped concurrency");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.subagent_max_depth(), 1);
+        assert_eq!(
+            reloaded.subagent_max_concurrent(),
+            SUBAGENT_MAX_CONCURRENT_LIMIT
         );
     }
 }

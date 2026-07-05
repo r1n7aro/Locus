@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -229,6 +229,20 @@ pub struct AgentInstance {
     raw_store: RawContextStore,
     workspace_id: Option<String>,
     parent_tool_call: Option<ParentToolCall>,
+    /// Nesting depth in the `task` subagent tree: 0 for a top-level agent,
+    /// parent depth + 1 for each spawned subagent. Checked against the
+    /// configured `subagent_max_depth` before a `task` call may spawn.
+    subagent_depth: u32,
+    /// Live count of `task` subagents running anywhere in this agent tree.
+    /// The top-level instance creates the counter and every descendant shares
+    /// it, so the configured concurrency cap applies tree-wide.
+    subagent_active: Arc<AtomicU32>,
+    /// True when this instance was spawned at the configured maximum subagent
+    /// nesting depth: `task` is removed from its tool surface entirely
+    /// (request tool list, lazy manifest, tool_load/tool_call) instead of
+    /// erroring only at call time. Spawn-time snapshot; `execute_task` keeps
+    /// the live-config depth check as backstop.
+    task_tool_suppressed: bool,
     effort: Option<String>,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
@@ -311,6 +325,46 @@ struct ParentToolCall {
     session_id: String,
     run_id: String,
     tool_call_id: String,
+}
+
+/// RAII slot in the tree-wide subagent concurrency budget: acquired before a
+/// `task` subagent starts and released on drop, so cancel and error unwinds
+/// cannot leak a slot.
+struct SubagentSlotGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl SubagentSlotGuard {
+    /// Atomically claims a slot unless `limit` subagents are already running.
+    /// Compare-exchange (not fetch_add) so concurrent `task` calls racing for
+    /// the last slot cannot overshoot the limit.
+    fn try_acquire(counter: &Arc<AtomicU32>, limit: u32) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(SubagentSlotGuard {
+                        counter: counter.clone(),
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for SubagentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct ParentStreamEvent {
@@ -2963,6 +3017,9 @@ impl AgentInstance {
             raw_store,
             workspace_id,
             parent_tool_call: None,
+            subagent_depth: 0,
+            subagent_active: Arc::new(AtomicU32::new(0)),
+            task_tool_suppressed: false,
             effort: effective_effort,
             app_knowledge_dir,
             app_agent_dir,
@@ -3435,11 +3492,19 @@ impl AgentInstance {
 
     async fn allowed_tool_set(&self) -> HashSet<String> {
         let enabled_overrides = self.tool_enabled_overrides();
-        self.configured_tool_set()
+        let mut allowed: HashSet<String> = self
+            .configured_tool_set()
             .await
             .into_iter()
             .filter(|name| self.is_tool_enabled(name, &enabled_overrides))
-            .collect()
+            .collect();
+        // Depth-capped subagents lose `task` entirely: the request tool
+        // list, lazy manifest, tool_load and tool_call all derive from this
+        // set, so the model is never offered a tool it cannot use.
+        if self.task_tool_suppressed {
+            allowed.remove("task");
+        }
+        allowed
     }
 
     async fn allowed_tool_set_for_active_skills(
@@ -5569,7 +5634,7 @@ impl AgentInstance {
             Some(child_def_id),
         )?;
 
-        Ok(AgentInstance::new(
+        let mut child = AgentInstance::new(
             Arc::new(child_def.clone()),
             &child_session_id,
             self.backend.clone(),
@@ -5588,7 +5653,10 @@ impl AgentInstance {
             self.undo_manager.clone(),
             self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
-        ))
+        );
+        child.subagent_depth = self.subagent_depth + 1;
+        child.subagent_active = self.subagent_active.clone();
+        Ok(child)
     }
 
     async fn call_llm(
@@ -5619,6 +5687,7 @@ impl AgentInstance {
                     None, // reasoning_effort
                     self.debug,
                     on_text_delta,
+                    on_thinking_delta,
                     on_tool_call_start,
                 )
                 .await?;
@@ -6156,14 +6225,14 @@ impl AgentInstance {
         attempt_kind: &str,
         trigger: crate::commands::CompactTrigger,
         iteration: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<u32>, String> {
         let LlmBackend::OpenAiCodex { auth, base_url, .. } = &self.backend else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
         let messages_before = messages.len() as u32;
 
@@ -6298,17 +6367,26 @@ impl AgentInstance {
             "the Codex remote compaction summary is an encrypted item that only the Codex API can read",
         );
         let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section =
-            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let restored_files_section = compact::build_post_compact_restored_files_section(
+            &messages,
+            &self.working_dir,
+            context_limit,
+        );
+        let transcript = compact::export_compact_transcript(&self.session_id, &messages);
         let summary_msg = compact::build_post_compact_message(
             &summary,
             &restored_files_section,
             keep_from_msg.created_at,
-            boundary_idx + 1 < messages.len(),
+            compact::will_retain_user_messages(&messages, context_limit),
+            transcript.as_ref(),
         );
 
-        let (count_before, count_after) =
-            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        let (count_before, count_after) = store.compact_messages(
+            &self.session_id,
+            &summary_msg,
+            &keep_from_msg.id,
+            compact::compact_user_message_token_budget(context_limit),
+        )?;
         store.set_message_response_request_metadata(
             &self.session_id,
             &summary_msg.id,
@@ -6338,7 +6416,7 @@ impl AgentInstance {
             },
         );
 
-        Ok(true)
+        Ok(Some(compacted_context_tokens))
     }
 
     async fn execute_auto_compact(
@@ -6352,7 +6430,7 @@ impl AgentInstance {
         run_id: &str,
         attempt_kind: &str,
         iteration: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<u32>, String> {
         let trigger = compact_trigger(force_compact, attempt_kind);
         // Codex subscription sessions default to the remote compaction endpoint
         // (codex-rs default strategy); the prompt-based flow below stays as the
@@ -6372,8 +6450,8 @@ impl AgentInstance {
                 )
                 .await
             {
-                Ok(true) => return Ok(true),
-                Ok(false) => return Ok(false),
+                Ok(Some(post_tokens)) => return Ok(Some(post_tokens)),
+                Ok(None) => return Ok(None),
                 Err(error) => {
                     eprintln!(
                         "[Agent {}] codex remote compact failed, falling back to prompt-based compact: {}",
@@ -6385,7 +6463,7 @@ impl AgentInstance {
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let messages_before = messages.len() as u32;
@@ -6420,19 +6498,27 @@ impl AgentInstance {
                     compact::compact_recent_tail_token_budget(context_limit),
                 );
                 if force_compact
-                    && !compact::has_compactable_messages_before_boundary(&messages, boundary_idx)
+                    && !compact::has_compactable_messages_before_boundary(
+                        &messages,
+                        boundary_idx,
+                        context_limit,
+                    )
                 {
                     boundary_idx = messages.len().saturating_sub(1);
                     while boundary_idx > 0 && messages[boundary_idx].role == MessageRole::Tool {
                         boundary_idx -= 1;
                     }
                 }
-                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                if !compact::has_compactable_messages_before_boundary(
+                    &messages,
+                    boundary_idx,
+                    context_limit,
+                ) {
                     eprintln!(
                         "[Agent {}] emergency {} skipped: no compactable messages before boundary {}",
                         self.id, compact_label, boundary_idx
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 emit_stream(
                     app_handle,
@@ -6449,15 +6535,22 @@ impl AgentInstance {
                 let restored_files_section = compact::build_post_compact_restored_files_section(
                     &messages,
                     &self.working_dir,
+                    context_limit,
                 );
+                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
                 let summary_msg = compact::build_post_compact_message(
                     &summary,
                     &restored_files_section,
                     keep_from_msg.created_at,
-                    boundary_idx + 1 < messages.len(),
+                    compact::will_retain_user_messages(&messages, context_limit),
+                    transcript.as_ref(),
                 );
-                let (count_before, count_after) =
-                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                let (count_before, count_after) = store.compact_messages(
+                    &self.session_id,
+                    &summary_msg,
+                    &keep_from_msg.id,
+                    compact::compact_user_message_token_budget(context_limit),
+                )?;
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
@@ -6485,7 +6578,7 @@ impl AgentInstance {
                         messages: compacted_messages,
                     },
                 );
-                return Ok(true);
+                return Ok(Some(compacted_context_tokens));
             }
         };
 
@@ -6493,6 +6586,7 @@ impl AgentInstance {
             && !compact::has_compactable_messages_before_boundary(
                 &messages,
                 compact_plan.boundary_idx,
+                context_limit,
             )
         {
             compact_plan.boundary_idx = messages.len().saturating_sub(1);
@@ -6512,13 +6606,16 @@ impl AgentInstance {
             compact_plan.truncated
         );
 
-        if !compact::has_compactable_messages_before_boundary(&messages, compact_plan.boundary_idx)
-        {
+        if !compact::has_compactable_messages_before_boundary(
+            &messages,
+            compact_plan.boundary_idx,
+            context_limit,
+        ) {
             eprintln!(
                 "[Agent {}] {} skipped: no compactable messages before boundary {}",
                 self.id, compact_label, compact_plan.boundary_idx
             );
-            return Ok(false);
+            return Ok(None);
         }
 
         emit_stream(
@@ -6576,27 +6673,38 @@ impl AgentInstance {
                     self.id, e
                 );
                 let boundary_idx = compact_plan.boundary_idx;
-                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                if !compact::has_compactable_messages_before_boundary(
+                    &messages,
+                    boundary_idx,
+                    context_limit,
+                ) {
                     eprintln!(
                         "[Agent {}] emergency auto-compact skipped after compact error: no compactable messages before boundary {}",
                         self.id, boundary_idx
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
                     &messages,
                     &self.working_dir,
+                    context_limit,
                 );
+                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
                 let summary_msg = compact::build_post_compact_message(
                     &summary,
                     &restored_files_section,
                     keep_from_msg.created_at,
-                    boundary_idx + 1 < messages.len(),
+                    compact::will_retain_user_messages(&messages, context_limit),
+                    transcript.as_ref(),
                 );
-                let (count_before, count_after) =
-                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                let (count_before, count_after) = store.compact_messages(
+                    &self.session_id,
+                    &summary_msg,
+                    &keep_from_msg.id,
+                    compact::compact_user_message_token_budget(context_limit),
+                )?;
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
@@ -6623,7 +6731,7 @@ impl AgentInstance {
                         messages: compacted_messages,
                     },
                 );
-                return Ok(true);
+                return Ok(Some(compacted_context_tokens));
             }
             Err(e) => {
                 eprintln!("[Agent {}] compact LLM call failed: {}", self.id, e);
@@ -6714,17 +6822,26 @@ impl AgentInstance {
         }
 
         let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section =
-            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let restored_files_section = compact::build_post_compact_restored_files_section(
+            &messages,
+            &self.working_dir,
+            context_limit,
+        );
+        let transcript = compact::export_compact_transcript(&self.session_id, &messages);
         let summary_msg = compact::build_post_compact_message(
             &summary,
             &restored_files_section,
             keep_from_msg.created_at,
-            boundary_idx + 1 < messages.len(),
+            compact::will_retain_user_messages(&messages, context_limit),
+            transcript.as_ref(),
         );
 
-        let (count_before, count_after) =
-            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        let (count_before, count_after) = store.compact_messages(
+            &self.session_id,
+            &summary_msg,
+            &keep_from_msg.id,
+            compact::compact_user_message_token_budget(context_limit),
+        )?;
         if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         }
@@ -6754,7 +6871,7 @@ impl AgentInstance {
             },
         );
 
-        Ok(true)
+        Ok(Some(compacted_context_tokens))
     }
 
     fn wrap_system_reminder(content: &str) -> Option<String> {
@@ -7477,7 +7594,8 @@ impl AgentInstance {
                     "compact",
                     1,
                 )
-                .await?;
+                .await?
+                .is_some();
             if !compacted {
                 eprintln!(
                     "[Agent {}] manual compact finished without changes: session={} run={} messages={}",
@@ -7761,6 +7879,11 @@ impl AgentInstance {
         // call in this run; calibrates the byte-heuristic estimate against the
         // provider's real tokenization for auto-compact decisions.
         let mut estimate_calibration_sample: Option<(u32, u32)> = None;
+        // True while an automatic compact has run without a successful request
+        // afterwards. A prompt-too-long error in that state means the
+        // post-compact floor itself does not fit the provider window, so
+        // scheduling another compact would only burn a summarization call.
+        let mut compact_unverified_since_send = false;
         let final_text;
         let final_thinking_text;
         let final_thinking_duration: u32;
@@ -7838,6 +7961,17 @@ impl AgentInstance {
                 estimate_calibration_sample,
                 persisted_context_tokens,
             );
+            // A no-progress verdict describes the retained floor at the time it
+            // was recorded; once the context has grown a buffer past that
+            // baseline there is new compactable material, so automatic
+            // compaction gets another chance. Compared on the RAW estimate:
+            // baselines are recorded on the same byte-heuristic scale, and the
+            // calibrated value would inflate by the provider tokenizer ratio
+            // after the first post-compact sample, masquerading as growth.
+            compact_tracker.reset_no_progress_if_grown(
+                estimated_input_tokens,
+                compact::auto_compact_buffer(ctx_limit),
+            );
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
             let should_preflight_compact = if is_codex_backend {
                 compact::should_codex_auto_compact(effective_input_tokens, ctx_limit)
@@ -7846,7 +7980,7 @@ impl AgentInstance {
             };
             let mut preflight_compact_error: Option<String> = None;
 
-            if !compact_tracker.is_circuit_broken()
+            if !compact_tracker.is_suppressed()
                 && should_preflight_compact
             {
                 eprintln!(
@@ -7874,12 +8008,30 @@ impl AgentInstance {
                     )
                     .await
                 {
-                    Ok(true) => {
+                    Ok(Some(post_compact_tokens)) => {
                         compact_tracker.record_success();
-                        eprintln!("[Agent {}] preflight auto-compact succeeded", self.id);
+                        compact_unverified_since_send = true;
+                        // The sampled (actual, estimated) pair described the
+                        // pre-compact history; applying it to the compacted
+                        // prompt would overshoot. The persisted post-compact
+                        // usage takes over as the calibration floor.
+                        estimate_calibration_sample = None;
+                        let still_over_threshold = post_compact_tokens > 0
+                            && if is_codex_backend {
+                                compact::should_codex_auto_compact(post_compact_tokens, ctx_limit)
+                            } else {
+                                compact::should_auto_compact(post_compact_tokens, ctx_limit)
+                            };
+                        if still_over_threshold {
+                            compact_tracker.record_no_progress(post_compact_tokens);
+                        }
+                        eprintln!(
+                            "[Agent {}] preflight auto-compact succeeded: post_compact_tokens={}",
+                            self.id, post_compact_tokens
+                        );
                         continue 'agent_loop;
                     }
-                    Ok(false) => {}
+                    Ok(None) => {}
                     Err(e) => {
                         compact_tracker.record_failure();
                         eprintln!("[Agent {}] preflight auto-compact failed: {}", self.id, e);
@@ -8226,13 +8378,32 @@ impl AgentInstance {
                             None,
                         )
                         .await;
-                        if is_prompt_too_long_error(&e) && !compact_tracker.is_circuit_broken() {
+                        if is_prompt_too_long_error(&e) {
+                            if compact_unverified_since_send {
+                                // The provider rejected the very first request
+                                // after an automatic compact: the retained
+                                // floor itself does not fit the window, so
+                                // another compact round cannot shrink it. The
+                                // baseline stays on the raw-estimate scale so
+                                // the growth reset compares like with like.
+                                compact_tracker.record_no_progress(estimated_input_tokens);
+                            }
+                            if !compact_tracker.is_suppressed() {
+                                eprintln!(
+                                    "[Agent {}] prompt-too-long detected on iteration {}, scheduling reactive compact: {}",
+                                    self.id, iteration, e
+                                );
+                                last_llm_error = e;
+                                needs_reactive_compact = true;
+                                break;
+                            }
+                            // Retrying a deterministic over-length request
+                            // cannot succeed; surface the provider error.
                             eprintln!(
-                                "[Agent {}] prompt-too-long detected on iteration {}, scheduling reactive compact: {}",
+                                "[Agent {}] prompt-too-long with automatic compaction suppressed on iteration {}; not retrying: {}",
                                 self.id, iteration, e
                             );
                             last_llm_error = e;
-                            needs_reactive_compact = true;
                             break;
                         }
 
@@ -8278,12 +8449,31 @@ impl AgentInstance {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(Some(post_compact_tokens)) => {
                             compact_tracker.record_success();
-                            eprintln!("[Agent {}] reactive auto-compact succeeded", self.id);
+                            compact_unverified_since_send = true;
+                            // Same rationale as the preflight path: the sample
+                            // no longer matches the compacted history.
+                            estimate_calibration_sample = None;
+                            let still_over_threshold = post_compact_tokens > 0
+                                && if is_codex_backend {
+                                    compact::should_codex_auto_compact(
+                                        post_compact_tokens,
+                                        ctx_limit,
+                                    )
+                                } else {
+                                    compact::should_auto_compact(post_compact_tokens, ctx_limit)
+                                };
+                            if still_over_threshold {
+                                compact_tracker.record_no_progress(post_compact_tokens);
+                            }
+                            eprintln!(
+                                "[Agent {}] reactive auto-compact succeeded: post_compact_tokens={}",
+                                self.id, post_compact_tokens
+                            );
                             continue 'agent_loop;
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(e) => {
                             compact_tracker.record_failure();
                             eprintln!("[Agent {}] reactive auto-compact failed: {}", self.id, e);
@@ -8293,6 +8483,9 @@ impl AgentInstance {
                 }
                 None => return Err(last_llm_error),
             };
+            // The provider accepted the prompt, so the last compact (if any)
+            // demonstrably made the history fit again.
+            compact_unverified_since_send = false;
 
             {
                 let round = RawRound {
@@ -10060,6 +10253,9 @@ impl AgentInstance {
                     .is_allowed_tool_for_active_skills(&canonical, active_skill_tool_names)
                     .await
             {
+                if canonical == "task" && self.task_tool_suppressed {
+                    return self.suppressed_task_tool_result();
+                }
                 return ExecutedToolResult::from_tool_result(ToolResult {
                     output: format!(
                         "tool_call target '{}' is not allowed for this agent.",
@@ -10099,6 +10295,14 @@ impl AgentInstance {
             return self
                 .execute_exit_plan_mode(app_handle, store, &tc.id, run_id)
                 .await;
+        }
+
+        // Depth-capped subagents have `task` filtered from their tool
+        // surface; a call that slips through anyway (hallucinated or from
+        // history) gets the specific depth explanation, not the generic
+        // not-allowed text below.
+        if tc.name == "task" && self.task_tool_suppressed {
+            return self.suppressed_task_tool_result();
         }
 
         if !self
@@ -14441,6 +14645,15 @@ impl AgentInstance {
             run_id.to_string(),
             tool_call_id.to_string(),
         ));
+        child.subagent_depth = self.subagent_depth + 1;
+        child.subagent_active = self.subagent_active.clone();
+        // A child spawned at the depth cap never sees `task` in its tool
+        // surface at all, instead of discovering the limit by erroring.
+        let max_depth = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| config.subagent_max_depth())
+            .unwrap_or(crate::config::DEFAULT_SUBAGENT_MAX_DEPTH);
+        child.task_tool_suppressed = child.subagent_depth >= max_depth;
         // Plan mode propagates to children: a subagent spawned while the
         // parent plans runs strictly read-only (no plan file, no
         // exit_plan_mode) so `task` cannot become a plan-mode bypass.
@@ -14621,6 +14834,20 @@ impl AgentInstance {
         }
     }
 
+    /// Error result for a `task` call from a subagent whose tool surface had
+    /// `task` removed at spawn time (it sits at the configured maximum
+    /// nesting depth). Names the reason and the setting instead of the
+    /// generic not-allowed text.
+    fn suppressed_task_tool_result(&self) -> ExecutedToolResult {
+        ExecutedToolResult::from_tool_result(ToolResult {
+            output: format!(
+                "Error: the task tool is not available to this agent. It was spawned at subagent depth {}, the configured maximum nesting depth, so it cannot spawn further subagents. Do the work directly with your other tools. (The user can raise 'Subagent max depth' in Locus Settings > General.)",
+                self.subagent_depth
+            ),
+            is_error: true,
+        })
+    }
+
     async fn execute_task(
         &self,
         app_handle: &AppHandle,
@@ -14652,6 +14879,39 @@ impl AgentInstance {
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
         }
+
+        let (max_depth, max_concurrent) = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| (config.subagent_max_depth(), config.subagent_max_concurrent()))
+            .unwrap_or((
+                crate::config::DEFAULT_SUBAGENT_MAX_DEPTH,
+                crate::config::DEFAULT_SUBAGENT_MAX_CONCURRENT,
+            ));
+        if self.subagent_depth >= max_depth {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "Error: subagent nesting depth limit reached. This agent is itself a subagent running at depth {} and the maximum nesting depth is {}, so it cannot spawn further subagents with the task tool. Do the work directly with your other tools instead. (The user can change this limit via \"Subagent max depth\" in Locus Settings > General.)",
+                    self.subagent_depth, max_depth
+                ),
+                is_error: true,
+            });
+        }
+        // Hold a concurrency slot for the child's whole lifetime; the guard
+        // drops (and frees the slot) on every exit path below.
+        let _subagent_slot =
+            match SubagentSlotGuard::try_acquire(&self.subagent_active, max_concurrent) {
+                Some(slot) => slot,
+                None => {
+                    let running = self.subagent_active.load(Ordering::Relaxed);
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!(
+                            "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this task call was rejected. Issue at most {} task calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
+                            running, max_concurrent, max_concurrent
+                        ),
+                        is_error: true,
+                    });
+                }
+            };
 
         match self
             .run_subagent_task(
@@ -18705,6 +18965,74 @@ Search, install, audit, and export a plugin.
         assert!(!names.iter().any(|name| name == "exit_plan_mode"));
     }
 
+    #[tokio::test]
+    async fn task_tool_filtered_out_for_depth_capped_subagents() {
+        // `with_builtins()` does not register `task` (the real app registers
+        // it with the live agent list), so the fixture registers it here.
+        let mut tool_registry = ToolRegistry::with_builtins();
+        tool_registry.register_task_tool(&[(
+            "explorer".to_string(),
+            "codebase exploration".to_string(),
+        )]);
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec!["read".to_string(), "task".to_string()],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(tool_registry),
+            "C:/Project".to_string(),
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            names.iter().any(|name| name == "task"),
+            "fixture must offer task before suppression"
+        );
+
+        instance.subagent_depth = 1;
+        instance.task_tool_suppressed = true;
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            !names.iter().any(|name| name == "task"),
+            "task must disappear from the request tool list at the depth cap"
+        );
+        assert!(!instance.allowed_tool_set().await.contains("task"));
+        // Other tools stay untouched.
+        assert!(names.iter().any(|name| name == "read"));
+
+        // A call that slips through anyway gets the specific depth error,
+        // which names the setting, rather than the generic not-allowed text.
+        let result = instance.suppressed_task_tool_result();
+        assert!(result.is_error);
+        assert!(result.output.contains("subagent depth 1"));
+        assert!(result.output.contains("Subagent max depth"));
+    }
+
     #[test]
     fn plan_reminder_renders_file_info_and_turn_contract() {
         let missing = std::env::temp_dir().join("locus-test-plan-does-not-exist.md");
@@ -18721,5 +19049,32 @@ Search, install, audit, and export a plugin.
         let rendered = AgentInstance::render_plan_reminder(&existing);
         assert!(rendered.contains("A plan file already exists"));
         assert!(rendered.contains("refine it if this continues the same task"));
+    }
+
+    #[test]
+    fn subagent_slot_guard_enforces_limit_and_releases_on_drop() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let first = super::SubagentSlotGuard::try_acquire(&counter, 2).expect("first slot");
+        let second = super::SubagentSlotGuard::try_acquire(&counter, 2).expect("second slot");
+        assert!(
+            super::SubagentSlotGuard::try_acquire(&counter, 2).is_none(),
+            "third acquire must fail at limit 2"
+        );
+
+        drop(second);
+        let reclaimed =
+            super::SubagentSlotGuard::try_acquire(&counter, 2).expect("slot freed by drop");
+
+        drop(first);
+        drop(reclaimed);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "all slots released"
+        );
     }
 }
