@@ -32,9 +32,11 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  /** Full auth check including provider details and codex status. */
+  /** Full auth check including provider details and codex status.
+   *  `authChecked` is a one-shot latch ("first check completed") — re-checks
+   *  must NOT reset it to false: the whole app layout is gated on it in
+   *  App.vue, so a mid-session reset unmounts and rebuilds every tab. */
   async function checkAuth(): Promise<AuthStatusLoadFailure[]> {
-    authChecked.value = false;
     try {
       await checkAuthLight(false);
       return await loadProviderStatus();

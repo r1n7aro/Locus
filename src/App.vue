@@ -770,8 +770,16 @@ onMounted(async () => {
   markStartupPhase("main_register_listeners_start");
   await registerListeners();
   markStartupPhase("main_register_listeners_done");
-  // Sessions page is now interactive — kick off background work
-  preloadTabsInBackground();
+  // Sessions page is now interactive — kick off background work. Passing the
+  // lazy-view loaders lets the preloader fill each view's component ref, so
+  // the first visit to these tabs mounts instantly (no loading-placeholder flash).
+  preloadTabsInBackground([
+    settingsView.ensureLoaded,
+    collabView.ensureLoaded,
+    knowledgeView.ensureLoaded,
+    assetView.ensureLoaded,
+    agentView.ensureLoaded,
+  ]);
   markStartupPhase("main_preload_tabs_scheduled");
   void bootstrapDeferred();
   markStartupPhase("main_bootstrap_deferred_scheduled");

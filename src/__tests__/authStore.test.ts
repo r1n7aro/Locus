@@ -54,6 +54,34 @@ describe("useAuthStore", () => {
     expect(authStore.codexAuthenticated).toBe(true);
   });
 
+  it("keeps authChecked latched during a re-check (no mid-session UI teardown)", async () => {
+    authServiceMocks.getAuthStatus.mockResolvedValue({
+      authenticated: true,
+      hasApiKey: true,
+      email: "user@example.com",
+    });
+    authServiceMocks.getProviders.mockResolvedValue([]);
+    authServiceMocks.codexStatus.mockResolvedValue({ authenticated: false, accountId: null });
+
+    const authStore = useAuthStore();
+    await authStore.checkAuth();
+    expect(authStore.authChecked).toBe(true);
+
+    // Re-check (e.g. the fallback refresh when leaving the settings tab) must
+    // never flip authChecked back to false — App.vue gates the entire layout
+    // on it, and a transient false unmounts and rebuilds every mounted tab.
+    const codexDeferred = createDeferred<{ authenticated: boolean; accountId: string | null }>();
+    authServiceMocks.codexStatus.mockReturnValue(codexDeferred.promise);
+
+    const recheckPromise = authStore.checkAuth();
+    await Promise.resolve();
+    expect(authStore.authChecked).toBe(true);
+
+    codexDeferred.resolve({ authenticated: true, accountId: "acct_123" });
+    await recheckPromise;
+    expect(authStore.authChecked).toBe(true);
+  });
+
   it("keeps the previous codex status when codexStatus fails", async () => {
     authServiceMocks.getAuthStatus.mockResolvedValue({
       authenticated: false,
