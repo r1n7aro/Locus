@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.4 (2026-07-02)"
+description: "Locus v0.5.5 (2026-07-05)"
 sidebarTitle: "Latest Version"
-version: "0.5.4"
-releasedAt: "2026-07-02"
+version: "0.5.5"
+releasedAt: "2026-07-05"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,28 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.5 (Added)
+
+- **Per-file revert.** The changes panel, the diff review window, and a new row context menu can restore a single file to its snapshot from before the current round, without popping the undo stack. If the file has later edits, Locus asks before rolling them back. (#100)
+- **Automatic retry for model requests.** Connection errors, timeouts, HTTP 5xx, and 429 rate limits retry automatically, honoring `Retry-After` on 429. Retries only happen before any output has streamed; the attempt cap is adjustable in General settings (default 3, 0 disables). (#101)
+- **Inline `<think>` tags routed to the thinking channel.** On the chat-completions and OpenRouter paths, inline `<think>…</think>` segments in streamed replies are stripped from the message body and shown as thinking instead (enabled by default).
+- **Subagent limits.** General settings now cap `task` subagent nesting depth and per-session concurrency (default depth 1). Calls over the limit return an error explaining the current caps.
+- **`/dream` memory consolidation skill.** A built-in skill that merges duplicate memories, fixes stale facts, and prunes the Memory index.
+
+### v0.5.5 (Fixed)
+
+- Auto-compaction scales its retention and request budgets to the model's context window and recognizes more provider "prompt too long" errors, so compaction converges on small-context models.
+- Replayed tool-call arguments are normalized before being resent to chat-completions/OpenRouter providers — empty or malformed JSON becomes `{}`; Codex replays stay verbatim. (#94)
+- Workspace file paths resolve lexically, so symlinked files open and reveal correctly. (#100)
+- Smoother streaming of long replies: finished markdown blocks are frozen and only the tail re-parses during streaming.
+- Context token estimates no longer undercount CJK text.
+- Auth re-checks no longer tear down open tabs, and views preload to avoid a flash on first visit.
 
 ### v0.5.4 (Added)
 

@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.5.4 (2026-07-02)"
+description: "Locus v0.5.5 (2026-07-05)"
 sidebarTitle: "当前版本"
-version: "0.5.4"
-releasedAt: "2026-07-02"
+version: "0.5.5"
+releasedAt: "2026-07-05"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,28 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.4/locus_0.5.4_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.5.5（新增）
+
+- **按文件撤回。** 变更面板、diff 审查窗口及新增的行右键菜单支持把单个文件恢复到本轮修改前的快照，不影响撤销栈；若该文件之后还有编辑，会先询问再回滚。(#100)
+- **模型请求自动重试。** 连接错误、超时、HTTP 5xx 与 429 限流自动重试，429 遵循 `Retry-After`；仅在尚未流式产出任何内容前重试；次数可在通用设置调整（默认 3，设 0 关闭）。(#101)
+- **内联 `<think>` 标签转入思考通道。** chat-completions 与 OpenRouter 路径上，流式正文中的 `<think>…</think>` 片段会从消息正文剥离并作为思考过程展示（默认开启）。
+- **子代理限制。** 通用设置新增 `task` 子代理最大嵌套深度与单会话最大并发（默认深度 1）；超限调用会返回错误并说明当前限制。
+- **`/dream` 记忆整理技能。** 内置技能：合并重复记忆、修正过期事实、精简记忆索引。
+
+### v0.5.5（修复）
+
+- 自动压缩的保留与请求预算按模型上下文窗口缩放，并识别更多供应商的「prompt 过长」报错，小上下文模型上的压缩现在能收敛。
+- 回放历史工具调用时规范化 arguments：空或非法 JSON 变为 `{}` 再发给 chat-completions/OpenRouter 供应商；Codex 路径保持逐字不变。(#94)
+- 工作区文件路径改为词法解析，符号链接文件现在能正常打开与定位。(#100)
+- 更流畅的长回复流式渲染：已完成的 markdown 块被冻结，流式期间仅重解析尾部。
+- 上下文 token 估算不再低估中日韩文本。
+- 登录态复查不再重建已打开的标签页；视图预加载，消除首次切换时的闪烁。
 
 ### v0.5.4（新增）
 
