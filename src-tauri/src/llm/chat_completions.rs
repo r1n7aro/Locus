@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::time::Instant;
 
 use super::openrouter::LlmResponse;
+use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
@@ -203,6 +204,7 @@ where
             &on_thinking_delta,
             &on_tool_call_start,
         )? {
+            state.flush_think_filter(&on_text_delta, &on_thinking_delta);
             return finalize_stream_response(
                 tag,
                 model,
@@ -226,6 +228,7 @@ where
         &on_thinking_delta,
         &on_tool_call_start,
     )? {
+        state.flush_think_filter(&on_text_delta, &on_thinking_delta);
         return finalize_stream_response(
             tag,
             model,
@@ -239,6 +242,7 @@ where
         );
     }
 
+    state.flush_think_filter(&on_text_delta, &on_thinking_delta);
     let saw_finish_reason = state.saw_finish_reason;
     finalize_stream_response(
         tag,
@@ -679,6 +683,10 @@ struct ChatStreamState {
     thinking_text: String,
     thinking_started_at: Option<Instant>,
     thinking_duration_secs: u32,
+    /// Reroutes literal `<think>`/`<thinking>` prefixes of the content
+    /// channel into the thinking channel (third-party endpoints that inline
+    /// reasoning as text tags instead of `reasoning_content`).
+    think_filter: ThinkTagFilter,
     reasoning_detail_text_by_key: std::collections::HashMap<String, String>,
     tool_calls_map: std::collections::HashMap<i64, PartialToolCall>,
     finish_reason: String,
@@ -697,6 +705,7 @@ impl ChatStreamState {
             thinking_text: String::new(),
             thinking_started_at: None,
             thinking_duration_secs: 0,
+            think_filter: ThinkTagFilter::new(super::think_tag_filter::strip_enabled()),
             reasoning_detail_text_by_key: std::collections::HashMap::new(),
             tool_calls_map: std::collections::HashMap::new(),
             finish_reason: String::from("stop"),
@@ -772,6 +781,46 @@ impl ChatStreamState {
         }
         if let Some(started_at) = self.thinking_started_at {
             self.thinking_duration_secs = started_at.elapsed().as_secs() as u32;
+        }
+    }
+
+    /// Route one content delta through the think-tag filter: rerouted
+    /// reasoning feeds the thinking channel, the remainder stays content.
+    fn route_content_delta<F, G>(&mut self, raw: &str, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.think_filter.push(raw);
+        self.apply_think_emit(emit, on_text_delta, on_thinking_delta);
+    }
+
+    /// Flush the filter at stream end so an undecided probe prefix or a
+    /// dangling partial close tag still lands in the right channel.
+    fn flush_think_filter<F, G>(&mut self, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.think_filter.finalize();
+        self.apply_think_emit(emit, on_text_delta, on_thinking_delta);
+    }
+
+    fn apply_think_emit<F, G>(&mut self, emit: ThinkTagEmit, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        if emit.is_empty() {
+            return;
+        }
+        if !emit.thinking.is_empty() {
+            self.push_thinking(&emit.thinking, on_thinking_delta);
+        }
+        if !emit.content.is_empty() {
+            self.finish_thinking_timing();
+            self.full_text.push_str(&emit.content);
+            on_text_delta(emit.content);
         }
     }
 }
@@ -948,9 +997,7 @@ fn apply_stream_chunk<F, G, H>(
             state.push_reasoning_details(reasoning_details, on_thinking_delta);
         }
         if let Some(ref content) = choice.delta.content {
-            state.finish_thinking_timing();
-            state.full_text.push_str(content);
-            on_text_delta(content.clone());
+            state.route_content_delta(content, on_text_delta, on_thinking_delta);
         }
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc in tcs {
@@ -1297,7 +1344,7 @@ mod tests {
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
         detect_flavor, drain_sse_buffer, finalize_stream_response, first_incomplete_tool_call,
         summarize_recent_raw_chunk, ChatCompletionsFlavor, ChatStreamState, PartialToolCall,
-        StreamChunk,
+        StreamChunk, ThinkTagFilter,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
@@ -1766,6 +1813,91 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Think more."
         );
+    }
+
+    fn content_chunk(text: &str) -> StreamChunk {
+        serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": { "content": text },
+                "finish_reason": null
+            }]
+        }))
+        .expect("content chunk should parse")
+    }
+
+    #[test]
+    fn inline_think_tag_content_is_rerouted_to_thinking() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+        let thinking = Arc::new(Mutex::new(String::new()));
+        let text = Arc::new(Mutex::new(String::new()));
+        let captured_thinking = thinking.clone();
+        let captured_text = text.clone();
+        let on_thinking = move |delta: String| {
+            captured_thinking
+                .lock()
+                .expect("thinking mutex poisoned")
+                .push_str(&delta);
+        };
+        let on_text = move |delta: String| {
+            captured_text
+                .lock()
+                .expect("text mutex poisoned")
+                .push_str(&delta);
+        };
+
+        // Open tag split across deltas, reasoning streamed, close tag plus
+        // prose in the final delta — the wire shape vLLM/Ollama relays emit.
+        for delta in ["<thi", "nk>先分析问题", "，再给结论", "</think>\n\n结论如下"] {
+            apply_stream_chunk(content_chunk(delta), &mut state, &on_text, &on_thinking, &ignore_tool);
+        }
+        state.flush_think_filter(&on_text, &on_thinking);
+
+        assert_eq!(state.thinking_text, "先分析问题，再给结论");
+        assert_eq!(state.full_text, "结论如下");
+        assert_eq!(
+            thinking.lock().expect("thinking mutex poisoned").as_str(),
+            "先分析问题，再给结论"
+        );
+        assert_eq!(text.lock().expect("text mutex poisoned").as_str(), "结论如下");
+    }
+
+    #[test]
+    fn unclosed_think_tag_stream_lands_in_thinking_on_flush() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+
+        apply_stream_chunk(
+            content_chunk("<thinking>reasoning that never closes"),
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
+        state.flush_think_filter(&ignore_text, &ignore_thinking);
+
+        assert_eq!(state.thinking_text, "reasoning that never closes");
+        assert_eq!(state.full_text, "");
+    }
+
+    #[test]
+    fn ordinary_content_is_untouched_by_think_filter() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+
+        for delta in ["Hello", " world, `<think>` is a literal here"] {
+            apply_stream_chunk(
+                content_chunk(delta),
+                &mut state,
+                &ignore_text,
+                &ignore_thinking,
+                &ignore_tool,
+            );
+        }
+        state.flush_think_filter(&ignore_text, &ignore_thinking);
+
+        assert_eq!(state.full_text, "Hello world, `<think>` is a literal here");
+        assert_eq!(state.thinking_text, "");
     }
 
     #[test]

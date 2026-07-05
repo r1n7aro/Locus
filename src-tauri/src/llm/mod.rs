@@ -11,6 +11,7 @@ pub mod openrouter;
 pub mod responses;
 pub mod retry;
 pub mod streaming;
+pub mod think_tag_filter;
 
 pub(crate) const CODEX_CLIENT_VERSION: &str = "0.124.0";
 

@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 #[derive(Debug, Clone)]
@@ -24,7 +25,88 @@ pub struct LlmResponse {
 
 const DEFAULT_BASE: &str = "https://openrouter.ai";
 
-pub async fn stream_chat<F, H>(
+/// Owns the thinking side of an OpenRouter-shaped stream: reroutes literal
+/// `<think>`/`<thinking>` prefixes of `delta.content` into the thinking
+/// channel (this transport has no structured `reasoning_content` handling,
+/// so text tags are the only way reasoning arrives here) and accumulates
+/// what the response object needs.
+struct ThinkChannel {
+    filter: ThinkTagFilter,
+    thinking_text: String,
+    started_at: Option<std::time::Instant>,
+    duration_secs: u32,
+}
+
+impl ThinkChannel {
+    fn new() -> Self {
+        Self {
+            filter: ThinkTagFilter::new(super::think_tag_filter::strip_enabled()),
+            thinking_text: String::new(),
+            started_at: None,
+            duration_secs: 0,
+        }
+    }
+
+    fn route_content<F, G>(
+        &mut self,
+        full_text: &mut String,
+        raw: &str,
+        on_text_delta: &F,
+        on_thinking_delta: &G,
+    ) where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.filter.push(raw);
+        self.apply(emit, full_text, on_text_delta, on_thinking_delta);
+    }
+
+    /// Flush the filter at stream end (undecided probe prefix → content,
+    /// dangling partial close tag → thinking).
+    fn flush<F, G>(&mut self, full_text: &mut String, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.filter.finalize();
+        self.apply(emit, full_text, on_text_delta, on_thinking_delta);
+    }
+
+    fn apply<F, G>(
+        &mut self,
+        emit: ThinkTagEmit,
+        full_text: &mut String,
+        on_text_delta: &F,
+        on_thinking_delta: &G,
+    ) where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        if !emit.thinking.is_empty() {
+            if self.started_at.is_none() {
+                self.started_at = Some(std::time::Instant::now());
+            }
+            self.thinking_text.push_str(&emit.thinking);
+            on_thinking_delta(emit.thinking);
+        }
+        if !emit.content.is_empty() {
+            self.finish_timing();
+            full_text.push_str(&emit.content);
+            on_text_delta(emit.content);
+        }
+    }
+
+    fn finish_timing(&mut self) {
+        if self.duration_secs > 0 || self.thinking_text.is_empty() {
+            return;
+        }
+        if let Some(started_at) = self.started_at {
+            self.duration_secs = started_at.elapsed().as_secs() as u32;
+        }
+    }
+}
+
+pub async fn stream_chat<F, G, H>(
     api_key: &str,
     model: &str,
     system_prompt: &str,
@@ -37,10 +119,12 @@ pub async fn stream_chat<F, H>(
     reasoning_effort: Option<&str>,
     debug: bool,
     on_text_delta: F,
+    on_thinking_delta: G,
     on_tool_call_start: H,
 ) -> Result<LlmResponse, String>
 where
     F: Fn(String) + Send + 'static,
+    G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
     let tag = provider_tag.unwrap_or("OpenRouter");
@@ -165,6 +249,7 @@ where
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut full_text = String::new();
+    let mut think = ThinkChannel::new();
     let mut raw_response = String::new();
     let mut tool_calls_map: std::collections::HashMap<i64, PartialToolCall> =
         std::collections::HashMap::new();
@@ -215,11 +300,13 @@ where
                 if let Some(data) = line.strip_prefix("data: ") {
                     let data = data.trim();
                     if data == "[DONE]" {
+                        think.flush(&mut full_text, &on_text_delta, &on_thinking_delta);
                         return finalize_stream_response(
                             tag,
                             debug,
                             true,
                             full_text,
+                            think,
                             &tool_calls_map,
                             finish_reason,
                             input_tokens,
@@ -240,8 +327,12 @@ where
                         Ok(chunk) => {
                             if let Some(choice) = chunk.choices.first() {
                                 if let Some(ref content) = choice.delta.content {
-                                    full_text.push_str(content);
-                                    on_text_delta(content.clone());
+                                    think.route_content(
+                                        &mut full_text,
+                                        content,
+                                        &on_text_delta,
+                                        &on_thinking_delta,
+                                    );
                                 }
                                 if let Some(ref tcs) = choice.delta.tool_calls {
                                     for tc in tcs {
@@ -285,11 +376,13 @@ where
             if let Some(data) = line.strip_prefix("data: ") {
                 let data = data.trim();
                 if data == "[DONE]" {
+                    think.flush(&mut full_text, &on_text_delta, &on_thinking_delta);
                     return finalize_stream_response(
                         tag,
                         debug,
                         true,
                         full_text,
+                        think,
                         &tool_calls_map,
                         finish_reason,
                         input_tokens,
@@ -307,8 +400,12 @@ where
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                     if let Some(choice) = chunk.choices.first() {
                         if let Some(ref content) = choice.delta.content {
-                            full_text.push_str(content);
-                            on_text_delta(content.clone());
+                            think.route_content(
+                                &mut full_text,
+                                content,
+                                &on_text_delta,
+                                &on_thinking_delta,
+                            );
                         }
                         if let Some(ref tcs) = choice.delta.tool_calls {
                             for tc in tcs {
@@ -332,11 +429,13 @@ where
         }
     }
 
+    think.flush(&mut full_text, &on_text_delta, &on_thinking_delta);
     finalize_stream_response(
         tag,
         debug,
         false,
         full_text,
+        think,
         &tool_calls_map,
         finish_reason,
         input_tokens,
@@ -354,6 +453,7 @@ fn finalize_stream_response(
     debug: bool,
     got_terminal_event: bool,
     full_text: String,
+    mut think: ThinkChannel,
     tool_calls_map: &std::collections::HashMap<i64, PartialToolCall>,
     mut finish_reason: String,
     input_tokens: u32,
@@ -365,10 +465,15 @@ fn finalize_stream_response(
     raw_response: String,
 ) -> Result<LlmResponse, String> {
     if !got_terminal_event {
-        if !full_text.is_empty() || !tool_calls_map.is_empty() || !raw_response.is_empty() {
+        if !full_text.is_empty()
+            || !think.thinking_text.is_empty()
+            || !tool_calls_map.is_empty()
+            || !raw_response.is_empty()
+        {
             return Err(format!(
-                "Stream ended without [DONE] (incomplete response, text_len={}, tool_calls={}). Refusing to return partial tool calls.",
+                "Stream ended without [DONE] (incomplete response, text_len={}, thinking_len={}, tool_calls={}). Refusing to return partial tool calls.",
                 full_text.len(),
+                think.thinking_text.len(),
                 tool_calls_map.len()
             ));
         }
@@ -380,6 +485,7 @@ fn finalize_stream_response(
         finish_reason = "tool_calls".to_string();
     }
 
+    think.finish_timing();
     let resp = LlmResponse {
         text: full_text,
         tool_calls,
@@ -392,8 +498,8 @@ fn finalize_stream_response(
         cost_usd,
         raw_request,
         raw_response,
-        thinking_text: String::new(),
-        thinking_duration_secs: 0,
+        thinking_text: think.thinking_text,
+        thinking_duration_secs: think.duration_secs,
         thinking_signature: String::new(),
         continuation_request: None,
     };
@@ -830,6 +936,7 @@ mod tests {
     use super::{
         apply_tool_call_delta, build_api_messages, build_request_body, collect_tool_calls,
         finalize_stream_response, usage_totals, PartialToolCall, StreamToolCallDelta, StreamUsage,
+        ThinkChannel,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
@@ -1045,6 +1152,7 @@ mod tests {
             false,
             false,
             String::from("hello"),
+            ThinkChannel::new(),
             &tool_calls,
             String::from("stop"),
             0,
@@ -1071,6 +1179,7 @@ mod tests {
             false,
             true,
             String::from("plain text"),
+            ThinkChannel::new(),
             &HashMap::new(),
             String::from("stop"),
             1,
@@ -1099,6 +1208,7 @@ mod tests {
             false,
             true,
             String::new(),
+            ThinkChannel::new(),
             &tool_calls,
             String::from("stop"),
             0,
@@ -1114,6 +1224,66 @@ mod tests {
         assert_eq!(tool_response.tool_calls[0].id, "call_1");
         assert_eq!(tool_response.tool_calls[0].name, "write_file");
         assert_eq!(tool_response.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn think_channel_reroutes_inline_tag_and_reports_in_response() {
+        let mut think = ThinkChannel {
+            filter: super::ThinkTagFilter::new(true),
+            thinking_text: String::new(),
+            started_at: None,
+            duration_secs: 0,
+        };
+        let mut full_text = String::new();
+        let thinking = Arc::new(Mutex::new(String::new()));
+        let text = Arc::new(Mutex::new(String::new()));
+        let captured_thinking = thinking.clone();
+        let captured_text = text.clone();
+        let on_thinking = move |delta: String| {
+            captured_thinking
+                .lock()
+                .expect("thinking mutex poisoned")
+                .push_str(&delta);
+        };
+        let on_text = move |delta: String| {
+            captured_text
+                .lock()
+                .expect("text mutex poisoned")
+                .push_str(&delta);
+        };
+
+        for delta in ["<think>推理", "过程</think>", "\n答案"] {
+            think.route_content(&mut full_text, delta, &on_text, &on_thinking);
+        }
+        think.flush(&mut full_text, &on_text, &on_thinking);
+
+        assert_eq!(full_text, "答案");
+        assert_eq!(think.thinking_text, "推理过程");
+        assert_eq!(
+            thinking.lock().expect("thinking mutex poisoned").as_str(),
+            "推理过程"
+        );
+        assert_eq!(text.lock().expect("text mutex poisoned").as_str(), "答案");
+
+        let resp = finalize_stream_response(
+            "OpenRouter",
+            false,
+            true,
+            full_text,
+            think,
+            &HashMap::new(),
+            String::from("stop"),
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            String::from("request"),
+            String::from("response"),
+        )
+        .expect("response should finalize");
+        assert_eq!(resp.text, "答案");
+        assert_eq!(resp.thinking_text, "推理过程");
     }
 
     #[test]

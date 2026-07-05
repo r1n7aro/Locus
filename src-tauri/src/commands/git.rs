@@ -5092,6 +5092,7 @@ pub async fn git_generate_commit_message(
             None,
             config.debug_enabled(),
             |_| {},
+            |_| {},
             |_, _| {},
         )
         .await?;
