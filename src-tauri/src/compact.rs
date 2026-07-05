@@ -28,48 +28,95 @@ const ANALYSIS_CLOSE: &str = "</analysis>";
 const SUMMARY_OPEN: &str = "<summary>";
 const SUMMARY_CLOSE: &str = "</summary>";
 
-const POST_COMPACT_MAX_FILES_TO_RESTORE: usize = 4;
-const POST_COMPACT_MAX_TOKENS_PER_FILE: u32 = 1_200;
-const POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET: u32 = 4_000;
+/// First line of every post-compact handoff message. Shared with
+/// `SessionStore` (handoff detection/redaction) and used here to give handoff
+/// messages their own truncation budget inside a follow-up compact request.
+pub const CONTEXT_HANDOFF_MARKER: &str = "## Context Handoff";
+
+const POST_COMPACT_MAX_FILES_TO_RESTORE: usize = 5;
+// Post-compact file restoration scales with the context window: small custom
+// endpoints keep the historical 4k budget, large models get room to actually
+// carry working state across the compact (Claude Code uses 50k against a
+// 200k-only window; we clamp lower because Locus also serves 32k endpoints).
+const POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET_MIN: u32 = 4_000;
+const POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET_MAX: u32 = 16_000;
+const POST_COMPACT_MIN_TOKENS_PER_FILE: u32 = 1_200;
 const COMPACT_REQUEST_BUDGET_MAX_TOKENS: u32 = 150_000;
 const COMPACT_REQUEST_BUDGET_MIN_TOKENS: u32 = 32_000;
+// The compact request is sent through `call_llm` without a per-request
+// max_tokens override, so the request itself must leave headroom inside the
+// context window for the summary output.
+const COMPACT_REQUEST_OUTPUT_RESERVE_TOKENS: u32 = 8_000;
 const COMPACT_RECENT_TAIL_MIN_TOKENS: u32 = 20_000;
 const COMPACT_RECENT_TAIL_MAX_TOKENS: u32 = 40_000;
-pub const COMPACT_USER_MESSAGE_MAX_TOKENS: u32 = 20_000;
-const COMPACT_MAX_USER_MESSAGE_TOKENS: u32 = 2_500;
-const COMPACT_MAX_ASSISTANT_MESSAGE_TOKENS: u32 = 1_600;
-const COMPACT_MAX_TOOL_OUTPUT_TOKENS: u32 = 900;
-const COMPACT_MAX_TOOL_ARGUMENT_TOKENS: u32 = 500;
+/// Ceiling for the token budget of user messages retained verbatim in the
+/// prompt AFTER a compact (applied by `SessionStore::compact_messages`).
+/// Scaled down on small context windows by
+/// `compact_user_message_token_budget`, because a flat 20k retention floor
+/// plus handoff, system prompt, and tool schemas would structurally overflow
+/// a 32k endpoint and make every post-compact state a no-progress state.
+/// Distinct from the `COMPACT_REQUEST_MAX_*` limits below, which truncate
+/// messages inside the one-shot summarization request itself.
+pub const COMPACT_RETAINED_USER_MESSAGES_BUDGET_TOKENS: u32 = 20_000;
+const COMPACT_TRANSCRIPT_MAX_BYTES: u64 = 24 * 1024 * 1024;
+const COMPACT_REQUEST_MAX_USER_MESSAGE_TOKENS: u32 = 2_500;
+// The latest user message drives the "current work" section of the summary
+// and may not survive into the retained set when oversized, so it gets a
+// larger slice of the compact request than older user messages.
+const COMPACT_REQUEST_MAX_LATEST_USER_MESSAGE_TOKENS: u32 = 8_000;
+const COMPACT_REQUEST_MAX_ASSISTANT_MESSAGE_TOKENS: u32 = 1_600;
+// A previous handoff is the sole carrier of everything summarized before it;
+// truncating it like an ordinary assistant message makes chained compactions
+// decay compound, so it keeps a larger slice of the request.
+const COMPACT_REQUEST_MAX_HANDOFF_MESSAGE_TOKENS: u32 = 4_000;
+const COMPACT_REQUEST_MAX_TOOL_OUTPUT_TOKENS: u32 = 900;
+const COMPACT_REQUEST_MAX_TOOL_ARGUMENT_TOKENS: u32 = 500;
 const EMERGENCY_SUMMARY_MAX_ITEMS: usize = 12;
 
-const COMPACT_PROMPT: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+/// The compact summarization prompt. The retention rule must match what
+/// `SessionStore::compact_messages` will actually keep: telling the
+/// summarizer "do not re-list user messages" while nothing survives verbatim
+/// would drop the user's intent from both the summary and the prompt.
+fn compact_prompt_text(has_retained_user_messages: bool) -> String {
+    let retention_rule = if has_retained_user_messages {
+        "- Recent user messages are retained verbatim alongside this handoff, so do not re-list them; spend your budget on work state the raw messages cannot convey."
+    } else {
+        "- No user messages survive verbatim after this compaction, so restate the user's requests, constraints, and corrections in the summary itself, quoting the key instructions verbatim."
+    };
+    let conflict_rule = if has_retained_user_messages {
+        "\nIf any retained raw user message conflicts with the summary, prefer the raw user message.\n"
+    } else {
+        "\n"
+    };
+
+    format!(
+        r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Important rules:
-- Do NOT call Read, Bash, Grep, List, Edit, Write, or any other tool.
+- Do NOT call Read, Bash, Grep, List, Edit, Write, or any other tool. Tool calls will be rejected and waste this turn.
 - Prefer the user's working language when it is obvious from the conversation.
 - Treat this as handoff context, not as a user-facing status update.
-- Be concise, structured, and focused on helping the next LLM continue the work.
+{retention_rule}
+- Be concise in sections 1-3, but give full technical detail in sections 4-7: recent work, errors, and next steps are where handoffs lose the most.
 - Your final answer must contain exactly two plain-text blocks:
   1. <analysis>...</analysis>
   2. <summary>...</summary>
 
-In <analysis>, identify the durable context worth carrying forward:
-- Current progress and key decisions made
-- Important constraints, user preferences, and project conventions
-- Files, commands, errors, and technical details needed to continue
-- What remains to be done and the immediate next step
+In <analysis>, review the conversation chronologically and identify the durable context worth carrying forward: progress, key decisions, constraints, user feedback, files, commands, errors, and what remains to be done.
 
-In <summary>, write only the compact handoff. Include:
-- Primary request and current intent
-- Current progress and decisions
-- Important constraints and references
-- Files and code areas that matter
-- Open issues, risks, and next steps
-
-Recent user messages may remain after this handoff. If any retained raw user message conflicts with the summary, prefer the raw user message.
-"#;
+In <summary>, write the compact handoff with these sections:
+1. Primary Request and Intent
+2. Key Decisions and Constraints (user preferences, corrections, project conventions)
+3. Files and Code Areas (paths that matter and what changed in each)
+4. Errors and Fixes (each error hit, how it was resolved, any user correction on the fix)
+5. Current Work (precisely what was in progress right before this checkpoint: files, symbols, commands, partial edits; include short verbatim snippets when they are needed to resume exactly)
+6. Open Issues and Risks
+7. Next Step (directly in line with the most recent work; quote the relevant recent request or plan line verbatim so the next LLM resumes without drift)
+{conflict_rule}"#
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 enum RestorableToolKind {
@@ -101,6 +148,21 @@ struct RestoredFileContext {
 pub struct CompactTracker {
     pub consecutive_failures: u32,
     pub compacted: bool,
+    /// Set when a compact "succeeded" but the resulting context still sits
+    /// above the auto-compact threshold (system prompt + tool schemas +
+    /// retained messages don't fit), or when the provider still rejected the
+    /// prompt right after a compact. Further automatic compaction would burn
+    /// an LLM call per iteration without making progress, so it is suppressed
+    /// until enough new material accumulates; manual compact stays available.
+    pub no_progress: bool,
+    /// RAW (uncalibrated) estimated context tokens at the moment
+    /// `no_progress` was recorded. Once the raw estimate grows well past this
+    /// baseline there is new compactable material, so automatic compaction
+    /// gets another chance. Callers must record and compare on the same raw
+    /// byte-heuristic scale: a calibrated value inflates by the provider
+    /// tokenizer ratio and would fake growth right after the first
+    /// post-compact usage sample.
+    no_progress_baseline_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -117,11 +179,48 @@ impl CompactTracker {
         Self {
             consecutive_failures: 0,
             compacted: false,
+            no_progress: false,
+            no_progress_baseline_tokens: 0,
         }
     }
 
     pub fn is_circuit_broken(&self) -> bool {
         self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+    }
+
+    /// Automatic compaction (preflight and reactive) should be skipped.
+    pub fn is_suppressed(&self) -> bool {
+        self.is_circuit_broken() || self.no_progress
+    }
+
+    pub fn record_no_progress(&mut self, baseline_tokens: u32) {
+        self.no_progress = true;
+        self.no_progress_baseline_tokens = baseline_tokens;
+        eprintln!(
+            "[Compact] compaction made no progress at ~{} estimated tokens; suppressing automatic compaction until the context grows",
+            baseline_tokens
+        );
+    }
+
+    /// Clear `no_progress` once the estimate has grown at least `margin`
+    /// tokens past the recorded baseline: the growth is new compactable
+    /// material a fresh compact can fold away, unlike the retained floor that
+    /// caused the no-progress verdict.
+    pub fn reset_no_progress_if_grown(&mut self, current_tokens: u32, margin: u32) {
+        if !self.no_progress {
+            return;
+        }
+        if current_tokens
+            > self
+                .no_progress_baseline_tokens
+                .saturating_add(margin.max(1))
+        {
+            self.no_progress = false;
+            eprintln!(
+                "[Compact] context grew from ~{} to ~{} estimated tokens since the no-progress compact; re-enabling automatic compaction",
+                self.no_progress_baseline_tokens, current_tokens
+            );
+        }
     }
 
     pub fn record_success(&mut self) {
@@ -231,10 +330,25 @@ pub fn calibrated_input_tokens(
         (estimated_tokens as f64 * ESTIMATE_CALIBRATION_RATIO_MAX).min(u32::MAX as f64) as u32;
     let floor = persisted_context_tokens.min(floor_cap);
 
-    calibrated.max(floor).max(estimated_tokens)
+    // Anchor-plus-delta candidate: the provider's real usage for the sampled
+    // request plus the estimated growth since then (both estimates share the
+    // same byte heuristic, so their difference is the increment estimate).
+    // The multiplicative ratio above over-corrects when the NEW content's
+    // density differs from the old (e.g. CJK-heavy history, English delta);
+    // the additive form is exact for the already-measured prefix. Take the
+    // max of both so the trigger errs toward compacting early.
+    let additive = calibration_sample
+        .filter(|(actual, estimated)| *actual > 0 && *estimated > 0)
+        .map(|(actual, estimated)| {
+            actual.saturating_add(estimated_tokens.saturating_sub(estimated))
+        })
+        .unwrap_or(0)
+        .min(floor_cap);
+
+    calibrated.max(floor).max(estimated_tokens).max(additive)
 }
 
-fn auto_compact_buffer(context_limit: u32) -> u32 {
+pub fn auto_compact_buffer(context_limit: u32) -> u32 {
     (context_limit / 20).clamp(
         AUTO_COMPACT_BUFFER_MIN_TOKENS,
         AUTO_COMPACT_BUFFER_MAX_TOKENS,
@@ -296,8 +410,17 @@ fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
     total
 }
 
-pub fn compact_user_message_token_budget() -> u32 {
-    COMPACT_USER_MESSAGE_MAX_TOKENS
+/// Budget for user messages retained verbatim across a compact, scaled to the
+/// context window: a quarter of the window, capped at the historical 20k.
+/// On a 32k endpoint the post-compact floor (handoff + retained users +
+/// system prompt + tool schemas) must stay clearly below the window, or every
+/// compact ends in a no-progress state. `context_limit == 0` (unknown window)
+/// keeps the legacy flat budget.
+pub fn compact_user_message_token_budget(context_limit: u32) -> u32 {
+    if context_limit == 0 {
+        return COMPACT_RETAINED_USER_MESSAGES_BUDGET_TOKENS;
+    }
+    (context_limit / 4).min(COMPACT_RETAINED_USER_MESSAGES_BUDGET_TOKENS)
 }
 
 pub fn select_recent_user_message_ids_for_compact_prompt(
@@ -331,7 +454,9 @@ pub fn select_recent_user_message_ids_for_compact_prompt(
 pub fn has_compactable_messages_before_boundary(
     messages: &[ChatMessage],
     boundary_idx: usize,
+    context_limit: u32,
 ) -> bool {
+    let retained_budget = compact_user_message_token_budget(context_limit);
     let mut user_tokens = 0u32;
     for message in messages.iter().take(boundary_idx.min(messages.len())) {
         if !is_real_user_message(message) {
@@ -339,7 +464,7 @@ pub fn has_compactable_messages_before_boundary(
         }
 
         user_tokens = user_tokens.saturating_add(estimate_message_prompt_tokens(message));
-        if user_tokens > COMPACT_USER_MESSAGE_MAX_TOKENS {
+        if user_tokens > retained_budget {
             return true;
         }
     }
@@ -383,45 +508,21 @@ pub fn prepare_messages_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     crate::session::history::materialize_prompt_edits(&normalized)
 }
 
-#[allow(dead_code)]
-pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut compact_messages = prepare_messages_for_llm(messages);
-
-    compact_messages.push(ChatMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: MessageRole::User,
-        content: COMPACT_PROMPT.to_string(),
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        prompt_prefix: None,
-        prompt_suffix: None,
-        response_id: None,
-        content_order: None,
-        thinking_order: None,
-        tool_calls: None,
-        tool_call_id: None,
-        images: None,
-        asset_refs: None,
-        thinking_content: None,
-        thinking_duration: None,
-        thinking_signature: None,
-        knowledge_proposal: None,
-        render_parts: None,
-    });
-
-    compact_messages
-}
-
 pub fn compact_request_token_budget(context_limit: u32) -> u32 {
     if context_limit == 0 {
         return COMPACT_REQUEST_BUDGET_MIN_TOKENS;
     }
-    (context_limit.saturating_mul(3) / 5).clamp(
-        COMPACT_REQUEST_BUDGET_MIN_TOKENS,
-        COMPACT_REQUEST_BUDGET_MAX_TOKENS,
-    )
+    // The 32k MIN clamp exists for large windows; on windows at or below it
+    // the budget must instead stay under the window minus output headroom,
+    // otherwise the request alone can fill the whole context and the summary
+    // has no room to stream back.
+    let output_reserve = (context_limit / 4).min(COMPACT_REQUEST_OUTPUT_RESERVE_TOKENS);
+    (context_limit.saturating_mul(3) / 5)
+        .clamp(
+            COMPACT_REQUEST_BUDGET_MIN_TOKENS,
+            COMPACT_REQUEST_BUDGET_MAX_TOKENS,
+        )
+        .min(context_limit.saturating_sub(output_reserve))
 }
 
 pub fn compact_recent_tail_token_budget(context_limit: u32) -> u32 {
@@ -434,16 +535,42 @@ pub fn compact_recent_tail_token_budget(context_limit: u32) -> u32 {
     )
 }
 
+/// (total_budget, per_file_budget) for post-compact file restoration, scaled
+/// to the context window so large models carry more working state across the
+/// compact while 32k endpoints keep the historical 4k budget.
+fn post_compact_restore_budgets(context_limit: u32) -> (u32, u32) {
+    let total = if context_limit == 0 {
+        POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET_MIN
+    } else {
+        (context_limit / 16).clamp(
+            POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET_MIN,
+            POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET_MAX,
+        )
+    };
+    let per_file = (total / 4).max(POST_COMPACT_MIN_TOKENS_PER_FILE);
+    (total, per_file)
+}
+
+/// Truncate to a UTF-8-safe byte prefix of `max_tokens * APPROX_BYTES_PER_TOKEN`.
+/// Byte-based to stay consistent with `estimate_text_tokens`: a char-based cut
+/// lets CJK content through at ~3x the nominal token budget.
 fn truncate_to_token_budget(content: &str, max_tokens: u32) -> (String, bool) {
-    let max_chars = max_tokens.max(1) as usize * 4;
-    if content.chars().count() <= max_chars {
+    let max_bytes = max_tokens.max(1) as usize * APPROX_BYTES_PER_TOKEN;
+    if content.len() <= max_bytes {
         return (content.to_string(), false);
     }
-    let truncated: String = content.chars().take(max_chars).collect();
+    let mut end = 0usize;
+    for (idx, ch) in content.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
     (
         format!(
-            "{}\n\n[truncated for compact request: {} chars total]",
-            truncated.trim_end(),
+            "{}\n\n[truncated: {} chars total]",
+            content[..end].trim_end(),
             content.chars().count()
         ),
         true,
@@ -454,14 +581,14 @@ fn sanitize_tool_call_for_compact(tool_call: &ToolCallInfo) -> (ToolCallInfo, bo
     let mut sanitized = tool_call.clone();
     let mut truncated = false;
     let (arguments, arguments_truncated) =
-        truncate_to_token_budget(&sanitized.arguments, COMPACT_MAX_TOOL_ARGUMENT_TOKENS);
+        truncate_to_token_budget(&sanitized.arguments, COMPACT_REQUEST_MAX_TOOL_ARGUMENT_TOKENS);
     sanitized.arguments = arguments;
     truncated |= arguments_truncated;
     sanitized.recorded_output = None;
 
     if let Some(output) = sanitized.server_tool_output.take() {
         let (output, output_truncated) =
-            truncate_to_token_budget(&output, COMPACT_MAX_TOOL_OUTPUT_TOKENS);
+            truncate_to_token_budget(&output, COMPACT_REQUEST_MAX_TOOL_OUTPUT_TOKENS);
         sanitized.server_tool_output = Some(output);
         truncated |= output_truncated;
     }
@@ -483,14 +610,23 @@ fn sanitize_tool_call_for_compact(tool_call: &ToolCallInfo) -> (ToolCallInfo, bo
     (sanitized, truncated)
 }
 
-fn sanitize_message_for_compact(message: &ChatMessage) -> (ChatMessage, bool) {
+fn sanitize_message_for_compact(
+    message: &ChatMessage,
+    is_latest_real_user_message: bool,
+) -> (ChatMessage, bool) {
     let mut sanitized = message.clone();
     let mut truncated = false;
 
     let max_tokens = match sanitized.role {
-        MessageRole::User => COMPACT_MAX_USER_MESSAGE_TOKENS,
-        MessageRole::Assistant => COMPACT_MAX_ASSISTANT_MESSAGE_TOKENS,
-        MessageRole::Tool => COMPACT_MAX_TOOL_OUTPUT_TOKENS,
+        MessageRole::User if is_latest_real_user_message => {
+            COMPACT_REQUEST_MAX_LATEST_USER_MESSAGE_TOKENS
+        }
+        MessageRole::User => COMPACT_REQUEST_MAX_USER_MESSAGE_TOKENS,
+        MessageRole::Assistant if sanitized.content.starts_with(CONTEXT_HANDOFF_MARKER) => {
+            COMPACT_REQUEST_MAX_HANDOFF_MESSAGE_TOKENS
+        }
+        MessageRole::Assistant => COMPACT_REQUEST_MAX_ASSISTANT_MESSAGE_TOKENS,
+        MessageRole::Tool => COMPACT_REQUEST_MAX_TOOL_OUTPUT_TOKENS,
     };
     let (content, content_truncated) = truncate_to_token_budget(&sanitized.content, max_tokens);
     sanitized.content = if sanitized.role == MessageRole::Tool
@@ -593,6 +729,72 @@ fn prune_tool_results_without_visible_calls(messages: &mut Vec<ChatMessage>) -> 
     before.saturating_sub(messages.len())
 }
 
+/// Rewrite tool interactions as plain text for the compact request.
+///
+/// The compact request is a one-shot summarization call sent WITHOUT tool
+/// definitions, but providers validate tool-call structure on replay:
+/// Anthropic rejects `tool_use`/`tool_result` blocks when the request defines
+/// no tools, and OpenAI Responses rejects `function_call_output` items whose
+/// `function_call` is missing. Flattening every tool interaction into text
+/// sidesteps structural validation on all backends while keeping the call
+/// trace visible to the summarizer. Assistant `tool_calls` become bracketed
+/// call notes appended to the message text; each Tool message becomes a
+/// user-role text message, which also preserves role alternation for
+/// providers that require it.
+///
+/// Does not add or remove messages, so indices computed before the call stay
+/// valid.
+fn flatten_tool_interactions_for_compact(messages: &mut [ChatMessage]) {
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            for tool_call in tool_calls {
+                if !tool_call.id.is_empty() {
+                    call_names.insert(tool_call.id.clone(), tool_call.name.clone());
+                }
+            }
+        }
+    }
+
+    for message in messages.iter_mut() {
+        match message.role {
+            MessageRole::Assistant => {
+                let Some(tool_calls) = message.tool_calls.take() else {
+                    continue;
+                };
+                let mut rendered = String::new();
+                for tool_call in &tool_calls {
+                    rendered.push_str(&format!(
+                        "\n\n[Tool call: {}({})]",
+                        tool_call.name, tool_call.arguments
+                    ));
+                    if let Some(output) = tool_call.server_tool_output.as_deref() {
+                        rendered.push_str(&format!(
+                            "\n[{} output]\n{}",
+                            tool_call.name, output
+                        ));
+                    }
+                }
+                message.content = format!("{}{}", message.content.trim_end(), rendered)
+                    .trim()
+                    .to_string();
+            }
+            MessageRole::Tool => {
+                let label = message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| call_names.get(id))
+                    .map(String::as_str)
+                    .unwrap_or("tool");
+                message.content = format!("[{} result]\n{}", label, message.content);
+                message.role = MessageRole::User;
+                message.tool_call_id = None;
+            }
+            MessageRole::User => {}
+        }
+    }
+}
+
 pub fn find_compact_boundary_by_budget(
     messages: &[ChatMessage],
     target_recent_tokens: u32,
@@ -636,12 +838,21 @@ pub fn build_compact_request_with_budget(
     let boundary_idx =
         find_compact_boundary_by_budget(messages, compact_recent_tail_token_budget(context_limit));
     let budget_tokens = compact_request_token_budget(context_limit);
+    // The prompt's retention rule must mirror what the store will actually
+    // keep, computed on the same raw message set the store re-selects from.
+    let compact_prompt = compact_prompt_text(will_retain_user_messages(messages, context_limit));
     let prepared = prepare_messages_for_llm(messages);
+    let latest_real_user_id = prepared
+        .iter()
+        .rev()
+        .find(|message| is_real_user_message(message))
+        .map(|message| message.id.clone());
     let mut truncated = false;
     let mut compact_messages: Vec<ChatMessage> = prepared
         .iter()
         .map(|message| {
-            let (message, was_truncated) = sanitize_message_for_compact(message);
+            let is_latest_user = latest_real_user_id.as_deref() == Some(message.id.as_str());
+            let (message, was_truncated) = sanitize_message_for_compact(message, is_latest_user);
             truncated |= was_truncated;
             message
         })
@@ -649,11 +860,18 @@ pub fn build_compact_request_with_budget(
     if prune_tool_results_without_visible_calls(&mut compact_messages) > 0 {
         truncated = true;
     }
+    // Locate the first real user message BEFORE flattening: flattening turns
+    // Tool messages into user-role text, which would otherwise satisfy the
+    // "first user message" probe used by the reduced fallback below.
+    let first_user = compact_messages
+        .iter()
+        .position(|message| message.role == MessageRole::User && message.tool_call_id.is_none());
+    flatten_tool_interactions_for_compact(&mut compact_messages);
 
     compact_messages.push(ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::User,
-        content: COMPACT_PROMPT.to_string(),
+        content: compact_prompt,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -688,9 +906,6 @@ pub fn build_compact_request_with_budget(
     let prompt = compact_messages
         .pop()
         .expect("compact prompt should have been appended");
-    let first_user = compact_messages
-        .iter()
-        .position(|message| message.role == MessageRole::User && message.tool_call_id.is_none());
     let mut reduced = Vec::new();
     if let Some(first_user_idx) = first_user {
         reduced.push(compact_messages[first_user_idx].clone());
@@ -717,7 +932,9 @@ pub fn build_compact_request_with_budget(
 
     let marker_insert_idx = reduced.len();
     reduced.extend(tail);
-    prune_tool_results_without_visible_calls(&mut reduced);
+    // No orphan pruning here: flattening already rewrote every Tool message
+    // as user-role text, so a tail sliced mid-round carries no structural
+    // tool_result references a provider could reject.
 
     let omitted = compact_messages.len().saturating_sub(reduced.len());
     if omitted > 0 {
@@ -860,19 +1077,19 @@ pub fn build_emergency_compact_summary(
                 *tool_counts.entry(tool_call.name.clone()).or_default() += 1;
             }
         }
-        if message.role == MessageRole::Tool {
-            if is_persisted_output_reference(&message.content) {
-                large_outputs.push(compact_line(&message.content, 350));
-            } else if estimate_text_tokens(&message.content) > COMPACT_MAX_TOOL_OUTPUT_TOKENS {
-                large_outputs.push(format!(
-                    "tool_call_id={} large output omitted ({} chars)",
-                    message.tool_call_id.as_deref().unwrap_or("unknown"),
-                    message.content.chars().count()
-                ));
-            }
+        // Capping large-output previews must not stop the tool-count scan, or
+        // the "Tool Calls Made Before Compact" section silently undercounts.
+        if message.role != MessageRole::Tool || large_outputs.len() >= 6 {
+            continue;
         }
-        if large_outputs.len() >= 6 {
-            break;
+        if is_persisted_output_reference(&message.content) {
+            large_outputs.push(compact_line(&message.content, 350));
+        } else if estimate_text_tokens(&message.content) > COMPACT_REQUEST_MAX_TOOL_OUTPUT_TOKENS {
+            large_outputs.push(format!(
+                "tool_call_id={} large output omitted ({} chars)",
+                message.tool_call_id.as_deref().unwrap_or("unknown"),
+                message.content.chars().count()
+            ));
         }
     }
 
@@ -904,7 +1121,7 @@ pub fn build_emergency_compact_summary(
         .join("\n");
 
     format!(
-        "1. Primary Request and Intent\n{}\n\n2. All User Messages\n{}\n\n3. Current State of the Work\nEmergency local compact was used because the compact LLM request could not be safely sent: {}.\n\n4. Important Technical Context\nRecent raw messages after this handoff remain in the prompt and take precedence over this summary.\n\n5. Files and Code Areas Touched\nNo deterministic file list is available from local emergency compact. Use recent raw tool calls and restored file context below.\n\n6. Recent Decisions and Why They Matter\n{}\n\n7. Open Issues, Risks, or Follow-ups\nThe LLM summary was skipped. Some middle conversation details may be omitted; large tool outputs are represented by persisted references or short previews.\n\n8. Latest User Feedback and Constraints\n{}\n\n9. Immediate Next Step\nContinue from the recent raw tail, using the latest user request and any surviving todo/tool context.\n\nTool Calls Made Before Compact\n{}\n\nLarge Outputs Omitted\n{}\n\nRecent Raw Tail Preview\n{}",
+        "1. Primary Request and Intent\n{}\n\n2. All User Messages\n{}\n\n3. Current State of the Work\nEmergency local compact was used because the compact LLM request could not be safely sent: {}.\n\n4. Important Technical Context\nOnly recent user messages (if any) are retained verbatim after this handoff and take precedence over this summary; assistant and tool messages do not survive compaction.\n\n5. Files and Code Areas Touched\nNo deterministic file list is available from local emergency compact. Use the tool-call overview and restored file context below.\n\n6. Recent Decisions and Why They Matter\n{}\n\n7. Open Issues, Risks, or Follow-ups\nThe LLM summary was skipped. Some middle conversation details may be omitted; large tool outputs are represented by persisted references or short previews.\n\n8. Latest User Feedback and Constraints\n{}\n\n9. Immediate Next Step\nContinue from the latest user request, using the tool-call overview, the raw tail preview, and any restored file context in this handoff.\n\nTool Calls Made Before Compact\n{}\n\nLarge Outputs Omitted\n{}\n\nRecent Raw Tail Preview\n{}",
         latest_user,
         if user_messages.is_empty() {
             "- empty".to_string()
@@ -1112,15 +1329,22 @@ fn parse_unity_yaml_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequ
 }
 
 fn truncate_for_token_budget(content: &str, max_tokens: u32) -> String {
-    let max_chars = (max_tokens as usize).saturating_mul(4);
-    if content.chars().count() <= max_chars {
+    let max_bytes = (max_tokens as usize).saturating_mul(APPROX_BYTES_PER_TOKEN);
+    if content.len() <= max_bytes {
         return content.to_string();
     }
 
-    let truncated: String = content.chars().take(max_chars).collect();
+    let mut end = 0usize;
+    for (idx, ch) in content.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
     format!(
         "{}\n\n(Post-compact restored context truncated to fit budget.)",
-        truncated.trim_end()
+        content[..end].trim_end()
     )
 }
 
@@ -1175,17 +1399,18 @@ fn resolve_prior_tool_output(content: &str) -> Option<String> {
     Some(content.to_string())
 }
 
-fn prior_tool_result_excerpt(content: &str, kind: &RestorableToolKind) -> Option<String> {
+fn prior_tool_result_excerpt(
+    content: &str,
+    kind: &RestorableToolKind,
+    max_tokens_per_file: u32,
+) -> Option<String> {
     let raw_output = resolve_prior_tool_output(content)?;
     match kind {
         RestorableToolKind::Read => {
             if !raw_output.trim_start().starts_with("<content>") {
                 return None;
             }
-            Some(truncate_for_token_budget(
-                &raw_output,
-                POST_COMPACT_MAX_TOKENS_PER_FILE,
-            ))
+            Some(truncate_for_token_budget(&raw_output, max_tokens_per_file))
         }
         RestorableToolKind::UnityYamlList
         | RestorableToolKind::UnityYamlSearch
@@ -1193,10 +1418,7 @@ fn prior_tool_result_excerpt(content: &str, kind: &RestorableToolKind) -> Option
             if raw_output.trim().is_empty() {
                 return None;
             }
-            Some(truncate_for_token_budget(
-                &raw_output,
-                POST_COMPACT_MAX_TOKENS_PER_FILE,
-            ))
+            Some(truncate_for_token_budget(&raw_output, max_tokens_per_file))
         }
     }
 }
@@ -1206,6 +1428,7 @@ fn read_current_file_excerpt(
     offset: usize,
     limit: usize,
     display_path: &str,
+    max_tokens_per_file: u32,
 ) -> Option<String> {
     let metadata = std::fs::metadata(resolved_path).ok()?;
     if !metadata.is_file() {
@@ -1219,20 +1442,24 @@ fn read_current_file_excerpt(
     let end = (start + limit).min(total);
     let selected = &lines[start..end];
 
-    let max_chars = (POST_COMPACT_MAX_TOKENS_PER_FILE as usize).saturating_mul(4);
+    // Byte-based like `truncate_to_token_budget`, so CJK-heavy files do not
+    // overshoot the per-file token budget by ~3x.
+    let max_bytes = (max_tokens_per_file as usize).saturating_mul(APPROX_BYTES_PER_TOKEN);
     let mut result_lines = Vec::new();
-    let mut used_chars = 0usize;
+    let mut used_bytes = 0usize;
     let mut truncated = false;
 
     for (index, line) in selected.iter().enumerate() {
-        let line_len = line.chars().count();
-        if used_chars + line_len + 1 > max_chars {
+        // +8 covers the "{:>6}\t" numbering prefix and the newline, so
+        // short-line files cannot silently overshoot the byte budget.
+        let line_len = line.len() + 8;
+        if used_bytes + line_len > max_bytes {
             truncated = true;
             break;
         }
         // Same cat -n numbering as the live read tool output.
         result_lines.push(format!("{:>6}\t{}", start + index + 1, line));
-        used_chars += line_len + 1;
+        used_bytes += line_len;
     }
 
     if result_lines.is_empty() {
@@ -1263,6 +1490,7 @@ fn read_current_unity_yaml_excerpt(
     resolved_path: &Path,
     request: &RestorableToolRequest,
     display_path: &str,
+    max_tokens_per_file: u32,
 ) -> Option<String> {
     let metadata = std::fs::metadata(resolved_path).ok()?;
     if !metadata.is_file() {
@@ -1283,7 +1511,7 @@ fn read_current_unity_yaml_excerpt(
         }
         return Some(truncate_for_token_budget(
             output.trim_end(),
-            POST_COMPACT_MAX_TOKENS_PER_FILE,
+            max_tokens_per_file,
         ));
     }
 
@@ -1337,7 +1565,7 @@ fn read_current_unity_yaml_excerpt(
         };
         return Some(truncate_for_token_budget(
             &output,
-            POST_COMPACT_MAX_TOKENS_PER_FILE,
+            max_tokens_per_file,
         ));
     }
 
@@ -1396,10 +1624,7 @@ fn read_current_unity_yaml_excerpt(
                         None,
                         &stripped,
                     );
-                    return Some(truncate_for_token_budget(
-                        &detail,
-                        POST_COMPACT_MAX_TOKENS_PER_FILE,
-                    ));
+                    return Some(truncate_for_token_budget(&detail, max_tokens_per_file));
                 }
             }
 
@@ -1447,19 +1672,19 @@ fn read_current_unity_yaml_excerpt(
         output.push_str(&resolved);
     }
 
-    Some(truncate_for_token_budget(
-        &output,
-        POST_COMPACT_MAX_TOKENS_PER_FILE,
-    ))
+    Some(truncate_for_token_budget(&output, max_tokens_per_file))
 }
 
 pub fn build_post_compact_restored_files_section(
     pruned_messages: &[ChatMessage],
     working_dir: &str,
+    context_limit: u32,
 ) -> String {
     if pruned_messages.is_empty() || working_dir.trim().is_empty() {
         return String::new();
     }
+    let (total_file_token_budget, max_tokens_per_file) =
+        post_compact_restore_budgets(context_limit);
 
     let tool_results: HashMap<&str, &str> = pruned_messages
         .iter()
@@ -1497,7 +1722,7 @@ pub fn build_post_compact_restored_files_section(
                 tool_results.get(tc.id.as_str())
             {
                 if let Some(exact_excerpt) =
-                    prior_tool_result_excerpt(raw_tool_result, &request.kind)
+                    prior_tool_result_excerpt(raw_tool_result, &request.kind, max_tokens_per_file)
                 {
                     let source_note = match request.kind {
                         RestorableToolKind::Read => {
@@ -1521,12 +1746,16 @@ pub fn build_post_compact_restored_files_section(
                             request.offset,
                             request.limit,
                             &display_path,
+                            max_tokens_per_file,
                         ),
                         RestorableToolKind::UnityYamlList
                         | RestorableToolKind::UnityYamlSearch
-                        | RestorableToolKind::UnityYamlRead => {
-                            read_current_unity_yaml_excerpt(&resolved_path, &request, &display_path)
-                        }
+                        | RestorableToolKind::UnityYamlRead => read_current_unity_yaml_excerpt(
+                            &resolved_path,
+                            &request,
+                            &display_path,
+                            max_tokens_per_file,
+                        ),
                     };
 
                     let Some(refreshed_content) = refreshed else {
@@ -1555,12 +1784,16 @@ pub fn build_post_compact_restored_files_section(
                         request.offset,
                         request.limit,
                         &display_path,
+                        max_tokens_per_file,
                     ),
                     RestorableToolKind::UnityYamlList
                     | RestorableToolKind::UnityYamlSearch
-                    | RestorableToolKind::UnityYamlRead => {
-                        read_current_unity_yaml_excerpt(&resolved_path, &request, &display_path)
-                    }
+                    | RestorableToolKind::UnityYamlRead => read_current_unity_yaml_excerpt(
+                        &resolved_path,
+                        &request,
+                        &display_path,
+                        max_tokens_per_file,
+                    ),
                 };
 
                 let Some(rebuilt_content) = rebuilt else {
@@ -1588,7 +1821,7 @@ pub fn build_post_compact_restored_files_section(
                 .saturating_add(estimate_text_tokens(&content))
                 .saturating_add(24);
 
-            if used_tokens.saturating_add(candidate_tokens) > POST_COMPACT_TOTAL_FILE_TOKEN_BUDGET {
+            if used_tokens.saturating_add(candidate_tokens) > total_file_token_budget {
                 continue;
             }
 
@@ -1628,13 +1861,30 @@ pub fn build_post_compact_restored_files_section(
 fn build_handoff_content(
     summary: &str,
     restored_files_section: &str,
-    has_recent_messages: bool,
+    has_retained_user_messages: bool,
+    transcript: Option<&CompactTranscriptExport>,
 ) -> String {
-    let recent_note = if has_recent_messages {
-        "Recent verbatim messages remain below this handoff. If anything conflicts, prefer the newer verbatim messages."
+    let recent_note = if has_retained_user_messages {
+        "Recent user messages are retained verbatim below this handoff. If anything conflicts, prefer the retained user messages."
     } else {
-        "No newer verbatim messages follow this handoff. Treat the summary below as the full carry-forward context."
+        "No verbatim messages follow this handoff. Treat the summary below as the full carry-forward context."
     };
+
+    let transcript_note = transcript
+        .map(|export| {
+            if export.latest_segment_omitted {
+                format!(
+                    "\n- A pre-compact transcript of EARLIER compaction rounds exists at: {} (it reached its size cap, so the segment for this round was omitted)",
+                    export.path
+                )
+            } else {
+                format!(
+                    "\n- If details you need are missing from this summary (exact code, command output, earlier decisions), read the full pre-compact transcript at: {}",
+                    export.path
+                )
+            }
+        })
+        .unwrap_or_default();
 
     let restored_files_block = if restored_files_section.trim().is_empty() {
         String::new()
@@ -1643,23 +1893,34 @@ fn build_handoff_content(
     };
 
     format!(
-        "## Context Handoff\n\nThis session was compacted to stay within the model context window. The note below is a handoff summary of the earlier conversation so work can continue without losing context.\n\n- Treat this as handoff context, not as a new user request.\n- Preserve the user's goals, constraints, file references, and unfinished work.\n- {}\n\n### Earlier Conversation Summary\n\n{}{}",
+        "{}\n\nThis session was compacted to stay within the model context window. The note below is a handoff summary of the earlier conversation so work can continue without losing context.\n\n- Treat this as handoff context, not as a new user request.\n- Preserve the user's goals, constraints, file references, and unfinished work.\n- {}{}\n\n### Earlier Conversation Summary\n\n{}{}",
+        CONTEXT_HANDOFF_MARKER,
         recent_note,
+        transcript_note,
         summary.trim(),
         restored_files_block
     )
 }
 
+/// `has_retained_user_messages` should reflect what actually survives in the
+/// prompt after `SessionStore::compact_messages` (the recent-user-message
+/// retention set), not the summary boundary position.
 pub fn build_post_compact_message(
     summary: &str,
     restored_files_section: &str,
     earliest_kept_ts: i64,
-    has_recent_messages: bool,
+    has_retained_user_messages: bool,
+    transcript: Option<&CompactTranscriptExport>,
 ) -> ChatMessage {
     ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::Assistant,
-        content: build_handoff_content(summary, restored_files_section, has_recent_messages),
+        content: build_handoff_content(
+            summary,
+            restored_files_section,
+            has_retained_user_messages,
+            transcript,
+        ),
         created_at: earliest_kept_ts - 1,
         prompt_prefix: None,
         prompt_suffix: None,
@@ -1686,6 +1947,114 @@ pub fn find_compact_boundary(messages: &[ChatMessage]) -> usize {
         }
     }
     messages.len() / 2
+}
+
+/// Whether `SessionStore::compact_messages` will retain any user message
+/// verbatim in the post-compact prompt. Mirrors the retention selection it
+/// performs (same selector, same budget) so the handoff text can describe
+/// what actually survives.
+pub fn will_retain_user_messages(messages: &[ChatMessage], context_limit: u32) -> bool {
+    !select_recent_user_message_ids_for_compact_prompt(
+        messages,
+        messages.len(),
+        compact_user_message_token_budget(context_limit),
+    )
+    .is_empty()
+}
+
+fn transcript_role_label(message: &ChatMessage) -> &'static str {
+    match message.role {
+        MessageRole::User => "User",
+        MessageRole::Assistant => "Assistant",
+        MessageRole::Tool => "Tool result",
+    }
+}
+
+fn transcript_capacity_reached(existing_len: u64) -> bool {
+    existing_len >= COMPACT_TRANSCRIPT_MAX_BYTES
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactTranscriptExport {
+    pub path: String,
+    /// The transcript file had already reached its size cap, so this round's
+    /// segment was replaced by an omission marker: the file holds earlier
+    /// compaction rounds only, and the handoff note must not advertise it as
+    /// the full transcript.
+    pub latest_segment_omitted: bool,
+}
+
+/// Append the pre-compact conversation to a per-session transcript file under
+/// the app temp directory (which the read tool may access even with the
+/// workspace boundary enabled), and return the file path for the handoff
+/// note. Appends rather than overwrites so earlier compaction rounds stay
+/// recoverable; once the file reaches the size cap, only a short omission
+/// marker is appended per round so a degenerate compact loop cannot fill the
+/// disk (a single append may overshoot the cap by one segment — the check is
+/// pre-write). Best-effort: any IO failure just drops the escape hatch.
+pub fn export_compact_transcript(
+    session_id: &str,
+    messages: &[ChatMessage],
+) -> Option<CompactTranscriptExport> {
+    if messages.is_empty() {
+        return None;
+    }
+    let safe_session: String = session_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect();
+    if safe_session.is_empty() {
+        return None;
+    }
+
+    let root = crate::commands::app_temp_dir().ok()?.join("compact-transcripts");
+    std::fs::create_dir_all(&root).ok()?;
+    let path = root.join(format!("{}.md", safe_session));
+    let existing_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let latest_segment_omitted = transcript_capacity_reached(existing_len);
+
+    let mut out = String::new();
+    if latest_segment_omitted {
+        out.push_str(&format!(
+            "\n\n---\n\n# Pre-compact transcript segment omitted ({} messages): transcript file reached its size cap\n",
+            messages.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "\n\n---\n\n# Pre-compact transcript segment ({} messages)\n",
+            messages.len()
+        ));
+        for message in messages {
+            out.push_str(&format!("\n## {}\n\n", transcript_role_label(message)));
+            if let Some(tool_calls) = message.tool_calls.as_ref() {
+                for tool_call in tool_calls {
+                    out.push_str(&format!(
+                        "[Tool call: {}({})]\n",
+                        tool_call.name, tool_call.arguments
+                    ));
+                    if let Some(output) = tool_call.server_tool_output.as_deref() {
+                        out.push_str(&format!("[{} output]\n{}\n", tool_call.name, output));
+                    }
+                }
+            }
+            if !message.content.is_empty() {
+                out.push_str(&message.content);
+                out.push('\n');
+            }
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    std::io::Write::write_all(&mut file, out.as_bytes()).ok()?;
+
+    Some(CompactTranscriptExport {
+        path: path.to_string_lossy().replace('\\', "/"),
+        latest_segment_omitted,
+    })
 }
 
 #[cfg(test)]
@@ -1764,10 +2133,137 @@ mod tests {
 
     #[test]
     fn build_post_compact_message_creates_assistant_handoff() {
-        let msg = build_post_compact_message("Continue editing src/main.rs", "", 100, true);
+        let msg = build_post_compact_message("Continue editing src/main.rs", "", 100, true, None);
         assert_eq!(msg.role, MessageRole::Assistant);
         assert!(msg.content.contains("## Context Handoff"));
         assert!(msg.content.contains("Continue editing src/main.rs"));
+        assert!(msg.content.contains("retained verbatim"));
+        assert!(!msg.content.contains("pre-compact transcript at:"));
+    }
+
+    #[test]
+    fn build_post_compact_message_reflects_retention_and_transcript() {
+        let export = CompactTranscriptExport {
+            path: "C:/temp/compact-transcripts/session.md".to_string(),
+            latest_segment_omitted: false,
+        };
+        let msg = build_post_compact_message("总结", "", 100, false, Some(&export));
+        assert!(msg.content.contains("No verbatim messages follow this handoff"));
+        assert!(msg
+            .content
+            .contains("read the full pre-compact transcript at: C:/temp/compact-transcripts/session.md"));
+
+        // Once the transcript file is capped, the handoff must not advertise
+        // it as the full transcript for this round.
+        let capped = CompactTranscriptExport {
+            path: "C:/temp/compact-transcripts/session.md".to_string(),
+            latest_segment_omitted: true,
+        };
+        let msg = build_post_compact_message("总结", "", 100, false, Some(&capped));
+        assert!(!msg.content.contains("full pre-compact transcript"));
+        assert!(msg.content.contains("EARLIER compaction rounds"));
+        assert!(msg.content.contains("the segment for this round was omitted"));
+    }
+
+    #[test]
+    fn compact_request_gives_previous_handoff_a_larger_truncation_budget() {
+        // ~3k-token handoff (under its 4k budget) alongside a ~6k-token
+        // ordinary assistant message (over the 1.6k budget): only the
+        // ordinary message may be truncated, or chained compactions decay.
+        let handoff_content = format!("{}\n\n{}", CONTEXT_HANDOFF_MARKER, "摘要".repeat(2_000));
+        let messages = vec![
+            make_message(
+                "handoff-1",
+                MessageRole::Assistant,
+                &handoff_content,
+                100,
+                None,
+                None,
+            ),
+            make_message("user-1", MessageRole::User, "继续", 101, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                &"普通回答".repeat(2_000),
+                102,
+                None,
+                None,
+            ),
+        ];
+
+        let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
+            .expect("budgeted compact request");
+        let handoff = plan
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with(CONTEXT_HANDOFF_MARKER))
+            .expect("handoff should be included");
+        assert!(!handoff.content.contains("[truncated:"));
+        let ordinary = plan
+            .messages
+            .iter()
+            .find(|message| message.id == "assistant-1")
+            .expect("ordinary assistant message should be included");
+        assert!(ordinary.content.contains("[truncated:"));
+    }
+
+    #[test]
+    fn emergency_summary_tool_counts_survive_large_output_cap() {
+        let mut messages = Vec::new();
+        // Seven oversized tool outputs exhaust the large-output preview cap.
+        for i in 0..7 {
+            messages.push(make_message(
+                &format!("assistant-{}", i),
+                MessageRole::Assistant,
+                "",
+                100 + i,
+                Some(vec![ToolCallInfo {
+                    id: format!("tc-{}", i),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ));
+            messages.push(make_message(
+                &format!("tool-{}", i),
+                MessageRole::Tool,
+                &"大输出".repeat(2_000),
+                100 + i,
+                None,
+                Some(&format!("tc-{}", i)),
+            ));
+        }
+        // A tool call issued after the preview cap is reached must still be
+        // counted in the overview.
+        messages.push(make_message(
+            "assistant-late",
+            MessageRole::Assistant,
+            "",
+            200,
+            Some(vec![ToolCallInfo {
+                id: "tc-late".to_string(),
+                name: "late_tool".to_string(),
+                arguments: "{}".to_string(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: None,
+                recorded_output: None,
+                nested_tool_calls: None,
+            }]),
+            None,
+        ));
+
+        let summary =
+            build_emergency_compact_summary(&messages, messages.len(), "request too large");
+        assert!(summary.contains("late_tool x1"));
+        assert!(summary.contains("bash x7"));
     }
 
     #[test]
@@ -2176,23 +2672,218 @@ mod tests {
 
         let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
             .expect("budgeted compact request");
-        let mut visible_tool_call_ids = HashSet::new();
+        // Tool interactions are flattened to plain text for the compact
+        // request, so no message may carry structural tool references a
+        // provider could validate (tool_use without tools, orphaned
+        // function_call_output).
         for message in &plan.messages {
-            if let Some(tool_calls) = message.tool_calls.as_ref() {
-                visible_tool_call_ids.extend(tool_calls.iter().map(|call| call.id.clone()));
-            }
-            if message.role == MessageRole::Tool {
-                let tool_call_id = message
-                    .tool_call_id
-                    .as_deref()
-                    .expect("tool result should have an id");
-                assert!(
-                    visible_tool_call_ids.contains(tool_call_id),
-                    "tool result without visible function call: {}",
-                    tool_call_id
-                );
-            }
+            assert!(
+                message.tool_calls.is_none(),
+                "compact request should not contain structured tool calls"
+            );
+            assert_ne!(
+                message.role,
+                MessageRole::Tool,
+                "compact request should not contain tool-role messages"
+            );
+            assert!(message.tool_call_id.is_none());
         }
+    }
+
+    #[test]
+    fn compact_request_flattens_tool_interactions_to_text() {
+        let messages = vec![
+            make_message("user-1", MessageRole::User, "排查资源加载", 100, None, None),
+            make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "checking",
+                101,
+                Some(vec![ToolCallInfo {
+                    id: "tc-1".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"filePath":"src/main.rs"}"#.to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                }]),
+                None,
+            ),
+            make_message(
+                "tool-1",
+                MessageRole::Tool,
+                "fn main() {}",
+                102,
+                None,
+                Some("tc-1"),
+            ),
+            make_message("assistant-2", MessageRole::Assistant, "done", 103, None, None),
+        ];
+
+        let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
+            .expect("budgeted compact request");
+
+        let flattened_call = plan
+            .messages
+            .iter()
+            .find(|message| message.content.contains("[Tool call: read("))
+            .expect("assistant tool call should be flattened into text");
+        assert_eq!(flattened_call.role, MessageRole::Assistant);
+        assert!(flattened_call.tool_calls.is_none());
+
+        let flattened_result = plan
+            .messages
+            .iter()
+            .find(|message| message.content.contains("[read result]"))
+            .expect("tool result should be flattened into text");
+        assert_eq!(flattened_result.role, MessageRole::User);
+        assert!(flattened_result.tool_call_id.is_none());
+        assert!(flattened_result.content.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn will_retain_user_messages_matches_store_retention() {
+        assert!(!will_retain_user_messages(&[], 0));
+        assert!(!will_retain_user_messages(
+            &[make_message(
+                "assistant-1",
+                MessageRole::Assistant,
+                "no users here",
+                100,
+                None,
+                None,
+            )],
+            0
+        ));
+        assert!(will_retain_user_messages(
+            &[make_message(
+                "user-1",
+                MessageRole::User,
+                "保留我",
+                100,
+                None,
+                None,
+            )],
+            0
+        ));
+        // A single oversized latest user message exceeds the retention budget
+        // entirely, so nothing survives verbatim.
+        assert!(!will_retain_user_messages(
+            &[make_message(
+                "user-big",
+                MessageRole::User,
+                &"a".repeat(200_000),
+                100,
+                None,
+                None,
+            )],
+            0
+        ));
+        // The retention budget scales with the window: a ~10k-token message
+        // survives on a 200k window (20k budget) but not on a 32k window
+        // (8k budget).
+        let mid_sized = [make_message(
+            "user-mid",
+            MessageRole::User,
+            &"a".repeat(40_000),
+            100,
+            None,
+            None,
+        )];
+        assert!(will_retain_user_messages(&mid_sized, 200_000));
+        assert!(!will_retain_user_messages(&mid_sized, 32_000));
+    }
+
+    #[test]
+    fn retained_user_budget_scales_with_context_window() {
+        assert_eq!(compact_user_message_token_budget(0), 20_000);
+        assert_eq!(compact_user_message_token_budget(200_000), 20_000);
+        assert_eq!(compact_user_message_token_budget(80_000), 20_000);
+        assert_eq!(compact_user_message_token_budget(64_000), 16_000);
+        assert_eq!(compact_user_message_token_budget(32_000), 8_000);
+    }
+
+    #[test]
+    fn compact_request_budget_reserves_output_headroom_on_small_windows() {
+        // Unknown window keeps the legacy floor.
+        assert_eq!(compact_request_token_budget(0), 32_000);
+        // Large windows are unchanged: 3/5 of the window, clamped to 150k.
+        assert_eq!(compact_request_token_budget(200_000), 120_000);
+        assert_eq!(compact_request_token_budget(300_000), 150_000);
+        // At or below the 32k MIN clamp the request must leave room for the
+        // summary output instead of filling the whole window.
+        assert_eq!(compact_request_token_budget(32_000), 24_000);
+        assert_eq!(compact_request_token_budget(40_000), 32_000);
+        assert_eq!(compact_request_token_budget(16_000), 12_000);
+    }
+
+    #[test]
+    fn tracker_resets_no_progress_after_context_growth() {
+        let mut tracker = CompactTracker::new();
+        assert!(!tracker.is_suppressed());
+
+        tracker.record_no_progress(30_000);
+        assert!(tracker.is_suppressed());
+
+        // Growth within the margin keeps automatic compaction suppressed.
+        tracker.reset_no_progress_if_grown(33_000, 4_000);
+        assert!(tracker.is_suppressed());
+
+        // Growth past baseline + margin means there is new compactable
+        // material, so automatic compaction is re-enabled.
+        tracker.reset_no_progress_if_grown(34_001, 4_000);
+        assert!(!tracker.is_suppressed());
+
+        // The circuit breaker is independent of the no-progress state.
+        tracker.record_failure();
+        tracker.record_failure();
+        tracker.record_failure();
+        assert!(tracker.is_suppressed());
+    }
+
+    #[test]
+    fn transcript_capacity_gate_uses_size_cap() {
+        assert!(!transcript_capacity_reached(0));
+        assert!(!transcript_capacity_reached(COMPACT_TRANSCRIPT_MAX_BYTES - 1));
+        assert!(transcript_capacity_reached(COMPACT_TRANSCRIPT_MAX_BYTES));
+    }
+
+    #[test]
+    fn truncate_to_token_budget_uses_byte_metric_for_cjk() {
+        let cjk = "工".repeat(4_000); // 12k bytes, 4k chars
+        let (truncated, was_truncated) = truncate_to_token_budget(&cjk, 1_000); // 4k-byte budget
+        assert!(was_truncated);
+        // Byte-based cut keeps ~1333 chars; the old char-based cut would have
+        // kept the full 4k chars (12k bytes ≈ 3k estimated tokens).
+        let kept_chars = truncated
+            .chars()
+            .take_while(|ch| *ch == '工')
+            .count();
+        assert!(kept_chars <= 1_334, "kept {} chars", kept_chars);
+        assert!(estimate_text_tokens(truncated.as_str()) <= 1_100);
+    }
+
+    #[test]
+    fn calibrated_input_tokens_uses_additive_anchor_for_grown_history() {
+        // Provider measured 150k where the heuristic said 100k; since then the
+        // estimate grew by 20k. The multiplicative path gives 1.5*120k=180k,
+        // the additive anchor gives 150k+20k=170k — max wins, both above the
+        // stale raw estimate.
+        assert_eq!(
+            calibrated_input_tokens(120_000, Some((150_000, 100_000)), 0),
+            180_000
+        );
+        // When the estimate shrinks below the sampled request (e.g. messages
+        // rolled back) the multiplicative path scales the smaller estimate
+        // down, but the additive anchor keeps the already-measured usage as
+        // the floor.
+        assert_eq!(
+            calibrated_input_tokens(80_000, Some((150_000, 100_000)), 0),
+            150_000
+        );
     }
 
     #[test]
@@ -2317,7 +3008,7 @@ mod tests {
         let boundary = find_compact_boundary_by_budget(&messages, 8_000);
         assert_eq!(boundary, 0);
         assert!(!has_compactable_messages_before_boundary(
-            &messages, boundary
+            &messages, boundary, 0
         ));
     }
 
@@ -2347,7 +3038,7 @@ mod tests {
 
         assert_eq!(boundary, 1);
         assert!(has_compactable_messages_before_boundary(
-            &messages, boundary
+            &messages, boundary, 0
         ));
     }
 
@@ -2374,7 +3065,8 @@ mod tests {
 
         assert!(has_compactable_messages_before_boundary(
             &messages,
-            messages.len()
+            messages.len(),
+            0
         ));
     }
 
@@ -2469,9 +3161,35 @@ mod tests {
 
     #[test]
     fn compact_prompt_requires_concise_checkpoint_handoff() {
-        assert!(COMPACT_PROMPT.contains("CONTEXT CHECKPOINT COMPACTION"));
-        assert!(COMPACT_PROMPT.contains("Be concise"));
-        assert!(!COMPACT_PROMPT.contains("All User Messages"));
+        let prompt = compact_prompt_text(true);
+        assert!(prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+        assert!(prompt.contains("Be concise"));
+        assert!(!prompt.contains("All User Messages"));
+        // Work-state sections carry the detail budget: user messages are
+        // retained verbatim by the store, so the summary must not re-list
+        // them, but recent work / errors / next step need full precision.
+        assert!(prompt.contains("Current Work"));
+        assert!(prompt.contains("Errors and Fixes"));
+        assert!(prompt.contains("Next Step"));
+        assert!(prompt.contains("do not re-list them"));
+        assert!(prompt.contains("Do NOT call any tools"));
+    }
+
+    #[test]
+    fn compact_prompt_reflects_retention_state() {
+        let retained = compact_prompt_text(true);
+        assert!(retained.contains("retained verbatim"));
+        assert!(retained.contains("do not re-list them"));
+        assert!(retained.contains("prefer the raw user message"));
+
+        // When the store will retain nothing, the summarizer must capture the
+        // user's requests itself instead of skipping them.
+        let unretained = compact_prompt_text(false);
+        assert!(unretained.contains("No user messages survive verbatim"));
+        assert!(unretained.contains("quoting the key instructions verbatim"));
+        assert!(!unretained.contains("do not re-list them"));
+        assert!(!unretained.contains("prefer the raw user message"));
+        assert!(unretained.contains("Do NOT call any tools"));
     }
 
     #[test]
@@ -2515,7 +3233,11 @@ mod tests {
         ];
 
         let section =
-            build_post_compact_restored_files_section(&messages, &temp_root.display().to_string());
+            build_post_compact_restored_files_section(
+                &messages,
+                &temp_root.display().to_string(),
+                0,
+            );
 
         assert!(section.contains("Restored File Context"));
         assert!(section.contains("src/main.ts"));
@@ -2568,7 +3290,11 @@ mod tests {
         ];
 
         let section =
-            build_post_compact_restored_files_section(&messages, &temp_root.display().to_string());
+            build_post_compact_restored_files_section(
+                &messages,
+                &temp_root.display().to_string(),
+                0,
+            );
 
         assert!(section.contains("src/main.ts"));
         assert!(section.contains("line two"));
@@ -2616,7 +3342,11 @@ mod tests {
         ];
 
         let section =
-            build_post_compact_restored_files_section(&messages, &temp_root.display().to_string());
+            build_post_compact_restored_files_section(
+                &messages,
+                &temp_root.display().to_string(),
+                0,
+            );
 
         assert!(section.contains("Assets/Data/Test.asset"));
         assert!(section.contains("exact `unity_yaml_read` result"));
@@ -2676,7 +3406,11 @@ mod tests {
         ];
 
         let section =
-            build_post_compact_restored_files_section(&messages, &temp_root.display().to_string());
+            build_post_compact_restored_files_section(
+                &messages,
+                &temp_root.display().to_string(),
+                0,
+            );
 
         assert!(section.contains("PersistedAsset"));
 

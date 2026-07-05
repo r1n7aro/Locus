@@ -112,9 +112,49 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_retryable_llm_error, model_context_limit, resolve_openrouter_model,
-        OPENAI_CODEX_CONTEXT_LIMIT,
+        is_prompt_too_long_error, is_retryable_llm_error, model_context_limit,
+        resolve_openrouter_model, OPENAI_CODEX_CONTEXT_LIMIT,
     };
+
+    #[test]
+    fn prompt_too_long_matches_provider_error_shapes() {
+        // Anthropic prose and error `type`.
+        assert!(is_prompt_too_long_error(
+            "prompt is too long: 213462 tokens > 200000 maximum"
+        ));
+        assert!(is_prompt_too_long_error(
+            "API error: {\"type\":\"invalid_request_error\",\"message\":\"prompt_too_long\"}"
+        ));
+        // Anthropic combined input + max_tokens validation.
+        assert!(is_prompt_too_long_error(
+            "input length and `max_tokens` exceed context limit: 195122 + 8192 > 200000"
+        ));
+        // OpenAI-compatible servers (code and prose).
+        assert!(is_prompt_too_long_error("error code: context_length_exceeded"));
+        assert!(is_prompt_too_long_error(
+            "This model's maximum context length is 65536 tokens. However, you requested 70000 tokens"
+        ));
+        // Generic relayed phrasings.
+        assert!(is_prompt_too_long_error(
+            "the request exceeds the context window of this model"
+        ));
+        assert!(is_prompt_too_long_error(
+            "requested tokens are larger than the context size"
+        ));
+        assert!(is_prompt_too_long_error("Input is too long for requested model."));
+    }
+
+    #[test]
+    fn prompt_too_long_ignores_unrelated_errors() {
+        assert!(!is_prompt_too_long_error("connection reset by peer"));
+        assert!(!is_prompt_too_long_error("429 too many requests"));
+        assert!(!is_prompt_too_long_error("invalid api key"));
+        // Local tool-output placeholder text must never be classified as a
+        // provider prompt-length rejection.
+        assert!(!is_prompt_too_long_error(
+            crate::compact::CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+        ));
+    }
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
@@ -355,6 +395,16 @@ pub(super) fn is_prompt_too_long_error(error: &str) -> bool {
         || lower.contains("input exceeds")
         || lower.contains("maximum number of input")
         || lower.contains("reduce the length")
+        // Anthropic error `type` and OpenAI error `code` identifiers appear
+        // verbatim in relayed error strings.
+        || lower.contains("prompt_too_long")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("exceeds the context")
+        || lower.contains("larger than the context")
+        // Anthropic's combined input + max_tokens validation ("input length
+        // and `max_tokens` exceed context limit: X + Y > Z") — compaction
+        // shrinks the input side, so it is recoverable.
+        || lower.contains("exceed context limit")
 }
 
 /// LLM backend type
