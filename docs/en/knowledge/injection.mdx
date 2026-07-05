@@ -1,0 +1,39 @@
+---
+title: Injection modes
+description: The trade-offs of the five injection levels, what summaries do, folder-level inheritance, and injection status
+---
+
+The Agent takes in knowledge along two paths: always-on injection and retrieval. Injected content enters the context window of every request, so the Agent sees it without searching, but more injection means a higher token cost; retrieval reads on demand and adds almost nothing to the standing cost. `Inject Mode` picks a level between the two for each document.
+
+![img](/images/showcases/knowledge.png)
+
+## The five levels
+
+Set `Inject Mode` in the document's `Config` sidebar:
+
+- **`Search Only`**: the document participates in retrieval and recall but never enters the Agent's context on its own. Fits material that is large in volume and only used by specific tasks.
+- **`L0 - Path Injection`**: gives the Agent the document title and path; the body is read on demand. Fits documents the Agent only needs to know exist, and where.
+- **`L1 - Summary Injection`**: gives the Agent the summary, or the opening of the body when there is no summary. Fits documents whose key points the Agent should always keep in mind, with details expanded on demand.
+- **`L2 - Full Injection`**: injects the maintenance rules and the body as always-on knowledge. Fits content of controlled length that nearly every task consults.
+- **`L3 - Full Rule Injection`**: injects the maintenance rules and the body in full as rules. Fits high-priority long-term constraints, such as project conventions that must be followed.
+
+Defaults differ by type: Design documents default to `L0 - Path Injection`, Skill documents to `L1 - Summary Injection`, and Memory and Reference documents to `Search Only`. Memory's three preset modules ship pre-tuned for their roles (Mistake Notebook at L2, User Preferences at L3, Project Understanding at L0); see [Design and Memory](/en/knowledge/memory-and-design).
+
+## Summaries
+
+What `L1 - Summary Injection` actually injects is the document's `Summary` field, falling back to the opening of the body when the field is empty. Openings tend to be background rather than conclusions, so for key always-on documents, write the summary by hand: two or three sentences on what the document covers and when the full text is worth opening. The summary is also used in search result previews.
+
+## Folder-level config and inheritance
+
+Right-click a folder and choose `Folder Config` to set an injection mode for the whole folder (`Search Only` / `L0` / `L1`; L1 attaches the folder description after the folder path). Documents and subfolders default to `Inherit Parent`, and top-level folders follow the type default. The `Effective` line in the config panel states whether the active config comes from the local config, a parent folder, or the type default. When organizing documents in bulk, configure at the folder level first, then override individual documents.
+
+## Injection status
+
+Two places show what actually gets injected:
+
+- `Injection status` on the folder inspect page: the count of `Injected docs` and the `Injected bytes` within the subtree. Always-on injection has no hard cap; growth translates directly into per-request cost, so when the volume swells noticeably, lower some documents' levels or trim their content.
+- `Injection Preview` at the top: the Knowledge content blocks the current Agent actually injects, with the `Estimated token load`. To confirm what the Agent really carries in a session, this is the source of truth.
+
+{/* TODO: 截图：注入预览窗口，显示注入内容分块与预估 Token 消耗 */}
+
+Levels have no right answer, only trade-offs: L2/L3 buys the Agent seeing the content every time, and pays for it on every request. A practical habit is to open the `Context Load` card on the [knowledge overview](/en/knowledge/index) regularly; when the always-on share swells noticeably, drop low-frequency documents back to `L1` or `Search Only`.

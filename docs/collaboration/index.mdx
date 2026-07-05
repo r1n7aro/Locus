@@ -1,6 +1,45 @@
 ---
 title: 协作
-description: TODO
+description: 面向 Unity 项目的图形化 Git 工作区
 ---
 
-TODO
+「协作」页面是内置的图形化 Git 工作区：查看历史、管理分支、暂存提交、审查差异与解决冲突都在同一页面完成。Agent 的修改与你的手工修改在这里统一走版本控制流程。
+
+![img](/images/overview/page-tour/collaboration.png)
+
+## 首次使用：Git 初始化
+
+当前项目还不是 Git 仓库时，页面显示初始化入口。`Git 初始化`一键完成仓库创建，自动写入针对 Unity 项目的 .gitignore 与 Git LFS 配置；`Perforce (P4) 初始化`暂不支持，SVN 同样在计划中。Git 的 user.name 或 user.email 未配置时会弹出补录窗口，补录前无法提交。
+
+## 页面分区
+
+- **左侧边栏**：`LOCAL`（本地分支）、`REMOTE`（远程分支）、`STASHES`、`TAGS` 与 `SUBMODULES` 分组。
+- **历史图谱**：提交历史的图形视图。`// WIP` 行代表工作区尚未提交的变更；滚动到底部自动加载更多提交。
+- **修改列表**：Unstaged 与 Staged 两区，见[修改管理与提交](/collaboration/changes-and-commit)。
+- **diff 区**：点击任意文件（提交、Stash、Unstaged/Staged 中的都可以）预览差异，Unity 资产自动进入语义视图，见[语义差异](/collaboration/semantic-diff)。
+- **底部命令行**：支持直接输入标准 Git 指令，或用自然语言向 AI 下达指令。
+
+![img](/images/showcases/git-graph.png)
+
+## 提交右键操作
+
+右键图谱中的提交：
+
+- **`Create Branch…`**：从该提交创建分支。
+- **`Soft Reset` / `Mixed Reset` / `Hard Reset`**：将当前分支重置到该提交。`Hard Reset` 会丢失所有未提交的更改，执行前需要确认。
+- **`Revert Commit`**：生成一笔反向提交来撤销该提交的变更。
+- **`Checkout Branch` / `Checkout Detached HEAD`**：切换到该提交上的分支，或以分离 HEAD 方式检出。
+
+## 分支与 Stash
+
+- 双击非当前分支直接切换；双击尚无本地分支的远程分支，会创建本地跟踪分支并检出。
+- 分支右键提供 `Merge into Current`、`Rebase Current onto This`、`Rename Branch…`、`Delete Branch`、`Copy Branch Name`。
+- Stash 右键提供 `Apply Stash`、`Pop Stash`、`Drop Stash`。基准提交尚未加载进图谱的 stash 会标记 `Unanchored`，仅显示在左侧列表中，继续加载历史后回到图中。
+
+## 布局与显示模式
+
+修改列表右上角的三个按钮：`列表视图` / `层级视图`切换、`.meta` 文件隐藏开关、`横向布局` / `纵向布局`切换。
+
+## Git 历史搜索
+
+图谱工具栏的`搜索历史`打开「Git 搜索」窗口：按`文件`（文件名匹配，可`启用正则表达式`）、`作者`与日期范围筛选。结果覆盖提交与 stash，上限 1000 条，超出时提示只显示前面的匹配结果。点击结果在图谱中定位；目标不在已加载范围内时会提示位于当前图范围之外。

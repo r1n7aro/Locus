@@ -1,0 +1,45 @@
+---
+title: Design and Memory
+description: Maintaining the requirements baseline and long-term memory, the preset modules, and edit modes
+---
+
+Design and Memory are the two knowledge types the AI helps maintain: Design records what you want, Memory records what the AI has learned in this project.
+
+## Design: the requirements baseline
+
+Design documents record design requirements and the factual baseline. During a session, the AI recognizes design conclusions worth keeping and raises them as a `Knowledge Maintenance Proposal` card, listing the detected items and their confidence. Click `View Draft` to check the content; nothing is written to the document until `Confirm and Apply`, and `Ignore` discards the proposal. You can also edit the documents by hand at any time.
+
+Design is the AI's summary of your requirements, and later tasks treat its content as the requirements basis. Keeping the information accurate is therefore an important responsibility of the user. Check proposals item by item when approving, and delete or revise stale conclusions as soon as you find them. See [Usage recommendations](/en/overview/usage-guidance).
+
+{/* TODO: 截图：会话中的知识维护建议卡片，含查看草稿、忽略与确认并应用按钮 */}
+
+## Memory: long-term memory
+
+Memory is maintained automatically by the AI, with three preset modules:
+
+- **`Project Understanding`**: the AI's running summary of the project structure and technical approach, shared at the project level.
+- **`Mistake Notebook`**: pitfalls hit and the corrected conclusions, to avoid repeating mistakes, shared at the project level.
+- **`User Preferences`**: your personal habits (communication language, code style preferences, and so on), scoped to the user and applied across projects.
+
+Memory documents use the same [injection levels](/en/knowledge/injection) as every other type, and the preset modules ship pre-tuned for their roles: `Mistake Notebook` is injected in full (L2), `User Preferences` is injected as rules (L3), and `Project Understanding` injects its paths only (L0) with bodies read on demand; custom Memory documents default to `Search Only` and can be re-tuned in the config sidebar. More always-on files and longer content mean a heavier load on every request. The `Memory Dashboard` shows the `Always-on Context Load` and a maintenance token estimate; trim promptly when entries swell. Memory is the AI's experiential summary, so review it regularly and edit or delete entries that are wrong. You can also run `/dream` to start a dedicated consolidation session that merges duplicates, removes expired entries under each document's maintenance rules, and spot-checks conclusions against the current project.
+
+## Custom Memory documents
+
+Right-click the Memory type for `New Memory` (project level) or `New User Memory` (user level), to manage one class of experience as its own document. Custom documents work together with `Maintenance Rules`: the rules constrain what the AI may change and what it must preserve during automatic updates. The preset modules' default rules show the pattern:
+
+- Keep only durable and reusable project memory
+- Consolidate duplicates or conflicts into the latest conclusion
+- Remove temporary context, one-off tasks, and unsupported guesses
+
+The more specific the rules, the more controlled the automatic maintenance. Adding "every conclusion must note the scenario it appeared in and how it was verified" to a performance notes document keeps vague, unreviewable experience from piling up; adding "re-check related entries after a plugin version upgrade" to a third-party plugin pitfalls document gives stale information a clear cleanup point.
+
+## Edit modes
+
+Each document's `AI Edit Mode` sets the AI's write permission:
+
+- **`Locked`**: view only; the AI cannot modify it.
+- **`Proposal-based`**: the AI submits a proposal first and writes only after you confirm. The default for non-Memory documents.
+- **`Automatic`**: the AI updates directly under the maintenance rules; the rules are mandatory. The default for the Memory preset modules.
+- **`Inherit Parent`**: follows the parent folder's AI edit config; top-level documents follow the type default.
+
+Keep important documents (core Design, say) on `Proposal-based`; open up `Automatic` only for high-frequency, low-risk record-keeping documents.

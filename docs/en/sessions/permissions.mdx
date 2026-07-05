@@ -1,0 +1,49 @@
+---
+title: Tool permissions
+description: Tool execution mode, approval cards, and the file tool boundary
+---
+
+The Agent reads and modifies your project through tool calls. Settings > Tool Permissions controls which calls run directly and which wait for your confirmation.
+
+{/* TODO: 截图：设置页工具权限标签，展示工具执行模式分段开关与单项工具权限列表 */}
+
+## Auto versus per-call approval
+
+`Tool execution mode` has two settings:
+
+- **`Auto`**: runs all tools automatically with no approval. Fast, and a good fit for prototyping or a repository you already trust (backed by version control).
+- **`Ask`**: confirms calls according to the per-tool rules. Modifying operations request your permission first. This mode is safer but needs manual confirmation.
+
+## How the layers stack
+
+- **Global mode**: `Auto` lets every tool call through; the rules below only apply in `Ask` mode.
+- **Per-tool permissions**: in `Ask` mode, each tool can be set to `Auto` or `Ask` individually. Without an override, defaults apply: read-type tools (`read`, `grep`, searches and queries) run automatically, while modifying and executing tools (`write`, `edit`, `bash`, `web_fetch`, `unity_execute`, `unity_run_states`, `task`) require confirmation.
+- **Behavior approvals**: extra gates that work independently of the global mode, described below.
+
+## Approval cards
+
+A tool call that needs confirmation shows a `Tool execution confirm` card in the conversation:
+
+- **Single approval**: review the arguments (file edits show a diff preview), then click `Allow` or `Deny`.
+- **Batch approval**: multiple pending calls merge into one card. Use `Allow all`, `Deny all`, or expand and handle them one by one.
+- **Feedback**: if the proposal is off, describe what should change in the `Feedback` field and submit. The Agent revises the proposal and asks again. Batch cards have `Send to all`, which returns the whole batch for revision with one instruction.
+
+## Behavior approvals
+
+The `Behavior Approvals` section in Settings > Tool Permissions controls extra approval gates inside tool execution. These are independent of the global mode: even under `Auto`, a behavior set to `Ask` still prompts. Both default to automatic:
+
+- **`Switch Unity Editor status`**: entering or leaving Play Mode, Paused Play Mode, or Edit Mode. When set to `Ask`, the Agent's request opens a `Request Play Mode` dialog showing `Current status` and `Target status`.
+- **`Edit protected knowledge`**: changes to Design, Skill, Reference, or approval-gated knowledge folders wait for confirmation, with a preview of the content or structure change. See [Knowledge](/en/knowledge/index) for the categories.
+
+## File tool boundary
+
+`File Tool Boundary` controls the path scope of file tools:
+
+- **`All`** (default): paths outside the workspace are allowed.
+- **`Workspace`**: file tools only operate inside the current project directory. With this on, referencing an external file in the composer shows the notice that file tools can only read workspace paths.
+
+## Why modifying tools ask by default
+
+Read calls do not change project state; a wrong one wastes a single query. Writing files, running commands, and switching Unity's play state have real consequences, and undoing a wrong direction costs far more than one confirmation. The defaults concentrate approval on operations with side effects: the Agent keeps its freedom to search and analyze, while every actual change passes through your judgment. Once you trust the Agent on a class of tasks, relax those tools to `Auto` one by one.
+
+File edits have one more safety net: whether or not a call was confirmed, every round of changes is recorded and can be reviewed and reverted at any time. See [File changes and undo](/en/sessions/changes-and-undo).

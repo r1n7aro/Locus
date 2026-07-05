@@ -1,0 +1,32 @@
+---
+title: Asset health
+description: Broken references, Missing Script, parse failures, and duplicate GUIDs, with an approach for triage and repair
+---
+
+After a scan completes, the `Asset Risk` card on the Assets page rolls up four kinds of problems in the project. With nothing found it shows `Healthy`; with problems found it shows `Needs attention` and lists each kind with its count. Clicking `View details` on any item generates a text report listing the affected asset paths and opens it in the default editor.
+
+{/* TODO: 截图：资产风险卡片处于「需处理」状态，列出失效引用与 GUID 重复两项及数量 */}
+
+## The four problem kinds
+
+- **`Broken references`**: an asset references a GUID that no longer exists in the project. Common causes: the asset was deleted, a rename lost the `.meta`, or a collaborator did not commit the files together. It shows up as Missing fields in the Inspector and null references at runtime.
+- **`Missing Script`**: a script component on a GameObject cannot find its script. The causes mirror broken references (script deleted, `.meta` changed, owning package not installed). Objects carrying Missing Script lose their behavior at runtime.
+- **`Parse failures`**: a file cannot be parsed as Unity's serialization format, typically a corrupted file or one with leftover merge conflict markers. These assets never enter the index, so their references go missing from search and analysis.
+- **`Duplicate GUIDs`**: two files use the same GUID, usually from copying a folder along with its `.meta` files, or from copying package content straight into `Assets`.
+
+## Why cross-root GUID duplicates are the most dangerous
+
+A GUID is an asset's unique identity in the project: every reference points at a GUID, not a file path. When the same GUID lives on two paths, only one path takes effect and the other is shadowed. Every reference in the project that points at that GUID then resolves to whichever file happens to win.
+
+The risk peaks when the duplicate spans `Assets` and `Packages`: the two roots import independently, so a package upgrade, a reimport, or opening the project on another machine can flip which side wins. The reference looks untouched but now points at a different file, and there is usually no error at all. Duplicates inside `Assets` are relatively easy to notice; cross-root duplicates can lurk for a long time.
+
+## Triage and repair
+
+1. Click `View details` on the problem in question to get the full list of affected assets.
+2. Work through the list:
+   - Broken references and Missing Script: repoint the reference at its target, or restore the deleted asset (version control usually has it; see [Collaboration](/en/collaboration/index)).
+   - Parse failures: check whether the file is corrupted or still carries conflict markers, fix it, and reimport.
+   - Duplicate GUIDs: keep one copy and delete the extras. If both copies must stay, delete the `.meta` of one so Unity generates a fresh GUID, then point the references back at the correct target by hand.
+3. When done, click `Rescan` and confirm the counts drop to zero.
+
+You can also hand the report straight to the Agent, for example by asking in a session to "read the duplicate GUID report, analyze where each group came from, and fix them". The Agent can use the reference graph to tell which copy is the one actually in use.

@@ -1,0 +1,50 @@
+---
+title: Plugins and views
+description: Installing and managing plugins, and custom view panels
+---
+
+Plugins package Agent definitions, Rules, Skills, Views, and project dependencies into installable extensions that can be used and updated inside Locus. The Plugins and Views tabs at the top manage them.
+
+{/* TODO: 截图：插件页面，左侧已安装列表与插件 Hub，右侧插件详情 */}
+
+## What a plugin can contain
+
+- **Agent definitions**: new Agent roles with their system prompts.
+- **Rules**: behavior rules injected into the Agent context.
+- **Skills**: execution components that capture stable workflows, checklists, and tool rules, so the Agent follows a fixed process for specific tasks. See [Skills and references](/en/knowledge/skills-and-references).
+- **Views**: custom panels that run inside Locus, described below.
+- **Project dependencies**: declared Unity packages, assemblies, or assets the plugin needs, checked against your project at install time.
+
+## Three ways to install
+
+- **`Plugin Hub`**: browse registry plugins with search, `Install`, `Update`, and `Star`. `GitHub Login` raises release metadata limits and supports private GitHub repositories.
+- **`Import From Link`**: paste a repository, release, or zip link.
+- **`Import Local Plugin`**: pick a local plugin zip or directory.
+
+## Scope: app level and project level
+
+Choose the `Install location` when installing:
+
+- **`Install to App`**: applies to every project on this machine; suits general-purpose workflows.
+- **`Install to Project`**: applies only to the current project (a project must be selected first); suits skills and views tied to one project, and ships to the team through the project repository.
+
+## Update, disable, uninstall
+
+Manage plugins from the `Installed` list or the detail page: `Update` appears when a new version exists; `Disable` removes the plugin's components temporarily while keeping the files; `Uninstall` deletes it. The detail page lists the plugin's `Components`, `Location`, and compatibility (minimum Locus version).
+
+## Custom registries
+
+The Plugin Hub reads the official registry by default, and teams can add their own: in the Hub's `Registry` configuration, `Add` an entry with `Name`, `Address` (owner/repo or a full URL), `Branch`, and `Path`. This suits distributing internal plugins inside an organization.
+
+## Views
+
+A View is a custom project editor panel that runs on Locus's own frontend: the Agent combines a Vue interface, runtime scripts, and Unity property data into a View package that runs as a standalone tool, such as a level table editor or an ability tuning panel.
+
+- **Browse**: the Views tab lists all Views of the current workspace; click a name to open it. Some Views require a Unity Editor connection.
+- **Create**: type `/view` with a request in a session, and the Agent enters the View workflow to create or update a View package.
+- **Organize**: drag entries to reorder or drop them into folders; right-click for new folder, rename, move, or delete. Views installed by a plugin are managed by that plugin and can only be deleted by uninstalling it.
+- **List entry**: `Show Views in session list` in Settings > Display puts View entries into the left column of the Sessions tab.
+
+## Creating and publishing plugins from a session
+
+Type `/plugin` with a request in a session, and the Agent enters the plugin workflow to create or update the plugin manifest, component folders, and publishing files. To publish to a registry: complete `GitHub Login` on the Plugins page first, then ask the Agent to create the plugin repository and open a pull request to the registry. Once merged, other users install it by refreshing their Plugins page.

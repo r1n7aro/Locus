@@ -1,0 +1,38 @@
+---
+title: Code analysis
+description: The C# language service and per-tool switches
+---
+
+Settings > Code Analysis controls the Agent's semantic C# capabilities. With it on, find-references and go-to-definition return compiler-grade results instead of text-search approximations.
+
+{/* TODO: 截图：设置页代码分析标签，展示 C# 代码分析总开关与 Roslyn 工具逐项开关列表 */}
+
+## C# code analysis switch
+
+Semantic C# analysis backed by a Roslyn language server: components download on demand, and the server loads the Unity-generated solution. All `code_*` tools require this switch to be on.
+
+The live status shows next to the switch: `Preparing components`, `Downloading`, `Generating project files via Unity`, `Starting analysis server`, `Loading projects`, then `Code analysis ready`, with the error message shown on failure. If results look wrong or the project structure changed heavily, click `Restart` to restart the analysis server and reload projects. The `C# code analysis` status indicator above the session composer offers the same view and restart.
+
+## How it works
+
+In a Unity C# codebase, identical method and field names are everywhere; text search cannot tell `Player.Reset()` from `Enemy.Reset()`. A language service actually compiles the solution and understands each symbol's type and owner, so the Agent gets semantically exact reference lists and signatures, and compiler diagnostics come back right after an edit, cutting the errors that come from guessing APIs by memory. The trade-off is a first-run component download and some loading time on large projects.
+
+## Roslyn tools
+
+Per-tool switches; a disabled tool is removed from the Agent's toolset entirely. When the main switch is off, none of these are available to the Agent regardless of their switches:
+
+- **`code_symbol_search`**: search C# symbols (classes, methods, fields) across the workspace.
+- **`code_goto_definition`**: resolve a symbol to its declaration, including other assemblies and packages.
+- **`code_find_references`**: semantically exact references to a symbol across the workspace.
+- **`edit/write diagnostics`**: after the Agent changes a Unity C# file, capped file-level errors, warnings, and project string-reference checks return automatically, closing the edit-then-verify loop.
+- **`code_diagnostics`**: compiler and analyzer errors and warnings without compiling in Unity; file scope also validates tag, layer, scene, Resources, and Input string literals against the project settings.
+- **`code_hover`**: the exact signature, type, and docs of a symbol (IDE hover), so the Agent stops guessing APIs.
+- **`Unity analyzers (UNT*)`**: injects Microsoft.Unity.Analyzers, adding Unity-specific diagnostics to `code_diagnostics` and suppressing generic C# hints that mislead on Unity code. Toggling restarts the analysis server.
+
+## Asset-side tools
+
+These bridge C# symbols to Unity asset data and project settings, and work without the Roslyn server:
+
+- **`unity_code_usages`**: where a script or member is used inside scenes, prefabs, and assets: attach points, UnityEvent bindings, serialized fields, and AnimationEvents. Code-side find-references cannot see these usage sites, so have the Agent check here before deleting or renaming a script to avoid breaking scene bindings. This tool relies on the asset database. See [Assets](/en/assets/index).
+
+The other tabs in the `Code & Unity` group (`Hot Reload & Compile`, `Unity Connection`, `Testing`) are covered in [Execute and compile](/en/unity/execute-and-compile) and [Hot reload](/en/unity/hot-reload).

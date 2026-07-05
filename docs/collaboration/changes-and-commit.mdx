@@ -1,0 +1,42 @@
+---
+title: 修改管理与提交
+description: 暂存区管理、.meta 配对、Locus 文件标记与提交流程
+---
+
+## Unstaged 与 Staged
+
+修改列表分为两区：Unstaged 是工作区的改动，Staged 是将进入下一次提交的内容。单个文件点击 `Stage` / `Unstage` 移动，多选后用 `Stage Selected (N)` 批量处理，`Stage All` 一键暂存全部。合并冲突发生时，右侧面板会切换为待解决文件列表，见[冲突解决](/collaboration/merge-conflicts)。
+
+{/* TODO: 截图：修改列表的 Unstaged 与 Staged 两区，含 Locus 徽标与 .meta 徽标 */}
+
+## .meta 配对
+
+Unity 为每个资产生成 .meta 文件，逐一显示会淹没真正的改动。开启 `.meta` 隐藏后：
+
+- 配对的 .meta 从列表中隐藏，数量以`已隐藏 N 个 .meta`提示。
+- 暂存、取消暂存与放弃改动会自动带上配对的 .meta，主文件行上以 `.meta` 徽标提示。
+- 找不到对应主文件的 .meta 标记为`孤立`并始终显示，列表顶部同时给出警告。孤立 .meta 通常意味着资产被删除或移动时 .meta 没有同步处理，值得检查一下。
+
+## Locus 标记文件
+
+带有 `Locus` 徽标（`Locus/Design`、`Locus/Memory`、`Locus/Skill`、`Locus/Reference`）的文件是 Agent 本身的知识或配置文件。默认情况下，除了 `user_preference` 外的记忆与理解在项目层级上共享；如无需将其纳入项目的版本控制，建议将其加入 .gitignore 文件中。
+
+放弃这类文件的改动时会额外警告：放弃后会丢失对应的知识库、Memory 或配置改动。
+
+## 平台限制跳过
+
+Windows 上部分路径无法暂存（保留设备名、以句点或空格结尾的路径段等，多见于从其他系统同步来的仓库）。这类文件会单独列出并注明原因；`Stage All` 自动跳过它们、继续处理其余改动，跳过数量在结果中提示。
+
+## 提交
+
+Staged 区有文件后出现 `Commit` 按钮，点击打开提交窗口：
+
+1. 窗口标题显示提交目标分支。
+2. 填写提交标题，可补充可选的详细说明。
+3. 也可以点击标题输入框旁的 AI 按钮，根据已暂存内容生成提交信息。生成结果建议人工过目：AI 概括的是「改了什么」，「为什么改」往往需要你补充。
+
+提交后图谱即时刷新。要撤销一笔提交，可在图谱中右键该提交使用 `Soft Reset` 或 `Revert Commit`，见[协作页总览](/collaboration/index)；会话内 Agent 修改的撤回见[修改与撤销](/sessions/changes-and-undo)。
+
+## 放弃改动
+
+右键文件选择 `Discard Changes` 放弃改动：已跟踪文件恢复到上次提交的状态，未跟踪文件被直接删除。操作不可撤销，确认弹窗会说明影响范围。

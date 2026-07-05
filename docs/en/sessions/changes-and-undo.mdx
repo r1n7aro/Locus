@@ -1,0 +1,48 @@
+---
+title: File changes and undo
+description: The changes panel, diff review, and per-file or per-round undo
+---
+
+Every file edit the Agent makes is recorded. You can inspect diffs at any time and revert a single file or an entire round.
+
+{/* TODO: 截图：对话区右侧的文件修改面板，展示当前轮次/全部修改切换与文件状态列表 */}
+
+## Changes panel
+
+Click the `File changes` button above the composer to open the panel:
+
+- **Scope switch**: `Current Round` shows this round's edits; `All Changes` lists everything since the conversation started.
+- **Status labels**: each file is marked `Modified`, `Added`, `Deleted`, or `Renamed`.
+- **Auto open**: by default the panel opens when file changes arrive. Under `Panel Behavior` in Settings > Display you can turn that off, or have the panel close automatically when you send a new message.
+
+## Reviewing diffs
+
+- **Inline**: click a file, or choose `View diff` from its `File actions` menu, to compare before and after in the current window.
+- **Separate window**: choose `Separate window` to open the review in its own window, which suits dual monitors and long diffs. The default location is set under `File Change Review` in Settings > Display.
+
+## Undo
+
+### Reverting a single file
+
+Open a file's `File actions` menu in the changes panel and choose `Revert this file`. The file returns to its state before this round; other files and the chat history stay as they are.
+
+### Undoing a round
+
+- **Changes panel**: click `Undo Current Round` in `Current Round` mode, or `Undo All Changes` in `All Changes` mode. A round undo also rolls back the corresponding chat history.
+- **`/undo` command**: opens the `Undo One Turn` dialog with two modes:
+  - **`Conversation only`**: rolls back the chat history and leaves files on disk as they are. Useful when the file changes are worth keeping but you want to redirect the conversation from one turn earlier.
+  - **`Files + conversation`**: rolls back both.
+
+The `Roll back to this message` entry in the message menu rewinds directly to any earlier message. See [Sessions page](/en/sessions/index).
+
+## Dirty write warnings
+
+If files changed again after the undo point, Locus warns you before proceeding:
+
+- **Later edits in this session**: a notice explains that these files were modified again after the turn and undoing rolls those extra changes back too, listing the affected files.
+- **Edits from other sessions**: when the undo would overwrite newer changes from other sessions, review the conflicting files first, then decide whether to click `Force Undo`.
+- **Single file revert**: shows the same kind of warning, with `Revert Anyway` as the confirmation.
+
+## How it works: Git snapshots
+
+Locus builds undo and change analysis on version control: it records a file snapshot before each round, and undoing restores files to that snapshot. This means undo requires the [Git setup](/en/overview/install-and-setup) to be complete, and the Git binary Locus uses is chosen under `Git Runtime` in Settings > General. Undo only covers changes recorded by Agent sessions; for cross-session or cross-commit version operations, use the Collab tab. See [Changes and commit](/en/collaboration/changes-and-commit).

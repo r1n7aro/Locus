@@ -1,0 +1,34 @@
+---
+title: Semantic diff
+description: Object-level and text diff views for Unity assets
+---
+
+Unity assets like Scenes and Prefabs serialize to YAML text, where one simple editor action often turns into sweeping line-level changes, and reading the text diff rarely reveals what actually changed. The semantic diff parses the YAML into a Unity object tree, compares by object and field, and presents the result much like the Inspector does.
+
+![img](/images/showcases/diff.png)
+
+## Two views
+
+Diff previews of Unity assets have `Semantic` and `Text` tabs:
+
+- **`Semantic` view**: a hierarchy tree on the left lists the objects that changed (added, removed, and modified in distinct colors); the right side shows field-level before and after values grouped by component. Only changed fields show by default; `Show Unchanged Fields` expands everything.
+- **`Text` view**: the traditional line diff. The `Side-by-side` button switches between stacked and side-by-side layouts. Use it to check the raw YAML, or for cases the semantic view does not cover.
+
+Large files take a moment to parse; loading progress shows four stages: fetching file content, computing the diff, parsing assets, and building the semantic model.
+
+## Supported asset types
+
+Scenes (.unity), Prefabs (.prefab), Materials (.mat), animations and animator controllers (.anim / .controller), ScriptableObjects and other .asset files, plus physics materials, render textures, and other assets serialized as YAML. Component fields follow the Inspector's grouping, for example Transform's transform values or ParticleSystem's main / emission / shape modules. Non-YAML assets and binary files fall back to a text diff or offer no preview.
+
+## An example
+
+Move an object's position in a Prefab from (0, 0, 0) to (0, 2.5, 0):
+
+- Text diff: first find the line where `y: 0` becomes `y: 2.5` among a dozen lines of `m_LocalPosition` and `m_LocalRotation` YAML context, then trace the block upward to work out which object the data belongs to.
+- Semantic diff: the position field of that object's Transform component shows its before and after values directly. Readable at a glance.
+
+## How it works
+
+Locus parses each side of the diff into its own Unity object tree, pairs objects by their persistent identity in the file, then compares the paired objects field by field. What you see is therefore "which field of which object changed from A to B" rather than "which text lines differ": the size of the change does not hurt readability, and the GameObject hierarchy and component ownership stay visible throughout.
+
+File change previews in session chat and asset inspection on the [Assets page](/en/assets/browse-and-inspect) use the same parsing and presentation, so the field structure looks the same in all three places.

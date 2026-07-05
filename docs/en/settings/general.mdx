@@ -1,0 +1,60 @@
+---
+title: General settings
+description: Interface, notifications, shortcuts, proxy, logs, and runtimes
+---
+
+The `General` group in Settings collects interface and environment configuration. This page walks through its tabs.
+
+## General
+
+- **`Interface Language`**: switch the display language.
+- **`Debug Mode`**: when enabled, every LLM HTTP request is saved to the debug capture directory (`debug/llm/` in dev builds, `data/debug/llm/` in packaged builds). Sensitive headers like `Authorization` are automatically redacted. Turn it on to inspect requests, keep it off otherwise.
+- **`LLM Auto Retry`**: how many times a failed model request (connection errors, timeouts, HTTP 5xx and 429 rate limits) is retried automatically. Default 3, range 0 to 10; retries only happen before any output has streamed, 429 responses honor the server's Retry-After header, and 0 disables retries.
+- **`Unity Background Boost`**: keeps the Unity editor loop responsive while the Unity window is in the background, so compiles and Agent commands do not wait for you to click back into Unity.
+- **`Close Behavior`**: closing the main window either runs `Exit App` or `Minimize to Tray`.
+- **`Local Data Storage`**: where sessions and memory files live (Knowledge content stays in the project directory). `Open Directory` or `Change Location`; a move finishes after restart.
+- **`Temporary Files`**: large tool outputs and runtime temp files. `Clear` frees space; historical sessions still open afterwards, and cleared large tool outputs show as `Full output deleted`.
+- **`Git Runtime`**: the Git that Locus uses for version control, undo, and change analysis. Choose the managed Git or one installed on your system.
+- **`Python Runtime`**: the interpreter the bash tool uses for `python` and `pip`. Managed Python installs packages into the data directory instead of your system environment.
+- **`Reset All Settings`**: clears the configuration and re-enters the onboarding flow.
+
+## Display
+
+- **`Theme`**: pick `System`, `Light`, or `Dark` separately for the main window and the Unity embedded window.
+- **`Main Interface`**: toggles for top navigation entries: `Show Knowledge`, `Show Collab`, `Show Assets`, `Show Views`, `Show Plugins`, `Show Agent`.
+- **`Panel Behavior`**: auto open and close rules for the task list and file changes panels. See [File changes and undo](/en/sessions/changes-and-undo).
+- **`Fonts`**: custom fonts for UI, prose, inline code, code blocks, and the editor area.
+
+## Notifications
+
+- **`System Notifications`**: desktop notifications for key chat events while the window is unfocused, with separate toggles for chat completed, Sub-agent completed, input needed, chat failed, and approval needed.
+- **`Sound Alerts`**: the same five events can play a sound. Use the built-in source (`Soft`, `Bright`, or `Alert` mode) or a custom audio file, with volume control and preview.
+
+## Shortcuts
+
+- **`Send behavior`**: `Enter sends` (modifier+Enter inserts a newline) or modifier+`Enter sends` (Enter inserts a newline).
+- **`While running`**: the default handling for messages sent during an active run, `Queue next` or `Insert now`. See [Sessions page](/en/sessions/index).
+- **`New session`**: record a custom key combination. Click `Record` and press the keys; at least one modifier is required.
+
+## Proxy
+
+`Proxy mode` decides the network route for Locus backend requests:
+
+- **`Auto discovery`** (default): reads proxy settings from environment variables and system configuration.
+- **`System Proxy`**: backend requests read the system proxy configuration.
+- **`Manual Proxy`**: uses the `Proxy URL` you enter, such as `http://127.0.0.1:7890`.
+- **`Disable Proxy`**: backend requests connect directly.
+
+The `Request routes` section below shows the route each request class actually takes, which confirms whether the proxy is in effect.
+
+## Console
+
+Unified frontend and backend debug output. Filter by level (`Trace` through `Error`) and source (`Frontend`/`Backend`), or search by module name and log text. Backend debug and trace logs follow `General > Debug Mode`. Logs are also written to a local file, so they survive a crash; `Export Logs` bundles the current output and `Locate Log File` opens the log's directory. Attaching an export is the most useful thing to include in a bug report.
+
+## Archived sessions
+
+Review archived conversations. Archived sessions are hidden from the Sessions list but remain readable here, and `Unarchive` restores them.
+
+## About
+
+Shows the current version and contact information. `Update channel` offers `Stable` or `Experimental`: the experimental channel gets features earlier with weaker stability. `Check for updates` fetches the latest release information on demand.

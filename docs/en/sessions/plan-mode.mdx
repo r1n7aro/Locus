@@ -1,0 +1,41 @@
+---
+title: Plan mode
+description: Produce an implementation plan first, then start changing files after approval
+---
+
+Plan mode lets the Agent research the project in a read-only state and produce an implementation plan. Actual changes start only after you approve the plan.
+
+{/* TODO: 截图：计划模式下的对话区，顶部粘性横幅"规划模式（只读）"与退出规划按钮可见 */}
+
+## When to use it
+
+Plenty of game logic that looks simple is complicated to implement. Given a one-line instruction, the Agent tends to satisfy the surface request as fast as possible, and the result drifts. For complex requirements, have the Agent produce a plan first, confirm requirements, edge cases, and key design decisions in conversation, and only then move to coding. The full discussion is in the "For Complex Tasks, Plan and Review Before Execution" section of [Usage recommendations](/en/overview/usage-guidance).
+
+Typical cases for plan mode:
+
+- Features that span multiple systems, such as a new gameplay module or a custom render pipeline.
+- Changes to existing architecture where you want the blast radius mapped out first.
+- You have not settled on a technical route and want to compare a few options.
+
+## Entering and exiting
+
+Type `/plan` in the composer with your task description (available in Dev sessions only). A sticky banner appears at the top of the conversation reading `Plan mode (read-only)`, with an `Exit plan mode` button to leave manually at any time.
+
+Settings > Default Models has a `Plan Mode Model` slot: the session switches to it automatically when entering plan mode, so you can plan with a stronger reasoning model and execute with a faster one.
+
+## What read-only means
+
+In plan mode the Agent can read files, search code and assets, query the knowledge base, fetch web documentation, and dispatch sub-agents for research (sub-agents are locked to read-only as well). All modifying tools are blocked: no file writes, no shell commands, no Unity operations. The single exception is the plan file itself, which the Agent writes and keeps refining.
+
+## Where the plan file is written
+
+Plan content goes into a Markdown file in the local Locus data directory, organized per project and session. It is never written into your project directory, so planning produces no workspace changes and leaves version control untouched.
+
+## Plan approval
+
+When the plan is ready, a `Plan ready for approval` card shows the full plan:
+
+- **`Approve & implement`**: exits plan mode and starts implementation immediately.
+- **`Keep planning`**: rejects the current plan, optionally with feedback on what to adjust. The Agent keeps refining and submits again.
+
+After approval the session returns to normal execution: tool calls follow the approval rules in [Tool permissions](/en/sessions/permissions), and file changes are recorded as usual for [review and undo](/en/sessions/changes-and-undo).

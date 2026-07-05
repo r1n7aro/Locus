@@ -62,12 +62,31 @@
             ]
           },
           {
+            "tab": "会话",
+            "groups": [
+              {
+                "group": "会话",
+                "pages": [
+                  "sessions/index",
+                  "sessions/permissions",
+                  "sessions/plan-mode",
+                  "sessions/changes-and-undo",
+                  "sessions/context"
+                ]
+              }
+            ]
+          },
+          {
             "tab": "知识",
             "groups": [
               {
                 "group": "知识",
                 "pages": [
-                  "knowledge/index"
+                  "knowledge/index",
+                  "knowledge/injection",
+                  "knowledge/retrieval",
+                  "knowledge/memory-and-design",
+                  "knowledge/skills-and-references"
                 ]
               }
             ]
@@ -78,7 +97,56 @@
               {
                 "group": "协作",
                 "pages": [
-                  "collaboration/index"
+                  "collaboration/index",
+                  "collaboration/changes-and-commit",
+                  "collaboration/semantic-diff",
+                  "collaboration/merge-conflicts"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "资产",
+            "groups": [
+              {
+                "group": "资产",
+                "pages": [
+                  "assets/index",
+                  "assets/browse-and-inspect",
+                  "assets/health"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Unity 集成",
+            "groups": [
+              {
+                "group": "Unity 集成",
+                "pages": [
+                  "unity/index",
+                  "unity/execute-and-compile",
+                  "unity/hot-reload",
+                  "unity/runtime-state"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "设置与扩展",
+            "groups": [
+              {
+                "group": "设置",
+                "pages": [
+                  "settings/models",
+                  "settings/general",
+                  "settings/code-analysis"
+                ]
+              },
+              {
+                "group": "扩展",
+                "pages": [
+                  "extensions/plugins-and-views"
                 ]
               }
             ]
@@ -116,12 +184,31 @@
             ]
           },
           {
+            "tab": "Sessions",
+            "groups": [
+              {
+                "group": "Sessions",
+                "pages": [
+                  "en/sessions/index",
+                  "en/sessions/permissions",
+                  "en/sessions/plan-mode",
+                  "en/sessions/changes-and-undo",
+                  "en/sessions/context"
+                ]
+              }
+            ]
+          },
+          {
             "tab": "Knowledge",
             "groups": [
               {
                 "group": "Knowledge",
                 "pages": [
-                  "en/knowledge/index"
+                  "en/knowledge/index",
+                  "en/knowledge/injection",
+                  "en/knowledge/retrieval",
+                  "en/knowledge/memory-and-design",
+                  "en/knowledge/skills-and-references"
                 ]
               }
             ]
@@ -132,7 +219,56 @@
               {
                 "group": "Collaboration",
                 "pages": [
-                  "en/collaboration/index"
+                  "en/collaboration/index",
+                  "en/collaboration/changes-and-commit",
+                  "en/collaboration/semantic-diff",
+                  "en/collaboration/merge-conflicts"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Assets",
+            "groups": [
+              {
+                "group": "Assets",
+                "pages": [
+                  "en/assets/index",
+                  "en/assets/browse-and-inspect",
+                  "en/assets/health"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Unity integration",
+            "groups": [
+              {
+                "group": "Unity integration",
+                "pages": [
+                  "en/unity/index",
+                  "en/unity/execute-and-compile",
+                  "en/unity/hot-reload",
+                  "en/unity/runtime-state"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Settings & extensions",
+            "groups": [
+              {
+                "group": "Settings",
+                "pages": [
+                  "en/settings/models",
+                  "en/settings/general",
+                  "en/settings/code-analysis"
+                ]
+              },
+              {
+                "group": "Extensions",
+                "pages": [
+                  "en/extensions/plugins-and-views"
                 ]
               }
             ]

@@ -1,0 +1,49 @@
+---
+title: Asset database
+description: Locus indexes your project by reading serialized files straight from disk, with incremental watching and scan tuning
+---
+
+The Assets page is built around the `Asset Database`. Locus does not go through the Unity editor to resolve asset references. It reads Unity's serialized files directly from disk, scans the `Assets` and `Packages` roots, creates a node for every asset, and records the references between them. Asset search, reference analysis, and [asset health checks](/en/assets/health) all run on top of this index.
+
+## How it works
+
+Unity generates a `.meta` file for every asset, and the GUID inside is that asset's unique identity in the project. Serialized files such as scenes, prefabs, and materials reference other assets by GUID. By parsing these files, Locus reconstructs the complete graph of who references whom.
+
+Because it only reads disk files, scanning works without a running Unity editor and takes nothing from editor performance. Scan results persist locally: the next time you open the project, the existing index loads directly (shown as `Loaded from persisted index`) and only changed parts are verified, with no full rescan.
+
+## Scan phases and progress
+
+Selecting a project for the first time triggers a full scan (one step of the [Installation and Setup](/en/overview/install-and-setup) onboarding flow); after that you can click `Rescan` on the Assets page at any time. A scan moves through five phases:
+
+1. `Directory scan`: walk the files under `Assets` and `Packages`.
+2. `.meta parse`: read each asset's GUID and import settings.
+3. `YAML parse`: parse serialized content such as scenes, prefabs, and ScriptableObjects, extracting references.
+4. `Index write`: write nodes and references into the local database.
+5. `Index verification`: check the index against the disk and fill in any gaps.
+
+Progress shows in two places: the `Scan Status` card on the Assets page displays the current phase with completed and total counts, and the `Asset Database` status indicator above the session composer mirrors the same phase progress. The database as a whole sits in one of a few states: `Not indexed`, `Scanning`, `Indexed`, `Scan failed`, or `Rescan required`. When `Rescan required` appears (for example, after the index file becomes invalid), the page prompts you to rescan before asset search and reference analysis come back.
+
+{/* TODO: 截图：资产页统计总览，处于「已索引」状态，可见索引规模/扫描状态/实时监听/资产风险四张卡片 */}
+
+## Live watcher
+
+The `Live Watcher` card corresponds to a filesystem watcher whose job is keeping the index in step with the project:
+
+- **`running`**: changes to `.meta` / `.asset` and similar files trigger an automatic incremental rescan that only touches the changed files. Import an asset in Unity, change a reference, or move a folder, and the index catches up within seconds.
+- **`stopped`**: the index only refreshes after a manual rescan.
+
+The card also shows the `Pending queue` length and the file currently under `Processing`. Occasional queue buildup is normal (after a bulk import, for instance) and clears once processing finishes.
+
+## Scan intensity and worker threads
+
+Two tuning controls sit below the `Live Watcher` card:
+
+- **`Scan intensity`**: a slider from `Eco` to `Turbo` that sets the throttle interval for incremental scans (0 to 1000 milliseconds; the readout to the right of the slider shows the current level and millisecond value live). `Turbo` responds fastest but uses more CPU; `Eco` suits large projects where background overhead matters.
+- **`Worker threads`**: the number of parallel threads used for scanning and parsing.
+
+## Stat cards
+
+- **`Index Scale`**: `Asset count`, `Reference count`, `Database size`, and `Asset size`, the overall reach of the index.
+- **`Scan Status`**: the current status badge, the last scan's time and duration, and the last scan's stats (`Dirs scanned`, `YAML assets`, `Nodes added`, `Edges added`, `Parse failures`). The `Rescan` button lives here too.
+- **`Live Watcher`**: watcher state, the pending queue, and the tuning controls.
+- **`Asset Risk`**: the summary entry for broken references, Missing Script, parse failures, and duplicate GUIDs. See [Asset health](/en/assets/health).

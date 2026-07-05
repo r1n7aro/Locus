@@ -1,0 +1,35 @@
+---
+title: Retrieval and indexing
+description: Configuring the full-text and semantic channels, folder-level switches, and index maintenance
+---
+
+The knowledge base supports two retrieval channels. Full-text retrieval matches by word and suits exact terms: class names, asset names, error text. Semantic retrieval matches by meaning and suits fuzzy descriptions like "the invincibility-frame logic after the character takes a hit". Both channels can be enabled at once: a search recalls from each separately and merges the ranking, and each result is labeled with its match source (`Lexical` / `Semantic` / `Hybrid`).
+
+![img](/images/overview/page-tour/knowledge-search.png)
+
+## Full-text retrieval
+
+The `Lexical Search` switch in the `Retrieval Settings` panel at the top controls whether an inverted index is maintained; it is off by default. While off, the search bar scans documents one by one, which is enough for a small knowledge base. Once documents pile up, turn it on: search gets faster and the Agent's lexical recall gets more complete.
+
+## Semantic retrieval
+
+Semantic retrieval is off by default and needs an embedding model configured first. Two ways to set one up:
+
+- **Local runtime**: in `Retrieval Settings`, pick a preset model (sorted small to large by parameter count, with GPU memory and RAM estimates) and `Download Model`, choosing `Official` or `HF-Mirror` as the download source; when the download finishes, click `Activate Vector` to start the local runtime. You can also enter a Hugging Face repository ID that contains the ONNX and tokenizer files directly, or point to a local model directory.
+- **Remote endpoint**: in `Embedding Settings` on the Settings page, switch to `Remote` mode and fill in an OpenAI-compatible `/v1/embeddings` endpoint address, the `API Key`, and the model name; once `Test Connection` passes, it is ready to use.
+
+The local route has no network dependency but takes machine resources (the runtime backend can be CPU or GPU). The remote route has no local overhead, but indexing and queries incur API call charges.
+
+## Folder-level switches
+
+Not every folder deserves a place in the index. `Retrieval Rules` in `Folder Config` controls a folder's participation in `Lexical Retrieval` and `Vector Retrieval`, with the values `Inherit` / `Enable` / `Disable`: by default a folder follows the nearest parent's rule, and stays enabled when no parent sets one. The `LX` / `SM` badges in the tree mean the corresponding retrieval mode is enabled for that directory. Folders that are big but thin on value (raw material imported wholesale, for example) can turn semantic retrieval off and save the indexing cost.
+
+## Index status and refresh
+
+- The `Search Index` card on the [knowledge overview](/en/knowledge/index) shows both channels' coverage and the `Fresh` / `Stale` / `Pending` states. Indexes follow document edits automatically; `Stale` is a normal transitional state.
+- If a state stays abnormal, rebuild everything with `Rebuild Index` in the dashboard; rebuild progress shows in a separate window.
+- The semantic runtime's model, current device, and GPU memory use are shown in the `Retrieval Settings` panel, and `Disable Vector` releases the resources at any time.
+
+## Which to pick
+
+Lexical and semantic are not an either-or choice. A common combination in practice: full-text retrieval on as the base channel, then semantic added when the project is heavy on jargon, naming is inconsistent, or teammates describe needs in natural language. When searching, give exact terms to the lexical side and intent descriptions to the semantic side; documents both channels hit rank higher.

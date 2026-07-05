@@ -1,0 +1,48 @@
+---
+title: Browse and inspect
+description: Search and preview assets on the Assets page, and view disk data and Unity live data in Locus Inspector
+---
+
+The Assets page browses, searches, and previews project assets without a trip to the Unity editor.
+
+## Layout
+
+The page defaults to two columns: a `Directory` tree on the left, and a `Current Folder` list plus preview area on the right. The layout button in the top-right corner of the directory panel toggles between one and two columns (`Switch to single-column layout` / `Switch to two-column layout`):
+
+- **Two columns**: suited to walking directories level by level; the search scope switches between `Current Folder Search` and `Global Search`.
+- **Single column**: the directory tree pairs directly with the preview area, and search is always global.
+
+{/* TODO: 截图：资产页双栏布局，左侧目录树、中间当前目录列表、右侧预览一个 Prefab */}
+
+## Search
+
+The search box at the top matches by filename, path, or type, and it understands ScriptableObject types and base classes: enter a ScriptableObject's type name (or the name of its base class) to find every data asset of that type.
+
+- Result counts are capped; past the cap the list shows `Showing first 200 results`, so refine the keywords to narrow the range.
+- While the index is not ready yet, the search bar shows an `Index not built` warning and results are limited to a filename walk; they are complete once the [scan](/en/assets/index) finishes.
+
+## Preview
+
+Select an asset and the preview area adapts to the file type:
+
+- **Text assets**: scripts, shaders, JSON, and the like show their text directly; large files load only the beginning, with a truncation notice.
+- **Images**: zoomable, with `Fit`, `Actual size`, and `Reset zoom` on the toolbar. `Channel` switches between `Color` and `Alpha` to inspect the transparency channel on its own, and the preview labels whether `alphaIsTransparency` is on in the `.meta`. PSD files preview as well.
+- **Scenes, prefabs, and other serialized assets**: a structured view of hierarchy tree plus Inspector; click any object to see its components and fields, and switch between `Simplified View` and `Full View` in the top-right corner.
+- **Other binary files**: when no preview is possible, an info card shows the `GUID`, `Size`, `Extension`, and `Path`.
+
+## Locus Inspector
+
+Locus Inspector is a standalone asset inspection window. Right-click any asset reference in a session and choose `Open in Locus Inspector` (or `Open in standalone Inspector window`) to bring it up.
+
+A badge on the window marks where the data comes from:
+
+- **`Disk`**: data comes from the serialized file itself, viewable even with Unity not running.
+- **`Live`**: with Unity connected, the window loads live data from the editor automatically; properties become editable and write back to Unity.
+
+Without a Unity connection only disk data is available; operations that need live data show `Requires Unity connection`.
+
+## Working with Unity
+
+- **`Select in Unity`**: this button on the preview title bar (and the item of the same name in the asset reference context menu) makes Unity select and locate the asset in the Project window; it needs Unity connected.
+- **`Open in default editor` / `Open in File Explorer` / `Copy Path`**: the usual context menu actions on an asset reference for jumping out to external tools.
+- **From Unity back to Locus**: with an asset or scene object selected in Unity, `Assets > Send to Locus` or `GameObject > Send to Locus` sends it to the Locus composer as a reference. See [Connection and plugin](/en/unity/index).

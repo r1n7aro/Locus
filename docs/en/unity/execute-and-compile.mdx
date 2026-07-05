@@ -1,0 +1,36 @@
+---
+title: Execute and compile
+description: The Agent runs C# inside the editor, backed by recompile waits and an out-of-process compile server
+---
+
+## Running C# in the editor
+
+With Unity connected, the Agent executes C# code directly inside the editor process: querying scene objects and component properties, modifying serialized fields, calling editor APIs, batch-processing assets. These operations appear in the session as tool calls such as `Execute Unity command`, and they go through the same [permission controls](/en/sessions/permissions) as file edits.
+
+Many tasks no longer need the detour of generating a script, dropping it into the project, running it from a menu, and deleting it afterwards. If the Agent wants to know how many objects in the scene carry a given component, it queries directly; to verify what a piece of logic actually does, one execution gives the answer.
+
+## Recompile and domain reload
+
+After a script file in the project changes, Unity has to recompile scripts and run a domain reload before the change takes effect. Locus requests the recompile itself after editing code and waits for the whole process to finish, with the status indicator showing `Unity recompiling, waiting for reconnect` in the meantime.
+
+From a user's perspective, one thing about domain reload is worth knowing: it resets scripts' in-memory state, static variables return to their initial values, and a briefly unresponsive editor is normal. Locus waits automatically until the reload completes and the connection recovers before continuing the task, so there is no need to switch back to Unity to confirm (the background mechanism that speeds up this wait is covered in [Runtime state and background operation](/en/unity/runtime-state)).
+
+## Why this chain matters
+
+Real Unity tasks rarely stop at getting the file edit right. For a change to actually land, it usually walks a chain: modify scripts or assets, make Unity notice the changes, wait for the compile or domain reload, then verify the behavior back in the editor.
+
+Locus executes this chain as one unit. Right after changing code, the Agent has the compile result: compile errors come straight back into the session and drive the next round of fixes, while a passing compile flows on to in-editor verification. Gaps like a change that never compiled, or a compile failure nobody noticed, are gone; by the time a task reads as done, the change has already taken effect in the editor.
+
+## Compile server
+
+The code snippets the Agent executes (along with View scripts) have to compile first. By default, this compilation runs in a compile server in its own process instead of occupying the Unity editor process:
+
+- **Faster compiles**: a modern compiler toolchain, unaffected by editor load.
+- **No dropped frames in Play Mode**: executing code while the game runs no longer stutters the editor with compilation.
+- **Errors return directly**: compile errors reach the session without passing through Unity.
+
+The compile server only handles the Agent's snippets; recompiling project scripts remains Unity's own job.
+
+The switch lives under Settings > `Hot Reload & Compile` as `Compile in CoreCLR sidecar`, on by default. Any compile-server failure falls back to in-Unity compilation automatically without interrupting the task; if you suspect it is causing problems, you can also turn the switch off manually to fall back to in-editor compilation. [Hot reload](/en/unity/hot-reload) depends on this switch.
+
+The `Compiler` row in the panel shows its state: `Running`, `Idle`, `Falling back to Unity`, or `Off`.

@@ -1,0 +1,45 @@
+---
+title: Context and cost
+description: Context usage indicator, automatic compaction, and raw context export
+---
+
+Language models have bounded context, and longer context means worse output and higher cost. Locus shows usage continuously and compacts automatically near the limit.
+
+## Usage indicator
+
+A ring indicator sits below the composer; hover it for details:
+
+- **`Context X / Y (Z%)`**: tokens used by this session, the model's context window, and the percentage. The ring turns yellow past 60% and red past 80%.
+- **`Cost $N`**: the estimated cumulative model spend for this session, shown only when the model has pricing data (subscription providers usually do not).
+
+For custom endpoints, the context window size is part of the endpoint configuration. See [Model configuration](/en/settings/models).
+
+## Automatic compaction
+
+When usage approaches the context window limit (around ninety percent), Locus compacts automatically. The transcript shows `Compacting context…` followed by `Context compacted`.
+
+What compaction keeps and drops:
+
+- **Kept**: the most recent exchanges verbatim, plus key technical decisions, code changes, and unfinished tasks, condensed into a handoff summary.
+- **Dropped**: older full exchanges and redundant intermediate steps, such as stale tool outputs.
+- **Restored**: after compacting, the contents of a few recently read files are loaded back into context, saving the Agent a round of re-reading.
+
+If a request outright exceeds the model's context window, Locus also compacts reactively and shows a notice that the conversation was compacted automatically.
+
+Compaction is lossy: a summary inevitably drops detail. After several compactions in a long session, the Agent's grip on early discussion weakens.
+
+## When to run /compact manually
+
+You do not have to wait for the automatic trigger. These moments favor a manual `/compact`:
+
+- A phase of work just finished and the next is about to start; the intermediate steps are exactly what a summary should absorb.
+- Usage entered the yellow zone and you expect many more tool calls ahead.
+- The conversation has piled up error output and retry noise that has no value for the work ahead.
+
+## Context export
+
+To debug unexpected Agent behavior, export the session's raw context: right-click the session in the list and choose `Save context (with system prompt)` or `Save context (without system prompt)`. The export contains the verbatim API request and response of each round, so you can verify what the model actually received and which rules and knowledge were injected. When sharing an export, keep in mind it may contain project code and document content.
+
+## Independent tasks, independent sessions
+
+Once a context fills with unrelated tool results, model quality drops noticeably, and cache read overhead grows. Run independent tasks in new sessions; it is also the most effective cost control. The full discussion is in the "Run Independent Tasks in Independent Contexts" section of [Usage recommendations](/en/overview/usage-guidance).

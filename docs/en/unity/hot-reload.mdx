@@ -1,0 +1,47 @@
+---
+title: Hot reload
+description: Method-body C# edits reach the running editor in 1-2 seconds; structural edits fall back to a recompile automatically
+---
+
+Hot reload (experimental, off by default) compiles method-body C# edits into patches and applies them to the running editor within 1 to 2 seconds, skipping the Unity recompile and domain reload. While you tune feel, change values, or fix logic in Play Mode, the game is never interrupted and memory state stays exactly as it was.
+
+To turn it on: Settings > `Hot Reload & Compile` > `Unity hot reload (experimental)`. It requires the [compile server](/en/unity/execute-and-compile#compile-server) on the same page to be enabled first.
+
+## Which changes hot reload
+
+- **Hot reloaded**: logic changes inside a method body. Changing a condition, a formula, a parameter, or the call order; these make up most of day-to-day iteration.
+- **Fall back to recompile**: structural changes, including adding or removing fields, changing method signatures, adjusting inheritance, and adding new types. These enter the `Need compile` queue and converge through one normal Unity recompile, behaving exactly as they would with hot reload off.
+
+The classification is automatic; you never declare the kind of change up front.
+
+## Reading the status panel
+
+Once enabled, a `Unity hot reload` indicator appears above the session composer. Expanded, it shows:
+
+- **`Unapplied edits`**: detected changes not yet live in the editor. Normally this drops to zero within a second or two.
+- **`Hot patch code`**: the amount of code currently running as hot patches. It returns to zero after a domain reload or recompile, after which the normal compiled output runs.
+- **`Need compile`**: changes that cannot hot reload and are waiting for a recompile to converge. When it is nonzero, click `Recompile` on the panel to converge them in one pass.
+- **`Failures`**: the number of failed hot reloads. Failed changes move to the recompile path automatically and are not lost.
+- **`Assembly memory`**: memory held by hot patch assemblies.
+- **`Compiler`**: the compile server state (`Running` / `Idle` / `Falling back to Unity`).
+
+{/* TODO: 截图：展开的 Unity 热更新面板，热更新已开启，可见各计数行与编辑器模式、进入 Play 重载两个开关 */}
+
+## Debug and Release
+
+The `Editor mode` control on the panel sets the optimization level of Unity scripts, which directly affects the hot reload success rate:
+
+- **`Debug`**: no inlining, so every method-body edit can hot reload; the editor is slightly slower.
+- **`Release`**: a faster editor, but some methods get inlined, and edits to inlined methods cannot hot reload; they need a recompile.
+
+Hot reload works as usual under Release: the few inlined edits trigger a converging recompile automatically, with nothing to handle by hand. Switch to `Debug` for the highest hot reload success rate; when the editor is in Release, the settings page also shows a hint with a `Switch to Debug` button.
+
+The `Reload on Play` control on the panel decides whether entering Play Mode runs a domain reload: `Reload` is Unity's default behavior, with clean static state, but applied hot patches are dropped and recompiled; `Skip` keeps hot patches and memory state, at the cost of static state persisting across plays.
+
+## Self-test
+
+If hot reload seems to misbehave, run a self-test first: Settings > `Hot Reload & Compile` > `Hot reload self-test`, then click `Run self-test` with the editor connected and in Edit Mode. The self-test writes a set of test scripts, enters Play Mode, verifies the hot reload behavior of each change kind one by one, cleans up automatically when finished, and reports the passed and failed counts with a full log.
+
+## Boundaries and safety
+
+Hot reload does not change how edits reach disk: the Agent's changes are always written to the source files first, and the patch only lets the running editor pick up the new logic early. Any change that cannot hot reload, or that fails to, falls back safely to a standard recompile, and the final state is identical to never having enabled hot reload. It will not break the project; the worst case is waiting through one extra compile.

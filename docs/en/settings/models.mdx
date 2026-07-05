@@ -1,0 +1,44 @@
+---
+title: Model configuration
+description: Subscription sign-in, custom endpoints, and default models
+---
+
+Locus needs a remote AI service as its reasoning engine, and the model's quality directly determines how well Locus works. The `Models` group in Settings has two tabs: `Models` connects providers, and `Default Models` assigns models per scenario.
+
+![img](/images/overview/page-tour/settings.png)
+
+## Subscription accounts
+
+- **`Claude Subscription`**: click `Sign In`, log in to your Claude account in the browser, then copy the authorization code shown after approval and paste it back into Locus. If Claude Code is installed, `Import from Claude Code` reuses its login. Once signed in, `Remaining quota` shows the `5-hour limit` and weekly windows.
+- **`ChatGPT Subscription (Device Auth)`**: click `Sign in with ChatGPT`, visit the link in your browser, and enter the code to authorize. Compatible with ChatGPT Pro / Plus plans. `Import from Codex CLI` is also available. After sign-in, quota shows the `Short window` and `Long window` remaining.
+- **`Claude Code CLI`**: Locus only calls the system `claude` command; Claude Code manages its own login state. If the CLI is detected but not logged in, run `claude` in a terminal and complete `/login`. `Test connection` sends a one-word probe through the CLI to verify the endpoint, credentials, and proxy a real run would use. Models from this source stay out of the model list until you turn on `Enable Claude Code CLI models` (experimental) in the `Default Models` tab.
+- **`OpenRouter`**: paste an API key. A unified gateway for Claude, GPT, Gemini, and more.
+
+## Custom model endpoints
+
+`Custom Model Endpoints` connects any compatible API service, including locally hosted models. Three message formats are supported:
+
+- **`Anthropic Messages`**: Claude-family APIs and compatible services.
+- **`OpenAI Chat Completions`**: the most widely compatible format; most third-party and local inference services speak it.
+- **`OpenAI Responses`**: OpenAI's newer interface format.
+
+Click `Add Custom Endpoint` and fill in:
+
+1. `Display Name`: the name shown in the model list.
+2. `API Model ID`: the model field value sent to the API, such as `gpt-4o`.
+3. `Endpoint URL`: the base URL including `/v1`; paths like `/chat/completions` are appended automatically.
+4. `API Format` and `API Key` (optional; some local models require none).
+
+Advanced options include `Context Window` (compaction triggers past this token count), `Reasoning Effort` (adds effort levels to the model selector), and `Image understanding` (enable when the endpoint accepts screenshots and image attachments). After saving, `Test` verifies connectivity. Multiple endpoints can coexist; `Edit` or `Delete` them at any time.
+
+## Default models
+
+The `Default Models` tab assigns models per scenario; unset slots follow your current manual selection:
+
+- **`Main Chat Model`**: the default for the main chat session.
+- **`Plan Mode Model`**: applied automatically when switching to plan mode, so plan design can use a stronger reasoning model. See [Plan mode](/en/sessions/plan-mode).
+- **`Sub-agent Models`**: per-subagent overrides used when the Agent dispatches sub-tasks; unset sub-agents inherit the session model. Sub-tasks are usually more mechanical, and a faster model there cuts cost noticeably.
+
+## Privacy boundary
+
+Apart from calls to the model services you configure, Locus is a pure client application and uploads nothing else to the internet. Sessions, knowledge, and configuration all stay on your machine; the storage location is described under `Local Data Storage` in [General settings](/en/settings/general).

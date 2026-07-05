@@ -1,0 +1,29 @@
+---
+title: Conflict resolution
+description: Operation limits during conflicts and field-level three-way merge
+---
+
+When a merge, rebase, cherry-pick, revert, or stash application produces conflicts, the Collaboration page enters a conflict-handling state until every file is resolved.
+
+![img](/images/showcases/merge.png)
+
+## Limits during a conflict
+
+While unresolved conflicts exist, other Git operations in the context menus (branches, commits, stashes, and so on) are disabled with the notice `Unresolved conflicts exist, actions are disabled`. The right panel switches to the list of files to resolve: .meta conflicts are hidden by default (they can be expanded), and the bottom offers `Continue` / `Skip` / `Abort`. `Abort` drops the conflict-handling progress made so far and restores the workspace to the state before the operation started.
+
+## Field-level three-way merge
+
+Click a conflicted file to open the resolution view. Unity YAML assets get a `Structured` view:
+
+- A three-way comparison: `Current changes` (your branch's edits), `Incoming changes` (the other side's edits), and `Shared base` (the common starting point of both sides, toggled with `Show shared base`). In conflicts from applying a stash, the other column is `Stashed changes`.
+- Click a field's value in a source column and that side is chosen for the field; `Use X for this object`, `Use X for this section`, and `Use X for all fields` pick sides in bulk.
+- A choice is only needed where both sides changed the same field; fields changed on one side only resolve automatically. `Conflicts Only` filters out everything unrelated.
+- The bottom shows a live count of fields still needing a choice. Choices are only staged before write-back: `Apply structured result` performs the actual write to the file, and leaving without applying discards the staged choices.
+
+The `Raw Text` tab keeps the traditional block-by-block picking, for unstructured files or cases that need manual rewriting. If the file is modified outside Locus, block picking is disabled and you edit the result directly below.
+
+## Compared with editing conflict markers by hand
+
+Resolving Unity YAML conflicts in a text editor means comparing large runs of serialized data between `<<<<<<<` markers: a single field's choice sits inside dozens of lines of context, and one wrongly deleted line can corrupt the file structure. Field-level merging changes the granularity from "whose lines" to "whose value for this field", and Locus performs the write-back, removing the manual risks of cutting across field boundaries or leaving conflict markers behind. Object hierarchy and component ownership stay visible in the view, which also gives the judgment of whose change to take more to stand on.
+
+For complex conflicts that need the full code context (a C# file where both sides refactored the same logic, say), you can still bring the AI into the analysis from the command line at the bottom, or fall back to the `Raw Text` view and resolve by hand.

@@ -1,0 +1,42 @@
+---
+title: Changes and commits
+description: Managing the staging area, .meta pairing, Locus file badges, and the commit flow
+---
+
+## Unstaged and Staged
+
+The change list has two areas: Unstaged holds workspace changes, Staged holds what goes into the next commit. Click `Stage` / `Unstage` to move a single file, multi-select and use `Stage Selected (N)` for a batch, or `Stage All` to stage everything at once. When a merge conflict happens, the right panel switches to the list of files waiting to be resolved. See [Conflict resolution](/en/collaboration/merge-conflicts).
+
+{/* TODO: 截图：修改列表的 Unstaged 与 Staged 两区，含 Locus 徽标与 .meta 徽标 */}
+
+## .meta pairing
+
+Unity generates a .meta file for every asset, and showing each one would bury the real changes. With `Hide .meta files` on:
+
+- Paired .meta files are hidden from the list, with the count shown as `N metas hidden`.
+- Staging, unstaging, and discarding automatically carry the paired .meta along, marked by a `.meta` badge on the primary file's row.
+- A .meta whose primary file cannot be found is tagged `Orphan` and always stays visible, with a warning at the top of the list. An orphan .meta usually means an asset was deleted or moved without its .meta being handled, so it is worth a look.
+
+## Locus files
+
+Files carrying a `Locus` badge (`Locus/Design`, `Locus/Memory`, `Locus/Skill`, `Locus/Reference`) are the Agent's own knowledge or configuration files. By default, memory and understanding other than `user_preference` are shared at the project level; if you would rather keep them out of the project's version control, add them to .gitignore.
+
+Discarding changes to these files triggers an extra warning: the discard also loses the corresponding knowledge base, Memory, or configuration changes.
+
+## Platform-blocked paths
+
+On Windows, some paths cannot be staged (reserved device names, path segments ending with a dot or a space, and similar, most often in repositories synced from other systems). These files are listed separately with the reason; `Stage All` skips them automatically and continues with the rest, and the result reports how many were skipped.
+
+## Committing
+
+A `Commit` button appears once the Staged area has files. Clicking it opens the commit window:
+
+1. The window title shows the branch the commit goes to.
+2. Write the commit message, optionally adding a longer description.
+3. Or click the AI button next to the message field to generate a commit message from the staged content. Give the result a human pass: the AI sums up what changed, and why it changed is usually yours to add.
+
+The graph refreshes as soon as the commit lands. To undo a commit, right-click it in the graph and use `Soft Reset` or `Revert Commit`; see the [Collaboration overview](/en/collaboration/index). For reverting the Agent's edits inside a session, see [File changes and undo](/en/sessions/changes-and-undo).
+
+## Discarding changes
+
+Right-click a file and choose `Discard Changes`: a tracked file is restored to its last committed state, an untracked file is deleted outright. The operation cannot be undone, and the confirmation dialog states the scope of the impact.

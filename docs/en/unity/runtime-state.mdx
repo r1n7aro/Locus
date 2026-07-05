@@ -1,0 +1,34 @@
+---
+title: Runtime state and background operation
+description: The state probe keeps reading editor state, while the native bridge and background boost free the Agent from the foreground window
+---
+
+Locus tracks the Unity editor's actual state continuously: `Editing`, `Playing`, `Paused`, `Reloading`, `Compiling`, `Importing`, and even `Unresponsive`. The same state feeds both sides. On the status panel you can see what Unity is doing, whether it is hung or just reloading normally; the Agent reads the same information to decide when to call Unity and when to wait, and the `Operation safety` row on the panel is exactly that verdict. This pays off in troubleshooting: the Agent can confirm the game is actually playing, or that the editor is mid-reload, instead of poking blind at a black box.
+
+The three subsystems below are all on by default; their switches sit together under Settings > `Unity Connection`.
+
+## State probe
+
+Ordinary state detection relies on replies from the in-editor plugin, but at exactly the moments state matters most (during a domain reload, or with the editor hung), that channel goes silent. The state probe reads editor state from outside the Unity process, so state keeps updating through those moments, and Locus can tell a normal reload apart from a real hang.
+
+The probe degrades in tiers: when deeper information is out of reach, it falls back to coarser detection, bottoming out at pipe plus process inference. The state display is always available; only precision drops. The `State probe` row on the status panel shows the current working tier.
+
+The switch is `Out-of-process state probe`. In the same area, `Live connection test` connects to the running editor, walks through domain reload, play, pause, resume, and exit-play in turn, and verifies the probe observes each state change.
+
+## Native bridge
+
+The native bridge is a native-layer implementation of the command channel between Locus and Unity. Its most important value is keeping the connection alive through domain reloads: commands continue after the reload finishes, with no fresh handshake.
+
+The switch is `Native Plugin Bridge`. Turned off, the channel falls back to a plain pipe connection; connection retention during domain reloads and state fusion go away with it, and each reload requires reestablishing the connection. The `Native bridge` row on the status panel shows `Ready`, `Not connected`, or `Off`.
+
+## Unity background boost
+
+When the Unity editor loses focus or sits in the background, it defers processing external commands until you bring it back to the foreground. Without background acceleration, that means every recompile the Agent triggers costs you a manual click on the Unity window.
+
+The background boost (`Background Hook`) patches the editor so it keeps processing Locus commands in the background, recompiles included. With it on, the Agent completes the edit, compile, verify loop on its own while you stay focused on Locus or any other window.
+
+The switch is `Keep editor responsive in background`. It is built on native symbols and falls back automatically when unavailable; after a fallback, bringing Unity to the foreground makes everything run normally again. The `Background Hook` row on the status panel shows `Active`, `Waiting for process`, `Failed`, `Unavailable`, or `Disabled`.
+
+`Background recompile probe` under Settings > `Testing` verifies the effect: it writes a harmless temporary script, triggers one real recompile, and cleans up automatically when done; with the background hook active, the whole run needs no switch of Unity to the foreground.
+
+{/* TODO: 截图：「设置」→「Unity 连接」页面，可见 Native Plugin Bridge、进程外状态探针、后台保持编辑器响应三个开关 */}

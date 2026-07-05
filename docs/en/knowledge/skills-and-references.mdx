@@ -1,0 +1,41 @@
+---
+title: Skill and Reference
+description: Capturing workflows and configuring triggers, importing and syncing external material
+---
+
+## Skill: captured workflows
+
+A Skill writes a high-frequency workflow down as a document: the steps, the checks, the output format. When a task of that kind comes up, the Agent follows the Skill instead of being briefed again. Having designers and other non-programmers ship features through Skills the programmers wrote ahead of time is also the recommended way to collaborate; see [Usage recommendations](/en/overview/usage-guidance).
+
+Right-click the Skill type and choose `New Skill` to create one. The body holds the workflow itself; the `Config` sidebar controls how it triggers:
+
+- **`Description`**: a short description used for retrieval and matching. Automatic triggering relies on it to decide whether the current task is a match, so state clearly when the Skill applies and when it does not.
+- **`Argument hint`**: placeholder text for the / command's arguments, shown while typing the command.
+- **`Surface`**: four settings. `Disabled` (absent from the / command palette and never recalled automatically), `Command` (manual / command only), `Auto` (semantic recall by the model only, not in the palette), and `Both`.
+- **`Command trigger`**: the / command name, such as `/commit-batch`. A name that clashes with a built-in command or is already taken by another Skill is flagged as a conflict and needs changing.
+
+{/* TODO: 截图：Skill 文档的配置侧栏，含触发方式四档与指令触发字段 */}
+
+## Skill packages
+
+Skills can be packaged for distribution. The right-click menu has three operations:
+
+- **`Import Package`**: import a package someone shared. Documents inside are read-only and cannot be renamed, moved, or deleted.
+- **`Export Package`**: export your own Skills as a package file to share with the team.
+- **`Delete Package`**: remove the whole package.
+
+When package content needs changes, the package author updates the version and you import it again; Skills provided by plugins are read-only in the same way and update with the plugin. See [Plugins and views](/en/extensions/plugins-and-views).
+
+## Reference: external material
+
+Reference stores read-only material from outside the project; once imported, it joins project knowledge in retrieval. Three sources:
+
+- **Local folders**: `Import External Folder`, pick a directory, and its content enters Reference.
+- **Official Unity documentation**: downloads the official offline docs matching the project's Unity version and converts them into searchable Markdown. Pick the `Document Language` (`Chinese` / `English`) at import; a separate window shows the download, extraction, conversion, and indexing progress. When the project moves to a new Unity version, the page suggests `Reimport` for the matching version.
+- **Feishu docs**: configure a Feishu app (app identity, or user identity after authorization), choose a knowledge space and folders, then run a managed import of the documents inside.
+
+{/* TODO: 截图：Unity 引擎文档导入窗口，显示文档语言选择与下载进度 */}
+
+## External content is read-only
+
+Imported documents stay read-only: to change one, go back to the original source (the local file, the Feishu doc), then reimport or sync. This keeps Reference consistent with its sources, with no fork where each side edits its own copy. With the official Unity docs imported, the Agent can search the local copy when it looks up API usage; combined with reference analysis from the [asset database](/en/assets/index), answers stay closer to the project's actual version.
