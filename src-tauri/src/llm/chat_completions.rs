@@ -59,7 +59,12 @@ where
         thinking_level,
         flavor,
     );
-    let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+    // Serialize once and send these exact bytes, so debug dumps and rejected-body
+    // diagnostics are byte-for-byte what went on the wire — server-side JSON parse
+    // errors report line/column against the compact wire form (issue #106).
+    let request_bytes = serde_json::to_vec(&body)
+        .map_err(|e| format!("{} request serialization failed: {}", tag, e))?;
+    let raw_request = String::from_utf8_lossy(&request_bytes).into_owned();
 
     eprintln!(
         "[{}] POST model={} messages={} tools={} flavor={:?} replay_reasoning_content={}",
@@ -96,7 +101,7 @@ where
         let mut req = client
             .post(&api_url)
             .header("Content-Type", "application/json")
-            .json(&body);
+            .body(request_bytes.clone());
         if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -115,7 +120,12 @@ where
                 // reuse it across attempts.
                 let retry_after_secs = super::retry::retry_after_secs_from_headers(resp.headers());
                 let error_body = resp.text().await.unwrap_or_default();
-                let error = format!("{} API error ({}): {}", tag, status, error_body);
+                let mut error = format!("{} API error ({}): {}", tag, status, error_body);
+                if let Some(hint) =
+                    server_json_parse_error_hint(status, &error_body, request_bytes.len())
+                {
+                    error.push_str(&hint);
+                }
 
                 if debug {
                     eprintln!(
@@ -282,6 +292,45 @@ fn dump_rejected_request_body(tag: &str, status: reqwest::StatusCode, raw_reques
         truncated,
         suffix
     );
+}
+
+/// Detect a 4xx whose body blames JSON syntax in the request we sent.
+///
+/// Locus serializes request bodies with serde_json, which cannot emit
+/// syntactically invalid JSON, so such a rejection means the bytes were
+/// corrupted after leaving this process — a proxy, security middlebox, or a
+/// gateway buffer/size limit in front of the endpoint (issue #106). Surface
+/// that context plus the exact request size so users verify with the debug
+/// dump instead of chasing tool-schema ghosts.
+fn server_json_parse_error_hint(
+    status: reqwest::StatusCode,
+    error_body: &str,
+    request_len: usize,
+) -> Option<String> {
+    if !status.is_client_error() {
+        return None;
+    }
+    let lower = error_body.to_ascii_lowercase();
+    const MARKERS: [&str; 6] = [
+        "json parse error",
+        "jsonparseexception",
+        "jsonmappingexception",
+        // Jackson's signature phrasing: "was expecting a colon/comma/...".
+        "was expecting",
+        "invalid json",
+        "malformed json",
+    ];
+    if !MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return None;
+    }
+    Some(format!(
+        "\n[Locus] The endpoint rejected the request body as malformed JSON, but Locus sent \
+         {request_len} bytes serialized by serde_json, which cannot produce invalid JSON. The \
+         body was most likely corrupted in transit (proxy, VPN, security software, or a gateway \
+         buffer/size limit in front of the endpoint). Enable Debug mode in Locus settings (or \
+         set LOCUS_DEBUG=1) to save the exact outgoing request to disk, validate it with a JSON \
+         checker, and replay it with curl to confirm the corruption happens outside Locus."
+    ))
 }
 
 fn detect_flavor(model: &str, base_url: &str) -> ChatCompletionsFlavor {
@@ -1343,11 +1392,49 @@ mod tests {
     use super::{
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
         detect_flavor, drain_sse_buffer, finalize_stream_response, first_incomplete_tool_call,
-        summarize_recent_raw_chunk, ChatCompletionsFlavor, ChatStreamState, PartialToolCall,
-        StreamChunk, ThinkTagFilter,
+        server_json_parse_error_hint, summarize_recent_raw_chunk, ChatCompletionsFlavor,
+        ChatStreamState, PartialToolCall, StreamChunk, ThinkTagFilter,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
+
+    #[test]
+    fn json_parse_error_hint_fires_on_client_error_with_parser_markers() {
+        // Verbatim shape of the issue #106 rejection (Spring/Jackson gateway).
+        let issue_106_body = r#"{"error":{"message":"JSON parse error: Unexpected character (',' (code 44)): was expecting a colon to separate field name and value","code":"400"}}"#;
+        let hint = server_json_parse_error_hint(
+            reqwest::StatusCode::BAD_REQUEST,
+            issue_106_body,
+            104_213,
+        )
+        .expect("Jackson-style parse error must produce a hint");
+        assert!(hint.contains("104213 bytes"));
+
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "request contained malformed JSON",
+            10,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn json_parse_error_hint_stays_quiet_otherwise() {
+        // Ordinary 4xx rejections must not accuse the network path.
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"model not found"}}"#,
+            10,
+        )
+        .is_none());
+        // 5xx means the server failed, not that the request bytes were bad.
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "JSON parse error while reading upstream response",
+            10,
+        )
+        .is_none());
+    }
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
