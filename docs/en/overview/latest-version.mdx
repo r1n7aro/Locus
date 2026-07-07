@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.5 (2026-07-05)"
+description: "Locus v0.5.6 (2026-07-07)"
 sidebarTitle: "Latest Version"
-version: "0.5.5"
-releasedAt: "2026-07-05"
+version: "0.5.6"
+releasedAt: "2026-07-07"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,22 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.6 (Added)
+
+- **Import local files as knowledge references.** External sources can now import a local file or folder as a reference folder, in two modes: *live link* mounts the path through an OS link (junction/symlink), so content always reflects the latest files on disk and stays read-only; *snapshot* copies the current content once, with optional AI editing and a manual re-sync action. Markdown and text documents (`.md` / `.markdown` / `.txt`) become searchable in knowledge. Deleting a live-linked reference only detaches the link — source files are never touched. (#85)
+- **LaTeX math in chat.** Messages render LaTeX formulas with KaTeX, recognizing `$…$`, `$$…$$`, `\(…\)`, and `\[…\]` delimiters.
+
+### v0.5.6 (Fixed)
+
+- Chat-completions requests are sent byte-for-byte as serialized, and request logs capture the same bytes that went on the wire. When a provider rejects a request with a JSON parse error, the message now explains that the body was most likely corrupted in transit (proxy, VPN, security software, or a gateway) and suggests a curl replay to confirm. (#106)
+- Long streaming replies no longer slow down as they grow: live text, thinking, and the typewriter append new chunks instead of re-rendering the whole message.
+- The message list no longer flashes for a frame when a streaming reply finishes.
 
 ### v0.5.5 (Added)
 

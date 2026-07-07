@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.5.5 (2026-07-05)"
+description: "Locus v0.5.6 (2026-07-07)"
 sidebarTitle: "当前版本"
-version: "0.5.5"
-releasedAt: "2026-07-05"
+version: "0.5.6"
+releasedAt: "2026-07-07"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,22 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.5/locus_0.5.5_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.5.6（新增）
+
+- **本地文件导入知识库。** 外部源支持把本地文件或文件夹导入为引用文件夹，两种模式：**实时链接**通过操作系统链接（junction/symlink）直接挂载本地路径，内容始终是磁盘上的最新状态、文档保持只读；**快照导入**一次性复制当前内容，可选择允许 AI 编辑，并支持手动同步源路径变化。其中 Markdown / 文本文档（`.md` / `.markdown` / `.txt`）会进入知识检索。删除实时链接引用只解除链接，不改动源文件。(#85)
+- **聊天 LaTeX 公式渲染。** 消息中的 LaTeX 公式以 KaTeX 渲染，识别 `$…$`、`$$…$$`、`\(…\)`、`\[…\]` 定界符。
+
+### v0.5.6（修复）
+
+- chat-completions 请求按序列化后的字节原样发送，请求日志记录的也是同一份字节；当服务商以 JSON 解析错误拒绝请求时，报错会说明请求体很可能在传输途中被损坏（代理、VPN、安全软件或网关），并建议用 curl 重放确认。(#106)
+- 长流式回复不再随内容增长越来越卡：正文、思考过程与打字机改为增量追加新内容，不再整段重渲染。
+- 流式回复结束的瞬间消息列表不再闪烁。
 
 ### v0.5.5（新增）
 
