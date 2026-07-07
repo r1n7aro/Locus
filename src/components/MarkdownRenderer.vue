@@ -20,6 +20,7 @@ import {
   normalizeMarkdownPathStatusKey,
   type MarkdownPathStatus,
 } from "../composables/markdownInject";
+import { resolveMathSentinels } from "../composables/markdownMath";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import {
@@ -109,6 +110,8 @@ function highlightHtml(html: string, terms: string[]): string {
     acceptNode(node) {
       if (!(node instanceof Text)) return NodeFilter.FILTER_REJECT;
       if (!node.nodeValue?.trim()) return NodeFilter.FILTER_REJECT;
+      // A <mark> inserted inside a math sentinel would break its expansion.
+      if (node.nodeValue.includes("")) return NodeFilter.FILTER_REJECT;
       if (shouldSkipHighlight(node)) return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
     },
@@ -235,7 +238,9 @@ const renderedHtml = computed(() => {
     if (highlightTerms.length) {
       html = highlightHtml(html, highlightTerms);
     }
-    return sanitizeRenderedMarkdownHtml(html);
+    // Math sentinels expand after sanitize: formula HTML is sanitized by its
+    // own formula-scoped pass inside the resolver (see markdownMath.ts).
+    return resolveMathSentinels(sanitizeRenderedMarkdownHtml(html));
   } catch {
     return sanitizeRenderedMarkdownHtml(escapeMarkdownHtml(props.content));
   }
@@ -1035,6 +1040,30 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   width: 100%;
   min-height: 110px;
   cursor: default;
+}
+
+.markdown-body .katex {
+  font-size: 1.16em;
+}
+
+/* KaTeX displayMode roots are span.katex-display (block via CSS), so they
+ * stay legal inside <p> while still needing the paragraph rhythm. */
+.markdown-body .katex-display {
+  margin: 4px 0 12px;
+  padding: 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.markdown-body .md-math-pending,
+.markdown-body .md-math-error {
+  font-family: var(--font-mono-inline);
+  font-size: 0.92em;
+  color: var(--text-secondary);
+}
+
+.markdown-body .md-math-error {
+  color: var(--danger, #d73a49);
 }
 
 .markdown-body strong {

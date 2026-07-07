@@ -19,7 +19,9 @@ describe("Markdown table styles", () => {
     expect(sanitizer).toContain("ALLOW_DATA_ATTR: true");
     expect(sanitizer).toContain("ADD_ATTR: [\"draggable\"]");
     expect(renderer).toContain("import { sanitizeRenderedMarkdownHtml } from \"../composables/markdownSanitize\";");
-    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(html);");
+    // Math sentinels expand only after the document sanitize pass; the
+    // resolver must wrap the sanitizer, never the other way around.
+    expect(renderer).toContain("return resolveMathSentinels(sanitizeRenderedMarkdownHtml(html));");
     expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(escapeMarkdownHtml(props.content));");
     expect(renderer).toContain('v-html="renderedHtml"');
   });

@@ -1,3 +1,5 @@
+import { stripMathSentinelChars } from "./markdownMath";
+
 const BLOCKQUOTE_PREFIX_RE = /^(\s*(?:>\s*)+)/;
 const PUNCTUATION_TERMINATED_STRONG_RE =
   /((?:\*\*[^*\n]*[：:；;，,。.!！？?、）】》」』]\*\*)|(?:__[^_\n]*[：:；;，,。.!！？?、）】》」』]__))(?=[\p{L}\p{N}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\[(（【「『<])/gu;
@@ -28,6 +30,6 @@ function normalizeStrongLabelSpacing(markdown: string): string {
 
 export function normalizeMarkdownForRender(markdown: string): string {
   if (!markdown) return "";
-  const normalizedLineEndings = markdown.replace(/\r\n/g, "\n");
+  const normalizedLineEndings = stripMathSentinelChars(markdown.replace(/\r\n/g, "\n"));
   return normalizeStrongLabelSpacing(normalizeLooseBlockquotes(normalizedLineEndings));
 }

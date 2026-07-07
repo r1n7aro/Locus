@@ -60,6 +60,7 @@
     "dompurify": "^3.4.8",
     "elkjs": "^0.11.1",
     "highlight.js": "^11.11.1",
+    "katex": "^0.17.0",
     "lucide": "^1.11.0",
     "marked": "^17.0.4",
     "marked-highlight": "^2.2.3",
@@ -72,7 +73,9 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@types/katex": "^0.16.8",
     "@vitejs/plugin-vue": "^5.2.1",
+    "jsdom": "^29.1.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
     "vite-plugin-static-copy": "^4.0.1",

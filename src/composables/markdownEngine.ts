@@ -6,6 +6,7 @@ import {
   isMarkdownUnityObjectFenceLanguage,
   isMarkdownUnityPropertyFenceLanguage,
 } from "./markdownInject";
+import { markdownMathExtension } from "./markdownMath";
 import { wrapMarkdownTables } from "./markdownTableHtml";
 
 export function escapeMarkdownHtml(source: string): string {
@@ -43,6 +44,7 @@ export const markdownEngine = new Marked(
       return renderHighlightedCodeLines(highlighted);
     },
   }),
+  markdownMathExtension,
   {
     breaks: true,
     gfm: true,

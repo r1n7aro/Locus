@@ -1,4 +1,9 @@
 import DOMPurify, { type Config } from "dompurify";
+import { installMathSentinelGuards } from "./markdownMath";
+
+// Math sentinels that leak into attribute values or rawtext containers are
+// restored to plain LaTeX source during this pass; see markdownMath.ts.
+installMathSentinelGuards(DOMPurify);
 
 const MARKDOWN_SANITIZE_CONFIG: Config = {
   USE_PROFILES: { html: true },
