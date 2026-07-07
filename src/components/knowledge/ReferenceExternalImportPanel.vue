@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
@@ -7,17 +8,23 @@ import { useNotificationStore } from "../../stores/notification";
 import {
   knowledgeCancelFeishuReferenceImport,
   knowledgeCancelFeishuReferenceOauthWait,
+  knowledgeCancelLocalReferenceImport,
   knowledgeCancelUnityReferenceImport,
   knowledgeCreate,
+  knowledgeDeleteLocalReferenceDocs,
   knowledgeFindUnityReferenceDirectory,
   knowledgeGetFeishuReferenceImportStatus,
+  knowledgeGetLocalReferenceImportStatus,
   knowledgeGetUnityReferenceImportStatus,
   knowledgeImportFeishuReferenceDocs,
+  knowledgeImportLocalReferenceDocs,
   knowledgeImportUnityReferenceDocs,
   knowledgeListFeishuReferenceSpaceNodes,
   knowledgeListDirectories,
+  knowledgePreviewLocalReferenceImport,
   knowledgeSaveFeishuReferenceConfig,
   knowledgeStartFeishuReferenceOauth,
+  knowledgeSyncLocalReferenceDocs,
   knowledgeTestFeishuReferenceConnection,
 } from "../../services/knowledge";
 import type {
@@ -29,6 +36,9 @@ import type {
   FeishuReferenceOauthPersistenceMode,
   FeishuReferenceRootSelection,
   KnowledgeDirectoryConfigRecord,
+  KnowledgeLocalSourceMode,
+  LocalReferenceImportStatus,
+  LocalReferenceScanPreview,
   UnityReferenceImportLocale,
   UnityReferenceImportStatus,
 } from "../../types";
@@ -36,6 +46,7 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import ReferenceExternalImportFeishuWindowFlow from "./externalImport/ReferenceExternalImportFeishuWindowFlow.vue";
+import ReferenceExternalImportLocalWindowPane from "./externalImport/ReferenceExternalImportLocalWindowPane.vue";
 import ReferenceExternalImportUnityWindowPane from "./externalImport/ReferenceExternalImportUnityWindowPane.vue";
 import {
   resolveStableExternalImportTargetPath,
@@ -43,12 +54,13 @@ import {
 import type {
   ReferenceExternalImportFeishuTreeRowModel,
   ReferenceExternalImportFeishuWindowModel,
+  ReferenceExternalImportLocalWindowModel,
   ReferenceExternalImportUnityWindowModel,
 } from "./externalImport/referenceExternalImportModels";
 
 const notificationStore = useNotificationStore();
 
-export type ExternalImportSource = "feishu" | "unity";
+export type ExternalImportSource = "feishu" | "unity" | "local";
 
 interface SpaceOption {
   spaceId: string;
@@ -219,6 +231,7 @@ function preferredSourceFromDirectory(
     : [];
   if (sources.some((source) => source.provider === "unity")) return "unity";
   if (sources.some((source) => source.provider === "feishu")) return "feishu";
+  if (sources.some((source) => source.provider === "local_folder")) return "local";
   return null;
 }
 
@@ -317,6 +330,52 @@ function feishuProgressRatioForStatus(status: FeishuReferenceImportStatus | null
   }
   if (status.stage === "ready" && status.importedDocCount > 0) return 1;
   return null;
+}
+
+function localStageLabel(stage: LocalReferenceImportStatus["stage"] | null | undefined): string {
+  switch (stage) {
+    case "scanning":
+      return t("knowledge.localReference.stage.scanning");
+    case "importing":
+      return t("knowledge.localReference.stage.importing");
+    case "reconciling":
+      return t("knowledge.referenceImport.stage.reconciling");
+    case "ready":
+      return t("knowledge.referenceImport.stage.ready");
+    case "error":
+      return t("knowledge.referenceImport.stage.error");
+    case "idle":
+    default:
+      return t("knowledge.referenceImport.stage.idle");
+  }
+}
+
+function localModeLabel(mode: KnowledgeLocalSourceMode | null | undefined): string {
+  switch (mode) {
+    case "live":
+      return t("knowledge.localReference.mode.live");
+    case "snapshot":
+      return t("knowledge.localReference.mode.snapshot");
+    default:
+      return "—";
+  }
+}
+
+function localProgressRatioForStatus(status: LocalReferenceImportStatus | null): number | null {
+  if (!status) return null;
+  if (status.stage === "ready" || status.state === "ready") return 1;
+  if (typeof status.progress === "number") return clampProgress(status.progress);
+  if (status.totalDocs && status.processedDocs > 0) {
+    return clampProgress(status.processedDocs / status.totalDocs);
+  }
+  return null;
+}
+
+function fileStemFromPath(path: string): string {
+  const normalized = trimOrEmpty(path).replace(/\\/g, "/").replace(/\/+$/g, "");
+  const segment = normalized.split("/").pop() || "";
+  const dotIndex = segment.lastIndexOf(".");
+  return dotIndex > 0 ? segment.slice(0, dotIndex) : segment;
 }
 
 const normalizedParentDir = computed(() => normalizeRelativePath(props.parentDir));
@@ -432,6 +491,7 @@ function externalSourceProviders(): ExternalImportSource[] {
   for (const source of sources) {
     if (source.provider === "feishu") providers.add("feishu");
     if (source.provider === "unity") providers.add("unity");
+    if (source.provider === "local_folder") providers.add("local");
   }
   return Array.from(providers.values());
 }
@@ -615,6 +675,231 @@ async function deleteUnityImport() {
   }
 }
 
+// Local files
+const localSourcePath = ref("");
+const localMode = ref<KnowledgeLocalSourceMode>("snapshot");
+const localAiEditable = ref(false);
+const localTargetName = ref("");
+const localFormTouched = ref(false);
+const localPreview = ref<LocalReferenceScanPreview | null>(null);
+const localPreviewPending = ref(false);
+const localStatus = ref<LocalReferenceImportStatus | null>(null);
+const localError = ref("");
+const localStartPending = ref(false);
+const localCancelPending = ref(false);
+const localSyncPending = ref(false);
+const localDeletePending = ref(false);
+const localImportSessionStarted = ref(false);
+const localCloseAfterSuccess = ref(false);
+let localPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearLocalPollTimer() {
+  if (!localPollTimer) return;
+  clearTimeout(localPollTimer);
+  localPollTimer = null;
+}
+
+function scheduleLocalPoll(delay = 600) {
+  clearLocalPollTimer();
+  localPollTimer = setTimeout(() => {
+    localPollTimer = null;
+    void refreshLocalStatus();
+  }, delay);
+}
+
+const localBoundHere = computed(() => boundProviders.value.includes("local"));
+
+const localTargetPath = computed(() => {
+  if (fixedTargetPath.value) return fixedTargetPath.value;
+  const fallback = sanitizePathSegment(
+    trimOrEmpty(localTargetName.value) || fileStemFromPath(localSourcePath.value),
+    "local-docs",
+  );
+  return joinRelativePath(normalizedParentDir.value, fallback);
+});
+const localTargetPathLabel = computed(() => referencePathLabel(localTargetPath.value));
+
+function applyLocalStatus(
+  status: LocalReferenceImportStatus | null,
+  options: { startedSession?: boolean } = {},
+) {
+  localStatus.value = status;
+  if (options.startedSession) {
+    localImportSessionStarted.value = true;
+  }
+  if (!localFormTouched.value && status && trimOrEmpty(status.sourcePath)) {
+    localSourcePath.value = trimOrEmpty(status.sourcePath);
+    if (status.mode) localMode.value = status.mode;
+    localAiEditable.value = !!status.aiEditable;
+    if (!trimOrEmpty(localTargetName.value) && status.targetPath) {
+      localTargetName.value = status.targetPath.split("/").pop() || "";
+    }
+  }
+  if (status?.running || status?.state === "running") {
+    localImportSessionStarted.value = true;
+    localCloseAfterSuccess.value = false;
+    return;
+  }
+  if (localImportSessionStarted.value && status?.state === "ready") {
+    localCloseAfterSuccess.value = true;
+    return;
+  }
+  if (!status || status.state !== "ready") {
+    localCloseAfterSuccess.value = false;
+  }
+}
+
+async function refreshLocalStatus() {
+  try {
+    const status = await knowledgeGetLocalReferenceImportStatus(
+      trimOrEmpty(localTargetPath.value) || null,
+    );
+    applyLocalStatus(status);
+    localError.value = "";
+    if (status.running) {
+      scheduleLocalPoll();
+    }
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  }
+}
+
+async function pickLocalSource(kind: "file" | "folder") {
+  try {
+    const selected = await open({
+      directory: kind === "folder",
+      multiple: false,
+      filters: kind === "file"
+        ? [{ name: "Documents", extensions: ["md", "markdown", "txt"] }]
+        : undefined,
+    });
+    if (typeof selected !== "string" || !selected.trim()) return;
+    localFormTouched.value = true;
+    localSourcePath.value = selected.trim();
+    if (!fixedTargetPath.value) {
+      localTargetName.value = sanitizePathSegment(
+        fileStemFromPath(selected),
+        "local-docs",
+      );
+    }
+    await previewLocalSource();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  }
+}
+
+async function previewLocalSource() {
+  const sourcePath = trimOrEmpty(localSourcePath.value);
+  if (!sourcePath) {
+    localPreview.value = null;
+    return;
+  }
+  localPreviewPending.value = true;
+  localError.value = "";
+  try {
+    localPreview.value = await knowledgePreviewLocalReferenceImport(sourcePath);
+  } catch (cause) {
+    localPreview.value = null;
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localPreviewPending.value = false;
+  }
+}
+
+async function startLocalImport() {
+  if (localStartPending.value || localCancelPending.value || localSyncPending.value) return;
+  const sourcePath = trimOrEmpty(localSourcePath.value);
+  if (!sourcePath) {
+    localError.value = t("knowledge.localReference.sourceRequired");
+    return;
+  }
+  const targetPath = trimOrEmpty(localTargetPath.value);
+  if (!targetPath) {
+    localError.value = t("knowledge.referenceFolder.external.targetPath");
+    return;
+  }
+  localStartPending.value = true;
+  localError.value = "";
+  localImportSessionStarted.value = true;
+  localCloseAfterSuccess.value = false;
+  try {
+    const status = await knowledgeImportLocalReferenceDocs({
+      sourcePath,
+      targetPath,
+      mode: localMode.value,
+      aiEditable: localMode.value === "snapshot" && localAiEditable.value,
+    });
+    applyLocalStatus(status, { startedSession: true });
+    if (status.running) scheduleLocalPoll();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localStartPending.value = false;
+  }
+}
+
+async function cancelLocalImport() {
+  if (localCancelPending.value) return;
+  localCancelPending.value = true;
+  localError.value = "";
+  try {
+    applyLocalStatus(await knowledgeCancelLocalReferenceImport());
+    scheduleLocalPoll(200);
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localCancelPending.value = false;
+  }
+}
+
+async function syncLocalImport() {
+  if (localSyncPending.value || localStatus.value?.running) return;
+  const targetPath = trimOrEmpty(localStatus.value?.targetPath) || trimOrEmpty(localTargetPath.value);
+  if (!targetPath) return;
+  if (localStatus.value?.aiEditable) {
+    const confirmed = await confirm(t("knowledge.localReference.syncConfirmEditable"), {
+      title: t("knowledge.localReference.syncAction"),
+      kind: "warning",
+    });
+    if (!confirmed) return;
+  }
+  localSyncPending.value = true;
+  localError.value = "";
+  try {
+    applyLocalStatus(await knowledgeSyncLocalReferenceDocs(targetPath));
+    if (props.refreshKnowledge) await props.refreshKnowledge();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localSyncPending.value = false;
+  }
+}
+
+async function deleteLocalImport() {
+  if (localDeletePending.value || localStatus.value?.running) return;
+  const targetPath = trimOrEmpty(localStatus.value?.targetPath) || trimOrEmpty(localTargetPath.value);
+  if (!targetPath) return;
+  const confirmed = await confirm(t("knowledge.localReference.deleteConfirm"), {
+    title: t("common.delete"),
+    kind: "warning",
+  });
+  if (!confirmed) return;
+  localDeletePending.value = true;
+  localError.value = "";
+  try {
+    await knowledgeDeleteLocalReferenceDocs(targetPath);
+    localImportSessionStarted.value = false;
+    localCloseAfterSuccess.value = false;
+    localStatus.value = null;
+    if (props.refreshKnowledge) await props.refreshKnowledge();
+    await refreshLocalStatus();
+  } catch (cause) {
+    localError.value = normalizeAppError(cause).message;
+  } finally {
+    localDeletePending.value = false;
+  }
+}
+
 const unityLocaleOptions = computed(() => [
   {
     value: "zh-CN",
@@ -654,6 +939,104 @@ const unityWindowPrimaryCloses = computed(() =>
 const unityWindowPrimaryLabel = computed(() =>
   unityWindowPrimaryCloses.value ? t("common.close") : unityActionLabel.value,
 );
+
+const localProgressRatio = computed(() => localProgressRatioForStatus(localStatus.value));
+const localProgressLabel = computed(() =>
+  localProgressRatio.value == null ? "—" : formatPercent(localProgressRatio.value),
+);
+const localCurrentStage = computed(() => localStageLabel(localStatus.value?.stage));
+const localSummaryMessage = computed(() =>
+  trimOrEmpty(localError.value)
+  || trimOrEmpty(localStatus.value?.error)
+  || trimOrEmpty(localStatus.value?.message)
+  || t("knowledge.localReference.subtitle"),
+);
+const localDisableInputs = computed(() =>
+  localStartPending.value
+  || localCancelPending.value
+  || localSyncPending.value
+  || localDeletePending.value
+  || !!localStatus.value?.running,
+);
+const localHasBinding = computed(() =>
+  localBoundHere.value || !!trimOrEmpty(localStatus.value?.sourcePath),
+);
+const localCanDelete = computed(() =>
+  localHasBinding.value
+  && !!trimOrEmpty(localStatus.value?.targetPath)
+  && !localStatus.value?.running,
+);
+const localCanSync = computed(() =>
+  localHasBinding.value
+  && !!trimOrEmpty(localStatus.value?.targetPath)
+  && !localStatus.value?.running
+  && !localStatus.value?.sourceMissing,
+);
+const localImportedAtLabel = computed(() => formatDateTime(localStatus.value?.importedAt));
+const localActionLabel = computed(() => {
+  if (localStatus.value?.running) return t("knowledge.referenceImport.action.running");
+  if (localHasBinding.value) return t("knowledge.referenceImport.action.reimport");
+  return t("knowledge.referenceImport.action.import");
+});
+const localWindowPrimaryCloses = computed(() =>
+  props.mode === "window"
+  && localCloseAfterSuccess.value
+  && !localStatus.value?.running,
+);
+const localWindowPrimaryLabel = computed(() =>
+  localWindowPrimaryCloses.value ? t("common.close") : localActionLabel.value,
+);
+const localModeOptions = computed(() => [
+  {
+    value: "snapshot",
+    label: t("knowledge.localReference.mode.snapshot"),
+    disabled: localDisableInputs.value || disableSourceSwitch.value,
+  },
+  {
+    value: "live",
+    label: t("knowledge.localReference.mode.live"),
+    disabled: localDisableInputs.value || disableSourceSwitch.value,
+  },
+]);
+const localModeHint = computed(() =>
+  localMode.value === "live"
+    ? t("knowledge.localReference.mode.liveHint")
+    : t("knowledge.localReference.mode.snapshotHint"),
+);
+const localPreviewText = computed(() => {
+  if (localPreviewPending.value) return t("knowledge.localReference.previewPending");
+  const preview = localPreview.value;
+  if (!preview) return "";
+  const parts = [
+    t("knowledge.localReference.previewFiles", `${preview.totalFileCount}`),
+    t("knowledge.localReference.previewCount", `${preview.docCount}`),
+  ];
+  if (preview.skippedFileCount > 0) {
+    parts.push(t("knowledge.localReference.previewSkipped", `${preview.skippedFileCount}`));
+  }
+  if (preview.totalBytes > 0) {
+    parts.push(formatBytes(preview.totalBytes));
+  }
+  return parts.join(" · ");
+});
+const localSourceMissingText = computed(() =>
+  localStatus.value?.sourceMissing ? t("knowledge.localReference.sourceMissing") : "",
+);
+const localSourceKindLabel = computed(() => {
+  const kind = localStatus.value?.sourceKind ?? localPreview.value?.sourceKind;
+  if (kind === "file") return t("knowledge.localReference.sourceKind.file");
+  if (kind === "folder") return t("knowledge.localReference.sourceKind.folder");
+  return "—";
+});
+const localImportedModeLabel = computed(() =>
+  localModeLabel(localStatus.value?.mode ?? localMode.value),
+);
+const localEditableValueLabel = computed(() => {
+  const editable = localStatus.value ? !!localStatus.value.aiEditable : localAiEditable.value;
+  return editable
+    ? t("knowledge.localReference.editable.on")
+    : t("knowledge.localReference.editable.off");
+});
 
 // Feishu
 const feishuStatus = ref<FeishuReferenceImportStatus | null>(null);
@@ -1309,6 +1692,7 @@ const panelHint = computed(() =>
 const isRunning = computed(() =>
   !!unityStatus.value?.running
   || !!feishuStatus.value?.running
+  || !!localStatus.value?.running
   || feishuWaitingForAuthorization.value,
 );
 const isWindowBusy = computed(() =>
@@ -1317,9 +1701,15 @@ const isWindowBusy = computed(() =>
   || unityCancelPending.value
   || feishuSavePending.value
   || feishuImportPending.value
-  || feishuCancelImportPending.value,
+  || feishuCancelImportPending.value
+  || localStartPending.value
+  || localCancelPending.value
+  || localSyncPending.value
+  || localDeletePending.value,
 );
-const canClose = computed(() => !unityStartPending.value && !feishuSavePending.value);
+const canClose = computed(() =>
+  !unityStartPending.value && !feishuSavePending.value && !localStartPending.value,
+);
 const disableSourceSwitch = computed(() => isRunning.value);
 const inlineSourceOptions = computed(() => [
   {
@@ -1332,6 +1722,11 @@ const inlineSourceOptions = computed(() => [
     label: t("knowledge.referenceFolder.external.sourceUnity"),
     disabled: disableSourceSwitch.value,
   },
+  {
+    value: "local",
+    label: t("knowledge.referenceFolder.external.sourceLocal"),
+    disabled: disableSourceSwitch.value,
+  },
 ]);
 const windowSourceOptions = computed(() => [
   {
@@ -1342,6 +1737,11 @@ const windowSourceOptions = computed(() => [
   {
     value: "unity",
     label: t("knowledge.referenceImport.title"),
+    disabled: disableSourceSwitch.value,
+  },
+  {
+    value: "local",
+    label: t("knowledge.localReference.title"),
     disabled: disableSourceSwitch.value,
   },
 ]);
@@ -1360,9 +1760,11 @@ const feishuSummaryMessage = computed(() =>
   || trimOrEmpty(feishuStatus.value?.message)
   || t("knowledge.feishuReference.window.subtitle"),
 );
-const windowTargetPathLabel = computed(() =>
-  activeSource.value === "unity" ? unityTargetPathLabel.value : feishuTargetPathLabel.value,
-);
+const windowTargetPathLabel = computed(() => {
+  if (activeSource.value === "unity") return unityTargetPathLabel.value;
+  if (activeSource.value === "local") return localTargetPathLabel.value;
+  return feishuTargetPathLabel.value;
+});
 const windowTargetPathHint = computed(() => {
   if (activeSource.value === "unity" && unityExistingPath.value && unityExistingPath.value === unityTargetPath.value) {
     return t("knowledge.referenceFolder.external.unityReuseHint", referencePathLabel(unityExistingPath.value));
@@ -1560,11 +1962,72 @@ const feishuWindowModel = computed<ReferenceExternalImportFeishuWindowModel>(() 
   deleteLabel: t("common.delete"),
 }));
 
+const localWindowModel = computed<ReferenceExternalImportLocalWindowModel>(() => ({
+  summary: t("knowledge.localReference.subtitle"),
+  sourcePath: localSourcePath.value,
+  sourcePathPlaceholder: t("knowledge.localReference.sourcePlaceholder"),
+  sourceLabel: t("knowledge.localReference.sourceLabel"),
+  pickFileLabel: t("knowledge.localReference.pickFile"),
+  pickFolderLabel: t("knowledge.localReference.pickFolder"),
+  pickDisabled: localDisableInputs.value || disableSourceSwitch.value,
+  previewText: localPreviewText.value,
+  modeLabel: t("knowledge.localReference.mode.label"),
+  mode: localMode.value,
+  modeOptions: localModeOptions.value,
+  modeDisabled: localDisableInputs.value || disableSourceSwitch.value,
+  modeHint: localModeHint.value,
+  aiEditableVisible: localMode.value === "snapshot",
+  aiEditableChecked: localAiEditable.value,
+  aiEditableDisabled: localDisableInputs.value || disableSourceSwitch.value,
+  aiEditableLabel: t("knowledge.localReference.editable.label"),
+  aiEditableHint: t("knowledge.localReference.editable.hint"),
+  targetNameLabel: t("knowledge.localReference.targetName"),
+  targetName: fixedTargetPath.value
+    ? fixedTargetPath.value.split("/").pop() || ""
+    : localTargetName.value,
+  targetNameDisabled: !!fixedTargetPath.value || localDisableInputs.value,
+  sourceMissingText: localSourceMissingText.value,
+  stageTitle: localCurrentStage.value,
+  progressLabel: localProgressLabel.value,
+  progressRatio: localProgressRatio.value ?? 0,
+  detail: localSummaryMessage.value,
+  rows: [
+    { label: t("knowledge.referenceImport.managedPath"), value: localTargetPathLabel.value, mono: true },
+    { label: t("knowledge.localReference.sourceKindLabel"), value: localSourceKindLabel.value },
+    { label: t("knowledge.localReference.mode.label"), value: localImportedModeLabel.value },
+    { label: t("knowledge.localReference.editable.label"), value: localEditableValueLabel.value },
+    { label: t("knowledge.referenceImport.importedAt"), value: localImportedAtLabel.value },
+    { label: t("knowledge.localReference.totalFiles"), value: `${localStatus.value?.totalFileCount ?? 0}` },
+    { label: t("knowledge.localReference.searchableDocs"), value: `${localStatus.value?.importedDocCount ?? 0}` },
+  ],
+  currentPath: trimOrEmpty(localStatus.value?.currentPath),
+  currentPathLabel: t("knowledge.referenceImport.window.currentPath"),
+  canSync: localCanSync.value,
+  syncDisabled: localSyncPending.value || localDisableInputs.value,
+  syncLabel: localSyncPending.value
+    ? t("knowledge.localReference.syncing")
+    : t("knowledge.localReference.syncAction"),
+  canDelete: localCanDelete.value,
+  deleteLabel: t("common.delete"),
+  canCancel: !!localStatus.value?.running,
+  cancelDisabled: localCancelPending.value,
+  cancelLabel: localCancelPending.value
+    ? t("knowledge.referenceImport.window.cancelling")
+    : t("common.cancel"),
+  primaryDisabled: localDisableInputs.value || disableSourceSwitch.value,
+  primaryClosesWindow: localWindowPrimaryCloses.value,
+  primaryLabel: localWindowPrimaryLabel.value,
+}));
+
 watch(
   () => activeSource.value,
   (source) => {
     if (source === "unity") {
       void loadUnityExistingDirectory().then(() => refreshUnityStatus());
+      return;
+    }
+    if (source === "local") {
+      void refreshLocalStatus();
       return;
     }
     void refreshFeishuStatus();
@@ -1597,8 +2060,15 @@ watch(
     unityImportSessionStarted.value = false;
     unityCloseAfterSuccess.value = false;
     feishuMaterializedTargetPath.value = "";
+    localImportSessionStarted.value = false;
+    localCloseAfterSuccess.value = false;
+    localFormTouched.value = false;
     if (activeSource.value === "unity") {
       void loadUnityExistingDirectory().then(() => refreshUnityStatus());
+      return;
+    }
+    if (activeSource.value === "local") {
+      void refreshLocalStatus();
       return;
     }
     void refreshFeishuStatus();
@@ -1618,6 +2088,7 @@ onMounted(() => {
 onUnmounted(() => {
   clearUnityPollTimer();
   clearFeishuPollTimer();
+  clearLocalPollTimer();
 });
 </script>
 
@@ -1660,6 +2131,21 @@ onUnmounted(() => {
         @cancel="void cancelUnityImport()"
         @close="emit('close')"
         @start="void startUnityImport()"
+      />
+
+      <ReferenceExternalImportLocalWindowPane
+        v-else-if="activeSource === 'local'"
+        :model="localWindowModel"
+        @pick-file="void pickLocalSource('file')"
+        @pick-folder="void pickLocalSource('folder')"
+        @update:mode="localMode = $event; localFormTouched = true"
+        @update:ai-editable="localAiEditable = $event; localFormTouched = true"
+        @update:target-name="localTargetName = $event; localFormTouched = true"
+        @sync="void syncLocalImport()"
+        @delete="void deleteLocalImport()"
+        @cancel="void cancelLocalImport()"
+        @close="emit('close')"
+        @start="void startLocalImport()"
       />
 
       <ReferenceExternalImportFeishuWindowFlow
@@ -1726,7 +2212,7 @@ onUnmounted(() => {
         <div class="reference-external-target-card">
           <span class="reference-external-label">{{ t("knowledge.referenceFolder.external.targetPath") }}</span>
           <span class="reference-external-target-path">
-            {{ activeSource === "unity" ? unityTargetPathLabel : feishuTargetPathLabel }}
+            {{ windowTargetPathLabel }}
           </span>
           <span
             v-if="activeSource === 'unity' && unityExistingPath && unityExistingPath === unityTargetPath"
@@ -1865,6 +2351,164 @@ onUnmounted(() => {
         >
           <span>{{ unityStageLabel(stage) }}</span>
           <span>{{ unityStatus?.stage === stage ? unityProgressLabel : "—" }}</span>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="activeSource === 'local'" class="reference-external-card">
+      <div class="reference-section-header">
+        <div>
+          <div class="reference-section-title">{{ t("knowledge.localReference.title") }}</div>
+          <div class="reference-section-hint">{{ t("knowledge.localReference.subtitle") }}</div>
+        </div>
+        <div class="reference-section-actions">
+          <BaseButton
+            v-if="localCanDelete"
+            variant="danger"
+            size="sm"
+            :disabled="localDeletePending"
+            @click="void deleteLocalImport()"
+          >
+            {{ t("common.delete") }}
+          </BaseButton>
+          <BaseButton
+            v-if="localCanSync"
+            size="sm"
+            :disabled="localSyncPending || localDisableInputs"
+            @click="void syncLocalImport()"
+          >
+            {{ localSyncPending ? t("knowledge.localReference.syncing") : t("knowledge.localReference.syncAction") }}
+          </BaseButton>
+          <BaseButton
+            v-if="localStatus?.running"
+            variant="danger"
+            size="sm"
+            :disabled="localCancelPending"
+            @click="void cancelLocalImport()"
+          >
+            {{ localCancelPending ? t("knowledge.referenceImport.window.cancelling") : t("common.cancel") }}
+          </BaseButton>
+          <BaseButton
+            v-else
+            variant="primary"
+            size="sm"
+            :disabled="localDisableInputs || disableSourceSwitch"
+            @click="void startLocalImport()"
+          >
+            {{ localActionLabel }}
+          </BaseButton>
+        </div>
+      </div>
+
+      <div class="reference-field-stack">
+        <span class="reference-external-label">{{ t("knowledge.localReference.sourceLabel") }}</span>
+        <div class="reference-local-inline-source">
+          <span
+            class="reference-local-inline-path"
+            :class="{ 'is-placeholder': !localSourcePath }"
+          >
+            {{ localSourcePath || t("knowledge.localReference.sourcePlaceholder") }}
+          </span>
+          <BaseButton
+            size="sm"
+            :disabled="localDisableInputs || disableSourceSwitch"
+            @click="void pickLocalSource('folder')"
+          >
+            {{ t("knowledge.localReference.pickFolder") }}
+          </BaseButton>
+          <BaseButton
+            size="sm"
+            :disabled="localDisableInputs || disableSourceSwitch"
+            @click="void pickLocalSource('file')"
+          >
+            {{ t("knowledge.localReference.pickFile") }}
+          </BaseButton>
+        </div>
+        <span v-if="localPreviewText" class="reference-external-meta">{{ localPreviewText }}</span>
+        <span v-if="localSourceMissingText" class="reference-inline-warning">{{ localSourceMissingText }}</span>
+      </div>
+
+      <div class="reference-settings-grid">
+        <div class="reference-field-stack">
+          <span class="reference-external-label">{{ t("knowledge.localReference.mode.label") }}</span>
+          <BaseSegmented
+            :model-value="localMode"
+            size="sm"
+            :options="localModeOptions"
+            :aria-label="t('knowledge.localReference.mode.label')"
+            @update:model-value="localMode = $event as KnowledgeLocalSourceMode; localFormTouched = true"
+          />
+          <span class="reference-external-meta">{{ localModeHint }}</span>
+          <label
+            v-if="localMode === 'snapshot'"
+            class="reference-local-inline-checkbox"
+            :class="{ 'is-disabled': localDisableInputs }"
+          >
+            <input
+              type="checkbox"
+              :checked="localAiEditable"
+              :disabled="localDisableInputs"
+              @change="localAiEditable = ($event.target as HTMLInputElement).checked; localFormTouched = true"
+            />
+            <span>{{ t("knowledge.localReference.editable.label") }}</span>
+          </label>
+          <span v-if="localMode === 'snapshot'" class="reference-external-meta">
+            {{ t("knowledge.localReference.editable.hint") }}
+          </span>
+        </div>
+
+        <div class="reference-meta-grid">
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.sourceKindLabel") }}</span>
+            <span>{{ localSourceKindLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.mode.label") }}</span>
+            <span>{{ localImportedModeLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.editable.label") }}</span>
+            <span>{{ localEditableValueLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.referenceImport.importedAt") }}</span>
+            <span>{{ localImportedAtLabel }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.totalFiles") }}</span>
+            <span>{{ localStatus?.totalFileCount ?? 0 }}</span>
+          </div>
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.localReference.searchableDocs") }}</span>
+            <span>{{ localStatus?.importedDocCount ?? 0 }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="reference-status-card">
+        <div class="reference-status-header">
+          <span class="reference-status-title">{{ localCurrentStage }}</span>
+          <span class="reference-status-value">{{ localProgressLabel }}</span>
+        </div>
+        <div class="reference-progress-track">
+          <div class="reference-progress-fill" :style="{ width: `${(localProgressRatio ?? 0) * 100}%` }" />
+        </div>
+        <div class="reference-status-message">{{ localSummaryMessage }}</div>
+        <div class="reference-meta-grid compact">
+          <div class="reference-meta-row">
+            <span>{{ t("knowledge.referenceImport.window.processed") }}</span>
+            <span>
+              {{
+                localStatus?.totalDocs == null
+                  ? `${localStatus?.processedDocs ?? 0}`
+                  : `${localStatus?.processedDocs ?? 0} / ${localStatus?.totalDocs ?? 0}`
+              }}
+            </span>
+          </div>
+          <div class="reference-meta-row wide">
+            <span>{{ t("knowledge.referenceImport.window.currentPath") }}</span>
+            <span class="reference-mono">{{ localStatus?.currentPath || "—" }}</span>
+          </div>
         </div>
       </div>
     </section>
@@ -2646,6 +3290,56 @@ onUnmounted(() => {
 
 .reference-inline-note {
   margin-top: 12px;
+}
+
+.reference-local-inline-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reference-local-inline-path {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--input-bg) 88%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  word-break: break-all;
+}
+
+.reference-local-inline-path.is-placeholder {
+  color: var(--text-secondary);
+  font-family: inherit;
+}
+
+.reference-local-inline-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-color);
+  cursor: pointer;
+  user-select: none;
+}
+
+.reference-local-inline-checkbox.is-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.reference-local-inline-checkbox input {
+  margin: 0;
+}
+
+.reference-inline-warning {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--status-danger-fg, var(--danger-color, #d9534f));
 }
 
 .reference-inline-link {

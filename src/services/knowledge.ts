@@ -34,6 +34,9 @@ import type {
   FeishuReferenceOauthStartResult,
   FeishuSourceTestResult,
   LexicalRebuildStatus,
+  LocalReferenceImportRequest,
+  LocalReferenceImportStatus,
+  LocalReferenceScanPreview,
   SkillCreateInput,
   UnityReferenceImportLocale,
   UnityReferenceImportStatus,
@@ -658,6 +661,64 @@ export function knowledgeDeleteFeishuReferenceDocs(
       targetPath: targetPath ?? null,
     },
   );
+}
+
+export function knowledgePreviewLocalReferenceImport(
+  sourcePath: string,
+): Promise<LocalReferenceScanPreview> {
+  return ipcInvoke<LocalReferenceScanPreview>(
+    "knowledge_preview_local_reference_import",
+    {
+      sourcePath,
+    },
+  );
+}
+
+export function knowledgeImportLocalReferenceDocs(
+  request: LocalReferenceImportRequest,
+): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_import_local_reference_docs",
+    {
+      request,
+    },
+  );
+}
+
+export function knowledgeGetLocalReferenceImportStatus(
+  targetPath?: string | null,
+): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_get_local_reference_import_status",
+    {
+      targetPath: targetPath ?? null,
+    },
+  );
+}
+
+export function knowledgeCancelLocalReferenceImport(): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_cancel_local_reference_import",
+  );
+}
+
+export function knowledgeSyncLocalReferenceDocs(
+  targetPath: string,
+): Promise<LocalReferenceImportStatus> {
+  return ipcInvoke<LocalReferenceImportStatus>(
+    "knowledge_sync_local_reference_docs",
+    {
+      targetPath,
+    },
+  );
+}
+
+export function knowledgeDeleteLocalReferenceDocs(
+  targetPath: string,
+): Promise<void> {
+  return ipcInvoke<void>("knowledge_delete_local_reference_docs", {
+    targetPath,
+  });
 }
 
 export function knowledgeRevealTarget(input: {

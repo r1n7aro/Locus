@@ -3168,6 +3168,7 @@ fn build_directory_external_sources(
             locator: Some(format!("space:{}{}", space_id, imported_at_segment)),
             source_id: Some(space_id.to_string()),
             sync_enabled: true,
+            ..Default::default()
         }];
     }
 
@@ -3181,6 +3182,7 @@ fn build_directory_external_sources(
             )),
             source_id: Some(root.node_token.clone()),
             sync_enabled: true,
+            ..Default::default()
         })
         .collect()
 }
@@ -3554,6 +3556,7 @@ async fn run_feishu_reference_import(
                 )),
                 source_id: Some(planned_doc.node_token.clone()),
                 sync_enabled: true,
+                ..Default::default()
             }),
             skill_enabled: None,
             skill_surface: None,

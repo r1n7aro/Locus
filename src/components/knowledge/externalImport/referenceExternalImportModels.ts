@@ -47,6 +47,49 @@ export interface ReferenceExternalImportUnityWindowModel {
   openExistingLabel: string;
 }
 
+export interface ReferenceExternalImportLocalWindowModel {
+  summary: string;
+  sourcePath: string;
+  sourcePathPlaceholder: string;
+  sourceLabel: string;
+  pickFileLabel: string;
+  pickFolderLabel: string;
+  pickDisabled: boolean;
+  previewText: string;
+  modeLabel: string;
+  mode: string;
+  modeOptions: ReferenceExternalImportOption[];
+  modeDisabled: boolean;
+  modeHint: string;
+  aiEditableVisible: boolean;
+  aiEditableChecked: boolean;
+  aiEditableDisabled: boolean;
+  aiEditableLabel: string;
+  aiEditableHint: string;
+  targetNameLabel: string;
+  targetName: string;
+  targetNameDisabled: boolean;
+  sourceMissingText: string;
+  stageTitle: string;
+  progressLabel: string;
+  progressRatio: number;
+  detail: string;
+  rows: ReferenceExternalImportWindowRow[];
+  currentPath: string;
+  currentPathLabel: string;
+  canSync: boolean;
+  syncDisabled: boolean;
+  syncLabel: string;
+  canDelete: boolean;
+  deleteLabel: string;
+  canCancel: boolean;
+  cancelDisabled: boolean;
+  cancelLabel: string;
+  primaryDisabled: boolean;
+  primaryClosesWindow: boolean;
+  primaryLabel: string;
+}
+
 export interface ReferenceExternalImportFeishuTreeRowModel {
   key: string;
   depth: number;

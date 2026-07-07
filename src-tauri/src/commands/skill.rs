@@ -2743,6 +2743,7 @@ fn package_source_summary(
         locator,
         source_id: Some(manifest.id.clone()),
         sync_enabled: false,
+        ..Default::default()
     })
 }
 

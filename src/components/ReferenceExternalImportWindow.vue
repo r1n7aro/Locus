@@ -39,7 +39,9 @@ function applyPayload(nextPayload: ReferenceExternalImportWindowPayload) {
   payload.value = {
     parentDir: normalizeRelativePath(nextPayload.parentDir),
     fixedTargetPath: normalizeRelativePath(nextPayload.fixedTargetPath),
-    initialSource: nextPayload.initialSource === "unity" ? "unity" : "feishu",
+    initialSource: nextPayload.initialSource === "unity" || nextPayload.initialSource === "local"
+      ? nextPayload.initialSource
+      : "feishu",
   };
   panelKey.value += 1;
 }

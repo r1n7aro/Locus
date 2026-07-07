@@ -41,6 +41,7 @@ pub mod knowledge_index;
 pub mod knowledge_store;
 mod knowledge_watcher;
 mod llm;
+mod local_docs;
 pub(crate) mod merge;
 pub mod network;
 pub mod plugin;
@@ -597,6 +598,8 @@ pub fn run() {
                 ));
             let unity_reference_import_state = unity_docs::UnityReferenceImportState::default();
             let feishu_reference_import_state = feishu_docs::FeishuReferenceImportState::default();
+            let local_reference_import_state = local_docs::LocalReferenceImportState::default();
+            let local_reference_watcher_state = local_docs::LocalReferenceWatcherState::default();
             startup_for_setup.mark("setup_knowledge_runtime_ready");
 
             let mut tool_registry = ToolRegistry::with_builtins();
@@ -896,6 +899,20 @@ pub fn run() {
                         );
                     }
                 }
+                {
+                    let app_handle = app.handle().clone();
+                    let working_dir = initial_working_dir_copy.clone();
+                    let knowledge_index_state = knowledge_index_state.clone();
+                    let watcher_state = local_reference_watcher_state.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        local_docs::restore_live_watchers(
+                            app_handle,
+                            working_dir,
+                            knowledge_index_state,
+                            watcher_state,
+                        );
+                    });
+                }
             }
             startup_for_setup.mark("setup_watchers_ready");
 
@@ -935,6 +952,8 @@ pub fn run() {
             app.manage(knowledge_index_state.clone());
             app.manage(unity_reference_import_state);
             app.manage(feishu_reference_import_state);
+            app.manage(local_reference_import_state);
+            app.manage(local_reference_watcher_state.clone());
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
             startup_for_setup.mark("setup_backend_ready");
@@ -1228,6 +1247,12 @@ pub fn run() {
             commands::knowledge_import_feishu_reference_docs,
             commands::knowledge_delete_unity_reference_docs,
             commands::knowledge_delete_feishu_reference_docs,
+            commands::knowledge_preview_local_reference_import,
+            commands::knowledge_import_local_reference_docs,
+            commands::knowledge_get_local_reference_import_status,
+            commands::knowledge_cancel_local_reference_import,
+            commands::knowledge_sync_local_reference_docs,
+            commands::knowledge_delete_local_reference_docs,
             commands::knowledge_delete_external_reference_directory,
             commands::knowledge_create,
             commands::knowledge_delete,

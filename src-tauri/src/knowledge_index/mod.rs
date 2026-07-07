@@ -5185,6 +5185,16 @@ fn collect_searchable_text_scan_candidates(
                 }
                 candidates.push(TextScanDocumentCandidate { doc_type, path });
             }
+            for path in crate::local_docs::list_live_document_paths(working_dir) {
+                deadline.check("checking text scan documents")?;
+                if !text_scan_path_matches_prefix(&path, normalized_prefix.as_deref()) {
+                    continue;
+                }
+                if !seen.insert(text_scan_candidate_key(doc_type, &path)) {
+                    continue;
+                }
+                candidates.push(TextScanDocumentCandidate { doc_type, path });
+            }
         }
 
         if let Some(app_root) = app_knowledge_dir {
@@ -6003,6 +6013,7 @@ mod tests {
                     ),
                     source_id: Some("unity-2022.3".to_string()),
                     sync_enabled: true,
+                    ..Default::default()
                 }),
                 skill_enabled: None,
                 skill_surface: None,
@@ -6097,6 +6108,7 @@ mod tests {
                     )),
                     source_id: Some("unity-2022.3".to_string()),
                     sync_enabled: true,
+                    ..Default::default()
                 }),
                 skill_enabled: None,
                 skill_surface: None,

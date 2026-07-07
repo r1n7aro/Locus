@@ -27,6 +27,10 @@ use crate::knowledge_store::{
     KnowledgeReadResponse, KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind,
     KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
+use crate::local_docs::{
+    self, LocalReferenceImportRequest, LocalReferenceImportState, LocalReferenceImportStatus,
+    LocalReferenceScanPreview, LocalReferenceWatcherState,
+};
 use crate::tool::ToolRegistry;
 use crate::unity_docs::{
     self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
@@ -1926,6 +1930,112 @@ pub async fn knowledge_delete_feishu_reference_docs(
 }
 
 #[tauri::command]
+pub async fn knowledge_preview_local_reference_import(
+    source_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<LocalReferenceScanPreview, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        local_docs::preview_local_reference_import(&working_dir, &source_path)
+    })
+    .await
+    .map_err(|error| AppError::from(format!("本地文档扫描任务执行失败：{}", error)))?
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_import_local_reference_docs(
+    request: LocalReferenceImportRequest,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    local_reference_import_state: State<'_, LocalReferenceImportState>,
+    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_docs::start_local_reference_import(
+        app_handle,
+        working_dir,
+        request,
+        knowledge_index_state.inner().clone(),
+        local_reference_import_state.inner().0.clone(),
+        local_reference_watcher_state.inner().clone(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_get_local_reference_import_status(
+    target_path: Option<String>,
+    workspace: State<'_, Arc<Workspace>>,
+    local_reference_import_state: State<'_, LocalReferenceImportState>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_docs::get_local_reference_import_status(
+        &working_dir,
+        target_path.as_deref(),
+        local_reference_import_state.inner().0.clone(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_cancel_local_reference_import(
+    workspace: State<'_, Arc<Workspace>>,
+    local_reference_import_state: State<'_, LocalReferenceImportState>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_docs::cancel_local_reference_import(
+        &working_dir,
+        local_reference_import_state.inner().0.clone(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_sync_local_reference_docs(
+    target_path: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    local_reference_import_state: State<'_, LocalReferenceImportState>,
+) -> Result<LocalReferenceImportStatus, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_docs::resync_local_reference_docs(
+        app_handle,
+        working_dir,
+        target_path,
+        knowledge_index_state.inner().clone(),
+        local_reference_import_state.inner().0.clone(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn knowledge_delete_local_reference_docs(
+    target_path: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    local_docs::delete_local_reference_docs(
+        app_handle,
+        working_dir,
+        target_path,
+        knowledge_index_state.inner().clone(),
+        local_reference_watcher_state.inner().clone(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn knowledge_list(
     doc_type: Option<String>,
     path_prefix: Option<String>,
@@ -2507,10 +2617,20 @@ pub async fn knowledge_delete_external_reference_directory(
     app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
     let (_, normalized_path) =
         resolve_knowledge_directory_target(Some(KnowledgeType::Reference), &path)?;
+    {
+        let watcher_state = local_reference_watcher_state.inner().clone();
+        let target = normalized_path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            local_docs::unregister_live_watcher(&watcher_state, &target);
+        })
+        .await
+        .map_err(|error| AppError::from(format!("本地源监听注销失败：{}", error)))?;
+    }
     knowledge_store::delete_external_reference_directory(&working_dir, &normalized_path)
         .map_err(AppError::from)?;
     reconcile_and_emit_knowledge_changed(
@@ -4159,6 +4279,7 @@ mod tests {
                 locator: Some("plugin://app/example".to_string()),
                 source_id: Some("example".to_string()),
                 sync_enabled: false,
+                ..Default::default()
             }),
             ..Default::default()
         }

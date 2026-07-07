@@ -2007,6 +2007,7 @@ fn build_reference_document_from_raw_html(
             locator: None,
             source_id: Some(source_id.to_string()),
             sync_enabled: true,
+            ..Default::default()
         }),
         skill_enabled: None,
         skill_surface: None,
@@ -2697,6 +2698,7 @@ fn configure_managed_directory(
                     )),
                     source_id: Some(docs_version.to_string()),
                     sync_enabled: true,
+                    ..Default::default()
                 }],
             )
         })
@@ -4459,6 +4461,7 @@ mod tests {
                 ),
                 source_id: Some("unity-2022.3".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }),
             skill_enabled: None,
             skill_surface: None,
@@ -4492,6 +4495,7 @@ mod tests {
                 ),
                 source_id: Some("unity-2022.3".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }],
         )
         .expect("seed directory config");

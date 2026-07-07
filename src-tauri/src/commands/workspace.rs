@@ -333,6 +333,7 @@ pub async fn set_working_dir(
     registry: State<'_, crate::AgentDefRegistryState>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
     config: State<'_, Arc<crate::config::AppConfig>>,
+    local_reference_watcher_state: State<'_, crate::local_docs::LocalReferenceWatcherState>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let switch_started_at = Instant::now();
@@ -520,6 +521,21 @@ pub async fn set_working_dir(
                 );
             }
         }
+        {
+            let app_handle = app_handle.clone();
+            let working_dir = canonical.clone();
+            let knowledge_index_state = knowledge_index_state.inner().clone();
+            let watcher_state = local_reference_watcher_state.inner().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::local_docs::restore_live_watchers(
+                    app_handle,
+                    working_dir,
+                    knowledge_index_state,
+                    watcher_state,
+                );
+            });
+        }
+        switch_timer.mark("local_reference_watchers_restore_spawned");
     }
 
     switch_timer.mark("asset_db_load_existing_start");

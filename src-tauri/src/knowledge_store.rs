@@ -140,7 +140,23 @@ impl Default for KnowledgeSourceProvider {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeLocalSourceMode {
+    Live,
+    Snapshot,
+}
+
+impl KnowledgeLocalSourceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeExternalSource {
     pub provider: KnowledgeSourceProvider,
@@ -150,6 +166,20 @@ pub struct KnowledgeExternalSource {
     pub source_id: Option<String>,
     #[serde(default)]
     pub sync_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_mode: Option<KnowledgeLocalSourceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_editable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<i64>,
+}
+
+impl KnowledgeExternalSource {
+    pub fn is_editable_local_snapshot(&self) -> bool {
+        self.provider == KnowledgeSourceProvider::LocalFolder
+            && matches!(self.local_mode, Some(KnowledgeLocalSourceMode::Snapshot))
+            && self.ai_editable == Some(true)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -852,10 +882,15 @@ fn provider_is_read_only(provider: KnowledgeSourceProvider) -> bool {
     )
 }
 
+fn source_is_read_only(source: &KnowledgeExternalSource) -> bool {
+    if source.is_editable_local_snapshot() {
+        return false;
+    }
+    provider_is_read_only(source.provider)
+}
+
 fn derive_read_only(external_source: Option<&KnowledgeExternalSource>) -> bool {
-    external_source
-        .map(|source| provider_is_read_only(source.provider))
-        .unwrap_or(false)
+    external_source.map(source_is_read_only).unwrap_or(false)
 }
 
 fn self_config_source() -> KnowledgeConfigSource {
@@ -4034,6 +4069,11 @@ pub fn load_document_by_path(
         if let Some(document) = unity_docs::load_managed_document(working_dir, &normalized_path)? {
             return Ok(document);
         }
+        if let Some(document) =
+            crate::local_docs::load_live_document(working_dir, &normalized_path)?
+        {
+            return Ok(document);
+        }
     }
     let path = document_path(working_dir, doc_type, &normalized_path)?;
     if !path.is_file() {
@@ -4333,6 +4373,11 @@ pub fn load_document_by_path_with_app_root(
         if let Some(document) = unity_docs::load_managed_document(working_dir, &normalized_path)? {
             return Ok(document);
         }
+        if let Some(document) =
+            crate::local_docs::load_live_document(working_dir, &normalized_path)?
+        {
+            return Ok(document);
+        }
     }
     let workspace_path = document_path(working_dir, doc_type, &normalized_path)?;
     if workspace_path.is_file() {
@@ -4418,9 +4463,12 @@ pub fn load_documents_with_app_root_excluding_prefixes(
     let types: Vec<_> = doc_type
         .map(|value| vec![value])
         .unwrap_or_else(|| KnowledgeType::all().to_vec());
-    if types.iter().any(|value| *value == KnowledgeType::Reference) {
+    let live_links = if types.iter().any(|value| *value == KnowledgeType::Reference) {
         unity_docs::ensure_managed_store_available(working_dir)?;
-    }
+        crate::local_docs::list_local_live_links(working_dir)
+    } else {
+        Vec::new()
+    };
     let normalized_prefix = path_prefix.map(normalize_relative_prefix).transpose()?;
     let normalized_exclusions = normalize_excluded_prefixes(excluded_prefixes)?;
     let workspace_knowledge_root = knowledge_root(working_dir);
@@ -4454,6 +4502,11 @@ pub fn load_documents_with_app_root_excluding_prefixes(
                     if ty == KnowledgeType::Reference
                         && unity_docs::has_managed_store(working_dir)
                         && unity_docs::is_unity_reference_managed_relative_path(&relative_path)
+                    {
+                        return None;
+                    }
+                    if ty == KnowledgeType::Reference
+                        && crate::local_docs::path_within_live_links(&live_links, &relative_path)
                     {
                         return None;
                     }
@@ -4497,6 +4550,26 @@ pub fn load_documents_with_app_root_excluding_prefixes(
                     continue;
                 }
                 documents.push(doc);
+            }
+        }
+
+        if ty == KnowledgeType::Reference {
+            for link in &live_links {
+                for doc in crate::local_docs::list_live_documents_for_link(link) {
+                    if let Some(prefix) = normalized_prefix.as_deref() {
+                        if !doc.path.starts_with(prefix) {
+                            continue;
+                        }
+                    }
+                    if path_is_excluded(ty, &doc.path, &normalized_exclusions) {
+                        continue;
+                    }
+                    let key = knowledge_item_key(doc.doc_type, &doc.path);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    documents.push(doc);
+                }
             }
         }
 
@@ -4589,9 +4662,12 @@ pub fn list_documents(
     let types: Vec<_> = doc_type
         .map(|value| vec![value])
         .unwrap_or_else(|| KnowledgeType::all().to_vec());
-    if types.iter().any(|value| *value == KnowledgeType::Reference) {
+    let live_links = if types.iter().any(|value| *value == KnowledgeType::Reference) {
         unity_docs::ensure_managed_store_available(working_dir)?;
-    }
+        crate::local_docs::list_local_live_links(working_dir)
+    } else {
+        Vec::new()
+    };
     let normalized_prefix = path_prefix.map(normalize_relative_prefix).transpose()?;
 
     for ty in types {
@@ -4621,6 +4697,11 @@ pub fn list_documents(
             {
                 continue;
             }
+            if ty == KnowledgeType::Reference
+                && crate::local_docs::path_within_live_links(&live_links, &relative_path)
+            {
+                continue;
+            }
             let Ok(doc) = load_document_by_path(working_dir, ty, &relative_path) else {
                 continue;
             };
@@ -4637,6 +4718,16 @@ pub fn list_documents(
                 unity_docs::list_managed_documents(working_dir, normalized_prefix.as_deref())?
             {
                 items.push(document_to_list_item(doc));
+            }
+            for link in &live_links {
+                for doc in crate::local_docs::list_live_documents_for_link(link) {
+                    if let Some(prefix) = normalized_prefix.as_ref() {
+                        if !doc.path.starts_with(prefix) {
+                            continue;
+                        }
+                    }
+                    items.push(document_to_list_item(doc));
+                }
             }
         }
     }
@@ -4688,6 +4779,7 @@ pub fn list_directories(working_dir: &str, doc_type: KnowledgeType) -> Result<Ve
     }
     if doc_type == KnowledgeType::Reference {
         directories.extend(crate::unity_docs::list_managed_directories(working_dir)?);
+        directories.extend(crate::local_docs::list_live_directories(working_dir));
     }
 
     directories.sort();
@@ -5989,6 +6081,7 @@ mod tests {
                 ),
                 source_id: Some("unity-2022.3".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }),
             skill_enabled: None,
             skill_surface: None,
@@ -6275,6 +6368,7 @@ Body content
             locator: Some("space://design".to_string()),
             source_id: Some("src_1".to_string()),
             sync_enabled: true,
+            ..Default::default()
         });
 
         let rendered = render_document(&doc).expect("render");
@@ -6688,6 +6782,7 @@ Body content
                 locator: Some("space:test-space;node:test-node".to_string()),
                 source_id: Some("test-node".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }],
         )
         .expect("save external sources");
@@ -6747,6 +6842,7 @@ Body content
                     locator: Some("space:test-space;node:test-node".to_string()),
                     source_id: Some("test-node".to_string()),
                     sync_enabled: true,
+                    ..Default::default()
                 }],
             )
             .expect_err("non-reference directories reject external sources");
@@ -6784,6 +6880,7 @@ Body content
                 locator: Some("project:2022.3.47f1;docs:2022.3;locale:zh-CN".to_string()),
                 source_id: Some("2022.3".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }],
         )
         .expect("bind unity source");
@@ -6796,6 +6893,7 @@ Body content
                 locator: Some("space:test-space".to_string()),
                 source_id: Some("test-space".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }],
         )
         .expect("bind feishu source");
@@ -6841,6 +6939,7 @@ Body content
                 locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
                 source_id: Some("example-reference".to_string()),
                 sync_enabled: false,
+                ..Default::default()
             }],
         )
         .expect("bind local folder source");
@@ -6853,6 +6952,7 @@ Body content
                 locator: Some("project:2022.3.47f1;docs:2022.3;locale:zh-CN".to_string()),
                 source_id: Some("unity-2022.3".to_string()),
                 sync_enabled: true,
+                ..Default::default()
             }],
         )
         .expect("bind unity source");
@@ -6901,6 +7001,7 @@ Body content
                 locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
                 source_id: Some("example-reference".to_string()),
                 sync_enabled: false,
+                ..Default::default()
             }],
         )
         .expect("bind local folder source");
@@ -6915,6 +7016,7 @@ Body content
             locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
             source_id: Some("example-reference".to_string()),
             sync_enabled: false,
+            ..Default::default()
         });
         save_document(&working_dir, doc).expect("save external doc");
 
@@ -8167,6 +8269,7 @@ Body content
             locator: None,
             source_id: Some("unity-2022.3".to_string()),
             sync_enabled: true,
+            ..Default::default()
         });
         save_document_to_path(&file_path, doc).expect("save mismatched reference doc");
 
@@ -8205,6 +8308,7 @@ Body content
             locator: Some("file:///F:/Docs/ExampleProjectReference".to_string()),
             source_id: Some("example-reference".to_string()),
             sync_enabled: false,
+            ..Default::default()
         });
         save_document_to_path(&file_path, doc).expect("save mismatched read-only doc");
 
