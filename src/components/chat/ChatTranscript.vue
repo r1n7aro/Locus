@@ -3190,6 +3190,17 @@ function openImage(src: string) {
     contain-intrinsic-size: auto 180px;
   }
 
+  /* Freshly inserted messages have no last-remembered size, so their first
+     frame lays out at the 180px placeholder. At stream end the transient
+     block (real height) is removed in the same patch, which collapses
+     scrollHeight for one frame, clamps scrollTop, and flashes the viewport.
+     Keep the bottom three messages always laid out: the swap happens at the
+     tail, and viewport-adjacent messages gain nothing from being skippable
+     (-n+3 covers history+transient coexistence and the pending-user swap). */
+  .chat-transcript-content > .chat-transcript-message.is-session:nth-last-child(-n+3 of .chat-transcript-message) {
+    content-visibility: visible;
+  }
+
   .chat-transcript-scroll.is-session.is-session-restore-stabilizing .chat-transcript-message.is-session {
     content-visibility: visible;
   }
