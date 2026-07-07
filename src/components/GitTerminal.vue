@@ -11,6 +11,7 @@ import StreamingMarkdownRenderer from "./chat/StreamingMarkdownRenderer.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { useThrottledStreamingText } from "../composables/streamingRenderThrottle";
 import { formatModelDisplayName } from "../utils/modelDisplay";
 
 const props = defineProps<{
@@ -79,6 +80,9 @@ const sessionId = ref<string | null>(null);
 const currentRunId = ref<string | null>(null);
 const streaming = ref(false);
 const streamingText = ref("");
+// Deltas arrive per token; render at the shared streaming cadence instead of
+// re-parsing the accumulated markdown once per delta.
+const { text: displayedStreamingText } = useThrottledStreamingText(() => streamingText.value);
 const thinking = ref(false);
 const nativeRunning = ref(false);
 const pendingQuestion = ref<PendingQuestion | null>(null);
@@ -868,8 +872,8 @@ defineExpose({ pushOutput });
         <pre v-else-if="line.type === 'info'" class="term-line term-line-info ui-select-text">{{ line.content }}</pre>
       </template>
 
-      <div v-if="streamingText" class="term-line term-line-ai term-streaming">
-        <StreamingMarkdownRenderer :content="streamingText" />
+      <div v-if="displayedStreamingText" class="term-line term-line-ai term-streaming">
+        <StreamingMarkdownRenderer :content="displayedStreamingText" />
       </div>
 
       <div
@@ -963,18 +967,18 @@ defineExpose({ pushOutput });
         </div>
       </div>
 
-      <div v-if="streaming && nativeRunning && !streamingText && !hasRunningTool" class="term-thinking-row">
+      <div v-if="streaming && nativeRunning && !displayedStreamingText && !hasRunningTool" class="term-thinking-row">
         <span class="term-status-text">{{ t("tool.status.running") }}</span>
       </div>
 
-      <div v-else-if="streaming && thinking && !streamingText && !hasRunningTool" class="term-thinking-row">
+      <div v-else-if="streaming && thinking && !displayedStreamingText && !hasRunningTool" class="term-thinking-row">
         <span class="thinking-dots">Thinking<span class="dots-anim"></span></span>
         <button class="term-cancel-inline ui-select-none" :title="t('git.cancelTitle')" @click.stop="cancel">
           Ctrl+C <span class="cancel-label">{{ t('git.cancelLabel') }}</span>
         </button>
       </div>
 
-      <div v-if="streaming && !nativeRunning && (streamingText || hasRunningTool)" class="term-thinking-row">
+      <div v-if="streaming && !nativeRunning && (displayedStreamingText || hasRunningTool)" class="term-thinking-row">
         <button class="term-cancel-inline ui-select-none" :title="t('git.cancelTitle')" @click.stop="cancel">
           Ctrl+C <span class="cancel-label">{{ t('git.cancelLabel') }}</span>
         </button>
@@ -1008,7 +1012,7 @@ defineExpose({ pushOutput });
         />
       </div>
 
-      <div v-if="!displaySettings.hideGitCommandSuggestions && lines.length === 0 && !streamingText && !streaming && !input" class="term-examples-inline">
+      <div v-if="!displaySettings.hideGitCommandSuggestions && lines.length === 0 && !displayedStreamingText && !streaming && !input" class="term-examples-inline">
         <span class="term-dim">{{ t("git.examples") }}</span>
         <span class="term-example ui-select-none" @click="input = 'git push'; handleBuiltinOrSubmit()">git push</span>
         <span class="term-example ui-select-none" @click="input = 'git pull'; handleBuiltinOrSubmit()">git pull</span>

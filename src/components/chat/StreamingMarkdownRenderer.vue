@@ -1,11 +1,13 @@
 
 <script setup lang="ts">
-import { shallowRef, watch } from "vue";
+import { onBeforeUnmount, shallowRef, watch } from "vue";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import {
   StreamingMarkdownSplitter,
   type StreamingMarkdownSplit,
 } from "../../composables/streamingMarkdownBlocks";
+import { STREAMING_RENDER_THROTTLE_MS } from "../../composables/streamingRenderThrottle";
+import type { StreamingTextSource } from "../../composables/streamingTextChunks";
 
 /**
  * Streaming markdown surface with amortized O(n) total render cost.
@@ -16,9 +18,20 @@ import {
  * each frame re-renders only the tail. History rendering is untouched — the
  * one-shot full render after the round lands corrects any block-boundary
  * divergence accepted while streaming.
+ *
+ * Two input modes, mutually exclusive:
+ * - `content`: the caller re-materializes the full text per update. Kept for
+ *   low-frequency surfaces and history correction.
+ * - `stream`: an append-only chunk buffer with a stable identity. Growth is
+ *   consumed incrementally at the shared streaming cadence, so neither this
+ *   component nor its parent re-renders per delta, and no full-text string is
+ *   ever rebuilt while streaming. `streamInitial` seeds text that accumulated
+ *   before the buffer existed (runtime snapshot restores).
  */
 const props = defineProps<{
-  content: string;
+  content?: string;
+  stream?: StreamingTextSource | null;
+  streamInitial?: string;
   cursor?: boolean;
   enableFileRefs?: boolean;
   unityPreviewStateScope?: string | null;
@@ -36,15 +49,143 @@ const emit = defineEmits<{
  */
 const TAIL_MARKDOWN_LIMIT = 24_000;
 
+/** Plain-tail parts freeze at this size so Blink only ever lays out the
+ * growing remainder, not the whole oversized block. */
+const PLAIN_TAIL_PART_TARGET = 4096;
+
 const splitter = new StreamingMarkdownSplitter();
-const split = shallowRef<StreamingMarkdownSplit>(splitter.update(props.content));
+const split = shallowRef<StreamingMarkdownSplit>({ blocks: [], tail: "" });
+
+/**
+ * Append-only projection of an oversized plain tail: frozen spans plus a
+ * growing remainder, so DOM text nodes for already-shown output never change.
+ */
+const plainTailParts = shallowRef<readonly string[]>([]);
+const plainTailActive = shallowRef("");
+let plainTailConsumed = 0;
+let plainTailBlockCount = 0;
+
+function resetPlainTail() {
+  plainTailParts.value = [];
+  plainTailActive.value = "";
+  plainTailConsumed = 0;
+}
+
+function projectPlainTail(tail: string) {
+  if (tail.length <= TAIL_MARKDOWN_LIMIT) {
+    if (plainTailConsumed > 0 || plainTailActive.value) resetPlainTail();
+    return;
+  }
+  if (tail.length < plainTailConsumed + plainTailActive.value.length) {
+    resetPlainTail();
+  }
+  let active = plainTailActive.value;
+  const appended = tail.slice(plainTailConsumed + active.length);
+  if (!appended) return;
+  active += appended;
+  if (active.length >= PLAIN_TAIL_PART_TARGET) {
+    plainTailParts.value = [...plainTailParts.value, active];
+    plainTailConsumed += active.length;
+    active = "";
+  }
+  plainTailActive.value = active;
+}
+
+function applySplit(next: StreamingMarkdownSplit) {
+  // A committed block re-heads the tail. The projection assumes it holds a
+  // prefix of the current tail, which a length check alone cannot verify when
+  // one flush both cuts a block and appends at least as much new text — so
+  // rebuild whenever the block count moves.
+  if (next.blocks.length !== plainTailBlockCount) {
+    plainTailBlockCount = next.blocks.length;
+    resetPlainTail();
+  }
+  split.value = next;
+  projectPlainTail(next.tail);
+}
+
+// -- content mode --
 
 watch(
   () => props.content,
   (next) => {
-    split.value = splitter.update(next);
+    if (props.stream) return;
+    applySplit(splitter.update(next ?? ""));
   },
 );
+
+// -- stream mode --
+
+let streamCursor = 0;
+let streamGeneration = -1;
+let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearStreamFlushTimer() {
+  if (streamFlushTimer === null) return;
+  clearTimeout(streamFlushTimer);
+  streamFlushTimer = null;
+}
+
+function consumeStream(source: StreamingTextSource) {
+  if (source.generation !== streamGeneration || source.length < streamCursor) {
+    streamGeneration = source.generation;
+    streamCursor = 0;
+    splitter.reset();
+    resetPlainTail();
+    const initial = props.streamInitial ?? "";
+    if (initial) {
+      applySplit(splitter.append(initial));
+    } else {
+      applySplit(splitter.update(""));
+    }
+  }
+  const delta = source.readFrom(streamCursor);
+  streamCursor = source.length;
+  if (delta || split.value.tail || split.value.blocks.length) {
+    applySplit(splitter.append(delta));
+  }
+}
+
+function scheduleStreamFlush(source: StreamingTextSource) {
+  if (streamFlushTimer !== null) return;
+  streamFlushTimer = setTimeout(() => {
+    streamFlushTimer = null;
+    if (props.stream === source) consumeStream(source);
+  }, STREAMING_RENDER_THROTTLE_MS);
+}
+
+watch(
+  () => props.stream,
+  (source, previous) => {
+    clearStreamFlushTimer();
+    if (!source) {
+      if (previous) {
+        splitter.reset();
+        resetPlainTail();
+        applySplit(splitter.update(props.content ?? ""));
+      }
+      return;
+    }
+    streamGeneration = -1;
+    consumeStream(source);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.stream?.version.value,
+  () => {
+    if (!props.stream) return;
+    scheduleStreamFlush(props.stream);
+  },
+);
+
+// Seed content mode once on mount (stream mode seeds through its own watch).
+if (!props.stream) {
+  applySplit(splitter.update(props.content ?? ""));
+}
+
+onBeforeUnmount(clearStreamFlushTimer);
 
 function blockPreviewScope(blockId: string): string | null | undefined {
   const scope = props.unityPreviewStateScope;
@@ -66,7 +207,10 @@ function blockPreviewScope(blockId: string): string | null | undefined {
     <pre
       v-if="split.tail && split.tail.length > TAIL_MARKDOWN_LIMIT"
       class="streaming-markdown-block streaming-markdown-tail-plain ui-select-text"
-    >{{ split.tail }}</pre>
+    ><span
+      v-for="(part, index) in plainTailParts"
+      :key="index"
+    >{{ part }}</span><span>{{ plainTailActive }}</span></pre>
     <MarkdownRenderer
       v-else-if="split.tail"
       class="streaming-markdown-block"

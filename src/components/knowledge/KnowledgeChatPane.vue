@@ -53,6 +53,7 @@ const {
   streamingTextOrder,
   thinkingOrder,
   liveRenderParts,
+  livePartStreams,
   isStreaming,
   isCompacting,
   isThinking,
@@ -107,6 +108,7 @@ function handleSelectAgent(agentId: string) {
     :thinking-text="thinkingText"
     :thinking-order="thinkingOrder"
     :live-render-parts="liveRenderParts"
+    :live-part-streams="livePartStreams"
     :is-streaming="isStreaming"
     :is-compacting="isCompacting"
     :is-thinking="isThinking"

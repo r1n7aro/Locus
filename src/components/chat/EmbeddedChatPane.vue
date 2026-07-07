@@ -18,6 +18,7 @@ import RichChatInput from "./RichChatInput.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
 import { useThrottledStreamingText } from "../../composables/streamingRenderThrottle";
+import type { StreamingTextSource } from "../../composables/streamingTextChunks";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -64,6 +65,7 @@ const props = withDefaults(defineProps<{
   isThinking: boolean;
   thinkingDuration?: number;
   liveRenderParts?: AssistantRenderPart[];
+  livePartStreams?: ReadonlyMap<string, StreamingTextSource> | null;
   activeToolCalls: ToolCallDisplay[];
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms?: PendingToolConfirm[];
@@ -97,6 +99,7 @@ const props = withDefaults(defineProps<{
   thinkingText: "",
   thinkingDuration: 0,
   isCompacting: false,
+  livePartStreams: null,
   pendingQuestion: null,
   pendingToolConfirms: () => [],
   queuedFollowUp: null,
@@ -653,6 +656,7 @@ onUnmounted(() => {
       :thinking-order="thinkingOrder"
       :thinking-duration="thinkingDuration"
       :live-render-parts="liveRenderParts"
+      :live-part-streams="livePartStreams"
       :active-tool-calls="activeToolCalls"
       :empty-title="emptyTitle"
       :empty-hint="emptyHint"

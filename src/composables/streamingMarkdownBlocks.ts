@@ -62,6 +62,9 @@ export class StreamingMarkdownSplitter {
   /** Cut points (block-start offsets) after frozenEnd, oldest first. */
   private cuts: number[] = [];
   private blocks: StreamingMarkdownBlock[] = [];
+  /** True once append() has run: `source` then holds only the unfrozen
+   * suffix, so update()'s full-text prefix checks no longer apply. */
+  private appendMode = false;
 
   private inFence = false;
   private fenceChar = "";
@@ -82,6 +85,12 @@ export class StreamingMarkdownSplitter {
    * anything else (new round, replacement, shrink) resets the splitter.
    */
   update(next: string): StreamingMarkdownSplit {
+    if (this.appendMode) {
+      // append() rebases `source` to the unfrozen suffix; full-text prefix
+      // comparisons against it would be meaningless (and a suffix that
+      // happens to also be a prefix would corrupt the scan state).
+      this.reset();
+    }
     if (next === this.source) {
       return this.snapshot();
     }
@@ -93,12 +102,45 @@ export class StreamingMarkdownSplitter {
     return this.snapshot();
   }
 
+  /**
+   * Feed a delta known to extend the current text. Skips the prefix check of
+   * `update`, and rebasing after each scan keeps `source` at O(tail), so
+   * growth costs O(delta + tail) regardless of document size.
+   */
+  append(delta: string): StreamingMarkdownSplit {
+    if (!delta) {
+      return this.snapshot();
+    }
+    this.appendMode = true;
+    this.source += delta;
+    this.scan();
+    this.rebase();
+    return this.snapshot();
+  }
+
+  /**
+   * Drop the frozen prefix from `source` and shift all offsets. Keeps every
+   * subsequent flatten (scan's indexOf) and snapshot slice proportional to
+   * the tail instead of the whole document, and lets newly frozen blocks pin
+   * only tail-sized parent strings.
+   */
+  private rebase(): void {
+    if (this.frozenEnd === 0) return;
+    this.source = this.source.slice(this.frozenEnd);
+    this.scanned -= this.frozenEnd;
+    for (let i = 0; i < this.cuts.length; i += 1) {
+      this.cuts[i]! -= this.frozenEnd;
+    }
+    this.frozenEnd = 0;
+  }
+
   reset(): void {
     this.source = "";
     this.scanned = 0;
     this.frozenEnd = 0;
     this.cuts = [];
     this.blocks = [];
+    this.appendMode = false;
     this.inFence = false;
     this.fenceChar = "";
     this.fenceLen = 0;

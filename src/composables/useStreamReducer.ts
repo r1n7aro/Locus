@@ -405,23 +405,38 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           state.streamingTextOrder || nextStreamOrder(),
           `${event.runId}:text`,
         );
-        mutations.push({ type: "deactivateLiveThinkingParts", duration: currentThinkingDuration(state) });
-        mutations.push({
-          type: "upsertLiveRenderPart",
-          part: {
-            kind: "text",
-            id: order.id,
-            order: order.order,
-            content: existingLivePart(state, "text", order.id)?.content ?? "",
-          },
-        });
+        // Steady-state deltas append into the part's chunk stream and nothing
+        // else: the structural mutations below are only emitted when they
+        // would actually change a part, so the liveRenderParts array keeps
+        // its identity (and the transcript does not re-render) while text is
+        // merely growing. The backend marks a part's order once and repeats
+        // it on every delta, so an existing part never needs re-upserting.
+        const hasActiveThinkingPart = state.liveRenderParts.some(
+          (part) => part.kind === "thinking" && part.active,
+        );
+        if (state.isThinking || hasActiveThinkingPart) {
+          mutations.push({ type: "deactivateLiveThinkingParts", duration: currentThinkingDuration(state) });
+        }
+        if (!existingLivePart(state, "text", order.id)) {
+          mutations.push({
+            type: "upsertLiveRenderPart",
+            part: {
+              kind: "text",
+              id: order.id,
+              order: order.order,
+              content: "",
+            },
+          });
+        }
         mutations.push({ type: "appendLiveRenderPartContent", partId: order.id, text: event.text });
       }
       mutations.push({ type: "appendRawText", text: event.text });
       if (state.isThinking && state.thinkingStartTime > 0) {
         mutations.push({ type: "updateThinkingDuration", duration: Math.round((Date.now() - state.thinkingStartTime) / 1000) });
       }
-      mutations.push({ type: "setThinking", value: false });
+      if (state.isThinking) {
+        mutations.push({ type: "setThinking", value: false });
+      }
       break;
 
     case "thinkingDelta":
@@ -432,17 +447,23 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           state.thinkingOrder || nextStreamOrder(),
           `${event.runId}:thinking`,
         );
-        mutations.push({
-          type: "upsertLiveRenderPart",
-          part: {
-            kind: "thinking",
-            id: order.id,
-            order: order.order,
-            content: existingLivePart(state, "thinking", order.id)?.content ?? "",
-            active: true,
-            duration: state.thinkingDuration > 0 ? state.thinkingDuration : undefined,
-          },
-        });
+        // Upsert only when the part is missing or needs re-activating (a
+        // thinking part deactivated by an interleaved text/tool part can
+        // resume); steady-state growth must not touch the parts array.
+        const existingThinking = existingLivePart(state, "thinking", order.id);
+        if (!existingThinking || !existingThinking.active) {
+          mutations.push({
+            type: "upsertLiveRenderPart",
+            part: {
+              kind: "thinking",
+              id: order.id,
+              order: order.order,
+              content: existingThinking?.content ?? "",
+              active: true,
+              duration: state.thinkingDuration > 0 ? state.thinkingDuration : undefined,
+            },
+          });
+        }
         mutations.push({ type: "appendLiveRenderPartContent", partId: order.id, text: event.text });
       }
       mutations.push({ type: "appendThinking", text: event.text });
@@ -637,6 +658,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
         renderParts: event.renderParts,
         contentOrder: messageOrders.contentOrder,
         thinkingOrder: messageOrders.thinkingOrder,
+        // Live thinking parts no longer accumulate content (growth lives in
+        // the chunk streams), so the fallback path must take the round's
+        // thinking from the same source the message body does below.
+        thinkingContent: state.streamingThinking || undefined,
       });
       mutations.push({
         type: "pushMessage",

@@ -1,10 +1,22 @@
 
 <script setup lang="ts">
-import { ref, watch, nextTick } from "vue";
+import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { t } from "../i18n";
+import { STREAMING_RENDER_THROTTLE_MS } from "../composables/streamingRenderThrottle";
+import type { StreamingTextSource } from "../composables/streamingTextChunks";
 
+/**
+ * Live thinking viewer. Streaming input arrives as an append-only chunk
+ * buffer (`stream`) rendered as frozen spans plus a growing tail span, so an
+ * update only lays out the tail instead of replacing (and re-laying-out) the
+ * whole accumulated text — the previous whole-string interpolation was an
+ * O(n) DOM rebuild per delta. Growth is consumed at the shared streaming
+ * cadence rather than per delta. `text` shows fixed content (history
+ * viewing) and wins over the stream when set.
+ */
 const props = defineProps<{
-  thinking: string;
+  stream?: StreamingTextSource | null;
+  text?: string;
   isThinking: boolean;
 }>();
 
@@ -14,11 +26,57 @@ const emit = defineEmits<{
 
 const contentRef = ref<HTMLElement | null>(null);
 
-watch(() => props.thinking, () => {
-  nextTick(() => {
+const liveStream = computed(() => (props.text ? null : props.stream ?? null));
+
+/** Throttled projection of the buffer: frozen parts diff away in the keyed
+ * v-for, so a flush re-renders only the active tail span. */
+const liveParts = shallowRef<{ frozen: readonly string[]; active: string } | null>(null);
+let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearLiveFlushTimer() {
+  if (liveFlushTimer === null) return;
+  clearTimeout(liveFlushTimer);
+  liveFlushTimer = null;
+}
+
+function flushLiveParts() {
+  clearLiveFlushTimer();
+  const stream = liveStream.value;
+  liveParts.value = stream && stream.length > 0
+    ? { frozen: stream.frozenParts, active: stream.activePart }
+    : null;
+  scheduleScrollToBottom();
+}
+
+watch(
+  () => liveStream.value?.version.value,
+  () => {
+    if (liveFlushTimer !== null) return;
+    liveFlushTimer = setTimeout(flushLiveParts, STREAMING_RENDER_THROTTLE_MS);
+  },
+);
+
+// Stream identity or mode changes swap the content outright: flush
+// immediately so stale parts never linger.
+watch([liveStream, () => props.text], flushLiveParts, { immediate: true });
+
+let scrollFrame: number | null = null;
+
+function scheduleScrollToBottom() {
+  if (scrollFrame !== null) return;
+  scrollFrame = requestAnimationFrame(() => {
+    scrollFrame = null;
     const el = contentRef.value;
     if (el) el.scrollTop = el.scrollHeight;
   });
+}
+
+onBeforeUnmount(() => {
+  clearLiveFlushTimer();
+  if (scrollFrame !== null) {
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame = null;
+  }
 });
 </script>
 
@@ -32,7 +90,14 @@ watch(() => props.thinking, () => {
       <button class="close-btn" @click="emit('close')" :title="t('thinking.panel.close')">&times;</button>
     </div>
     <div ref="contentRef" class="thinking-content">
-      <pre v-if="thinking" class="thinking-text">{{ thinking }}</pre>
+      <pre v-if="text" class="thinking-text">{{ text }}</pre>
+      <pre
+        v-else-if="liveParts"
+        class="thinking-text"
+      ><span
+        v-for="(part, index) in liveParts.frozen"
+        :key="index"
+      >{{ part }}</span><span>{{ liveParts.active }}</span></pre>
       <div v-else class="empty-hint">{{ t("thinking.panel.empty") }}</div>
     </div>
   </aside>

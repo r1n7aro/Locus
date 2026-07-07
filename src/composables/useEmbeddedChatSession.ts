@@ -1,5 +1,6 @@
 import {
   computed,
+  markRaw,
   onMounted,
   onUnmounted,
   reactive,
@@ -12,7 +13,9 @@ import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
-import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
+import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
+import { StreamingTextChunks } from "./streamingTextChunks";
+import { useThrottledStreamingText } from "./streamingRenderThrottle";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import { useChatInputSettings } from "./useChatInputSettings";
 import {
@@ -62,6 +65,11 @@ interface EmbeddedChatState extends StreamState {
   deferredUserMessagesByRun: Map<string, ChatMessage[]>;
   localMergeGroupId: string | null;
   localFallbackMergeGroupId: string | null;
+  /** Chunked mirrors of the streaming text; see the chat store's counterparts.
+   * markRaw keeps the reactive proxy from deep-wrapping them — growth is
+   * observed through each stream's own version ref. */
+  thinkingStream: StreamingTextChunks;
+  livePartStreams: Map<string, StreamingTextChunks>;
 }
 
 export interface EmbeddedChatKnowledgeFocus {
@@ -128,7 +136,23 @@ function createState(key: string): EmbeddedChatState {
     pendingQuestion: null as PendingQuestion | null,
     pendingToolConfirms: [] as PendingToolConfirm[],
     undoableMessageIds: new Set<string>(),
+    thinkingStream: markRaw(new StreamingTextChunks()),
+    livePartStreams: markRaw(new Map<string, StreamingTextChunks>()),
   });
+}
+
+function ensureEmbeddedPartStream(state: EmbeddedChatState, partId: string): StreamingTextChunks {
+  let stream = state.livePartStreams.get(partId);
+  if (!stream) {
+    stream = new StreamingTextChunks();
+    state.livePartStreams.set(partId, stream);
+  }
+  return stream;
+}
+
+function resetEmbeddedStreams(state: EmbeddedChatState) {
+  state.thinkingStream.reset();
+  state.livePartStreams.clear();
 }
 
 function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMessage[] {
@@ -398,10 +422,22 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
   state.rawStreamText = runtime.streamingText ?? "";
   state.streamingText = runtime.streamingText ?? "";
   state.streamingThinking = runtime.streamingThinking ?? "";
+  state.thinkingStream.reset();
+  if (state.streamingThinking) {
+    state.thinkingStream.append(state.streamingThinking);
+  }
   state.streamSequence = runtime.streamSequence ?? 0;
   state.streamingTextOrder = runtime.streamingTextOrder ?? 0;
   state.thinkingOrder = runtime.thinkingOrder ?? 0;
   state.liveRenderParts = cloneRuntimeJson(runtime.liveRenderParts ?? []);
+  // Restored parts carry accumulated content as their baseline; fresh streams
+  // collect only post-restore growth.
+  state.livePartStreams.clear();
+  for (const part of state.liveRenderParts) {
+    if (part.kind === "text" || part.kind === "thinking") {
+      ensureEmbeddedPartStream(state, part.id);
+    }
+  }
   state.isThinking = runtime.isThinking === true;
   state.thinkingStartTime = state.isThinking ? Date.now() : 0;
   state.thinkingDuration = runtime.thinkingDuration ?? 0;
@@ -448,11 +484,15 @@ function resetRoundState(state: EmbeddedChatState) {
   state.thinkingStartTime = 0;
   state.thinkingDuration = 0;
   state.activeToolCalls = [];
+  resetEmbeddedStreams(state);
 }
 
 function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
-  const messagesBeforeMutation = traceEmbeddedMessageOrder(state.messages);
-  const activeToolCallsBeforeMutation = traceEmbeddedToolCallOrder(state.activeToolCalls);
+  // Sampling the pre-mutation order is O(messages) per delta; only pay for it
+  // when the trace is actually enabled.
+  const traceApplyMutation = isToolCollapseTraceEnabled("embeddedApplyStreamMutation");
+  const messagesBeforeMutation = traceApplyMutation ? traceEmbeddedMessageOrder(state.messages) : null;
+  const activeToolCallsBeforeMutation = traceApplyMutation ? traceEmbeddedToolCallOrder(state.activeToolCalls) : null;
   switch (mutation.type) {
     case "appendRawText":
       state.rawStreamText += mutation.text;
@@ -460,6 +500,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "appendThinking":
       state.streamingThinking += mutation.text;
+      state.thinkingStream.append(mutation.text);
       break;
     case "setStreamSequence":
       state.streamSequence = Math.max(state.streamSequence, mutation.value);
@@ -471,6 +512,9 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.thinkingOrder = mutation.order;
       break;
     case "upsertLiveRenderPart": {
+      if (mutation.part.kind === "text" || mutation.part.kind === "thinking") {
+        ensureEmbeddedPartStream(state, mutation.part.id);
+      }
       const index = state.liveRenderParts.findIndex((part) => part.id === mutation.part.id);
       if (index < 0) {
         state.liveRenderParts = [...state.liveRenderParts, mutation.part];
@@ -482,18 +526,19 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     }
     case "appendLiveRenderPartContent":
-      state.liveRenderParts = state.liveRenderParts.map((part) => {
-        if (part.id !== mutation.partId) return part;
-        if (part.kind !== "thinking" && part.kind !== "text") return part;
-        return { ...part, content: part.content + mutation.text };
-      });
+      // Growth goes into the part's chunk stream; finalize events carry the
+      // authoritative full text (see the chat store's counterpart).
+      ensureEmbeddedPartStream(state, mutation.partId).append(mutation.text);
       break;
     case "deactivateLiveThinkingParts":
-      state.liveRenderParts = state.liveRenderParts.map((part) =>
-        part.kind === "thinking"
-          ? { ...part, active: false, duration: mutation.duration ?? part.duration }
-          : part,
-      );
+      // Keep the array's identity when there is nothing to deactivate.
+      if (state.liveRenderParts.some((part) => part.kind === "thinking" && part.active)) {
+        state.liveRenderParts = state.liveRenderParts.map((part) =>
+          part.kind === "thinking"
+            ? { ...part, active: false, duration: mutation.duration ?? part.duration }
+            : part,
+        );
+      }
       break;
     case "updateLiveToolPart":
       state.liveRenderParts = state.liveRenderParts.map((part) =>
@@ -504,6 +549,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "clearLiveRenderParts":
       state.liveRenderParts = [];
+      state.livePartStreams.clear();
       break;
     case "setThinking":
       state.isThinking = mutation.value;
@@ -629,18 +675,21 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.isThinking = false;
       state.thinkingStartTime = 0;
       state.thinkingDuration = 0;
+      resetEmbeddedStreams(state);
       break;
     case "setTodos":
     case "addUndoable":
       break;
   }
-  traceEmbeddedOrder(state, "embeddedApplyStreamMutation", {
-    mutation: traceEmbeddedStreamMutation(mutation),
-    messagesBeforeMutation,
-    messagesAfterMutation: traceEmbeddedMessageOrder(state.messages),
-    activeToolCallsBeforeMutation,
-    activeToolCallsAfterMutation: traceEmbeddedToolCallOrder(state.activeToolCalls),
-  });
+  if (traceApplyMutation) {
+    traceEmbeddedOrder(state, "embeddedApplyStreamMutation", {
+      mutation: traceEmbeddedStreamMutation(mutation),
+      messagesBeforeMutation,
+      messagesAfterMutation: traceEmbeddedMessageOrder(state.messages),
+      activeToolCallsBeforeMutation,
+      activeToolCallsAfterMutation: traceEmbeddedToolCallOrder(state.activeToolCalls),
+    });
+  }
 }
 
 export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
@@ -1161,11 +1210,15 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
   const activeKey = computed(() => toValue(options.sessionKey));
   const messages = computed(() => activeState.value.messages);
-  const streamingText = computed(() => activeState.value.streamingText);
-  const thinkingText = computed(() => activeState.value.streamingThinking);
+  // Embedded sessions have no typewriter: raw deltas would otherwise propagate
+  // as new prop values per event, re-rendering the host transcript each time.
+  // Coalesce both streaming strings to the shared cadence.
+  const streamingText = useThrottledStreamingText(() => activeState.value.streamingText).text;
+  const thinkingText = useThrottledStreamingText(() => activeState.value.streamingThinking).text;
   const streamingTextOrder = computed(() => activeState.value.streamingTextOrder);
   const thinkingOrder = computed(() => activeState.value.thinkingOrder);
   const liveRenderParts = computed(() => activeState.value.liveRenderParts);
+  const livePartStreams = computed(() => activeState.value.livePartStreams);
   const isStreaming = computed(() => activeState.value.isStreaming);
   const isCompacting = computed(() => activeState.value.isCompacting);
   const isThinking = computed(() => activeState.value.isThinking);
@@ -1220,6 +1273,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     streamingTextOrder,
     thinkingOrder,
     liveRenderParts,
+    livePartStreams,
     isStreaming,
     isCompacting,
     isThinking,

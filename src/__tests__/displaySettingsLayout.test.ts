@@ -469,7 +469,7 @@ describe("display settings transcript alignment", () => {
     expect(transcript).toContain("hasVisibleActiveThinkingBlock.value || hasVisibleCompletedThinkingContent.value");
     expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
     expect(transcript).toContain("function shouldRenderTransientThinkingSegment(");
-    expect(transcript).toContain("return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);");
+    expect(transcript).toContain("return !!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part));");
     expect(transcript).toMatch(/if \(part\.kind === "thinking"\) \{\s+if \(!shouldRenderTransientThinkingSegment\(part\)\) continue;\s+flushPendingTools\(\);/);
 
     expect(zh).toContain('"settings.display.hideThinkingBlocks": "隐藏已完成思考块"');

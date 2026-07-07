@@ -67,6 +67,7 @@ import {
 } from "../composables/resizeObserver";
 import { forwardWheelToElement } from "../composables/chatWheelPassthrough";
 import { STREAMING_RENDER_THROTTLE_MS } from "../composables/streamingRenderThrottle";
+import type { StreamingTextSource } from "../composables/streamingTextChunks";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -178,17 +179,22 @@ async function onChatDiffLfsPulled() {
 
 const props = defineProps<{
   messages: ChatMessage[];
+  /** Legacy throttled typewriter text. Pass "" (and supply typedTextStream +
+   * hasStreamingText) so growing text never transits props; the transcript
+   * then renders the typewriter through its incremental stream path. */
   streamingText: string;
+  typedTextStream?: StreamingTextSource | null;
+  hasStreamingText?: boolean;
   streamingTextOrder?: number;
   isStreaming: boolean;
   isCancelling?: boolean;
   isCompacting: boolean;
   isThinking: boolean;
   hasThinking: boolean;
-  thinkingText: string;
   thinkingOrder?: number;
   thinkingDuration: number;
   liveRenderParts?: AssistantRenderPart[];
+  livePartStreams?: ReadonlyMap<string, StreamingTextSource> | null;
   activeToolCalls: ToolCallDisplay[];
   agents: AgentInfo[];
   selectedAgentId: string;
@@ -1400,7 +1406,8 @@ watch(inputText, (value) => {
 });
 
 const hasStreamingContent = computed(
-  () => !!displayedStreamingText.value || hasRunningToolCall(props.activeToolCalls)
+  () => (props.hasStreamingText ?? !!displayedStreamingText.value)
+    || hasRunningToolCall(props.activeToolCalls)
 );
 
 const isWaitingForResponse = computed(
@@ -2626,6 +2633,8 @@ onUnmounted(() => {
           :session-key="activeSessionId || NEW_CHAT_DRAFT_KEY"
           :messages="messages"
           :streaming-text="displayedStreamingText"
+          :typed-text-stream="typedTextStream"
+          :has-streaming-text="hasStreamingText"
           :streaming-text-order="streamingTextOrder"
           :is-streaming="isStreaming"
           :is-compacting="isCompacting"
@@ -2634,6 +2643,7 @@ onUnmounted(() => {
           :thinking-order="thinkingOrder"
           :thinking-duration="thinkingDuration"
           :live-render-parts="liveRenderParts"
+          :live-part-streams="livePartStreams"
           :active-tool-calls="activeToolCalls"
           :selected-message-id="contextSelectedMessageId"
           user-label="You"

@@ -52,6 +52,7 @@ import {
 } from "../../services/layoutDiagnostics";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import StreamingMarkdownRenderer from "./StreamingMarkdownRenderer.vue";
+import type { StreamingTextSource } from "../../composables/streamingTextChunks";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
@@ -101,6 +102,12 @@ interface PromotedHistoryToolCallsState {
 const props = withDefaults(defineProps<{
   messages: ChatMessage[];
   streamingText: string;
+  /** Typewriter output as a chunk stream. When set, single-part rounds render
+   * it incrementally and `streamingText` is expected to stay empty — growing
+   * text then never transits this component's props. */
+  typedTextStream?: StreamingTextSource | null;
+  /** Stable "round has visible text" flag accompanying typedTextStream. */
+  hasStreamingText?: boolean;
   streamingTextOrder?: number;
   isStreaming: boolean;
   isCompacting?: boolean;
@@ -110,6 +117,10 @@ const props = withDefaults(defineProps<{
   thinkingOrder?: number;
   thinkingDuration?: number;
   liveRenderParts?: AssistantRenderPart[];
+  /** Chunk streams carrying live text/thinking growth per render part. The
+   * map identity is stable; renderers subscribe to each stream's version, so
+   * per-delta growth bypasses this component's props entirely. */
+  livePartStreams?: ReadonlyMap<string, StreamingTextSource> | null;
   activeToolCalls: ToolCallDisplay[];
   variant?: TranscriptVariant;
   emptyTitle?: string;
@@ -131,12 +142,15 @@ const props = withDefaults(defineProps<{
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
+  typedTextStream: null,
+  hasStreamingText: undefined,
   streamingTextOrder: 0,
   isCompacting: false,
   thinkingText: "",
   thinkingOrder: 0,
   thinkingDuration: 0,
   liveRenderParts: () => [],
+  livePartStreams: null,
   emptyTitle: "",
   emptyHint: "",
   userLabel: "User",
@@ -521,7 +535,9 @@ watch(
   { flush: "sync" },
 );
 
-const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);
+const hasVisibleStreamingText = computed(() =>
+  props.hasStreamingText ?? (props.streamingText.trim().length > 0),
+);
 const hasVisibleStreamingTextAfterToolHandoff = computed(() => {
   const handoff = toolCallHandoff.value;
   if (!handoff) return hasVisibleStreamingText.value;
@@ -932,8 +948,26 @@ function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message
   return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();
 }
 
+function livePartStream(partId: string): StreamingTextSource | null {
+  return props.livePartStreams?.get(partId) ?? null;
+}
+
+/** Live part content is split between the frozen baseline on the part and
+ * growth in its chunk stream; either side counts as visible content.
+ *
+ * `hasNonWhitespace` is deliberately read without registering a reactive
+ * dependency (subscribing to the stream's version here would re-run the
+ * enclosing computeds once per delta — the exact cost this design removes).
+ * Correctness rides on the reducer contract that every
+ * appendLiveRenderPartContent batch also upserts its part, which swaps the
+ * liveRenderParts array identity and re-runs those computeds. */
+function livePartHasContent(part: Extract<AssistantRenderPart, { kind: "thinking" | "text" }>): boolean {
+  if (part.content.trim().length > 0) return true;
+  return livePartStream(part.id)?.hasNonWhitespace ?? false;
+}
+
 function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart, { kind: "thinking" }>) {
-  return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);
+  return !!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part));
 }
 
 function shouldRenderItem(item: MessageRenderItem) {
@@ -1554,7 +1588,7 @@ const canonicalLiveRenderParts = computed(() => {
 const hasVisibleCompletedThinkingContent = computed(() =>
   !shouldHideThinkingBlocks()
   && canonicalLiveRenderParts.value.some((part) =>
-    part.kind === "thinking" && !part.active && part.content.trim(),
+    part.kind === "thinking" && !part.active && livePartHasContent(part),
   ),
 );
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
@@ -1738,7 +1772,14 @@ type TransientRenderSegment =
       animateCollapseOnMount: boolean;
     }
   | { type: "waiting"; key: string; label: string }
-  | { type: "content"; key: string; part: AssistantRenderPart; content: string };
+  | {
+      type: "content";
+      key: string;
+      part: AssistantRenderPart;
+      content: string;
+      stream?: StreamingTextSource | null;
+      streamInitial?: string;
+    };
 
 function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[] {
   const hasToolFilter = hasExplicitDisplayToolCalls(item) || !!toolCallInfosForMessage(item.message);
@@ -1887,7 +1928,7 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
   return segments;
 }
 
-function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
+function buildHistoryRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
   if (group.role !== "assistant") return [];
 
   const segments: HistoryRenderSegment[] = [];
@@ -1928,6 +1969,28 @@ function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegmen
   }
   flushPendingTools();
   return segments;
+}
+
+/**
+ * Segment construction is O(group items) and the template calls it once per
+ * group per render, so an uncached implementation makes every transcript
+ * re-render O(history). The cache keys off group identity: groupedMessages
+ * is stabilized (groups keep identity while their content is unchanged), so
+ * during streaming this map rebuilds only when history actually changes,
+ * and reactive dependencies (display settings, message data) still register
+ * through the computed.
+ */
+const historyRenderSegmentsByGroup = computed(() => {
+  const map = new Map<MessageGroup, HistoryRenderSegment[]>();
+  for (const group of groupedMessages.value) {
+    if (group.role !== "assistant") continue;
+    map.set(group, buildHistoryRenderSegmentsForGroup(group));
+  }
+  return map;
+});
+
+function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
+  return historyRenderSegmentsByGroup.value.get(group) ?? buildHistoryRenderSegmentsForGroup(group);
 }
 
 function isToolOnlyMessageGroup(group: MessageGroup) {
@@ -2074,14 +2137,48 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
       });
     } else if (part.kind === "text") {
       flushPendingTools();
-      const content = displayedLiveRenderParts.value.length <= 1 && props.streamingText ? props.streamingText : part.content;
-      if (content) {
+      if (displayedLiveRenderParts.value.length <= 1 && props.typedTextStream && hasVisibleStreamingText.value) {
+        // Single-part rounds render the typewriter's chunk stream: the
+        // animation advances inside the renderer without any growing prop.
         segments.push({
           type: "content",
           key: `transient:${part.id}`,
           part,
-          content,
+          content: "",
+          stream: props.typedTextStream,
+          streamInitial: "",
         });
+      } else if (displayedLiveRenderParts.value.length <= 1 && props.streamingText) {
+        // Legacy string path (embedded panes): throttled typewriter text.
+        segments.push({
+          type: "content",
+          key: `transient:${part.id}`,
+          part,
+          content: props.streamingText,
+        });
+      } else {
+        // Multi-part rounds render the part's chunk stream on top of its
+        // baseline. The segment must exist as soon as the stream does — the
+        // renderer subscribes to growth itself, and this computed only
+        // re-runs on structural changes.
+        const stream = livePartStream(part.id);
+        if (stream) {
+          segments.push({
+            type: "content",
+            key: `transient:${part.id}`,
+            part,
+            content: part.content,
+            stream,
+            streamInitial: part.content,
+          });
+        } else if (part.content) {
+          segments.push({
+            type: "content",
+            key: `transient:${part.id}`,
+            part,
+            content: part.content,
+          });
+        }
       }
     } else if (part.kind === "toolCall") {
       const toolCall = transientById.get(part.toolCall.id) ?? toolCallDisplayForPart(part);
@@ -2997,7 +3094,9 @@ function openImage(src: string) {
                   data-render-part-kind="text"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
-                  :content="segment.content"
+                  :content="segment.stream ? undefined : segment.content"
+                  :stream="segment.stream"
+                  :stream-initial="segment.streamInitial"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
                   cursor
                   enable-file-refs

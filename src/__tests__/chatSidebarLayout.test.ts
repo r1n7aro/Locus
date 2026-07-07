@@ -172,7 +172,8 @@ describe("chat sidebar layout", () => {
 
     expect(transcript).toContain("interface ToolCallHandoffState {");
     expect(transcript).toContain("const TOOL_HANDOFF_MIN_VISIBLE_MS = 160;");
-    expect(transcript).toContain("const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);");
+    expect(transcript).toContain("const hasVisibleStreamingText = computed(() =>");
+    expect(transcript).toContain("props.hasStreamingText ?? (props.streamingText.trim().length > 0)");
     expect(transcript).toContain("const shouldArmToolCallHandoffCollapse = computed(");
     expect(transcript).toContain("const toolCallHandoff = ref<ToolCallHandoffState | null>(null);");
     expect(transcript).toContain("renderKey: `tool-handoff-");

@@ -89,6 +89,63 @@ describe("StreamingMarkdownSplitter", () => {
     }
   });
 
+  it("append(delta) produces the same split as update(full) for any step size", () => {
+    const text = [
+      "# Title",
+      "",
+      "Intro paragraph with `code`.",
+      "",
+      "```csharp",
+      "int a = 1;",
+      "",
+      "int b = 2;",
+      "```",
+      "",
+      "- item one",
+      "",
+      "- item two",
+      "",
+      "> quote one",
+      "",
+      "> quote two",
+      "",
+      "Ending paragraph.",
+      "",
+      "Tail line",
+    ].join("\n");
+
+    const oneShot = new StreamingMarkdownSplitter().update(text);
+    for (const step of [1, 2, 3, 7, 31, 128, text.length]) {
+      const splitter = new StreamingMarkdownSplitter();
+      let split: StreamingMarkdownSplit = { blocks: [], tail: "" };
+      for (let cut = 0; cut < text.length; cut += step) {
+        split = splitter.append(text.slice(cut, cut + step));
+      }
+      expect(split.blocks.map((b) => b.text)).toEqual(oneShot.blocks.map((b) => b.text));
+      expect(split.tail).toBe(oneShot.tail);
+      expect(joined(split)).toBe(text);
+    }
+  });
+
+  it("append after update continues the same document", () => {
+    const splitter = new StreamingMarkdownSplitter();
+    splitter.update("first para\n\nsecond");
+    const split = splitter.append(" para\n\nthird para\n\nfourth\n");
+    const oneShot = new StreamingMarkdownSplitter().update(
+      "first para\n\nsecond para\n\nthird para\n\nfourth\n",
+    );
+    expect(split.blocks.map((b) => b.text)).toEqual(oneShot.blocks.map((b) => b.text));
+    expect(split.tail).toBe(oneShot.tail);
+  });
+
+  it("append with an empty delta returns the current snapshot unchanged", () => {
+    const splitter = new StreamingMarkdownSplitter();
+    const before = splitter.update("alpha\n\nbeta\n\ngamma\n\ndelta\n");
+    const after = splitter.append("");
+    expect(after.blocks.map((b) => b.text)).toEqual(before.blocks.map((b) => b.text));
+    expect(after.tail).toBe(before.tail);
+  });
+
   it("never cuts inside a fenced code block even across blank lines", () => {
     const text = [
       "before",

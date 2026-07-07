@@ -108,7 +108,86 @@ describe("reduceStreamEvent", () => {
       // Auto-activation removed — streaming now controlled by runStart/cancel
       expect(mutations.filter((m) => m.type === "setStreaming")).toHaveLength(0);
       expect(mutations).toContainEqual({ type: "appendRawText", text: "hello" });
+      // Not thinking: no redundant setThinking(false) — steady-state text
+      // deltas must not emit structural/state mutations.
+      expect(mutations.filter((m) => m.type === "setThinking")).toHaveLength(0);
+    });
+
+    it("ends thinking when text arrives while thinking is active", () => {
+      const state = makeState({ isStreaming: true, isThinking: true, thinkingStartTime: Date.now() - 1000 });
+      const event: StreamEvent = { runId: "test-run", type: "textDelta", sessionId: "s1", text: "hello" };
+      const mutations = reduceStreamEvent(state, event);
+
       expect(mutations).toContainEqual({ type: "setThinking", value: false });
+    });
+
+    it("keeps the live parts array untouched for steady-state text growth", () => {
+      const state = makeState({
+        isStreaming: true,
+        rawStreamText: "hel",
+        streamingTextOrder: 2,
+        streamSequence: 2,
+        liveRenderParts: [
+          { kind: "text", id: "test-run:text", order: { runId: "test-run", seq: 2 }, content: "" },
+        ],
+      });
+      const event: StreamEvent = {
+        runId: "test-run", type: "textDelta", sessionId: "s1", text: "lo",
+        partId: "test-run:text", renderSeq: 2,
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations.filter((m) => m.type === "upsertLiveRenderPart")).toHaveLength(0);
+      expect(mutations.filter((m) => m.type === "deactivateLiveThinkingParts")).toHaveLength(0);
+      expect(mutations).toContainEqual({ type: "appendLiveRenderPartContent", partId: "test-run:text", text: "lo" });
+    });
+
+    it("keeps the live parts array untouched for steady-state thinking growth", () => {
+      const state = makeState({
+        isStreaming: true,
+        isThinking: true,
+        thinkingStartTime: Date.now(),
+        streamingThinking: "hm",
+        thinkingOrder: 1,
+        streamSequence: 1,
+        liveRenderParts: [
+          { kind: "thinking", id: "test-run:thinking", order: { runId: "test-run", seq: 1 }, content: "", active: true },
+        ],
+      });
+      const event: StreamEvent = {
+        runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "mm",
+        partId: "test-run:thinking", renderSeq: 1,
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations.filter((m) => m.type === "upsertLiveRenderPart")).toHaveLength(0);
+      expect(mutations).toContainEqual({ type: "appendLiveRenderPartContent", partId: "test-run:thinking", text: "mm" });
+      expect(mutations).toContainEqual({ type: "appendThinking", text: "mm" });
+    });
+
+    it("re-activates a deactivated thinking part when thinking resumes", () => {
+      const state = makeState({
+        isStreaming: true,
+        streamingThinking: "earlier",
+        thinkingOrder: 1,
+        streamSequence: 3,
+        liveRenderParts: [
+          { kind: "thinking", id: "test-run:thinking", order: { runId: "test-run", seq: 1 }, content: "", active: false },
+        ],
+      });
+      const event: StreamEvent = {
+        runId: "test-run", type: "thinkingDelta", sessionId: "s1", text: "more",
+        partId: "test-run:thinking", renderSeq: 1,
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      const upsert = mutations.find((m) => m.type === "upsertLiveRenderPart");
+      expect(upsert).toBeDefined();
+      expect((upsert as Extract<StreamMutation, { type: "upsertLiveRenderPart" }>).part).toMatchObject({
+        kind: "thinking",
+        id: "test-run:thinking",
+        active: true,
+      });
     });
 
     it("does not set streaming state on text delta", () => {
