@@ -1193,11 +1193,16 @@ export interface KnowledgeConfigSource {
   path?: string | null;
 }
 
+export type KnowledgeLocalSourceMode = "live" | "snapshot";
+
 export interface KnowledgeExternalSource {
   provider: "local_folder" | "feishu" | "url" | "package" | "unity" | "custom";
   locator?: string | null;
   sourceId?: string | null;
   syncEnabled?: boolean;
+  localMode?: KnowledgeLocalSourceMode | null;
+  aiEditable?: boolean | null;
+  syncedAt?: number | null;
 }
 
 export interface KnowledgeFolderDisplayStats {
@@ -1491,6 +1496,63 @@ export interface FeishuReferenceImportStatus {
   message: string;
   error?: string | null;
   lastOutcome?: FeishuReferenceImportLastOutcome | null;
+}
+
+export type LocalReferenceImportStage =
+  | "idle"
+  | "scanning"
+  | "importing"
+  | "reconciling"
+  | "ready"
+  | "error";
+
+export type LocalReferenceImportState =
+  | "idle"
+  | "running"
+  | "ready"
+  | "error";
+
+export type LocalReferenceSourceKind = "file" | "folder";
+
+export type LocalReferenceImportLastOutcome = "cancelled";
+
+export interface LocalReferenceImportRequest {
+  sourcePath: string;
+  targetPath: string;
+  mode: KnowledgeLocalSourceMode;
+  aiEditable?: boolean;
+}
+
+export interface LocalReferenceScanPreview {
+  sourceKind: LocalReferenceSourceKind;
+  docCount: number;
+  totalFileCount: number;
+  skippedFileCount: number;
+  totalBytes: number;
+}
+
+export interface LocalReferenceImportStatus {
+  state: LocalReferenceImportState;
+  stage: LocalReferenceImportStage;
+  running: boolean;
+  targetPath?: string | null;
+  managedPath?: string | null;
+  sourcePath?: string | null;
+  sourceKind?: LocalReferenceSourceKind | null;
+  mode?: KnowledgeLocalSourceMode | null;
+  aiEditable: boolean;
+  sourceMissing: boolean;
+  importedAt?: number | null;
+  importedDocCount: number;
+  totalFileCount: number;
+  skippedFileCount: number;
+  progress?: number | null;
+  processedDocs: number;
+  totalDocs?: number | null;
+  currentPath?: string | null;
+  message: string;
+  error?: string | null;
+  lastOutcome?: LocalReferenceImportLastOutcome | null;
 }
 
 export interface KnowledgeCatalogStats {
