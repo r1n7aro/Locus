@@ -76,6 +76,7 @@ const modelStoreMocks = vi.hoisted(() => ({
   selectedModelId: "model-a",
   effort: "none" as const,
   effortSupported: false,
+  codexFastModeForModel: vi.fn(() => false),
 }));
 
 const notificationStoreMocks = vi.hoisted(() => ({
