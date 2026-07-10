@@ -21,6 +21,7 @@ export interface ChatParams {
   agentId?: string | null;
   model?: string | null;
   effort?: string | null;
+  fastMode?: boolean | null;
   images?: ImageAttachment[] | null;
   assetRefs?: AssetRefAttachment[] | null;
   sessionType?: string | null;

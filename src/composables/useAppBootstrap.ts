@@ -201,6 +201,7 @@ export function useAppBootstrap() {
         chatStore.loadToolPermissionMode(),
         modelStore.loadModelDefaults(),
         modelStore.loadLastModel(),
+        modelStore.loadCodexFastMode(),
         modelStore.loadCustomEndpoints(),
         modelStore.loadCodexModelConfig(),
       ]);
@@ -612,6 +613,7 @@ export function useAppBootstrap() {
       authStore.checkAuth(),
       modelStore.loadModelDefaults(),
       modelStore.loadLastModel(),
+      modelStore.loadCodexFastMode(),
       modelStore.loadCustomEndpoints(),
       modelStore.loadCodexModelConfig(),
     ]);

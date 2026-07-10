@@ -56,6 +56,8 @@ struct CodexRemoteModel {
     supported_reasoning_levels: Vec<CodexReasoningLevel>,
     #[serde(default)]
     additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    service_tiers: Vec<CodexServiceTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_window: Option<i64>,
     /// Maximum context window allowed for config overrides; fallback when
@@ -95,6 +97,14 @@ impl CodexRemoteModel {
 struct CodexReasoningLevel {
     #[serde(default)]
     effort: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexServiceTier {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +301,15 @@ fn remote_model_to_available(model: CodexRemoteModel, is_default: bool) -> Codex
         .unwrap_or(slug.as_str())
         .to_string();
     let effective_context_window = model.effective_context_window();
+    let mut additional_speed_tiers = model.additional_speed_tiers.clone();
+    if model.service_tiers.iter().any(|tier| {
+        tier.id.eq_ignore_ascii_case("priority") || tier.name.eq_ignore_ascii_case("fast")
+    }) && !additional_speed_tiers
+        .iter()
+        .any(|tier| tier.eq_ignore_ascii_case("fast"))
+    {
+        additional_speed_tiers.push("fast".to_string());
+    }
     let supported_efforts = model
         .supported_reasoning_levels
         .into_iter()
@@ -306,7 +325,7 @@ fn remote_model_to_available(model: CodexRemoteModel, is_default: bool) -> Codex
         provider: "openai_codex".to_string(),
         default_effort: model.default_reasoning_level,
         supported_efforts,
-        additional_speed_tiers: model.additional_speed_tiers,
+        additional_speed_tiers,
         effective_context_window,
         is_default,
     }
@@ -368,7 +387,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         cached_effective_context_window, codex_models_endpoint, persist_cache,
-        remote_models_to_available, CodexReasoningLevel, CodexRemoteModel,
+        remote_models_to_available, CodexReasoningLevel, CodexRemoteModel, CodexServiceTier,
     };
 
     fn remote(slug: &str, priority: i32, visibility: &str) -> CodexRemoteModel {
@@ -387,6 +406,7 @@ mod tests {
                 },
             ],
             additional_speed_tiers: vec!["fast".to_string()],
+            service_tiers: Vec::new(),
             context_window: None,
             max_context_window: None,
             auto_compact_token_limit: None,
@@ -424,6 +444,20 @@ mod tests {
         assert!(models[0].is_default);
         assert!(!models[1].is_default);
         assert_eq!(models[0].supported_efforts, vec!["low", "medium"]);
+        assert_eq!(models[0].additional_speed_tiers, vec!["fast"]);
+    }
+
+    #[test]
+    fn service_tier_metadata_exposes_one_fast_capability() {
+        let mut model = remote("gpt-5.6-sol", 1, "list");
+        model.additional_speed_tiers.clear();
+        model.service_tiers = vec![CodexServiceTier {
+            id: "priority".to_string(),
+            name: "Fast".to_string(),
+        }];
+
+        let models = remote_models_to_available(vec![model]);
+
         assert_eq!(models[0].additional_speed_tiers, vec!["fast"]);
     }
 

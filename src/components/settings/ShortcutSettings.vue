@@ -57,8 +57,18 @@ const shortcutRows = computed(() => [
     action: "newChat" as const,
     title: t("settings.shortcuts.newChatTitle"),
     desc: t("settings.shortcuts.newChatDesc"),
-    parts: formatShortcutParts(state.newChat),
+    chords: [formatShortcutParts(state.newChat)],
     titleText: formatShortcut(state.newChat),
+  },
+  {
+    action: "cancelRun" as const,
+    title: t("settings.shortcuts.cancelRunTitle"),
+    desc: t("settings.shortcuts.cancelRunDesc"),
+    chords: [
+      formatShortcutParts(state.cancelRun),
+      formatShortcutParts(state.cancelRun),
+    ],
+    titleText: `${formatShortcut(state.cancelRun)} ${formatShortcut(state.cancelRun)}`,
   },
 ]);
 
@@ -79,7 +89,7 @@ function stopRecording() {
 function handleRecordKeydown(action: ShortcutAction, event: KeyboardEvent) {
   if (!isRecording(action)) return;
 
-  if (event.key === "Escape") {
+  if (event.key === "Escape" && action !== "cancelRun") {
     event.preventDefault();
     stopRecording();
     return;
@@ -88,7 +98,7 @@ function handleRecordKeydown(action: ShortcutAction, event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
 
-  const shortcut = parseShortcutEvent(event);
+  const shortcut = parseShortcutEvent(event, action !== "cancelRun");
   if (!shortcut) {
     captureError.value = t("settings.shortcuts.requireModifier");
     return;
@@ -159,11 +169,17 @@ function handleReset(action: ShortcutAction) {
 
         <div class="shortcut-actions">
           <div class="shortcut-keys" :title="row.titleText">
-            <kbd
-              v-for="part in row.parts"
-              :key="part"
-              class="shortcut-key"
-            >{{ part }}</kbd>
+            <span
+              v-for="(chord, chordIndex) in row.chords"
+              :key="chordIndex"
+              class="shortcut-chord"
+            >
+              <kbd
+                v-for="(part, partIndex) in chord"
+                :key="`${chordIndex}-${partIndex}-${part}`"
+                class="shortcut-key"
+              >{{ part }}</kbd>
+            </span>
           </div>
 
           <BaseButton
@@ -259,6 +275,12 @@ function handleReset(action: ShortcutAction) {
   gap: 6px;
   min-width: 132px;
   justify-content: flex-end;
+}
+
+.shortcut-chord {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .shortcut-key {

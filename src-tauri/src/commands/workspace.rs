@@ -876,6 +876,24 @@ pub async fn save_last_effort(effort: String, _app_handle: AppHandle) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_codex_fast_mode(_app_handle: AppHandle) -> Result<bool, AppError> {
+    let path = persistent_config_dir()?.join("codex_fast_mode.txt");
+    Ok(read_nonempty_string(&path)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true")))
+}
+
+#[tauri::command]
+pub async fn save_codex_fast_mode(
+    enabled: bool,
+    _app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {e}"))?;
+    std::fs::write(dir.join("codex_fast_mode.txt"), enabled.to_string())
+        .map_err(|e| format!("Failed to save Codex Fast mode: {e}"))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefaults {
@@ -2634,6 +2652,7 @@ pub async fn reset_all_config(
             "config.json",
             "last_model.txt",
             "last_effort.txt",
+            "codex_fast_mode.txt",
             "model_defaults.json",
             "custom_endpoints.json",
             "codex_model_config.json",

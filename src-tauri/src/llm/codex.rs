@@ -45,6 +45,7 @@ pub struct TurnState {
 pub struct CodexStreamOptions {
     pub include_web_search: bool,
     pub use_session_continuation: bool,
+    pub fast_mode: bool,
 }
 
 impl Default for CodexStreamOptions {
@@ -52,6 +53,7 @@ impl Default for CodexStreamOptions {
         Self {
             include_web_search: true,
             use_session_continuation: true,
+            fast_mode: false,
         }
     }
 }
@@ -61,7 +63,13 @@ impl CodexStreamOptions {
         Self {
             include_web_search: false,
             use_session_continuation: false,
+            fast_mode: false,
         }
+    }
+
+    pub fn with_fast_mode(mut self, enabled: bool) -> Self {
+        self.fast_mode = enabled;
+        self
     }
 }
 
@@ -353,6 +361,9 @@ fn build_request_body(
 
     apply_reasoning_effort(&mut body, model, thinking_level);
     apply_text_verbosity_default(&mut body, model);
+    if options.fast_mode {
+        body["service_tier"] = serde_json::json!("priority");
+    }
 
     if !responses_tools.is_empty() {
         body["tools"] = serde_json::json!(responses_tools);
@@ -563,6 +574,7 @@ fn build_compact_request_body(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
+    fast_mode: bool,
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> serde_json::Value {
@@ -582,6 +594,9 @@ fn build_compact_request_body(
         body["prompt_cache_key"] = serde_json::json!(sid);
     }
     apply_reasoning_effort(&mut body, model, thinking_level);
+    if fast_mode {
+        body["service_tier"] = serde_json::json!("priority");
+    }
     body
 }
 
@@ -609,6 +624,7 @@ pub async fn compact_conversation_history(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
+    fast_mode: bool,
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     debug: bool,
@@ -619,6 +635,7 @@ pub async fn compact_conversation_history(
         history,
         tools,
         thinking_level,
+        fast_mode,
         session_id,
         response_request_metadata,
     );
@@ -1859,6 +1876,7 @@ pub async fn stream_chat<F, G, H>(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
+    fast_mode: bool,
     debug: bool,
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
@@ -1886,7 +1904,7 @@ where
         session_id,
         response_request_metadata,
         turn_state,
-        CodexStreamOptions::default(),
+        CodexStreamOptions::default().with_fast_mode(fast_mode),
         on_text_delta,
         on_thinking_delta,
         on_tool_call_start,
@@ -3447,6 +3465,23 @@ mod tests {
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+        assert!(body.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn build_request_body_injects_priority_service_tier_for_fast_mode() {
+        let body = build_request_body(
+            "gpt-5.6-sol",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            Some("low"),
+            None,
+            None,
+            CodexStreamOptions::default().with_fast_mode(true),
+        );
+
+        assert_eq!(body["service_tier"].as_str(), Some("priority"));
     }
 
     #[test]
@@ -3489,6 +3524,7 @@ mod tests {
                 "function": { "name": "read", "description": "Read file", "parameters": {} }
             })],
             Some("high"),
+            false,
             Some("session-1"),
             None,
         );
@@ -3502,6 +3538,22 @@ mod tests {
         assert!(body.get("stream").is_none());
         assert!(body.get("store").is_none());
         assert!(body.get("type").is_none());
+    }
+
+    #[test]
+    fn compact_request_body_reuses_fast_service_tier() {
+        let body = build_compact_request_body(
+            "gpt-5.6-sol",
+            "You are Codex",
+            &[user_message_with_images("compact", vec![])],
+            &[],
+            Some("low"),
+            true,
+            Some("session-1"),
+            None,
+        );
+
+        assert_eq!(body["service_tier"].as_str(), Some("priority"));
     }
 
     #[test]

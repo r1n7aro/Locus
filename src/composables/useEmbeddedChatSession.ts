@@ -85,6 +85,7 @@ export interface UseEmbeddedChatSessionOptions {
   selectedAgentId?: MaybeRefOrGetter<string | null | undefined>;
   effort?: MaybeRefOrGetter<EffortLevel | null | undefined>;
   effortSupported?: MaybeRefOrGetter<boolean | undefined>;
+  fastMode?: MaybeRefOrGetter<boolean | undefined>;
   /** Knowledge document this session is scoped to; injected into the agent env by the backend. */
   knowledgeFocus?: MaybeRefOrGetter<EmbeddedChatKnowledgeFocus | null | undefined>;
   buildRequest: (input: string) => EmbeddedChatRequest | null;
@@ -1018,6 +1019,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         agentId: toValue(options.selectedAgentId) ?? null,
         model: selectedModelId,
         effort: toValue(options.effortSupported) ? (toValue(options.effort) ?? null) : null,
+        fastMode: toValue(options.fastMode) ?? false,
         images: request.images && request.images.length > 0 ? request.images : null,
         assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : null,
         sessionType: options.sessionType ?? "chat",

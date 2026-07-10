@@ -21,6 +21,7 @@ watch(() => overlay.visible.value, (visible) => {
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape" && overlay.visible.value) {
+    e.preventDefault();
     if (confirmAction.value) {
       confirmAction.value = null;
     } else {
@@ -29,8 +30,8 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onUnmounted(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => window.addEventListener("keydown", onKeydown, true));
+onUnmounted(() => window.removeEventListener("keydown", onKeydown, true));
 
 function handleHeaderAction(action: DiffOverlayHeaderAction) {
   if (action.confirmMessage) {

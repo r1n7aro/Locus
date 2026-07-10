@@ -45,6 +45,9 @@ describe("selector dropdown alignment", () => {
     expect(source).toContain(".model-effort-effort-panel {");
     expect(source).toContain("border-left: 1px solid var(--border-color);");
     expect(source).not.toContain("model-effort-option-desc");
+    expect(source).toContain("group.provider === 'openai_codex'");
+    expect(source).toContain("<BaseSwitch");
+    expect(source.match(/<BaseSwitch/g)).toHaveLength(1);
     expect(source).toContain("selectModel: [id: string]");
     expect(source).toContain("selectEffort: [level: EffortLevel]");
   });

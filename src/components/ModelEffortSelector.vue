@@ -4,6 +4,7 @@ import type { EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelDisplayName } from "../utils/modelDisplay";
+import BaseSwitch from "./ui/BaseSwitch.vue";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -11,6 +12,8 @@ const props = defineProps<{
   effort: EffortLevel;
   efforts?: EffortLevel[];
   effortSupported?: boolean;
+  fastModeEnabled?: boolean;
+  fastModeAvailable?: boolean;
   align?: "start" | "end";
   disabled?: boolean;
 }>();
@@ -18,6 +21,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   selectModel: [id: string];
   selectEffort: [level: EffortLevel];
+  selectFastMode: [enabled: boolean];
 }>();
 
 interface LevelOption {
@@ -142,6 +146,10 @@ function selectEffort(level: EffortLevel) {
   open.value = false;
 }
 
+function selectFastMode(enabled: boolean) {
+  emit("selectFastMode", enabled);
+}
+
 function onClickOutside(event: MouseEvent) {
   if (selectorRef.value && !selectorRef.value.contains(event.target as Node)) {
     open.value = false;
@@ -184,7 +192,23 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
           </template>
           <template v-for="(group, groupIndex) in groupedModels" :key="group.provider">
             <div v-if="groupIndex > 0" class="model-effort-divider"></div>
-            <div class="model-effort-section-label">{{ group.label }}</div>
+            <div class="model-effort-section-header">
+              <div class="model-effort-section-label">{{ group.label }}</div>
+              <div
+                v-if="group.provider === 'openai_codex'"
+                class="model-effort-fast-toggle"
+                :title="t('model.fastHint')"
+                @click.stop
+              >
+                <span>{{ t("model.fast") }}</span>
+                <BaseSwitch
+                  :model-value="fastModeEnabled === true"
+                  :disabled="disabled || fastModeAvailable !== true"
+                  :aria-label="t('model.fast')"
+                  @update:model-value="selectFastMode"
+                />
+              </div>
+            </div>
             <button
               v-for="model in group.models"
               :key="model.id"
@@ -335,6 +359,23 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   letter-spacing: 0.5px;
   color: var(--text-secondary);
   opacity: 0.7;
+}
+
+.model-effort-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-right: 8px;
+}
+
+.model-effort-fast-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .model-effort-divider {

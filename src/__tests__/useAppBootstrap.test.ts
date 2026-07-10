@@ -176,6 +176,7 @@ describe("useAppBootstrap onboarding completion", () => {
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
       loadLastModel: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
+      loadCodexFastMode: vi.fn().mockResolvedValue(undefined),
       loadCustomEndpoints: vi.fn().mockResolvedValue(undefined),
       loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
       loadCodexAvailableModels: vi.fn().mockResolvedValue(undefined),

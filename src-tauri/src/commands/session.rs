@@ -827,6 +827,7 @@ pub async fn chat(
     agent_id: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    fast_mode: Option<bool>,
     images: Option<Vec<ImageData>>,
     asset_refs: Option<Vec<AssetRefData>>,
     session_type: Option<String>,
@@ -1046,6 +1047,7 @@ pub async fn chat(
         subagent_models.unwrap_or_default(),
         cancel_rx,
     );
+    instance.set_codex_fast_mode(fast_mode.unwrap_or(false));
     let knowledge_focus = match (knowledge_doc_type, knowledge_doc_path) {
         (Some(doc_type), Some(path)) if !path.trim().is_empty() => {
             Some(crate::agent::instance::KnowledgeFocusDoc {

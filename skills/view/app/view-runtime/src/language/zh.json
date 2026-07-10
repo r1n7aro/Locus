@@ -939,6 +939,8 @@
 
   "model.select": "选择模型",
   "model.noProvider": "未配置任何供应商",
+  "model.fast": "Fast",
+  "model.fastHint": "提高响应速度，同时增加订阅用量",
   "model.provider.anthropic": "Claude 订阅账户",
   "model.provider.claude_code": "Claude Code CLI",
   "model.provider.openai": "ChatGPT 订阅账户",
@@ -1147,7 +1149,7 @@
   "settings.claudeCode.testHint": "通过 CLI 发送一个单词探针，按真实运行的方式验证端点、凭据与代理是否可用。",
 
   "settings.codex.title": "ChatGPT 订阅账户（设备授权）",
-  "settings.codex.desc": "使用 ChatGPT Pro / Plus 订阅调用 GPT-5.5",
+  "settings.codex.desc": "使用 ChatGPT Pro / Plus 订阅调用 GPT-5.6 系列",
   "settings.codex.loggedIn": "已登录",
   "settings.codex.notLoggedIn": "未登录",
   "settings.codex.authenticated": "已认证",
@@ -1187,6 +1189,8 @@
   "settings.codex.quotaWindowWeeks": "{0} 周",
   "settings.codex.quotaCreditsUnlimited": "点数不限",
   "settings.codex.quotaCredits": "{0} 点",
+  "settings.codex.resetCredits": "使用限制重置",
+  "settings.codex.resetCreditsAvailable": "{0} 次可用",
   "settings.codex.transportLabel": "传输路径",
   "settings.codex.transportDesc": "HTTP 使用当前 ChatGPT Codex 路径，WebSocket 使用 OpenAI Responses websocket。",
   "settings.codex.transportHttp": "HTTP",
@@ -3408,7 +3412,7 @@
   "onboarding.auth.notConfigured": "未配置",
   "onboarding.auth.skipHint": "可以稍后在设置中配置",
   "onboarding.auth.customEndpointDesc": "接入兼容 API 或本地模型服务",
-  "onboarding.auth.codexDesc": "ChatGPT Pro/Plus 订阅，gpt-5.5",
+  "onboarding.auth.codexDesc": "ChatGPT Pro/Plus 订阅，GPT-5.6 系列",
 
   "onboarding.project.title": "选择 Unity 项目",
   "onboarding.project.desc": "浏览到 Unity 项目的根目录（包含 Assets/ 的文件夹）",

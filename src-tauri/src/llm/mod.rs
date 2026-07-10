@@ -13,7 +13,7 @@ pub mod retry;
 pub mod streaming;
 pub mod think_tag_filter;
 
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.124.0";
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.144.1";
 
 /// Normalize historical tool call arguments before replaying them to an
 /// OpenAI-shaped endpoint. Strict servers (vLLM-based providers such as

@@ -244,6 +244,7 @@ pub struct AgentInstance {
     /// the live-config depth check as backstop.
     task_tool_suppressed: bool,
     effort: Option<String>,
+    codex_fast_mode: bool,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
     knowledge_access_mode: KnowledgeAccessMode,
@@ -3021,6 +3022,7 @@ impl AgentInstance {
             subagent_active: Arc::new(AtomicU32::new(0)),
             task_tool_suppressed: false,
             effort: effective_effort,
+            codex_fast_mode: false,
             app_knowledge_dir,
             app_agent_dir,
             knowledge_access_mode,
@@ -3038,6 +3040,10 @@ impl AgentInstance {
 
     pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
         self.partial_assistant.clone()
+    }
+
+    pub fn set_codex_fast_mode(&mut self, enabled: bool) {
+        self.codex_fast_mode = enabled;
     }
 
     /// Marks this instance as a subagent whose parent session is in plan
@@ -5656,6 +5662,7 @@ impl AgentInstance {
         );
         child.subagent_depth = self.subagent_depth + 1;
         child.subagent_active = self.subagent_active.clone();
+        child.codex_fast_mode = self.codex_fast_mode;
         Ok(child)
     }
 
@@ -5775,6 +5782,7 @@ impl AgentInstance {
                     messages,
                     api_tools,
                     self.effort.as_deref(),
+                    self.codex_fast_mode,
                     self.debug,
                     Some(&self.session_id),
                     Some(&response_request_metadata),
@@ -5803,6 +5811,7 @@ impl AgentInstance {
                             messages,
                             api_tools,
                             self.effort.as_deref(),
+                            self.codex_fast_mode,
                             self.debug,
                             Some(&self.session_id),
                             Some(&response_request_metadata),
@@ -6072,7 +6081,7 @@ impl AgentInstance {
                 None,
                 None,
                 &mut compact_turn_state,
-                codex::CodexStreamOptions::compact(),
+                codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
                 &|_| {},
                 &|_| {},
                 &|_, _| {},
@@ -6102,7 +6111,7 @@ impl AgentInstance {
                         None,
                         None,
                         &mut compact_turn_state,
-                        codex::CodexStreamOptions::compact(),
+                        codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
                         &|_| {},
                         &|_| {},
                         &|_, _| {},
@@ -6284,6 +6293,7 @@ impl AgentInstance {
             &prepared,
             &api_tools,
             self.effort.as_deref(),
+            self.codex_fast_mode,
             Some(&self.session_id),
             Some(&response_request_metadata),
             self.debug,
@@ -6307,6 +6317,7 @@ impl AgentInstance {
                     &prepared,
                     &api_tools,
                     self.effort.as_deref(),
+                    self.codex_fast_mode,
                     Some(&self.session_id),
                     Some(&response_request_metadata),
                     self.debug,

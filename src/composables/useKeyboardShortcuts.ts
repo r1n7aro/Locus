@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 
-export type ShortcutAction = "newChat";
+export type ShortcutAction = "newChat" | "cancelRun";
 export type ShortcutPlatform = "default" | "mac";
 
 export interface ShortcutDefinition {
@@ -35,6 +35,7 @@ function cloneShortcut(shortcut: ShortcutDefinition): ShortcutDefinition {
 function snapshotSettings(settings: ShortcutSettings): ShortcutSettings {
   return {
     newChat: cloneShortcut(settings.newChat),
+    cancelRun: cloneShortcut(settings.cancelRun),
   };
 }
 
@@ -57,12 +58,20 @@ export function createDefaultShortcutSettings(
       shift: false,
       key: "n",
     },
+    cancelRun: {
+      ctrl: false,
+      meta: false,
+      alt: false,
+      shift: false,
+      key: "escape",
+    },
   };
 }
 
 function normalizeShortcut(
   shortcut: Partial<ShortcutDefinition> | null | undefined,
   fallback: ShortcutDefinition,
+  requireModifier = true,
 ): ShortcutDefinition {
   const normalized: ShortcutDefinition = {
     ctrl: Boolean(shortcut?.ctrl),
@@ -72,7 +81,7 @@ function normalizeShortcut(
     key: normalizeKeyValue(shortcut?.key),
   };
 
-  if (!normalized.key || !hasModifier(normalized)) {
+  if (!normalized.key || (requireModifier && !hasModifier(normalized))) {
     return cloneShortcut(fallback);
   }
 
@@ -88,6 +97,7 @@ function normalizeShortcutSettings(raw: unknown): ShortcutSettings {
   const record = raw as Partial<Record<ShortcutAction, ShortcutDefinition>>;
   return {
     newChat: normalizeShortcut(record.newChat, defaults.newChat),
+    cancelRun: normalizeShortcut(record.cancelRun, defaults.cancelRun, false),
   };
 }
 
@@ -163,6 +173,7 @@ function isModifierKey(key: string): boolean {
 
 export function parseShortcutEvent(
   event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey">,
+  requireModifier = true,
 ): ShortcutDefinition | null {
   const key = normalizeKeyValue(event.key);
   if (!key || isModifierKey(key)) {
@@ -177,7 +188,7 @@ export function parseShortcutEvent(
     key,
   };
 
-  if (!hasModifier(shortcut)) {
+  if (requireModifier && !hasModifier(shortcut)) {
     return null;
   }
 
@@ -188,7 +199,7 @@ export function matchesShortcut(
   event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey">,
   shortcut: ShortcutDefinition,
 ): boolean {
-  const parsed = parseShortcutEvent(event);
+  const parsed = parseShortcutEvent(event, false);
   if (!parsed) return false;
   return parsed.ctrl === shortcut.ctrl
     && parsed.meta === shortcut.meta
@@ -197,9 +208,34 @@ export function matchesShortcut(
     && parsed.key === shortcut.key;
 }
 
+export const DOUBLE_PRESS_SHORTCUT_INTERVAL_MS = 1_000;
+
+export function createDoublePressShortcutTracker(
+  intervalMs = DOUBLE_PRESS_SHORTCUT_INTERVAL_MS,
+) {
+  let firstPressedAt: number | null = null;
+
+  return {
+    press(now = Date.now()): boolean {
+      const shouldTrigger = firstPressedAt !== null
+        && now >= firstPressedAt
+        && now - firstPressedAt <= intervalMs;
+      firstPressedAt = shouldTrigger ? null : now;
+      return shouldTrigger;
+    },
+    reset() {
+      firstPressedAt = null;
+    },
+  };
+}
+
 export function useKeyboardShortcuts() {
   function setShortcut(action: ShortcutAction, shortcut: ShortcutDefinition) {
-    state[action] = normalizeShortcut(shortcut, createDefaultShortcutSettings()[action]);
+    state[action] = normalizeShortcut(
+      shortcut,
+      createDefaultShortcutSettings()[action],
+      action !== "cancelRun",
+    );
     saveShortcutSettings(state);
   }
 

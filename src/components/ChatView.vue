@@ -71,7 +71,13 @@ import type { StreamingTextSource } from "../composables/streamingTextChunks";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
-import { matchesShortcut, useKeyboardShortcuts } from "../composables/useKeyboardShortcuts";
+import {
+  createDoublePressShortcutTracker,
+  DOUBLE_PRESS_SHORTCUT_INTERVAL_MS,
+  formatShortcut,
+  matchesShortcut,
+  useKeyboardShortcuts,
+} from "../composables/useKeyboardShortcuts";
 import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
@@ -205,6 +211,8 @@ const props = defineProps<{
   effort: EffortLevel;
   effortSupported: boolean;
   effortLevels: EffortLevel[];
+  fastModeEnabled: boolean;
+  fastModeAvailable: boolean;
   tokenUsage: TokenUsage;
   pendingQuestion: PendingQuestion | null;
   pendingToolConfirms: PendingToolConfirm[];
@@ -245,6 +253,7 @@ const emit = defineEmits<{
   selectAgent: [id: string];
   selectModel: [id: string];
   selectEffort: [level: EffortLevel];
+  selectFastMode: [enabled: boolean];
   saveRawContext: [request: SaveRawContextRequest];
   answerQuestion: [answer: string];
   answerToolConfirm: [questionId: string, answer: string];
@@ -2462,17 +2471,74 @@ function setSessionPanelCollapsed(value: boolean) {
   try { localStorage.setItem(sessionPanelCollapsedStorageKey.value, value ? "1" : "0"); } catch {}
 }
 
+const CANCEL_SHORTCUT_CONFIRM_OPERATION = "chat.cancelShortcutConfirm";
+const cancelShortcutTracker = createDoublePressShortcutTracker();
+
+function clearCancelShortcutConfirmation() {
+  cancelShortcutTracker.reset();
+  notificationStore.clearByOperation(CANCEL_SHORTCUT_CONFIRM_OPERATION);
+}
+
 function onGlobalChatKeydown(e: KeyboardEvent) {
   if (uiStore.activeTab !== "chat") return;
+
+  if (e.key === "Escape" && showInlineDiff.value) {
+    e.preventDefault();
+    clearCancelShortcutConfirmation();
+    chatChangesStore.closeInlineDiff();
+    return;
+  }
+
+  if (e.defaultPrevented) {
+    clearCancelShortcutConfirmation();
+    return;
+  }
+
+  if (!e.repeat && props.isStreaming && matchesShortcut(e, shortcutState.cancelRun)) {
+    e.preventDefault();
+    if (props.isCancelling) {
+      clearCancelShortcutConfirmation();
+      return;
+    }
+
+    if (cancelShortcutTracker.press()) {
+      clearCancelShortcutConfirmation();
+      emit("cancel");
+      return;
+    }
+
+    notificationStore.addNotice(
+      "info",
+      t("chat.cancelShortcut.confirm", formatShortcut(shortcutState.cancelRun)),
+      {
+        operation: CANCEL_SHORTCUT_CONFIRM_OPERATION,
+        replaceOperation: true,
+        ttl: DOUBLE_PRESS_SHORTCUT_INTERVAL_MS,
+        skipConsoleLog: true,
+      },
+    );
+    return;
+  }
+
+  if (!e.repeat && !["Control", "Meta", "Alt", "Shift"].includes(e.key)) {
+    clearCancelShortcutConfirmation();
+  }
+
   if (!e.repeat && matchesShortcut(e, shortcutState.newChat)) {
     e.preventDefault();
     handleNewChatRequest();
     return;
   }
-  if (e.key === "Escape" && showInlineDiff.value) {
-    chatChangesStore.closeInlineDiff();
-  }
 }
+
+watch(
+  () => [props.isStreaming, props.isCancelling] as const,
+  ([isStreaming, isCancelling]) => {
+    if (!isStreaming || isCancelling) {
+      clearCancelShortcutConfirmation();
+    }
+  },
+);
 
 onMounted(() => {
   window.addEventListener("keydown", onGlobalChatKeydown);
@@ -2493,6 +2559,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onGlobalChatKeydown);
+  clearCancelShortcutConfirmation();
   rememberScrollForSession();
   clearInputControlsSwitchTimer();
   scrollToBottomScheduler.cancel();
@@ -2849,6 +2916,7 @@ onUnmounted(() => {
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
         :asset-ref-sync-key="composerAssetRefSyncKey"
+        :message-history="messages"
         @send="handleComposerSend"
         @compact="emit('compact')"
         @fork="emit('fork')"
@@ -2864,9 +2932,12 @@ onUnmounted(() => {
             :effort="effort"
             :efforts="effortLevels"
             :effort-supported="effortSupported"
+            :fast-mode-enabled="fastModeEnabled"
+            :fast-mode-available="fastModeAvailable"
             :disabled="isStreaming"
             @select-model="emit('selectModel', $event)"
             @select-effort="emit('selectEffort', $event)"
+            @select-fast-mode="emit('selectFastMode', $event)"
           />
           <TokenUsageBar
             :token-usage="tokenUsage"

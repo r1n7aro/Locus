@@ -13,6 +13,7 @@ import { useNotificationStore } from "../../stores/notification";
 import type {
   AssetRefAttachment,
   ChatComposerSendPayload,
+  ChatMessage,
   ImageAttachment,
   KnowledgeDocumentType,
   KnowledgeSearchResult,
@@ -35,9 +36,15 @@ import {
 } from "../../composables/chatInputIntents";
 import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
 import {
+  buildUserMessageDraft,
   readUserMessageDraftFromClipboardData,
   type UserMessageDraft,
 } from "../../composables/chatMessageDraft";
+import {
+  createChatInputHistoryState,
+  navigateChatInputHistory,
+  shouldNavigateChatInputHistory,
+} from "../../composables/chatInputHistory";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
 import { normalizeAppError } from "../../services/errors";
@@ -128,6 +135,10 @@ interface LocalFileAttachment extends LocusFileDropRef {
   id: string;
 }
 
+interface ComposerHistorySnapshot extends UserMessageDraft {
+  pastedContent: string;
+}
+
 const props = withDefaults(defineProps<{
   modelValue: string;
   selectedAgentId: string;
@@ -145,6 +156,7 @@ const props = withDefaults(defineProps<{
   compact?: boolean;
   showAction?: boolean;
   assetRefSyncKey?: string;
+  messageHistory?: ChatMessage[];
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -160,6 +172,7 @@ const props = withDefaults(defineProps<{
   compact: false,
   showAction: true,
   assetRefSyncKey: "",
+  messageHistory: () => [],
 });
 
 const emit = defineEmits<{
@@ -243,6 +256,12 @@ let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
 const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let messageHistoryNavigation = createChatInputHistoryState<ComposerHistorySnapshot>();
+let applyingMessageHistory = false;
+
+function resetMessageHistoryNavigation() {
+  messageHistoryNavigation = createChatInputHistoryState<ComposerHistorySnapshot>();
+}
 
 const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
@@ -259,6 +278,13 @@ const canSend = computed(() =>
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0,
 );
+
+const userMessageHistory = computed(() => props.messageHistory
+  .filter((message) => message.role === "user")
+  .map((message) => ({
+    ...buildUserMessageDraft(message),
+    pastedContent: "",
+  })));
 
 function isDraftEmpty() {
   return !props.modelValue
@@ -507,6 +533,9 @@ function showIntentBlockedNotice(command: CommandDef) {
 }
 
 function setInputValue(value: string) {
+  if (!applyingMessageHistory) {
+    resetMessageHistoryNavigation();
+  }
   emit("update:modelValue", value);
 }
 
@@ -1505,6 +1534,70 @@ async function applyDraftPrefill(draft: UserMessageDraft) {
   await applyUserMessageDraft(draft);
 }
 
+function captureComposerHistorySnapshot(): ComposerHistorySnapshot {
+  return {
+    text: props.modelValue,
+    pastedContent: pastedContent.value,
+    images: imageAttachments.value.map((image) => ({
+      data: image.data,
+      mimeType: image.mimeType,
+    })),
+    assetRefs: cloneAssetRefs(assetRefAttachments.value),
+    localFiles: localFileAttachments.value.map((file) => ({
+      path: file.path,
+      isDir: file.isDir,
+      name: file.name,
+      typeLabel: file.typeLabel,
+      source: file.source,
+    })),
+    consoleTexts: consoleTextAttachments.value.map((entry) => ({
+      title: entry.title,
+      source: entry.source,
+      level: entry.level,
+      text: entry.text,
+    })),
+    intent: {
+      mode: composerIntent.value.mode,
+      skills: composerIntent.value.skills.map((skill) => ({ ...skill })),
+    },
+  };
+}
+
+function applyComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
+  resetDraft();
+  setInputValue(snapshot.text);
+  pastedContent.value = snapshot.pastedContent;
+  imageAttachments.value = snapshot.images
+    .slice(0, props.maxImages)
+    .map((image) => ({
+      data: image.data,
+      mimeType: image.mimeType,
+    }));
+  setAssetRefAttachments(snapshot.assetRefs);
+  consoleTextAttachments.value = snapshot.consoleTexts
+    .map((entry) => normalizeConsoleTextAttachment(entry))
+    .filter((entry): entry is ConsoleTextAttachment => !!entry);
+  addLocalFileAttachments(snapshot.localFiles);
+  composerIntent.value = {
+    mode: snapshot.intent.mode,
+    skills: snapshot.intent.skills.map((skill) => ({ ...skill })),
+  };
+  nextTick(() => {
+    autoResizeTextarea();
+    focusComposerSelection(snapshot.text.length);
+    syncOperatorState();
+  });
+}
+
+function startApplyingComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
+  applyingMessageHistory = true;
+  try {
+    applyComposerHistorySnapshot(snapshot);
+  } finally {
+    applyingMessageHistory = false;
+  }
+}
+
 function appendDraftText(text: string) {
   if (!text) {
     return props.modelValue.length;
@@ -1734,6 +1827,33 @@ function handleSend() {
   emit("send", payload);
 }
 
+function tryNavigateMessageHistory(event: KeyboardEvent): boolean {
+  const textarea = getComposerTextarea();
+  if (!textarea || !shouldNavigateChatInputHistory(event, {
+    value: textarea.value,
+    selectionStart: textarea.selectionStart,
+    selectionEnd: textarea.selectionEnd,
+    isNavigating: messageHistoryNavigation.index != null,
+  })) {
+    return false;
+  }
+
+  const direction = event.key === "ArrowUp" ? "previous" : "next";
+  const step = navigateChatInputHistory(
+    userMessageHistory.value,
+    messageHistoryNavigation,
+    direction,
+    captureComposerHistorySnapshot(),
+  );
+  if (!step) return false;
+
+  event.preventDefault();
+  event.stopPropagation();
+  messageHistoryNavigation = step.state;
+  startApplyingComposerHistorySnapshot(step.value);
+  return true;
+}
+
 function handleKeydown(event: KeyboardEvent) {
   if (showMentionPopup.value) {
     const items = mentionDisplayList.value;
@@ -1828,6 +1948,10 @@ function handleKeydown(event: KeyboardEvent) {
       executeCommandFromPopup(commands[commandHighlightIndex.value]);
       return;
     }
+  }
+
+  if (tryNavigateMessageHistory(event)) {
+    return;
   }
 
   if (shouldSubmitOnEnter(event, chatInputSettings.submitMode)) {
@@ -1999,18 +2123,25 @@ function closeImagePreview() {
 }
 
 function handleDocumentKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape" && previewImageIndex.value != null) {
+  if (event.key !== "Escape") return;
+
+  const handled = previewImageIndex.value != null
+    || showAssetRefDetails.value
+    || showConsoleTextDetails.value
+    || showLocalFileDetails.value;
+  if (previewImageIndex.value != null) {
     closeImagePreview();
   }
-  if (event.key === "Escape" && showAssetRefDetails.value) {
+  if (showAssetRefDetails.value) {
     closeAssetRefDetails();
   }
-  if (event.key === "Escape" && showConsoleTextDetails.value) {
+  if (showConsoleTextDetails.value) {
     closeConsoleTextDetails();
   }
-  if (event.key === "Escape" && showLocalFileDetails.value) {
+  if (showLocalFileDetails.value) {
     closeLocalFileDetails();
   }
+  if (handled) event.preventDefault();
 }
 
 function handleDocumentMouseDown(event: MouseEvent) {
@@ -2059,6 +2190,31 @@ function removeSkillBadge(skill: SkillIntentItem) {
 watch(() => props.modelValue, () => {
   nextTick(syncOperatorState);
 });
+
+watch(
+  [
+    pastedContent,
+    imageAttachments,
+    assetRefAttachments,
+    consoleTextAttachments,
+    localFileAttachments,
+    composerIntent,
+  ],
+  () => {
+    if (!applyingMessageHistory) {
+      resetMessageHistoryNavigation();
+    }
+  },
+  { deep: true, flush: "sync" },
+);
+
+watch(
+  () => props.messageHistory
+    .filter((message) => message.role === "user")
+    .map((message) => message.id)
+    .join("\u0000"),
+  resetMessageHistoryNavigation,
+);
 
 watch(
   () => [showCommandPopup.value, commandHighlightIndex.value, filteredCommands.value.length],

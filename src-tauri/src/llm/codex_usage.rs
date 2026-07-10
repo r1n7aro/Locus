@@ -39,6 +39,7 @@ pub struct CodexRateLimitsResponse {
     pub fetched_at_ms: i64,
     pub rate_limits: CodexRateLimitSnapshot,
     pub rate_limits_by_limit_id: HashMap<String, CodexRateLimitSnapshot>,
+    pub rate_limit_reset_credits: Option<CodexRateLimitResetCreditsSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -70,6 +71,12 @@ pub struct CodexCreditsSnapshot {
     pub balance: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRateLimitResetCreditsSummary {
+    pub available_count: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct CodexUsagePayload {
@@ -83,6 +90,8 @@ struct CodexUsagePayload {
     additional_rate_limits: Option<Vec<CodexAdditionalRateLimit>>,
     #[serde(default)]
     rate_limit_reached_type: Option<CodexRateLimitReachedPayload>,
+    #[serde(default)]
+    rate_limit_reset_credits: Option<CodexUsageRateLimitResetCreditsSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +136,11 @@ struct CodexAdditionalRateLimit {
 struct CodexRateLimitReachedPayload {
     #[serde(rename = "type")]
     kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageRateLimitResetCreditsSummary {
+    available_count: i64,
 }
 
 pub async fn fetch_codex_rate_limits(
@@ -230,11 +244,18 @@ fn rate_limits_from_payload(payload: CodexUsagePayload) -> CodexRateLimitsRespon
         .get("codex")
         .cloned()
         .unwrap_or_else(|| snapshots[0].clone());
+    let rate_limit_reset_credits =
+        payload
+            .rate_limit_reset_credits
+            .map(|summary| CodexRateLimitResetCreditsSummary {
+                available_count: summary.available_count.max(0),
+            });
 
     CodexRateLimitsResponse {
         fetched_at_ms: chrono::Utc::now().timestamp_millis(),
         rate_limits,
         rate_limits_by_limit_id,
+        rate_limit_reset_credits,
     }
 }
 
@@ -367,6 +388,9 @@ mod tests {
             "rate_limit_reached_type": {
                 "type": "workspace_member_usage_limit_reached"
             },
+            "rate_limit_reset_credits": {
+                "available_count": 4
+            },
             "additional_rate_limits": [
                 {
                     "limit_name": "codex_other",
@@ -396,5 +420,12 @@ mod tests {
             Some("workspace_member_usage_limit_reached")
         );
         assert!(response.rate_limits_by_limit_id.contains_key("codex_other"));
+        assert_eq!(
+            response
+                .rate_limit_reset_credits
+                .as_ref()
+                .map(|summary| summary.available_count),
+            Some(4)
+        );
     }
 }

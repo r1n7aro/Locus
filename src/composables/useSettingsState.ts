@@ -110,6 +110,7 @@ export interface CodexQuotaState {
   fetchedAtMs: number | null;
   windows: CodexQuotaWindowState[];
   credits: CodexQuotaCreditsState | null;
+  resetCreditsAvailable: number | null;
   planType: string | null;
 }
 
@@ -148,6 +149,7 @@ export function useSettingsState(emit: SettingsEmit) {
       fetchedAtMs: null,
       windows: [],
       credits: null,
+      resetCreditsAvailable: null,
       planType: null,
     };
   }
@@ -244,6 +246,10 @@ export function useSettingsState(emit: SettingsEmit) {
           balance: response.rateLimits.credits.balance ?? null,
         }
       : null;
+    const resetCreditsAvailable = typeof response.rateLimitResetCredits?.availableCount === "number"
+      && Number.isFinite(response.rateLimitResetCredits.availableCount)
+      ? Math.max(0, Math.trunc(response.rateLimitResetCredits.availableCount))
+      : null;
 
     return {
       loading: false,
@@ -252,6 +258,7 @@ export function useSettingsState(emit: SettingsEmit) {
       fetchedAtMs: response.fetchedAtMs,
       windows,
       credits,
+      resetCreditsAvailable,
       planType: response.rateLimits.planType ?? null,
     };
   }

@@ -738,6 +738,7 @@ onUnmounted(() => {
         :model-value="inputValue"
         :selected-agent-id="selectedAgentId"
         :skills="skills"
+        :message-history="messages"
         :placeholder="placeholder"
         :disabled="disabled"
         :is-streaming="isStreaming"

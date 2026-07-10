@@ -47,6 +47,7 @@ fn matches_versioned_model(model: &str, base: &str) -> bool {
 }
 
 const OPENAI_CODEX_CONTEXT_LIMIT: u32 = 258_400;
+const OPENAI_CODEX_5_6_CONTEXT_LIMIT: u32 = 353_400;
 
 pub(super) fn model_context_limit(model: &str) -> u32 {
     let raw = model.trim().to_ascii_lowercase();
@@ -61,7 +62,9 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
     // for ChatGPT subscription models, not the larger public API model-page
     // limits. Codex-family variants (-spark, -mini, dated snapshots) share the
     // runtime budget, so match them by family rather than exact version.
-    if matches_versioned_model(&m, "gpt-5.5")
+    if m == "gpt-5.6" || m.starts_with("gpt-5.6-") {
+        OPENAI_CODEX_5_6_CONTEXT_LIMIT
+    } else if matches_versioned_model(&m, "gpt-5.5")
         || matches_versioned_model(&m, "gpt-5.5-pro")
         || matches_versioned_model(&m, "gpt-5.4")
         || matches_versioned_model(&m, "gpt-5.4-pro")
@@ -113,7 +116,7 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 mod tests {
     use super::{
         is_prompt_too_long_error, is_retryable_llm_error, model_context_limit,
-        resolve_openrouter_model, OPENAI_CODEX_CONTEXT_LIMIT,
+        resolve_openrouter_model, OPENAI_CODEX_5_6_CONTEXT_LIMIT, OPENAI_CODEX_CONTEXT_LIMIT,
     };
 
     #[test]
@@ -158,6 +161,18 @@ mod tests {
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
+        assert_eq!(
+            model_context_limit("openai/gpt-5.6-sol"),
+            OPENAI_CODEX_5_6_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("openai/gpt-5.6-terra"),
+            OPENAI_CODEX_5_6_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("openai/gpt-5.6-luna"),
+            OPENAI_CODEX_5_6_CONTEXT_LIMIT
+        );
         assert_eq!(
             model_context_limit("openai/gpt-5.5"),
             OPENAI_CODEX_CONTEXT_LIMIT

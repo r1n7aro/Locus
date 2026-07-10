@@ -579,7 +579,10 @@ function quotaCreditsLabel() {
       >
         <div class="codex-quota-copy">
           <span class="key-hint codex-quota-label">{{ t("settings.codex.quotaLabel") }}</span>
-          <div v-if="codexQuota.windows.length > 0" class="codex-quota-list">
+          <div
+            v-if="codexQuota.windows.length > 0 || codexQuota.resetCreditsAvailable !== null"
+            class="codex-quota-list"
+          >
             <div
               v-for="window in codexQuota.windows"
               :key="window.id"
@@ -594,6 +597,15 @@ function quotaCreditsLabel() {
               </span>
               <span v-if="formatQuotaReset(window.resetsAt)" class="codex-quota-reset">
                 {{ formatQuotaReset(window.resetsAt) }}
+              </span>
+            </div>
+            <div
+              v-if="codexQuota.resetCreditsAvailable !== null"
+              class="codex-reset-credits-row"
+            >
+              <span>{{ t("settings.codex.resetCredits") }}</span>
+              <span class="codex-reset-credits-value">
+                {{ t("settings.codex.resetCreditsAvailable", codexQuota.resetCreditsAvailable) }}
               </span>
             </div>
             <span v-if="quotaCreditsLabel()" class="oauth-hint">{{ quotaCreditsLabel() }}</span>
@@ -1027,6 +1039,22 @@ function quotaCreditsLabel() {
   inset: 0 auto 0 0;
   border-radius: inherit;
   background: var(--accent-color);
+}
+
+.codex-reset-credits-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.codex-reset-credits-value {
+  color: var(--text-color);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .codex-validation-label {

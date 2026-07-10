@@ -1252,6 +1252,7 @@ function toggleViewHelp() {
 
 function onViewHelpKeydown(event: KeyboardEvent) {
   if (event.key === "Escape") {
+    event.preventDefault();
     closeViewHelp();
   }
 }

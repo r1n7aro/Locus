@@ -37,6 +37,14 @@ export function saveLastEffort(effort: string): Promise<void> {
   return ipcInvoke("save_last_effort", { effort });
 }
 
+export function getCodexFastMode(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_codex_fast_mode");
+}
+
+export function saveCodexFastMode(enabled: boolean): Promise<void> {
+  return ipcInvoke("save_codex_fast_mode", { enabled });
+}
+
 export function getCustomEndpoints(): Promise<CustomEndpoint[]> {
   return ipcInvoke<CustomEndpoint[]>("get_custom_endpoints");
 }

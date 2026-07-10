@@ -111,13 +111,43 @@ const builtinModels: ModelOption[] = [
 
 const codexFallbackModels: ModelOption[] = [
   {
+    id: "openai/gpt-5.6-sol",
+    name: "GPT-5.6 Sol",
+    provider: "openai_codex",
+    contextWindow: 353_400,
+    defaultEffort: "low",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: true,
+  },
+  {
+    id: "openai/gpt-5.6-terra",
+    name: "GPT-5.6 Terra",
+    provider: "openai_codex",
+    contextWindow: 353_400,
+    defaultEffort: "medium",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: false,
+  },
+  {
+    id: "openai/gpt-5.6-luna",
+    name: "GPT-5.6 Luna",
+    provider: "openai_codex",
+    contextWindow: 353_400,
+    defaultEffort: "medium",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: false,
+  },
+  {
     id: "openai/gpt-5.5",
     name: "GPT-5.5",
     provider: "openai_codex",
     defaultEffort: "medium",
     supportedEfforts: ["low", "medium", "high", "xhigh"],
     additionalSpeedTiers: ["fast"],
-    isDefault: true,
+    isDefault: false,
   },
   {
     id: "openai/gpt-5.4",
@@ -166,6 +196,7 @@ function supportsOpenAiReasoningModel(model: string): boolean {
 
 function openAiReasoningLevels(model: string): EffortLevel[] {
   const m = normalizeOpenAiReasoningModel(model);
+  if (m.includes("gpt-5.6")) return ["low", "medium", "high", "xhigh", "max"];
   if (m.includes("gpt-5.5-pro") || m.includes("gpt-5.4-pro") || m.includes("gpt-5.2-pro")) return ["medium", "high"];
   if (m.includes("gpt-5-pro")) return ["high"];
   if (m.includes("gpt-5.1-codex-mini")) return ["medium", "high"];
@@ -234,6 +265,7 @@ export const useModelStore = defineStore("model", () => {
   const customEndpoints = ref<CustomEndpoint[]>([]);
   const codexRemoteModels = ref<ModelOption[]>([]);
   const codexTransport = ref<CodexTransportMode>("websocket");
+  const codexFastMode = ref(false);
   const selectedModelId = ref("");
   const lastModelId = ref("");
   const effort = ref<EffortLevel>("high");
@@ -279,6 +311,20 @@ export const useModelStore = defineStore("model", () => {
 
   const selectedModelOption = computed<ModelOption | null>(() =>
     allModels.value.find((model) => model.id === selectedModelId.value) ?? null
+  );
+
+  function modelSupportsCodexFastMode(modelId: string): boolean {
+    const model = allModels.value.find((candidate) => candidate.id === modelId);
+    return model?.provider === "openai_codex"
+      && model.additionalSpeedTiers?.some((tier) => tier.toLowerCase() === "fast") === true;
+  }
+
+  const codexFastModeAvailable = computed(() =>
+    modelSupportsCodexFastMode(selectedModelId.value)
+  );
+
+  const effectiveCodexFastMode = computed(() =>
+    codexFastMode.value && codexFastModeAvailable.value
   );
 
   const selectedOpenAiReasoningModel = computed<string | null>(() => {
@@ -380,6 +426,14 @@ export const useModelStore = defineStore("model", () => {
     effortPersistenceReady = true;
   }
 
+  async function loadCodexFastMode() {
+    try {
+      codexFastMode.value = await modelService.getCodexFastMode();
+    } catch {
+      codexFastMode.value = false;
+    }
+  }
+
   async function loadCustomEndpoints() {
     try {
       customEndpoints.value = await modelService.getCustomEndpoints();
@@ -439,6 +493,16 @@ export const useModelStore = defineStore("model", () => {
     effort.value = clampEffortForSelectedModel(level);
   }
 
+  function selectCodexFastMode(enabled: boolean) {
+    codexFastMode.value = enabled;
+    modelService.saveCodexFastMode(enabled)
+      .catch((e: unknown) => console.warn("[model] save_codex_fast_mode:", e));
+  }
+
+  function codexFastModeForModel(modelId: string): boolean {
+    return codexFastMode.value && modelSupportsCodexFastMode(modelId);
+  }
+
   function applyContextEffort(level: EffortLevel | null | undefined) {
     const normalized = typeof level === "string" && isEffortLevel(level) ? level : "none";
     effort.value = clampEffortForSelectedModel(normalized);
@@ -464,6 +528,7 @@ export const useModelStore = defineStore("model", () => {
     customEndpoints,
     codexRemoteModels,
     codexTransport,
+    codexFastMode,
     selectedModelId,
     lastModelId,
     effort,
@@ -475,17 +540,22 @@ export const useModelStore = defineStore("model", () => {
     codexModels,
     selectedCustomEndpoint,
     selectedOpenAiReasoningModel,
+    codexFastModeAvailable,
+    effectiveCodexFastMode,
     availableEfforts,
     effortSupported,
     loadModelDefaults,
     loadLastModel,
     loadLastEffort,
+    loadCodexFastMode,
     loadCustomEndpoints,
     loadCodexModelConfig,
     loadCodexAvailableModels,
     resolveSelectedModel,
     selectModel,
     selectEffort,
+    selectCodexFastMode,
+    codexFastModeForModel,
     applyContextEffort,
     restoreDefaultEffort,
     applyModelDefaults,

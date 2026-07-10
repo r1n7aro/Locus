@@ -1306,6 +1306,8 @@ pub fn run() {
             commands::save_last_model,
             commands::get_last_effort,
             commands::save_last_effort,
+            commands::get_codex_fast_mode,
+            commands::save_codex_fast_mode,
             commands::get_model_defaults,
             commands::save_model_defaults,
             commands::get_codex_model_config,

@@ -939,6 +939,8 @@
 
   "model.select": "Select model",
   "model.noProvider": "No provider configured",
+  "model.fast": "Fast",
+  "model.fastHint": "Faster responses with increased subscription usage",
   "model.provider.anthropic": "Claude Subscription",
   "model.provider.claude_code": "Claude Code CLI",
   "model.provider.openai": "ChatGPT Subscription",
@@ -1147,7 +1149,7 @@
   "settings.claudeCode.testHint": "Send a one-word probe through the CLI to verify the endpoint, credentials, and proxy a real run would use.",
 
   "settings.codex.title": "ChatGPT Subscription (Device Auth)",
-  "settings.codex.desc": "Invoke GPT-5.5 with a ChatGPT Pro / Plus subscription",
+  "settings.codex.desc": "Invoke GPT-5.6 models with a ChatGPT Pro / Plus subscription",
   "settings.codex.loggedIn": "Logged in",
   "settings.codex.notLoggedIn": "Not logged in",
   "settings.codex.authenticated": "Authenticated",
@@ -1187,6 +1189,8 @@
   "settings.codex.quotaWindowWeeks": "{0} wk",
   "settings.codex.quotaCreditsUnlimited": "Unlimited credits",
   "settings.codex.quotaCredits": "{0} credits",
+  "settings.codex.resetCredits": "Usage limit resets",
+  "settings.codex.resetCreditsAvailable": "{0} available",
   "settings.codex.transportLabel": "Transport",
   "settings.codex.transportDesc": "HTTP uses the current ChatGPT Codex path. WebSocket uses the OpenAI Responses websocket path.",
   "settings.codex.transportHttp": "HTTP",
@@ -3408,7 +3412,7 @@
   "onboarding.auth.notConfigured": "Not configured",
   "onboarding.auth.skipHint": "You can configure this later in Settings",
   "onboarding.auth.customEndpointDesc": "Connect a compatible API or local model service",
-  "onboarding.auth.codexDesc": "ChatGPT Pro/Plus subscription, gpt-5.5",
+  "onboarding.auth.codexDesc": "ChatGPT Pro/Plus subscription, GPT-5.6 models",
 
   "onboarding.project.title": "Select Unity Project",
   "onboarding.project.desc": "Browse to your Unity project root directory (the folder containing Assets/)",

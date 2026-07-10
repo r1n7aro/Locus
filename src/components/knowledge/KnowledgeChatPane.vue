@@ -81,6 +81,7 @@ const {
   selectedAgentId: knowledgeAgentId,
   effort: computed(() => modelStore.effort),
   effortSupported: computed(() => modelStore.effortSupported),
+  fastMode: computed(() => modelStore.effectiveCodexFastMode),
   // The current document is injected into the agent env by the backend
   // (knowledge focus), so user messages carry only what the user typed.
   knowledgeFocus: computed(() => ({
@@ -164,9 +165,12 @@ function handleSelectAgent(agentId: string) {
         :effort="modelStore.effort"
         :efforts="modelStore.availableEfforts"
         :effort-supported="modelStore.effortSupported"
+        :fast-mode-enabled="modelStore.effectiveCodexFastMode"
+        :fast-mode-available="modelStore.codexFastModeAvailable"
         :disabled="isStreaming"
         @select-model="modelStore.selectModel"
         @select-effort="modelStore.selectEffort"
+        @select-fast-mode="modelStore.selectCodexFastMode"
       />
     </template>
   </EmbeddedChatPane>

@@ -363,6 +363,36 @@ describe("custom endpoint persistence", () => {
     ]);
   });
 
+  it("loads the available Codex usage reset count", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    state.codexStatus.value = {
+      authenticated: true,
+      accountId: "account-1",
+      validationFailed: false,
+      validationError: null,
+    };
+    modelServiceMocks.codexRateLimits.mockResolvedValueOnce({
+      fetchedAtMs: 1_735_689_600_000,
+      rateLimits: {
+        limitId: "codex",
+        primary: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          windowMinutes: 300,
+          resetsAt: 1_735_707_600,
+        },
+      },
+      rateLimitsByLimitId: {},
+      rateLimitResetCredits: {
+        availableCount: 4,
+      },
+    });
+
+    await state.loadCodexRateLimits();
+
+    expect(state.codexQuota.value.resetCreditsAvailable).toBe(4);
+  });
+
   it("serializes delete mutations against the latest reloaded list", async () => {
     const state = useSettingsState((() => undefined) as never);
     const first = endpoint({ id: "first", name: "First" });

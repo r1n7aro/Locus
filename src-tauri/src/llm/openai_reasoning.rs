@@ -80,6 +80,7 @@ pub fn reasoning_effort_for_model(
         "medium" if supported.medium => Some("medium"),
         "high" if supported.high => Some("high"),
         "xhigh" if supported.xhigh => Some("xhigh"),
+        "max" if supported.max => Some("max"),
         _ => None,
     }
 }
@@ -97,6 +98,7 @@ struct SupportedEfforts {
     medium: bool,
     high: bool,
     xhigh: bool,
+    max: bool,
 }
 
 const LOW_MEDIUM_HIGH_XHIGH: SupportedEfforts = SupportedEfforts {
@@ -105,6 +107,16 @@ const LOW_MEDIUM_HIGH_XHIGH: SupportedEfforts = SupportedEfforts {
     medium: true,
     high: true,
     xhigh: true,
+    max: false,
+};
+
+const LOW_MEDIUM_HIGH_XHIGH_MAX: SupportedEfforts = SupportedEfforts {
+    none: false,
+    low: true,
+    medium: true,
+    high: true,
+    xhigh: true,
+    max: true,
 };
 
 const MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
@@ -113,6 +125,7 @@ const MEDIUM_HIGH: SupportedEfforts = SupportedEfforts {
     medium: true,
     high: true,
     xhigh: false,
+    max: false,
 };
 
 const HIGH_ONLY: SupportedEfforts = SupportedEfforts {
@@ -121,6 +134,7 @@ const HIGH_ONLY: SupportedEfforts = SupportedEfforts {
     medium: false,
     high: true,
     xhigh: false,
+    max: false,
 };
 
 const UNSUPPORTED: SupportedEfforts = SupportedEfforts {
@@ -129,11 +143,15 @@ const UNSUPPORTED: SupportedEfforts = SupportedEfforts {
     medium: false,
     high: false,
     xhigh: false,
+    max: false,
 };
 
 fn supported_efforts(model: &str) -> SupportedEfforts {
     let model = model.trim().to_ascii_lowercase();
 
+    if model.contains("gpt-5.6") {
+        return LOW_MEDIUM_HIGH_XHIGH_MAX;
+    }
     if model.contains("gpt-5.5-pro")
         || model.contains("gpt-5.4-pro")
         || model.contains("gpt-5.2-pro")
@@ -177,6 +195,22 @@ mod tests {
             Some("xhigh")
         );
         assert_eq!(reasoning_effort_for_model("gpt-5.5", Some("none")), None);
+    }
+
+    #[test]
+    fn gpt56_accepts_max_and_hides_none() {
+        assert_eq!(
+            reasoning_effort_for_model("gpt-5.6-sol", Some("max")),
+            Some("max")
+        );
+        assert_eq!(
+            reasoning_effort_for_model("gpt-5.6-terra", Some("xhigh")),
+            Some("xhigh")
+        );
+        assert_eq!(
+            reasoning_effort_for_model("gpt-5.6-luna", Some("none")),
+            None
+        );
     }
 
     #[test]

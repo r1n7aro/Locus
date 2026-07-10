@@ -49,10 +49,15 @@ export interface CodexRateLimitSnapshot {
   rateLimitReachedType?: string | null;
 }
 
+export interface CodexRateLimitResetCreditsSummary {
+  availableCount: number;
+}
+
 export interface CodexRateLimitsResponse {
   fetchedAtMs: number;
   rateLimits: CodexRateLimitSnapshot;
   rateLimitsByLimitId: Record<string, CodexRateLimitSnapshot>;
+  rateLimitResetCredits?: CodexRateLimitResetCreditsSummary | null;
 }
 
 export interface AnthropicRateLimitWindow {
