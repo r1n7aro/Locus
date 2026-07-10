@@ -14,6 +14,7 @@ import type {
   AnthropicQuotaState,
   AnthropicQuotaWindowState,
   CodexQuotaState,
+  CodexQuotaResetCreditState,
   CodexQuotaWindowState,
   CodexStatusState,
   ProviderStatus,
@@ -40,6 +41,7 @@ const props = defineProps<{
   codexStep: "idle" | "opening" | "waiting" | "success";
   codexStatus: CodexStatusState;
   codexQuota: CodexQuotaState;
+  codexResetCreditBusyId: string | null;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
@@ -75,6 +77,7 @@ const emit = defineEmits<{
   codexLogout: [];
   retryCodexValidation: [];
   refreshCodexQuota: [];
+  consumeCodexResetCredit: [creditId: string | null];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
@@ -277,6 +280,32 @@ function quotaCreditsLabel() {
   if (credits.unlimited) return t("settings.codex.quotaCreditsUnlimited");
   if (credits.balance) return t("settings.codex.quotaCredits", credits.balance);
   return "";
+}
+
+function formatResetCreditTitle(credit: CodexQuotaResetCreditState): string {
+  return credit.title || t("settings.codex.resetCreditFallbackTitle");
+}
+
+function formatResetCreditExpiry(credit: CodexQuotaResetCreditState): string {
+  if (credit.expiresAt === null) {
+    return credit.id
+      ? t("settings.codex.resetCreditNoExpiry")
+      : t("settings.codex.resetCreditExpiryUnavailable");
+  }
+  const date = new Date(credit.expiresAt * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return t("settings.codex.resetCreditExpiryUnavailable");
+  }
+  const dateLabel = date.toLocaleDateString(locale.value === "zh" ? "zh-CN" : "en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return t("settings.codex.resetCreditExpires", dateLabel);
+}
+
+function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
+  return credit.id ?? "__next_available__";
 }
 </script>
 
@@ -601,12 +630,37 @@ function quotaCreditsLabel() {
             </div>
             <div
               v-if="codexQuota.resetCreditsAvailable !== null"
-              class="codex-reset-credits-row"
+              class="codex-reset-credits"
             >
-              <span>{{ t("settings.codex.resetCredits") }}</span>
-              <span class="codex-reset-credits-value">
-                {{ t("settings.codex.resetCreditsAvailable", codexQuota.resetCreditsAvailable) }}
-              </span>
+              <div class="codex-reset-credits-header">
+                <span>{{ t("settings.codex.resetCredits") }}</span>
+                <span class="codex-reset-credits-value">
+                  {{ t("settings.codex.resetCreditsAvailable", codexQuota.resetCreditsAvailable) }}
+                </span>
+              </div>
+              <div
+                v-for="credit in codexQuota.resetCredits"
+                :key="credit.id ?? 'next-available'"
+                class="codex-reset-credit-item"
+              >
+                <div class="codex-reset-credit-copy" :title="credit.description ?? undefined">
+                  <span class="codex-reset-credit-title">{{ formatResetCreditTitle(credit) }}</span>
+                  <span class="codex-reset-credit-expiry">{{ formatResetCreditExpiry(credit) }}</span>
+                </div>
+                <BaseButton
+                  variant="neutral"
+                  size="sm"
+                  type="button"
+                  :disabled="codexResetCreditBusyId !== null || codexQuota.loading"
+                  @click="emit('consumeCodexResetCredit', credit.id)"
+                >
+                  {{
+                    codexResetCreditBusyId === resetCreditBusyKey(credit)
+                      ? t("settings.codex.resetCreditConsuming")
+                      : t("settings.codex.resetCreditConsume")
+                  }}
+                </BaseButton>
+              </div>
             </div>
             <span v-if="quotaCreditsLabel()" class="oauth-hint">{{ quotaCreditsLabel() }}</span>
             <span v-if="codexQuota.error" class="oauth-hint codex-validation-error">
@@ -624,7 +678,7 @@ function quotaCreditsLabel() {
             variant="neutral"
             size="sm"
             type="button"
-            :disabled="codexQuota.loading"
+            :disabled="codexQuota.loading || codexResetCreditBusyId !== null"
             @click="emit('refreshCodexQuota')"
           >
             {{ codexQuota.loading ? t("settings.codex.quotaRefreshing") : t("settings.codex.refreshQuota") }}
@@ -978,6 +1032,10 @@ function quotaCreditsLabel() {
   min-width: 0;
 }
 
+.codex-quota-copy {
+  flex: 1 1 auto;
+}
+
 .codex-transport-detail {
   align-items: center;
 }
@@ -998,7 +1056,8 @@ function quotaCreditsLabel() {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  width: min(420px, 100%);
+  width: 100%;
+  max-width: 720px;
 }
 
 .codex-quota-row {
@@ -1041,12 +1100,18 @@ function quotaCreditsLabel() {
   background: var(--accent-color);
 }
 
-.codex-reset-credits-row {
+.codex-reset-credits {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.codex-reset-credits-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding-top: 2px;
   font-size: 12px;
   color: var(--text-secondary);
 }
@@ -1055,6 +1120,37 @@ function quotaCreditsLabel() {
   color: var(--text-color);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.codex-reset-credit-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-color);
+}
+
+.codex-reset-credit-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.codex-reset-credit-title {
+  overflow: hidden;
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-reset-credit-expiry {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .codex-validation-label {

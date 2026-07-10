@@ -13,6 +13,7 @@ const modelServiceMocks = vi.hoisted(() => ({
   importClaudeCodeOAuth: vi.fn(),
   codexStatus: vi.fn(),
   codexRateLimits: vi.fn(),
+  codexConsumeRateLimitResetCredit: vi.fn(),
   codexStartLogin: vi.fn(),
   codexPollLogin: vi.fn(),
   codexLogout: vi.fn(),
@@ -29,10 +30,15 @@ const modelServiceMocks = vi.hoisted(() => ({
   setWarmup: vi.fn(),
   getWarmup: vi.fn(),
   clearWarmup: vi.fn(),
+  confirm: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  confirm: modelServiceMocks.confirm,
 }));
 
 vi.mock("../services/auth", () => ({
@@ -45,6 +51,7 @@ vi.mock("../services/auth", () => ({
   importClaudeCodeOAuth: modelServiceMocks.importClaudeCodeOAuth,
   codexStatus: modelServiceMocks.codexStatus,
   codexRateLimits: modelServiceMocks.codexRateLimits,
+  codexConsumeRateLimitResetCredit: modelServiceMocks.codexConsumeRateLimitResetCredit,
   codexStartLogin: modelServiceMocks.codexStartLogin,
   codexPollLogin: modelServiceMocks.codexPollLogin,
   codexLogout: modelServiceMocks.codexLogout,
@@ -121,6 +128,7 @@ describe("custom endpoint persistence", () => {
     modelServiceMocks.saveCustomEndpoints.mockResolvedValue(undefined);
     modelServiceMocks.getFileToolWorkspaceBoundary.mockResolvedValue(false);
     modelServiceMocks.setFileToolWorkspaceBoundary.mockResolvedValue(undefined);
+    modelServiceMocks.confirm.mockResolvedValue(true);
   });
 
   it("reloads saved endpoints and refreshes the warmup cache", async () => {
@@ -363,7 +371,7 @@ describe("custom endpoint persistence", () => {
     ]);
   });
 
-  it("loads the available Codex usage reset count", async () => {
+  it("loads and sorts detailed Codex usage reset credits", async () => {
     const state = useSettingsState((() => undefined) as never);
     state.codexStatus.value = {
       authenticated: true,
@@ -385,12 +393,72 @@ describe("custom endpoint persistence", () => {
       rateLimitsByLimitId: {},
       rateLimitResetCredits: {
         availableCount: 4,
+        credits: [
+          {
+            id: "credit-later",
+            resetType: "codex_rate_limits",
+            status: "available",
+            grantedAt: 1_752_796_800,
+            expiresAt: 1_784_851_200,
+            title: "Full reset (Weekly + 5 hr)",
+          },
+          {
+            id: "credit-used",
+            resetType: "codex_rate_limits",
+            status: "redeemed",
+            grantedAt: 1_752_796_800,
+            expiresAt: 1_784_246_400,
+          },
+          {
+            id: "credit-sooner",
+            resetType: "codex_rate_limits",
+            status: "available",
+            grantedAt: 1_752_796_800,
+            expiresAt: 1_784_246_400,
+            title: "Full reset (Weekly + 5 hr)",
+          },
+        ],
       },
     });
 
     await state.loadCodexRateLimits();
 
     expect(state.codexQuota.value.resetCreditsAvailable).toBe(4);
+    expect(state.codexQuota.value.resetCredits.map((credit) => credit.id)).toEqual([
+      "credit-sooner",
+      "credit-later",
+    ]);
+  });
+
+  it("consumes a selected Codex reset credit and refreshes quota", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    state.codexStatus.value = {
+      authenticated: true,
+      accountId: "account-1",
+      validationFailed: false,
+      validationError: null,
+    };
+    modelServiceMocks.codexConsumeRateLimitResetCredit.mockResolvedValueOnce({
+      outcome: "reset",
+      windowsReset: 2,
+    });
+    modelServiceMocks.codexRateLimits.mockResolvedValueOnce({
+      fetchedAtMs: 1_735_689_600_000,
+      rateLimits: { limitId: "codex" },
+      rateLimitsByLimitId: {},
+      rateLimitResetCredits: {
+        availableCount: 3,
+        credits: [],
+      },
+    });
+
+    await state.consumeCodexResetCredit("credit-sooner");
+
+    expect(modelServiceMocks.confirm).toHaveBeenCalledOnce();
+    expect(modelServiceMocks.codexConsumeRateLimitResetCredit).toHaveBeenCalledWith("credit-sooner");
+    expect(modelServiceMocks.codexRateLimits).toHaveBeenCalledOnce();
+    expect(state.codexQuota.value.resetCreditsAvailable).toBe(3);
+    expect(state.codexResetCreditBusyId.value).toBeNull();
   });
 
   it("serializes delete mutations against the latest reloaded list", async () => {

@@ -8,7 +8,7 @@ use crate::auth::codex::{CodexAuthState, CodexLoginInfo, CodexPollResult, CodexS
 use crate::auth::{AuthState, AuthStatus, AuthUrlInfo, ClaudeCodeTokenImportResult};
 use crate::keychain;
 use crate::llm::anthropic_usage::AnthropicRateLimitsResponse;
-use crate::llm::codex_usage::CodexRateLimitsResponse;
+use crate::llm::codex_usage::{CodexRateLimitResetConsumeResponse, CodexRateLimitsResponse};
 
 use crate::error::AppError;
 use crate::{ApiKeyState, ProviderKeysState};
@@ -465,6 +465,56 @@ pub async fn codex_rate_limits(
             )
             .await
             .map_err(|err| AppError::from(err.to_string()))
+        }
+        Err(error) => Err(AppError::from(error.to_string())),
+    }
+}
+
+#[tauri::command]
+pub async fn codex_consume_rate_limit_reset_credit(
+    credit_id: Option<String>,
+    codex: State<'_, CodexAuthStateHandle>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<CodexRateLimitResetConsumeResponse, AppError> {
+    let credit_id = credit_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let redeem_request_id = uuid::Uuid::new_v4().to_string();
+    let (access_token, account_id) = {
+        let mut guard = codex.lock().await;
+        let access_token = guard.access_token().await.map_err(AppError::from)?;
+        let account_id = guard.account_id();
+        (access_token, account_id)
+    };
+
+    match crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
+        &access_token,
+        account_id.as_deref(),
+        config.base_url.as_deref(),
+        &redeem_request_id,
+        credit_id.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_unauthorized() => {
+            let (access_token, account_id) = {
+                let mut guard = codex.lock().await;
+                guard.retry_validation().await.map_err(AppError::from)?;
+                let access_token = guard.access_token().await.map_err(AppError::from)?;
+                let account_id = guard.account_id();
+                (access_token, account_id)
+            };
+
+            crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
+                &access_token,
+                account_id.as_deref(),
+                config.base_url.as_deref(),
+                &redeem_request_id,
+                credit_id.as_deref(),
+            )
+            .await
+            .map_err(|error| AppError::from(error.to_string()))
         }
         Err(error) => Err(AppError::from(error.to_string())),
     }

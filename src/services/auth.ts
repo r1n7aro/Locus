@@ -51,6 +51,28 @@ export interface CodexRateLimitSnapshot {
 
 export interface CodexRateLimitResetCreditsSummary {
   availableCount: number;
+  credits?: CodexRateLimitResetCredit[] | null;
+}
+
+export interface CodexRateLimitResetCredit {
+  id: string;
+  resetType: string;
+  status: string;
+  grantedAt: number;
+  expiresAt?: number | null;
+  title?: string | null;
+  description?: string | null;
+}
+
+export type CodexRateLimitResetOutcome =
+  | "reset"
+  | "nothingToReset"
+  | "noCredit"
+  | "alreadyRedeemed";
+
+export interface CodexRateLimitResetConsumeResponse {
+  outcome: CodexRateLimitResetOutcome;
+  windowsReset: number;
 }
 
 export interface CodexRateLimitsResponse {
@@ -158,4 +180,13 @@ export function codexRetryAuth(): Promise<CodexStatus> {
 
 export function codexRateLimits(): Promise<CodexRateLimitsResponse> {
   return ipcInvoke<CodexRateLimitsResponse>("codex_rate_limits");
+}
+
+export function codexConsumeRateLimitResetCredit(
+  creditId: string | null,
+): Promise<CodexRateLimitResetConsumeResponse> {
+  return ipcInvoke<CodexRateLimitResetConsumeResponse>(
+    "codex_consume_rate_limit_reset_credit",
+    { creditId },
+  );
 }

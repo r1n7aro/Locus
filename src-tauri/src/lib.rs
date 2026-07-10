@@ -1323,6 +1323,7 @@ pub fn run() {
             commands::import_codex_cli,
             commands::codex_retry_auth,
             commands::codex_rate_limits,
+            commands::codex_consume_rate_limit_reset_credit,
             commands::diff_single_file,
             commands::diff_semantic_target,
             commands::diff_text_for_large,
