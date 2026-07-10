@@ -4,6 +4,7 @@ import {
   isMatchingPendingUserMessage,
   mergeUserMessage,
   reduceStreamEvent,
+  type StreamMutation,
   type StreamState,
 } from "../composables/useStreamReducer";
 import type { StreamEvent, ToolCallDisplay } from "../types";
