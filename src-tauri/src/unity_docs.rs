@@ -4331,8 +4331,10 @@ fn write_manifest(
 fn zip_url_regex() -> &'static Regex {
     static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"https://storage\.googleapis\.com/[^"' )]+UnityDocumentation\.zip"#)
-            .expect("zip url regex")
+        Regex::new(
+            r#"https://(?:storage\.googleapis\.com|cloudmedia-docs\.unity3d\.com)/[^"' )]+UnityDocumentation\.zip"#,
+        )
+        .expect("zip url regex")
     })
 }
 
@@ -4409,8 +4411,8 @@ mod tests {
     use super::{
         apply_manual_breadcrumb_hierarchy, bounded_reference_convert_parallelism,
         build_reference_document_batch, build_script_reference_path_context, cache_root,
-        classify_html_doc_path, clean_markdown, configure_managed_directory, count_progress_ratio,
-        current_unity_reference_managed_snapshot, derive_unity_docs_version,
+        capture_zip_url, classify_html_doc_path, clean_markdown, configure_managed_directory,
+        count_progress_ratio, current_unity_reference_managed_snapshot, derive_unity_docs_version,
         ensure_managed_store_available, extract_main_html, extract_manual_breadcrumb_labels,
         extract_title, get_unity_reference_import_status, legacy_manifest_path,
         list_managed_directories, list_managed_directory_stats, list_managed_documents,
@@ -5019,6 +5021,24 @@ Suggest a change
             offline_source_candidates("2022.3", UnityReferenceImportLocale::ZhCn),
             vec!["https://docs.unity3d.com/cn/2022.3/Manual/OfflineDocumentation.html".to_string(),]
         );
+    }
+
+    #[test]
+    fn capture_zip_url_supports_current_and_legacy_unity_doc_hosts() {
+        for expected in [
+            "https://cloudmedia-docs.unity3d.com/docscloudstorage/en/6000.3/UnityDocumentation.zip",
+            "https://storage.googleapis.com/docscloudstorage/2022.3/UnityDocumentation.zip",
+            "https://storage.googleapis.com/localized_docs/zh-cn/2022.3/UnityDocumentation.zip",
+        ] {
+            let body = format!(r#"<a href="{expected}">Download</a>"#);
+            assert_eq!(capture_zip_url(&body).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn capture_zip_url_rejects_untrusted_hosts() {
+        let body = r#"<a href="https://example.com/6000.3/UnityDocumentation.zip">Download</a>"#;
+        assert_eq!(capture_zip_url(body), None);
     }
 
     #[tokio::test]
