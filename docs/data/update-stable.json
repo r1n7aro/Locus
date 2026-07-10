@@ -1,12 +1,12 @@
 {
-  "version": "0.5.6",
-  "releasedAt": "2026-07-07",
+  "version": "0.5.7",
+  "releasedAt": "2026-07-10",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,25 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.6 (2026-07-07)",
+      "summary": "Locus v0.5.7 (2026-07-10)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.7（新增）",
+          "items": [
+            "**GPT-5.6 系列与 Fast 模式。** ChatGPT 订阅新增 GPT-5.6 Sol、Terra、Luna，支持 353,400 token 的 Codex 运行时上下文与最高 Max 推理级别；模型选择器新增 Fast 模式，可提高响应速度，同时增加订阅用量。",
+            "**手动重置 Codex 使用限制。** ChatGPT 订阅设置会列出可用的使用限制重置额度与到期日期；确认后可消耗一次额度，手动重置当前符合条件的 Codex 用量周期，并自动刷新配额。",
+            "**聊天输入历史。** 聊天输入框支持通过上下方向键恢复历史用户消息，同时恢复附件与输入意图，并在返回末尾时还原当前草稿。",
+            "**双击快捷键中止响应。** 新增可配置的双击中止响应快捷键，默认使用 Esc；第一次按下会提示，再次按下才会中止当前响应。"
+          ]
+        },
+        {
+          "title": "v0.5.7（修复）",
+          "items": [
+            "Unity 文档导入支持当前的 `cloudmedia-docs.unity3d.com` 下载域名，并兼容旧 Google Storage 地址。",
+            "Esc 会优先关闭当前预览、弹层和 diff 窗口，再处理全局响应中止快捷键。"
+          ]
+        },
         {
           "title": "v0.5.6（新增）",
           "items": [
@@ -159,11 +175,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -173,9 +189,25 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.6 (2026-07-07)",
+      "summary": "Locus v0.5.7 (2026-07-10)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.7 (Added)",
+          "items": [
+            "**GPT-5.6 models and Fast mode.** ChatGPT subscriptions now include GPT-5.6 Sol, Terra, and Luna with a 353,400-token Codex runtime context budget and reasoning levels up to Max. The model picker also offers Fast mode for faster responses with increased subscription usage.",
+            "**Manual Codex usage-limit resets.** ChatGPT subscription settings list available usage-limit reset credits and expiry dates. After confirmation, a credit can be consumed to reset currently eligible Codex usage windows and refresh the displayed quota.",
+            "**Chat input history.** The chat composer recalls previous user messages with Up/Down, restores their attachments and composer intent, and returns to the current draft at the end of the history.",
+            "**Double-press shortcut to stop responses.** A configurable shortcut now stops the active response after a second press, with Esc as the default; the first press shows a confirmation notice."
+          ]
+        },
+        {
+          "title": "v0.5.7 (Fixed)",
+          "items": [
+            "Unity documentation imports now recognize the current `cloudmedia-docs.unity3d.com` download host and legacy Google Storage URLs.",
+            "Escape closes active previews, popovers, and diff overlays before the global response-stop shortcut is evaluated."
+          ]
+        },
         {
           "title": "v0.5.6 (Added)",
           "items": [
@@ -303,11 +335,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

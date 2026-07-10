@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.6 (2026-07-07)"
+description: "Locus v0.5.7 (2026-07-10)"
 sidebarTitle: "Latest Version"
-version: "0.5.6"
-releasedAt: "2026-07-07"
+version: "0.5.7"
+releasedAt: "2026-07-10"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,23 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.5.7 (Added)
+
+- **GPT-5.6 models and Fast mode.** ChatGPT subscriptions now include GPT-5.6 Sol, Terra, and Luna with a 353,400-token Codex runtime context budget and reasoning levels up to Max. The model picker also offers Fast mode for faster responses with increased subscription usage.
+- **Manual Codex usage-limit resets.** ChatGPT subscription settings list available usage-limit reset credits and expiry dates. After confirmation, a credit can be consumed to reset currently eligible Codex usage windows and refresh the displayed quota.
+- **Chat input history.** The chat composer recalls previous user messages with Up/Down, restores their attachments and composer intent, and returns to the current draft at the end of the history.
+- **Double-press shortcut to stop responses.** A configurable shortcut now stops the active response after a second press, with Esc as the default; the first press shows a confirmation notice.
+
+### v0.5.7 (Fixed)
+
+- Unity documentation imports now recognize the current `cloudmedia-docs.unity3d.com` download host and legacy Google Storage URLs.
+- Escape closes active previews, popovers, and diff overlays before the global response-stop shortcut is evaluated.
 
 ### v0.5.6 (Added)
 

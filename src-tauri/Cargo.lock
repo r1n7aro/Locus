@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "locus"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "aes-gcm",
  "aisdk",
