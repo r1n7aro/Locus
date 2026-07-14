@@ -26,6 +26,7 @@ changelogUrl: "/en/overview/latest-version"
 - **Resolved intermittent DeepSeek HTTP 400 failures on Windows.** Upgraded `schannel` from 0.1.28 to 0.1.29, preventing pending request data from being resent during TLS 1.3 renegotiation and corrupting large JSON bodies. This resolves the `400 Bad Request: Failed to parse the request body as JSON` failures tracked in [issue #48](https://github.com/r1n7aro/Locus/issues/48). ([PR #110](https://github.com/r1n7aro/Locus/pull/110))
 - **Plan approval flow.** Approval cards now render Markdown, attach optional feedback to Send back, and preserve approved plans or send-back feedback in the transcript with the correct lifecycle state. Selecting `/plan` in an idle session immediately enters sticky Plan mode.
 - Fast-capable Codex models now show `Fast` in their model labels while Fast mode is enabled.
+- **Exact edit tool contracts.** `edit` and `knowledge_edit` now expose one exact replacement per call. `knowledge_read` can return the stored `summary`, `body`, or `maintenanceRules` section verbatim—including whitespace and empty content—so edits can match the selected section exactly. Existing persisted batch file-edit calls remain executable.
 
 ### v0.5.7 (Added)
 

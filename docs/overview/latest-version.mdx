@@ -26,6 +26,7 @@ changelogUrl: "/overview/latest-version"
 - **已解决 Windows 上 DeepSeek 请求间歇性 HTTP 400。** 将 `schannel` 从 0.1.28 升级到 0.1.29，避免 TLS 1.3 重新协商期间重复发送待处理请求数据并破坏较大的 JSON 请求体，解决 [issue #48](https://github.com/r1n7aro/Locus/issues/48) 集中记录的 `400 Bad Request: Failed to parse the request body as JSON` 问题。([PR #110](https://github.com/r1n7aro/Locus/pull/110))
 - **计划审批流程。** 审批卡现在以 Markdown 展示计划，退回说明会随“退回修改”一并发送，批准后的计划与退回反馈会以正确状态保留在会话记录中。空闲会话选择 `/plan` 后会立即进入持续性规划模式。
 - 启用 Fast 模式时，支持 Fast 的 Codex 模型会在模型标签中显示 `Fast` 状态。
+- **精确编辑工具契约。** `edit` 与 `knowledge_edit` 的公开工具定义现按每次一处精确替换执行。`knowledge_read` 可原样返回 `summary`、`body` 或 `maintenanceRules` 分区，保留空白与空内容，供后续编辑逐字匹配目标分区；已有的历史批量文件编辑调用继续兼容。
 
 ### v0.5.7（新增）
 
