@@ -12,6 +12,7 @@ import type {
   CodexTransportMode,
 } from "../types";
 import { filterVisibleModels } from "../config/providerVisibility";
+import { modelSupportsFastMode } from "../utils/modelDisplay";
 
 const CLAUDE_CONTEXT_1M = 1_000_000;
 const CLAUDE_STANDARD_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "max"];
@@ -315,8 +316,7 @@ export const useModelStore = defineStore("model", () => {
 
   function modelSupportsCodexFastMode(modelId: string): boolean {
     const model = allModels.value.find((candidate) => candidate.id === modelId);
-    return model?.provider === "openai_codex"
-      && model.additionalSpeedTiers?.some((tier) => tier.toLowerCase() === "fast") === true;
+    return model ? modelSupportsFastMode(model) : false;
   }
 
   const codexFastModeAvailable = computed(() =>

@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import type { EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
-import { formatModelDisplayName } from "../utils/modelDisplay";
+import { formatModelOptionDisplayName } from "../utils/modelDisplay";
 import BaseSwitch from "./ui/BaseSwitch.vue";
 
 const props = defineProps<{
@@ -138,7 +138,7 @@ function selectModel(id: string) {
 }
 
 function modelDisplayName(model: ModelOption): string {
-  return formatModelDisplayName(model.name);
+  return formatModelOptionDisplayName(model, props.fastModeEnabled === true);
 }
 
 function selectEffort(level: EffortLevel) {
