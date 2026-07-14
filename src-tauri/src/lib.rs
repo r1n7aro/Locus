@@ -1354,6 +1354,7 @@ pub fn run() {
             commands::reset_all_config,
             commands::get_session_plan_state,
             commands::set_session_plan_mode,
+            commands::get_plan_file_content,
             commands::get_system_fonts,
             commands::get_system_locale,
             commands::get_close_behavior,

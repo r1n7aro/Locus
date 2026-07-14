@@ -49,6 +49,43 @@ pub struct SessionPlanStatePayload {
     pub plan_file_exists: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFileContentPayload {
+    pub plan_file_path: String,
+    pub content: String,
+}
+
+/// Read a plan file for the standalone plan review window. Only files under
+/// the runtime storage `plan/` root are readable — this is a frontend-facing
+/// command and must not become an arbitrary-file read primitive.
+#[tauri::command]
+pub async fn get_plan_file_content(
+    path: String,
+    app_handle: AppHandle,
+) -> Result<PlanFileContentPayload, AppError> {
+    let plan_root = crate::commands::resolve_runtime_storage_dir(&app_handle)
+        .map_err(|e| AppError::new("plan.path_failed", format!("Failed to get data dir: {}", e)).operation("plan"))?
+        .join("plan");
+    let plan_root = dunce::canonicalize(&plan_root)
+        .map_err(|e| AppError::new("plan.path_failed", format!("Plan root unavailable: {}", e)).operation("plan"))?;
+    let requested = dunce::canonicalize(std::path::Path::new(&path))
+        .map_err(|e| AppError::new("plan.read_failed", format!("Plan file unavailable: {}", e)).operation("plan"))?;
+    if !requested.starts_with(&plan_root) {
+        return Err(AppError::new(
+            "plan.path_forbidden",
+            format!("Path is outside the plan directory: {}", requested.to_string_lossy()),
+        )
+        .operation("plan"));
+    }
+    let content = std::fs::read_to_string(&requested)
+        .map_err(|e| AppError::new("plan.read_failed", format!("Failed to read plan file: {}", e)).operation("plan"))?;
+    Ok(PlanFileContentPayload {
+        plan_file_path: requested.to_string_lossy().to_string(),
+        content,
+    })
+}
+
 fn build_plan_state_payload(
     app_handle: &AppHandle,
     working_dir: &str,

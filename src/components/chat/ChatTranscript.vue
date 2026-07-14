@@ -2763,12 +2763,9 @@ function openImage(src: string) {
                     class="chat-transcript-intent-badge"
                     :class="badge.kind"
                   >
-                    <template v-if="badge.kind === 'skill'">
-                      <span class="chat-transcript-intent-badge-mark">SKILL</span>
-                      <span class="chat-transcript-intent-badge-divider"></span>
-                      <span class="chat-transcript-intent-badge-text">{{ badge.label }}</span>
-                    </template>
-                    <template v-else>{{ badge.label }}</template>
+                    <span class="chat-transcript-intent-badge-mark">{{ badge.kind === "skill" ? "SKILL" : "MODE" }}</span>
+                    <span class="chat-transcript-intent-badge-divider"></span>
+                    <span class="chat-transcript-intent-badge-text">{{ badge.label }}</span>
                   </span>
                 </div>
 
@@ -3426,11 +3423,7 @@ function openImage(src: string) {
   color: var(--text-secondary);
 }
 
-.chat-transcript-intent-badge.plan {
-  color: #1d4ed8;
-  background: color-mix(in srgb, #3b82f6 14%, transparent);
-}
-
+.chat-transcript-intent-badge.plan,
 .chat-transcript-intent-badge.skill {
   display: inline-grid;
   grid-template-columns: auto 1px minmax(0, auto);

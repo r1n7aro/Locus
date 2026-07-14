@@ -8,6 +8,7 @@ export type FontSlot = "ui" | "prose" | "monoInline" | "monoBlock" | "monoEditor
 export type DiffReviewTarget = "inline" | "window";
 export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
+export type PlanApprovalTarget = "card" | "window";
 export type AssetRefClickAction =
   | "unitySelect"
   | "fileBrowser"
@@ -43,6 +44,8 @@ export interface DisplaySettings {
   chatDiffReviewTarget: DiffReviewTarget;
   /** Default target for reviewing Git file diffs */
   gitDiffReviewTarget: DiffReviewTarget;
+  /** Default surface for the exit_plan_mode approval (inline card or standalone window) */
+  planApprovalTarget: PlanApprovalTarget;
   /** Default action when clicking a Unity asset reference in chat messages */
   assetRefClickAction: AssetRefClickAction;
   /** Click action override for chat running inside the Unity embed window */
@@ -119,6 +122,7 @@ const defaults: DisplaySettings = {
   fileChangePopoverEnabled: true,
   chatDiffReviewTarget: "window",
   gitDiffReviewTarget: "window",
+  planApprovalTarget: "card",
   assetRefClickAction: "locusInspectorAuto",
   // Inside the Unity embed window the editor's own Inspector is one click
   // away, so asset/GameObject refs open there by default.

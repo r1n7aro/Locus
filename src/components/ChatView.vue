@@ -32,6 +32,7 @@ import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
+import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
 import type { LocusAssetInspectorWindowPayload } from "../services/locusAssetInspectorWindow";
 import { openLocusAssetInspector } from "../composables/useLocusAssetInspectorPanel";
 import { normalizeAppError } from "../services/errors";
@@ -2326,6 +2327,31 @@ const showSingleToolConfirmCard = computed(() =>
   !isViewingSubagent.value
   && props.pendingToolConfirms.length === 1
   && !showBatchToolConfirmCard.value,
+);
+
+// Standalone plan review window: auto-open when the user prefers the window
+// surface, and tell an open window when the pending approval settles (the
+// card answered it, the run was cancelled, ...) so it drops its action bar.
+watch(
+  () => props.pendingToolConfirms.find((item) => item.display.kind === "planApproval")?.questionId ?? "",
+  (questionId, previousQuestionId) => {
+    if (questionId) {
+      if (questionId === previousQuestionId) return;
+      if (displaySettings.planApprovalTarget !== "window") return;
+      const confirm = props.pendingToolConfirms.find((item) => item.questionId === questionId);
+      if (confirm?.display.kind === "planApproval") {
+        void openPlanViewWindow({
+          planFilePath: confirm.display.planFilePath,
+          questionId,
+        });
+      }
+      return;
+    }
+    if (previousQuestionId) {
+      void broadcastPlanApprovalResolved(previousQuestionId);
+    }
+  },
+  { immediate: true },
 );
 
 function handleExitPlanMode() {

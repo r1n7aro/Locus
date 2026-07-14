@@ -2,7 +2,7 @@
 import { computed, ref, onMounted } from "vue";
 import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
-import { useDisplaySettings, type AssetRefClickAction, type DiffReviewTarget, type FontSlot } from "../../composables/useDisplaySettings";
+import { useDisplaySettings, type AssetRefClickAction, type DiffReviewTarget, type FontSlot, type PlanApprovalTarget } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
 import {
@@ -42,6 +42,11 @@ const themeOptions = computed(() =>
 const diffReviewTargetOptions = computed(() => [
   { value: "inline", label: t("settings.display.diffReviewInline") },
   { value: "window", label: t("settings.display.diffReviewWindow") },
+]);
+
+const planApprovalTargetOptions = computed(() => [
+  { value: "card", label: t("chat.plan.approvalTarget.card") },
+  { value: "window", label: t("chat.plan.approvalTarget.window") },
 ]);
 
 const assetRefClickActionOptions = computed(() => [
@@ -351,6 +356,18 @@ async function updateViewWindowsAboveMain(value: boolean) {
         :aria-label="t('settings.display.diffReviewGitTarget')"
         size="sm"
         @update:model-value="setDisplay('gitDiffReviewTarget', $event as DiffReviewTarget)"
+      />
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("chat.plan.approvalTargetLabel") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.planApprovalTarget"
+        :options="planApprovalTargetOptions"
+        :aria-label="t('chat.plan.approvalTargetLabel')"
+        size="sm"
+        @update:model-value="setDisplay('planApprovalTarget', $event as PlanApprovalTarget)"
       />
     </div>
   </div>

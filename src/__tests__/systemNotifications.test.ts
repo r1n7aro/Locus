@@ -36,6 +36,7 @@ function createDisplayState(): DisplaySettings {
     fileChangePopoverEnabled: true,
     chatDiffReviewTarget: "inline",
     gitDiffReviewTarget: "inline",
+    planApprovalTarget: "card",
     assetRefClickAction: "locusInspectorEmbedded",
     unityEmbedAssetRefClickAction: "unityInspector",
     rightAlignUserMessages: false,

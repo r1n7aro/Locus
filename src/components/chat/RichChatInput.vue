@@ -9,6 +9,7 @@ import {
   listDirEntriesPage,
   type DirEntry,
 } from "../../services/project";
+import { useChatStore } from "../../stores/chat";
 import { useNotificationStore } from "../../stores/notification";
 import type {
   AssetRefAttachment,
@@ -186,6 +187,7 @@ const emit = defineEmits<{
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
+const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const slots = useSlots();
@@ -853,12 +855,29 @@ function handleTextareaInteraction() {
   nextTick(syncOperatorState);
 }
 
+function applyPlanIntentBadge() {
+  composerIntent.value = {
+    ...composerIntent.value,
+    mode: "plan",
+  };
+}
+
 function applyIntentCommand(command: CommandDef) {
   if (command.commandType === "plan") {
-    composerIntent.value = {
-      ...composerIntent.value,
-      mode: "plan",
-    };
+    // Symmetric with the sticky bar's exit button: picking /plan on an idle
+    // session enters sticky plan mode immediately (the status bar is the
+    // feedback). The pending badge remains only for the cases where the
+    // sticky state cannot flip yet — no session or a run in flight.
+    const sessionId = chatStore.activeSessionId;
+    if (sessionId && chatStore.activeSessionPlanMode) return;
+    if (sessionId && !props.isStreaming) {
+      chatStore.setSessionPlanMode(sessionId, true).catch((e) => {
+        notificationStore.addNotice("error", normalizeAppError(e).message, { operation: "planMode" });
+        applyPlanIntentBadge();
+      });
+      return;
+    }
+    applyPlanIntentBadge();
     return;
   }
 
@@ -2741,15 +2760,22 @@ defineExpose({
         <div class="composer-header-row">
           <div v-if="hasHeaderStart" class="composer-header-start">
             <slot name="header-start" />
-            <button
+            <span
               v-if="showTopPlanBadge && composerPlanBadge"
-              type="button"
               class="composer-badge composer-top-badge plan ui-select-none"
-              @click="removePlanBadge"
             >
-              <span>{{ composerPlanBadge.label }}</span>
-              <span class="composer-badge-remove">&times;</span>
-            </button>
+              <span class="composer-badge-mark">MODE</span>
+              <span class="composer-badge-divider"></span>
+              <span class="composer-badge-text">{{ composerPlanBadge.label }}</span>
+              <button
+                type="button"
+                class="composer-badge-remove"
+                :aria-label="`移除 ${composerPlanBadge.label} 模式`"
+                @click="removePlanBadge"
+              >
+                &times;
+              </button>
+            </span>
             <div v-if="showSkillBadges && composerSkillBadges.length > 0" class="composer-badge-row">
               <span
                 v-for="badge in composerSkillBadges"
@@ -4046,18 +4072,7 @@ defineExpose({
   box-shadow: none;
 }
 
-.composer-badge.plan {
-  color: var(--text-secondary);
-  border-color: color-mix(in srgb, var(--accent-color) 18%, var(--border-color));
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--input-bg) 28%);
-}
-
-.composer-badge.plan:hover {
-  color: var(--text-color);
-  border-color: color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
-  background: color-mix(in srgb, var(--panel-bg) 56%, var(--hover-bg) 44%);
-}
-
+.composer-badge.plan,
 .composer-badge.skill {
   display: inline-grid;
   grid-template-columns: auto 1px minmax(0, auto) auto;

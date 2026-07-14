@@ -273,16 +273,16 @@ const toolConfirmPreviewText = computed(() => {
 
 const toolConfirmAllowLabel = computed(() => {
   const display = pendingToolConfirm.value?.display;
-  return display?.kind === "unityEditorStatusChange"
-    ? t("chat.toolConfirm.unityStatus.confirm")
-    : t("chat.toolConfirm.allow");
+  if (display?.kind === "unityEditorStatusChange") return t("chat.toolConfirm.unityStatus.confirm");
+  if (display?.kind === "planApproval") return t("chat.plan.approve");
+  return t("chat.toolConfirm.allow");
 });
 
 const toolConfirmDenyLabel = computed(() => {
   const display = pendingToolConfirm.value?.display;
-  return display?.kind === "unityEditorStatusChange"
-    ? t("chat.toolConfirm.unityStatus.cancel")
-    : t("chat.toolConfirm.deny");
+  if (display?.kind === "unityEditorStatusChange") return t("chat.toolConfirm.unityStatus.cancel");
+  if (display?.kind === "planApproval") return t("chat.plan.reject");
+  return t("chat.toolConfirm.deny");
 });
 
 function shouldRefreshOnToolCompletion(toolName: string): boolean {

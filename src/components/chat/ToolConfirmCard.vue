@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
+import { ExternalLink } from "lucide";
 import type {
   BasicToolConfirmDisplay,
   KnowledgeToolConfirmPreview,
@@ -9,9 +10,14 @@ import type {
   UnityEditorStatusChangeToolConfirmDisplay,
 } from "../../types";
 import { t } from "../../i18n";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
+import { openPlanViewWindow } from "../../services/planViewWindow";
+import LucideIcon from "../icons/LucideIcon.vue";
+import MarkdownRenderer from "../MarkdownRenderer.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import KnowledgeToolConfirmCard from "./KnowledgeToolConfirmCard.vue";
 import ToolConfirmFeedbackForm from "./ToolConfirmFeedbackForm.vue";
+import { encodeToolConfirmFeedback } from "./toolConfirmAnswer";
 import {
   editorStatusLabelForToolConfirm,
   titleForUnityEditorStatusChange,
@@ -119,6 +125,42 @@ const unityStatusRows = computed(() => {
     },
   ];
 });
+
+// Plan approval collapses to TWO intents: approve, or send the plan back.
+// The feedback field is an optional note attached to "send back" — not a
+// third, separately-submitted action.
+const planFeedback = ref("");
+
+const { state: displaySettings } = useDisplaySettings();
+
+// With the standalone-window preference the card stays as the in-transcript
+// anchor (actions still work here) but stops duplicating the full plan text.
+const planPrefersWindow = computed(
+  () => !!planApprovalDisplay.value && displaySettings.planApprovalTarget === "window",
+);
+
+function openPlanWindow() {
+  const display = planApprovalDisplay.value;
+  if (!display) return;
+  void openPlanViewWindow({
+    planFilePath: display.planFilePath,
+    questionId: props.toolConfirm.questionId,
+  });
+}
+
+function submitPlanSendBack() {
+  const feedback = planFeedback.value.trim();
+  emit("answer", feedback ? encodeToolConfirmFeedback(feedback) : "deny");
+}
+
+// Enter only sends back when there is an actual note: an empty field must
+// not reject the plan by accident, and an IME composition Enter (Chinese
+// candidate confirm) must never submit.
+function handlePlanFeedbackEnter(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  if (!planFeedback.value.trim()) return;
+  submitPlanSendBack();
+}
 </script>
 
 <template>
@@ -168,32 +210,121 @@ const unityStatusRows = computed(() => {
     </template>
     <template v-else-if="planApprovalDisplay">
       <div class="tool-confirm-body">
-        <div class="plan-approval-path">{{ planApprovalDisplay.planFilePath }}</div>
-        <pre class="plan-approval-content">{{ planApprovalDisplay.plan }}</pre>
+        <div class="plan-approval-path-row">
+          <span class="plan-approval-path">{{ planApprovalDisplay.planFilePath }}</span>
+          <button
+            type="button"
+            class="plan-approval-open-window ui-select-none"
+            :title="t('chat.plan.openInWindow')"
+            @click="openPlanWindow"
+          >
+            <LucideIcon :icon="ExternalLink" :size="12" />
+            <span>{{ t("chat.plan.openInWindow") }}</span>
+          </button>
+        </div>
+        <button
+          v-if="planPrefersWindow"
+          type="button"
+          class="plan-approval-window-notice ui-select-none"
+          @click="openPlanWindow"
+        >
+          {{ t("chat.plan.openedInWindow") }} · {{ t("chat.plan.focusWindow") }}
+        </button>
+        <div v-else class="plan-approval-content">
+          <MarkdownRenderer :content="planApprovalDisplay.plan" />
+        </div>
         <div class="plan-approval-hint">{{ t("chat.plan.approvalHint") }}</div>
       </div>
     </template>
     <ToolConfirmFeedbackForm
-      v-if="basicDisplay || planApprovalDisplay"
+      v-if="basicDisplay"
       @submit="emit('answer', $event)"
+    />
+    <input
+      v-if="planApprovalDisplay"
+      v-model="planFeedback"
+      class="plan-approval-feedback-input"
+      :placeholder="t('chat.plan.feedbackPlaceholder')"
+      @keydown.enter="handlePlanFeedbackEnter"
     />
     <div class="tool-confirm-actions">
       <BaseButton class="tool-confirm-btn" variant="primary" size="md" @click="emit('answer', 'allow')">{{ allowLabel }}</BaseButton>
-      <BaseButton class="tool-confirm-btn" size="md" @click="emit('answer', 'deny')">{{ denyLabel }}</BaseButton>
+      <BaseButton
+        v-if="planApprovalDisplay"
+        class="tool-confirm-btn"
+        size="md"
+        @click="submitPlanSendBack"
+      >
+        {{ denyLabel }}
+      </BaseButton>
+      <BaseButton v-else class="tool-confirm-btn" size="md" @click="emit('answer', 'deny')">{{ denyLabel }}</BaseButton>
     </div>
   </div>
 </template>
 
 <style scoped>
-.plan-approval-path {
+.plan-approval-path-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 6px;
+}
+
+.plan-approval-path {
+  min-width: 0;
   color: var(--text-secondary);
   font-size: 11px;
   font-family: var(--font-mono-identifier);
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-approval-open-window {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.plan-approval-open-window:hover {
+  background: var(--hover-bg);
+  border-color: color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+  color: var(--text-color);
+}
+
+.plan-approval-window-notice {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px dashed color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--accent-color) 8%);
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plan-approval-window-notice:hover {
+  color: var(--text-color);
 }
 
 .plan-approval-content {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
   max-height: 320px;
   overflow: auto;
   margin: 0 0 8px;
@@ -202,15 +333,35 @@ const unityStatusRows = computed(() => {
   border-radius: 8px;
   background: color-mix(in srgb, var(--panel-bg) 86%, var(--sidebar-bg) 14%);
   color: var(--text-color);
+}
+
+.plan-approval-content :deep(.markdown-body) {
   font-size: 12px;
   line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 .plan-approval-hint {
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+.plan-approval-feedback-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 32px;
+  margin-bottom: 10px;
+  padding: 0 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg, var(--panel-bg));
+  color: var(--text-color);
+  font: inherit;
+  font-size: 12px;
+}
+
+.plan-approval-feedback-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent-color) 42%, var(--border-color));
 }
 
 .tool-confirm-card.is-unity-status-change {

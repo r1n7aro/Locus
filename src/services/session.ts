@@ -232,3 +232,13 @@ export function setSessionPlanMode(
 ): Promise<SessionPlanState> {
   return ipcInvoke<SessionPlanState>("set_session_plan_mode", { sessionId, active });
 }
+
+export interface PlanFileContent {
+  planFilePath: string;
+  content: string;
+}
+
+/** Read a plan file for the standalone plan review window (plan/ root only). */
+export function getPlanFileContent(path: string): Promise<PlanFileContent> {
+  return ipcInvoke<PlanFileContent>("get_plan_file_content", { path });
+}
