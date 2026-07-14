@@ -1,12 +1,12 @@
 {
-  "version": "0.5.7",
-  "releasedAt": "2026-07-10",
+  "version": "0.5.8",
+  "releasedAt": "2026-07-14",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,23 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.7 (2026-07-10)",
+      "summary": "Locus v0.5.8 (2026-07-14)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.8（新增）",
+          "items": [
+            "**独立计划审阅窗口。** 可在显示设置中选择将计划审批呈现在审批卡或独立窗口；选择独立窗口后会自动打开计划审阅窗口，可审阅 Markdown 计划、批准并开始实现，或附带说明退回修改。"
+          ]
+        },
+        {
+          "title": "v0.5.8（修复）",
+          "items": [
+            "**已解决 Windows 上 DeepSeek 请求间歇性 HTTP 400。** 将 `schannel` 从 0.1.28 升级到 0.1.29，避免 TLS 1.3 重新协商期间重复发送待处理请求数据并破坏较大的 JSON 请求体，解决 [issue #48](https://github.com/r1n7aro/Locus/issues/48) 集中记录的 `400 Bad Request: Failed to parse the request body as JSON` 问题。([PR #110](https://github.com/r1n7aro/Locus/pull/110))",
+            "**计划审批流程。** 审批卡现在以 Markdown 展示计划，退回说明会随“退回修改”一并发送，批准后的计划与退回反馈会以正确状态保留在会话记录中。空闲会话选择 `/plan` 后会立即进入持续性规划模式。",
+            "启用 Fast 模式时，支持 Fast 的 Codex 模型会在模型标签中显示 `Fast` 状态。"
+          ]
+        },
         {
           "title": "v0.5.7（新增）",
           "items": [
@@ -175,11 +189,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -189,9 +203,23 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.7 (2026-07-10)",
+      "summary": "Locus v0.5.8 (2026-07-14)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.8 (Added)",
+          "items": [
+            "**Standalone plan review.** Plan approvals can open automatically in a dedicated window selected from Display settings. The window supports reviewing the Markdown plan, approving implementation, or sending it back with an optional note."
+          ]
+        },
+        {
+          "title": "v0.5.8 (Fixed)",
+          "items": [
+            "**Resolved intermittent DeepSeek HTTP 400 failures on Windows.** Upgraded `schannel` from 0.1.28 to 0.1.29, preventing pending request data from being resent during TLS 1.3 renegotiation and corrupting large JSON bodies. This resolves the `400 Bad Request: Failed to parse the request body as JSON` failures tracked in [issue #48](https://github.com/r1n7aro/Locus/issues/48). ([PR #110](https://github.com/r1n7aro/Locus/pull/110))",
+            "**Plan approval flow.** Approval cards now render Markdown, attach optional feedback to Send back, and preserve approved plans or send-back feedback in the transcript with the correct lifecycle state. Selecting `/plan` in an idle session immediately enters sticky Plan mode.",
+            "Fast-capable Codex models now show `Fast` in their model labels while Fast mode is enabled."
+          ]
+        },
         {
           "title": "v0.5.7 (Added)",
           "items": [
@@ -335,11 +363,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

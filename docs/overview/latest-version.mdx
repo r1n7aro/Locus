@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.5.7 (2026-07-10)"
+description: "Locus v0.5.8 (2026-07-14)"
 sidebarTitle: "当前版本"
-version: "0.5.7"
-releasedAt: "2026-07-10"
+version: "0.5.8"
+releasedAt: "2026-07-14"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,21 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.7/locus_0.5.7_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.5.8（新增）
+
+- **独立计划审阅窗口。** 可在显示设置中选择将计划审批呈现在审批卡或独立窗口；选择独立窗口后会自动打开计划审阅窗口，可审阅 Markdown 计划、批准并开始实现，或附带说明退回修改。
+
+### v0.5.8（修复）
+
+- **已解决 Windows 上 DeepSeek 请求间歇性 HTTP 400。** 将 `schannel` 从 0.1.28 升级到 0.1.29，避免 TLS 1.3 重新协商期间重复发送待处理请求数据并破坏较大的 JSON 请求体，解决 [issue #48](https://github.com/r1n7aro/Locus/issues/48) 集中记录的 `400 Bad Request: Failed to parse the request body as JSON` 问题。([PR #110](https://github.com/r1n7aro/Locus/pull/110))
+- **计划审批流程。** 审批卡现在以 Markdown 展示计划，退回说明会随“退回修改”一并发送，批准后的计划与退回反馈会以正确状态保留在会话记录中。空闲会话选择 `/plan` 后会立即进入持续性规划模式。
+- 启用 Fast 模式时，支持 Fast 的 Codex 模型会在模型标签中显示 `Fast` 状态。
 
 ### v0.5.7（新增）
 
