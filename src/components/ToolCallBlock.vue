@@ -270,7 +270,9 @@ const editDiffData = computed((): EditDiffResult | null => {
   }
 });
 
-// Compute diff payloads for each edit item using backend diff_strings
+// Compute diff payloads for each edit item using backend diff_strings.
+// `item.startLine` is the source-file line where the oldStr snippet starts;
+// newStr replaces oldStr in place, so its source line offset is the same.
 const editDiffPayloads = ref<Map<number, FileDiffPayload>>(new Map());
 
 watch(editDiffData, async (data) => {
@@ -279,7 +281,14 @@ watch(editDiffData, async (data) => {
   for (let i = 0; i < data.items.length; i++) {
     const item = data.items[i];
     try {
-      const hunks = await diffStrings(item.oldStr, item.newStr, 3);
+      const sourceStartLine = item.startLine > 0 ? item.startLine : undefined;
+      const hunks = await diffStrings(
+        item.oldStr,
+        item.newStr,
+        3,
+        sourceStartLine,
+        sourceStartLine,
+      );
       const additions = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.kind === "add").length, 0);
       const deletions = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.kind === "delete").length, 0);
       const payload: FileDiffPayload = {

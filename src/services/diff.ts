@@ -124,11 +124,25 @@ export async function diffStrings(
   oldText: string,
   newText: string,
   contextLines?: number,
+  /**
+   * 1-based line number in the surrounding document that corresponds to
+   * the first line of `oldText`. When omitted (or 0), line numbers stay
+   * relative to `oldText` itself.
+   */
+  oldStartOffset?: number,
+  /**
+   * Same as `oldStartOffset` but for `newText`. When `oldText` and `newText`
+   * replace each other in place (the edit-tool case), pass the same value
+   * for both.
+   */
+  newStartOffset?: number,
 ): Promise<DiffHunk[]> {
   return ipcInvoke<DiffHunk[]>("diff_strings", {
     oldText,
     newText,
     contextLines: contextLines ?? null,
+    oldStartOffset: oldStartOffset ?? null,
+    newStartOffset: newStartOffset ?? null,
   });
 }
 

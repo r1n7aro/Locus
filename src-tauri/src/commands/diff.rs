@@ -96,14 +96,25 @@ pub async fn diff_text_for_large(
 }
 
 #[tauri::command]
+/// Compute diff hunks between two text blobs and optionally shift the
+/// reported line numbers onto a surrounding document.
+///
+/// `old_start_offset` and `new_start_offset` are 1-based line numbers in
+/// the surrounding document that correspond to the first line of `old_text`
+/// and `new_text` respectively. Pass `0` to keep the legacy behaviour where
+/// line numbers are relative to each input (1-based per string).
 pub async fn diff_strings(
     old_text: String,
     new_text: String,
     context_lines: Option<usize>,
+    old_start_offset: Option<usize>,
+    new_start_offset: Option<usize>,
 ) -> AppResult<Vec<DiffHunk>> {
     Ok(compute_hunks(
         &old_text,
         &new_text,
         context_lines.unwrap_or(3),
+        old_start_offset.filter(|n| *n > 0),
+        new_start_offset.filter(|n| *n > 0),
     ))
 }

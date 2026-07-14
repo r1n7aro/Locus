@@ -361,7 +361,7 @@ pub(crate) async fn build_file_diff_payload(
         };
         // Emit TextDiff BEFORE compute so UI shows progress during the work
         semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::TextDiff, None);
-        let all_hunks = compute_hunks(&pair.old_content, &pair.new_content, context);
+        let all_hunks = compute_hunks(&pair.old_content, &pair.new_content, context, None, None);
         let stats = count_stats(&all_hunks);
         let hunks = if detail == DiffDetail::Preview {
             truncate_for_preview(all_hunks)
@@ -468,6 +468,6 @@ pub(crate) async fn compute_text_diff_on_demand(
         .max(pair.new_content.lines().count());
     let context = if request.full_context { total_lines } else { 3 };
 
-    let hunks = compute_hunks(&pair.old_content, &pair.new_content, context);
+    let hunks = compute_hunks(&pair.old_content, &pair.new_content, context, None, None);
     Ok(TextDiffResult { hunks })
 }

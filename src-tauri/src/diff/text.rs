@@ -20,7 +20,21 @@ fn normalize_for_text_diff(text: &str) -> Cow<'_, str> {
     }
 }
 
-pub fn compute_hunks(old: &str, new: &str, context: usize) -> Vec<DiffHunk> {
+/// Compute diff hunks between two text blobs.
+///
+/// `old_start_offset` and `new_start_offset` (both 1-based) shift the
+/// reported line numbers so callers can map the relative `old`/`new` line
+/// indices back to a surrounding document (e.g. an edit tool's preview,
+/// where `old`/`new` are the diffed snippet and the offset is the snippet's
+/// first source-file line number). Pass `None` to keep the legacy 1-based
+/// behaviour where line numbers are relative to each input.
+pub fn compute_hunks(
+    old: &str,
+    new: &str,
+    context: usize,
+    old_start_offset: Option<usize>,
+    new_start_offset: Option<usize>,
+) -> Vec<DiffHunk> {
     let old = normalize_for_text_diff(old);
     let new = normalize_for_text_diff(new);
     let old = old.as_ref();
@@ -37,6 +51,8 @@ pub fn compute_hunks(old: &str, new: &str, context: usize) -> Vec<DiffHunk> {
     } else {
         TextDiff::from_lines(old, new)
     };
+    let old_offset = old_start_offset.unwrap_or(1);
+    let new_offset = new_start_offset.unwrap_or(1);
     let mut hunks = Vec::new();
 
     for group in diff.grouped_ops(context) {
@@ -68,11 +84,11 @@ pub fn compute_hunks(old: &str, new: &str, context: usize) -> Vec<DiffHunk> {
                 let (kind, old_line_no, new_line_no) = match change.tag() {
                     ChangeTag::Equal => (
                         DiffLineKind::Context,
-                        old_idx.map(|i| i + 1),
-                        new_idx.map(|i| i + 1),
+                        old_idx.map(|i| i + old_offset),
+                        new_idx.map(|i| i + new_offset),
                     ),
-                    ChangeTag::Delete => (DiffLineKind::Delete, old_idx.map(|i| i + 1), None),
-                    ChangeTag::Insert => (DiffLineKind::Add, None, new_idx.map(|i| i + 1)),
+                    ChangeTag::Delete => (DiffLineKind::Delete, old_idx.map(|i| i + old_offset), None),
+                    ChangeTag::Insert => (DiffLineKind::Add, None, new_idx.map(|i| i + new_offset)),
                 };
 
                 lines.push(DiffLine {
@@ -85,14 +101,14 @@ pub fn compute_hunks(old: &str, new: &str, context: usize) -> Vec<DiffHunk> {
         }
 
         let old_start_1 = if old_start == usize::MAX {
-            1
+            old_offset
         } else {
-            old_start + 1
+            old_start + old_offset
         };
         let new_start_1 = if new_start == usize::MAX {
-            1
+            new_offset
         } else {
-            new_start + 1
+            new_start + new_offset
         };
 
         hunks.push(DiffHunk {
@@ -156,14 +172,14 @@ mod tests {
 
     #[test]
     fn compute_hunks_ignores_line_ending_only_changes() {
-        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nbeta\ngamma\n", 3);
+        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nbeta\ngamma\n", 3, None, None);
 
         assert!(hunks.is_empty());
     }
 
     #[test]
     fn compute_hunks_keeps_content_changes_when_line_endings_differ() {
-        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nBETA\ngamma\n", 3);
+        let hunks = compute_hunks("alpha\r\nbeta\r\ngamma\r\n", "alpha\nBETA\ngamma\n", 3, None, None);
         let stats = count_stats(&hunks);
         let deletes: Vec<&str> = hunks
             .iter()
@@ -194,7 +210,7 @@ mod tests {
             .collect::<String>();
 
         let started = std::time::Instant::now();
-        let hunks = compute_hunks(&old, &new, 3);
+        let hunks = compute_hunks(&old, &new, 3, None, None);
         let elapsed = started.elapsed();
 
         assert!(!hunks.is_empty());
@@ -203,5 +219,55 @@ mod tests {
             "large distinct diff took too long: {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn compute_hunks_shifts_line_numbers_with_offsets() {
+        // Simulates the edit-tool case: old/new are a snippet that lives at
+        // source lines 42-45 in the surrounding document. The reported line
+        // numbers must reflect the surrounding document, not the snippet
+        // (which itself starts at 1).
+        let old = "alpha\nbeta\ngamma\n";
+        let new = "alpha\nBETA\ngamma\n";
+        let hunks = compute_hunks(old, new, 3, Some(42), Some(42));
+
+        let hunk = hunks.first().expect("expected one hunk");
+        assert_eq!(hunk.old_start, 43, "oldStart should be 42 + 1");
+        assert_eq!(hunk.new_start, 43, "newStart should be 42 + 1");
+
+        let deletes: Vec<Option<usize>> =
+            hunk.lines.iter().map(|l| l.old_line_no).collect();
+        let adds: Vec<Option<usize>> =
+            hunk.lines.iter().map(|l| l.new_line_no).collect();
+
+        // Old snippet lines 1..3 -> source 42..44 (alpha context, beta delete, gamma context).
+        assert_eq!(deletes, vec![Some(42), Some(43), Some(44)]);
+        // New snippet lines 1..3 -> source 42..44 (alpha context, BETA add, gamma context).
+        assert_eq!(adds, vec![Some(42), None, Some(43), Some(44)]);
+    }
+
+    #[test]
+    fn compute_hunks_one_offset_matches_legacy_one_based() {
+        // `Some(1)` reproduces the legacy 1-based per-string behaviour
+        // (the IPC layer maps `0` or `None` to `1` for the call site).
+        let hunks_none = compute_hunks("alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n", 3, None, None);
+        let hunks_one = compute_hunks("alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n", 3, Some(1), Some(1));
+
+        assert_eq!(hunks_none.len(), hunks_one.len());
+        for (a, b) in hunks_none.iter().zip(hunks_one.iter()) {
+            assert_eq!(a.old_start, b.old_start);
+            assert_eq!(a.new_start, b.new_start);
+            let a_line_nos: Vec<_> = a
+                .lines
+                .iter()
+                .map(|l| (l.old_line_no, l.new_line_no))
+                .collect();
+            let b_line_nos: Vec<_> = b
+                .lines
+                .iter()
+                .map(|l| (l.old_line_no, l.new_line_no))
+                .collect();
+            assert_eq!(a_line_nos, b_line_nos);
+        }
     }
 }
