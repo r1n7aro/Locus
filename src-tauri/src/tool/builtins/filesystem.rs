@@ -409,81 +409,83 @@ pub(super) fn edit() -> ToolDef {
                     replace_all: bool,
                 }
 
-                let ops: Vec<EditOp> = if let Some(edits_arr) =
-                    args.get("edits").and_then(|v| v.as_array())
-                {
-                    let mut ops = Vec::with_capacity(edits_arr.len());
-                    for (i, edit) in edits_arr.iter().enumerate() {
-                        let old_s = match edit.get("oldString").and_then(|v| v.as_str()) {
+                // Legacy compatibility for persisted tool calls created while the
+                // public schema exposed an `edits` array. New calls only expose the
+                // top-level single-edit fields in tools/edit.json.
+                let ops: Vec<EditOp> =
+                    if let Some(edits_arr) = args.get("edits").and_then(|v| v.as_array()) {
+                        let mut ops = Vec::with_capacity(edits_arr.len());
+                        for (i, edit) in edits_arr.iter().enumerate() {
+                            let old_s = match edit.get("oldString").and_then(|v| v.as_str()) {
+                                Some(s) => s.to_string(),
+                                None => {
+                                    return ToolResult {
+                                        output: format!(
+                                            "edits[{}]: missing required field 'oldString'",
+                                            i
+                                        ),
+                                        is_error: true,
+                                    };
+                                }
+                            };
+                            let new_s = match edit.get("newString").and_then(|v| v.as_str()) {
+                                Some(s) => s.to_string(),
+                                None => {
+                                    return ToolResult {
+                                        output: format!(
+                                            "edits[{}]: missing required field 'newString'",
+                                            i
+                                        ),
+                                        is_error: true,
+                                    };
+                                }
+                            };
+                            let repl_all = edit
+                                .get("replaceAll")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            ops.push(EditOp {
+                                old_string: normalize_lf(&old_s),
+                                new_string: normalize_lf(&new_s),
+                                replace_all: repl_all,
+                            });
+                        }
+                        if ops.is_empty() {
+                            return ToolResult {
+                                output: "edits array is empty".to_string(),
+                                is_error: true,
+                            };
+                        }
+                        ops
+                    } else {
+                        let old_string = match args.get("oldString").and_then(|v| v.as_str()) {
                             Some(s) => s.to_string(),
                             None => {
                                 return ToolResult {
-                                    output: format!(
-                                        "edits[{}]: missing required field 'oldString'",
-                                        i
-                                    ),
+                                    output: "Missing required parameter: oldString".to_string(),
                                     is_error: true,
-                                };
+                                }
                             }
                         };
-                        let new_s = match edit.get("newString").and_then(|v| v.as_str()) {
+                        let new_string = match args.get("newString").and_then(|v| v.as_str()) {
                             Some(s) => s.to_string(),
                             None => {
                                 return ToolResult {
-                                    output: format!(
-                                        "edits[{}]: missing required field 'newString'",
-                                        i
-                                    ),
+                                    output: "Missing required parameter: newString".to_string(),
                                     is_error: true,
-                                };
+                                }
                             }
                         };
-                        let repl_all = edit
+                        let replace_all = args
                             .get("replaceAll")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        ops.push(EditOp {
-                            old_string: normalize_lf(&old_s),
-                            new_string: normalize_lf(&new_s),
-                            replace_all: repl_all,
-                        });
-                    }
-                    if ops.is_empty() {
-                        return ToolResult {
-                            output: "edits array is empty".to_string(),
-                            is_error: true,
-                        };
-                    }
-                    ops
-                } else {
-                    let old_string = match args.get("oldString").and_then(|v| v.as_str()) {
-                        Some(s) => s.to_string(),
-                        None => {
-                            return ToolResult {
-                                output: "Missing required parameter: oldString (or use 'edits' array for batch mode)".to_string(),
-                                is_error: true,
-                            }
-                        }
+                        vec![EditOp {
+                            old_string: normalize_lf(&old_string),
+                            new_string: normalize_lf(&new_string),
+                            replace_all,
+                        }]
                     };
-                    let new_string = match args.get("newString").and_then(|v| v.as_str()) {
-                        Some(s) => s.to_string(),
-                        None => {
-                            return ToolResult {
-                                output: "Missing required parameter: newString (or use 'edits' array for batch mode)".to_string(),
-                                is_error: true,
-                            }
-                        }
-                    };
-                    let replace_all = args
-                        .get("replaceAll")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    vec![EditOp {
-                        old_string: normalize_lf(&old_string),
-                        new_string: normalize_lf(&new_string),
-                        replace_all,
-                    }]
-                };
 
                 let mut current_content = normalize_lf(&content);
                 let mut applied_count = 0;
@@ -1180,6 +1182,35 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("read edited file"),
             "class Player\r\n{\r\n    void Fire()\r\n    {\r\n        Shoot();\r\n        Reload();\r\n    }\r\n}\r\n"
+        );
+    }
+
+    #[test]
+    fn edit_keeps_legacy_batch_input_compatible() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("legacy.txt");
+        std::fs::write(&target, "alpha beta\n").expect("seed legacy file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "edits": [
+                            { "oldString": "alpha", "newString": "ALPHA" },
+                            { "oldString": "beta", "newString": "BETA" }
+                        ]
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read edited file"),
+            "ALPHA BETA\n"
         );
     }
 

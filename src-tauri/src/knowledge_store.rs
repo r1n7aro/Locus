@@ -2956,7 +2956,7 @@ fn replace_unique_text(
                 line_numbers.push("...".to_string());
             }
             Err(format!(
-                "Found multiple matches for oldString at lines: {}. Provide more surrounding context or set replaceAll=true.",
+                "Found multiple matches for oldString at lines: {}. Provide more surrounding context so oldString matches exactly once.",
                 line_numbers.join(", ")
             ))
         }
@@ -3012,6 +3012,22 @@ pub fn apply_document_content_edits(
         })?;
         set_document_section_content(document, edit.section, updated);
     }
+    Ok(())
+}
+
+pub fn apply_document_content_edit(
+    document: &mut KnowledgeDocument,
+    edit: &KnowledgeDocumentEditOperation,
+) -> Result<(), String> {
+    let current = document_section_content(document, edit.section);
+    let updated = replace_unique_text(
+        &current,
+        &edit.old_string,
+        &edit.new_string,
+        edit.replace_all,
+    )
+    .map_err(|error| format!("section {}: {}", edit.section.as_str(), error))?;
+    set_document_section_content(document, edit.section, updated);
     Ok(())
 }
 
@@ -5803,6 +5819,7 @@ pub fn read_document_part(
         "full" => render_document_body(&document)?,
         "summary" => document.summary.unwrap_or_default(),
         "body" => document.body,
+        "maintenanceRules" => document.maintenance_rules.unwrap_or_default(),
         _ => unreachable!("normalize_read_part only returns known values"),
     })
 }
@@ -5812,8 +5829,9 @@ fn normalize_read_part(part: &str) -> Result<&'static str, String> {
         "" | "full" => Ok("full"),
         "summary" => Ok("summary"),
         "body" => Ok("body"),
+        "maintenanceRules" => Ok("maintenanceRules"),
         other => Err(format!(
-            "knowledge_read part must be one of: full, summary, body (got '{}')",
+            "knowledge_read part must be one of: full, summary, body, maintenanceRules (got '{}')",
             other
         )),
     }
@@ -5839,6 +5857,11 @@ fn build_read_result(
             document.summary_enabled = false;
             document.maintenance_rules = None;
             document.explicit_maintenance_rules = false;
+        }
+        "maintenanceRules" => {
+            document.summary = None;
+            document.summary_enabled = false;
+            document.body.clear();
         }
         _ => unreachable!("normalize_read_part only returns known values"),
     }
@@ -6179,6 +6202,33 @@ mod tests {
         assert_eq!(body.document.body, "Body content");
         assert!(body.document.maintenance_rules.is_none());
         assert!(!body.document.explicit_maintenance_rules);
+
+        let maintenance_rules = read_document(
+            &working_dir,
+            KnowledgeType::Design,
+            "gameplay/core-loop.md",
+            "maintenanceRules",
+        )
+        .expect("read maintenance rules");
+        assert_eq!(maintenance_rules.part, "maintenanceRules");
+        assert!(maintenance_rules.document.summary.is_none());
+        assert!(!maintenance_rules.document.summary_enabled);
+        assert!(maintenance_rules.document.body.is_empty());
+        assert_eq!(
+            maintenance_rules.document.maintenance_rules.as_deref(),
+            Some("Keep only durable notes")
+        );
+
+        assert_eq!(
+            read_document_part(
+                &working_dir,
+                KnowledgeType::Design,
+                "gameplay/core-loop.md",
+                "maintenanceRules",
+            )
+            .expect("read exact maintenance rules"),
+            "Keep only durable notes"
+        );
     }
 
     #[test]
@@ -6195,7 +6245,7 @@ mod tests {
         )
         .expect_err("auto should be rejected");
 
-        assert!(error.contains("full, summary, body"));
+        assert!(error.contains("full, summary, body, maintenanceRules"));
     }
 
     #[test]

@@ -95,7 +95,7 @@ describe("parseAgentToolDefinition", () => {
     ]);
   });
 
-  it("keeps knowledge_read part restricted to full summary and body", () => {
+  it("exposes exact knowledge sections through knowledge_read", () => {
     const raw = readFileSync(resolve(cwd, "tools/knowledge_read.json"), "utf8");
     const definition = JSON.parse(raw);
     const tool = parseAgentToolDefinition({
@@ -111,11 +111,35 @@ describe("parseAgentToolDefinition", () => {
       "full",
       "summary",
       "body",
+      "maintenanceRules",
     ]);
     expect(tool?.parameterRows.find((row) => row.path === "part")?.defaultValue).toBe("full");
+    expect(definition.description).toContain("exactly the stored text");
+    expect(definition.description).toContain("no heading, trimming, placeholder, added newline, or runtime annotation");
   });
 
-  it("keeps knowledge_edit limited to document content sections", () => {
+  it("keeps edit limited to one public file edit", () => {
+    const raw = readFileSync(resolve(cwd, "tools/edit.json"), "utf8");
+    const definition = JSON.parse(raw);
+    const tool = parseAgentToolDefinition({
+      name: "edit",
+      ...definition,
+    });
+
+    expect(tool).not.toBeNull();
+    expect(definition.parameters.additionalProperties).toBe(false);
+    expect(tool?.topLevelRequired).toEqual(["filePath", "oldString", "newString"]);
+    expect(tool?.parameterRows.map((row) => row.path)).toEqual([
+      "filePath",
+      "oldString",
+      "newString",
+      "replaceAll",
+    ]);
+    expect(tool?.parameterRows.some((row) => row.path === "edits")).toBe(false);
+    expect(tool?.parameterRows.find((row) => row.path === "replaceAll")?.defaultValue).toBe("false");
+  });
+
+  it("keeps knowledge_edit limited to one targeted document edit", () => {
     const raw = readFileSync(resolve(cwd, "tools/knowledge_edit.json"), "utf8");
     const definition = JSON.parse(raw);
     const tool = parseAgentToolDefinition({
@@ -125,26 +149,21 @@ describe("parseAgentToolDefinition", () => {
 
     expect(tool).not.toBeNull();
     expect(definition.parameters.additionalProperties).toBe(false);
-    expect(definition.parameters.properties.document.additionalProperties).toBe(false);
-    expect(tool?.topLevelRequired).toEqual(["path", "document"]);
+    expect(tool?.topLevelRequired).toEqual(["path", "section", "oldString", "newString"]);
     expect(tool?.parameterRows.map((row) => row.path)).toEqual([
       "path",
-      "document",
-      "document.summary",
-      "document.body",
-      "document.maintenanceRules",
-      "document.edits",
-      "document.edits[]",
-      "document.edits[].section",
-      "document.edits[].oldString",
-      "document.edits[].newString",
-      "document.edits[].replaceAll",
+      "section",
+      "oldString",
+      "newString",
     ]);
-    expect(tool?.parameterRows.find((row) => row.path === "document.edits[].section")?.enumValues).toEqual([
+    expect(tool?.parameterRows.every((row) => row.required)).toBe(true);
+    expect(tool?.parameterRows.find((row) => row.path === "section")?.enumValues).toEqual([
       "summary",
       "body",
       "maintenanceRules",
     ]);
+    expect(definition.description).toContain("`part` equal to `section`");
+    expect(definition.description).toContain("`full` is a rendered reading view");
   });
 
   it("keeps knowledge_create free of metadata and directory config patches", () => {

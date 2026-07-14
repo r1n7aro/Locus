@@ -2982,9 +2982,10 @@ pub(crate) fn read_skill_package_document_sync(
         "" | "full" => "full",
         "summary" => "summary",
         "body" => "body",
+        "maintenanceRules" => "maintenanceRules",
         other => {
             return Err(format!(
-                "knowledge_read part must be one of: full, summary, body (got '{}')",
+                "knowledge_read part must be one of: full, summary, body, maintenanceRules (got '{}')",
                 other
             ))
         }
@@ -3021,6 +3022,11 @@ pub(crate) fn read_skill_package_document_sync(
                 document.summary_enabled = false;
                 document.maintenance_rules = None;
                 document.explicit_maintenance_rules = false;
+            }
+            "maintenanceRules" => {
+                document.summary = None;
+                document.summary_enabled = false;
+                document.body.clear();
             }
             _ => unreachable!("normalized_part only returns known values"),
         }

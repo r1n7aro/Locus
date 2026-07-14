@@ -74,7 +74,7 @@ interface KnowledgeReadPayload {
   createdAt: number;
   updatedAt: number;
   hasBodyContent?: boolean;
-  part?: "full" | "summary" | "body";
+  part?: "full" | "summary" | "body" | "maintenanceRules";
   fileMetadata?: KnowledgeDocument["fileMetadata"];
 }
 

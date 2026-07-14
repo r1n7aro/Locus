@@ -837,38 +837,6 @@ impl AgentKnowledgeDocumentContentPatch {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AgentKnowledgeDocumentEditPatch {
-    #[serde(default)]
-    summary: Option<Option<String>>,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    maintenance_rules: Option<Option<String>>,
-    #[serde(default)]
-    edits: Vec<crate::knowledge_store::KnowledgeDocumentEditOperation>,
-}
-
-impl AgentKnowledgeDocumentEditPatch {
-    fn is_empty(&self) -> bool {
-        self.summary.is_none()
-            && self.body.is_none()
-            && self.maintenance_rules.is_none()
-            && self.edits.is_empty()
-    }
-
-    fn into_document_patch(self) -> crate::knowledge_store::KnowledgeDocumentPatch {
-        crate::knowledge_store::KnowledgeDocumentPatch {
-            summary: self.summary,
-            body: self.body.map(Some),
-            maintenance_rules: self.maintenance_rules,
-            edits: self.edits,
-            ..Default::default()
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentKnowledgeCreateArgs {
@@ -882,7 +850,55 @@ struct AgentKnowledgeCreateArgs {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentKnowledgeEditArgs {
     path: String,
-    document: AgentKnowledgeDocumentEditPatch,
+    section: crate::knowledge_store::KnowledgeDocumentEditSection,
+    old_string: String,
+    new_string: String,
+}
+
+impl AgentKnowledgeEditArgs {
+    fn edit_operation(&self) -> crate::knowledge_store::KnowledgeDocumentEditOperation {
+        crate::knowledge_store::KnowledgeDocumentEditOperation {
+            section: self.section,
+            old_string: self.old_string.clone(),
+            new_string: self.new_string.clone(),
+            replace_all: false,
+        }
+    }
+
+    fn into_path_and_document_patch(
+        self,
+    ) -> (String, crate::knowledge_store::KnowledgeDocumentPatch) {
+        let Self {
+            path,
+            section,
+            old_string,
+            new_string,
+        } = self;
+        let patch = crate::knowledge_store::KnowledgeDocumentPatch {
+            edits: vec![crate::knowledge_store::KnowledgeDocumentEditOperation {
+                section,
+                old_string,
+                new_string,
+                replace_all: false,
+            }],
+            ..Default::default()
+        };
+        (path, patch)
+    }
+}
+
+fn parse_agent_knowledge_edit_args(
+    args: &serde_json::Value,
+) -> Result<AgentKnowledgeEditArgs, serde_json::Error> {
+    let mut normalized = args.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        for (snake_case, camel_case) in [("old_string", "oldString"), ("new_string", "newString")] {
+            if let Some(value) = object.remove(snake_case) {
+                object.entry(camel_case).or_insert(value);
+            }
+        }
+    }
+    serde_json::from_value(normalized)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1292,16 +1308,7 @@ fn build_knowledge_document_edit_preview(
     let before_text = crate::knowledge_store::render_document_preview(&current)?;
 
     let mut next = current;
-    if let Some(summary) = parsed.document.summary.clone() {
-        next.summary = summary;
-    }
-    if let Some(body) = parsed.document.body.clone() {
-        next.body = body;
-    }
-    if let Some(maintenance_rules) = parsed.document.maintenance_rules.clone() {
-        next.maintenance_rules = maintenance_rules;
-    }
-    crate::knowledge_store::apply_document_content_edits(&mut next, &parsed.document.edits)?;
+    crate::knowledge_store::apply_document_content_edit(&mut next, &parsed.edit_operation())?;
     next = crate::knowledge_store::prepare_document_preview(next)?;
 
     Ok(KnowledgeToolConfirmPreview {
@@ -1498,7 +1505,7 @@ fn assess_knowledge_tool_confirmation(
             })
         }
         "knowledge_edit" => {
-            let parsed = serde_json::from_value::<AgentKnowledgeEditArgs>(args.clone())
+            let parsed = parse_agent_knowledge_edit_args(args)
                 .map_err(|error| format!("Error parsing knowledge_edit arguments: {}", error))?;
             Some(build_knowledge_document_edit_preview(working_dir, &parsed)?)
         }
@@ -5336,20 +5343,16 @@ impl AgentInstance {
         document: &crate::knowledge_store::KnowledgeDocument,
         part: &str,
     ) -> AgentKnowledgeDocumentContent {
-        let summary = if part == "body" {
-            None
-        } else {
-            crate::knowledge_store::active_summary(document).map(str::to_string)
-        };
-        let maintenance_rules = if part == "full" {
-            crate::knowledge_store::active_maintenance_rules(document).map(str::to_string)
-        } else {
-            None
-        };
-        let body = if part == "summary" {
-            None
-        } else {
-            Some(document.body.clone())
+        let (summary, maintenance_rules, body) = match part {
+            "full" => (
+                crate::knowledge_store::active_summary(document).map(str::to_string),
+                crate::knowledge_store::active_maintenance_rules(document).map(str::to_string),
+                Some(document.body.clone()),
+            ),
+            "summary" => (document.summary.clone(), None, None),
+            "body" => (None, None, Some(document.body.clone())),
+            "maintenanceRules" => (None, document.maintenance_rules.clone(), None),
+            _ => (None, None, None),
         };
 
         AgentKnowledgeDocumentContent {
@@ -5461,22 +5464,13 @@ impl AgentInstance {
 
     fn format_knowledge_read_output(response: &AgentKnowledgeReadResponse) -> String {
         match response.part.as_str() {
-            "summary" => response
+            "summary" => response.document.summary.clone().unwrap_or_default(),
+            "body" => response.document.body.clone().unwrap_or_default(),
+            "maintenanceRules" => response
                 .document
-                .summary
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("<empty>")
-                .to_string(),
-            "body" => response
-                .document
-                .body
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("<empty>")
-                .to_string(),
+                .maintenance_rules
+                .clone()
+                .unwrap_or_default(),
             _ => {
                 let mut output = String::new();
                 output.push_str("# ");
@@ -11216,6 +11210,7 @@ impl AgentInstance {
                     }
                 };
                 let mut output = Self::format_knowledge_read_output(&sanitized);
+                let include_runtime_annotations = sanitized.part == "full";
 
                 let compile_note = match self
                     .compile_skill_package_unity_scripts_for_knowledge_read(
@@ -11244,14 +11239,16 @@ impl AgentInstance {
                         ))
                     }
                 };
-                if let Some(note) = compile_note {
-                    output.push_str("\n\n");
-                    output.push_str(&note);
-                }
-                if !activated_tools.is_empty() {
-                    output.push_str("\n\n");
-                    output.push_str("Loaded Skill document tools for the next step: ");
-                    output.push_str(&activated_tools.join(", "));
+                if include_runtime_annotations {
+                    if let Some(note) = compile_note {
+                        output.push_str("\n\n");
+                        output.push_str(&note);
+                    }
+                    if !activated_tools.is_empty() {
+                        output.push_str("\n\n");
+                        output.push_str("Loaded Skill document tools for the next step: ");
+                        output.push_str(&activated_tools.join(", "));
+                    }
                 }
                 ExecutedToolResult::from_tool_result(ToolResult {
                     output,
@@ -11478,7 +11475,7 @@ impl AgentInstance {
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
-        let parsed = match serde_json::from_value::<AgentKnowledgeEditArgs>(args.clone()) {
+        let parsed = match parse_agent_knowledge_edit_args(args) {
             Ok(value) if !value.path.trim().is_empty() => value,
             Ok(_) => {
                 return ToolResult {
@@ -11494,19 +11491,12 @@ impl AgentInstance {
             }
         };
 
-        if parsed.document.is_empty() {
-            return ToolResult {
-                output: "Error: knowledge_edit requires at least one document content field."
-                    .to_string(),
-                is_error: true,
-            };
-        }
-
+        let (path, document) = parsed.into_path_and_document_patch();
         let request = crate::knowledge_store::KnowledgeEditRequest {
             kind: crate::knowledge_store::KnowledgeTargetKind::Document,
-            path: parsed.path,
+            path,
             doc_type: None,
-            document: Some(parsed.document.into_document_patch()),
+            document: Some(document),
             config: None,
         };
 
@@ -17418,13 +17408,9 @@ Search, install, audit, and export a plugin.
             "knowledge_edit",
             &json!({
                 "path": "design/combat/core-loop.md",
-                "document": {
-                    "edits": [{
-                        "section": "body",
-                        "oldString": "Damage remains 15.",
-                        "newString": "Damage remains 30."
-                    }]
-                }
+                "section": "body",
+                "oldString": "Damage remains 15.",
+                "newString": "Damage remains 30."
             }),
         )
         .expect_err("knowledge_edit confirmation preflight should fail");
@@ -17432,10 +17418,94 @@ Search, install, audit, and export a plugin.
         match decision {
             ToolConfirmDecision::PreflightError { output } => {
                 assert!(output.contains("Error preparing knowledge_edit confirmation preview"));
-                assert!(output.contains("document.edits[0] body"));
+                assert!(output.contains("section body"));
                 assert!(output.contains("Could not find oldString"));
             }
             _ => panic!("expected knowledge_edit preflight error"),
+        }
+    }
+
+    #[test]
+    fn knowledge_edit_confirm_preview_applies_single_edit() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.body = "Damage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        let mut args = json!({
+            "path": "design/combat/core-loop.md",
+            "section": "body",
+            "oldString": "Damage remains 20.",
+            "newString": "Damage remains 30."
+        });
+        super::normalize_tool_args(&mut args);
+
+        let inspection = assess_knowledge_tool_confirmation(&working_dir, "knowledge_edit", &args)
+            .expect("inspect knowledge edit")
+            .expect("knowledge preview");
+
+        assert!(inspection
+            .preview
+            .document_before_text
+            .as_deref()
+            .is_some_and(|text| text.contains("Damage remains 20.")));
+        assert!(inspection
+            .preview
+            .document_after_text
+            .as_deref()
+            .is_some_and(|text| text.contains("Damage remains 30.")));
+    }
+
+    #[test]
+    fn knowledge_edit_confirm_preview_requires_a_unique_match() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.body = "Damage remains 20.\nDamage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        let error = assess_knowledge_tool_confirmation(
+            &working_dir,
+            "knowledge_edit",
+            &json!({
+                "path": "design/combat/core-loop.md",
+                "section": "body",
+                "oldString": "Damage remains 20.",
+                "newString": "Damage remains 30."
+            }),
+        )
+        .expect_err("duplicate oldString should fail preflight");
+
+        assert!(error.contains("Found multiple matches for oldString at lines: 1, 2"));
+        assert!(error.contains("oldString matches exactly once"));
+        assert!(!error.contains("replaceAll"));
+    }
+
+    #[test]
+    fn knowledge_edit_args_reject_removed_wrappers_and_batch_fields() {
+        for removed_field in [
+            "document",
+            "edit",
+            "edits",
+            "replaceAll",
+            "summary",
+            "body",
+            "maintenanceRules",
+        ] {
+            let mut args = json!({
+                "path": "design/combat/core-loop.md",
+                "section": "body",
+                "oldString": "Damage remains 20.",
+                "newString": "Damage remains 30."
+            });
+            args.as_object_mut()
+                .expect("knowledge_edit args")
+                .insert(removed_field.to_string(), json!("removed"));
+            let error = super::parse_agent_knowledge_edit_args(&args)
+                .expect_err("removed knowledge_edit field should be rejected");
+
+            assert!(error.to_string().contains("unknown field"), "{error}");
         }
     }
 
@@ -18607,20 +18677,81 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn knowledge_read_output_returns_plain_text_for_summary_part() {
-        let output = AgentInstance::format_knowledge_read_output(&AgentKnowledgeReadResponse {
-            document: AgentKnowledgeDocumentContent {
-                doc_type: KnowledgeType::Design,
-                path: "design/project-overview.md".to_string(),
-                title: "Project Overview".to_string(),
-                summary: Some("Summary".to_string()),
-                maintenance_rules: None,
-                body: None,
-            },
-            part: "summary".to_string(),
-        });
+    fn knowledge_read_output_preserves_exact_section_boundaries() {
+        let summary_output =
+            AgentInstance::format_knowledge_read_output(&AgentKnowledgeReadResponse {
+                document: AgentKnowledgeDocumentContent {
+                    doc_type: KnowledgeType::Design,
+                    path: "design/project-overview.md".to_string(),
+                    title: "Project Overview".to_string(),
+                    summary: Some("  Summary\n".to_string()),
+                    maintenance_rules: None,
+                    body: None,
+                },
+                part: "summary".to_string(),
+            });
+        let body_output =
+            AgentInstance::format_knowledge_read_output(&AgentKnowledgeReadResponse {
+                document: AgentKnowledgeDocumentContent {
+                    doc_type: KnowledgeType::Design,
+                    path: "design/project-overview.md".to_string(),
+                    title: "Project Overview".to_string(),
+                    summary: None,
+                    maintenance_rules: None,
+                    body: Some("Body\n\n".to_string()),
+                },
+                part: "body".to_string(),
+            });
+        let rules_output =
+            AgentInstance::format_knowledge_read_output(&AgentKnowledgeReadResponse {
+                document: AgentKnowledgeDocumentContent {
+                    doc_type: KnowledgeType::Design,
+                    path: "design/project-overview.md".to_string(),
+                    title: "Project Overview".to_string(),
+                    summary: None,
+                    maintenance_rules: Some(" Rules ".to_string()),
+                    body: None,
+                },
+                part: "maintenanceRules".to_string(),
+            });
+        let empty_output =
+            AgentInstance::format_knowledge_read_output(&AgentKnowledgeReadResponse {
+                document: AgentKnowledgeDocumentContent {
+                    doc_type: KnowledgeType::Design,
+                    path: "design/project-overview.md".to_string(),
+                    title: "Project Overview".to_string(),
+                    summary: None,
+                    maintenance_rules: None,
+                    body: None,
+                },
+                part: "maintenanceRules".to_string(),
+            });
 
-        assert_eq!(output, "Summary");
+        assert_eq!(summary_output, "  Summary\n");
+        assert_eq!(body_output, "Body\n\n");
+        assert_eq!(rules_output, " Rules ");
+        assert_eq!(empty_output, "");
+    }
+
+    #[test]
+    fn knowledge_read_exact_parts_use_the_fields_targeted_by_knowledge_edit() {
+        let mut document =
+            sample_agent_knowledge_document("design/project-overview.md", "Project Overview");
+        document.summary_enabled = false;
+        document.explicit_maintenance_rules = false;
+        document.summary = Some("Cached summary".to_string());
+        document.maintenance_rules = Some("Cached rules".to_string());
+
+        let summary = AgentInstance::sanitize_knowledge_document_content(&document, "summary");
+        let rules =
+            AgentInstance::sanitize_knowledge_document_content(&document, "maintenanceRules");
+
+        assert_eq!(summary.summary.as_deref(), Some("Cached summary"));
+        assert!(summary.maintenance_rules.is_none());
+        assert!(summary.body.is_none());
+        assert_eq!(rules.maintenance_rules.as_deref(), Some("Cached rules"));
+        assert!(rules.summary.is_none());
+        assert!(rules.body.is_none());
     }
 
     #[test]

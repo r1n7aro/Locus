@@ -1,5 +1,5 @@
 {
-  "description": "Read a unified knowledge document by type-prefixed path. When structure shows `skill/<package-id>/ [package]`, pass `skill/<package-id>` directly to read that package's root `SKILL.md`. Package child docs can be read by their package-relative `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
+  "description": "Read a unified knowledge document by type-prefixed path. When structure shows `skill/<package-id>/ [package]`, pass `skill/<package-id>` directly to read that package's root `SKILL.md`. Package child docs can be read by their package-relative `.md` path. `full` returns a rendered Markdown view for reading. `summary`, `body`, and `maintenanceRules` return exactly the stored text targeted by the matching `knowledge_edit.section`, with no heading, trimming, placeholder, added newline, or runtime annotation. A section result may be empty. Before editing, read the matching section part and copy the target text verbatim into `oldString`.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -10,8 +10,8 @@
       },
       "part": {
         "type": "string",
-        "enum": ["full", "summary", "body"],
-        "description": "Which content section to read. `full` returns the markdown document body, `summary` returns the summary text only, and `body` returns the body text only.",
+        "enum": ["full", "summary", "body", "maintenanceRules"],
+        "description": "Content to read. `full` is a rendered view. A section value returns the exact stored text for the same `knowledge_edit.section` and may be empty.",
         "default": "full"
       }
     },

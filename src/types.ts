@@ -1627,7 +1627,7 @@ export interface KnowledgeReadInput {
   kind: KnowledgeTargetKind;
   path: string;
   type?: KnowledgeDocumentType;
-  part?: "full" | "summary" | "body";
+  part?: "full" | "summary" | "body" | "maintenanceRules";
 }
 
 export interface KnowledgeCreateInput {

@@ -1,5 +1,5 @@
 {
-  "description": "Edit an existing unified knowledge document by type-prefixed `.md` path. This tool updates full content sections and can also replace specific text inside a section. Knowledge metadata and directory config use dedicated knowledge tools. Returns a plain-text status line.",
+  "description": "Edit one exact text range in an existing unified knowledge document. Before editing, call `knowledge_read` with `part` equal to `section`; section reads return the exact editable text without headings, trimming, placeholders, added newlines, or runtime annotations. Copy the target text verbatim into `oldString`. Use an empty `oldString` only to replace the whole section. `full` is a rendered reading view and is not an `oldString` source. Returns a plain-text status line.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -8,45 +8,20 @@
         "type": "string",
         "description": "Current type-prefixed document path. Document paths must end with `.md`, for example `memory/preferences/editor.md`."
       },
-      "document": {
-        "type": "object",
-        "additionalProperties": false,
-        "description": "Document content patch. Provide one or more sections to update.",
-        "properties": {
-          "summary": { "type": ["string", "null"] },
-          "body": { "type": "string" },
-          "maintenanceRules": { "type": ["string", "null"] },
-          "edits": {
-            "type": "array",
-            "description": "Partial replacements to apply sequentially after any full section fields in this request.",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "section": {
-                  "type": "string",
-                  "enum": ["summary", "body", "maintenanceRules"],
-                  "description": "Document section to edit."
-                },
-                "oldString": {
-                  "type": "string",
-                  "description": "Exact text to find inside the selected section. Use an empty string to replace the whole section."
-                },
-                "newString": {
-                  "type": "string",
-                  "description": "Replacement text for oldString."
-                },
-                "replaceAll": {
-                  "type": "boolean",
-                  "description": "Replace every occurrence in the selected section. Default is false."
-                }
-              },
-              "required": ["section", "oldString", "newString"]
-            }
-          }
-        }
+      "section": {
+        "type": "string",
+        "enum": ["summary", "body", "maintenanceRules"],
+        "description": "Document section to edit. Use the same value as `knowledge_read.part` before editing."
+      },
+      "oldString": {
+        "type": "string",
+        "description": "Exact text copied from the matching `knowledge_read` section result. Use an empty string only to replace the whole section."
+      },
+      "newString": {
+        "type": "string",
+        "description": "Replacement text for oldString."
       }
     },
-    "required": ["path", "document"]
+    "required": ["path", "section", "oldString", "newString"]
   }
 }

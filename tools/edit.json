@@ -1,7 +1,8 @@
 {
-  "description": "Edits an existing file by replacing specific strings with new ones. Supports both single and batch edits.\n\nUsage:\n- oldString must match exactly (including whitespace and indentation)\n- read output prefixes every line with a line number and a tab — that prefix is NOT part of the file; strip it before using line content in oldString/newString\n- If oldString appears multiple times, provide more surrounding context to make it unique\n- Set replaceAll=true to replace every occurrence\n- Read the file first to understand its current content before editing\n- For multiple edits to the same file, use the 'edits' array to apply all changes in one call\n- When using 'edits', do NOT provide top-level oldString/newString\n- Edits are applied sequentially, so later edits see the result of earlier ones\n- When C# code analysis and edit/write diagnostics are enabled, successful .cs edits append capped file-scope diagnostics automatically",
+  "description": "Edits an existing file by replacing one exact string with new text.\n\nUsage:\n- oldString must match exactly (including whitespace and indentation)\n- read output prefixes every line with a line number and a tab — that prefix is NOT part of the file; strip it before using line content in oldString/newString\n- If oldString appears multiple times, provide more surrounding context to make it unique\n- Set replaceAll=true to replace every occurrence\n- Read the file first to understand its current content before editing\n- When C# code analysis and edit/write diagnostics are enabled, successful .cs edits append capped file-scope diagnostics automatically",
   "parameters": {
     "type": "object",
+    "additionalProperties": false,
     "properties": {
       "filePath": {
         "type": "string",
@@ -9,39 +10,18 @@
       },
       "oldString": {
         "type": "string",
-        "description": "The exact text to find and replace (for single edit mode)"
+        "description": "The exact text to find and replace"
       },
       "newString": {
         "type": "string",
-        "description": "The text to replace it with (for single edit mode)"
+        "description": "The text to replace it with"
       },
       "replaceAll": {
         "type": "boolean",
-        "description": "Replace all occurrences (default: false, for single edit mode)"
-      },
-      "edits": {
-        "type": "array",
-        "description": "Array of edit operations to apply sequentially to the same file (batch edit mode)",
-        "items": {
-          "type": "object",
-          "properties": {
-            "oldString": {
-              "type": "string",
-              "description": "The exact text to find and replace"
-            },
-            "newString": {
-              "type": "string",
-              "description": "The text to replace it with"
-            },
-            "replaceAll": {
-              "type": "boolean",
-              "description": "Replace all occurrences (default: false)"
-            }
-          },
-          "required": ["oldString", "newString"]
-        }
+        "description": "Replace all occurrences. Default is false.",
+        "default": false
       }
     },
-    "required": ["filePath"]
+    "required": ["filePath", "oldString", "newString"]
   }
 }
