@@ -1013,7 +1013,6 @@ fn manual_pooling_to_fastembed(pooling: ManualPoolingMode) -> Option<Pooling> {
     }
 }
 
-#[cfg(windows)]
 fn manual_pooling_from_fastembed(pooling: Pooling) -> ManualPoolingMode {
     match pooling {
         Pooling::Cls => ManualPoolingMode::Cls,
