@@ -395,7 +395,7 @@ pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::Permissions::from_mode(0o755);
             let _ = std::fs::set_permissions(&python, mode.clone());
-            let _ = std::fs::set_permissions(&python3, mode);
+            let _ = std::fs::set_permissions(&python3, mode.clone());
             let _ = std::fs::set_permissions(&pip, mode.clone());
             let _ = std::fs::set_permissions(&pip3, mode);
         }
