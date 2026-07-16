@@ -359,7 +359,57 @@ pub fn python_prompt_display(app_handle: Option<&AppHandle>) -> String {
     }
 }
 
-pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
+/// Env assignments that let the selected runtime locate its own stdlib and
+/// package dir. Scoped to individual python/pip invocations (shell function
+/// prefix, PATH shims) instead of the whole shell environment so unrelated
+/// Python distributions (uvx, venv, conda, tool-bundled interpreters) never
+/// inherit a foreign PYTHONHOME/PYTHONPATH and crash on startup.
+fn python_invocation_env(runtime: &ResolvedPythonRuntime) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if let Some(home) = &runtime.home {
+        env.push(("PYTHONHOME", home.display().to_string()));
+    }
+    if matches!(runtime.source, PythonRuntimeSource::Managed) {
+        env.push(("PYTHONNOUSERSITE", "1".to_string()));
+        env.push(("PIP_DISABLE_PIP_VERSION_CHECK", "1".to_string()));
+        env.push(("PIP_NO_WARN_SCRIPT_LOCATION", "1".to_string()));
+        if let Some(package_dir) = &runtime.package_dir {
+            env.push(("PIP_TARGET", package_dir.display().to_string()));
+        }
+    }
+    env
+}
+
+fn managed_package_dir(runtime: &ResolvedPythonRuntime) -> Option<&PathBuf> {
+    if matches!(runtime.source, PythonRuntimeSource::Managed) {
+        runtime.package_dir.as_ref()
+    } else {
+        None
+    }
+}
+
+/// `VAR='value' ` assignment prefix for sh function bodies and shim scripts.
+/// PYTHONPATH prepends the managed package dir while preserving a caller
+/// PYTHONPATH via `${PYTHONPATH:+<sep>$PYTHONPATH}`.
+fn sh_python_env_assignments(runtime: &ResolvedPythonRuntime) -> String {
+    let mut assigns = String::new();
+    for (key, value) in python_invocation_env(runtime) {
+        assigns.push_str(key);
+        assigns.push('=');
+        assigns.push_str(&shell_quote_posix(&value.replace('\\', "/")));
+        assigns.push(' ');
+    }
+    if let Some(package_dir) = managed_package_dir(runtime) {
+        let quoted = shell_quote_posix(&package_dir.display().to_string().replace('\\', "/"));
+        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        assigns.push_str(&format!(
+            "PYTHONPATH={quoted}\"${{PYTHONPATH:+{sep}$PYTHONPATH}}\" "
+        ));
+    }
+    assigns
+}
+
+pub fn ensure_python_shim_dir(runtime: &ResolvedPythonRuntime) -> Option<PathBuf> {
     let dir = crate::commands::persistent_config_dir()
         .ok()?
         .join("runtime-shims")
@@ -368,9 +418,21 @@ pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        let target = python_path.display().to_string();
-        let shim = format!("@echo off\r\n\"{}\" %*\r\n", target);
-        let pip_shim = format!("@echo off\r\n\"{}\" -m pip %*\r\n", target);
+        let target = runtime.path.display().to_string();
+        // The shim is its own cmd.exe process, so `set` stays local to one
+        // python/pip invocation and nothing leaks into the caller.
+        let mut env_lines = String::new();
+        for (key, value) in python_invocation_env(runtime) {
+            env_lines.push_str(&format!("set \"{}={}\"\r\n", key, value));
+        }
+        if let Some(package_dir) = managed_package_dir(runtime) {
+            let pkg = package_dir.display().to_string();
+            env_lines.push_str(&format!(
+                "if defined PYTHONPATH (set \"PYTHONPATH={pkg};%PYTHONPATH%\") else (set \"PYTHONPATH={pkg}\")\r\n"
+            ));
+        }
+        let shim = format!("@echo off\r\n{}\"{}\" %*\r\n", env_lines, target);
+        let pip_shim = format!("@echo off\r\n{}\"{}\" -m pip %*\r\n", env_lines, target);
         std::fs::write(dir.join("python.cmd"), &shim).ok()?;
         std::fs::write(dir.join("python3.cmd"), shim).ok()?;
         std::fs::write(dir.join("pip.cmd"), &pip_shim).ok()?;
@@ -379,9 +441,10 @@ pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let target = shell_quote_posix(&python_path.display().to_string());
-        let shim = format!("#!/bin/sh\nexec {} \"$@\"\n", target);
-        let pip_shim = format!("#!/bin/sh\nexec {} -m pip \"$@\"\n", target);
+        let target = shell_quote_posix(&runtime.path.display().to_string());
+        let assigns = sh_python_env_assignments(runtime);
+        let shim = format!("#!/bin/sh\n{}exec {} \"$@\"\n", assigns, target);
+        let pip_shim = format!("#!/bin/sh\n{}exec {} -m pip \"$@\"\n", assigns, target);
         let python = dir.join("python");
         let python3 = dir.join("python3");
         let pip = dir.join("pip");
@@ -406,24 +469,26 @@ pub fn ensure_python_shim_dir(python_path: &Path) -> Option<PathBuf> {
 
 pub fn prepend_python_to_path(
     current_path: Option<OsString>,
-    python_path: &Path,
+    runtime: &ResolvedPythonRuntime,
 ) -> Option<OsString> {
     let mut paths = Vec::new();
-    if let Some(shim_dir) = ensure_python_shim_dir(python_path) {
+    if let Some(shim_dir) = ensure_python_shim_dir(runtime) {
         paths.push(shim_dir);
     }
-    if let Some(parent) = python_path.parent() {
+    if let Some(parent) = runtime.path.parent() {
         paths.push(parent.to_path_buf());
     }
 
     crate::process_util::prepend_paths(current_path, paths)
 }
 
-pub fn sh_python_function_prefix(python_path: &Path) -> String {
-    let executable = shell_quote_posix(&python_path.display().to_string().replace('\\', "/"));
+pub fn sh_python_function_prefix(runtime: &ResolvedPythonRuntime) -> String {
+    let executable = shell_quote_posix(&runtime.path.display().to_string().replace('\\', "/"));
+    let assigns = sh_python_env_assignments(runtime);
     format!(
-        "python() {{ {} \"$@\"; }}\npython3() {{ {} \"$@\"; }}\npip() {{ {} -m pip \"$@\"; }}\npip3() {{ {} -m pip \"$@\"; }}\n",
-        executable, executable, executable, executable
+        "python() {{ {assigns}{exe} \"$@\"; }}\npython3() {{ {assigns}{exe} \"$@\"; }}\npip() {{ {assigns}{exe} -m pip \"$@\"; }}\npip3() {{ {assigns}{exe} -m pip \"$@\"; }}\n",
+        assigns = assigns,
+        exe = executable
     )
 }
 
@@ -888,7 +953,6 @@ mod tests {
         find_managed_python_executable, managed_python_executable_under,
         managed_python_version_tag, sh_python_function_prefix,
     };
-    use std::path::Path;
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -908,14 +972,66 @@ mod tests {
         );
     }
 
+    fn system_runtime(path: &str) -> super::ResolvedPythonRuntime {
+        super::ResolvedPythonRuntime {
+            path: std::path::PathBuf::from(path),
+            version: None,
+            source: super::PythonRuntimeSource::System,
+            home: None,
+            package_dir: None,
+            pip_zipapp: None,
+        }
+    }
+
+    fn managed_runtime(path: &str) -> super::ResolvedPythonRuntime {
+        let path = std::path::PathBuf::from(path);
+        super::ResolvedPythonRuntime {
+            home: path.parent().map(std::path::Path::to_path_buf),
+            package_dir: Some(std::path::PathBuf::from("E:/data/managed/site-packages")),
+            path,
+            version: Some("3.13.12".to_string()),
+            source: super::PythonRuntimeSource::Managed,
+            pip_zipapp: None,
+        }
+    }
+
     #[test]
     fn sh_prefix_defines_python_and_python3_functions() {
-        let prefix = sh_python_function_prefix(Path::new("C:/Tools/Python/python.exe"));
+        let prefix = sh_python_function_prefix(&system_runtime("C:/Tools/Python/python.exe"));
         assert!(prefix.contains("python()"));
         assert!(prefix.contains("python3()"));
         assert!(prefix.contains("pip()"));
         assert!(prefix.contains("pip3()"));
         assert!(prefix.contains("'C:/Tools/Python/python.exe'"));
+    }
+
+    #[test]
+    fn sh_prefix_scopes_runtime_env_to_the_invocation() {
+        let prefix = sh_python_function_prefix(&managed_runtime("F:\\gen\\python\\python.exe"));
+        // Self-location env rides inside the function bodies as per-invocation
+        // assignment prefixes, never as standalone exports.
+        assert!(prefix.contains("PYTHONHOME='F:/gen/python'"));
+        assert!(prefix.contains("PYTHONPATH='E:/data/managed/site-packages'"));
+        assert!(prefix.contains("PIP_TARGET='E:/data/managed/site-packages'"));
+        assert!(prefix.contains("${PYTHONPATH:+"));
+        assert!(!prefix.contains("export"));
+        for line in prefix.lines() {
+            assert!(
+                line.starts_with("python() {")
+                    || line.starts_with("python3() {")
+                    || line.starts_with("pip() {")
+                    || line.starts_with("pip3() {"),
+                "unexpected top-level line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sh_prefix_for_system_python_has_no_runtime_env() {
+        let prefix = sh_python_function_prefix(&system_runtime("/usr/bin/python3"));
+        assert!(!prefix.contains("PYTHONHOME"));
+        assert!(!prefix.contains("PYTHONPATH"));
+        assert!(!prefix.contains("PIP_TARGET"));
     }
 
     #[test]

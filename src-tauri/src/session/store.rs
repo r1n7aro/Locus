@@ -224,21 +224,29 @@ fn build_deleted_tool_result_message(path: &Path) -> String {
     )
 }
 
+/// Head+tail preview: CLI output puts errors and final results at the END, so
+/// a prefix-only preview hides exactly what the agent needs before it decides
+/// whether to Read the full file.
 fn estimate_preview(content: &str, max_chars: usize) -> (String, bool) {
-    let mut preview = String::new();
-    let mut count = 0usize;
-    let mut has_more = false;
-
-    for ch in content.chars() {
-        if count >= max_chars {
-            has_more = true;
-            break;
-        }
-        preview.push(ch);
-        count += 1;
+    let total = content.chars().count();
+    if total <= max_chars {
+        return (content.to_string(), false);
     }
 
-    (preview, has_more)
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars - head_chars;
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .skip(total - tail_chars)
+        .collect();
+    let preview = format!(
+        "{}\n\n... [{} chars omitted, see full output file] ...\n\n{}",
+        head,
+        total - head_chars - tail_chars,
+        tail
+    );
+    (preview, true)
 }
 
 fn tool_result_threshold(tool_name: &str) -> Option<usize> {
@@ -274,14 +282,12 @@ pub fn build_large_tool_result_message(result: &PersistedToolResult) -> String {
         result.filepath.display()
     ));
     message.push_str("Use the Read tool with this exact path if you need the full output.\n\n");
-    message.push_str(&format!(
-        "Preview (first {} chars):\n",
-        result.preview.chars().count()
-    ));
-    message.push_str(&result.preview);
     if result.has_more {
-        message.push_str("\n...");
+        message.push_str("Preview (head and tail of the output):\n");
+    } else {
+        message.push_str("Preview:\n");
     }
+    message.push_str(&result.preview);
     message.push('\n');
     message.push_str(LARGE_RESULT_TAG_CLOSE);
     message
@@ -4062,7 +4068,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_large_tool_result_message, PersistedToolResult, SessionStore,
+        build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionStore,
         CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER, RUN_STATUS_CANCELLING,
         RUN_STATUS_DONE,
     };
@@ -4083,6 +4089,23 @@ mod tests {
         .optional()
         .expect("query sqlite master")
         .is_some()
+    }
+
+    #[test]
+    fn estimate_preview_returns_short_content_unchanged() {
+        let (preview, has_more) = estimate_preview("hello", 10);
+        assert_eq!(preview, "hello");
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn estimate_preview_keeps_head_and_tail_of_large_output() {
+        let content = format!("BEGIN{}FATAL: the real error", "x".repeat(5000));
+        let (preview, has_more) = estimate_preview(&content, 100);
+        assert!(has_more);
+        assert!(preview.starts_with("BEGIN"));
+        assert!(preview.ends_with("FATAL: the real error"));
+        assert!(preview.contains("chars omitted"));
     }
 
     #[test]

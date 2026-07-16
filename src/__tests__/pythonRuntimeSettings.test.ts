@@ -156,9 +156,13 @@ describe("Python runtime settings", () => {
     expect(runtime).toContain("managed_python_package_dir");
     expect(runtime).toContain(".join(\"site-packages\")");
     expect(runtime).toContain("write_pip_module_shim");
-    expect(shell).toContain("PIP_TARGET");
-    expect(shell).toContain("PYTHONHOME");
-    expect(shell).toContain("managed_python_path_env");
+    // PIP_TARGET/PYTHONHOME ride inside per-invocation prefixes (function
+    // prefix + PATH shims) built in python_runtime.rs, not the global shell
+    // env — leaking them crashes unrelated Python distributions (uvx, venv).
+    expect(runtime).toContain("PIP_TARGET");
+    expect(runtime).toContain("PYTHONHOME");
+    expect(runtime).toContain("python_invocation_env");
+    expect(shell).toContain("sh_python_function_prefix");
     expect(bashTool).toContain("Managed Python installs pip packages into the Locus data directory by default");
   });
 

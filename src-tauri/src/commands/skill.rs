@@ -2267,7 +2267,7 @@ fn configure_skill_process_env(
     let mut path =
         augment_path_with_git(std::env::var_os("PATH")).or_else(|| std::env::var_os("PATH"));
     if let Some(python) = python {
-        path = crate::python_runtime::prepend_python_to_path(path, &python.path);
+        path = crate::python_runtime::prepend_python_to_path(path, python);
     }
     if let Some(path) = path {
         cmd.env("PATH", path);

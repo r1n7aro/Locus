@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use super::misc::truncate_utf8_prefix;
+use super::misc::truncate_utf8_middle;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::process_util::{
     async_command, augment_path_with_git, augment_path_with_github_cli, command,
@@ -58,11 +58,73 @@ pub fn shell_display_name() -> &'static str {
     }
 }
 
+/// Windows-only friction rules appended to the bash tool description when the
+/// shell is Git Bash. Kept out of tools/bash.json so macOS/Linux sessions
+/// never see them.
+const WINDOWS_SH_GUIDANCE: &str = "\n\nWindows (Git Bash) rules:\n\
+- Write paths with forward slashes ('F:/Proj/File.cs'); inside double quotes a backslash is an escape character, so \"F:\\dir\\\" swallows the closing quote\n\
+- Native tools may end lines with \\r: strip captured values with `tr -d '\\r'` before reusing them\n\
+- When embedding powershell.exe -Command, single-quote the whole command so bash does not expand $vars first; PowerShell error text can arrive garbled from legacy-codepage tools - prefer pure bash or the read/write/edit tools\n\
+- For content with nested quotes or backslashes (JSON, sed programs), write a python heredoc (python - <<'PY' ... PY) instead of stacking shell escape layers";
+
+/// Decode child-process output. Native Windows tools (PowerShell 5.1 cmdlets
+/// among others) emit legacy ANSI-codepage bytes (e.g. GBK on zh-CN systems);
+/// lossy UTF-8 alone turns their diagnostics into unreadable U+FFFD soup.
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(bytes);
+            // A mostly-valid UTF-8 stream with sparse invalid bytes is UTF-8
+            // with noise, not ANSI text; reinterpreting it as the ANSI
+            // codepage would garble the valid majority.
+            let replacements = lossy.matches('\u{FFFD}').count();
+            if replacements * 64 < lossy.chars().count() {
+                return lossy.into_owned();
+            }
+            decode_ansi_codepage(bytes).unwrap_or_else(|| lossy.into_owned())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn decode_ansi_codepage(bytes: &[u8]) -> Option<String> {
+    use windows::Win32::Globalization::{GetACP, MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+
+    let codepage = unsafe { GetACP() };
+    if codepage == 65001 {
+        // System codepage is UTF-8; the strict parse above already failed.
+        return None;
+    }
+    unsafe {
+        let needed = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, bytes, None);
+        if needed <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS, bytes, Some(&mut wide));
+        if written <= 0 {
+            return None;
+        }
+        wide.truncate(written as usize);
+        String::from_utf16(&wide).ok()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_ansi_codepage(_bytes: &[u8]) -> Option<String> {
+    None
+}
+
 pub(super) fn bash() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::BASH);
+    let mut description = prompt.description;
+    if cfg!(target_os = "windows") && detect_shell() == ShellKind::Sh {
+        description.push_str(WINDOWS_SH_GUIDANCE);
+    }
     ToolDef {
         name: "bash".to_string(),
-        description: prompt.description,
+        description,
         parameters: prompt.parameters,
         // Arbitrary shell commands can touch anything in the workspace.
         mutates_workspace: true,
@@ -124,7 +186,7 @@ pub(super) fn bash() -> ToolDef {
                     if let Some(ref python) = python {
                         format!(
                             "{}{}",
-                            crate::python_runtime::sh_python_function_prefix(&python.path),
+                            crate::python_runtime::sh_python_function_prefix(python),
                             command
                         )
                     } else {
@@ -181,8 +243,8 @@ pub(super) fn bash() -> ToolDef {
 
                 match result {
                     Ok(Ok(output)) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = decode_console_bytes(&output.stdout);
+                        let stderr = decode_console_bytes(&output.stderr);
 
                         let mut out = String::new();
                         out.push_str(&stdout);
@@ -190,10 +252,10 @@ pub(super) fn bash() -> ToolDef {
 
                         if out.len() > 50_000 {
                             let total_bytes = out.len();
-                            let truncated = truncate_utf8_prefix(&out, 50_000);
                             out = format!(
-                                "{}...\n\n(output truncated, {} bytes total)",
-                                truncated, total_bytes
+                                "{}\n\n(output truncated, {} bytes total)",
+                                truncate_utf8_middle(&out, 50_000),
+                                total_bytes
                             );
                         }
 
@@ -239,40 +301,20 @@ fn collect_shell_env(
 
     envs.push(("PYTHONIOENCODING".to_string(), OsString::from("utf-8")));
     envs.push(("PYTHONUTF8".to_string(), OsString::from("1")));
+    // Non-interactive agent session: no pagers, no ANSI color noise.
+    envs.push(("PAGER".to_string(), OsString::from("cat")));
+    envs.push(("GIT_PAGER".to_string(), OsString::from("cat")));
+    envs.push(("GH_PAGER".to_string(), OsString::from("cat")));
+    envs.push(("NO_COLOR".to_string(), OsString::from("1")));
+    // The managed runtime's PYTHONHOME/PYTHONPATH/PIP_* ride inside the
+    // python()/pip() function prefix and the PATH shims (per invocation), NOT
+    // here: a global export leaks into every child Python (uvx, venv, conda)
+    // and crashes it on startup with a foreign stdlib location.
     if let Some(python) = python {
         envs.push((
             "LOCUS_PYTHON".to_string(),
             python.path.clone().into_os_string(),
         ));
-        if let Some(ref home) = python.home {
-            envs.push(("PYTHONHOME".to_string(), home.clone().into_os_string()));
-        }
-        if matches!(
-            &python.source,
-            crate::python_runtime::PythonRuntimeSource::Managed
-        ) {
-            envs.push(("PYTHONNOUSERSITE".to_string(), OsString::from("1")));
-            envs.push((
-                "PIP_DISABLE_PIP_VERSION_CHECK".to_string(),
-                OsString::from("1"),
-            ));
-            envs.push((
-                "PIP_NO_WARN_SCRIPT_LOCATION".to_string(),
-                OsString::from("1"),
-            ));
-            if let Some(ref package_dir) = python.package_dir {
-                envs.push((
-                    "PIP_TARGET".to_string(),
-                    package_dir.clone().into_os_string(),
-                ));
-                if let Some(python_path) = crate::python_runtime::managed_python_path_env(
-                    std::env::var_os("PYTHONPATH"),
-                    python,
-                ) {
-                    envs.push(("PYTHONPATH".to_string(), python_path));
-                }
-            }
-        }
     }
 
     #[cfg(target_os = "windows")]
@@ -292,7 +334,7 @@ fn collect_shell_env(
     path = augment_path_with_git(path.clone()).or(path);
     path = augment_path_with_github_cli(path.clone()).or(path);
     if let Some(python) = python {
-        path = crate::python_runtime::prepend_python_to_path(path, &python.path);
+        path = crate::python_runtime::prepend_python_to_path(path, python);
     }
     if let Some(path) = path {
         envs.push(("PATH".to_string(), path));
@@ -710,6 +752,38 @@ mod tests {
     fn sh_single_quote_escapes_embedded_quotes() {
         assert_eq!(sh_single_quote("plain"), "'plain'");
         assert_eq!(sh_single_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn decode_console_bytes_passes_utf8_through() {
+        assert_eq!(decode_console_bytes("中文 ok".as_bytes()), "中文 ok");
+    }
+
+    #[test]
+    fn decode_console_bytes_keeps_mostly_utf8_streams_lossy() {
+        // A UTF-8 stream with one stray invalid byte must not be
+        // reinterpreted as ANSI text wholesale.
+        let mut bytes = "long valid utf-8 text with 中文 and more text".as_bytes().to_vec();
+        bytes.push(0xFF);
+        let decoded = decode_console_bytes(&bytes);
+        assert!(decoded.contains("long valid utf-8 text"));
+        assert!(decoded.contains('中'));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decode_console_bytes_recovers_ansi_codepage_text() {
+        use windows::Win32::Globalization::GetACP;
+        // "无法将" in GBK — the classic garbled PowerShell 5.1 error prefix.
+        let gbk: &[u8] = &[0xCE, 0xDE, 0xB7, 0xA8, 0xBD, 0xAB];
+        let decoded = decode_console_bytes(gbk);
+        if unsafe { GetACP() } == 936 {
+            assert_eq!(decoded, "无法将");
+        } else {
+            // On non-GBK systems the bytes may decode differently or fall
+            // back to lossy; the call must simply not panic.
+            assert!(!decoded.is_empty());
+        }
     }
 
     #[test]
