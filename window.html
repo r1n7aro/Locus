@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Locus</title>
+    <style>
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: #1d1d21;
+        color: #a1a4ad;
+        font-family: var(--font-ui, "SF Mono", SFMono-Regular, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas, "Liberation Mono", ui-monospace, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", monospace);
+        font-size: 14px;
+      }
+
+      html[data-theme="light"] body {
+        background: #f6f7f8;
+        color: #5b6270;
+      }
+
+      html[data-theme="dark"] body {
+        background: #1d1d21;
+        color: #a1a4ad;
+      }
+
+      #app:empty {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      #app:empty::before {
+        content: "Locus";
+      }
+    </style>
+  </head>
+
+  <body>
+    <script>
+      // Apply theme before Vue mounts to prevent flash of wrong theme.
+      (function(){
+        var key='locus-theme-preference';
+        var fallback='dark';
+        var p;try{p=localStorage.getItem(key)}catch(e){}
+        p=p==='light'||p==='dark'||p==='system'?p:fallback;
+        var t=p==='light'?'light':p==='dark'?'dark':
+          (window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+        document.documentElement.setAttribute('data-theme',t);
+      })();
+    </script>
+    <div id="app"></div>
+    <script type="module" src="/src/window-main.ts"></script>
+  </body>
+</html>

@@ -1,23 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const webviewWindowMocks = vi.hoisted(() => ({
+const subWindowMocks = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   getByLabelMock: vi.fn(),
-  createdWindows: [] as Array<unknown[]>,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: subWindowMocks.invokeMock,
 }));
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
   WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
-
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
-
-    once(event: string, callback: (...args: unknown[]) => void) {
-      if (event === "tauri://created") {
-        callback();
-      }
-    }
+    static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
 
@@ -30,60 +25,73 @@ import {
 
 describe("unityReferenceImportWindow", () => {
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.createdWindows.length = 0;
-  });
-
-  it("serializes the selected locale into the window url", () => {
-    expect(buildUnityReferenceImportWindowUrl({
-      targetPath: "reference-folder",
-      projectVersion: "2022.3.47f1",
-      docsVersion: "2022.3",
-      locale: "zh-CN",
-    })).toBe(
-      "/unity-reference-import?unityReferenceImport=1&targetPath=reference-folder&projectVersion=2022.3.47f1&docsVersion=2022.3&locale=zh-CN",
-    );
-  });
-
-  it("reads the locale from the window query string", () => {
-    expect(
-      getUnityReferenceImportWindowPayload(
-        "?unityReferenceImport=1&targetPath=reference-folder&projectVersion=2022.3.47f1&docsVersion=2022.3&locale=en",
-      ),
-    ).toMatchObject({
-      targetPath: "reference-folder",
-      projectVersion: "2022.3.47f1",
-      docsVersion: "2022.3",
-      locale: "en",
+    subWindowMocks.invokeMock.mockReset();
+    subWindowMocks.getByLabelMock.mockReset();
+    subWindowMocks.getByLabelMock.mockResolvedValue(null);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { pathname: "/", search: "" },
+        __TAURI_INTERNALS__: {
+          invoke: vi.fn(),
+          metadata: { currentWindow: { label: "main" } },
+        },
+      },
     });
   });
 
+  it("serializes the selected locale into the window url", () => {
+    const url = buildUnityReferenceImportWindowUrl({
+      targetPath: "reference-folder",
+      projectVersion: "2022.3.47f1",
+      docsVersion: "2022.3",
+      running: true,
+      locale: "zh-CN",
+    });
+
+    expect(url).toContain("/window.html?unityReferenceImport=1");
+    expect(url).toContain("locale=zh-CN");
+  });
+
+  it("reads the locale from the window query string", () => {
+    const payload = getUnityReferenceImportWindowPayload(
+      "?unityReferenceImport=1&targetPath=reference-folder&running=1&locale=zh-CN",
+    );
+
+    expect(payload.targetPath).toBe("reference-folder");
+    expect(payload.running).toBe(true);
+    expect(payload.locale).toBe("zh-CN");
+  });
+
   it("focuses an existing window without resetting state when no payload is provided", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "sub-pool-4",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
     await openUnityReferenceImportProgressWindow();
 
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({ focusExisting: true }),
+    });
     expect(existingWindow.emit).not.toHaveBeenCalled();
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
   });
 
-  it("pushes payload updates into an existing window and focuses it", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+  it("pushes payload updates into an existing window", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "unity-reference-import-progress",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
     await openUnityReferenceImportProgressWindow({
       targetPath: "reference-folder",
       running: true,
-      projectVersion: "2022.3.47f1",
-      docsVersion: "2022.3",
       locale: "zh-CN",
     });
 
@@ -92,28 +100,32 @@ describe("unityReferenceImportWindow", () => {
       expect.objectContaining({
         targetPath: "reference-folder",
         running: true,
-        projectVersion: "2022.3.47f1",
-        docsVersion: "2022.3",
         locale: "zh-CN",
       }),
     );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
   });
 
-  it("creates an independent top-level window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
-
-    await openUnityReferenceImportProgressWindow({
-      targetPath: "reference-folder",
-      projectVersion: "2022.3.47f1",
-      docsVersion: "2022.3",
-      locale: "en",
+  it("creates a fixed-size progress window through the sub-window command", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "unity-reference-import-progress",
+      existing: false,
+      pooled: true,
     });
 
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [, options] = webviewWindowMocks.createdWindows[0] as [string, Record<string, unknown>];
-    expect(options.parent).toBeUndefined();
-    expect(options.center).toBe(true);
-    expect(options.shadow).toBe(true);
+    await openUnityReferenceImportProgressWindow({ targetPath: "reference-folder" });
+
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({
+        kind: "unity-reference-import-progress",
+        title: "Locus Unity Docs",
+        width: 720,
+        height: 560,
+        resizable: false,
+        maximizable: false,
+        minimizable: false,
+        closable: false,
+        query: expect.stringContaining("unityReferenceImport=1"),
+      }),
+    });
   });
 });

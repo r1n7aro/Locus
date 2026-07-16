@@ -53,7 +53,7 @@ describe("chat responsive layout", () => {
   });
 
   it("keeps Unity and the native app on the same chat workspace contract", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
     const unityView = read("src/components/UnityEmbeddedSessionView.vue");
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
@@ -106,7 +106,7 @@ describe("chat responsive layout", () => {
   });
 
   it("pins chat resize to parent width instead of intrinsic child width", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
     const chatView = read("src/components/ChatView.vue");
     const shell = read("src/components/chat/ChatInputShell.vue");
     const composer = read("src/components/chat/ChatComposer.vue");
@@ -128,7 +128,7 @@ describe("chat responsive layout", () => {
   });
 
   it("keeps resize work out of the hot path while the window or session splitter is moving", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
     const chatView = read("src/components/ChatView.vue");
     const main = read("src/main.ts");
     const tauriRuntime = read("src/services/tauriRuntime.ts");

@@ -1550,7 +1550,8 @@ pub async fn knowledge_cancel_local_embedding_model_download(
 pub async fn knowledge_close_download_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) = app_handle.get_webview_window(KNOWLEDGE_DOWNLOAD_WINDOW_LABEL) else {
+    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_DOWNLOAD_WINDOW_LABEL)
+    else {
         return Ok(());
     };
     window.close().map_err(|error| {
@@ -1566,7 +1567,8 @@ pub async fn knowledge_close_download_progress_window(
 pub async fn knowledge_close_lexical_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) = app_handle.get_webview_window(KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
+    let Some(window) =
+        super::find_sub_window(&app_handle, KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
     else {
         return Ok(());
     };
@@ -1586,7 +1588,8 @@ pub async fn knowledge_close_lexical_progress_window(
 pub async fn knowledge_close_unity_reference_import_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) = app_handle.get_webview_window(UNITY_REFERENCE_IMPORT_WINDOW_LABEL) else {
+    let Some(window) = super::find_sub_window(&app_handle, UNITY_REFERENCE_IMPORT_WINDOW_LABEL)
+    else {
         return Ok(());
     };
     window.close().map_err(|error| {
@@ -1605,7 +1608,8 @@ pub async fn knowledge_close_unity_reference_import_progress_window(
 pub async fn knowledge_close_feishu_reference_import_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) = app_handle.get_webview_window(FEISHU_REFERENCE_IMPORT_WINDOW_LABEL) else {
+    let Some(window) = super::find_sub_window(&app_handle, FEISHU_REFERENCE_IMPORT_WINDOW_LABEL)
+    else {
         return Ok(());
     };
     window.close().map_err(|error| {

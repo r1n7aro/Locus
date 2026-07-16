@@ -1,4 +1,5 @@
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { emit } from "@tauri-apps/api/event";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const PLAN_VIEW_WINDOW_LABEL = "plan-view";
@@ -38,7 +39,7 @@ export function getPlanViewWindowPayload(
   };
 }
 
-export function buildPlanViewWindowUrl(payload: PlanViewWindowPayload): string {
+export function buildPlanViewWindowQuery(payload: PlanViewWindowPayload): string {
   const params = new URLSearchParams({
     [PLAN_VIEW_WINDOW_FLAG]: "1",
     planFilePath: payload.planFilePath,
@@ -46,7 +47,11 @@ export function buildPlanViewWindowUrl(payload: PlanViewWindowPayload): string {
   if (payload.questionId) {
     params.set("questionId", payload.questionId);
   }
-  return `${PLAN_VIEW_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildPlanViewWindowUrl(payload: PlanViewWindowPayload): string {
+  return buildSubWindowUrl(buildPlanViewWindowQuery(payload));
 }
 
 export async function openPlanViewWindow(
@@ -55,46 +60,27 @@ export async function openPlanViewWindow(
   if (!hasTauriWindowRuntime()) return false;
   if (!payload.planFilePath.trim()) return false;
 
-  const existingWindow = await WebviewWindow.getByLabel(PLAN_VIEW_WINDOW_LABEL);
-  if (existingWindow) {
-    await existingWindow.emit(PLAN_VIEW_WINDOW_EVENT, payload);
-    await existingWindow.setFocus();
-    return true;
+  const result = await openSubWindow({
+    kind: PLAN_VIEW_WINDOW_LABEL,
+    title: PLAN_VIEW_WINDOW_TITLE,
+    width: 920,
+    height: 760,
+    minWidth: 600,
+    minHeight: 420,
+    resizable: true,
+    maximizable: true,
+    minimizable: false,
+  }, buildPlanViewWindowQuery(payload));
+  if (result.existing) {
+    await result.window?.emit(PLAN_VIEW_WINDOW_EVENT, payload);
   }
-
-  await new Promise<void>((resolve, reject) => {
-    const planWindow = new WebviewWindow(PLAN_VIEW_WINDOW_LABEL, {
-      url: buildPlanViewWindowUrl(payload),
-      title: PLAN_VIEW_WINDOW_TITLE,
-      width: 920,
-      height: 760,
-      minWidth: 600,
-      minHeight: 420,
-      decorations: false,
-      resizable: true,
-      closable: true,
-      minimizable: false,
-      maximizable: true,
-      parent: getCurrentWebviewWindow(),
-      center: true,
-      shadow: true,
-    });
-
-    planWindow.once("tauri://created", () => {
-      resolve();
-    });
-    planWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
-
   return true;
 }
 
-/** Tell an open plan review window that the pending approval is settled. */
+/** Tell an open plan review window that the pending approval is settled.
+ *  Broadcast globally: the plan window may be pool-claimed under a pool
+ *  label, so it cannot be found by a fixed label anymore. */
 export async function broadcastPlanApprovalResolved(questionId: string): Promise<void> {
   if (!hasTauriWindowRuntime()) return;
-  const existingWindow = await WebviewWindow.getByLabel(PLAN_VIEW_WINDOW_LABEL);
-  if (!existingWindow) return;
-  await existingWindow.emit(PLAN_VIEW_RESOLVED_EVENT, { questionId });
+  await emit(PLAN_VIEW_RESOLVED_EVENT, { questionId });
 }

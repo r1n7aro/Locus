@@ -1,4 +1,5 @@
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export type ReferenceExternalImportSource = "feishu" | "unity" | "local";
 
@@ -39,7 +40,7 @@ export function getReferenceExternalImportWindowPayload(
   };
 }
 
-export function buildReferenceExternalImportWindowUrl(
+export function buildReferenceExternalImportWindowQuery(
   payload: ReferenceExternalImportWindowPayload = {},
 ): string {
   const params = new URLSearchParams({
@@ -58,42 +59,32 @@ export function buildReferenceExternalImportWindowUrl(
   ) {
     params.set("initialSource", payload.initialSource);
   }
-  return `${REFERENCE_EXTERNAL_IMPORT_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildReferenceExternalImportWindowUrl(
+  payload: ReferenceExternalImportWindowPayload = {},
+): string {
+  return buildSubWindowUrl(buildReferenceExternalImportWindowQuery(payload));
 }
 
 export async function openReferenceExternalImportWindow(
   payload: ReferenceExternalImportWindowPayload = {},
 ): Promise<void> {
-  const existingWindow = await WebviewWindow.getByLabel(REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL);
-  if (existingWindow) {
-    await existingWindow.emit(REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT, payload);
-    await existingWindow.setFocus();
-    return;
+  if (!hasTauriWindowRuntime()) return;
+  const result = await openSubWindow({
+    kind: REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL,
+    title: REFERENCE_EXTERNAL_IMPORT_WINDOW_TITLE,
+    width: 1180,
+    height: 900,
+    minWidth: 920,
+    minHeight: 700,
+    resizable: true,
+    maximizable: false,
+    minimizable: false,
+    closable: false,
+  }, buildReferenceExternalImportWindowQuery(payload));
+  if (result.existing) {
+    await result.window?.emit(REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT, payload);
   }
-
-  await new Promise<void>((resolve, reject) => {
-    const importWindow = new WebviewWindow(REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL, {
-      url: buildReferenceExternalImportWindowUrl(payload),
-      title: REFERENCE_EXTERNAL_IMPORT_WINDOW_TITLE,
-      width: 1180,
-      height: 900,
-      minWidth: 920,
-      minHeight: 700,
-      decorations: false,
-      resizable: true,
-      closable: false,
-      minimizable: false,
-      maximizable: false,
-      parent: getCurrentWebviewWindow(),
-      center: true,
-      shadow: true,
-    });
-
-    importWindow.once("tauri://created", () => {
-      resolve();
-    });
-    importWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
 }

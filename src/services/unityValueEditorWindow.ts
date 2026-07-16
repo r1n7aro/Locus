@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { UnitySerializedPropertyTarget } from "./unitySerializedProperty";
 
@@ -64,14 +64,18 @@ export function getUnityValueEditorWindowPayload(
   };
 }
 
-export function buildUnityValueEditorWindowUrl(payload: UnityValueEditorPayload): string {
+export function buildUnityValueEditorWindowQuery(payload: UnityValueEditorPayload): string {
   const params = new URLSearchParams({
     [UNITY_VALUE_EDITOR_WINDOW_FLAG]: "1",
     kind: payload.kind,
     target: JSON.stringify(payload.target),
   });
   if (payload.label) params.set("label", payload.label);
-  return `${UNITY_VALUE_EDITOR_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildUnityValueEditorWindowUrl(payload: UnityValueEditorPayload): string {
+  return buildSubWindowUrl(buildUnityValueEditorWindowQuery(payload));
 }
 
 function hasValidEditorPayload(payload: UnityValueEditorPayload): boolean {
@@ -106,32 +110,25 @@ function waitForEditorWindowReady(): Promise<void> {
   });
 }
 
-function createUnityValueEditorWindow(payload: UnityValueEditorPayload): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const editorWindow = new WebviewWindow(UNITY_VALUE_EDITOR_WINDOW_LABEL, {
-      url: buildUnityValueEditorWindowUrl(payload),
-      title: UNITY_VALUE_EDITOR_WINDOW_TITLE,
-      width: 760,
-      height: 560,
-      minWidth: 540,
-      minHeight: 400,
-      decorations: false,
-      resizable: true,
-      closable: true,
-      minimizable: false,
-      maximizable: false,
-      parent: getCurrentWebviewWindow(),
-      center: true,
-      shadow: true,
-    });
-
-    editorWindow.once("tauri://created", () => {
-      resolve();
-    });
-    editorWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
+async function createOrReuseUnityValueEditorWindow(
+  payload: UnityValueEditorPayload,
+): Promise<void> {
+  const readyBeforeOpen = editorWindowReady;
+  const result = await openSubWindow({
+    kind: UNITY_VALUE_EDITOR_WINDOW_LABEL,
+    title: UNITY_VALUE_EDITOR_WINDOW_TITLE,
+    width: 760,
+    height: 560,
+    minWidth: 540,
+    minHeight: 400,
+    resizable: true,
+    maximizable: false,
+    minimizable: false,
+  }, buildUnityValueEditorWindowQuery(payload));
+  if (result.existing) {
+    if (readyBeforeOpen) await readyBeforeOpen;
+    await result.window?.emit(UNITY_VALUE_EDITOR_PAYLOAD_EVENT, payload);
+  }
 }
 
 export async function openUnityValueEditorWindow(
@@ -148,16 +145,10 @@ export async function openUnityValueEditorWindow(
     }
   }
 
-  const existingWindow = await WebviewWindow.getByLabel(UNITY_VALUE_EDITOR_WINDOW_LABEL);
-  if (existingWindow) {
-    if (editorWindowReady) await editorWindowReady;
-    await existingWindow.emit(UNITY_VALUE_EDITOR_PAYLOAD_EVENT, payload);
-    await existingWindow.setFocus();
-    return true;
+  if (!editorWindowReady) {
+    editorWindowReady = waitForEditorWindowReady();
   }
-
-  editorWindowReady = waitForEditorWindowReady();
-  pendingEditorWindowCreation = createUnityValueEditorWindow(payload);
+  pendingEditorWindowCreation = createOrReuseUnityValueEditorWindow(payload);
   try {
     await pendingEditorWindowCreation;
   } catch (error) {

@@ -1,4 +1,5 @@
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const FEISHU_REFERENCE_IMPORT_WINDOW_LABEL = "feishu-reference-import-progress";
 export const FEISHU_REFERENCE_IMPORT_WINDOW_PATH = "/feishu-reference-import";
@@ -26,7 +27,7 @@ export function getFeishuReferenceImportWindowPayload(
   };
 }
 
-export function buildFeishuReferenceImportWindowUrl(
+export function buildFeishuReferenceImportWindowQuery(
   payload: FeishuReferenceImportWindowPayload = {},
 ): string {
   const params = new URLSearchParams({
@@ -35,43 +36,32 @@ export function buildFeishuReferenceImportWindowUrl(
   if (payload.targetPath?.trim()) {
     params.set("targetPath", payload.targetPath.trim());
   }
-  return `${FEISHU_REFERENCE_IMPORT_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildFeishuReferenceImportWindowUrl(
+  payload: FeishuReferenceImportWindowPayload = {},
+): string {
+  return buildSubWindowUrl(buildFeishuReferenceImportWindowQuery(payload));
 }
 
 export async function openFeishuReferenceImportProgressWindow(
   payload: FeishuReferenceImportWindowPayload = {},
 ): Promise<void> {
-  const existingWindow = await WebviewWindow.getByLabel(FEISHU_REFERENCE_IMPORT_WINDOW_LABEL);
-  if (existingWindow) {
-    if (payload.targetPath?.trim()) {
-      await existingWindow.emit(FEISHU_REFERENCE_IMPORT_WINDOW_STATUS_EVENT, payload);
-    }
-    await existingWindow.setFocus();
-    return;
+  if (!hasTauriWindowRuntime()) return;
+  const result = await openSubWindow({
+    kind: FEISHU_REFERENCE_IMPORT_WINDOW_LABEL,
+    title: FEISHU_REFERENCE_IMPORT_WINDOW_TITLE,
+    width: 760,
+    height: 760,
+    minWidth: 700,
+    minHeight: 680,
+    resizable: true,
+    maximizable: false,
+    minimizable: false,
+    closable: false,
+  }, buildFeishuReferenceImportWindowQuery(payload));
+  if (result.existing && payload.targetPath?.trim()) {
+    await result.window?.emit(FEISHU_REFERENCE_IMPORT_WINDOW_STATUS_EVENT, payload);
   }
-
-  await new Promise<void>((resolve, reject) => {
-    const progressWindow = new WebviewWindow(FEISHU_REFERENCE_IMPORT_WINDOW_LABEL, {
-      url: buildFeishuReferenceImportWindowUrl(payload),
-      title: FEISHU_REFERENCE_IMPORT_WINDOW_TITLE,
-      width: 760,
-      height: 760,
-      minWidth: 700,
-      minHeight: 680,
-      decorations: false,
-      resizable: true,
-      closable: false,
-      minimizable: false,
-      maximizable: false,
-      center: true,
-      shadow: true,
-    });
-
-    progressWindow.once("tauri://created", () => {
-      resolve();
-    });
-    progressWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
 }

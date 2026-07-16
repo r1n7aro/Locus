@@ -1,91 +1,105 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const webviewWindowMocks = vi.hoisted(() => ({
+const subWindowMocks = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   getByLabelMock: vi.fn(),
-  createdWindows: [] as Array<unknown[]>,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: subWindowMocks.invokeMock,
 }));
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
+  getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
   WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
-
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
-
-    once(event: string, callback: (...args: unknown[]) => void) {
-      if (event === "tauri://created") {
-        callback();
-      }
-    }
+    static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
 
 import {
   FEISHU_REFERENCE_IMPORT_WINDOW_STATUS_EVENT,
   buildFeishuReferenceImportWindowUrl,
+  getFeishuReferenceImportWindowPayload,
   openFeishuReferenceImportProgressWindow,
 } from "../services/feishuReferenceImportWindow";
 
 describe("feishuReferenceImportWindow", () => {
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.createdWindows.length = 0;
+    subWindowMocks.invokeMock.mockReset();
+    subWindowMocks.getByLabelMock.mockReset();
+    subWindowMocks.getByLabelMock.mockResolvedValue(null);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { pathname: "/", search: "" },
+        __TAURI_INTERNALS__: {
+          invoke: vi.fn(),
+          metadata: { currentWindow: { label: "main" } },
+        },
+      },
+    });
   });
 
   it("builds the window url", () => {
     expect(buildFeishuReferenceImportWindowUrl()).toBe(
-      "/feishu-reference-import?feishuReferenceImport=1",
+      "/window.html?feishuReferenceImport=1",
     );
-    expect(
-      buildFeishuReferenceImportWindowUrl({ targetPath: "reference-folder" }),
-    ).toBe(
-      "/feishu-reference-import?feishuReferenceImport=1&targetPath=reference-folder",
-    );
+    const url = buildFeishuReferenceImportWindowUrl({ targetPath: "feishu/docs" });
+    expect(url).toContain("targetPath=feishu%2Fdocs");
+    expect(getFeishuReferenceImportWindowPayload(url.slice(url.indexOf("?"))).targetPath)
+      .toBe("feishu/docs");
   });
 
-  it("focuses an existing window", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+  it("reuses an existing window without payload", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "sub-pool-6",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
     await openFeishuReferenceImportProgressWindow();
 
     expect(existingWindow.emit).not.toHaveBeenCalled();
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
   });
 
   it("switches an existing window to a specific reference folder", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
-
-    await openFeishuReferenceImportProgressWindow({
-      targetPath: "reference-folder",
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "feishu-reference-import-progress",
+      existing: true,
+      pooled: false,
     });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+
+    await openFeishuReferenceImportProgressWindow({ targetPath: "feishu/docs" });
 
     expect(existingWindow.emit).toHaveBeenCalledWith(
       FEISHU_REFERENCE_IMPORT_WINDOW_STATUS_EVENT,
-      { targetPath: "reference-folder" },
+      expect.objectContaining({ targetPath: "feishu/docs" }),
     );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
   });
 
-  it("creates an independent top-level window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+  it("creates the import window through the sub-window command", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "feishu-reference-import-progress",
+      existing: false,
+      pooled: true,
+    });
 
-    await openFeishuReferenceImportProgressWindow();
+    await openFeishuReferenceImportProgressWindow({ targetPath: "feishu/docs" });
 
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [, options] = webviewWindowMocks.createdWindows[0] as [string, Record<string, unknown>];
-    expect(options.parent).toBeUndefined();
-    expect(options.center).toBe(true);
-    expect(options.shadow).toBe(true);
-    expect(options.resizable).toBe(true);
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({
+        kind: "feishu-reference-import-progress",
+        title: "Locus Feishu Knowledge Base",
+        width: 760,
+        height: 760,
+        resizable: true,
+        closable: false,
+        query: expect.stringContaining("feishuReferenceImport=1"),
+      }),
+    });
   });
 });

@@ -10,7 +10,7 @@ function read(relPath: string) {
 
 describe("plugin status notice", () => {
   it("routes plugin attention through the global error notice style and top warning strip", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
     const projectStore = read("src/stores/project.ts");
 
     expect(projectStore).toContain('const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";');
@@ -53,7 +53,7 @@ describe("plugin status notice", () => {
   });
 
   it("keeps the top tabs single-line when the plugin notice is visible", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
 
     expect(app).toMatch(/\.tab-item\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);
     expect(app).toMatch(/\.tab-plugin-warn\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);

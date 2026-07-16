@@ -89,7 +89,7 @@ describe("chat sidebar layout", () => {
   });
 
   it("keeps non-user chat surfaces on the assistant background", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
     const chatView = read("src/components/ChatView.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");

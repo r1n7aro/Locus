@@ -1,4 +1,5 @@
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const COLLAB_SEARCH_WINDOW_LABEL = "collab-history-search";
 export const COLLAB_SEARCH_WINDOW_PATH = "/collab-search";
@@ -18,43 +19,28 @@ export function isCollabSearchWindowLocation(
     || locationLike.search.includes(`${COLLAB_SEARCH_WINDOW_FLAG}=1`);
 }
 
-export function buildCollabSearchWindowUrl(): string {
+export function buildCollabSearchWindowQuery(): string {
   const params = new URLSearchParams({
     [COLLAB_SEARCH_WINDOW_FLAG]: "1",
   });
-  return `${COLLAB_SEARCH_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildCollabSearchWindowUrl(): string {
+  return buildSubWindowUrl(buildCollabSearchWindowQuery());
 }
 
 export async function openCollabSearchWindow(): Promise<void> {
-  const existingWindow = await WebviewWindow.getByLabel(COLLAB_SEARCH_WINDOW_LABEL);
-  if (existingWindow) {
-    await existingWindow.setFocus();
-    return;
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const searchWindow = new WebviewWindow(COLLAB_SEARCH_WINDOW_LABEL, {
-      url: buildCollabSearchWindowUrl(),
-      title: COLLAB_SEARCH_WINDOW_TITLE,
-      width: 960,
-      height: 640,
-      minWidth: 640,
-      minHeight: 500,
-      decorations: false,
-      resizable: true,
-      closable: true,
-      minimizable: false,
-      maximizable: false,
-      parent: "main",
-      center: true,
-      shadow: true,
-    });
-
-    searchWindow.once("tauri://created", () => {
-      resolve();
-    });
-    searchWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
+  if (!hasTauriWindowRuntime()) return;
+  await openSubWindow({
+    kind: COLLAB_SEARCH_WINDOW_LABEL,
+    title: COLLAB_SEARCH_WINDOW_TITLE,
+    width: 960,
+    height: 640,
+    minWidth: 640,
+    minHeight: 500,
+    resizable: true,
+    maximizable: false,
+    minimizable: false,
+  }, buildCollabSearchWindowQuery());
 }

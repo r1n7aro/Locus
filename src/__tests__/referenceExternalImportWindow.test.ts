@@ -1,93 +1,98 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const webviewWindowMocks = vi.hoisted(() => ({
+const subWindowMocks = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   getByLabelMock: vi.fn(),
-  getCurrentWebviewWindowMock: vi.fn(),
-  createdWindows: [] as Array<unknown[]>,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: subWindowMocks.invokeMock,
 }));
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
-  getCurrentWebviewWindow: webviewWindowMocks.getCurrentWebviewWindowMock,
+  getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
   WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
-
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
-
-    once(event: string, callback: (...args: unknown[]) => void) {
-      if (event === "tauri://created") {
-        callback();
-      }
-    }
+    static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
 
 import {
   REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT,
   buildReferenceExternalImportWindowUrl,
+  getReferenceExternalImportWindowPayload,
   openReferenceExternalImportWindow,
 } from "../services/referenceExternalImportWindow";
 
 describe("referenceExternalImportWindow", () => {
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReturnValue({ label: "main" });
-    webviewWindowMocks.createdWindows.length = 0;
+    subWindowMocks.invokeMock.mockReset();
+    subWindowMocks.getByLabelMock.mockReset();
+    subWindowMocks.getByLabelMock.mockResolvedValue(null);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { pathname: "/", search: "" },
+        __TAURI_INTERNALS__: {
+          invoke: vi.fn(),
+          metadata: { currentWindow: { label: "main" } },
+        },
+      },
+    });
   });
 
   it("builds the dedicated window url", () => {
-    expect(buildReferenceExternalImportWindowUrl()).toBe(
-      "/reference-external-import?referenceExternalImport=1",
-    );
-    expect(buildReferenceExternalImportWindowUrl({
-      parentDir: "reference/gameplay",
-      initialSource: "unity",
-    })).toBe(
-      "/reference-external-import?referenceExternalImport=1&parentDir=reference%2Fgameplay&initialSource=unity",
-    );
-  });
-
-  it("focuses an existing window and updates its payload", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
-
-    await openReferenceExternalImportWindow({
-      parentDir: "reference/gameplay",
+    const url = buildReferenceExternalImportWindowUrl({
+      parentDir: "reference/docs",
       initialSource: "feishu",
     });
 
-    expect(existingWindow.emit).toHaveBeenCalledWith(
-      REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT,
-      {
-        parentDir: "reference/gameplay",
-        initialSource: "feishu",
-      },
-    );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+    expect(url).toContain("/window.html?referenceExternalImport=1");
+    expect(url).toContain("parentDir=reference%2Fdocs");
+    expect(url).toContain("initialSource=feishu");
+
+    const payload = getReferenceExternalImportWindowPayload(url.slice(url.indexOf("?")));
+    expect(payload.parentDir).toBe("reference/docs");
+    expect(payload.initialSource).toBe("feishu");
   });
 
-  it("creates a frameless child window bound to the current parent window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+  it("updates the payload of an existing window", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "sub-pool-5",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openReferenceExternalImportWindow({
-      fixedTargetPath: "unity-official-docs",
-      initialSource: "unity",
+    await openReferenceExternalImportWindow({ parentDir: "reference/docs" });
+
+    expect(existingWindow.emit).toHaveBeenCalledWith(
+      REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT,
+      expect.objectContaining({ parentDir: "reference/docs" }),
+    );
+  });
+
+  it("creates the import window through the sub-window command", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "reference-external-import",
+      existing: false,
+      pooled: true,
     });
 
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [, options] = webviewWindowMocks.createdWindows[0] as [string, Record<string, unknown>];
-    expect(options.parent).toEqual({ label: "main" });
-    expect(options.decorations).toBe(false);
-    expect(options.center).toBe(true);
-    expect(options.shadow).toBe(true);
-    expect(options.resizable).toBe(true);
-    expect(options.width).toBe(1180);
-    expect(options.height).toBe(900);
+    await openReferenceExternalImportWindow({ initialSource: "local" });
+
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({
+        kind: "reference-external-import",
+        title: "Locus External Import",
+        width: 1180,
+        height: 900,
+        minWidth: 920,
+        minHeight: 700,
+        resizable: true,
+        closable: false,
+        query: expect.stringContaining("referenceExternalImport=1"),
+      }),
+    });
   });
 });

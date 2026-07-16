@@ -10,7 +10,7 @@ function read(relPath: string) {
 
 describe("selection semantics", () => {
   it("defines shared selection utilities in App.vue", () => {
-    const app = read("src/App.vue");
+    const app = read("src/App.vue") + read("src/styles/app-global.css");
 
     expect(app).toMatch(/body\s*\{[\s\S]*?user-select:\s*none;/);
     expect(app).toContain("body.is-dragging-select-lock");

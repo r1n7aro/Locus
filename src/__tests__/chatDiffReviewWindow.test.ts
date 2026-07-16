@@ -1,26 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileDiffRequest } from "../types";
 
-const webviewWindowMocks = vi.hoisted(() => ({
+const subWindowMocks = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   getByLabelMock: vi.fn(),
-  getCurrentWebviewWindowMock: vi.fn(),
-  createdWindows: [] as Array<unknown[]>,
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: subWindowMocks.invokeMock,
 }));
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
-  getCurrentWebviewWindow: webviewWindowMocks.getCurrentWebviewWindowMock,
+  getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
   WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
-
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
-
-    once(event: string, callback: (...args: unknown[]) => void) {
-      if (event === "tauri://created") {
-        callback();
-      }
-    }
+    static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
 
@@ -41,10 +34,9 @@ describe("chatDiffReviewWindow", () => {
   };
 
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReset();
-    webviewWindowMocks.getCurrentWebviewWindowMock.mockReturnValue({ label: "main" });
-    webviewWindowMocks.createdWindows.length = 0;
+    subWindowMocks.invokeMock.mockReset();
+    subWindowMocks.getByLabelMock.mockReset();
+    subWindowMocks.getByLabelMock.mockResolvedValue(null);
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
@@ -57,46 +49,57 @@ describe("chatDiffReviewWindow", () => {
     });
   });
 
-  it("builds and parses request URLs for the dedicated review window", () => {
+  it("builds and parses request URLs for the lightweight window entry", () => {
     const url = buildChatDiffReviewWindowUrl({ request });
 
-    expect(url).toContain("/chat-diff-review?chatDiffReview=1");
+    expect(url).toContain("/window.html?chatDiffReview=1");
     expect(getChatDiffReviewWindowPayload(url.slice(url.indexOf("?"))).request).toEqual(request);
   });
 
-  it("focuses an existing review window and sends the next request", async () => {
-    const existingWindow = {
-      emit: vi.fn(),
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+  it("sends the next request to an existing review window", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "sub-pool-1",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
     await openChatDiffReviewWindow({ request });
 
+    expect(subWindowMocks.getByLabelMock).toHaveBeenCalledWith("sub-pool-1");
     expect(existingWindow.emit).toHaveBeenCalledWith(
       CHAT_DIFF_REVIEW_WINDOW_EVENT,
       { request },
     );
-    expect(existingWindow.setFocus).toHaveBeenCalledTimes(1);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
   });
 
-  it("creates a frameless child window bound to the current parent window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+  it("opens a new review window through the pooled sub-window command", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "chat-diff-review",
+      existing: false,
+      pooled: true,
+    });
+    const newWindow = { emit: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(newWindow);
 
     const opened = await openChatDiffReviewWindow({ request });
 
     expect(opened).toBe(true);
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [label, options] = webviewWindowMocks.createdWindows[0] as [string, Record<string, unknown>];
-    expect(label).toBe("chat-diff-review");
-    expect(options.parent).toEqual({ label: "main" });
-    expect(options.decorations).toBe(false);
-    expect(options.center).toBe(true);
-    expect(options.shadow).toBe(true);
-    expect(options.resizable).toBe(true);
-    expect(options.closable).toBe(true);
-    expect(options.width).toBe(1180);
-    expect(options.height).toBe(760);
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({
+        kind: "chat-diff-review",
+        title: "Locus File Review",
+        width: 1180,
+        height: 760,
+        minWidth: 760,
+        minHeight: 520,
+        resizable: true,
+        maximizable: true,
+        minimizable: false,
+        query: expect.stringContaining("chatDiffReview=1"),
+      }),
+    });
+    expect(newWindow.emit).not.toHaveBeenCalled();
   });
 });

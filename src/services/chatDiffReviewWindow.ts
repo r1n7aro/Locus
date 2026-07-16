@@ -1,5 +1,5 @@
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { FileDiffPayload, FileDiffRequest } from "../types";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const CHAT_DIFF_REVIEW_WINDOW_LABEL = "chat-diff-review";
@@ -53,7 +53,7 @@ export function getChatDiffReviewWindowPayload(
   };
 }
 
-export function buildChatDiffReviewWindowUrl(
+export function buildChatDiffReviewWindowQuery(
   payload: ChatDiffReviewWindowPayload,
 ): string {
   const params = new URLSearchParams({
@@ -66,7 +66,13 @@ export function buildChatDiffReviewWindowUrl(
   } else if (payload.payload?.key.trim()) {
     params.set("diffKey", payload.payload.key.trim());
   }
-  return `${CHAT_DIFF_REVIEW_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildChatDiffReviewWindowUrl(
+  payload: ChatDiffReviewWindowPayload,
+): string {
+  return buildSubWindowUrl(buildChatDiffReviewWindowQuery(payload));
 }
 
 function eventPayload(input: ChatDiffReviewWindowPayload): ChatDiffReviewWindowPayload {
@@ -81,39 +87,20 @@ export async function openChatDiffReviewWindow(
   if (!hasTauriWindowRuntime()) return false;
 
   const payload = eventPayload(input);
-  const existingWindow = await WebviewWindow.getByLabel(CHAT_DIFF_REVIEW_WINDOW_LABEL);
-  if (existingWindow) {
-    await existingWindow.emit(CHAT_DIFF_REVIEW_WINDOW_EVENT, payload);
-    await existingWindow.setFocus();
-    return true;
+  const result = await openSubWindow({
+    kind: CHAT_DIFF_REVIEW_WINDOW_LABEL,
+    title: CHAT_DIFF_REVIEW_WINDOW_TITLE,
+    width: 1180,
+    height: 760,
+    minWidth: 760,
+    minHeight: 520,
+    resizable: true,
+    maximizable: true,
+    minimizable: false,
+  }, buildChatDiffReviewWindowQuery(payload));
+  if (result.existing) {
+    await result.window?.emit(CHAT_DIFF_REVIEW_WINDOW_EVENT, payload);
   }
-
-  await new Promise<void>((resolve, reject) => {
-    const reviewWindow = new WebviewWindow(CHAT_DIFF_REVIEW_WINDOW_LABEL, {
-      url: buildChatDiffReviewWindowUrl(payload),
-      title: CHAT_DIFF_REVIEW_WINDOW_TITLE,
-      width: 1180,
-      height: 760,
-      minWidth: 760,
-      minHeight: 520,
-      decorations: false,
-      resizable: true,
-      closable: true,
-      minimizable: false,
-      maximizable: true,
-      parent: getCurrentWebviewWindow(),
-      center: true,
-      shadow: true,
-    });
-
-    reviewWindow.once("tauri://created", () => {
-      resolve();
-    });
-    reviewWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
-
   return true;
 }
 

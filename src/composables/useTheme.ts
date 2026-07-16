@@ -125,6 +125,13 @@ export function setThemePreference(
   bindSystemListener();
 }
 
+/** Resolved background color for the current theme; used as the native
+ *  window background when creating sub-windows so the pre-paint phase
+ *  matches the app instead of flashing WebView2 white. */
+export function currentThemeBackgroundColor(scope: ThemeScope = activeScope): string {
+  return THEME_BACKGROUND_COLOR[resolveTheme(preferenceRef(scope).value)];
+}
+
 /** Call once from App.vue for each window surface that uses shared app tokens. */
 export function initTheme(scope: ThemeScope = "main") {
   activeScope = scope;

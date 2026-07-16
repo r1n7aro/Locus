@@ -2,6 +2,7 @@ import { createApp } from "vue";
 import { createPinia } from "pinia";
 import App from "./App.vue";
 import "./assets/hljs-theme.css";
+import "./styles/app-global.css";
 import "./styles/typography.css";
 import "./styles/asset-icons.css";
 import { initDebugConsole } from "./services/debugConsole";

@@ -39,8 +39,18 @@ export default defineConfig(async () => ({
   },
 
   build: {
+    // Locus ships exclusively on WebView2 (Chromium); top-level await in
+    // src/i18n.ts (async locale catalogs) needs a post-es2020 target.
+    target: "chrome105",
     chunkSizeWarningLimit: 800, // three.js chunk ~725KB, already lazy-loaded
     rollupOptions: {
+      input: {
+        // Main app entry plus the lightweight sub-window entry; sub-windows
+        // (plan review, diff review, View hosts, ...) skip the main store
+        // and service graph entirely.
+        main: path.resolve(__dirname, "index.html"),
+        window: path.resolve(__dirname, "window.html"),
+      },
       output: {
         manualChunks: {
           vendor: ["vue", "pinia", "marked", "highlight.js"],

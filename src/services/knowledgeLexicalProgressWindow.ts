@@ -1,5 +1,6 @@
-import { getCurrentWebviewWindow, WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { LexicalRebuildStatus } from "../types";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL = "knowledge-lexical-progress";
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_PATH = "/knowledge-lexical-progress";
@@ -15,11 +16,15 @@ export function isKnowledgeLexicalProgressWindowLocation(
     || locationLike.search.includes(`${KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_FLAG}=1`);
 }
 
-export function buildKnowledgeLexicalProgressWindowUrl(): string {
+export function buildKnowledgeLexicalProgressWindowQuery(): string {
   const params = new URLSearchParams({
     [KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_FLAG]: "1",
   });
-  return `${KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildKnowledgeLexicalProgressWindowUrl(): string {
+  return buildSubWindowUrl(buildKnowledgeLexicalProgressWindowQuery());
 }
 
 export function shouldAutoOpenKnowledgeLexicalProgressWindow(
@@ -41,33 +46,17 @@ export function getKnowledgeLexicalProgressRunKey(
 export async function openKnowledgeLexicalProgressWindow(
   _status?: LexicalRebuildStatus | null,
 ): Promise<void> {
-  const existingWindow = await WebviewWindow.getByLabel(KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL);
-  if (existingWindow) {
-    return;
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const progressWindow = new WebviewWindow(KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL, {
-      url: buildKnowledgeLexicalProgressWindowUrl(),
-      title: KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
-      width: 560,
-      height: 420,
-      minWidth: 520,
-      minHeight: 360,
-      decorations: false,
-      resizable: false,
-      closable: true,
-      minimizable: false,
-      maximizable: false,
-      parent: getCurrentWebviewWindow(),
-      center: true,
-    });
-
-    progressWindow.once("tauri://created", () => {
-      resolve();
-    });
-    progressWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
+  if (!hasTauriWindowRuntime()) return;
+  await openSubWindow({
+    kind: KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL,
+    title: KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
+    width: 560,
+    height: 420,
+    minWidth: 520,
+    minHeight: 360,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    focusExisting: false,
+  }, buildKnowledgeLexicalProgressWindowQuery());
 }

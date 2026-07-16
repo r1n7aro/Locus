@@ -2,6 +2,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
+import { FolderCog, FolderOpen, ListX } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -24,6 +25,7 @@ import { APP_CLOSE_REQUESTED_EVENT, requestAppExit } from "./services/system";
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
 import BaseContextMenu from "./components/ui/BaseContextMenu.vue";
+import LucideIcon from "./components/icons/LucideIcon.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
@@ -42,6 +44,13 @@ import {
   useLocusAssetInspectorPanel,
 } from "./composables/useLocusAssetInspectorPanel";
 import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
+import {
+  isExtraWorkdirsWindowLocation,
+  listenExtraWorkdirsUpdated,
+  openExtraWorkdirsWindow,
+} from "./services/extraWorkdirsWindow";
+import { prepareSubWindowPool } from "./services/subWindow";
+import type { ExtraWorkdirStatus } from "./services/extraWorkdirs";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
@@ -66,6 +75,7 @@ const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
 const isPlanViewWindow = isPlanViewWindowLocation();
 const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
+const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
 const isViewContentWindow = isViewContentWindowLocation();
 const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
@@ -80,6 +90,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isChatDiffReviewWindow
   || isPlanViewWindow
   || isUnityValueEditorWindow
+  || isExtraWorkdirsWindow
   || isViewHostWindow
   || isViewContentWindow
   || isAgentGraphToolWindow;
@@ -93,6 +104,7 @@ const CollabSearchWindow = defineAsyncComponent(() => import("./components/Colla
 const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
 const PlanViewWindow = defineAsyncComponent(() => import("./components/PlanViewWindow.vue"));
 const UnityValueEditorWindow = defineAsyncComponent(() => import("./components/UnityValueEditorWindow.vue"));
+const ExtraWorkdirsConfigWindow = defineAsyncComponent(() => import("./components/ExtraWorkdirsConfigWindow.vue"));
 const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
 const AgentGraphToolWindow = defineAsyncComponent(() => import("./components/AgentGraphToolWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
@@ -122,6 +134,7 @@ const KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT = 16;
 let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
 let knowledgeRuntimeStartupPollsRemaining = 0;
 let appCloseRequestUnlisten: UnlistenFn | null = null;
+let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -415,9 +428,19 @@ function parentPath(dir: string): string {
 function toggleDirDropdown() {
   if (workspaceSwitchBusy.value) return;
   showDirDropdown.value = !showDirDropdown.value;
-  if (!showDirDropdown.value) {
+  if (showDirDropdown.value) {
+    void projectStore.loadExtraWorkdirs();
+  } else {
     recentDirContextMenu.value = null;
   }
+}
+
+function extraWorkdirsFor(dir: string): ExtraWorkdirStatus[] {
+  return projectStore.extraWorkdirs[dir] ?? [];
+}
+
+function extraWorkdirTooltip(extra: ExtraWorkdirStatus): string {
+  return extra.comment ? `${extra.path} — ${extra.comment}` : extra.path;
 }
 
 function closeRecentDirContextMenu() {
@@ -603,6 +626,23 @@ async function removeContextRecentDir() {
   }
 }
 
+async function configureContextRecentDirExtraWorkdirs() {
+  const dir = recentDirContextMenu.value?.dir;
+  if (!dir) return;
+  closeRecentDirContextMenu();
+  try {
+    await openExtraWorkdirsWindow({ workspacePath: dir });
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openExtraWorkdirsWindow",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  }
+}
+
 function handleDirClickOutside(e: MouseEvent) {
   const target = e.target as Node;
   const targetElement = target instanceof Element ? target : target.parentElement;
@@ -711,6 +751,17 @@ async function registerAppCloseRequestListener() {
   }
 }
 
+async function registerExtraWorkdirsUpdatedListener() {
+  if (isStandaloneWindow || extraWorkdirsUpdatedUnlisten) return;
+  try {
+    extraWorkdirsUpdatedUnlisten = await listenExtraWorkdirsUpdated(({ workspacePath }) => {
+      void projectStore.handleExtraWorkdirsUpdated(workspacePath);
+    });
+  } catch (error) {
+    console.warn("Failed to listen for extra workdirs updates:", error);
+  }
+}
+
 function revealMainWindow() {
   if (isStandaloneWindow) return;
   const currentTauriWindowLabel = getCurrentTauriWindowLabel();
@@ -767,6 +818,7 @@ onMounted(async () => {
   }
   document.addEventListener("click", handleDirClickOutside, true);
   await registerAppCloseRequestListener();
+  await registerExtraWorkdirsUpdatedListener();
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
   await bootstrapCritical();
@@ -790,6 +842,13 @@ onMounted(async () => {
   void appUpdateStore.checkForUpdates({ silent: true });
   markStartupPhase("main_update_check_scheduled");
   startKnowledgeRuntimeStartupPolling();
+  // Pre-warm the shared sub-window pool once startup work settled so the
+  // first plan/diff/import window opens from an already-loaded shell.
+  window.setTimeout(() => {
+    void prepareSubWindowPool().catch(() => {
+      /* pool is an optimization; opens fall back to direct creation */
+    });
+  }, 3000);
   markStartupPhase("main_startup_done");
 });
 
@@ -802,6 +861,8 @@ onUnmounted(() => {
   document.removeEventListener("click", handleDirClickOutside, true);
   appCloseRequestUnlisten?.();
   appCloseRequestUnlisten = null;
+  extraWorkdirsUpdatedUnlisten?.();
+  extraWorkdirsUpdatedUnlisten = null;
   notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
   clearKnowledgeRuntimeStatusTimer();
   cleanup();
@@ -834,6 +895,7 @@ watch(() => projectStore.workingDir, () => {
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
   <PlanViewWindow v-else-if="isPlanViewWindow" />
   <UnityValueEditorWindow v-else-if="isUnityValueEditorWindow" />
+  <ExtraWorkdirsConfigWindow v-else-if="isExtraWorkdirsWindow" />
   <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
   <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
@@ -908,27 +970,48 @@ watch(() => projectStore.workingDir, () => {
           <Transition name="dropdown">
             <div v-if="showDirDropdown" class="dir-dropdown">
               <div class="dropdown-label">{{ t("app.dir.recentDirs") }}</div>
-              <div
-                v-for="dir in projectStore.recentDirs"
-                :key="dir"
-                class="dir-item"
-                :class="{
-                  active: dir === projectStore.workingDir,
-                  'context-selected': recentDirContextMenu?.dir === dir,
-                }"
-                @click="selectRecentDir(dir)"
-                @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
-                :title="dir"
-              >
-                <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                  <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
-                </svg>
-                <div class="dir-item-text">
-                  <span class="dir-item-name">{{ shortDir(dir) }}</span>
-                  <span class="dir-item-path">{{ parentPath(dir) }}</span>
+              <template v-for="dir in projectStore.recentDirs" :key="dir">
+                <div
+                  class="dir-item"
+                  :class="{
+                    active: dir === projectStore.workingDir,
+                    'context-selected': recentDirContextMenu?.dir === dir,
+                  }"
+                  @click="selectRecentDir(dir)"
+                  @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
+                  :title="dir"
+                >
+                  <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                    <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
+                  </svg>
+                  <div class="dir-item-text">
+                    <span class="dir-item-name">{{ shortDir(dir) }}</span>
+                    <span class="dir-item-path">{{ parentPath(dir) }}</span>
+                  </div>
+                  <span v-if="dir === projectStore.workingDir" class="dir-check">&#10003;</span>
                 </div>
-                <span v-if="dir === projectStore.workingDir" class="dir-check">&#10003;</span>
-              </div>
+                <div
+                  v-if="extraWorkdirsFor(dir).length > 0"
+                  class="dir-item-extras"
+                  @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
+                >
+                  <div
+                    v-for="extra in extraWorkdirsFor(dir)"
+                    :key="extra.path"
+                    class="dir-extra-row"
+                    :class="{ missing: !extra.exists }"
+                    :title="extraWorkdirTooltip(extra)"
+                    @click.stop
+                  >
+                    <svg class="dir-extra-icon" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
+                      <path d="M7.775 3.275a.75.75 0 0 0 1.06 1.06l1.25-1.25a2 2 0 1 1 2.83 2.83l-2.5 2.5a2 2 0 0 1-2.83 0 .75.75 0 0 0-1.06 1.06 3.5 3.5 0 0 0 4.95 0l2.5-2.5a3.5 3.5 0 0 0-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 0 1 0-2.83l2.5-2.5a2 2 0 0 1 2.83 0 .75.75 0 0 0 1.06-1.06 3.5 3.5 0 0 0-4.95 0l-2.5 2.5a3.5 3.5 0 0 0 4.95 4.95l1.25-1.25a.75.75 0 0 0-1.06-1.06l-1.25 1.25a2 2 0 0 1-2.83 0z"/>
+                    </svg>
+                    <span class="dir-extra-name">{{ shortDir(extra.path) }}</span>
+                    <span v-if="extra.comment" class="dir-extra-comment">{{ extra.comment }}</span>
+                    <span v-if="!extra.exists" class="dir-extra-missing">{{ t("extraWorkdirs.missingBadge") }}</span>
+                  </div>
+                </div>
+              </template>
               <div v-if="projectStore.recentDirs.length === 0" class="dropdown-empty">{{ t("app.dir.noRecords") }}</div>
               <div class="dropdown-divider"></div>
               <div class="dir-item browse" @click="browseFromDropdown">
@@ -1082,7 +1165,7 @@ watch(() => projectStore.workingDir, () => {
           @auth-changed="handleSettingsAuthChanged"
           @model-defaults-changed="modelStore.applyModelDefaults"
           @codex-transport-changed="modelStore.applyCodexModelConfig"
-          @custom-endpoints-changed="modelStore.applyCustomEndpoints"
+          @custom-providers-changed="modelStore.applyCustomProviders"
           @reset-onboarding="onResetOnboarding"
         />
         <div
@@ -1115,13 +1198,23 @@ watch(() => projectStore.workingDir, () => {
       class="recent-dir-ctx-item"
       @click="openContextRecentDirInFileExplorer"
     >
+      <LucideIcon :icon="FolderOpen" :size="13" />
       {{ t("common.openInFileExplorer") }}
+    </button>
+    <button
+      type="button"
+      class="recent-dir-ctx-item"
+      @click="configureContextRecentDirExtraWorkdirs"
+    >
+      <LucideIcon :icon="FolderCog" :size="13" />
+      {{ t("app.dir.configureExtraWorkdirs") }}
     </button>
     <button
       type="button"
       class="recent-dir-ctx-item"
       @click="removeContextRecentDir"
     >
+      <LucideIcon :icon="ListX" :size="13" />
       {{ t("app.dir.removeRecent") }}
     </button>
   </BaseContextMenu>
@@ -1228,852 +1321,3 @@ watch(() => projectStore.workingDir, () => {
   <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
 </template>
 
-<style>
-:root {
-  --bg-color: #f6f7f8;
-  --sidebar-bg: #f3f4f6;
-  --panel-bg: #ffffff;
-  --surface-elevated: #ffffff;
-  --text-color: #111318;
-  --text-secondary: #5b6270;
-  --text-tertiary: #7b8393;
-  --radius-badge: 8px;
-  --border-color: #e3e5e8;
-  --border-strong: #d4d7dd;
-  --hover-bg: #eef1f4;
-  --active-bg: #e7ebf0;
-  --input-bg: #f8f9fb;
-  --msg-user-bg: #eff0f1;
-  --msg-assistant-bg: #f9fafb;
-  --msg-divider: color-mix(in srgb, var(--border-strong) 74%, var(--border-color) 26%);
-  --msg-user-role: color-mix(in srgb, var(--text-color) 76%, var(--text-secondary) 24%);
-  --accent-color: #4c5bd4;
-  --accent-soft: rgba(76, 91, 212, 0.10);
-  --accent-border: rgba(76, 91, 212, 0.22);
-
-  --git-surface-nav: #f5f7fb;
-  --git-surface-history: #fbfcfe;
-  --git-surface-detail: #ffffff;
-  --git-surface-header: #eef2f8;
-  --git-surface-subheader: #f6f8fc;
-  --git-surface-terminal: #f9fbfd;
-  --git-row-hover: #eef4fb;
-  --git-row-selected: #e4edfb;
-  --git-divider: #d7dee8;
-  --git-divider-strong: #b8c6d8;
-  --git-text-primary: #18212b;
-  --git-text-secondary: #526173;
-  --git-text-tertiary: #748397;
-  --git-focus: #2f6df6;
-  --git-status-added: #2ea043;
-  --git-status-modified: #d29b00;
-  --git-status-deleted: #e15759;
-  --git-status-renamed: #5d83b4;
-  --git-status-stash: #8a63d2;
-  --git-status-conflict: #e28a2e;
-  --git-section-staged-bg: #f3fbf7;
-  --git-section-staged-border: #69b587;
-  --git-section-unstaged-bg: #fff8ef;
-  --git-section-unstaged-border: #d4a658;
-  --git-section-conflict-bg: #ffebe7;
-  --git-section-conflict-border: #e7a18f;
-
-  --status-good-fg: #18794e;
-  --status-good-bg: rgba(24, 121, 78, 0.10);
-  --status-good-border: rgba(24, 121, 78, 0.18);
-  --status-warn-fg: #a16207;
-  --status-warn-bg: rgba(202, 138, 4, 0.10);
-  --status-warn-border: rgba(202, 138, 4, 0.18);
-  --status-danger-fg: #b42318;
-  --status-danger-bg: rgba(217, 45, 32, 0.10);
-  --status-danger-border: rgba(217, 45, 32, 0.18);
-
-  font-family: var(--font-ui);
-  font-size: 14px;
-  line-height: 1.5;
-  color: var(--text-color);
-  background: var(--bg-color);
-
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-:root[data-theme="dark"] {
-  --bg-color: #1d1d21;
-  --sidebar-bg: #17181c;
-  --panel-bg: #111216;
-  --surface-elevated: #1a1b20;
-  --text-color: #f3f3f5;
-  --text-secondary: #a1a4ad;
-  --text-tertiary: #787b84;
-  --border-color: #26282e;
-  --border-strong: #31333b;
-  --hover-bg: #1d1f25;
-  --active-bg: #23252c;
-  --input-bg: #181a20;
-  --msg-user-bg: #212125;
-  --msg-assistant-bg: #17181d;
-  --msg-divider: color-mix(in srgb, var(--border-strong) 76%, var(--border-color) 24%);
-  --msg-user-role: color-mix(in srgb, var(--text-color) 74%, var(--text-secondary) 26%);
-  --accent-color: #6f77f6;
-  --accent-soft: rgba(111, 119, 246, 0.12);
-  --accent-border: rgba(111, 119, 246, 0.24);
-
-  --git-surface-nav: #17181c;
-  --git-surface-history: #141519;
-  --git-surface-detail: #17181d;
-  --git-surface-header: #1b1d23;
-  --git-surface-subheader: #16181d;
-  --git-surface-terminal: #121318;
-  --git-row-hover: #1f2128;
-  --git-row-selected: #262932;
-  --git-divider: #2c2f36;
-  --git-divider-strong: #383c46;
-  --git-text-primary: #f3f3f5;
-  --git-text-secondary: #c0c4cc;
-  --git-text-tertiary: #9498a1;
-  --git-focus: #7c84ff;
-  --git-status-added: #7fd39b;
-  --git-status-modified: #f2c56b;
-  --git-status-deleted: #ff9698;
-  --git-status-renamed: #a9c2e6;
-  --git-status-stash: #ccb8ff;
-  --git-status-conflict: #f6b267;
-  --git-section-staged-bg: #17261f;
-  --git-section-staged-border: #4f8d68;
-  --git-section-unstaged-bg: #342716;
-  --git-section-unstaged-border: #b68035;
-  --git-section-conflict-bg: #311919;
-  --git-section-conflict-border: #a65e50;
-
-  --status-good-fg: #6dcf9b;
-  --status-good-bg: rgba(109, 207, 155, 0.14);
-  --status-good-border: rgba(109, 207, 155, 0.28);
-  --status-warn-fg: #f1c069;
-  --status-warn-bg: rgba(241, 192, 105, 0.14);
-  --status-warn-border: rgba(241, 192, 105, 0.28);
-  --status-danger-fg: #ff8a8a;
-  --status-danger-bg: rgba(255, 138, 138, 0.14);
-  --status-danger-border: rgba(255, 138, 138, 0.30);
-}
-
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-html,
-body,
-#app {
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--bg-color);
-}
-
-#app {
-  display: flex;
-}
-
-/* Global scrollbar styling */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.15);
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.25);
-}
-
-:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
-}
-
-:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.25);
-}
-
-body {
-  overflow: hidden;
-  background: var(--bg-color);
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-body.is-dragging-select-lock,
-body.is-dragging-select-lock * {
-  user-select: none !important;
-}
-
-.app-layout {
-  display: flex;
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  position: relative;
-  overflow: hidden;
-  background: var(--bg-color);
-}
-
-.app-layout.is-window-resizing .tab-content {
-  pointer-events: none;
-}
-
-.app-layout.is-window-resizing :is(
-  .chat-workspace-view,
-  .chat-view-layout,
-  .chat-view,
-  .chat-main,
-  .input-area,
-  .chat-input-shell,
-  .chat-input-shell-body,
-  .chat-input-shell-stack,
-  .chat-composer,
-  .chat-transcript-scroll,
-  .chat-transcript-content
-) {
-  transition: none !important;
-}
-
-.app-layout.is-window-resizing .chat-transcript-message.is-session {
-  content-visibility: visible;
-  contain-intrinsic-size: auto;
-}
-
-.app-layout.is-window-resizing :is(
-  .workspace-btn,
-  .tab-item,
-  .win-ctrl-btn,
-  .session-divider,
-  .input-controls-toggle,
-  .changes-toggle-btn,
-  .sp-collapse-btn,
-  .sp-session-item
-) {
-  transition-duration: 0s !important;
-  transition-delay: 0s !important;
-}
-
-.app-layout.is-window-resizing :is(
-  .tab-plugin-spinner,
-  .workspace-switch-spinner,
-  .chat-transcript-thinking-spinner,
-  .sp-session-dot.is-running,
-  .sp-expand-btn.is-running svg
-) {
-  animation-duration: 0s !important;
-  animation-delay: 0s !important;
-}
-
-.ui-select-none {
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-.ui-select-text,
-.selectable-text,
-:where(pre, code),
-:is(input, textarea, [contenteditable="true"]) {
-  user-select: text;
-  -webkit-user-select: text;
-}
-
-.main-area {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  position: relative;
-}
-
-.app-startup-state {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100vw;
-  height: 100vh;
-  background: var(--bg-color);
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.tab-bar {
-  --window-resize-hit-area: 6px;
-  display: flex;
-  align-items: center;
-  gap: 0;
-  padding: 0 0 0 16px;
-  height: 38px;
-  flex-shrink: 0;
-  position: relative;
-  background: var(--sidebar-bg);
-  border-bottom: 1px solid var(--border-color);
-  z-index: 20;
-  overflow: visible;
-  -webkit-app-region: no-drag;
-}
-
-.tab-drag-region {
-  position: absolute;
-  inset: var(--window-resize-hit-area) var(--window-resize-hit-area) 0 var(--window-resize-hit-area);
-  z-index: 0;
-  -webkit-app-region: drag;
-}
-
-.tab-bar > :not(.tab-drag-region) {
-  position: relative;
-  z-index: 1;
-}
-
-.tab-item {
-  -webkit-app-region: no-drag;
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  padding: 0 14px;
-  height: 100%;
-  border: none;
-  background: none;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: color 0.15s ease;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.tab-item:hover {
-  color: var(--text-color);
-}
-
-.tab-item.active {
-  color: var(--text-color);
-}
-
-.tab-item.active::after {
-  content: "";
-  position: absolute;
-  bottom: 1px;
-  left: 14px;
-  right: 14px;
-  height: 1px;
-  background: var(--accent-color);
-  border-radius: 999px;
-  opacity: 0.72;
-}
-
-.tab-brand {
-  -webkit-app-region: no-drag;
-  flex: 0 0 auto;
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: -0.2px;
-  margin-right: 10px;
-  color: var(--text-color);
-  white-space: nowrap;
-}
-
-.tab-spacer {
-  -webkit-app-region: drag;
-  flex: 1 1 auto;
-  min-width: 8px;
-  align-self: stretch;
-}
-
-.window-controls {
-  -webkit-app-region: no-drag;
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  margin-left: 10px;
-  height: 100%;
-}
-
-.win-ctrl-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 42px;
-  height: 100%;
-  border: none;
-  background: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background 0.1s, color 0.1s;
-}
-
-.win-ctrl-btn:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.win-ctrl-btn.win-pinned {
-  color: var(--accent-color);
-}
-
-.win-ctrl-btn.win-close:hover {
-  background: #e81123;
-  color: #fff;
-}
-
-.workspace-selector {
-  -webkit-app-region: no-drag;
-  flex: 0 1 220px;
-  width: 220px;
-  min-width: 120px;
-  max-width: 220px;
-  position: relative;
-  margin-right: 6px;
-}
-
-.workspace-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 0 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 78%, var(--sidebar-bg) 22%);
-  color: var(--text-color);
-  font-size: 12px;
-  line-height: 21px;
-  cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-  width: 100%;
-  min-width: 0;
-  max-width: none;
-  height: 23px;
-}
-
-.workspace-btn:hover {
-  background: var(--hover-bg);
-  border-color: var(--border-strong);
-}
-
-.workspace-btn:disabled {
-  cursor: progress;
-  opacity: 0.86;
-}
-
-.workspace-btn.is-switching {
-  color: var(--text-secondary);
-}
-
-.ws-icon {
-  opacity: 0.7;
-  flex-shrink: 0;
-}
-
-.workspace-btn:hover .ws-icon {
-  opacity: 1;
-}
-
-.ws-name {
-  flex: 1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-weight: 500;
-  text-align: center;
-}
-
-.ws-chevron {
-  opacity: 0.4;
-  flex-shrink: 0;
-  margin-left: auto;
-  transition: transform 0.2s;
-}
-
-.ws-chevron.open {
-  transform: rotate(180deg);
-}
-
-.workspace-switch-spinner {
-  width: 12px;
-  height: 12px;
-  flex-shrink: 0;
-  border-radius: 999px;
-  border: 2px solid color-mix(in srgb, currentColor 18%, transparent);
-  border-top-color: currentColor;
-  animation: workspace-switch-spin 0.8s linear infinite;
-}
-
-.dir-dropdown {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
-  width: 280px;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(15, 17, 21, 0.12);
-  z-index: 200;
-  padding: 4px;
-  max-height: 320px;
-  overflow-y: auto;
-}
-
-:root[data-theme="dark"] .dir-dropdown {
-  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.34);
-}
-
-.dropdown-label {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-  padding: 6px 8px 4px;
-}
-
-.dir-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.12s;
-  font-size: 12px;
-  color: var(--text-color);
-}
-
-.dir-item:hover {
-  background: var(--hover-bg);
-}
-
-.dir-item.active {
-  background: var(--active-bg);
-}
-
-.dir-item.context-selected,
-.dir-item.context-selected:hover {
-  background: color-mix(in srgb, var(--active-bg) 58%, var(--hover-bg) 42%);
-}
-
-.dir-item-icon {
-  opacity: 0.45;
-  flex-shrink: 0;
-}
-
-.dir-item:hover .dir-item-icon {
-  opacity: 0.7;
-}
-
-.dir-item-text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.dir-item-name {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-weight: 500;
-}
-
-.dir-item-path {
-  font-size: 10px;
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.dir-check {
-  font-size: 11px;
-  color: var(--accent-color);
-  flex-shrink: 0;
-  opacity: 0.72;
-}
-
-.dropdown-empty {
-  text-align: center;
-  font-size: 11px;
-  color: var(--text-secondary);
-  padding: 8px;
-}
-
-.dropdown-divider {
-  height: 1px;
-  background: var(--border-color);
-  margin: 4px 4px;
-}
-
-.dir-item.browse {
-  color: var(--text-secondary);
-}
-
-.dir-item.browse:hover {
-  color: var(--text-color);
-}
-
-.dropdown-enter-active,
-.dropdown-leave-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
-}
-
-.dropdown-enter-from,
-.dropdown-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
-
-.workspace-switch-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 320;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(10, 12, 16, 0.32);
-  backdrop-filter: blur(2px);
-}
-
-.workspace-switch-dialog {
-  width: 420px;
-  max-width: min(420px, calc(100vw - 32px));
-  border-radius: 10px;
-  border: 1px solid var(--border-color);
-  background: var(--surface-elevated);
-  box-shadow: 0 16px 34px rgba(15, 17, 21, 0.18);
-  overflow: hidden;
-}
-
-:root[data-theme="dark"] .workspace-switch-dialog {
-  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.4);
-}
-
-.workspace-switch-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px 12px;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.workspace-switch-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-color);
-}
-
-.workspace-switch-close {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
-}
-
-.workspace-switch-close:hover:not(:disabled) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.workspace-switch-close:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.workspace-switch-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 16px;
-}
-
-.workspace-switch-message,
-.workspace-switch-warning {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.workspace-switch-message {
-  color: var(--text-secondary);
-}
-
-.workspace-switch-path {
-  padding: 8px 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--panel-bg) 72%, var(--sidebar-bg) 28%);
-  color: var(--text-color);
-  font-size: 12px;
-  line-height: 1.5;
-  font-family: var(--font-mono-identifier);
-  word-break: break-all;
-}
-
-.workspace-switch-warning {
-  padding: 8px 10px;
-  border: 1px solid var(--status-warn-border);
-  border-radius: 6px;
-  background: var(--status-warn-bg);
-  color: var(--status-warn-fg);
-}
-
-.workspace-switch-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 16px 16px;
-  border-top: 1px solid var(--border-color);
-}
-
-.workspace-switch-modal-enter-active,
-.workspace-switch-modal-leave-active {
-  transition: opacity 0.16s ease;
-}
-
-.workspace-switch-modal-enter-active .workspace-switch-dialog,
-.workspace-switch-modal-leave-active .workspace-switch-dialog {
-  transition: transform 0.16s ease, opacity 0.16s ease;
-}
-
-.workspace-switch-modal-enter-from,
-.workspace-switch-modal-leave-to {
-  opacity: 0;
-}
-
-.workspace-switch-modal-enter-from .workspace-switch-dialog,
-.workspace-switch-modal-leave-to .workspace-switch-dialog {
-  opacity: 0;
-  transform: translateY(6px) scale(0.98);
-}
-
-.tab-content {
-  flex: 1;
-  display: flex;
-  position: relative;
-  z-index: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.tab-content > :is(.chat-workspace-view, .chat-view-layout, .collab-view, .knowledge-view, .asset-view, .view-package-view, .agent-view, .settings-panel) {
-  min-width: 0;
-  min-height: 0;
-  contain: layout paint;
-}
-
-.tab-loading-state {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--panel-bg);
-  color: var(--text-secondary);
-  font-size: 13px;
-}
-
-.tab-loading-state.is-error {
-  color: var(--status-danger-fg);
-}
-
-.tab-plugin-warn {
-  -webkit-app-region: no-drag;
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 10px;
-  height: 23px;
-  margin-left: 8px;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--status-danger-bg) 78%, var(--panel-bg) 22%);
-  border: 1px solid color-mix(in srgb, var(--status-danger-border) 72%, var(--border-color) 28%);
-  color: var(--status-danger-fg);
-  cursor: pointer;
-  font: inherit;
-  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
-  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-  white-space: nowrap;
-}
-
-.tab-plugin-warn:hover:not(:disabled),
-.tab-plugin-warn:focus-visible {
-  background: color-mix(in srgb, var(--status-danger-bg) 88%, var(--panel-bg) 12%);
-  border-color: color-mix(in srgb, var(--status-danger-fg) 42%, var(--status-danger-border) 58%);
-}
-
-.tab-plugin-warn:focus-visible {
-  outline: none;
-}
-
-.tab-plugin-warn:disabled {
-  cursor: progress;
-  opacity: 0.82;
-}
-
-.tab-plugin-icon {
-  flex-shrink: 0;
-  opacity: 0.86;
-}
-
-.tab-plugin-spinner {
-  width: 13px;
-  height: 13px;
-  flex-shrink: 0;
-  border-radius: 999px;
-  border: 2px solid color-mix(in srgb, currentColor 18%, transparent);
-  border-top-color: currentColor;
-  animation: tab-plugin-spin 0.8s linear infinite;
-}
-
-.tab-plugin-label {
-  font-size: 12px;
-  font-weight: 500;
-  color: currentColor;
-  white-space: nowrap;
-}
-
-.tab-plugin-action {
-  font-size: 11px;
-  color: color-mix(in srgb, currentColor 76%, var(--text-secondary) 24%);
-  white-space: nowrap;
-}
-
-@keyframes tab-plugin-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes workspace-switch-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-</style>

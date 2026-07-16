@@ -26,8 +26,11 @@ pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
 pub const VIEW_AUTOMATION_REQUEST_EVENT: &str = "view-automation-request";
 
 const MAIN_WINDOW_LABEL: &str = "main";
-const VIEW_HOST_ROUTE: &str = "/view-host";
-const VIEW_CONTENT_ROUTE: &str = "/view-content";
+// View windows load the lightweight `window.html` entry; the legacy
+// pathname routes ("/view-host", "/view-content") stay recognized by the
+// frontend for compatibility with previously built URLs.
+const VIEW_HOST_ROUTE: &str = "/window.html?viewHost=1";
+const VIEW_CONTENT_ROUTE: &str = "/window.html?viewContent=1";
 const VIEW_HOST_TABS_MERGE_EVENT: &str = "view-host-tabs-merge";
 const VIEW_HOST_TABS_SELECT_EVENT: &str = "view-host-tabs-select";
 const VIEW_FRONTEND_LOG_REL_PATH: &str = ".locus/logs/frontend.log";
@@ -36,7 +39,7 @@ const VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES: usize = 20_000;
 const VIEW_PACKAGE_ARCHIVE_MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
 const VIEW_HOST_POOL_LABEL_PREFIX: &str = "view-pool-";
-const VIEW_HOST_POOL_ROUTE: &str = "/view-host?pool=1";
+const VIEW_HOST_POOL_ROUTE: &str = "/window.html?viewHost=1&pool=1";
 const VIEW_CONTENT_WINDOW_LABEL_PREFIX: &str = "view-content-";
 const VIEW_INSPECTOR_WINDOW_LABEL_PREFIX: &str = "view-inspector-";
 pub const LOCUS_INSPECTOR_TAB_ID_PREFIX: &str = "locus-inspector:";
@@ -4207,7 +4210,7 @@ fn encode_view_host_tab_id(tab_id: &str) -> String {
 }
 
 fn view_host_url_for_tab_id(tab_id: &str) -> String {
-    format!("{}?id={}", VIEW_HOST_ROUTE, encode_view_host_tab_id(tab_id))
+    format!("{}&id={}", VIEW_HOST_ROUTE, encode_view_host_tab_id(tab_id))
 }
 
 fn view_host_url_for_label(view_id: &str, label: &str) -> String {
@@ -4508,6 +4511,7 @@ fn build_view_window(
         .decorations(false)
         .resizable(true)
         .visible(false)
+        .background_color(tauri::webview::Color(0x1d, 0x1d, 0x21, 0xff))
         .disable_drag_drop_handler()
         .build();
     if let Err(error) = &result {
@@ -4682,7 +4686,7 @@ pub fn view_content_window_label(view_id: &str) -> String {
 }
 
 fn view_content_host_url(view_id: &str) -> String {
-    format!("{}?id={}", VIEW_CONTENT_ROUTE, view_id)
+    format!("{}&id={}", VIEW_CONTENT_ROUTE, view_id)
 }
 
 fn cancel_view_content_destroy(label: &str) {
@@ -4910,6 +4914,7 @@ fn build_view_content_window(
     .skip_taskbar(true)
     .focused(false)
     .visible(false)
+    .background_color(tauri::webview::Color(0x1d, 0x1d, 0x21, 0xff))
     .disable_drag_drop_handler()
     .build()
     .map_err(|error| format!("Failed to create View content window: {error}"))

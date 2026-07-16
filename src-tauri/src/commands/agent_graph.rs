@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager, State, WebviewUrl, WindowEvent};
 use crate::error::AppError;
 use crate::session::models::ImageData;
 
-pub const AGENT_GRAPH_TOOL_ROUTE: &str = "/agent-graph";
+pub const AGENT_GRAPH_TOOL_ROUTE: &str = "/window.html?agentGraph=1";
 const AGENT_GRAPH_TOOL_LABEL_PREFIX: &str = "agent-graph-";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,7 +433,7 @@ pub fn open_agent_graph_tool_window(
     request: &AgentGraphToolRequest,
 ) -> Result<AgentGraphToolOpenResult, String> {
     let label = agent_graph_tool_window_label(&request.request_id);
-    let host_url = format!("{}?id={}", AGENT_GRAPH_TOOL_ROUTE, request.request_id);
+    let host_url = format!("{}&id={}", AGENT_GRAPH_TOOL_ROUTE, request.request_id);
 
     if let Some(window) = app_handle.get_webview_window(&label) {
         window
@@ -450,7 +450,10 @@ pub fn open_agent_graph_tool_window(
         .min_inner_size(760.0, 520.0)
         .decorations(false)
         .resizable(true)
-        .visible(true)
+        // Created hidden; the window.html shell reveals itself after first
+        // paint so the WebView2 init phase never flashes white.
+        .visible(false)
+        .background_color(tauri::webview::Color(0x1d, 0x1d, 0x21, 0xff))
         .disable_drag_drop_handler()
         .build()
         .map_err(|error| format!("Failed to open Graph window: {}", error))?;

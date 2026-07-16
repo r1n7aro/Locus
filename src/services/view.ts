@@ -450,11 +450,13 @@ export const VIEW_HOST_PATH = "/view-host";
 export const VIEW_CONTENT_PATH = "/view-content";
 
 export function isViewHostWindowLocation(): boolean {
-  return window.location.pathname === VIEW_HOST_PATH;
+  return window.location.pathname === VIEW_HOST_PATH
+    || new URLSearchParams(window.location.search).get("viewHost") === "1";
 }
 
 export function isViewContentWindowLocation(): boolean {
-  return window.location.pathname === VIEW_CONTENT_PATH;
+  return window.location.pathname === VIEW_CONTENT_PATH
+    || new URLSearchParams(window.location.search).get("viewContent") === "1";
 }
 
 export function viewHostIdFromLocation(): string {
@@ -462,7 +464,7 @@ export function viewHostIdFromLocation(): string {
 }
 
 export function isViewHostPoolWindowLocation(): boolean {
-  return window.location.pathname === VIEW_HOST_PATH
+  return isViewHostWindowLocation()
     && new URLSearchParams(window.location.search).get("pool") === "1";
 }
 

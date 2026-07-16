@@ -1,5 +1,6 @@
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { UnityReferenceImportLocale, UnityReferenceImportStatus } from "../types";
+import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const UNITY_REFERENCE_IMPORT_WINDOW_LABEL = "unity-reference-import-progress";
 export const UNITY_REFERENCE_IMPORT_WINDOW_PATH = "/unity-reference-import";
@@ -49,7 +50,7 @@ export function getUnityReferenceImportWindowPayload(
   };
 }
 
-export function buildUnityReferenceImportWindowUrl(
+export function buildUnityReferenceImportWindowQuery(
   payload: UnityReferenceImportWindowPayload = {},
 ): string {
   const params = new URLSearchParams({
@@ -60,7 +61,13 @@ export function buildUnityReferenceImportWindowUrl(
   if (payload.projectVersion?.trim()) params.set("projectVersion", payload.projectVersion.trim());
   if (payload.docsVersion?.trim()) params.set("docsVersion", payload.docsVersion.trim());
   if (payload.locale) params.set("locale", payload.locale);
-  return `${UNITY_REFERENCE_IMPORT_WINDOW_PATH}?${params.toString()}`;
+  return params.toString();
+}
+
+export function buildUnityReferenceImportWindowUrl(
+  payload: UnityReferenceImportWindowPayload = {},
+): string {
+  return buildSubWindowUrl(buildUnityReferenceImportWindowQuery(payload));
 }
 
 function toWindowPayload(
@@ -92,37 +99,20 @@ export async function openUnityReferenceImportProgressWindow(
     || payload.docsVersion?.trim()
     || payload.locale
   );
-  const existingWindow = await WebviewWindow.getByLabel(UNITY_REFERENCE_IMPORT_WINDOW_LABEL);
-  if (existingWindow) {
-    if (hasPayload) {
-      await existingWindow.emit(UNITY_REFERENCE_IMPORT_WINDOW_STATUS_EVENT, payload);
-    }
-    await existingWindow.setFocus();
-    return;
+  if (!hasTauriWindowRuntime()) return;
+  const result = await openSubWindow({
+    kind: UNITY_REFERENCE_IMPORT_WINDOW_LABEL,
+    title: UNITY_REFERENCE_IMPORT_WINDOW_TITLE,
+    width: 720,
+    height: 560,
+    minWidth: 680,
+    minHeight: 500,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    closable: false,
+  }, buildUnityReferenceImportWindowQuery(payload));
+  if (result.existing && hasPayload) {
+    await result.window?.emit(UNITY_REFERENCE_IMPORT_WINDOW_STATUS_EVENT, payload);
   }
-
-  await new Promise<void>((resolve, reject) => {
-    const progressWindow = new WebviewWindow(UNITY_REFERENCE_IMPORT_WINDOW_LABEL, {
-      url: buildUnityReferenceImportWindowUrl(payload),
-      title: UNITY_REFERENCE_IMPORT_WINDOW_TITLE,
-      width: 720,
-      height: 560,
-      minWidth: 680,
-      minHeight: 500,
-      decorations: false,
-      resizable: false,
-      closable: false,
-      minimizable: false,
-      maximizable: false,
-      center: true,
-      shadow: true,
-    });
-
-    progressWindow.once("tauri://created", () => {
-      resolve();
-    });
-    progressWindow.once("tauri://error", (event) => {
-      reject(event);
-    });
-  });
 }

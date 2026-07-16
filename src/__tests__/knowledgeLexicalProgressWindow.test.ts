@@ -2,23 +2,19 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const webviewWindowMocks = vi.hoisted(() => ({
-  createdWindows: [] as Array<unknown[]>,
+const subWindowMocks = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   getByLabelMock: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: subWindowMocks.invokeMock,
 }));
 
 vi.mock("@tauri-apps/api/webviewWindow", () => ({
   getCurrentWebviewWindow: vi.fn(() => ({ label: "main" })),
   WebviewWindow: class {
-    static getByLabel = webviewWindowMocks.getByLabelMock;
-
-    constructor(...args: unknown[]) {
-      webviewWindowMocks.createdWindows.push(args);
-    }
-
-    once(event: string, handler: () => void) {
-      if (event === "tauri://created") handler();
-    }
+    static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
 
@@ -39,12 +35,23 @@ import {
 
 describe("knowledgeLexicalProgressWindow", () => {
   beforeEach(() => {
-    webviewWindowMocks.getByLabelMock.mockReset();
-    webviewWindowMocks.createdWindows.length = 0;
+    subWindowMocks.invokeMock.mockReset();
+    subWindowMocks.getByLabelMock.mockReset();
+    subWindowMocks.getByLabelMock.mockResolvedValue(null);
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { pathname: "/", search: "" },
+        __TAURI_INTERNALS__: {
+          invoke: vi.fn(),
+          metadata: { currentWindow: { label: "main" } },
+        },
+      },
+    });
   });
 
   it("builds a dedicated window url", () => {
-    expect(buildKnowledgeLexicalProgressWindowUrl()).toBe("/knowledge-lexical-progress?knowledgeLexicalProgress=1");
+    expect(buildKnowledgeLexicalProgressWindowUrl()).toBe("/window.html?knowledgeLexicalProgress=1");
   });
 
   it("detects lexical progress window locations", () => {
@@ -126,11 +133,12 @@ describe("knowledgeLexicalProgressWindow", () => {
     })).toBe("2026-04-16T00:00:00Z");
   });
 
-  it("reuses an existing progress window without forcing focus", async () => {
-    const existingWindow = {
-      setFocus: vi.fn(),
-    };
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
+  it("opens without stealing focus from the main window", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "knowledge-lexical-progress",
+      existing: false,
+      pooled: false,
+    });
 
     await openKnowledgeLexicalProgressWindow({
       running: true,
@@ -144,22 +152,30 @@ describe("knowledgeLexicalProgressWindow", () => {
       completedAt: null,
     });
 
-    expect(existingWindow.setFocus).not.toHaveBeenCalled();
-    expect(webviewWindowMocks.createdWindows).toHaveLength(0);
+    expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
+      request: expect.objectContaining({
+        kind: "knowledge-lexical-progress",
+        focusExisting: false,
+        resizable: false,
+        closable: true,
+        query: expect.stringContaining("knowledgeLexicalProgress=1"),
+      }),
+    });
   });
 
-  it("creates a closable frameless progress window", async () => {
-    webviewWindowMocks.getByLabelMock.mockResolvedValue(null);
+  it("reuses an existing progress window without emitting a payload", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "sub-pool-2",
+      existing: true,
+      pooled: false,
+    });
+    const existingWindow = { emit: vi.fn(), setFocus: vi.fn() };
+    subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
     await openKnowledgeLexicalProgressWindow();
 
-    expect(webviewWindowMocks.createdWindows).toHaveLength(1);
-    const [, options] = webviewWindowMocks.createdWindows[0] as [
-      string,
-      Record<string, unknown>,
-    ];
-    expect(options.decorations).toBe(false);
-    expect(options.closable).toBe(true);
+    expect(existingWindow.emit).not.toHaveBeenCalled();
+    expect(existingWindow.setFocus).not.toHaveBeenCalled();
   });
 
   it("uses a titlebar close action instead of duplicate progress text", () => {
