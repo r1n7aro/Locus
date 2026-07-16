@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.5.8 (2026-07-14)"
+description: "Locus v0.6.0 (2026-07-17)"
 sidebarTitle: "Latest Version"
-version: "0.5.8"
-releasedAt: "2026-07-14"
+version: "0.6.0"
+releasedAt: "2026-07-17"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,37 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.5.8/locus_0.5.8_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.6.0 (Added)
+
+- **MCP servers.** Connect external MCP servers over stdio or HTTP and use their tools from agent sessions. A new MCP settings page manages servers and their tools; MCP tool calls show confirmation cards and status in chat. Server entries can be imported from Claude Desktop, Claude Code, and Cursor configs (imported entries arrive disabled). The new `/connect` command starts a guided flow for connecting external software, picking between MCP, CLI, and HTTP channels and verifying the connection actually works.
+- **Multi-model providers and a bundled models.dev catalog.** Custom models are now grouped into providers, each hosting multiple models, replacing single custom-endpoint entries. Providers can be added from the bundled models.dev catalog (70+ services with prefilled official endpoints) or configured manually in a two-step dialog with per-field validation. Reasoning options such as `enable_thinking` and thinking type can be set per model, and the model selector groups custom models by provider. Existing configurations migrate automatically; old model ids keep working.
+- **External skill discovery.** Optionally discover read-only agent skills from Claude Code, Codex, and `.agents` directories — user-level and per-workspace — plus installed Claude Code plugins. Off by default. Skill activation is now split into separate auto-inject and command channels with per-skill controls; external command skills support `$ARGUMENTS` and `$1`–`$9` substitution.
+- **Extra working directories.** A workspace can attach additional directories through its context menu; file tools can read and edit within them, and the workspace selector shows attached paths inline.
+- **Unity object preview straight from disk.** Files Unity does not serialize (markdown, plain text, source code, binaries) now preview from disk, so previews keep working for assets Unity has not imported — such as AI-generated files under symlinked folders. Preview folding is now optional, and the asset inspector keeps previews expanded. (#114)
+- **Copy selection in chat.** Right-clicking selected text in a message offers copying the selection as the first menu item.
+- **View log bar toggle.** The log bar in view windows is hidden by default and can be enabled in display settings; the choice syncs across windows.
+
+### v0.6.0 (Fixed)
+
+- Command-tool friction on Windows: managed Python environment variables now apply only to Python invocations instead of the whole command environment; command output is decoded using the system ANSI code page, fixing garbled Chinese (GBK) output; long-output truncation keeps both head and tail instead of only the head.
+- Deferred tools now load through Anthropic native tool references and Codex native tool search, replacing the previous meta-tool activation.
+- The builtin Unity profiler sampling skill now defaults to summary injection so agents can discover it on demand; it previously shipped with injection off.
+- Helper windows (plan review, diff review, import dialogs, and others) open through a pre-warmed window pool and appear faster.
+- UI locale catalogs are code-split and loaded on demand.
+- Session and knowledge-index databases vacuum automatically once free pages dominate the file, reclaiming disk space.
+- Context menu items now carry icons with a unified layout.
+- Plugin toggles apply immediately in the plugin list instead of waiting for the backend round-trip.
+- The scroll wheel no longer changes focused number inputs in settings.
+
+### v0.6.0 (Removed)
+
+- The single-endpoint custom model configuration is gone, replaced by the multi-model provider dialog; existing custom endpoints migrate automatically.
 
 ### v0.5.8 (Added)
 
