@@ -47,6 +47,7 @@ const previewModel = computed<UnityObjectPreviewInput>(() => ({
       :model="previewModel"
       level="inspector"
       :auto-load-preview="true"
+      :collapsible="false"
     />
   </div>
 </template>

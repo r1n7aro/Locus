@@ -50,6 +50,9 @@ describe("Locus asset inspector integration", () => {
     expect(pane).toContain("objectPath");
     expect(pane).toContain('level="inspector"');
     expect(pane).toContain(":auto-load-preview=\"true\"");
+    // The tab hosts exactly one target; a fold toggle would collapse the
+    // whole window content, so the preview renders without it.
+    expect(pane).toContain(":collapsible=\"false\"");
     // The preview header already names the target; no extra path/source row.
     expect(pane).not.toContain("locus-asset-inspector-pane-header");
 
@@ -127,6 +130,7 @@ describe("Locus asset inspector integration", () => {
     expect(panel).toContain("UnityObjectPreview");
     expect(panel).toContain('level="inspector"');
     expect(panel).toContain(":auto-load-preview=\"true\"");
+    expect(panel).toContain(":collapsible=\"false\"");
     expect(panel).toContain("@source-change=\"handlePreviewSourceChange\"");
     expect(panel).toContain("handleTitlebarPointerDown");
     expect(panel).toContain("handleResizePointerDown");

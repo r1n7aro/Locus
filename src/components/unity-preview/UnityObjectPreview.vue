@@ -197,7 +197,7 @@ import UnityInspectorPane from "../diff/UnityInspectorPane.vue";
 import {
   hasEditableUnityPropertySnapshot,
   isUnityCodeSourceAssetPath,
-  isUnityExternalSourceAssetPath,
+  isUnityLiveSerializedAssetPath,
   normalizeUnityObjectPreviewModel,
   type UnityObjectPreviewInput,
   type UnityObjectPreviewLevel,
@@ -232,6 +232,7 @@ const props = withDefaults(defineProps<{
   disableObjectDrawer?: boolean;
   autoLoadPreview?: boolean;
   previewStateKey?: string;
+  collapsible?: boolean;
 }>(), {
   level: "inline",
   loading: false,
@@ -249,6 +250,7 @@ const props = withDefaults(defineProps<{
   disableObjectDrawer: false,
   autoLoadPreview: true,
   previewStateKey: "",
+  collapsible: true,
 });
 
 const emit = defineEmits<{
@@ -394,7 +396,11 @@ const liveSerializedTarget = computed<UnitySerializedPropertyTarget | null>(() =
 
   if (model.ref.kind !== "asset" && model.ref.kind !== "subObject") return null;
   if (!UNITY_ASSET_REF_ROOT_RE.test(path)) return null;
-  if (isUnityExternalSourceAssetPath(path)) return null;
+  // Extension routing (#114): only Unity-native serialized assets are worth a
+  // live editor round-trip. Text, source, and binary files preview from disk,
+  // so they render even when Unity has not imported them (symlinked folders,
+  // freshly generated files).
+  if (!isUnityLiveSerializedAssetPath(path)) return null;
   return { kind: "asset", path };
 });
 const liveSerializedTargetKey = computed(() => {
@@ -511,6 +517,18 @@ const targetErrorState = computed(() => previewErrorDisplayMessage(autoTargetErr
 const targetErrorRequiresUnity = computed(() => isUnityConnectionError(autoTargetError.value));
 const livePropertyErrorState = computed(() => previewErrorDisplayMessage(livePropertyError.value));
 const livePropertyErrorRequiresUnity = computed(() => isUnityConnectionError(livePropertyError.value));
+// A live-property failure must not blank out an inspector that already has
+// disk content to show (#114); it demotes to the note rendered above the
+// disk preview instead.
+const hasDiskPreviewContent = computed(() => !!previewPayload.value || !!inspector.value);
+const showLivePropertyErrorNote = computed(() => (
+  props.level === "inspector"
+  && !inspectorCollapsed.value
+  && !!livePropertyError.value
+  && !effectivePropertyTree.value
+  && !livePropertyLoading.value
+  && hasDiskPreviewContent.value
+));
 const canRenderBinaryThumbnail = computed(() => {
   const payload = binaryPreviewPayload.value;
   if (!payload) return false;
@@ -611,6 +629,7 @@ function previewErrorDisplayMessage(error: string): string {
 }
 
 function toggleInspectorCollapsed() {
+  if (!props.collapsible) return;
   inspectorCollapsed.value = !inspectorCollapsed.value;
   rememberUnityObjectPreviewExpandedState(props.previewStateKey, !inspectorCollapsed.value);
 }
@@ -1281,7 +1300,7 @@ watch(
 watch(
   () => [props.previewStateKey, props.level] as const,
   ([previewStateKey, level]) => {
-    if (level !== "inspector") return;
+    if (level !== "inspector" || !props.collapsible) return;
     const expanded = readUnityObjectPreviewExpandedState(previewStateKey);
     if (expanded === null) return;
     inspectorCollapsed.value = !expanded;
@@ -1399,8 +1418,13 @@ onBeforeUnmount(() => {
   />
 
   <section v-else class="unity-object-preview" :class="previewClass" @click="handlePreviewRootClick">
-    <div v-if="level === 'inspector'" class="unity-object-inspector-header">
+    <div
+      v-if="level === 'inspector'"
+      class="unity-object-inspector-header"
+      :class="{ 'no-fold': !collapsible }"
+    >
       <button
+        v-if="collapsible"
         type="button"
         class="unity-object-inspector-fold"
         :class="{ collapsed: inspectorCollapsed }"
@@ -1419,11 +1443,20 @@ onBeforeUnmount(() => {
     </div>
 
     <div
+      v-if="showLivePropertyErrorNote"
+      class="unity-object-live-error-note"
+      :class="{ neutral: livePropertyErrorRequiresUnity }"
+      :title="livePropertyErrorState"
+    >
+      {{ livePropertyErrorState }}
+    </div>
+
+    <div
       v-if="level === 'inspector' && inspectorCollapsed"
       class="unity-object-inspector-collapsed-body"
     />
 
-    <template v-else-if="level === 'inspector' && (effectivePropertyTree || livePropertyLoading || livePropertyError)">
+    <template v-else-if="level === 'inspector' && (effectivePropertyTree || livePropertyLoading || (livePropertyError && !hasDiskPreviewContent))">
       <UnityObjectEditorPanel
         v-if="effectivePropertyTree || livePropertyLoading"
         :model="liveEditorModel"
@@ -1768,6 +1801,10 @@ onBeforeUnmount(() => {
   padding: 4px 8px 4px 6px;
 }
 
+.unity-object-inspector-header.no-fold :deep(.unity-object-identity.mode-row) {
+  padding-left: 10px;
+}
+
 .unity-object-inspector-collapsed-body {
   display: none;
 }
@@ -1909,6 +1946,22 @@ onBeforeUnmount(() => {
 }
 
 .unity-object-preview-error.neutral {
+  color: var(--text-secondary);
+}
+
+.unity-object-live-error-note {
+  flex-shrink: 0;
+  overflow: hidden;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--status-danger-fg);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unity-object-live-error-note.neutral {
   color: var(--text-secondary);
 }
 

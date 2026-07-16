@@ -436,6 +436,7 @@ onUnmounted(() => {
         :model="previewModel"
         level="inspector"
         :auto-load-preview="true"
+        :collapsible="false"
         @source-change="handlePreviewSourceChange"
       />
     </div>

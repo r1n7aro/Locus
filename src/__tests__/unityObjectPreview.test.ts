@@ -8,6 +8,7 @@ import {
   hasEditableUnityPropertySnapshot,
   isUnityCodeSourceAssetPath,
   isUnityExternalSourceAssetPath,
+  isUnityLiveSerializedAssetPath,
   normalizeUnityObjectPreviewModel,
   resolveUnityObjectDrawer,
   type UnityObjectDrawerContext,
@@ -45,6 +46,28 @@ describe("unityObjectPreview", () => {
     expect(isUnityCodeSourceAssetPath("Assets/Shaders/Common.cginc")).toBe(true);
     expect(isUnityCodeSourceAssetPath("Assets/Prefabs/Enemy.prefab")).toBe(false);
     expect(isUnityCodeSourceAssetPath("Assets/Data/Notes.txt")).toBe(false);
+  });
+
+  it("routes only Unity-native serialized assets to the live property tree", () => {
+    // Unity-native serialized assets keep the live editor round-trip.
+    expect(isUnityLiveSerializedAssetPath("Assets/Prefabs/Enemy.prefab")).toBe(true);
+    expect(isUnityLiveSerializedAssetPath("Assets/Scenes/Main.unity")).toBe(true);
+    expect(isUnityLiveSerializedAssetPath("Assets/Materials/Water.mat")).toBe(true);
+    expect(isUnityLiveSerializedAssetPath("Assets/Data/BasicAttack.asset")).toBe(true);
+    expect(isUnityLiveSerializedAssetPath("Assets/UI/Icons.spriteatlas")).toBe(true);
+    expect(isUnityLiveSerializedAssetPath("Assets/Audio/Master.mixer")).toBe(true);
+    // Extension-less refs (folders) resolve to DefaultAsset and stay live.
+    expect(isUnityLiveSerializedAssetPath("Assets/AIGen")).toBe(true);
+    // Text, source, and binary files preview from disk instead (#114): the
+    // live path breaks whenever Unity has not imported the file, e.g. under
+    // symlinked folders.
+    expect(isUnityLiveSerializedAssetPath("Assets/AIGen/回复流程.md")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Data/Notes.txt")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Config/settings.json")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Scripts/FireLight.cs")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Characters/Hero.fbx")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Textures/Grass.png")).toBe(false);
+    expect(isUnityLiveSerializedAssetPath("Assets/Tools/report.html")).toBe(false);
   });
 
   it("uses asset file names with extensions for default titles", () => {
@@ -320,6 +343,12 @@ describe("unityObjectPreview", () => {
     expect(preview).toContain('@click="handlePreviewRootClick"');
     expect(preview).toContain("unity-object-inspector-header");
     expect(preview).toContain("unity-object-inspector-fold");
+    // Single-target hosts (Locus Inspector window/panel) hide the fold toggle.
+    expect(preview).toContain("collapsible?: boolean");
+    expect(preview).toContain("collapsible: true");
+    expect(preview).toContain('v-if="collapsible"');
+    expect(preview).toContain("'no-fold': !collapsible");
+    expect(preview).toContain("if (!props.collapsible) return;");
     expect(preview).toContain("structuredSelectableTargetIds");
     expect(preview).toContain("showStructuredTargetSelector");
     expect(preview).toContain('v-if="showStructuredTargetSelector"');
@@ -463,6 +492,20 @@ describe("unityObjectPreview", () => {
     expect(identity).toContain("resolveRefGraphGuid");
     expect(identity).toContain("resolveRefGraphPath");
     expect(identity).toContain("unityObjectPreviewAssetRef");
+  });
+
+  it("keeps disk previews visible when the live property tree fails (#114)", () => {
+    const preview = read("src/components/unity-preview/UnityObjectPreview.vue");
+
+    // Live serialized loading is gated on the extension whitelist, so text
+    // and binary assets never depend on Unity having imported the file.
+    expect(preview).toContain("isUnityLiveSerializedAssetPath(path)");
+    expect(preview).not.toContain("isUnityExternalSourceAssetPath");
+    // A live failure demotes to a note instead of blanking out disk content.
+    expect(preview).toContain("hasDiskPreviewContent");
+    expect(preview).toContain("(livePropertyError && !hasDiskPreviewContent)");
+    expect(preview).toContain("showLivePropertyErrorNote");
+    expect(preview).toContain("unity-object-live-error-note");
   });
 
   it("routes markdown Unity refs through the public preview component without replacing delegated actions", () => {
