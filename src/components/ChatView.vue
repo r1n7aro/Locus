@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { FileDiff, PanelTopOpen } from "lucide";
+import { AppWindow, BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -90,6 +90,7 @@ import {
   buildUserMessageDraft,
   writeChatMessageClipboard,
 } from "../composables/chatMessageDraft";
+import { selectionTextAtPoint } from "../composables/chatSelectionContext";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
   captureTranscriptLayoutSnapshot,
@@ -321,7 +322,8 @@ type AssetRefContextMenuState = {
 type MessageContextMenuState = {
   x: number;
   y: number;
-  messageId: string;
+  messageId: string | null;
+  selectionText: string;
 };
 
 const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
@@ -576,29 +578,37 @@ function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarg
 function handleContentContextMenu(e: MouseEvent) {
   if (!(e.target instanceof Element)) return;
   if (e.target.closest(".unity-property-fence, [data-md-unity-property-fence='true']")) return;
-  const target = assetContextTargetFromElement(e.target);
-  if (target) {
-    e.preventDefault();
-    e.stopPropagation();
-    closeMessageContextMenu();
-    assetRefCtxMenu.value = {
-      x: e.clientX,
-      y: e.clientY,
-      target,
-    };
-    return;
+  const selectionText = typeof window === "undefined"
+    ? ""
+    : selectionTextAtPoint(window.getSelection(), { x: e.clientX, y: e.clientY });
+  if (!selectionText) {
+    const target = assetContextTargetFromElement(e.target);
+    if (target) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMessageContextMenu();
+      assetRefCtxMenu.value = {
+        x: e.clientX,
+        y: e.clientY,
+        target,
+      };
+      return;
+    }
   }
 
   const messageEl = e.target.closest("[data-chat-message-id]") as HTMLElement | null;
   const hitMessageId = messageEl?.dataset.chatMessageId?.trim();
-  if (!hitMessageId) return;
   const groupEl = messageEl?.closest("[data-chat-message-group-end-id]") as HTMLElement | null;
   const groupEndMessageId = groupEl?.dataset.chatMessageGroupEndId?.trim();
-  const messageId =
+  const resolvedMessageId =
     groupEl?.dataset.chatMessageGroupRole === "assistant" && groupEndMessageId
       ? groupEndMessageId
       : hitMessageId;
-  if (!props.messages.some((message) => message.id === messageId)) return;
+  const messageId =
+    resolvedMessageId && props.messages.some((message) => message.id === resolvedMessageId)
+      ? resolvedMessageId
+      : null;
+  if (!selectionText && !messageId) return;
 
   e.preventDefault();
   e.stopPropagation();
@@ -607,6 +617,7 @@ function handleContentContextMenu(e: MouseEvent) {
     x: e.clientX,
     y: e.clientY,
     messageId,
+    selectionText,
   };
 }
 
@@ -1059,6 +1070,26 @@ async function doMessageCopy() {
     });
   } catch (error) {
     console.warn("copy chat message failed:", error);
+    notificationStore.addNotice("warning", t("chat.messageMenu.copyFailed"), {
+      operation: "messageCopy",
+      replaceOperation: true,
+    });
+  }
+}
+
+async function doMessageCopySelection() {
+  const selectionText = messageCtxMenu.value?.selectionText ?? "";
+  if (!selectionText) return;
+  closeMessageContextMenu();
+  try {
+    await writeChatMessageClipboard({ text: selectionText, draft: null, serializedDraft: null });
+    notificationStore.addNotice("success", t("common.copied"), {
+      operation: "messageCopy",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  } catch (error) {
+    console.warn("copy chat selection failed:", error);
     notificationStore.addNotice("warning", t("chat.messageMenu.copyFailed"), {
       operation: "messageCopy",
       replaceOperation: true,
@@ -3053,12 +3084,24 @@ onUnmounted(() => {
       @close="closeMessageContextMenu"
     >
           <button
+            v-if="messageCtxMenu.selectionText"
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            @click="doMessageCopySelection"
+          >
+            <LucideIcon :icon="Copy" :size="13" />
+            {{ t("chat.messageMenu.copySelection") }}
+          </button>
+          <button
+            v-else-if="messageCtxMenu.messageId"
             type="button"
             class="asset-ref-ctx-item ui-select-none"
             role="menuitem"
             :disabled="!messageContextCanCopy"
             @click="doMessageCopy"
           >
+            <LucideIcon :icon="Copy" :size="13" />
             {{ t("chat.messageMenu.copyMessage") }}
           </button>
           <button
@@ -3069,27 +3112,32 @@ onUnmounted(() => {
             :disabled="!messageContextCanReEdit"
             @click="doMessageReEdit"
           >
+            <LucideIcon :icon="PencilLine" :size="13" />
             {{ t("chat.messageMenu.reEditUserMessage") }}
           </button>
-          <div class="asset-ref-ctx-sep"></div>
-          <button
-            type="button"
-            class="asset-ref-ctx-item ui-select-none"
-            role="menuitem"
-            :disabled="!messageContextCanAct"
-            @click="doMessageRollback"
-          >
-            {{ t("chat.messageMenu.rollbackToMessage") }}
-          </button>
-          <button
-            type="button"
-            class="asset-ref-ctx-item ui-select-none"
-            role="menuitem"
-            :disabled="!messageContextCanAct"
-            @click="doMessageFork"
-          >
-            {{ t("chat.messageMenu.forkFromMessage") }}
-          </button>
+          <template v-if="messageCtxMenu.messageId">
+            <div class="asset-ref-ctx-sep"></div>
+            <button
+              type="button"
+              class="asset-ref-ctx-item ui-select-none"
+              role="menuitem"
+              :disabled="!messageContextCanAct"
+              @click="doMessageRollback"
+            >
+              <LucideIcon :icon="Undo2" :size="13" />
+              {{ t("chat.messageMenu.rollbackToMessage") }}
+            </button>
+            <button
+              type="button"
+              class="asset-ref-ctx-item ui-select-none"
+              role="menuitem"
+              :disabled="!messageContextCanAct"
+              @click="doMessageFork"
+            >
+              <LucideIcon :icon="GitFork" :size="13" />
+              {{ t("chat.messageMenu.forkFromMessage") }}
+            </button>
+          </template>
     </BaseContextMenu>
 
     <BaseContextMenu
@@ -3106,6 +3154,7 @@ onUnmounted(() => {
             class="asset-ref-ctx-item"
             @click="doAssetRefOpenInKnowledge"
           >
+            <LucideIcon :icon="BookOpen" :size="13" />
             {{ t("common.openInKnowledge") }}
           </button>
           <button
@@ -3114,12 +3163,15 @@ onUnmounted(() => {
             class="asset-ref-ctx-item"
             @click="doAssetRefOpenInEditor"
           >
+            <LucideIcon :icon="ExternalLink" :size="13" />
             {{ t("common.openInEditor") }}
           </button>
           <button type="button" class="asset-ref-ctx-item" @click="doAssetRefShowInFolder">
+            <LucideIcon :icon="FolderOpen" :size="13" />
             {{ t("common.openInFileExplorer") }}
           </button>
           <button type="button" class="asset-ref-ctx-item" @click="doAssetRefCopyPath">
+            <LucideIcon :icon="Copy" :size="13" />
             {{ t("common.copyPath") }}
           </button>
           <template v-if="assetRefContextSupportsUnity">
@@ -3131,6 +3183,7 @@ onUnmounted(() => {
               :disabled="!assetRefContextCanSelectInUnity"
               @click="doAssetRefSelectInUnity"
             >
+              <LucideIcon :icon="Crosshair" :size="13" />
               {{ t("common.selectInUnity") }}
             </button>
             <template v-if="assetRefContextCanOpenLocusInspector">
@@ -3140,6 +3193,7 @@ onUnmounted(() => {
                 class="asset-ref-ctx-item"
                 @click="doAssetRefOpenInLocusInspector()"
               >
+                <LucideIcon :icon="PanelTopOpen" :size="13" />
                 {{ t("common.openInLocusInspector") }}
               </button>
               <button
@@ -3147,6 +3201,7 @@ onUnmounted(() => {
                 class="asset-ref-ctx-item"
                 @click="doAssetRefOpenInLocusInspectorWindow"
               >
+                <LucideIcon :icon="AppWindow" :size="13" />
                 {{ t("common.openInLocusInspectorWindow") }}
               </button>
             </template>
