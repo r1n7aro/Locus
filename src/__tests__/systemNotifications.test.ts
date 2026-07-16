@@ -27,6 +27,7 @@ function createDisplayState(): DisplaySettings {
     showKnowledgeTab: true,
     showCollabTab: true,
     showAssetTab: true,
+    showTestsTab: true,
     showViewsTab: true,
     showPluginsTab: true,
     showAgentTab: true,

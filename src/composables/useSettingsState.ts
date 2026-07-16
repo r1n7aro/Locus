@@ -1075,6 +1075,8 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "web_fetch",          label: "web_fetch",          desc: t("tool.desc.web_fetch"),          defaultMode: "ask"  as const },
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
+    { name: "unity_test_find",    label: "unity_test_find",    desc: t("tool.desc.unity_test_find"),    defaultMode: "auto" as const },
+    { name: "unity_test_run",     label: "unity_test_run",     desc: t("tool.desc.unity_test_run"),     defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
     { name: "unity_hot_reload",   label: "unity_hot_reload",   desc: t("tool.desc.unity_hot_reload"),   defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },

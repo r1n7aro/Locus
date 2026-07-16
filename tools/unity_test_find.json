@@ -1,0 +1,31 @@
+{
+  "description": "Discover Unity Test Framework tests in the connected Unity Editor. Use this before running tests to inspect available EditMode and PlayMode tests. Returns a pruned assembly -> fixture -> test tree with source paths when Unity can resolve them.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "test_mode": {
+        "type": "string",
+        "enum": ["all", "editmode", "playmode"],
+        "description": "Explicit discovery scope."
+      },
+      "assembly_name": {
+        "type": "string",
+        "description": "Optional exact assembly filter, case-insensitive."
+      },
+      "fixture_name": {
+        "type": "string",
+        "description": "Optional exact fixture/class filter, case-insensitive."
+      },
+      "test_name": {
+        "type": "string",
+        "description": "Optional exact test method filter, case-insensitive."
+      },
+      "search": {
+        "type": "string",
+        "description": "Optional fuzzy contains search across assembly, fixture, test full name, and source path. Combined with exact filters using AND semantics."
+      }
+    },
+    "required": ["test_mode"],
+    "additionalProperties": false
+  }
+}

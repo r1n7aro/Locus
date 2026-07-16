@@ -2716,6 +2716,145 @@ export interface ToolCallProgress {
   state: string;
 }
 
+export interface UnityTestSnapshot {
+  runId: string;
+  startedAt: string;
+  finishedAt: string;
+  terminalStatus: string;
+  preparation: UnityTestPreparation;
+  requestedScope: UnityTestRunRequest;
+  phaseSummaries: UnityTestPhaseResult[];
+  totalSummary: UnityTestSummary;
+  results: UnityTestResult[];
+  error?: UnityTestError;
+}
+
+export type UnityTestMode = "all" | "editmode" | "playmode";
+
+export interface UnityTestFilter {
+  testMode: UnityTestMode;
+  assemblyName?: string;
+  fixtureName?: string;
+  testName?: string;
+  search?: string;
+}
+
+export interface UnityTestDiscovery {
+  assemblies: UnityTestAssembly[];
+}
+
+export interface UnityTestAssembly {
+  name: string;
+  testMode: string;
+  fixtures: UnityTestFixture[];
+}
+
+export interface UnityTestFixture {
+  name: string;
+  tests: UnityTestMethod[];
+}
+
+export interface UnityTestMethod {
+  name: string;
+  fullName: string;
+  attributes: string[];
+  sourcePath?: string;
+  line?: number;
+}
+
+export interface UnityTestProgress {
+  active: boolean;
+  runId: string;
+  phase: string;
+  currentTest: string;
+  completed: number;
+  total: number;
+  failed: number;
+  revision: number;
+}
+
+export type UnityTestRunSource = "agent" | "dashboard";
+
+export interface UnityTestProgressEvent {
+  workingDir: string;
+  source: UnityTestRunSource;
+  progress: UnityTestProgress;
+}
+
+export interface UnityTestSnapshotChangedEvent {
+  workingDir: string;
+  source: UnityTestRunSource;
+  runId: string;
+  terminalStatus: string;
+}
+
+export interface UnityTestSourceNavigationResult {
+  opened: boolean;
+  positioned: boolean;
+}
+
+export interface UnityTestPreparation {
+  method: string;
+  status: string;
+  message?: string;
+}
+
+export interface UnityTestRunRequest {
+  testMode: UnityTestMode;
+  assemblyName?: string;
+  fixtureName?: string;
+  testName?: string;
+  search?: string;
+  tests?: UnityTestTarget[];
+}
+
+export interface UnityTestTarget {
+  assemblyName?: string;
+  fixtureName?: string;
+  testName?: string;
+}
+
+export interface UnityTestPhaseResult {
+  runId: string;
+  testMode: string;
+  status: string;
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  duration: number;
+  results: UnityTestResult[];
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export interface UnityTestSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  duration: number;
+}
+
+export interface UnityTestResult {
+  testMode?: string;
+  assemblyName: string;
+  fixtureName: string;
+  testName: string;
+  fullName: string;
+  outcome: string;
+  duration: number;
+  message: string;
+  stackTrace: string;
+  sourcePath?: string;
+  line?: number;
+}
+
+export interface UnityTestError {
+  code: string;
+  message: string;
+}
+
 export type NotificationLevel = "error" | "warning" | "success" | "info";
 
 export interface AppErrorPayload {

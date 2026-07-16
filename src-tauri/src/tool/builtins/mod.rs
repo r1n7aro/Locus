@@ -31,6 +31,8 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::list());
     registry.register_builtin(unity::unity_execute());
     registry.register_builtin(unity::unity_run_states());
+    registry.register_builtin(unity::unity_test_find());
+    registry.register_builtin(unity::unity_test_run());
     registry.register_builtin(unity::unity_capture_viewport());
     registry.register_builtin(unity::unity_recompile());
     registry.register_builtin(unity::unity_hot_reload());

@@ -51,6 +51,7 @@ pub enum CliDriverSuite {
     HotReload,
     HotReloadRelease,
     Execute,
+    UnityTest,
 }
 
 impl CliDriverSuite {
@@ -64,6 +65,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::Execute => "execute",
+            CliDriverSuite::UnityTest => "unity-test",
         }
     }
 
@@ -78,6 +80,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
+            CliDriverSuite::UnityTest => None,
         }
     }
 }
@@ -503,6 +506,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
                 CliDriverSuite::HotReload,
                 CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::Execute,
+                CliDriverSuite::UnityTest,
             ] {
                 if !suites.contains(&suite) {
                     suites.push(suite);
@@ -523,9 +527,12 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
+        "unity-test" | "unity_test" | "test-framework" | "test_framework" | "tests" => {
+            CliDriverSuite::UnityTest
+        }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, or all.",
+            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, unity-test, or all.",
             value
         ))
         }
@@ -559,6 +566,7 @@ pub fn spawn(app_handle: AppHandle, workspace: Arc<Workspace>, config: CliDriver
             }
         };
         app_handle.exit(exit_code);
+        std::process::exit(exit_code);
     });
 }
 
@@ -801,6 +809,9 @@ async fn run_driver(
                     Ok(()) => run_execute_suite(&project, *suite, &config, &sink, &cancel_rx).await,
                     Err(error) => Err(error),
                 }
+            }
+            CliDriverSuite::UnityTest => {
+                run_unity_test_suite(&project, *suite, &config, &sink, &cancel_rx).await
             }
         };
 
@@ -2130,6 +2141,133 @@ async fn run_execute_suite(
             "execute suite finished with {} failed check(s)",
             run.failed
         ))
+    }
+}
+
+async fn run_unity_test_suite(
+    project: &str,
+    suite: CliDriverSuite,
+    _config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &watch::Receiver<bool>,
+) -> Result<(), String> {
+    use crate::unity_bridge::test_runner::{
+        find_tests, run_tests, UnityTestFilter, UnityTestMode, UnityTestRunRequest,
+    };
+
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": suite.as_str(),
+            "project": project,
+        }),
+    );
+
+    let filter = UnityTestFilter {
+        test_mode: UnityTestMode::All,
+        ..Default::default()
+    };
+    let discovery = find_tests(project, filter.clone())
+        .await
+        .map_err(|error| format!("unity_test_find failed [{}]: {}", error.code, error.message))?;
+    let discovered = discovery
+        .assemblies
+        .iter()
+        .flat_map(|assembly| assembly.fixtures.iter())
+        .map(|fixture| fixture.tests.len())
+        .sum::<usize>();
+    if discovered == 0 {
+        sink.emit(
+            "suite_event",
+            json!({
+                "suite": suite.as_str(),
+                "line": "FAIL  unity_test_find: discovered 0 tests",
+                "passed": 0,
+                "failed": 1,
+            }),
+        );
+        sink.emit(
+            "suite_result",
+            json!({ "suite": suite.as_str(), "passed": 0, "failed": 1 }),
+        );
+        return Err("unity_test_find discovered 0 tests".to_string());
+    }
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!("PASS  unity_test_find: discovered {discovered} tests"),
+            "passed": 1,
+            "failed": 0,
+        }),
+    );
+
+    if run_cancelled(cancel_rx) {
+        return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+    }
+
+    let request = UnityTestRunRequest {
+        filter,
+        tests: Vec::new(),
+    };
+    let snapshot = run_tests(project, request, cancel_rx.clone(), |progress| {
+        sink.emit(
+            "suite_event",
+            json!({
+                "suite": suite.as_str(),
+                "line": format!(
+                    "RUN   unity_test_run: {} {}/{} complete, {} failed",
+                    progress.phase, progress.completed, progress.total, progress.failed
+                ),
+                "passed": 0,
+                "failed": 0,
+            }),
+        );
+    })
+    .await
+    .map_err(|error| format!("unity_test_run failed [{}]: {}", error.code, error.message))?;
+
+    let failed = snapshot.total_summary.failed;
+    let passed = snapshot.total_summary.passed;
+    let total = snapshot.total_summary.total;
+    let skipped = snapshot.total_summary.skipped;
+    let run_failed = failed > 0 || total == 0;
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!(
+                "{}  unity_test_run: status={} total={} passed={} failed={} skipped={}",
+                if run_failed { "FAIL" } else { "PASS" },
+                snapshot.terminal_status,
+                total,
+                passed,
+                failed,
+                skipped
+            ),
+            "passed": if run_failed { 0 } else { 1 },
+            "failed": if run_failed { 1 } else { 0 },
+        }),
+    );
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": if run_failed { 1 } else { 2 },
+            "failed": if run_failed { 1 } else { 0 },
+            "total": total,
+            "testPassed": passed,
+            "testFailed": failed,
+            "testSkipped": skipped,
+        }),
+    );
+
+    if run_failed {
+        Err(format!(
+            "unity_test_run did not pass cleanly: total={total}, failed={failed}"
+        ))
+    } else {
+        Ok(())
     }
 }
 

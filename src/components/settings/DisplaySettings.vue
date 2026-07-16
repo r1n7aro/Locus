@@ -91,6 +91,7 @@ const topNavigationToggles = [
   { key: "showKnowledgeTab", labelKey: "settings.display.showKnowledgeTab" },
   { key: "showCollabTab", labelKey: "settings.display.showCollabTab" },
   { key: "showAssetTab", labelKey: "settings.display.showAssetTab" },
+  { key: "showTestsTab", labelKey: "settings.display.showTestsTab" },
   { key: "showViewsTab", labelKey: "settings.display.showViewsTab" },
   { key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" },
   { key: "showAgentTab", labelKey: "settings.display.showAgentTab" },

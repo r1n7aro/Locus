@@ -540,6 +540,24 @@ mod tests {
     }
 
     #[test]
+    fn unity_agents_expose_test_framework_tools() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        for agent_id in ["dev", "runtime_debugger"] {
+            let agent = registry
+                .get(agent_id)
+                .unwrap_or_else(|| panic!("{} agent should be loadable", agent_id));
+            for tool in ["unity_test_find", "unity_test_run"] {
+                assert!(
+                    agent.tools.iter().any(|name| name == tool),
+                    "{} agent should expose {}",
+                    agent_id,
+                    tool
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dev_agent_exposes_view_property_tools() {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
         let agent = registry.get("dev").expect("dev agent should be loadable");

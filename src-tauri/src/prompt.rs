@@ -9,8 +9,7 @@ pub mod plan {
     pub const PLAN_REMINDER: &str = include_str!("../../prompt/plan-reminder.md");
     /// Read-only reminder for subagents spawned while the parent session is
     /// in plan mode (no plan file, no exit_plan_mode).
-    pub const PLAN_REMINDER_SUBAGENT: &str =
-        include_str!("../../prompt/plan-reminder-subagent.md");
+    pub const PLAN_REMINDER_SUBAGENT: &str = include_str!("../../prompt/plan-reminder-subagent.md");
     /// One-shot notice injected on the first user message after leaving plan
     /// mode. `{plan_file_block}` carries the plan file reference when one
     /// exists.
@@ -31,6 +30,8 @@ pub mod tools {
     pub const GRAPH_VIEW: &str = include_str!("../../tools/graph_view.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
+    pub const UNITY_TEST_FIND: &str = include_str!("../../tools/unity_test_find.json");
+    pub const UNITY_TEST_RUN: &str = include_str!("../../tools/unity_test_run.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
         include_str!("../../tools/unity_capture_viewport.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
@@ -134,6 +135,8 @@ mod tests {
             ("graph_view", tools::GRAPH_VIEW),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
+            ("unity_test_find", tools::UNITY_TEST_FIND),
+            ("unity_test_run", tools::UNITY_TEST_RUN),
             ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),

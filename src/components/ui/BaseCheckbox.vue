@@ -2,10 +2,12 @@
 const props = withDefaults(defineProps<{
   modelValue: boolean;
   disabled?: boolean;
+  indeterminate?: boolean;
   ariaLabel?: string;
   ariaLabelledby?: string;
 }>(), {
   disabled: false,
+  indeterminate: false,
   ariaLabel: "",
   ariaLabelledby: "",
 });
@@ -23,17 +25,20 @@ function toggle() {
 <template>
   <button
     class="base-checkbox"
-    :class="{ checked: modelValue }"
+    :class="{ checked: modelValue || indeterminate, indeterminate }"
     type="button"
     role="checkbox"
-    :aria-checked="modelValue"
+    :aria-checked="indeterminate ? 'mixed' : modelValue"
     :aria-label="ariaLabel || undefined"
     :aria-labelledby="ariaLabelledby || undefined"
     :disabled="disabled"
     @click="toggle"
   >
     <span class="base-checkbox-box">
-      <svg v-if="modelValue" viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+      <svg v-if="indeterminate" viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+        <path d="M3.5 8h9" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+      </svg>
+      <svg v-else-if="modelValue" viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
         <path d="M3.5 8.25 6.5 11.25 12.5 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
     </span>

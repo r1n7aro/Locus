@@ -173,6 +173,8 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "exit_plan_mode",
     // Unity editor actions.
     "unity_execute",
+    "unity_test_find",
+    "unity_test_run",
     "unity_recompile",
     "unity_hot_reload",
     // Unity project search & inspection.
@@ -604,6 +606,28 @@ mod tests {
         assert_eq!(
             registry.default_load_mode("unity_capture_viewport"),
             ToolLoadMode::Lazy
+        );
+    }
+
+    #[test]
+    fn builtins_register_unity_test_tools_with_expected_load_modes() {
+        let registry = ToolRegistry::with_builtins();
+
+        assert_eq!(
+            registry.canonical_name("unity_test_find").as_deref(),
+            Some("unity_test_find")
+        );
+        assert_eq!(
+            registry.canonical_name("unity_test_run").as_deref(),
+            Some("unity_test_run")
+        );
+        assert_eq!(
+            registry.default_load_mode("unity_test_find"),
+            ToolLoadMode::Direct
+        );
+        assert_eq!(
+            registry.default_load_mode("unity_test_run"),
+            ToolLoadMode::Direct
         );
     }
 

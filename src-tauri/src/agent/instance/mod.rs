@@ -2991,6 +2991,8 @@ impl AgentInstance {
                 }
             }
             "unity_execute"
+            | "unity_test_find"
+            | "unity_test_run"
             | "unity_run_states"
             | "unity_capture_viewport"
             | "unity_ref_search"
@@ -3196,10 +3198,7 @@ impl AgentInstance {
         matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Main { .. }))
     }
 
-    fn resolve_plan_file_path(
-        &self,
-        app_handle: &AppHandle,
-    ) -> Result<std::path::PathBuf, String> {
+    fn resolve_plan_file_path(&self, app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
         crate::commands::plan_file_path_for_session(app_handle, &self.working_dir, &self.session_id)
     }
 
@@ -3276,11 +3275,7 @@ impl AgentInstance {
 
     /// Compares a tool call's `filePath` argument against the plan file,
     /// tolerating relative paths, separator style, and case differences.
-    fn args_target_plan_file(
-        &self,
-        args: &serde_json::Value,
-        plan_file: &std::path::Path,
-    ) -> bool {
+    fn args_target_plan_file(&self, args: &serde_json::Value, plan_file: &std::path::Path) -> bool {
         let Some(raw) = args
             .get("filePath")
             .or_else(|| args.get("file_path"))
@@ -10686,7 +10681,13 @@ impl AgentInstance {
             },
         );
         let decision = self
-            .await_tool_confirm_decision(app_handle, tool_call_id, "exit_plan_mode", display, run_id)
+            .await_tool_confirm_decision(
+                app_handle,
+                tool_call_id,
+                "exit_plan_mode",
+                display,
+                run_id,
+            )
             .await;
 
         match decision {
@@ -11156,6 +11157,9 @@ impl AgentInstance {
                 .await
         } else if tc.name == "unity_run_states" {
             self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
+                .await
+        } else if tc.name == "unity_test_run" {
+            self.execute_unity_test_run(app_handle, &tc.id, args, run_id)
                 .await
         } else if tc.name == "unity_capture_viewport" {
             self.await_executed_tool_result(self.execute_unity_capture_viewport(args))
@@ -13821,6 +13825,236 @@ impl AgentInstance {
         }
     }
 
+    async fn execute_unity_test_run(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ExecutedToolResult {
+        if !self.has_selected_working_dir() {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: "unity_test_run requires a selected Unity project working directory."
+                    .to_string(),
+                is_error: true,
+            });
+        }
+
+        let request = match serde_json::from_value::<
+            crate::unity_bridge::test_runner::UnityTestRunRequest,
+        >(args.clone())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!("Invalid unity_test_run arguments: {error}"),
+                    is_error: true,
+                });
+            }
+        };
+
+        let (connected, _current_status, _) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            });
+        }
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Preparing Unity tests",
+            "",
+            None,
+            "preparing",
+        );
+        crate::commands::emit_unity_test_progress(
+            app_handle,
+            &self.working_dir,
+            "agent",
+            crate::unity_bridge::test_runner::UnityTestProgress {
+                active: true,
+                run_id: run_id.to_string(),
+                phase: "preparing".to_string(),
+                current_test: String::new(),
+                completed: 0,
+                total: 0,
+                failed: 0,
+                revision: 0,
+            },
+        );
+
+        let progress_handle = app_handle.clone();
+        let progress_run_id = run_id.to_string();
+        let progress_session_id = self.session_id.clone();
+        let progress_tool_call_id = tool_call_id.to_string();
+        let progress_working_dir = self.working_dir.clone();
+        let cancel_rx = self.cancel_waiter();
+
+        let test_result = crate::unity_bridge::test_runner::run_tests(
+            &self.working_dir,
+            request,
+            cancel_rx,
+            move |progress| {
+                crate::commands::emit_unity_test_progress(
+                    &progress_handle,
+                    &progress_working_dir,
+                    "agent",
+                    progress.clone(),
+                );
+                let info = if progress.current_test.trim().is_empty() {
+                    format!(
+                        "{}/{} complete · {} failed",
+                        progress.completed, progress.total, progress.failed
+                    )
+                } else {
+                    format!(
+                        "{} · {}/{} complete · {} failed",
+                        progress.current_test, progress.completed, progress.total, progress.failed
+                    )
+                };
+                let ratio = if progress.total > 0 {
+                    Some((progress.completed as f32 / progress.total as f32).clamp(0.0, 1.0))
+                } else {
+                    None
+                };
+                let title = match progress.phase.as_str() {
+                    "editmode" => "Running EditMode tests",
+                    "playmode" => "Running PlayMode tests",
+                    other if !other.is_empty() => other,
+                    _ => "Running Unity tests",
+                };
+                emit_tool_progress(
+                    &progress_handle,
+                    &progress_run_id,
+                    &progress_session_id,
+                    &progress_tool_call_id,
+                    title,
+                    info,
+                    ratio,
+                    "running",
+                );
+            },
+        )
+        .await;
+
+        match &test_result {
+            Ok(snapshot) => crate::commands::emit_unity_test_snapshot_changed(
+                app_handle,
+                &self.working_dir,
+                "agent",
+                snapshot,
+            ),
+            Err(error) if error.code != "busy" => {
+                if let Ok(Some(snapshot)) =
+                    crate::unity_bridge::test_runner::read_latest_snapshot(&self.working_dir)
+                {
+                    crate::commands::emit_unity_test_snapshot_changed(
+                        app_handle,
+                        &self.working_dir,
+                        "agent",
+                        &snapshot,
+                    );
+                }
+            }
+            Err(_) => crate::commands::emit_unity_test_progress(
+                app_handle,
+                &self.working_dir,
+                "agent",
+                crate::unity_bridge::test_runner::UnityTestProgress {
+                    active: false,
+                    run_id: run_id.to_string(),
+                    phase: "busy".to_string(),
+                    current_test: String::new(),
+                    completed: 0,
+                    total: 0,
+                    failed: 0,
+                    revision: 0,
+                },
+            ),
+        }
+
+        match test_result {
+            Ok(snapshot) => {
+                let output = Self::format_unity_test_snapshot(&snapshot);
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: snapshot.total_summary.failed > 0,
+                })
+            }
+            Err(error) if error.code == "cancelled" => Self::interrupted_tool_result(),
+            Err(error) => {
+                emit_tool_progress(
+                    app_handle,
+                    run_id,
+                    &self.session_id,
+                    tool_call_id,
+                    "Unity tests failed",
+                    error.code.clone(),
+                    None,
+                    "error",
+                );
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: serde_json::to_string_pretty(&error).unwrap_or_else(|_| error.message),
+                    is_error: true,
+                })
+            }
+        }
+    }
+
+    fn format_unity_test_snapshot(
+        snapshot: &crate::unity_bridge::test_runner::UnityTestSnapshot,
+    ) -> String {
+        let summary = &snapshot.total_summary;
+        let mut lines = vec![
+            format!("run_id: {}", snapshot.run_id),
+            format!("status: {}", snapshot.terminal_status),
+            format!(
+                "summary: {} total, {} passed, {} failed, {} skipped",
+                summary.total, summary.passed, summary.failed, summary.skipped
+            ),
+            format!("latest_snapshot: Locus/test-results/latest.json"),
+        ];
+
+        let failed = snapshot
+            .results
+            .iter()
+            .filter(|result| result.outcome == "failed")
+            .collect::<Vec<_>>();
+        if !failed.is_empty() {
+            lines.push(String::new());
+            lines.push("failed:".to_string());
+            for result in failed {
+                lines.push(format!("- {}", result.full_name));
+                if !result.message.trim().is_empty() {
+                    lines.push(format!("  message: {}", result.message.trim()));
+                }
+                if !result.stack_trace.trim().is_empty() {
+                    lines.push(format!("  stack_trace: {}", result.stack_trace.trim()));
+                }
+            }
+        }
+
+        let skipped = snapshot
+            .results
+            .iter()
+            .filter(|result| result.outcome == "skipped")
+            .collect::<Vec<_>>();
+        if !skipped.is_empty() {
+            lines.push(String::new());
+            lines.push("skipped:".to_string());
+            for result in skipped {
+                lines.push(format!("- {}", result.full_name));
+            }
+        }
+
+        lines.join("\n")
+    }
+
     fn execute_unity_ref_search(
         &self,
         app_handle: &AppHandle,
@@ -15855,7 +16089,12 @@ impl AgentInstance {
 
         let (max_depth, max_concurrent) = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
-            .map(|config| (config.subagent_max_depth(), config.subagent_max_concurrent()))
+            .map(|config| {
+                (
+                    config.subagent_max_depth(),
+                    config.subagent_max_concurrent(),
+                )
+            })
             .unwrap_or((
                 crate::config::DEFAULT_SUBAGENT_MAX_DEPTH,
                 crate::config::DEFAULT_SUBAGENT_MAX_CONCURRENT,
@@ -15871,20 +16110,22 @@ impl AgentInstance {
         }
         // Hold a concurrency slot for the child's whole lifetime; the guard
         // drops (and frees the slot) on every exit path below.
-        let _subagent_slot =
-            match SubagentSlotGuard::try_acquire(&self.subagent_active, max_concurrent) {
-                Some(slot) => slot,
-                None => {
-                    let running = self.subagent_active.load(Ordering::Relaxed);
-                    return ExecutedToolResult::from_tool_result(ToolResult {
+        let _subagent_slot = match SubagentSlotGuard::try_acquire(
+            &self.subagent_active,
+            max_concurrent,
+        ) {
+            Some(slot) => slot,
+            None => {
+                let running = self.subagent_active.load(Ordering::Relaxed);
+                return ExecutedToolResult::from_tool_result(ToolResult {
                         output: format!(
                             "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this task call was rejected. Issue at most {} task calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
                             running, max_concurrent, max_concurrent
                         ),
                         is_error: true,
                     });
-                }
-            };
+            }
+        };
 
         match self
             .run_subagent_task(
@@ -17076,6 +17317,8 @@ PrefabInstance:
                     "read".to_string(),
                     "edit".to_string(),
                     "unity_execute".to_string(),
+                    "unity_test_find".to_string(),
+                    "unity_test_run".to_string(),
                     "unity_run_states".to_string(),
                     "unity_capture_viewport".to_string(),
                     "graph_view".to_string(),
@@ -17120,6 +17363,8 @@ PrefabInstance:
         assert_eq!(tool_load_mode(&items, "read"), "direct");
         assert_eq!(tool_load_mode(&items, "edit"), "direct");
         assert_eq!(tool_load_mode(&items, "unity_execute"), "direct");
+        assert_eq!(tool_load_mode(&items, "unity_test_find"), "direct");
+        assert_eq!(tool_load_mode(&items, "unity_test_run"), "direct");
         assert_eq!(tool_load_mode(&items, "knowledge_create"), "direct");
         assert_eq!(tool_load_mode(&items, "knowledge_edit"), "direct");
         assert_eq!(tool_load_mode(&items, "knowledge_move"), "lazy");
@@ -20419,7 +20664,14 @@ Search, install, audit, and export a plugin.
         let instance = test_agent_instance("C:/Project".to_string());
         let runtime = super::PlanRuntime::Subagent;
 
-        for tool in ["write", "edit", "bash", "task", "web_fetch", "exit_plan_mode"] {
+        for tool in [
+            "write",
+            "edit",
+            "bash",
+            "task",
+            "web_fetch",
+            "exit_plan_mode",
+        ] {
             assert!(
                 instance
                     .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
@@ -20493,10 +20745,8 @@ Search, install, audit, and export a plugin.
         // `with_builtins()` does not register `task` (the real app registers
         // it with the live agent list), so the fixture registers it here.
         let mut tool_registry = ToolRegistry::with_builtins();
-        tool_registry.register_task_tool(&[(
-            "explorer".to_string(),
-            "codebase exploration".to_string(),
-        )]);
+        tool_registry
+            .register_task_tool(&[("explorer".to_string(), "codebase exploration".to_string())]);
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         let mut instance = AgentInstance::new(
             Arc::new(AgentDef {

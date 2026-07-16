@@ -6,6 +6,7 @@ mod native_selftest;
 mod plugin;
 mod process;
 mod state_probe;
+pub mod test_runner;
 mod transport;
 
 use std::{
@@ -957,7 +958,10 @@ fn push_editor_install_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) 
         // contains one flavor's exe, so the other flavor's candidate is silently
         // skipped by the `is_file()` check in `resolve_unity_editor_executable`.
         for flavor in EditorFlavor::ALL {
-            push_unique_path(paths, root.join("Editor").join(flavor.editor_exe_file_name()));
+            push_unique_path(
+                paths,
+                root.join("Editor").join(flavor.editor_exe_file_name()),
+            );
             push_unique_path(paths, root.join(flavor.editor_exe_file_name()));
         }
     }
@@ -5170,7 +5174,9 @@ mod tests {
         // Editor installed on a non-default drive is still resolved.
         assert_eq!(
             parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2021.3.45f1"),
-            vec![PathBuf::from(r"F:\UnityEditor\2021.3.45f1\Editor\Unity.exe")]
+            vec![PathBuf::from(
+                r"F:\UnityEditor\2021.3.45f1\Editor\Unity.exe"
+            )]
         );
         // ProjectVersion.txt parsing may leave surrounding whitespace.
         assert_eq!(
@@ -5186,7 +5192,9 @@ mod tests {
 
     #[test]
     fn unity_hub_locations_ignore_unknown_versions_and_invalid_cache() {
-        assert!(parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2019.4.0f1").is_empty());
+        assert!(
+            parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2019.4.0f1").is_empty()
+        );
         assert!(parse_unity_hub_editor_locations("not json", "2022.3.2f1").is_empty());
         assert!(parse_unity_hub_editor_locations("{}", "2022.3.2f1").is_empty());
         assert!(parse_unity_hub_editor_locations(r#"{"data":[]}"#, "2022.3.2f1").is_empty());

@@ -189,6 +189,74 @@ pub(super) fn unity_run_states() -> ToolDef {
     }
 }
 
+// ─── unity_test_find / unity_test_run ───────────────────────────────────────
+
+pub(super) fn unity_test_find() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_TEST_FIND);
+    ToolDef {
+        name: "unity_test_find".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_test_find' requires a selected Unity project working directory.".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let request = match serde_json::from_value::<
+                    crate::unity_bridge::test_runner::UnityTestFilter,
+                >(args)
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!("Invalid unity_test_find arguments: {error}"),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                match crate::unity_bridge::test_runner::find_tests(&project_path, request).await {
+                    Ok(discovery) => ToolResult {
+                        output: serde_json::to_string_pretty(&discovery)
+                            .unwrap_or_else(|_| "{\"assemblies\":[]}".to_string()),
+                        is_error: false,
+                    },
+                    Err(error) => ToolResult {
+                        output: serde_json::to_string(&error).unwrap_or_else(|_| error.message),
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn unity_test_run() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_TEST_RUN);
+    ToolDef {
+        name: "unity_test_run".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: true,
+        execute: Arc::new(|_args, _ctx| {
+            Box::pin(async {
+                ToolResult {
+                    output: "Error: unity_test_run should be intercepted by agent loop, not executed directly".to_string(),
+                    is_error: true,
+                }
+            })
+        }),
+    }
+}
+
 // ─── unity_ref_search ──────────────────────────────────────────────────────
 
 pub(super) fn unity_ref_search() -> ToolDef {

@@ -963,6 +963,7 @@ pub fn run() {
             app.manage(local_reference_import_state);
             app.manage(local_reference_watcher_state.clone());
             app.manage(log_store_for_setup.clone());
+            app.manage(commands::UnityTestDashboardState::default());
             startup_for_setup.mark("setup_state_managed");
             startup_for_setup.mark("setup_backend_ready");
 
@@ -1140,6 +1141,12 @@ pub fn run() {
             commands::unity_recompile_run,
             commands::unity_recompile_probe_run,
             commands::unity_execute_snippet_run,
+            commands::unity_test_discover,
+            commands::unity_test_run_dashboard,
+            commands::unity_test_cancel_dashboard,
+            commands::unity_test_active_progress,
+            commands::unity_test_latest_snapshot,
+            commands::unity_test_open_source,
             commands::send_unity_log,
             commands::select_unity_asset,
             commands::open_unity_asset_inspector,

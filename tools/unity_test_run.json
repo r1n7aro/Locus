@@ -1,0 +1,44 @@
+{
+  "description": "Run Unity Test Framework tests in the connected Unity Editor. Always pass an explicit scope or explicit tests. Locus prepares code once, runs EditMode before PlayMode for mixed scopes, streams progress to the tool call panel, saves the latest terminal result to Locus/test-results/latest.json, and exits PlayMode at cleanup.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "test_mode": {
+        "type": "string",
+        "enum": ["all", "editmode", "playmode"],
+        "description": "Explicit run scope. Use all only when a broad regression is intended."
+      },
+      "assembly_name": {
+        "type": "string",
+        "description": "Optional exact assembly filter for scoped runs."
+      },
+      "fixture_name": {
+        "type": "string",
+        "description": "Optional exact fixture/class filter for scoped runs."
+      },
+      "test_name": {
+        "type": "string",
+        "description": "Optional exact test method filter for scoped runs."
+      },
+      "search": {
+        "type": "string",
+        "description": "Optional fuzzy contains filter. Run requests resolve search by discovery into explicit targets before execution, so it cannot broaden the UTF run scope. Use unity_test_find first if unsure what this matches."
+      },
+      "tests": {
+        "type": "array",
+        "description": "Optional explicit target list. When present, these targets are primary and simple filters do not broaden the run.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "assembly_name": { "type": "string" },
+            "fixture_name": { "type": "string" },
+            "test_name": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": ["test_mode"],
+    "additionalProperties": false
+  }
+}

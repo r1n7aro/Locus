@@ -511,6 +511,8 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("bash", "Shell command execution"),
         ("web_fetch", "HTTP fetch from the web"),
         ("unity_execute", "Execute C# code in Unity"),
+        ("unity_test_find", "Find Unity Test Framework tests"),
+        ("unity_test_run", "Run Unity Test Framework tests"),
         ("unity_run_states", "Run Unity state-machine debugging flow"),
         ("unity_recompile", "Trigger Unity recompilation"),
         ("unity_hot_reload", "Hot-patch C# method edits into Unity"),
