@@ -3,8 +3,6 @@
  * Supports zh / en languages, loaded from JSON at startup, switchable at runtime
  */
 import { ref, readonly } from "vue";
-import zhMessages from "./language/zh.json";
-import enMessages from "./language/en.json";
 
 export type Locale = "zh" | "en";
 
@@ -13,10 +11,26 @@ const DEFAULT_LOCALE: Locale = "en";
 
 type Messages = Record<string, string>;
 
+// Catalogs load as separate async chunks so entries only pay for the
+// active language (each catalog is ~230KB of generated JS).
 const messages: Record<Locale, Messages> = {
-  zh: zhMessages as Messages,
-  en: enMessages as Messages,
+  zh: {},
+  en: {},
 };
+
+const catalogLoaders: Record<Locale, () => Promise<{ default: Messages }>> = {
+  zh: () => import("./language/zh.json"),
+  en: () => import("./language/en.json"),
+};
+
+const loadedLocales = new Set<Locale>();
+
+async function loadCatalog(locale: Locale): Promise<void> {
+  if (loadedLocales.has(locale)) return;
+  const catalog = await catalogLoaders[locale]();
+  messages[locale] = catalog.default;
+  loadedLocales.add(locale);
+}
 
 const currentLocale = ref<Locale>(loadLocale());
 
@@ -76,24 +90,49 @@ function loadLocale(): Locale {
   });
 }
 
+/** Flip the active locale, waiting for its catalog first so `t()` never
+ *  renders raw keys mid-switch. */
+function activateLocale(locale: Locale) {
+  if (loadedLocales.has(locale)) {
+    currentLocale.value = locale;
+    return;
+  }
+  void loadCatalog(locale)
+    .then(() => {
+      currentLocale.value = locale;
+    })
+    .catch((error) => {
+      console.warn(`[i18n] failed to load ${locale} catalog:`, error);
+    });
+}
+
 export function bootstrapLocale(systemLocale?: string | null): Locale {
   const resolved = resolveLocale({
     savedLocale: readSavedLocale(),
     systemLocale,
     navigatorLocales: readNavigatorLocales(),
   });
-  currentLocale.value = resolved;
+  activateLocale(resolved);
   return resolved;
 }
 
 export function setLocale(locale: Locale) {
-  currentLocale.value = locale;
   try {
     localStorage.setItem(STORAGE_KEY, locale);
   } catch { /* ignore */ }
+  activateLocale(locale);
 }
 
 export const locale = readonly(currentLocale);
+
+// Top-level await: every module that imports `t` only executes once the
+// active catalog is parsed, keeping `t()` synchronous with no key flash.
+// The other catalog warms in the background for the cross-locale fallback
+// in `t()` (and for instant language switching).
+await loadCatalog(currentLocale.value);
+void loadCatalog(currentLocale.value === "zh" ? "en" : "zh").catch(() => {
+  /* fallback catalog is best-effort */
+});
 
 /**
  * Translation function: returns the string for the current locale by key

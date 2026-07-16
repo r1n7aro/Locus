@@ -1102,7 +1102,7 @@ export interface SkillManifest {
   skillDescription: string | null;
   commandTrigger: string;
   tools?: string[];
-  kind?: "document" | "package";
+  kind?: "document" | "package" | "external";
   packageId?: string | null;
   packageVersion?: string | null;
   hasUnity?: boolean;
@@ -1111,6 +1111,10 @@ export interface SkillManifest {
   hasL2?: boolean;
   pluginId?: string | null;
   pluginScope?: "app" | "project" | string | null;
+  /** Absolute on-disk directory of an external (generic-format) skill. */
+  originPath?: string | null;
+  /** Unconsumed frontmatter fields of an external skill, shown in the UI. */
+  extraMetadata?: Record<string, unknown> | null;
 }
 
 export interface SkillConfig {

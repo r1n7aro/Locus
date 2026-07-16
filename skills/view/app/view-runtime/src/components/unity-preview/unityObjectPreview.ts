@@ -115,6 +115,31 @@ const UNITY_EDITABLE_ASSET_EXTENSIONS = new Set([
   ".fontsettings",
 ]);
 
+/**
+ * Unity-native serialized assets whose editor-memory state can drift from the
+ * file on disk, making a live serialized-property round-trip worth it. Every
+ * other extension (markdown, plain text, source code, binaries) previews from
+ * disk only, so the inspector keeps working when Unity has not imported the
+ * file — e.g. AI-generated files under symlinked folders (#114).
+ */
+const UNITY_LIVE_SERIALIZED_ASSET_EXTENSIONS = new Set([
+  ...UNITY_EDITABLE_ASSET_EXTENSIONS,
+  ".playable",
+  ".signal",
+  ".spriteatlas",
+  ".spriteatlasv2",
+  ".terrainlayer",
+  ".shadervariants",
+  ".rendertexture",
+  ".cubemap",
+  ".guiskin",
+  ".brush",
+  ".giparams",
+  ".lighting",
+  ".mixer",
+  ".preset",
+]);
+
 export function normalizeUnityObjectPreviewModel(
   input: UnityObjectPreviewInput | UnityObjectPreviewModel | UnityObjectAssetRefAttachment,
 ): UnityObjectPreviewModel {
@@ -204,6 +229,17 @@ export function isUnityExternalSourceAssetPath(path: string): boolean {
  */
 export function isUnityCodeSourceAssetPath(path: string): boolean {
   return CODE_SOURCE_EXTENSIONS.has(extensionOf(path));
+}
+
+/**
+ * Whether the asset at `path` should load the live serialized-property tree
+ * from the Unity editor. Extension-less paths stay live: folder refs resolve
+ * to DefaultAsset and have no disk preview to fall back to.
+ */
+export function isUnityLiveSerializedAssetPath(path: string): boolean {
+  const ext = extensionOf(path);
+  if (!ext) return true;
+  return UNITY_LIVE_SERIALIZED_ASSET_EXTENSIONS.has(ext);
 }
 
 export function hasEditableUnityPropertySnapshot(input: UnityObjectPropertyTreeInput | null | undefined): boolean {
