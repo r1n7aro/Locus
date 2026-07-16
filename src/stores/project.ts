@@ -3,6 +3,8 @@ import { defineStore } from "pinia";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import * as projectService from "../services/project";
 import * as unityService from "../services/unity";
+import { extraWorkdirsGet, extraWorkdirsMap } from "../services/extraWorkdirs";
+import type { ExtraWorkdirStatus } from "../services/extraWorkdirs";
 import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
@@ -21,12 +23,14 @@ export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 
 const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";
 const UNITY_BACKGROUND_HOOK_NOTICE_OPERATION = "unity-background-hook";
+const EXTRA_WORKDIRS_MISSING_NOTICE_OPERATION = "extra-workdirs-missing";
 const UNITY_LAUNCH_CONNECTION_POLL_MS = 1500;
 const UNITY_LAUNCH_WAIT_TIMEOUT_MS = 120_000;
 
 export const useProjectStore = defineStore("project", () => {
   const workingDir = ref("");
   const recentDirs = ref<string[]>([]);
+  const extraWorkdirs = ref<Record<string, ExtraWorkdirStatus[]>>({});
   const unityConnected = ref(false);
   const unityConnectionStatus = ref<UnityConnectionStatus | null>(null);
   const scanPhase = ref<AssetDbScanEvent | null>(null);
@@ -192,6 +196,9 @@ export const useProjectStore = defineStore("project", () => {
   async function loadWorkingDir() {
     try {
       workingDir.value = await projectService.getWorkingDir();
+      if (workingDir.value) {
+        void checkCurrentExtraWorkdirs();
+      }
     } catch (e) {
       console.error("get_working_dir failed:", e);
     }
@@ -205,14 +212,63 @@ export const useProjectStore = defineStore("project", () => {
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
+    void checkCurrentExtraWorkdirs();
     return result;
   }
 
   async function loadRecentDirs() {
     try {
       recentDirs.value = await projectService.listRecentDirs();
+      void loadExtraWorkdirs();
     } catch (e) {
       console.error("list_recent_dirs failed:", e);
+    }
+  }
+
+  async function loadExtraWorkdirs() {
+    const paths = [...new Set([...recentDirs.value, workingDir.value].filter(Boolean))];
+    if (paths.length === 0) {
+      extraWorkdirs.value = {};
+      return;
+    }
+    try {
+      extraWorkdirs.value = await extraWorkdirsMap(paths);
+    } catch (e) {
+      console.error("extra_workdirs_map failed:", e);
+    }
+  }
+
+  /** Validates the current workspace's attached directories and keeps a
+   * warning notice alive while any of them is missing on disk. */
+  async function checkCurrentExtraWorkdirs() {
+    const dir = workingDir.value;
+    if (!dir) return;
+    try {
+      const statuses = await extraWorkdirsGet(dir);
+      if (workingDir.value !== dir) return;
+      const missing = statuses.filter((status) => !status.exists);
+      const notificationStore = useNotificationStore();
+      if (missing.length > 0) {
+        notificationStore.addNotice(
+          "warning",
+          t("app.dir.extraWorkdirsMissing", missing.map((status) => status.path).join(", ")),
+          {
+            operation: EXTRA_WORKDIRS_MISSING_NOTICE_OPERATION,
+            replaceOperation: true,
+          },
+        );
+      } else {
+        notificationStore.clearByOperation(EXTRA_WORKDIRS_MISSING_NOTICE_OPERATION);
+      }
+    } catch (e) {
+      console.error("extra_workdirs_get failed:", e);
+    }
+  }
+
+  async function handleExtraWorkdirsUpdated(workspacePath: string) {
+    await loadExtraWorkdirs();
+    if (workspacePath && workspacePath === workingDir.value) {
+      await checkCurrentExtraWorkdirs();
     }
   }
 
@@ -368,6 +424,7 @@ export const useProjectStore = defineStore("project", () => {
   function resetWorkspaceState() {
     workingDir.value = "";
     recentDirs.value = [];
+    extraWorkdirs.value = {};
     unityConnected.value = false;
     unityConnectionStatus.value = null;
     scanPhase.value = null;
@@ -417,6 +474,7 @@ export const useProjectStore = defineStore("project", () => {
   return {
     workingDir,
     recentDirs,
+    extraWorkdirs,
     unityConnected,
     unityConnectionStatus,
     scanPhase,
@@ -429,6 +487,9 @@ export const useProjectStore = defineStore("project", () => {
     loadWorkingDir,
     setWorkingDir,
     loadRecentDirs,
+    loadExtraWorkdirs,
+    checkCurrentExtraWorkdirs,
+    handleExtraWorkdirsUpdated,
     removeRecentDir,
     openDirInFileExplorer,
     startScan,

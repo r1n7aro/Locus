@@ -13,10 +13,12 @@
     "chat-diff-review",
     "plan-view",
     "locus-value-editor",
+    "extra-workdirs-config",
     "unity-embed",
     "unity-embed-*",
     "view-*",
-    "agent-graph-*"
+    "agent-graph-*",
+    "sub-pool-*"
   ],
   "permissions": [
     "core:default",
