@@ -12,6 +12,7 @@ pub mod responses;
 pub mod retry;
 pub mod streaming;
 pub mod think_tag_filter;
+pub mod tool_references;
 
 pub(crate) const CODEX_CLIENT_VERSION: &str = "0.144.1";
 

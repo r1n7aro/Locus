@@ -160,11 +160,15 @@ pub enum DynamicToolLoadingMode {
     #[serde(alias = "meta-tool", alias = "meta_tool")]
     MetaTool,
     Direct,
+    /// Protocol-native lazy loading: Anthropic `defer_loading` +
+    /// `tool_reference`, Codex `tool_search`. Backends without a native
+    /// renderer fall back to the MetaTool mechanism per request.
+    Native,
 }
 
 impl Default for DynamicToolLoadingMode {
     fn default() -> Self {
-        Self::MetaTool
+        Self::Native
     }
 }
 
@@ -189,7 +193,11 @@ mod serde_dynamic_tool_loading_mode {
 }
 
 fn default_dynamic_tool_loading_mode() -> Arc<Mutex<DynamicToolLoadingMode>> {
-    Arc::new(Mutex::new(DynamicToolLoadingMode::MetaTool))
+    Arc::new(Mutex::new(DynamicToolLoadingMode::Native))
+}
+
+fn default_anthropic_native_lazy_enabled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
 }
 
 /// Per-tool switches for the code-analysis tool family. Each flag controls
@@ -285,6 +293,23 @@ pub struct AppConfig {
         with = "serde_dynamic_tool_loading_mode"
     )]
     pub dynamic_tool_loading_mode: Arc<Mutex<DynamicToolLoadingMode>>,
+    /// One-time migration marker: configs written before the Native default
+    /// get `dynamic_tool_loading_mode` rewritten to `native` exactly once
+    /// (regardless of the previously persisted value); afterwards the user's
+    /// choice sticks.
+    #[serde(default)]
+    pub dynamic_tool_loading_native_migrated: bool,
+    /// Whether the configured Anthropic endpoint supports native lazy tool
+    /// loading (`defer_loading` + `tool_reference`). Default on — the
+    /// official API supports it. Turn off for gateway/proxy `base_url`s that
+    /// reject those fields; otherwise every request pays a 400 + eager
+    /// retry round-trip (the strip-retry in `llm::anthropic` is per-request
+    /// and cannot remember the endpoint's answer).
+    #[serde(
+        default = "default_anthropic_native_lazy_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub anthropic_native_lazy_enabled: Arc<AtomicBool>,
     #[serde(
         default = "default_skill_package_namespace",
         with = "serde_string_mutex"
@@ -438,6 +463,8 @@ impl AppConfig {
             file_tool_workspace_boundary: default_debug_flag(),
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
+            dynamic_tool_loading_native_migrated: true,
+            anthropic_native_lazy_enabled: default_anthropic_native_lazy_enabled(),
             default_skill_package_namespace: default_skill_package_namespace(),
             view_windows_above_main: default_view_windows_above_main(),
             view_open_in_existing_window: default_view_open_in_existing_window(),
@@ -475,17 +502,17 @@ impl AppConfig {
 
     fn try_load_file(path: &Path) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
-        let (config, scrubbed_legacy_secret) = Self::parse_content(&content).ok()?;
-        if scrubbed_legacy_secret {
+        let (config, rewritten) = Self::parse_content(&content).ok()?;
+        if rewritten {
             if let Err(err) = Self::persist_to_path(&config, path) {
                 eprintln!(
-                    "[Locus] failed to scrub legacy api_key from '{}': {}",
+                    "[Locus] failed to rewrite migrated config '{}': {}",
                     path.display(),
                     err
                 );
             } else {
                 println!(
-                    "[Locus] scrubbed legacy api_key from config: {:?}",
+                    "[Locus] config migrations applied and persisted: {:?}",
                     dunce::canonicalize(path).unwrap_or(path.to_path_buf())
                 );
             }
@@ -497,9 +524,43 @@ impl AppConfig {
         let mut value: Value =
             serde_json::from_str(content).map_err(|e| format!("failed to parse config: {}", e))?;
         let scrubbed_legacy_secret = Self::remove_legacy_api_key(&mut value);
+        let migrated_native_tool_loading = Self::apply_native_tool_loading_migration(&mut value);
         let config = serde_json::from_value::<AppConfig>(value)
             .map_err(|e| format!("failed to deserialize config: {}", e))?;
-        Ok((config, scrubbed_legacy_secret))
+        Ok((config, scrubbed_legacy_secret || migrated_native_tool_loading))
+    }
+
+    /// Rewrites `dynamic_tool_loading_mode` to `native` exactly once per
+    /// config file — the Native default should reach existing installs too,
+    /// whether the old value was the previous default or a manual choice.
+    /// The marker keeps later user changes authoritative.
+    fn apply_native_tool_loading_migration(value: &mut Value) -> bool {
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        if obj
+            .get("dynamic_tool_loading_native_migrated")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            return false;
+        }
+        obj.insert(
+            "dynamic_tool_loading_native_migrated".to_string(),
+            Value::Bool(true),
+        );
+        let previous = obj.insert(
+            "dynamic_tool_loading_mode".to_string(),
+            Value::String("native".to_string()),
+        );
+        println!(
+            "[Locus] dynamic tool loading migrated to native (previous: {})",
+            previous
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("<default>")
+        );
+        true
     }
 
     fn remove_legacy_api_key(value: &mut Value) -> bool {
@@ -566,6 +627,16 @@ impl AppConfig {
             .dynamic_tool_loading_mode
             .lock()
             .map_err(|e| format!("dynamic tool loading mode lock poisoned: {}", e))? = value;
+        self.persist()
+    }
+
+    pub fn anthropic_native_lazy_enabled(&self) -> bool {
+        self.anthropic_native_lazy_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_anthropic_native_lazy_enabled(&self, value: bool) -> Result<(), String> {
+        self.anthropic_native_lazy_enabled
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -891,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tool_loading_mode_defaults_to_meta_tool() {
+    fn dynamic_tool_loading_mode_defaults_to_native() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
         fs::write(
@@ -907,8 +978,80 @@ mod tests {
 
         assert_eq!(
             config.dynamic_tool_loading_mode(),
+            DynamicToolLoadingMode::Native
+        );
+    }
+
+    #[test]
+    fn dynamic_tool_loading_mode_migrates_persisted_value_to_native_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false,
+  "dynamic_tool_loading_mode": "metaTool"
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        // Pre-migration values — even manual ones — flip to native once.
+        assert_eq!(
+            config.dynamic_tool_loading_mode(),
+            DynamicToolLoadingMode::Native
+        );
+        let written = fs::read_to_string(&config_path).expect("rewritten config");
+        assert!(written.contains("\"dynamic_tool_loading_native_migrated\": true"));
+        assert!(written.contains("\"dynamic_tool_loading_mode\": \"native\""));
+    }
+
+    #[test]
+    fn dynamic_tool_loading_mode_user_choice_sticks_after_migration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false,
+  "dynamic_tool_loading_mode": "metaTool",
+  "dynamic_tool_loading_native_migrated": true
+}"#,
+        )
+        .expect("migrated config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(
+            config.dynamic_tool_loading_mode(),
             DynamicToolLoadingMode::MetaTool
         );
+    }
+
+    #[test]
+    fn anthropic_native_lazy_enabled_defaults_to_true_and_persists_opt_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(config.anthropic_native_lazy_enabled());
+
+        config
+            .set_anthropic_native_lazy_enabled(false)
+            .expect("persist opt-out");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(!reloaded.anthropic_native_lazy_enabled());
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub(crate) mod diff;
 pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
+pub mod extra_workdirs;
 mod feishu_docs;
 pub mod file_log;
 pub mod keychain;
@@ -43,12 +44,14 @@ mod knowledge_watcher;
 mod llm;
 mod local_docs;
 pub(crate) mod merge;
+pub mod model_catalog;
 pub mod network;
 pub mod plugin;
 pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
 mod session;
+mod sqlite_maint;
 mod tool;
 pub mod unity_bridge;
 pub mod unity_csharp;
@@ -390,6 +393,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             commands::handle_locus_window_event(window, event);
             commands::handle_agent_graph_tool_window_event(window, event);
+            commands::handle_sub_window_event(window, event);
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
@@ -475,6 +479,10 @@ pub fn run() {
                     .map_err(|e| format!("Failed to initialize SessionStore: {}", e))?,
             );
             startup_for_setup.mark("setup_session_store_ready");
+            // Deleted sessions leave locus.db at its high-water mark (SQLite
+            // never returns freelist pages to the OS on its own); reclaim in
+            // the background when most of the file is dead space.
+            store.clone().spawn_vacuum_if_fragmented();
 
             let working_dir_file = data_dir.join("working_dir.txt");
             let initial_working_dir = std::fs::read_to_string(&working_dir_file)
@@ -1016,6 +1024,8 @@ pub fn run() {
                 startup_for_unity.mark("unity_monitor_task_done");
             });
 
+            tauri::async_runtime::spawn(model_catalog::background_refresh());
+
             let knowledge_startup_state = knowledge_index_state.clone();
             let workspace_for_knowledge = workspace.clone();
             let app_handle_for_knowledge = app.handle().clone();
@@ -1106,6 +1116,9 @@ pub fn run() {
             commands::set_working_dir,
             commands::list_recent_dirs,
             commands::remove_recent_dir,
+            commands::extra_workdirs_get,
+            commands::extra_workdirs_set,
+            commands::extra_workdirs_map,
             commands::open_dir_in_file_explorer,
             commands::list_dir_entries,
             commands::list_dir_entries_page,
@@ -1269,6 +1282,7 @@ pub fn run() {
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
+            commands::refresh_external_skills,
             commands::plugin_registry_sources_get,
             commands::plugin_registry_sources_set,
             commands::plugin_registry_fetch_manifest,
@@ -1313,9 +1327,11 @@ pub fn run() {
             commands::get_codex_model_config,
             commands::get_codex_available_models,
             commands::save_codex_model_config,
-            commands::get_custom_endpoints,
-            commands::save_custom_endpoints,
             commands::test_custom_endpoint,
+            commands::get_custom_providers,
+            commands::save_custom_providers,
+            model_catalog::get_model_catalog,
+            model_catalog::refresh_model_catalog,
             commands::codex_status,
             commands::codex_start_login,
             commands::codex_poll_login,
@@ -1361,6 +1377,8 @@ pub fn run() {
             commands::set_close_behavior,
             commands::get_dynamic_tool_loading_mode,
             commands::set_dynamic_tool_loading_mode,
+            commands::get_anthropic_native_lazy_enabled,
+            commands::set_anthropic_native_lazy_enabled,
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
@@ -1441,6 +1459,10 @@ pub fn run() {
             commands::view_open_inspector_tab,
             commands::view_host_pool_prepare,
             commands::view_host_pool_ready,
+            commands::sub_window_open,
+            commands::sub_window_pool_prepare,
+            commands::sub_window_pool_ready,
+            commands::sub_window_claimed_query,
             commands::view_host_revealed,
             commands::view_content_mount,
             commands::view_content_hide,

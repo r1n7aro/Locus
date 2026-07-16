@@ -177,6 +177,43 @@ fn codex_compaction_encrypted_content(metadata: &serde_json::Value) -> Option<&s
         .filter(|content| !content.is_empty())
 }
 
+/// Reserved name tagging client `tool_search` rounds in session history.
+/// Matching assistant tool calls and their outputs replay as the typed
+/// `tool_search_call` / `tool_search_output` wire items instead of
+/// `function_call` items (the API requires the round-trip in that shape).
+pub const TOOL_SEARCH_HISTORY_TOOL_NAME: &str = "tool_search";
+
+fn build_tool_search_call_item(tc: &ToolCallInfo) -> serde_json::Value {
+    // The wire item carries `arguments` as a JSON value (unlike
+    // function_call's string form); the stored string is its serialization.
+    let arguments = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    serde_json::json!({
+        "type": "tool_search_call",
+        "call_id": tc.id,
+        "status": "completed",
+        "execution": "client",
+        "arguments": arguments,
+    })
+}
+
+fn build_tool_search_output_item(call_id: &str, content: Option<&str>) -> serde_json::Value {
+    // Missing or unparsable output (interrupted round, error text) degrades
+    // to the empty patch — the same normalization codex itself applies.
+    let tools = content
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .and_then(|value| value.get("tools").cloned())
+        .filter(|tools| tools.is_array())
+        .unwrap_or_else(|| serde_json::json!([]));
+    serde_json::json!({
+        "type": "tool_search_output",
+        "call_id": call_id,
+        "status": "completed",
+        "execution": "client",
+        "tools": tools,
+    })
+}
+
 fn build_input(history: &[ChatMessage]) -> Vec<serde_json::Value> {
     build_input_with_metadata(history, None)
 }
@@ -185,6 +222,22 @@ fn build_input_with_metadata(
     history: &[ChatMessage],
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Vec<serde_json::Value> {
+    // call_ids of tool_search rounds; their Tool messages must replay as
+    // tool_search_output items rather than function_call_output.
+    let tool_search_call_ids: std::collections::HashSet<&str> = history
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Assistant)
+        .filter_map(|msg| msg.tool_calls.as_ref())
+        .flatten()
+        .filter(|tc| tc.name == TOOL_SEARCH_HISTORY_TOOL_NAME && !tc.is_server_tool())
+        .map(|tc| tc.id.as_str())
+        .collect();
+    let tool_output_call_ids: std::collections::HashSet<&str> = history
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Tool)
+        .filter_map(|msg| msg.tool_call_id.as_deref())
+        .collect();
+
     let mut input = Vec::new();
     for msg in history {
         if let Some(encrypted_content) = response_request_metadata
@@ -215,6 +268,15 @@ fn build_input_with_metadata(
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
+                        if tc.name == TOOL_SEARCH_HISTORY_TOOL_NAME && !tc.is_server_tool() {
+                            input.push(build_tool_search_call_item(tc));
+                            if !tool_output_call_ids.contains(tc.id.as_str()) {
+                                // A call without its output would 400; patch
+                                // with the empty result like codex normalize.
+                                input.push(build_tool_search_output_item(&tc.id, None));
+                            }
+                            continue;
+                        }
                         input.push(serde_json::json!({
                             "type": "function_call",
                             "call_id": tc.id,
@@ -233,6 +295,10 @@ fn build_input_with_metadata(
             }
             MessageRole::Tool => {
                 if let Some(ref call_id) = msg.tool_call_id {
+                    if tool_search_call_ids.contains(call_id.as_str()) {
+                        input.push(build_tool_search_output_item(call_id, Some(&msg.content)));
+                        continue;
+                    }
                     input.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
@@ -368,6 +434,68 @@ fn build_request_body(
     if !responses_tools.is_empty() {
         body["tools"] = serde_json::json!(responses_tools);
         body["tool_choice"] = serde_json::json!("auto");
+    }
+
+    body
+}
+
+/// Typed `tool_search` declaration (client execution). The description is
+/// source-level and deterministic — request-signature stability is what keeps
+/// websocket continuation and the server prompt cache alive.
+fn build_tool_search_declaration(description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_search",
+        "execution": "client",
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for deferred tools."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of tools to return. Defaults to 8."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn build_request_body_with_tool_search(
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    tool_search_description: Option<&str>,
+    thinking_level: Option<&str>,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    options: CodexStreamOptions,
+) -> serde_json::Value {
+    let mut body = build_request_body(
+        model,
+        system_prompt,
+        history,
+        tools,
+        thinking_level,
+        session_id,
+        response_request_metadata,
+        options,
+    );
+
+    if let Some(description) = tool_search_description {
+        let declaration = build_tool_search_declaration(description);
+        match body.get_mut("tools").and_then(|tools| tools.as_array_mut()) {
+            Some(existing) => existing.push(declaration),
+            None => {
+                body["tools"] = serde_json::json!([declaration]);
+                body["tool_choice"] = serde_json::json!("auto");
+            }
+        }
     }
 
     body
@@ -1622,6 +1750,45 @@ where
                                     .pending_server_tool_start_orders
                                     .insert(id, start_order);
                             }
+                        } else if item_type == Some("tool_search_call") {
+                            // Client-executed tool discovery. The arguments
+                            // arrive as a JSON value; the authoritative copy
+                            // lands on output_item.done, which upgrades this
+                            // entry and fires the start notification.
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let item_id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&call_id)
+                                .to_string();
+                            if !call_id.is_empty() {
+                                state.tool_calls_map.insert(
+                                    item_id,
+                                    PartialToolCall {
+                                        call_id,
+                                        name: TOOL_SEARCH_HISTORY_TOOL_NAME.to_string(),
+                                        arguments: item
+                                            .get("arguments")
+                                            .map(|v| {
+                                                if let Some(text) = v.as_str() {
+                                                    text.to_string()
+                                                } else {
+                                                    v.to_string()
+                                                }
+                                            })
+                                            .unwrap_or_default(),
+                                        arguments_done: false,
+                                        item_done: false,
+                                        notified: false,
+                                        start_order: None,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -1664,6 +1831,53 @@ where
                             } else if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                                 tc.item_done = true;
                                 tc.notify_started(
+                                    &mut state.next_tool_start_order,
+                                    on_tool_call_start,
+                                );
+                            }
+                        } else if item_type == Some("tool_search_call") {
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let item_id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&call_id)
+                                .to_string();
+                            // Arguments arrive as a JSON value; store its
+                            // serialization (the executor and history replay
+                            // parse it back).
+                            let arguments = item
+                                .get("arguments")
+                                .map(|v| {
+                                    if let Some(text) = v.as_str() {
+                                        text.to_string()
+                                    } else {
+                                        v.to_string()
+                                    }
+                                })
+                                .unwrap_or_default();
+                            if !call_id.is_empty() {
+                                let entry = state
+                                    .tool_calls_map
+                                    .entry(item_id)
+                                    .or_insert_with(|| PartialToolCall {
+                                        call_id,
+                                        name: TOOL_SEARCH_HISTORY_TOOL_NAME.to_string(),
+                                        arguments: String::new(),
+                                        arguments_done: false,
+                                        item_done: false,
+                                        notified: false,
+                                        start_order: None,
+                                    });
+                                if !arguments.is_empty() {
+                                    entry.arguments = arguments;
+                                }
+                                entry.item_done = true;
+                                entry.notify_started(
                                     &mut state.next_tool_start_order,
                                     on_tool_call_start,
                                 );
@@ -1875,6 +2089,7 @@ pub async fn stream_chat<F, G, H>(
     system_prompt: &str,
     history: &[ChatMessage],
     tools: &[serde_json::Value],
+    tool_search_description: Option<&str>,
     thinking_level: Option<&str>,
     fast_mode: bool,
     debug: bool,
@@ -1899,6 +2114,7 @@ where
         system_prompt,
         history,
         tools,
+        tool_search_description,
         thinking_level,
         debug,
         session_id,
@@ -1921,6 +2137,7 @@ pub async fn stream_chat_with_options<F, G, H>(
     system_prompt: &str,
     history: &[ChatMessage],
     tools: &[serde_json::Value],
+    tool_search_description: Option<&str>,
     thinking_level: Option<&str>,
     debug: bool,
     session_id: Option<&str>,
@@ -1948,6 +2165,7 @@ where
             system_prompt,
             history,
             tools,
+            tool_search_description,
             thinking_level,
             debug,
             session_id,
@@ -1994,6 +2212,7 @@ async fn stream_chat_once<F, G, H>(
     system_prompt: &str,
     history: &[ChatMessage],
     tools: &[serde_json::Value],
+    tool_search_description: Option<&str>,
     thinking_level: Option<&str>,
     debug: bool,
     session_id: Option<&str>,
@@ -2012,11 +2231,12 @@ where
     // Compaction items must be replayed in every request shape (including full
     // replay), so the body builder always receives the metadata map even when
     // session continuation is disabled.
-    let body = build_request_body(
+    let body = build_request_body_with_tool_search(
         model,
         system_prompt,
         history,
         tools,
+        tool_search_description,
         thinking_level,
         session_id,
         response_request_metadata,
@@ -2871,12 +3091,13 @@ mod tests {
     use super::{
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
-        build_request_body, build_websocket_transport_request, codex_websocket_url,
-        collect_complete_tool_calls, drain_sse_buffer, establish_http_connect_tunnel,
-        extract_compaction_encrypted_content, process_sse_event_block, request_without_input,
-        uri_host_port, websocket_event_error_message, websocket_proxy_match_uri,
-        CodexStreamOptions, CodexStreamState, LastWebsocketResponse, PartialToolCall,
-        CODEX_ORIGINATOR_HEADER_VALUE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
+        build_request_body, build_request_body_with_tool_search,
+        build_websocket_transport_request, codex_websocket_url, collect_complete_tool_calls,
+        drain_sse_buffer, establish_http_connect_tunnel, extract_compaction_encrypted_content,
+        process_sse_event_block, request_without_input, uri_host_port,
+        websocket_event_error_message, websocket_proxy_match_uri, CodexStreamOptions,
+        CodexStreamState, LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
+        RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE, TOOL_SEARCH_HISTORY_TOOL_NAME,
         X_CODEX_TURN_STATE_HEADER,
     };
     use crate::llm::CODEX_CLIENT_VERSION;
@@ -3053,6 +3274,147 @@ mod tests {
         );
     }
 
+    fn tool_search_call_info(call_id: &str, arguments: &str) -> ToolCallInfo {
+        ToolCallInfo {
+            id: call_id.to_string(),
+            name: TOOL_SEARCH_HISTORY_TOOL_NAME.to_string(),
+            arguments: arguments.to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn build_input_replays_tool_search_round_as_typed_items() {
+        let output_json = r#"{"tools":[{"type":"function","name":"pdf_export","description":"Export PDF.","parameters":{"type":"object"},"defer_loading":true}]}"#;
+        let input = build_input(&[
+            assistant_message_with_tool_calls(
+                "assistant-1",
+                "",
+                Some("resp_prev"),
+                vec![tool_search_call_info(
+                    "search-1",
+                    r#"{"limit":2,"query":"pdf export"}"#,
+                )],
+            ),
+            tool_message("tool-1", "search-1", output_json),
+        ]);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], serde_json::json!("tool_search_call"));
+        assert_eq!(input[0]["call_id"], serde_json::json!("search-1"));
+        assert_eq!(input[0]["execution"], serde_json::json!("client"));
+        assert_eq!(
+            input[0]["arguments"],
+            serde_json::json!({"query": "pdf export", "limit": 2})
+        );
+        assert_eq!(input[1]["type"], serde_json::json!("tool_search_output"));
+        assert_eq!(input[1]["call_id"], serde_json::json!("search-1"));
+        assert_eq!(input[1]["status"], serde_json::json!("completed"));
+        assert_eq!(
+            input[1]["tools"][0]["name"],
+            serde_json::json!("pdf_export")
+        );
+        assert_eq!(
+            input[1]["tools"][0]["defer_loading"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn build_input_patches_missing_tool_search_output_with_empty_tools() {
+        let input = build_input(&[assistant_message_with_tool_calls(
+            "assistant-1",
+            "",
+            Some("resp_prev"),
+            vec![tool_search_call_info("search-1", r#"{"query":"pdf"}"#)],
+        )]);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], serde_json::json!("tool_search_call"));
+        assert_eq!(input[1]["type"], serde_json::json!("tool_search_output"));
+        assert_eq!(input[1]["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn build_input_degrades_error_tool_search_output_to_empty_tools() {
+        let input = build_input(&[
+            assistant_message_with_tool_calls(
+                "assistant-1",
+                "",
+                Some("resp_prev"),
+                vec![tool_search_call_info("search-1", r#"{"query":"pdf"}"#)],
+            ),
+            tool_message("tool-1", "search-1", "query must not be empty"),
+        ]);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["type"], serde_json::json!("tool_search_output"));
+        assert_eq!(input[1]["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn request_body_appends_tool_search_declaration() {
+        let body = build_request_body_with_tool_search(
+            "gpt-5.4",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            Some("# Tool discovery\n\nsources:\n- locus_skills"),
+            None,
+            Some("session-1"),
+            None,
+            CodexStreamOptions::default(),
+        );
+
+        let tools = body["tools"].as_array().expect("tools declared");
+        let search = tools
+            .iter()
+            .find(|tool| tool["type"] == serde_json::json!("tool_search"))
+            .expect("tool_search declaration present");
+        assert_eq!(search["execution"], serde_json::json!("client"));
+        assert_eq!(
+            search["parameters"]["required"],
+            serde_json::json!(["query"])
+        );
+
+        // The declaration is excluded from the continuation signature the
+        // same way every tool is.
+        let signature = request_without_input(&body);
+        assert!(signature.get("tools").is_none());
+    }
+
+    #[test]
+    fn request_body_without_description_matches_legacy_shape() {
+        let with = build_request_body_with_tool_search(
+            "gpt-5.4",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            None,
+            None,
+            Some("session-1"),
+            None,
+            CodexStreamOptions::default(),
+        );
+        let legacy = build_request_body(
+            "gpt-5.4",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            None,
+            Some("session-1"),
+            None,
+            CodexStreamOptions::default(),
+        );
+
+        assert_eq!(with, legacy);
+    }
+
     #[test]
     fn ignores_incomplete_tool_calls() {
         let mut tool_calls = std::collections::HashMap::new();
@@ -3186,6 +3548,53 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].0, "call_1");
         assert_eq!(started[0].1, "read");
+    }
+
+    #[test]
+    fn collects_tool_search_call_from_sse_items() {
+        let mut state = CodexStreamState::new();
+        let started = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured = started.clone();
+        let on_tool = move |id: String, name: String| {
+            captured
+                .lock()
+                .expect("tool mutex poisoned")
+                .push((id, name));
+        };
+
+        process_sse_event_block(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"tool_search_call\",\"call_id\":\"search_1\",\"execution\":\"client\",\"arguments\":{}}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &on_tool,
+        )
+        .expect("output_item.added should parse");
+        process_sse_event_block(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"tool_search_call\",\"call_id\":\"search_1\",\"status\":\"completed\",\"execution\":\"client\",\"arguments\":{\"limit\":2,\"query\":\"pdf export\"}}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &on_tool,
+        )
+        .expect("output_item.done should parse");
+
+        let (collected, incomplete) = collect_complete_tool_calls(&state.tool_calls_map);
+        assert_eq!(incomplete, 0);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].tool_call.id, "search_1");
+        assert_eq!(collected[0].tool_call.name, TOOL_SEARCH_HISTORY_TOOL_NAME);
+        let arguments: serde_json::Value =
+            serde_json::from_str(&collected[0].tool_call.arguments).expect("arguments JSON");
+        assert_eq!(arguments["query"], serde_json::json!("pdf export"));
+        assert_eq!(arguments["limit"], serde_json::json!(2));
+
+        let started = started.lock().expect("tool mutex poisoned");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, "search_1");
+        assert_eq!(started[0].1, TOOL_SEARCH_HISTORY_TOOL_NAME);
     }
 
     #[test]

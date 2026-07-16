@@ -3,7 +3,7 @@ import type { ProxyConfig, ProxyStatus, PythonRuntimeState, UnityBackgroundHookS
 
 export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
 export type AppCloseBehavior = "exit" | "minimizeToTray";
-export type DynamicToolLoadingMode = "metaTool" | "direct";
+export type DynamicToolLoadingMode = "metaTool" | "direct" | "native";
 
 let pythonRuntimeStateCache: PythonRuntimeState | null = null;
 let pythonRuntimeStateRequest: Promise<PythonRuntimeState> | null = null;
@@ -15,7 +15,8 @@ function normalizeCloseBehavior(value: unknown): AppCloseBehavior {
 }
 
 function normalizeDynamicToolLoadingMode(value: unknown): DynamicToolLoadingMode {
-  return value === "direct" ? "direct" : "metaTool";
+  if (value === "direct" || value === "native") return value;
+  return "metaTool";
 }
 
 export function getSystemLocale(): Promise<string | null> {
@@ -59,6 +60,14 @@ export function setDynamicToolLoadingMode(value: DynamicToolLoadingMode): Promis
   return ipcInvoke<void>("set_dynamic_tool_loading_mode", {
     value: normalizeDynamicToolLoadingMode(value),
   });
+}
+
+export function getAnthropicNativeLazyEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_anthropic_native_lazy_enabled");
+}
+
+export function setAnthropicNativeLazyEnabled(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_anthropic_native_lazy_enabled", { value });
 }
 
 export function getLlmRetryMaxAttempts(): Promise<number> {

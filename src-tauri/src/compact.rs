@@ -494,6 +494,12 @@ pub fn estimate_request_tokens(
     }
 
     for tool in tools {
+        // Deferred declarations (native lazy loading) are stripped from the
+        // rendered prompt by the API until referenced; they cost request
+        // bytes but no context tokens, so they stay out of the estimate.
+        if tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
         let serialized = serde_json::to_string(tool).unwrap_or_default();
         total = total
             .saturating_add(TOOL_SCHEMA_OVERHEAD_TOKENS)

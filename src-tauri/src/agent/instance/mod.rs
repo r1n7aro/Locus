@@ -254,12 +254,102 @@ pub struct AgentInstance {
     tool_runtime_state: Arc<ToolRuntimeState>,
     loaded_tool_names: Mutex<HashSet<String>>,
     document_skill_tool_names: Mutex<HashSet<String>>,
+    /// Lazy-tool renderer resolved at run start (config mode × backend ×
+    /// model). Cached so deep call paths without an `AppHandle` (system
+    /// prompt assembly, tool handlers) can branch on it; `ToolLoadFallback`
+    /// outside runs.
+    lazy_tool_renderer: Mutex<LazyToolRenderer>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     /// Run-scoped view of the session's sticky plan mode. Initialized from
     /// the session store at run start and flipped live by exit_plan_mode
     /// approval so enforcement inside the same run follows the transition.
     plan_runtime: Mutex<Option<PlanRuntime>>,
+}
+
+/// Which mechanism serves lazily loaded tools for the active backend when
+/// `DynamicToolLoadingMode::Native` is configured. Resolved per run; every
+/// unsupported backend/model combination degrades to the MetaTool fallback so
+/// its requests stay byte-identical with the pre-native behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum LazyToolRenderer {
+    #[default]
+    ToolLoadFallback,
+    /// Anthropic `defer_loading` declarations + `tool_reference` expansion.
+    AnthropicNative,
+    /// OpenAI Responses `tool_search` protocol; deferred definitions stay
+    /// client-side.
+    CodexNative,
+}
+
+impl LazyToolRenderer {
+    pub(super) fn is_native(self) -> bool {
+        !matches!(self, Self::ToolLoadFallback)
+    }
+
+    fn strategy_label(self) -> &'static str {
+        match self {
+            Self::ToolLoadFallback => "tool_load_fallback",
+            Self::AnthropicNative => "anthropic_native",
+            Self::CodexNative => "codex_native",
+        }
+    }
+}
+
+/// Native-renderer request tool split. `direct` tools are declared eagerly
+/// (and carry the tools-section cache breakpoint on the API-key path);
+/// `deferred` tools follow with `defer_loading: true` on the Anthropic path
+/// and stay out of the request entirely on the Codex path.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RequestToolPlan {
+    direct: Vec<String>,
+    deferred: Vec<String>,
+}
+
+impl RequestToolPlan {
+    fn all_names(&self) -> Vec<String> {
+        let mut names = self.direct.clone();
+        names.extend(self.deferred.iter().cloned());
+        names
+    }
+}
+
+/// Request tool assembly output for one LLM call.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PreparedRequestTools {
+    request_tool_names: Vec<String>,
+    deferred_count: usize,
+    api_tools: Vec<serde_json::Value>,
+    /// `Some` only on the codex-native path: description for the request's
+    /// `tool_search` declaration.
+    tool_search_description: Option<String>,
+}
+
+/// Reserved Responses-API tool name for the codex-native discovery round.
+/// The declaration is typed (`"type": "tool_search"`), so this never collides
+/// with a client function tool; Locus reuses the name to tag the round in
+/// session history for replay.
+pub(super) const CODEX_TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+
+/// Default result cap for `tool_search`, matching the codex client.
+const CODEX_TOOL_SEARCH_DEFAULT_LIMIT: usize = 8;
+
+/// Tool names inside a persisted `tool_search` result (`{"tools":[...]}`).
+pub(super) fn codex_tool_search_output_tool_names(content: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    value
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Plan-mode enforcement profile for the current run.
@@ -2050,13 +2140,22 @@ fn build_structure_section(
             &excluded_reference_prefixes,
         )?,
     );
-    let mut skill_items =
-        prompt_items_from_documents(crate::knowledge_store::load_documents_with_app_root(
+    // Skill lines in the always-on structure exist to let the model discover
+    // and auto-recall skills, so they pass the same recall gate as
+    // knowledge_read: enabled + auto surface + a non-none inject mode.
+    // Command-only skills stay reachable through the slash menu and the
+    // skill_list tool instead.
+    let mut skill_items = prompt_items_from_documents(
+        crate::knowledge_store::load_documents_with_app_root(
             working_dir,
             app_knowledge_dir,
             Some(crate::knowledge_store::KnowledgeType::Skill),
             None,
-        )?);
+        )?
+        .into_iter()
+        .filter(crate::knowledge_store::document_allows_model_recall)
+        .collect(),
+    );
     skill_items.extend(prompt_items_from_list_items(
         crate::commands::list_skill_package_knowledge_items_sync_with_hidden(
             working_dir,
@@ -2602,6 +2701,9 @@ fn env_block_position(env_template: &str, tags: &[&str]) -> usize {
 
 fn injected_item_prompt_sort_key(env_template: &str, item_id: &str) -> (u8, usize) {
     match item_id {
+        // Extra workdirs render inside the env block right after the working
+        // directory, so the item sorts directly behind the env.md entry.
+        "extra_workdirs" => (0, usize::MAX),
         id if id.starts_with("knowledge_rule::") => (1, usize::MAX),
         "knowledge_context" => (2, env_block_position(env_template, &["{{#knowledge}}"])),
         "lazy_tool_names" => (3, usize::MAX),
@@ -2797,8 +2899,18 @@ impl AgentInstance {
                     return None;
                 }
             }
+            // Attached additional working directories are advertised to the
+            // agent as part of the project scope (env prompt), so the
+            // boundary must honor them too.
+            for entry in crate::extra_workdirs::load_entries(working_dir) {
+                let root = std::path::PathBuf::from(&entry.path);
+                let canonical_extra_root = dunce::canonicalize(&root).unwrap_or(root);
+                if Self::path_is_within_root(&resolved, &canonical_extra_root) {
+                    return None;
+                }
+            }
             Some(format!(
-                "Tool '{}' cannot access '{}': direct filesystem tools may only operate within the selected working directory '{}', an app Skill package directory, or the app temp directory.",
+                "Tool '{}' cannot access '{}': direct filesystem tools may only operate within the selected working directory '{}', an attached additional working directory, an app Skill package directory, or the app temp directory.",
                 tool_name,
                 raw_path,
                 canonical_root.display()
@@ -3039,6 +3151,7 @@ impl AgentInstance {
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
             loaded_tool_names: Mutex::new(HashSet::new()),
             document_skill_tool_names: Mutex::new(HashSet::new()),
+            lazy_tool_renderer: Mutex::new(LazyToolRenderer::default()),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
             plan_runtime: Mutex::new(None),
@@ -3565,6 +3678,137 @@ impl AgentInstance {
         Self::dynamic_tool_loading_mode_from_app_handle(app_handle)
     }
 
+    /// Endpoint capability switch for Anthropic native lazy loading. Missing
+    /// config state (tests, early startup) keeps the default-on behavior.
+    fn anthropic_native_lazy_enabled_from_app_handle(app_handle: &AppHandle) -> bool {
+        app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| config.anthropic_native_lazy_enabled())
+            .unwrap_or(true)
+    }
+
+    /// Anthropic models below Opus/Sonnet/Haiku 4.5 predate `defer_loading`.
+    /// Unknown (newer) families default to supported — the request-level
+    /// strip-and-retry in `llm::anthropic` degrades gracefully if that guess
+    /// is ever wrong.
+    fn anthropic_model_supports_native_lazy(model: &str) -> bool {
+        let normalized = model
+            .trim()
+            .strip_prefix("anthropic/")
+            .unwrap_or(model.trim())
+            .to_ascii_lowercase()
+            .replace('.', "-");
+        if normalized.contains("fable") || normalized.contains("mythos") {
+            return true;
+        }
+        if normalized.contains("instant") {
+            return false;
+        }
+
+        let mut version_parts = normalized
+            .split('-')
+            .filter_map(|part| part.parse::<u32>().ok())
+            // Date suffixes (20251001) are not version components.
+            .filter(|value| *value < 100);
+        let Some(major) = version_parts.next() else {
+            // No parsable version — assume a new naming scheme, post-4.5.
+            return true;
+        };
+        let minor = version_parts.next().unwrap_or(0);
+        (major, minor) >= (4, 5)
+    }
+
+    /// chatgpt-backend Codex models from gpt-5.2 on implement the
+    /// `tool_search` protocol (verified against the codex models manifest);
+    /// there is no runtime strip-retry on this path, so gate conservatively.
+    fn codex_model_supports_tool_search(model: &str) -> bool {
+        let normalized = model
+            .trim()
+            .strip_prefix("openai/")
+            .unwrap_or(model.trim())
+            .to_ascii_lowercase();
+        if normalized == "codex-auto-review" {
+            return true;
+        }
+        let Some(version) = normalized
+            .strip_prefix("gpt-")
+            .map(|rest| rest.split(['-', '_']).next().unwrap_or(rest))
+        else {
+            return false;
+        };
+        let mut parts = version.split('.');
+        let Some(major) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+            return false;
+        };
+        let minor = parts
+            .next()
+            .and_then(|part| part.parse::<u32>().ok())
+            .unwrap_or(0);
+        (major, minor) >= (5, 2)
+    }
+
+    /// `tool_search` is confirmed on the default chatgpt backend only;
+    /// `api.openai.com`/custom endpoints stay on the fallback until probed
+    /// (plan T4).
+    fn codex_backend_supports_tool_search(base_url: Option<&str>) -> bool {
+        match base_url.map(str::trim).filter(|value| !value.is_empty()) {
+            None => true,
+            Some(url) => url.contains("chatgpt.com"),
+        }
+    }
+
+    /// Resolves which lazy-tool renderer this run uses. Pure function of the
+    /// configured mode, the instance backend/model, and the Anthropic
+    /// endpoint capability switch (`anthropic_native_lazy_enabled` — off for
+    /// gateway `base_url`s that reject `defer_loading`/`tool_reference`, so
+    /// their requests skip the per-request 400 + eager retry entirely).
+    fn resolve_lazy_tool_renderer(
+        &self,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        anthropic_endpoint_lazy_enabled: bool,
+    ) -> LazyToolRenderer {
+        if dynamic_mode != crate::config::DynamicToolLoadingMode::Native {
+            return LazyToolRenderer::ToolLoadFallback;
+        }
+        match &self.backend {
+            LlmBackend::Anthropic { .. }
+                if anthropic_endpoint_lazy_enabled
+                    && Self::anthropic_model_supports_native_lazy(&self.effective_model) =>
+            {
+                LazyToolRenderer::AnthropicNative
+            }
+            LlmBackend::OpenAiCodex { base_url, .. }
+                if Self::codex_backend_supports_tool_search(base_url.as_deref())
+                    && Self::codex_model_supports_tool_search(&self.effective_model) =>
+            {
+                LazyToolRenderer::CodexNative
+            }
+            _ => LazyToolRenderer::ToolLoadFallback,
+        }
+    }
+
+    /// Resolves and caches the renderer for the current run; call once per
+    /// run before prompt/tool assembly.
+    fn refresh_lazy_tool_renderer(
+        &self,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        anthropic_endpoint_lazy_enabled: bool,
+    ) -> LazyToolRenderer {
+        let renderer =
+            self.resolve_lazy_tool_renderer(dynamic_mode, anthropic_endpoint_lazy_enabled);
+        if let Ok(mut cached) = self.lazy_tool_renderer.lock() {
+            *cached = renderer;
+        }
+        renderer
+    }
+
+    pub(super) fn cached_lazy_tool_renderer(&self) -> LazyToolRenderer {
+        self.lazy_tool_renderer
+            .lock()
+            .map(|cached| *cached)
+            .unwrap_or_default()
+    }
+
     /// Context-window budget for the active backend/model. Codex models
     /// prefer the per-model effective window from the cached /models
     /// manifest; the static `model_context_limit` table only guesses
@@ -3640,6 +3884,71 @@ impl AgentInstance {
             }
         }
         names
+    }
+
+    /// Builds the native request tool plan: eager (direct) names first, then
+    /// deferred names. Deterministic — both sections use the priority sort —
+    /// so the serialized tools array is byte-stable between requests and only
+    /// ever grows at the deferred tail when a skill activates (the officially
+    /// cache-safe mutation).
+    async fn build_native_request_tool_plan(
+        &self,
+        renderer: LazyToolRenderer,
+        selected_skill_tool_names: &HashSet<String>,
+    ) -> RequestToolPlan {
+        let active_skill_tool_names = self.active_skill_tool_names(selected_skill_tool_names);
+        let allowed = self
+            .allowed_tool_set_for_active_skills(&active_skill_tool_names)
+            .await;
+        let direct_overrides = self.tool_direct_load_overrides();
+
+        let mut direct = Vec::new();
+        // tool_load stays the discovery entry point on the Anthropic path
+        // (its result carries tool_reference blocks); the Codex path replaces
+        // it with the protocol-level tool_search declaration.
+        if renderer == LazyToolRenderer::AnthropicNative {
+            push_unique_tool_name(&mut direct, "tool_load");
+        }
+        if self.plan_mode_main_active() {
+            push_unique_tool_name(&mut direct, "exit_plan_mode");
+        }
+
+        let mut deferred = Vec::new();
+        let mut allowed_sorted: Vec<_> = allowed.into_iter().collect();
+        crate::tool::sort_tool_names_by_priority(&mut allowed_sorted);
+        for name in allowed_sorted {
+            // The meta tools are pinned explicitly above; tool_call in
+            // particular must never leak into a native request.
+            if Self::is_meta_tool(&name) {
+                continue;
+            }
+            let configured_load_mode = self.configured_tool_load_mode(&name, &direct_overrides);
+            // Intent-selected skill tools keep the legacy direct declaration:
+            // the reminder embeds the full skill document, so the model needs
+            // the schemas immediately, without a discovery round-trip.
+            if configured_load_mode == ToolLoadMode::Direct
+                || selected_skill_tool_names.contains(&name)
+            {
+                push_unique_tool_name(&mut direct, &name);
+                continue;
+            }
+            match configured_load_mode {
+                // The Lazy set is configuration-stable and bounded — declared
+                // deferred upfront so tool_load references always resolve.
+                ToolLoadMode::Lazy => push_unique_tool_name(&mut deferred, &name),
+                // Skill tools declare incrementally on activation (reading
+                // the skill document / a tool_search hit). Declaring the
+                // whole catalog upfront would couple request size to the
+                // skill-package inventory again.
+                ToolLoadMode::Skill if active_skill_tool_names.contains(&name) => {
+                    push_unique_tool_name(&mut deferred, &name)
+                }
+                _ => {}
+            }
+        }
+        deferred.retain(|name| !direct.contains(name));
+
+        RequestToolPlan { direct, deferred }
     }
 
     fn requested_tool_load_names(args: &serde_json::Value) -> Vec<String> {
@@ -3789,6 +4098,7 @@ impl AgentInstance {
     async fn available_tool_prompt_items(&self) -> Vec<InjectedPromptItem> {
         let direct_overrides = self.tool_direct_load_overrides();
         let enabled_overrides = self.tool_enabled_overrides();
+        let native_renderer_active = self.cached_lazy_tool_renderer().is_native();
         let request_tool_names = self.build_request_tool_names().await;
         let mut direct_tool_names = HashSet::new();
         let mut tool_names = Vec::new();
@@ -3853,6 +4163,12 @@ impl AgentInstance {
                 } else {
                     "default_lazy"
                 };
+                // True when the active renderer serves this tool through the
+                // provider-native deferred mechanism instead of the
+                // tool_load/tool_call fallback.
+                let native_lazy = native_renderer_active
+                    && !Self::is_meta_tool(&name)
+                    && configured_load_mode != ToolLoadMode::Direct;
                 Some(InjectedPromptItem {
                     id: format!("available_tool::{}", name),
                     title: name,
@@ -3873,7 +4189,7 @@ impl AgentInstance {
                         "canConfigureDirectLoad": can_configure_direct_load,
                         "enabled": enabled,
                         "canToggleEnabled": can_toggle_enabled,
-                        "nativeLazy": false,
+                        "nativeLazy": native_lazy,
                         "toolSource": tool_source,
                     })),
                 })
@@ -3888,6 +4204,17 @@ impl AgentInstance {
 
         let mut items = Vec::new();
         let env_template = self.def.env_template.as_str();
+
+        if let Some(content) = crate::extra_workdirs::build_env_prompt_block(&self.working_dir) {
+            items.push(InjectedPromptItem {
+                id: "extra_workdirs".to_string(),
+                title: "Additional Working Directories".to_string(),
+                kind: "context".to_string(),
+                content,
+                source: "workspace".to_string(),
+                meta: None,
+            });
+        }
 
         if self.knowledge_access_mode.allows_context() {
             if let Ok(rule_entries) =
@@ -4067,6 +4394,221 @@ impl AgentInstance {
             .into_iter()
             .map(|tool| self.contextualize_api_tool(tool))
             .collect()
+    }
+
+    /// API tools for a native request plan. Anthropic: direct tools first,
+    /// deferred tools appended with the `defer_loading` wrapper marker (the
+    /// backend serializer maps it onto the wire field and keeps the cache
+    /// breakpoint on the eager section). Codex: direct tools only — the
+    /// deferred catalog stays client-side behind `tool_search`.
+    async fn build_api_tools_for_plan(
+        &self,
+        renderer: LazyToolRenderer,
+        plan: &RequestToolPlan,
+    ) -> Vec<serde_json::Value> {
+        let mut tools = self.build_api_tools(&plan.direct).await;
+
+        if renderer == LazyToolRenderer::AnthropicNative {
+            // The env-prompt manifest is withdrawn on this path; the deferred
+            // catalog rides on tool_load's description instead (stable per
+            // configuration, so the tools prefix does not wobble).
+            if let Some(manifest) = self.native_tool_load_manifest_section().await {
+                for tool in tools.iter_mut() {
+                    let is_tool_load = tool
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("tool_load");
+                    if !is_tool_load {
+                        continue;
+                    }
+                    if let Some(description) = tool
+                        .get_mut("function")
+                        .and_then(|f| f.get_mut("description"))
+                    {
+                        if let Some(text) = description.as_str() {
+                            *description =
+                                serde_json::json!(format!("{}\n\n{}", text, manifest));
+                        }
+                    }
+                    break;
+                }
+            }
+
+            for tool in self.build_api_tools(&plan.deferred).await {
+                let mut tool = tool;
+                tool["defer_loading"] = serde_json::json!(true);
+                tools.push(tool);
+            }
+        }
+
+        tools
+    }
+
+    /// Deferred-tool catalog embedded into tool_load's description on the
+    /// Anthropic native path. Covers the configuration-stable Lazy set only:
+    /// skill tools are discovered by reading their skill documents, and
+    /// listing them here would mutate the tools prefix on every activation.
+    async fn native_tool_load_manifest_section(&self) -> Option<String> {
+        let tool_names = self.lazy_tool_manifest_names().await;
+        if tool_names.is_empty() {
+            return None;
+        }
+        let mut lines = vec![
+            "## Deferred tools".to_string(),
+            String::new(),
+            "These additional tools are declared with deferred definitions. Load them by name with `tool_load`; the full schemas expand automatically and the tools become directly callable:".to_string(),
+        ];
+        for name in tool_names {
+            let summary = self
+                .tool_registry
+                .tool_description(&name)
+                .map(|(description, _)| Self::summarize_tool_description(&description))
+                .unwrap_or_default();
+            if summary.is_empty() {
+                lines.push(format!("- `{}`", name));
+            } else {
+                lines.push(format!("- `{}` — {}", name, summary));
+            }
+        }
+        Some(lines.join("\n"))
+    }
+
+    /// One-stop request tool assembly for the agent loop: picks the native
+    /// plan or the legacy (MetaTool/Direct) list depending on the resolved
+    /// renderer, so every non-native path stays byte-identical with the
+    /// pre-native behavior.
+    async fn prepare_request_tools(
+        &self,
+        renderer: LazyToolRenderer,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        selected_skill_tool_names: &HashSet<String>,
+    ) -> PreparedRequestTools {
+        if renderer.is_native() {
+            let plan = self
+                .build_native_request_tool_plan(renderer, selected_skill_tool_names)
+                .await;
+            let api_tools = self.build_api_tools_for_plan(renderer, &plan).await;
+            let tool_search_description = (renderer == LazyToolRenderer::CodexNative)
+                .then(|| self.codex_tool_search_description(&plan))
+                .flatten();
+            return PreparedRequestTools {
+                request_tool_names: plan.all_names(),
+                deferred_count: plan.deferred.len(),
+                api_tools,
+                tool_search_description,
+            };
+        }
+
+        let active_skill_tool_names = self.active_skill_tool_names(selected_skill_tool_names);
+        let request_tool_names = self
+            .build_request_tool_names_for_mode_and_skills(dynamic_mode, &active_skill_tool_names)
+            .await;
+        let api_tools = self.build_api_tools(&request_tool_names).await;
+        PreparedRequestTools {
+            request_tool_names,
+            deferred_count: 0,
+            api_tools,
+            tool_search_description: None,
+        }
+    }
+
+    /// Description for the codex `tool_search` declaration. Source-level and
+    /// deterministic: per-tool churn must not leak into the request signature.
+    /// `None` when nothing is searchable (the declaration is withheld).
+    fn codex_tool_search_description(&self, plan: &RequestToolPlan) -> Option<String> {
+        let has_lazy_source = !plan.deferred.is_empty();
+        let has_skill_source = !self.tool_registry.skill_tool_names().is_empty();
+        if !has_lazy_source && !has_skill_source {
+            return None;
+        }
+
+        let mut sources = Vec::new();
+        if has_lazy_source {
+            sources.push(
+                "- locus_lazy: Low-frequency Locus built-in tools with deferred definitions."
+                    .to_string(),
+            );
+        }
+        if has_skill_source {
+            sources.push(
+                "- locus_skills: Tools bundled with Locus Skill packages; Skill documents name the tools they need."
+                    .to_string(),
+            );
+        }
+
+        Some(format!(
+            "# Tool discovery\n\nSearches over deferred tool metadata and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{}`) to search for the required tools.",
+            sources.join("\n"),
+            CODEX_TOOL_SEARCH_TOOL_NAME
+        ))
+    }
+
+    /// Rebuilds the session-scoped skill activation set from history at run
+    /// start (native renderers only). Anthropic: tool-reference marker lines
+    /// on tool results. Codex: tools returned by past `tool_search` rounds.
+    /// Only Skill-mode tools need seeding — Lazy tools are declared deferred
+    /// unconditionally.
+    async fn seed_native_skill_activations_from_history(
+        &self,
+        renderer: LazyToolRenderer,
+        messages: &[ChatMessage],
+    ) {
+        let mut names: Vec<String> = Vec::new();
+        match renderer {
+            LazyToolRenderer::AnthropicNative => {
+                for message in messages {
+                    if message.role != crate::session::models::MessageRole::Tool {
+                        continue;
+                    }
+                    names.extend(crate::llm::tool_references::parse_tool_reference_marker(
+                        &message.content,
+                    ));
+                }
+            }
+            LazyToolRenderer::CodexNative => {
+                for tool_call in crate::session::history::collect_assistant_tool_calls(messages) {
+                    if tool_call.name != CODEX_TOOL_SEARCH_TOOL_NAME {
+                        continue;
+                    }
+                    let Some(output) = messages.iter().find(|message| {
+                        message.role == crate::session::models::MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some(tool_call.id.as_str())
+                    }) else {
+                        continue;
+                    };
+                    names.extend(codex_tool_search_output_tool_names(&output.content));
+                }
+            }
+            LazyToolRenderer::ToolLoadFallback => return,
+        }
+
+        if names.is_empty() {
+            return;
+        }
+
+        let mut seeded = 0usize;
+        if let Ok(mut activated) = self.document_skill_tool_names.lock() {
+            for name in names {
+                let Some(canonical) = self.canonical_tool_name(&name) else {
+                    continue;
+                };
+                if Self::is_meta_tool(&canonical)
+                    || self.default_tool_load_mode(&canonical) != ToolLoadMode::Skill
+                {
+                    continue;
+                }
+                if activated.insert(canonical) {
+                    seeded += 1;
+                }
+            }
+        }
+        if seeded > 0 {
+            eprintln!(
+                "[Agent {}] seeded native skill tool activations from history: count={}",
+                self.id, seeded
+            );
+        }
     }
 
     ///
@@ -4330,6 +4872,18 @@ impl AgentInstance {
         }
 
         if has_working_dir {
+            if let Some(extra_workdirs_block) =
+                crate::extra_workdirs::build_env_prompt_block(&self.working_dir)
+            {
+                env.push_str("\n\n");
+                env.push_str(&extra_workdirs_block);
+            }
+        }
+
+        // Native renderers withdraw the env manifest: the deferred catalog
+        // rides on the tool declarations themselves (tool_load description /
+        // tool_search declaration), removing this system-prompt wobble source.
+        if has_working_dir && !self.cached_lazy_tool_renderer().is_native() {
             if let Some(lazy_tool_manifest) = self.lazy_tool_manifest_prompt().await {
                 env.push_str("\n\n");
                 env.push_str(&lazy_tool_manifest);
@@ -5667,6 +6221,7 @@ impl AgentInstance {
         system_parts: &[&str],
         messages: &[crate::session::models::ChatMessage],
         api_tools: &[serde_json::Value],
+        tool_search_description: Option<&str>,
         on_text_delta: impl Fn(String) + Send + Sync + 'static,
         on_thinking_delta: impl Fn(String) + Send + Sync + 'static,
         on_tool_call_start: impl Fn(String, String) + Send + Sync + 'static,
@@ -5775,6 +6330,7 @@ impl AgentInstance {
                     &system_prompt,
                     messages,
                     api_tools,
+                    tool_search_description,
                     self.effort.as_deref(),
                     self.codex_fast_mode,
                     self.debug,
@@ -5804,6 +6360,7 @@ impl AgentInstance {
                             &system_prompt,
                             messages,
                             api_tools,
+                            tool_search_description,
                             self.effort.as_deref(),
                             self.codex_fast_mode,
                             self.debug,
@@ -5845,6 +6402,7 @@ impl AgentInstance {
                 supported_reasoning_efforts,
                 reasoning_param_format,
                 replay_reasoning_content,
+                reasoning_replay_field,
                 server_tools,
                 supports_vision,
                 ..
@@ -5872,6 +6430,15 @@ impl AgentInstance {
                         )
                         .then_some(self.effort.as_deref())
                         .flatten();
+                        let thinking_toggle = match reasoning_param_format {
+                            CustomReasoningParamFormat::OpenaiChatEnableThinking => {
+                                Some(chat_completions::ThinkingToggle::EnableThinking)
+                            }
+                            CustomReasoningParamFormat::OpenaiChatThinkingType => {
+                                Some(chat_completions::ThinkingToggle::ThinkingType)
+                            }
+                            _ => None,
+                        };
                         let resp = chat_completions::stream_chat(
                             api_key,
                             api_model,
@@ -5879,9 +6446,13 @@ impl AgentInstance {
                             messages,
                             api_tools,
                             endpoint.as_str(),
-                            reasoning_effort,
-                            thinking_level,
-                            *replay_reasoning_content,
+                            chat_completions::CustomChatTuning {
+                                reasoning_effort,
+                                thinking_level,
+                                replay_reasoning_content: *replay_reasoning_content,
+                                reasoning_replay_field: *reasoning_replay_field,
+                                thinking_toggle,
+                            },
                             self.debug,
                             on_text_delta,
                             on_thinking_delta,
@@ -6070,6 +6641,7 @@ impl AgentInstance {
                 &system_prompt,
                 messages,
                 &[],
+                None,
                 self.effort.as_deref(),
                 self.debug,
                 None,
@@ -6100,6 +6672,7 @@ impl AgentInstance {
                         &system_prompt,
                         messages,
                         &[],
+                        None,
                         self.effort.as_deref(),
                         self.debug,
                         None,
@@ -6139,6 +6712,7 @@ impl AgentInstance {
             system_parts,
             messages,
             &[],
+            None,
             |_| {},
             |_| {},
             |_, _| {},
@@ -6890,9 +7464,55 @@ impl AgentInstance {
         ))
     }
 
+    /// Substitute Claude Code command-argument placeholders in skill content:
+    /// `$ARGUMENTS` receives the full argument text, `$1`..`$9` the
+    /// whitespace-separated positional arguments (missing positions become
+    /// empty). Single pass — substituted values are never re-scanned, so
+    /// argument text containing `$2` cannot cascade. When the content uses no
+    /// placeholder but arguments were provided, an `ARGUMENTS:` line is
+    /// appended (Claude Code convention).
+    fn substitute_skill_argument_placeholders(content: &str, raw_arguments: &str) -> String {
+        let arguments = raw_arguments.trim();
+        let positional: Vec<&str> = arguments.split_whitespace().collect();
+        let mut output = String::with_capacity(content.len() + arguments.len());
+        let mut rest = content;
+        let mut replaced_any = false;
+        while let Some(pos) = rest.find('$') {
+            let (before, after) = rest.split_at(pos);
+            output.push_str(before);
+            if let Some(tail) = after.strip_prefix("$ARGUMENTS") {
+                output.push_str(arguments);
+                replaced_any = true;
+                rest = tail;
+                continue;
+            }
+            let mut chars = after.chars();
+            chars.next();
+            match chars.next() {
+                Some(digit @ '1'..='9') => {
+                    let index = digit as usize - '1' as usize;
+                    output.push_str(positional.get(index).copied().unwrap_or(""));
+                    replaced_any = true;
+                    rest = chars.as_str();
+                }
+                _ => {
+                    output.push('$');
+                    rest = &after[1..];
+                }
+            }
+        }
+        output.push_str(rest);
+        if !replaced_any && !arguments.is_empty() {
+            output.push_str("\n\nARGUMENTS: ");
+            output.push_str(arguments);
+        }
+        output
+    }
+
     fn build_selected_skill_reminder(
         &self,
         intent: &crate::session::models::UserIntentPayload,
+        user_text: &str,
     ) -> String {
         let mut blocks = Vec::new();
         let skills = crate::commands::list_skills_sync(
@@ -6916,6 +7536,18 @@ impl AgentInstance {
                     Self::resolve_selected_skill_reminder_path(&skills, app_knowledge_dir, skill),
                 )
             };
+            // External skills keep their bundled files (references/, scripts/)
+            // on disk outside the workspace; the model reaches them through
+            // this absolute root, not through knowledge paths.
+            let origin_root = manifest
+                .and_then(|manifest| manifest.origin_path.as_deref())
+                .map(|origin| {
+                    format!(
+                        "\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
+                        origin.replace('\n', " ").trim()
+                    )
+                })
+                .unwrap_or_default();
 
             let content_result = crate::commands::read_skill_manifest_sync(
                 &self.working_dir,
@@ -6923,18 +7555,32 @@ impl AgentInstance {
                 dir_name,
                 Some(source),
             );
+            // Claude Code style skills template their command arguments via
+            // $ARGUMENTS / $1..$9; the command token itself is stripped by the
+            // composer, so the remaining message text is the argument string.
+            let is_external = manifest
+                .map(|manifest| manifest.kind == crate::commands::SkillManifestKind::External)
+                .unwrap_or(false);
             let escaped_name = skill.name.replace('\n', " ").trim().to_string();
             let escaped_source = source.replace('\n', " ").trim().to_string();
             let escaped_path = rel_path.replace('\n', " ").trim().to_string();
 
             match content_result {
-                Ok(content) => blocks.push(format!(
-                    "<selected-skill>\nName: {}\nSource: {}\nPath: {}\n\n{}\n</selected-skill>",
+                Ok(content) => {
+                    let content = if is_external {
+                        Self::substitute_skill_argument_placeholders(&content, user_text)
+                    } else {
+                        content
+                    };
+                    blocks.push(format!(
+                    "<selected-skill>\nName: {}\nSource: {}\nPath: {}{}\n\n{}\n</selected-skill>",
                     escaped_name,
                     escaped_source,
                     escaped_path,
+                    origin_root,
                     content.trim()
-                )),
+                    ))
+                }
                 Err(error) => blocks.push(format!(
                     "<selected-skill-error>\nName: {}\nSource: {}\nPath: {}\nError: {}\n</selected-skill-error>",
                     escaped_name,
@@ -7109,10 +7755,11 @@ impl AgentInstance {
         app_handle: &AppHandle,
         store: &SessionStore,
         user_intent: Option<&crate::session::models::UserIntentPayload>,
+        user_text: &str,
     ) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(intent) = user_intent {
-            let skill_reminder = self.build_selected_skill_reminder(intent);
+            let skill_reminder = self.build_selected_skill_reminder(intent, user_text);
             if !skill_reminder.is_empty() {
                 parts.push(skill_reminder);
             }
@@ -7200,8 +7847,12 @@ impl AgentInstance {
                 // A queued /plan message entering an active run must flip
                 // enforcement before its reminder is rendered.
                 self.maybe_enter_plan_mode(app_handle, store, run_id, &effective_mode)?;
-                let user_prompt_suffix =
-                    self.build_user_prompt_suffix(app_handle, store, input.user_intent.as_ref());
+                let user_prompt_suffix = self.build_user_prompt_suffix(
+                    app_handle,
+                    store,
+                    input.user_intent.as_ref(),
+                    &input.text,
+                );
                 let first_user_message_id = store.first_user_message_id(&self.session_id)?;
                 let current_prompt_prefix = if first_user_message_id.is_none() {
                     env_prompt_prefix
@@ -7546,11 +8197,24 @@ impl AgentInstance {
         });
 
         let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
+        let lazy_tool_renderer = self.refresh_lazy_tool_renderer(
+            dynamic_tool_loading_mode,
+            Self::anthropic_native_lazy_enabled_from_app_handle(app_handle),
+        );
         if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             self.seed_loaded_tools_from_history(&messages).await;
         }
+        // Native renderers keep skill activations for the whole session
+        // (deferred definitions may only grow — a reference in history whose
+        // declaration disappears would dangle), so the per-run reset is
+        // replaced by a deterministic rebuild from history.
         self.clear_document_skill_tool_names();
+        if lazy_tool_renderer.is_native() {
+            let messages = store.get_messages_for_prompt(&self.session_id)?;
+            self.seed_native_skill_activations_from_history(lazy_tool_renderer, &messages)
+                .await;
+        }
         let selected_skill_tool_names = self.selected_skill_tool_names(user_intent.as_ref());
         if !selected_skill_tool_names.is_empty() {
             eprintln!(
@@ -7577,16 +8241,18 @@ impl AgentInstance {
             let ctx_limit = self.context_limit();
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
-            let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
-            let request_tools = self
-                .build_request_tool_names_for_mode_and_skills(
+            let prepared_tools = self
+                .prepare_request_tools(
+                    lazy_tool_renderer,
                     dynamic_tool_loading_mode,
-                    &active_skill_tool_names,
+                    &selected_skill_tool_names,
                 )
                 .await;
-            let api_tools = self.build_api_tools(&request_tools).await;
-            let estimated_input_tokens =
-                compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
+            let estimated_input_tokens = compact::estimate_request_tokens(
+                &system_parts,
+                &prepared_messages,
+                &prepared_tools.api_tools,
+            );
             let compacted = self
                 .execute_auto_compact(
                     app_handle,
@@ -7742,8 +8408,10 @@ impl AgentInstance {
 
         let persist_user_message_started_at = Instant::now();
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
+        // The raw composer text (not actual_user_text, which may carry an
+        // editor-state prefix) is the argument string for skill placeholders.
         let user_prompt_suffix =
-            self.build_user_prompt_suffix(app_handle, store, user_intent.as_ref());
+            self.build_user_prompt_suffix(app_handle, store, user_intent.as_ref(), user_text);
         let first_user_message_id = store.first_user_message_id(&self.session_id)?;
         let current_prompt_prefix = if first_user_message_id.is_none() {
             env_prompt_prefix.as_deref()
@@ -7832,23 +8500,24 @@ impl AgentInstance {
 
         // Filter tools based on gating config
         let api_tools_started_at = Instant::now();
-        let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
-        let request_tools = self
-            .build_request_tool_names_for_mode_and_skills(
+        let prepared_tools = self
+            .prepare_request_tools(
+                lazy_tool_renderer,
                 dynamic_tool_loading_mode,
-                &active_skill_tool_names,
+                &selected_skill_tool_names,
             )
             .await;
-        let api_tools = self.build_api_tools(&request_tools).await;
         eprintln!(
-            "[Agent {}] api tools ready: session={} run={} elapsed_ms={} lazy_strategy=tool_load_fallback dynamic_tool_loading_mode={:?} request_tools={} api_tools={}",
+            "[Agent {}] api tools ready: session={} run={} elapsed_ms={} lazy_strategy={} dynamic_tool_loading_mode={:?} request_tools={} deferred_tools={} api_tools={}",
             self.id,
             self.session_id,
             run_id,
             api_tools_started_at.elapsed().as_millis(),
+            lazy_tool_renderer.strategy_label(),
             dynamic_tool_loading_mode,
-            request_tools.len(),
-            api_tools.len()
+            prepared_tools.request_tool_names.len(),
+            prepared_tools.deferred_count,
+            prepared_tools.api_tools.len()
         );
 
         let backend_name = match &self.backend {
@@ -7945,13 +8614,15 @@ impl AgentInstance {
             let ctx_limit = self.context_limit();
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
-            let request_tools = self
-                .build_request_tool_names_for_mode_and_skills(
+            let prepared_tools = self
+                .prepare_request_tools(
+                    lazy_tool_renderer,
                     dynamic_tool_loading_mode,
-                    &active_skill_tool_names,
+                    &selected_skill_tool_names,
                 )
                 .await;
-            let api_tools = self.build_api_tools(&request_tools).await;
+            let api_tools = prepared_tools.api_tools;
+            let tool_search_description = prepared_tools.tool_search_description;
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
             // Real usage recorded for the session (API-reported during normal
@@ -8133,6 +8804,7 @@ impl AgentInstance {
                         &system_parts,
                         &prepared_messages,
                         &api_tools,
+                        tool_search_description.as_deref(),
                         move |delta| {
                             emitted_output_for_text.store(true, Ordering::Relaxed);
                             let mark = render_order_for_text
@@ -10227,12 +10899,41 @@ impl AgentInstance {
         if tc.name == "tool_load" {
             let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
             return ExecutedToolResult::from_tool_result(
-                self.execute_tool_load_with_mode_and_skills(
-                    args,
-                    dynamic_mode,
-                    active_skill_tool_names,
-                )
-                .await,
+                match self.cached_lazy_tool_renderer() {
+                    LazyToolRenderer::AnthropicNative => {
+                        self.execute_tool_load_native(args, active_skill_tool_names)
+                            .await
+                    }
+                    // tool_load is not declared on the codex-native path; a
+                    // stray call (history habit) gets the schema-text answer
+                    // with direct-call guidance. The loaded-set side effect is
+                    // inert here — native assembly never reads it.
+                    LazyToolRenderer::CodexNative => {
+                        self.execute_tool_load_with_mode_and_skills(
+                            args,
+                            crate::config::DynamicToolLoadingMode::Direct,
+                            active_skill_tool_names,
+                        )
+                        .await
+                    }
+                    LazyToolRenderer::ToolLoadFallback => {
+                        self.execute_tool_load_with_mode_and_skills(
+                            args,
+                            dynamic_mode,
+                            active_skill_tool_names,
+                        )
+                        .await
+                    }
+                },
+            );
+        }
+
+        if tc.name == CODEX_TOOL_SEARCH_TOOL_NAME
+            && self.cached_lazy_tool_renderer() == LazyToolRenderer::CodexNative
+        {
+            return ExecutedToolResult::from_tool_result(
+                self.execute_codex_tool_search(args, active_skill_tool_names)
+                    .await,
             );
         }
 
@@ -10540,6 +11241,214 @@ impl AgentInstance {
         let active_skill_tool_names = HashSet::new();
         self.execute_tool_load_with_mode_and_skills(args, dynamic_mode, &active_skill_tool_names)
             .await
+    }
+
+    /// Native-renderer `tool_load`: no schema text — the definitions are
+    /// already declared (deferred) in the request, so the result carries a
+    /// tool-reference marker instead and the API expands the full schemas
+    /// in place. Statuses stay for unknown/not-allowed feedback.
+    async fn execute_tool_load_native(
+        &self,
+        args: &serde_json::Value,
+        active_skill_tool_names: &HashSet<String>,
+    ) -> ToolResult {
+        let allowed = self
+            .allowed_tool_set_for_active_skills(active_skill_tool_names)
+            .await;
+        let requested = Self::requested_tool_load_names(args);
+
+        if requested.is_empty() {
+            return ToolResult {
+                output: "Error: tool_load requires a non-empty tools array.".to_string(),
+                is_error: true,
+            };
+        }
+
+        let direct_overrides = self.tool_direct_load_overrides();
+        let mut available = Vec::new();
+        let mut referenced = Vec::new();
+        let mut problems = Vec::new();
+        for requested_name in requested {
+            let Some(canonical) = self.canonical_tool_name(&requested_name) else {
+                problems.push(format!("- `{}`: unknown tool", requested_name));
+                continue;
+            };
+            if Self::is_meta_tool(&canonical) || !allowed.contains(&canonical) {
+                problems.push(format!("- `{}`: not allowed for this agent", canonical));
+                continue;
+            }
+            let configured_load_mode =
+                self.configured_tool_load_mode(&canonical, &direct_overrides);
+            if configured_load_mode != ToolLoadMode::Direct {
+                push_unique_tool_name(&mut referenced, &canonical);
+            }
+            // Skill tools are declared incrementally: loading one through
+            // tool_load activates it so the next request carries its deferred
+            // definition and the reference resolves.
+            if configured_load_mode == ToolLoadMode::Skill {
+                self.activate_document_skill_tool_names(std::slice::from_ref(&canonical));
+            }
+            push_unique_tool_name(&mut available, &canonical);
+        }
+
+        let mut output = if available.is_empty() {
+            "No requested tools are available.".to_string()
+        } else {
+            format!(
+                "The following tools are now directly callable (full schemas expand automatically): {}",
+                available
+                    .iter()
+                    .map(|name| format!("`{}`", name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        if !problems.is_empty() {
+            output.push_str("\n\nSkipped:\n");
+            output.push_str(&problems.join("\n"));
+        }
+        crate::llm::tool_references::append_tool_reference_marker(&mut output, &referenced);
+
+        eprintln!(
+            "[Agent {}] tool_load native: available={} referenced={} problems={}",
+            self.id,
+            available.len(),
+            referenced.len(),
+            problems.len()
+        );
+
+        ToolResult {
+            output,
+            is_error: false,
+        }
+    }
+
+    /// Names searchable through the codex `tool_search` round: allowed Lazy
+    /// tools plus every skill tool the registry knows (activation happens on
+    /// hit, so an unactivated skill tool is still discoverable).
+    async fn codex_tool_search_universe(&self) -> Vec<String> {
+        let allowed = self.allowed_tool_set().await;
+        let direct_overrides = self.tool_direct_load_overrides();
+        let mut names: Vec<String> = Vec::new();
+        for name in &allowed {
+            if Self::is_meta_tool(name) {
+                continue;
+            }
+            if self.configured_tool_load_mode(name, &direct_overrides) == ToolLoadMode::Lazy {
+                push_unique_tool_name(&mut names, name);
+            }
+        }
+        for name in self.tool_registry.skill_tool_names() {
+            let Some(canonical) = self.canonical_tool_name(&name) else {
+                continue;
+            };
+            if Self::is_meta_tool(&canonical) {
+                continue;
+            }
+            push_unique_tool_name(&mut names, &canonical);
+        }
+        crate::tool::sort_tool_names_by_priority(&mut names);
+        names
+    }
+
+    /// Client-side handler for the codex-native `tool_search` round.
+    /// Substring scoring over name + description; matched Skill tools are
+    /// activated (session-scoped) so their subsequent direct calls pass the
+    /// allowed-tool gate. The result JSON is replayed verbatim as the
+    /// `tool_search_output` wire item.
+    async fn execute_codex_tool_search(
+        &self,
+        args: &serde_json::Value,
+        _active_skill_tool_names: &HashSet<String>,
+    ) -> ToolResult {
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return ToolResult {
+                output: "query must not be empty".to_string(),
+                is_error: true,
+            };
+        }
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .filter(|value| *value > 0)
+            .unwrap_or(CODEX_TOOL_SEARCH_DEFAULT_LIMIT);
+
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|token| token.to_ascii_lowercase())
+            .filter(|token| !token.is_empty())
+            .collect();
+
+        let mut scored: Vec<(i64, String, serde_json::Value)> = Vec::new();
+        for name in self.codex_tool_search_universe().await {
+            let Some(tool) = self.resolve_api_tool(&name) else {
+                continue;
+            };
+            let tool = self.contextualize_api_tool(tool);
+            let description = tool
+                .get("function")
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            let name_lower = name.to_ascii_lowercase();
+            let description_lower = description.to_ascii_lowercase();
+
+            let mut score = 0i64;
+            for token in &tokens {
+                if name_lower == *token {
+                    score += 8;
+                } else if name_lower.contains(token) {
+                    score += 3;
+                }
+                if description_lower.contains(token) {
+                    score += 1;
+                }
+            }
+            if score > 0 {
+                scored.push((score, name, tool));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.truncate(limit);
+
+        let mut activated = Vec::new();
+        let mut tools_json = Vec::new();
+        for (_score, name, tool) in scored {
+            if self.default_tool_load_mode(&name) == ToolLoadMode::Skill {
+                activated.push(name.clone());
+            }
+            let function = tool.get("function").cloned().unwrap_or_default();
+            tools_json.push(serde_json::json!({
+                "type": "function",
+                "name": function.get("name").cloned().unwrap_or(serde_json::json!(name)),
+                "description": function.get("description").cloned().unwrap_or(serde_json::json!("")),
+                "parameters": function.get("parameters").cloned().unwrap_or(serde_json::json!({})),
+                "defer_loading": true,
+            }));
+        }
+        if !activated.is_empty() {
+            self.activate_document_skill_tool_names(&activated);
+        }
+
+        eprintln!(
+            "[Agent {}] tool_search: query_len={} matches={} activated_skill_tools={}",
+            self.id,
+            query.len(),
+            tools_json.len(),
+            activated.len()
+        );
+
+        ToolResult {
+            output: serde_json::json!({ "tools": tools_json }).to_string(),
+            is_error: false,
+        }
     }
 
     async fn execute_tool_load_with_mode_and_skills(
@@ -11192,13 +12101,31 @@ impl AgentInstance {
             request.clone(),
         ) {
             Ok(mut result) => {
-                let activated_tools = result
+                let document_tool_names: Vec<String> = result
                     .document
                     .as_ref()
-                    .map(|document| {
-                        self.activate_document_skill_tool_names(&document.document.tools)
-                    })
+                    .map(|document| document.document.tools.clone())
                     .unwrap_or_default();
+                let activated_tools =
+                    self.activate_document_skill_tool_names(&document_tool_names);
+                // Reference every tool the document declares (not just the
+                // newly activated ones): after a compact or restart the model
+                // may re-read the document, and the references must re-expand
+                // the schemas even though the activation set already knows
+                // them.
+                let referenced_tools: Vec<String> = {
+                    let mut names = Vec::new();
+                    for name in &document_tool_names {
+                        let Some(canonical) = self.canonical_tool_name(name) else {
+                            continue;
+                        };
+                        if Self::is_meta_tool(&canonical) {
+                            continue;
+                        }
+                        push_unique_tool_name(&mut names, &canonical);
+                    }
+                    names
+                };
                 Self::prefix_knowledge_read_response_paths(&mut result);
                 let sanitized = match Self::sanitize_knowledge_read_response(result) {
                     Ok(value) => value,
@@ -11210,6 +12137,21 @@ impl AgentInstance {
                     }
                 };
                 let mut output = Self::format_knowledge_read_output(&sanitized);
+                // External skills keep their bundled files (references/,
+                // scripts/) on disk outside the workspace; without this
+                // anchor the model has no way to resolve the relative paths
+                // the document mentions.
+                if let Some(origin_root) =
+                    crate::commands::external_skill_origin_root_for_virtual_path(
+                        &self.working_dir,
+                        &parsed.path,
+                    )
+                {
+                    output.push_str(&format!(
+                        "\n\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
+                        origin_root
+                    ));
+                }
                 let include_runtime_annotations = sanitized.part == "full";
 
                 let compile_note = match self
@@ -11249,6 +12191,22 @@ impl AgentInstance {
                         output.push_str("Loaded Skill document tools for the next step: ");
                         output.push_str(&activated_tools.join(", "));
                     }
+                }
+                match self.cached_lazy_tool_renderer() {
+                    LazyToolRenderer::AnthropicNative => {
+                        crate::llm::tool_references::append_tool_reference_marker(
+                            &mut output,
+                            &referenced_tools,
+                        );
+                    }
+                    LazyToolRenderer::CodexNative if !referenced_tools.is_empty() => {
+                        output.push_str(&format!(
+                            "\n\nThe Skill tools above are deferred. Call `{}` with a matching query to load their schemas before use: {}",
+                            CODEX_TOOL_SEARCH_TOOL_NAME,
+                            referenced_tools.join(", ")
+                        ));
+                    }
+                    _ => {}
                 }
                 ExecutedToolResult::from_tool_result(ToolResult {
                     output,
@@ -11616,6 +12574,7 @@ impl AgentInstance {
         let kind = match skill.kind {
             crate::commands::SkillManifestKind::Document => "document",
             crate::commands::SkillManifestKind::Package => "package",
+            crate::commands::SkillManifestKind::External => "external",
         };
         let command = if skill.command_trigger.trim().is_empty() {
             "<none>"
@@ -11652,6 +12611,19 @@ impl AgentInstance {
             ) {
                 output.push_str("\npackageRoot=");
                 output.push_str(&root.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        if skill.kind == crate::commands::SkillManifestKind::External {
+            if let Some(origin) = skill
+                .origin_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                output.push_str(&format!(
+                    "\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
+                    origin
+                ));
             }
         }
         output
@@ -14949,9 +15921,9 @@ mod tests {
         build_structure_section, compact_trigger, finalize_tool_call_record, render_tree_lines,
         utf8_prefix_chars, AgentInstance, AgentKnowledgeDocumentContent,
         AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
-        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ExecutedToolResult,
-        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, ParentToolCall,
-        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult,
+        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer,
+        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
         REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
@@ -15680,6 +16652,63 @@ PrefabInstance:
         .is_none());
     }
 
+    #[test]
+    fn workspace_scoped_fs_tools_allow_attached_extra_workdirs_when_boundary_is_enabled() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let attached = root.path().join("attached");
+        let unattached = root.path().join("unattached");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&attached).expect("create attached");
+        std::fs::create_dir_all(&unattached).expect("create unattached");
+
+        let attached_file = attached.join("doc.md");
+        std::fs::write(&attached_file, "ok").expect("write attached file");
+
+        let workspace_str = workspace.to_string_lossy().to_string();
+        crate::extra_workdirs::save_entries(
+            &workspace_str,
+            &[crate::extra_workdirs::ExtraWorkdirEntry {
+                path: attached.to_string_lossy().to_string(),
+                comment: "art sources".to_string(),
+            }],
+        )
+        .expect("save extra workdirs");
+
+        // The env prompt authorizes attached directories as project scope;
+        // the boundary honors them for read/write/list alike.
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "read",
+            &json!({"filePath":attached_file.to_string_lossy().to_string()}),
+            true
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "write",
+            &json!({"filePath":attached.join("nested/new.txt").to_string_lossy().to_string(),"content":"ok"}),
+            true
+        )
+        .is_none());
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "list",
+            &json!({"path":attached.to_string_lossy().to_string()}),
+            true
+        )
+        .is_none());
+
+        // Directories that are not attached stay rejected.
+        assert!(AgentInstance::validate_tool_path_requirements(
+            &workspace_str,
+            "read",
+            &json!({"filePath":unattached.join("doc.md").to_string_lossy().to_string()}),
+            true
+        )
+        .is_some());
+    }
+
     #[cfg(windows)]
     #[test]
     fn workspace_scoped_fs_tools_reject_drive_relative_paths() {
@@ -16113,6 +17142,315 @@ PrefabInstance:
         );
     }
 
+    fn native_plan_test_instance(temp: &tempfile::TempDir) -> AgentInstance {
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec![
+                    "read".to_string(),
+                    "edit".to_string(),
+                    "web_fetch".to_string(),
+                    "unity_run_states".to_string(),
+                    "skill_list".to_string(),
+                ],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            temp.path().to_string_lossy().to_string(),
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        )
+    }
+
+    #[test]
+    fn anthropic_endpoint_lazy_switch_gates_native_renderer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut instance = native_plan_test_instance(&temp);
+        instance.backend = crate::agent::instance::LlmBackend::Anthropic {
+            access_token: "token".to_string(),
+            base_url: Some("https://gateway.example.com".to_string()),
+            user_metadata: crate::auth::ClaudeCodeUserMetadata {
+                device_id: "device".to_string(),
+                account_uuid: "account".to_string(),
+            },
+        };
+        instance.effective_model = "claude-opus-4-8".to_string();
+
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                true
+            ),
+            LazyToolRenderer::AnthropicNative
+        );
+        // Endpoint opted out: the run degrades to the fallback renderer
+        // instead of paying a 400 + eager retry on every request.
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                false
+            ),
+            LazyToolRenderer::ToolLoadFallback
+        );
+        // The switch only concerns the Anthropic endpoint: outside Native
+        // mode it changes nothing.
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::MetaTool,
+                true
+            ),
+            LazyToolRenderer::ToolLoadFallback
+        );
+    }
+
+    #[test]
+    fn anthropic_native_lazy_model_gate_matrix() {
+        for supported in [
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4.5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "anthropic/claude-opus-4-8",
+        ] {
+            assert!(
+                AgentInstance::anthropic_model_supports_native_lazy(supported),
+                "expected support: {supported}"
+            );
+        }
+        for unsupported in [
+            "claude-opus-4-1",
+            "claude-3-5-sonnet-20241022",
+            "claude-instant-1.2",
+            "claude-2.1",
+        ] {
+            assert!(
+                !AgentInstance::anthropic_model_supports_native_lazy(unsupported),
+                "expected no support: {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_tool_search_gate_matrix() {
+        for supported in [
+            "gpt-5.2",
+            "gpt-5.4-mini",
+            "gpt-5.6-sol",
+            "openai/gpt-5.5",
+            "gpt-6",
+            "codex-auto-review",
+        ] {
+            assert!(
+                AgentInstance::codex_model_supports_tool_search(supported),
+                "expected support: {supported}"
+            );
+        }
+        for unsupported in ["gpt-5.1", "gpt-5", "gpt-4.1", "o3", "codex-mini-latest"] {
+            assert!(
+                !AgentInstance::codex_model_supports_tool_search(unsupported),
+                "expected no support: {unsupported}"
+            );
+        }
+
+        assert!(AgentInstance::codex_backend_supports_tool_search(None));
+        assert!(AgentInstance::codex_backend_supports_tool_search(Some(
+            "https://chatgpt.com/backend-api/codex"
+        )));
+        assert!(!AgentInstance::codex_backend_supports_tool_search(Some(
+            "https://api.openai.com/v1"
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_plan_splits_direct_and_deferred_and_drops_meta_proxy() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::AnthropicNative, &HashSet::new())
+            .await;
+
+        assert!(plan.direct.contains(&"tool_load".to_string()));
+        assert!(plan.direct.contains(&"read".to_string()));
+        assert!(plan.direct.contains(&"edit".to_string()));
+        assert!(!plan.direct.contains(&"tool_call".to_string()));
+        assert!(plan.deferred.contains(&"web_fetch".to_string()));
+        assert!(plan.deferred.contains(&"unity_run_states".to_string()));
+        // Skill-mode tools stay undeclared until activation.
+        assert!(!plan.all_names().contains(&"skill_list".to_string()));
+
+        // Codex path replaces tool_load with the protocol declaration.
+        let codex_plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::CodexNative, &HashSet::new())
+            .await;
+        assert!(!codex_plan.direct.contains(&"tool_load".to_string()));
+        assert!(!codex_plan.direct.contains(&"tool_call".to_string()));
+    }
+
+    #[tokio::test]
+    async fn native_plan_declares_activated_skill_tools_deferred() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        instance.activate_document_skill_tool_names(&["skill_list".to_string()]);
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::AnthropicNative, &HashSet::new())
+            .await;
+
+        assert!(plan.deferred.contains(&"skill_list".to_string()));
+        assert!(!plan.direct.contains(&"skill_list".to_string()));
+    }
+
+    #[tokio::test]
+    async fn native_api_tools_mark_deferred_and_embed_tool_load_manifest() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::AnthropicNative, &HashSet::new())
+            .await;
+        let api_tools = instance
+            .build_api_tools_for_plan(LazyToolRenderer::AnthropicNative, &plan)
+            .await;
+
+        let tool_name = |tool: &serde_json::Value| {
+            tool["function"]["name"].as_str().unwrap_or_default().to_string()
+        };
+        let deferred_flag = |tool: &serde_json::Value| {
+            tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true)
+        };
+
+        let tool_load = api_tools
+            .iter()
+            .find(|tool| tool_name(tool) == "tool_load")
+            .expect("tool_load declared");
+        let description = tool_load["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("## Deferred tools"));
+        assert!(description.contains("`web_fetch`"));
+        assert!(!deferred_flag(tool_load));
+
+        let web_fetch = api_tools
+            .iter()
+            .find(|tool| tool_name(tool) == "web_fetch")
+            .expect("web_fetch declared");
+        assert!(deferred_flag(web_fetch));
+        let read = api_tools
+            .iter()
+            .find(|tool| tool_name(tool) == "read")
+            .expect("read declared");
+        assert!(!deferred_flag(read));
+
+        // Eager tools precede deferred ones so the serializer breakpoint
+        // stays on the eager section.
+        let first_deferred = api_tools.iter().position(deferred_flag).expect("deferred present");
+        assert!(api_tools[..first_deferred].iter().all(|tool| !deferred_flag(tool)));
+        assert!(api_tools[first_deferred..].iter().all(deferred_flag));
+
+        // Codex renderer keeps deferred definitions client-side entirely.
+        let codex_tools = instance
+            .build_api_tools_for_plan(LazyToolRenderer::CodexNative, &plan)
+            .await;
+        assert!(codex_tools.iter().all(|tool| !deferred_flag(tool)));
+        assert!(codex_tools.iter().all(|tool| tool_name(tool) != "web_fetch"));
+    }
+
+    #[tokio::test]
+    async fn native_tool_load_returns_reference_marker_and_activates_skill_tools() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let result = instance
+            .execute_tool_load_native(
+                &serde_json::json!({ "tools": ["web_fetch", "skill_list", "nonexistent_tool"] }),
+                &HashSet::new(),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        let (_text, references) =
+            crate::llm::tool_references::split_tool_reference_marker(&result.output);
+        assert!(references.contains(&"web_fetch".to_string()));
+        assert!(references.contains(&"skill_list".to_string()));
+        assert!(result.output.contains("nonexistent_tool"));
+
+        // Skill tool activation makes the next request declare it deferred.
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::AnthropicNative, &HashSet::new())
+            .await;
+        assert!(plan.deferred.contains(&"skill_list".to_string()));
+    }
+
+    #[tokio::test]
+    async fn native_seed_rebuilds_skill_activations_from_history_markers() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let mut output = "loaded".to_string();
+        crate::llm::tool_references::append_tool_reference_marker(
+            &mut output,
+            &["skill_list".to_string(), "web_fetch".to_string()],
+        );
+        let history = vec![ChatMessage {
+            id: "tool-1".to_string(),
+            role: crate::session::models::MessageRole::Tool,
+            content: output,
+            created_at: 0,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: Some("toolu_1".to_string()),
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        }];
+
+        instance
+            .seed_native_skill_activations_from_history(
+                LazyToolRenderer::AnthropicNative,
+                &history,
+            )
+            .await;
+
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::AnthropicNative, &HashSet::new())
+            .await;
+        // Skill-mode tool re-activated from the marker; the Lazy tool needs
+        // no seeding (always declared deferred).
+        assert!(plan.deferred.contains(&"skill_list".to_string()));
+        assert!(plan.deferred.contains(&"web_fetch".to_string()));
+    }
+
     #[tokio::test]
     async fn openai_chat_custom_backend_uses_meta_tool_lazy_loading_without_manual_config() {
         let temp = tempdir().expect("temp dir");
@@ -16158,6 +17496,7 @@ PrefabInstance:
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort,
                 replay_reasoning_content: true,
+                reasoning_replay_field: None,
                 server_tools: crate::commands::CustomEndpointServerTools::default(),
                 supports_vision: true,
             },
@@ -16257,6 +17596,7 @@ PrefabInstance:
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
                 replay_reasoning_content: true,
+                reasoning_replay_field: None,
                 server_tools: crate::commands::CustomEndpointServerTools::default(),
                 supports_vision: true,
             },
@@ -16338,6 +17678,7 @@ PrefabInstance:
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
                 replay_reasoning_content: true,
+                reasoning_replay_field: None,
                 server_tools: crate::commands::CustomEndpointServerTools::default(),
                 supports_vision: true,
             },
@@ -16842,7 +18183,7 @@ Use profiler helpers.
             client_message_id: None,
         };
 
-        let reminder = agent.build_selected_skill_reminder(&intent);
+        let reminder = agent.build_selected_skill_reminder(&intent, "");
 
         assert!(
             reminder.contains("Path: skill/builtin/profiler.md"),
@@ -16856,6 +18197,44 @@ Use profiler helpers.
             "{}",
             reminder
         );
+        // Non-external skills never get placeholder substitution: literal
+        // occurrences in the document survive even when arguments exist.
+        let intent_with_placeholder_doc = intent.clone();
+        let reminder_with_args =
+            agent.build_selected_skill_reminder(&intent_with_placeholder_doc, "some args");
+        assert!(
+            !reminder_with_args.contains("ARGUMENTS: some args"),
+            "{}",
+            reminder_with_args
+        );
+    }
+
+    #[test]
+    fn skill_argument_placeholder_substitution_matches_claude_code_semantics() {
+        let substitute = AgentInstance::substitute_skill_argument_placeholders;
+
+        // $ARGUMENTS receives the full text; $1..$9 the positional parts.
+        assert_eq!(
+            substitute("Review: $ARGUMENTS", "plans/a.md quickly"),
+            "Review: plans/a.md quickly"
+        );
+        assert_eq!(
+            substitute("First=$1 Second=$2 Missing=$3.", "alpha beta"),
+            "First=alpha Second=beta Missing=."
+        );
+        // Substituted values are never re-scanned.
+        assert_eq!(substitute("X: $1", "$2 tail"), "X: $2");
+        // Non-placeholder dollars survive ($0, $x, trailing $).
+        assert_eq!(substitute("costs $0 or $x or $", ""), "costs $0 or $x or $");
+        // No placeholders + arguments => appended ARGUMENTS line.
+        assert_eq!(
+            substitute("Plain body.", "extra input"),
+            "Plain body.\n\nARGUMENTS: extra input"
+        );
+        // No placeholders + no arguments => untouched.
+        assert_eq!(substitute("Plain body.", "  "), "Plain body.");
+        // Placeholders + no arguments => cleared, no append.
+        assert_eq!(substitute("Run $ARGUMENTS now", ""), "Run  now");
     }
 
     #[tokio::test]
@@ -17845,7 +19224,9 @@ Search, install, audit, and export a plugin.
                 explicit_maintenance_rules: false,
                 external_source: None,
                 skill_enabled: Some(true),
-                skill_surface: None,
+                // Structure lines require the auto surface since the recall
+                // gate unified: command-only skills stay out of the tree.
+                skill_surface: Some(crate::knowledge_store::SkillSurface::Both),
                 command_trigger: Some("/create-skill".to_string()),
                 argument_hint: None,
                 tools: Vec::new(),

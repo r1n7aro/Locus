@@ -378,7 +378,11 @@ where
     let model = model.strip_prefix("anthropic/").unwrap_or(model);
     let mut effective_model = normalize_anthropic_model(model).to_string();
 
-    let mut messages = build_anthropic_messages(history, AnthropicHistoryOptions::standard());
+    let tool_reference_names = tool_reference_names_for_request(tools);
+    let mut messages = build_anthropic_messages(
+        history,
+        AnthropicHistoryOptions::standard().with_tool_reference_names(tool_reference_names),
+    );
     let (converted_tools, tool_aliases) = convert_tools_to_oauth_sdk_like_anthropic(tools);
     rewrite_oauth_tool_use_blocks(&mut messages, &tool_aliases);
     apply_cache_control(&mut messages, Some(CACHE_TTL));
@@ -443,6 +447,7 @@ where
     let mut retried_model_fallback = false;
     let mut retried_body_compat = false;
     let mut retried_without_tools = false;
+    let mut retried_native_lazy_strip = false;
     let is_first_user_turn = history.len() == 1
         && history[0].role == MessageRole::User
         && history[0].tool_call_id.is_none();
@@ -517,7 +522,40 @@ where
 
         let error_body = resp.text().await.unwrap_or_default();
 
+        // A 400 that names the native lazy-loading surface (deferred tools /
+        // tool references) means this endpoint or model does not support it.
+        // Stripping is semantics-preserving — every deferred definition
+        // becomes an eager one — so the session keeps working, only without
+        // the caching win. Loud log so misconfiguration is discoverable.
+        if status.as_u16() == 400
+            && !retried_native_lazy_strip
+            && attempt < MAX_RETRIES
+            && body_uses_native_lazy_features(&body)
+            && error_mentions_native_lazy_features(&error_body)
+        {
+            eprintln!(
+                "[Anthropic] HTTP 400 rejected native lazy tool loading, retrying with eager tool declarations: {}",
+                utf8_prefix_chars(&error_body, 300)
+            );
+            strip_native_lazy_features(&mut body);
+            raw_request =
+                serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+            retried_native_lazy_strip = true;
+            continue;
+        }
+
         if is_oauth_generic_bad_request(status, &error_body) && attempt < MAX_RETRIES {
+            if !retried_native_lazy_strip && body_uses_native_lazy_features(&body) {
+                eprintln!(
+                    "[Anthropic] HTTP 400 invalid_request_error, retrying with eager tool declarations"
+                );
+                strip_native_lazy_features(&mut body);
+                raw_request =
+                    serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+                retried_native_lazy_strip = true;
+                continue;
+            }
+
             if !retried_model_fallback && effective_model != OAUTH_COMPAT_FALLBACK_MODEL {
                 eprintln!(
                     "[Anthropic] HTTP 400 invalid_request_error, retrying with fallback model: {} -> {}",
@@ -650,7 +688,8 @@ where
 
     let mut messages = build_anthropic_messages(
         history,
-        AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks),
+        AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks)
+            .with_tool_reference_names(tool_reference_names_for_request(tools)),
     );
     // No ttl on custom endpoints: the 1h value needs the official
     // `extended-cache-ttl-2025-04-11` beta header, which this path does not
@@ -1377,10 +1416,16 @@ fn build_thinking_params(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AnthropicHistoryOptions {
     replay_thinking_blocks: bool,
     require_thinking_signature: bool,
+    /// Internal names of the tools declared in this request. When set,
+    /// tool-reference marker lines in tool results are stripped and re-emitted
+    /// as `tool_reference` content blocks — filtered against this set so a
+    /// reference to an undeclared tool (deleted skill, renamed tool) degrades
+    /// to plain text instead of a `Tool reference not found` 400.
+    tool_reference_names: Option<std::collections::HashSet<String>>,
 }
 
 impl AnthropicHistoryOptions {
@@ -1388,6 +1433,7 @@ impl AnthropicHistoryOptions {
         Self {
             replay_thinking_blocks: true,
             require_thinking_signature: false,
+            tool_reference_names: None,
         }
     }
 
@@ -1395,7 +1441,16 @@ impl AnthropicHistoryOptions {
         Self {
             replay_thinking_blocks,
             require_thinking_signature: true,
+            tool_reference_names: None,
         }
+    }
+
+    fn with_tool_reference_names(
+        mut self,
+        names: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.tool_reference_names = names;
+        self
     }
 }
 
@@ -1437,6 +1492,10 @@ enum HistoryContentBlock {
         tool_use_id: String,
         content: ToolResultContent,
     },
+    /// Reference to a deferred tool (`defer_loading: true`); the API expands
+    /// the full definition in place. Only emitted when the native lazy
+    /// renderer is active and the referenced tool is declared in the request.
+    ToolReference { tool_name: String },
 }
 
 impl HistoryContentBlock {
@@ -1610,6 +1669,7 @@ fn build_anthropic_messages(
                                 content: build_tool_result_content(
                                     &tool_msg.content,
                                     tool_msg.images.as_deref(),
+                                    options.tool_reference_names.as_ref(),
                                 ),
                             });
                         } else {
@@ -1749,6 +1809,92 @@ fn apply_flattened_body_compat(body: &mut serde_json::Value) {
     }
 }
 
+/// Whether the serialized request body carries native lazy-loading features:
+/// `defer_loading` on any tool or a `tool_reference` block in any tool result.
+fn body_uses_native_lazy_features(body: &serde_json::Value) -> bool {
+    let has_deferred_tool = body
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true))
+        })
+        .unwrap_or(false);
+    if has_deferred_tool {
+        return true;
+    }
+
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| messages.iter().any(message_has_tool_reference_block))
+        .unwrap_or(false)
+}
+
+fn message_has_tool_reference_block(message: &serde_json::Value) -> bool {
+    let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_reference") {
+            return true;
+        }
+        block
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|nested| {
+                nested
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_reference"))
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn error_mentions_native_lazy_features(error_body: &str) -> bool {
+    let lowered = error_body.to_ascii_lowercase();
+    lowered.contains("defer_loading")
+        || lowered.contains("tool_reference")
+        || lowered.contains("tool reference")
+}
+
+/// Degrades a native-lazy request to eager declarations in place: removes
+/// every `defer_loading` flag and drops `tool_reference` blocks from tool
+/// results. Definitions stay declared, so history references losing their
+/// blocks cannot dangle.
+fn strip_native_lazy_features(body: &mut serde_json::Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(|tools| tools.as_array_mut()) {
+        for tool in tools {
+            if let Some(map) = tool.as_object_mut() {
+                map.remove("defer_loading");
+            }
+        }
+    }
+
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+    for message in messages {
+        let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if let Some(nested) = block.get_mut("content").and_then(|c| c.as_array_mut()) {
+                nested.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_reference"));
+                if nested.is_empty() {
+                    // An empty content array is invalid; keep a placeholder
+                    // text block so the tool_result stays well-formed.
+                    nested.push(serde_json::json!({ "type": "text", "text": "(empty)" }));
+                }
+            }
+        }
+        blocks.retain(|b| b.get("type").and_then(|t| t.as_str()) != Some("tool_reference"));
+    }
+}
+
 fn apply_cache_control(messages: &mut [AnthropicMessage], ttl: Option<&'static str>) {
     let len = messages.len();
     if len == 0 {
@@ -1772,12 +1918,40 @@ fn apply_cache_control(messages: &mut [AnthropicMessage], ttl: Option<&'static s
     }
 }
 
+/// Whether an OpenAI-format tool entry carries the native lazy-loading marker
+/// set by the request assembly (`defer_loading: true` on the wrapper).
+fn is_deferred_api_tool(tool: &serde_json::Value) -> bool {
+    tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Internal names of the function tools in an OpenAI-format tool list.
+fn api_tool_names(openai_tools: &[serde_json::Value]) -> std::collections::HashSet<String> {
+    openai_tools
+        .iter()
+        .filter_map(|tool| tool.get("function")?.get("name")?.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tool-reference declared set for a request: only populated when at least one
+/// tool is deferred (native lazy renderer active); `None` keeps tool results
+/// byte-verbatim on every other path.
+fn tool_reference_names_for_request(
+    openai_tools: &[serde_json::Value],
+) -> Option<std::collections::HashSet<String>> {
+    openai_tools
+        .iter()
+        .any(is_deferred_api_tool)
+        .then(|| api_tool_names(openai_tools))
+}
+
 /// OpenAI: { type: "function", function: { name, description, parameters } }
 /// Anthropic: { name, description, input_schema }
 fn convert_tools_to_anthropic(openai_tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let tools: Vec<serde_json::Value> = openai_tools
         .iter()
         .filter_map(|tool| {
+            let deferred = is_deferred_api_tool(tool);
             let func = tool.get("function")?;
             let name = func.get("name")?.as_str()?;
             let description = func.get("description")?.as_str().unwrap_or("");
@@ -1786,11 +1960,15 @@ fn convert_tools_to_anthropic(openai_tools: &[serde_json::Value]) -> Vec<serde_j
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
 
-            Some(serde_json::json!({
+            let mut converted = serde_json::json!({
                 "name": name,
                 "description": description,
                 "input_schema": parameters,
-            }))
+            });
+            if deferred {
+                converted["defer_loading"] = serde_json::json!(true);
+            }
+            Some(converted)
         })
         .collect();
 
@@ -1801,7 +1979,13 @@ fn build_native_anthropic_tools(
     openai_tools: &[serde_json::Value],
     include_web_search: bool,
 ) -> Vec<serde_json::Value> {
-    let mut tools = convert_tools_to_anthropic(openai_tools);
+    // Deferred tools sort after every eager tool and must never carry
+    // `cache_control` (the API rejects the combination with a 400); the cache
+    // breakpoint goes on the last eager tool so appending deferred
+    // declarations mid-session cannot move it.
+    let (mut tools, deferred): (Vec<_>, Vec<_>) = convert_tools_to_anthropic(openai_tools)
+        .into_iter()
+        .partition(|tool| !is_deferred_api_tool(tool));
 
     if include_web_search {
         // Server-side Anthropic tool. Some custom-compatible endpoints reject this type.
@@ -1816,6 +2000,7 @@ fn build_native_anthropic_tools(
         last_tool["cache_control"] = serde_json::json!({ "type": "ephemeral", "ttl": CACHE_TTL });
     }
 
+    tools.extend(deferred);
     tools
 }
 
@@ -1826,6 +2011,7 @@ fn convert_tools_to_oauth_sdk_like_anthropic(
     let mut aliases = OauthToolAliases::default();
 
     for tool in openai_tools {
+        let deferred = is_deferred_api_tool(tool);
         let Some(function) = tool.get("function") else {
             continue;
         };
@@ -1844,11 +2030,15 @@ fn convert_tools_to_oauth_sdk_like_anthropic(
             .unwrap_or_else(|| serde_json::json!({}));
         let (public_input_schema, arg_aliases) = convert_oauth_input_schema(&parameters);
 
-        tools.push(serde_json::json!({
+        let mut converted = serde_json::json!({
             "name": public_name,
             "description": description,
             "input_schema": public_input_schema,
-        }));
+        });
+        if deferred {
+            converted["defer_loading"] = serde_json::json!(true);
+        }
+        tools.push(converted);
 
         aliases.insert(OauthToolAlias {
             internal_name: internal_name.to_string(),
@@ -1934,16 +2124,34 @@ fn convert_oauth_input_schema(
 fn rewrite_oauth_tool_use_blocks(messages: &mut [AnthropicMessage], aliases: &OauthToolAliases) {
     for message in messages {
         for block in &mut message.content {
-            let HistoryContentBlock::ToolUse { name, input, .. } = block else {
-                continue;
-            };
-            let Some(public_name) = aliases.public_name_for(name) else {
-                continue;
-            };
+            match block {
+                HistoryContentBlock::ToolUse { name, input, .. } => {
+                    let Some(public_name) = aliases.public_name_for(name) else {
+                        continue;
+                    };
 
-            let internal_name = std::mem::replace(name, public_name.to_string());
-            let current = std::mem::take(input);
-            *input = aliases.public_input_for(&internal_name, current);
+                    let internal_name = std::mem::replace(name, public_name.to_string());
+                    let current = std::mem::take(input);
+                    *input = aliases.public_input_for(&internal_name, current);
+                }
+                // References are recorded under internal names; the request
+                // declares tools under their public aliases, so rewrite here
+                // as well or the API cannot resolve them.
+                HistoryContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(blocks),
+                    ..
+                } => {
+                    for nested in blocks {
+                        let HistoryContentBlock::ToolReference { tool_name } = nested else {
+                            continue;
+                        };
+                        if let Some(public_name) = aliases.public_name_for(tool_name) {
+                            *tool_name = public_name.to_string();
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -2062,14 +2270,40 @@ fn build_text_blocks(text: &str) -> Vec<HistoryContentBlock> {
     blocks
 }
 
-fn build_tool_result_content(text: &str, images: Option<&[ImageData]>) -> ToolResultContent {
-    let Some(images) = images.filter(|images| !images.is_empty()) else {
-        return ToolResultContent::Text(text.to_string());
+fn build_tool_result_content(
+    text: &str,
+    images: Option<&[ImageData]>,
+    tool_reference_names: Option<&std::collections::HashSet<String>>,
+) -> ToolResultContent {
+    // Native lazy renderer: marker lines are protocol, not content — strip
+    // them and re-emit references for tools declared in this request.
+    let (text, reference_names) = match tool_reference_names {
+        Some(declared) => {
+            let (clean, names) =
+                crate::llm::tool_references::split_tool_reference_marker(text);
+            let names: Vec<String> = names
+                .into_iter()
+                .filter(|name| declared.contains(name))
+                .collect();
+            (clean, names)
+        }
+        None => (text.to_string(), Vec::new()),
     };
 
-    let mut blocks = build_text_blocks(text);
-    for img in images {
+    let images = images.filter(|images| !images.is_empty());
+    if images.is_none() && reference_names.is_empty() {
+        return ToolResultContent::Text(text);
+    }
+
+    let mut blocks = build_text_blocks(&text);
+    for img in images.into_iter().flatten() {
         blocks.push(HistoryContentBlock::image(img));
+    }
+    for tool_name in reference_names {
+        blocks.push(HistoryContentBlock::ToolReference { tool_name });
+    }
+    if blocks.is_empty() {
+        return ToolResultContent::Text(text);
     }
     ToolResultContent::Blocks(blocks)
 }
@@ -2419,6 +2653,179 @@ mod tests {
         let value = format!("{}x", "错".repeat(200));
 
         assert_eq!(utf8_prefix_chars(&value, 200), "错".repeat(200));
+    }
+
+    fn tool_message(tool_call_id: &str, content: &str) -> ChatMessage {
+        let mut message = assistant_message(content, None, None);
+        message.role = MessageRole::Tool;
+        message.tool_call_id = Some(tool_call_id.to_string());
+        message
+    }
+
+    fn openai_tool(name: &str, deferred: bool) -> serde_json::Value {
+        let mut tool = json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("{} description", name),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        });
+        if deferred {
+            tool["defer_loading"] = json!(true);
+        }
+        tool
+    }
+
+    #[test]
+    fn native_tools_keep_cache_breakpoint_on_last_eager_tool() {
+        let tools = build_native_anthropic_tools(
+            &[
+                openai_tool("read", false),
+                openai_tool("pdf_export", true),
+                openai_tool("edit", false),
+            ],
+            false,
+        );
+
+        // Eager tools first (input order), deferred after; breakpoint on the
+        // last eager tool and never on a deferred one.
+        assert_eq!(tools[0]["name"], json!("read"));
+        assert_eq!(tools[1]["name"], json!("edit"));
+        assert_eq!(tools[2]["name"], json!("pdf_export"));
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_some());
+        assert!(tools[2].get("cache_control").is_none());
+        assert_eq!(tools[2]["defer_loading"], json!(true));
+        assert!(tools[0].get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn native_tools_without_deferred_match_legacy_shape() {
+        let tools = build_native_anthropic_tools(
+            &[openai_tool("read", false), openai_tool("edit", false)],
+            true,
+        );
+
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[2]["name"], json!("web_search"));
+        assert!(tools[2].get("cache_control").is_some());
+        assert!(tools.iter().all(|tool| tool.get("defer_loading").is_none()));
+    }
+
+    #[test]
+    fn oauth_tools_carry_defer_loading_marker() {
+        let (tools, _aliases) = convert_tools_to_oauth_sdk_like_anthropic(&[
+            openai_tool("read", false),
+            openai_tool("pdf_export", true),
+        ]);
+
+        assert!(tools[0].get("defer_loading").is_none());
+        assert_eq!(tools[1]["defer_loading"], json!(true));
+        // No cache_control on the OAuth tools section (breakpoints live in
+        // system/messages there).
+        assert!(tools.iter().all(|tool| tool.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn tool_reference_marker_becomes_reference_blocks_for_declared_tools() {
+        let content = format!(
+            "pdf_export is ready.\n\n{}pdf_export, ghost_tool{}",
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_OPEN,
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_CLOSE
+        );
+        let history = vec![tool_message("toolu_1", &content)];
+        let declared: std::collections::HashSet<String> =
+            ["pdf_export".to_string(), "read".to_string()].into();
+
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard().with_tool_reference_names(Some(declared)),
+        ));
+
+        let blocks = messages[0]["content"][0]["content"]
+            .as_array()
+            .expect("tool_result content blocks");
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!("pdf_export is ready."));
+        // ghost_tool is not declared in this request: reference dropped, no
+        // dangling `Tool reference not found` 400 possible.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], json!("tool_reference"));
+        assert_eq!(blocks[1]["tool_name"], json!("pdf_export"));
+    }
+
+    #[test]
+    fn tool_reference_marker_stays_verbatim_text_without_declared_set() {
+        let content = format!(
+            "done\n\n{}pdf_export{}",
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_OPEN,
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_CLOSE
+        );
+        let history = vec![tool_message("toolu_1", &content)];
+
+        let messages = to_json(build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard(),
+        ));
+
+        // Fallback path: content is a plain string, byte-identical.
+        assert_eq!(messages[0]["content"][0]["content"], json!(content));
+    }
+
+    #[test]
+    fn oauth_rewrite_maps_tool_reference_names_to_public_aliases() {
+        let content = format!(
+            "ready\n\n{}knowledge_move{}",
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_OPEN,
+            crate::llm::tool_references::TOOL_REFERENCE_MARKER_CLOSE
+        );
+        let history = vec![tool_message("toolu_1", &content)];
+        let declared: std::collections::HashSet<String> = ["knowledge_move".to_string()].into();
+        let mut messages = build_anthropic_messages(
+            &history,
+            AnthropicHistoryOptions::standard().with_tool_reference_names(Some(declared)),
+        );
+        let (_tools, aliases) =
+            convert_tools_to_oauth_sdk_like_anthropic(&[openai_tool("knowledge_move", true)]);
+
+        rewrite_oauth_tool_use_blocks(&mut messages, &aliases);
+
+        let messages = to_json(messages);
+        let blocks = messages[0]["content"][0]["content"]
+            .as_array()
+            .expect("blocks");
+        assert_eq!(blocks[1]["type"], json!("tool_reference"));
+        assert_eq!(blocks[1]["tool_name"], json!("KnowledgeMove"));
+    }
+
+    #[test]
+    fn strip_native_lazy_features_degrades_to_eager_declarations() {
+        let mut body = json!({
+            "tools": [
+                { "name": "read", "input_schema": {} },
+                { "name": "pdf_export", "input_schema": {}, "defer_loading": true }
+            ],
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        { "type": "text", "text": "ready" },
+                        { "type": "tool_reference", "tool_name": "pdf_export" }
+                    ]}
+                ]}
+            ]
+        });
+
+        assert!(super::body_uses_native_lazy_features(&body));
+        super::strip_native_lazy_features(&mut body);
+        assert!(!super::body_uses_native_lazy_features(&body));
+
+        assert!(body["tools"][1].get("defer_loading").is_none());
+        let blocks = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .expect("tool_result blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("text"));
     }
 
     #[test]
