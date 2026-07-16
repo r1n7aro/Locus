@@ -3,7 +3,7 @@ id: kd_skill_builtin_profiler
 type: skill
 path: profiler.md
 title: Unity Profiler Runtime Sampling
-injectMode: none
+injectMode: excerpt
 summaryEnabled: true
 commandEnabled: false
 readOnly: false
@@ -15,7 +15,7 @@ argumentHint:
 tools:
   - unity_run_states
 createdAt: 1777332556825
-updatedAt: 1781049600000
+updatedAt: 1784246400000
 ---
 
 # Unity Profiler Runtime Sampling
