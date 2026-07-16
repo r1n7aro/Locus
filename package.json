@@ -31,6 +31,7 @@
     "github-cli:bundle": "bun run scripts/prepare-managed-github-cli.mjs",
     "ort:bundle": "bun run scripts/prepare-ort-runtime.mjs",
     "licenses:bundle": "bun run scripts/generate-third-party-bundle.mjs",
+    "catalog:refresh": "bun run scripts/refresh-model-catalog.mjs",
     "view-runtime:export": "bun run scripts/export-view-runtime-sources.mjs",
     "preview": "vite preview",
     "tauri": "bun run scripts/run-tauri.mjs",

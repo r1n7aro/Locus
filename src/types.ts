@@ -498,6 +498,12 @@ export interface ModelOption {
   supportedEfforts?: EffortLevel[];
   additionalSpeedTiers?: string[];
   isDefault?: boolean;
+  /** Custom models only: owning provider, so selectors can render one
+   *  section per custom provider (like the built-in subscription groups). */
+  customProviderId?: string;
+  customProviderName?: string;
+  /** Custom models only: bare model name shown inside the provider section. */
+  customModelName?: string;
 }
 
 export type ApiFormat =
@@ -509,12 +515,21 @@ export type ReasoningParamFormat =
   | "none"
   | "openai_chat_reasoning_effort"
   | "openai_responses_reasoning_effort"
-  | "anthropic_thinking";
+  | "anthropic_thinking"
+  | "openai_chat_enable_thinking"
+  | "openai_chat_thinking_type";
+
+/** Message-level field that carries replayed reasoning (models.dev interleaved.field). */
+export type ReasoningReplayField =
+  | "reasoning_content"
+  | "reasoning_details"
+  | "reasoning";
 
 export interface CustomEndpointServerTools {
   webSearch: boolean;
 }
 
+/** Legacy single-model endpoint shape; still used by test_custom_endpoint. */
 export interface CustomEndpoint {
   id: string;
   name: string;
@@ -530,6 +545,72 @@ export interface CustomEndpoint {
   serverTools: CustomEndpointServerTools;
   supportsToolLazyLoading: boolean;
   supportsVision: boolean;
+}
+
+export interface CustomProviderModel {
+  /** Row id, unique within the provider; model id is `custom/<provider>/<row id>`. */
+  id: string;
+  apiModel: string;
+  name: string;
+  contextLength: number;
+  betaFlags: string[];
+  supportedReasoningEfforts: EffortLevel[];
+  reasoningParamFormat: ReasoningParamFormat | null;
+  replayReasoningContent?: boolean | null;
+  reasoningReplayField?: ReasoningReplayField | null;
+  serverTools: CustomEndpointServerTools;
+  supportsVision: boolean;
+  catalogModelId?: string | null;
+}
+
+export interface CustomProvider {
+  id: string;
+  name: string;
+  endpoint: string;
+  apiFormat: ApiFormat;
+  /** Keychain-backed; empty string means "keep existing / none". */
+  apiKey: string;
+  catalogId?: string | null;
+  models: CustomProviderModel[];
+}
+
+// models.dev catalog (slim snapshot; inner fields keep the upstream snake_case)
+
+export interface ModelCatalogReasoningOption {
+  type: "effort" | "toggle" | "budget_tokens" | string;
+  values?: (string | null)[];
+  min?: number;
+  max?: number;
+}
+
+export interface ModelCatalogModel {
+  name: string;
+  limit: { context: number; output: number };
+  reasoning?: boolean;
+  tool_call?: boolean;
+  attachment?: boolean;
+  temperature?: boolean;
+  interleaved?: true | { field: ReasoningReplayField };
+  reasoning_options?: ModelCatalogReasoningOption[];
+  modalities?: { input: string[] };
+  release_date?: string;
+  status?: "alpha" | "beta" | "deprecated";
+  cost?: { input: number; output: number; cache_read?: number; cache_write?: number };
+}
+
+export interface ModelCatalogProvider {
+  name: string;
+  api?: string;
+  npm?: string;
+  env?: string[];
+  doc?: string;
+  models: Record<string, ModelCatalogModel>;
+}
+
+export interface ModelCatalogResponse {
+  source: "cache" | "snapshot";
+  fetchedAt: string;
+  providers: Record<string, ModelCatalogProvider>;
 }
 
 export interface ModelDefaults {
@@ -1102,7 +1183,7 @@ export interface SkillManifest {
   skillDescription: string | null;
   commandTrigger: string;
   tools?: string[];
-  kind?: "document" | "package";
+  kind?: "document" | "package" | "external";
   packageId?: string | null;
   packageVersion?: string | null;
   hasUnity?: boolean;
@@ -1111,6 +1192,10 @@ export interface SkillManifest {
   hasL2?: boolean;
   pluginId?: string | null;
   pluginScope?: "app" | "project" | string | null;
+  /** Absolute on-disk directory of an external (generic-format) skill. */
+  originPath?: string | null;
+  /** Unconsumed frontmatter fields of an external skill, shown in the UI. */
+  extraMetadata?: Record<string, unknown> | null;
 }
 
 export interface SkillConfig {

@@ -571,6 +571,34 @@ pub async fn get_agent_system_prompt_stats(
     Ok(instance.system_prompt_stats().await)
 }
 
+/// Build the Custom backend for a `custom/<provider>/<model>` id (legacy
+/// single-segment `custom/<endpoint>` ids resolve to the provider's first
+/// model). Provider-level endpoint/format combine with model-level tuning.
+fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError> {
+    let (provider, model) = crate::commands::workspace::find_custom_provider_model(selected_model)?
+        .ok_or_else(|| format!("Custom model config not found: {}", selected_model))?;
+    let api_key = crate::keychain::get_secret(&crate::keychain::endpoint_key_name(&provider.id))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Ok(LlmBackend::Custom {
+        api_key,
+        api_model: model.api_model,
+        endpoint: provider.endpoint,
+        api_format: provider.api_format,
+        context_length: model.context_length,
+        beta_flags: model.beta_flags,
+        supported_reasoning_efforts: model.supported_reasoning_efforts,
+        reasoning_param_format: model
+            .reasoning_param_format
+            .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
+        replay_reasoning_content: model.replay_reasoning_content.unwrap_or(false),
+        reasoning_replay_field: model.reasoning_replay_field,
+        server_tools: model.server_tools,
+        supports_vision: model.supports_vision,
+    })
+}
+
 async fn resolve_model_backend(
     app_handle: &AppHandle,
     _def: &crate::agent::definition::AgentDef,
@@ -596,40 +624,7 @@ async fn resolve_model_backend(
     let is_anthropic_direct = !selected_model.contains('/');
 
     if is_custom {
-        let endpoint_id = selected_model.strip_prefix("custom/").unwrap_or("");
-        let endpoints_path = crate::commands::workspace::custom_endpoints_path(app_handle)?;
-        let endpoints: Vec<crate::commands::CustomEndpoint> =
-            std::fs::read_to_string(&endpoints_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-        let mut endpoint = endpoints
-            .iter()
-            .find(|item| item.id == endpoint_id)
-            .cloned()
-            .ok_or_else(|| format!("Custom endpoint config not found: {}", endpoint_id))?;
-        crate::commands::workspace::normalize_custom_endpoint_config(&mut endpoint);
-        let endpoint_api_key =
-            crate::keychain::get_secret(&crate::keychain::endpoint_key_name(&endpoint.id))
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-        return Ok(LlmBackend::Custom {
-            api_key: endpoint_api_key,
-            api_model: endpoint.api_model.clone(),
-            endpoint: endpoint.endpoint.clone(),
-            api_format: endpoint.api_format.clone(),
-            context_length: endpoint.context_length,
-            beta_flags: endpoint.beta_flags.clone(),
-            supported_reasoning_efforts: endpoint.supported_reasoning_efforts.clone(),
-            reasoning_param_format: endpoint
-                .reasoning_param_format
-                .clone()
-                .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
-            replay_reasoning_content: endpoint.replay_reasoning_content.unwrap_or(false),
-            server_tools: endpoint.server_tools.clone(),
-            supports_vision: endpoint.supports_vision,
-        });
+        return custom_backend_for_model(selected_model);
     }
 
     if is_openrouter {
@@ -925,40 +920,7 @@ pub async fn chat(
     let is_anthropic_direct = !selected_model.contains('/');
 
     let backend = if is_custom {
-        let endpoint_id = selected_model.strip_prefix("custom/").unwrap_or("");
-        let endpoints_path = crate::commands::workspace::custom_endpoints_path(&app_handle)?;
-        let endpoints: Vec<crate::commands::CustomEndpoint> =
-            std::fs::read_to_string(&endpoints_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-        let mut ep = endpoints
-            .iter()
-            .find(|e| e.id == endpoint_id)
-            .cloned()
-            .ok_or_else(|| format!("Custom endpoint config not found: {}", endpoint_id))?;
-        crate::commands::workspace::normalize_custom_endpoint_config(&mut ep);
-        // Load API key from keychain (JSON file no longer stores it)
-        let ep_api_key = crate::keychain::get_secret(&crate::keychain::endpoint_key_name(&ep.id))
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        LlmBackend::Custom {
-            api_key: ep_api_key,
-            api_model: ep.api_model.clone(),
-            endpoint: ep.endpoint.clone(),
-            api_format: ep.api_format.clone(),
-            context_length: ep.context_length,
-            beta_flags: ep.beta_flags.clone(),
-            supported_reasoning_efforts: ep.supported_reasoning_efforts.clone(),
-            reasoning_param_format: ep
-                .reasoning_param_format
-                .clone()
-                .unwrap_or(crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort),
-            replay_reasoning_content: ep.replay_reasoning_content.unwrap_or(false),
-            server_tools: ep.server_tools.clone(),
-            supports_vision: ep.supports_vision,
-        }
+        custom_backend_for_model(&selected_model)?
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();
         if !api_key.is_empty() {
@@ -1759,6 +1721,9 @@ pub async fn delete_session(
     store.delete_session(&session_id).map_err(AppError::from)?;
     crate::llm::codex::invalidate_cached_session(&session_id);
     undo_manager.on_session_delete(&session_id).await;
+    // The delete cascades to messages/events; reclaim file space in the
+    // background once enough of the database is dead freelist pages.
+    store.inner().clone().spawn_vacuum_if_fragmented();
     Ok(())
 }
 

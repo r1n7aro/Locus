@@ -8,16 +8,19 @@ function read(relPath: string) {
   return readFileSync(resolve(cwd, relPath), "utf8");
 }
 
-describe("onboarding custom endpoint layout", () => {
-  it("keeps model setup inline and exposes custom endpoint testing", () => {
+describe("onboarding custom provider layout", () => {
+  it("keeps model setup inline with catalog picking and provider testing", () => {
     const source = read("src/components/OnboardingView.vue");
 
     expect(source).toContain("toggleAuthProvider('custom')");
     expect(source).toContain("toggleAuthProvider('codex')");
     expect(source).toContain('import BaseDropdown from "./ui/BaseDropdown.vue"');
-    expect(source).toContain("settingsEditingEndpoint");
+    expect(source).toContain("settingsEditingProvider");
+    expect(source).toContain("settingsCustomProviders");
+    expect(source).toContain('import ModelCatalogPicker from "./settings/ModelCatalogPicker.vue"');
+    expect(source).toContain("handleOnboardingCatalogSelect");
     expect(source).toContain('class="custom-endpoint-format-dropdown"');
-    expect(source).toContain("@click=\"settingsTestEndpoint\"");
+    expect(source).toContain("@click=\"settingsTestProvider()\"");
     expect(source).toContain('t("settings.custom.test")');
     expect(source).toContain('class="custom-endpoint-test-result"');
     expect(source).toContain("max-width: 600px;");

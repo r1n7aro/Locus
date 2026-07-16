@@ -56,6 +56,7 @@ base64 = "0.22"
 aes-gcm = "0.10"
 rand = "0.8"
 dirs = "5"
+flate2 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-dialog = "2.6.0"
 rayon = "1.10"

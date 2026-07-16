@@ -5,6 +5,7 @@ import type { ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelDisplayName } from "../utils/modelDisplay";
+import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -24,9 +25,12 @@ const selectedModel = () => props.models.find((m) => m.id === props.selectedId);
 const selectedDisplayName = computed(() => {
   const sel = selectedModel();
   if (!sel) return "Model";
-  const displayName = modelDisplayName(sel);
-  const duplicated = props.models.some((m) => m.id !== sel.id && modelDisplayName(m) === displayName);
+  const displayName = optionDisplayName(sel);
+  const duplicated = props.models.some((m) => m.id !== sel.id && optionDisplayName(m) === displayName);
   if (!duplicated) return displayName;
+  if (sel.provider === "custom" && sel.customProviderName) {
+    return `${sel.customProviderName} / ${displayName}`;
+  }
   const prefix = providerShortLabels.value[sel.provider] || sel.provider;
   return `${prefix} / ${displayName}`;
 });
@@ -47,32 +51,9 @@ const providerShortLabels = computed<Record<string, string>>(() => ({
   custom: t("model.provider.custom"),
 }));
 
-interface ProviderGroup {
-  provider: string;
-  label: string;
-  models: ModelOption[];
-}
-
-const groupedModels = computed<ProviderGroup[]>(() => {
-  const map = new Map<string, ModelOption[]>();
-  for (const m of props.models) {
-    const list = map.get(m.provider) || [];
-    list.push(m);
-    map.set(m.provider, list);
-  }
-  const groups: ProviderGroup[] = [];
-  for (const provider of visibleProviderOrder) {
-    const models = map.get(provider);
-    if (models && models.length > 0) {
-      groups.push({
-        provider,
-        label: providerLabels.value[provider] || provider,
-        models,
-      });
-    }
-  }
-  return groups;
-});
+const groupedModels = computed<ModelSelectorGroup[]>(() =>
+  groupModelsForSelector(props.models, visibleProviderOrder, providerLabels.value),
+);
 
 function toggle() {
   if (props.disabled) return;
@@ -86,6 +67,11 @@ function select(id: string) {
 
 function modelDisplayName(model: ModelOption): string {
   return formatModelDisplayName(model.name);
+}
+
+function optionDisplayName(model: ModelOption): string {
+  if (model.provider === "custom") return modelListEntryName(model);
+  return modelDisplayName(model);
 }
 
 function onClickOutside(e: MouseEvent) {
@@ -115,7 +101,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
         <template v-if="groupedModels.length === 0">
           <div class="model-empty">{{ t("model.noProvider") }}</div>
         </template>
-        <template v-for="(group, gi) in groupedModels" :key="group.provider">
+        <template v-for="(group, gi) in groupedModels" :key="group.key">
           <div v-if="gi > 0" class="model-divider"></div>
           <div class="model-group-label">{{ group.label }}</div>
           <div
@@ -125,7 +111,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
             :class="{ active: model.id === selectedId }"
             @click="select(model.id)"
           >
-            <div class="model-option-name">{{ modelDisplayName(model) }}</div>
+            <div class="model-option-name">{{ optionDisplayName(model) }}</div>
           </div>
         </template>
       </div>

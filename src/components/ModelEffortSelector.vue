@@ -4,6 +4,7 @@ import type { EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelOptionDisplayName } from "../utils/modelDisplay";
+import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
 import BaseSwitch from "./ui/BaseSwitch.vue";
 
 const props = defineProps<{
@@ -28,12 +29,6 @@ interface LevelOption {
   value: EffortLevel;
   label: string;
   desc: string;
-}
-
-interface ProviderGroup {
-  provider: string;
-  label: string;
-  models: ModelOption[];
 }
 
 const open = ref(false);
@@ -62,9 +57,12 @@ const selectedModel = computed(() =>
 const selectedDisplayName = computed(() => {
   const selected = selectedModel.value;
   if (!selected) return "Model";
-  const displayName = modelDisplayName(selected);
-  const duplicated = props.models.some((model) => model.id !== selected.id && modelDisplayName(model) === displayName);
+  const displayName = optionDisplayName(selected);
+  const duplicated = props.models.some((model) => model.id !== selected.id && optionDisplayName(model) === displayName);
   if (!duplicated) return displayName;
+  if (selected.provider === "custom" && selected.customProviderName) {
+    return `${selected.customProviderName} / ${displayName}`;
+  }
   const prefix = providerShortLabels.value[selected.provider] || selected.provider;
   return `${prefix} / ${displayName}`;
 });
@@ -88,27 +86,9 @@ const currentLevel = computed(() =>
   levels.value.find((level) => level.value === props.effort) ?? levels.value[0],
 );
 
-const groupedModels = computed<ProviderGroup[]>(() => {
-  const map = new Map<string, ModelOption[]>();
-  for (const model of props.models) {
-    const list = map.get(model.provider) || [];
-    list.push(model);
-    map.set(model.provider, list);
-  }
-
-  const groups: ProviderGroup[] = [];
-  for (const provider of visibleProviderOrder) {
-    const models = map.get(provider);
-    if (models && models.length > 0) {
-      groups.push({
-        provider,
-        label: providerLabels.value[provider] || provider,
-        models,
-      });
-    }
-  }
-  return groups;
-});
+const groupedModels = computed<ModelSelectorGroup[]>(() =>
+  groupModelsForSelector(props.models, visibleProviderOrder, providerLabels.value),
+);
 
 const triggerTitle = computed(() => {
   const modelTitle = selectedModel.value?.id || t("model.select");
@@ -139,6 +119,11 @@ function selectModel(id: string) {
 
 function modelDisplayName(model: ModelOption): string {
   return formatModelOptionDisplayName(model, props.fastModeEnabled === true);
+}
+
+function optionDisplayName(model: ModelOption): string {
+  if (model.provider === "custom") return modelListEntryName(model);
+  return modelDisplayName(model);
 }
 
 function selectEffort(level: EffortLevel) {
@@ -190,7 +175,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
           <template v-if="groupedModels.length === 0">
             <div class="model-effort-empty">{{ t("model.noProvider") }}</div>
           </template>
-          <template v-for="(group, groupIndex) in groupedModels" :key="group.provider">
+          <template v-for="(group, groupIndex) in groupedModels" :key="group.key">
             <div v-if="groupIndex > 0" class="model-effort-divider"></div>
             <div class="model-effort-section-header">
               <div class="model-effort-section-label">{{ group.label }}</div>
@@ -217,7 +202,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
               :class="{ active: model.id === selectedId }"
               @click="selectModel(model.id)"
             >
-              <span class="model-effort-option-name">{{ modelDisplayName(model) }}</span>
+              <span class="model-effort-option-name">{{ optionDisplayName(model) }}</span>
             </button>
           </template>
         </div>

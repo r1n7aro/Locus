@@ -1030,6 +1030,12 @@ pub enum CustomReasoningParamFormat {
     OpenaiChatReasoningEffort,
     OpenaiResponsesReasoningEffort,
     AnthropicThinking,
+    /// DashScope/Qwen style: `enable_thinking: true` in the chat body
+    /// (required for hosted Qwen/QwQ to emit reasoning_content at all).
+    OpenaiChatEnableThinking,
+    /// Zhipu GLM style: `thinking: {"type": "enabled"|"disabled"}` in the
+    /// chat body.
+    OpenaiChatThinkingType,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
@@ -1108,16 +1114,6 @@ fn normalize_reasoning_effort(value: &str) -> Option<String> {
     }
 }
 
-fn custom_endpoint_ids_from_file(path: &std::path::Path) -> HashSet<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<CustomEndpoint>>(&s).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|endpoint| endpoint.id)
-        .collect()
-}
-
 fn is_stale_custom_model_ref(model_id: &str, valid_endpoint_ids: &HashSet<String>) -> bool {
     if let Some(endpoint_id) = model_id.trim().strip_prefix("custom/") {
         return !endpoint_id.is_empty() && !valid_endpoint_ids.contains(endpoint_id);
@@ -1188,61 +1184,6 @@ pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
         endpoint.replay_reasoning_content = Some(default_replay_reasoning_content(endpoint));
     }
     endpoint.supports_tool_lazy_loading = false;
-}
-
-#[tauri::command]
-pub async fn get_custom_endpoints(app_handle: AppHandle) -> Result<Vec<CustomEndpoint>, AppError> {
-    let path = custom_endpoints_path(&app_handle)?;
-    let mut endpoints: Vec<CustomEndpoint> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    for ep in &mut endpoints {
-        normalize_custom_endpoint_config(ep);
-        if let Ok(Some(key)) = keychain::get_secret(&keychain::endpoint_key_name(&ep.id)) {
-            ep.api_key = key;
-        }
-    }
-
-    Ok(endpoints)
-}
-
-#[tauri::command]
-pub async fn save_custom_endpoints(
-    endpoints: Vec<CustomEndpoint>,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let path = custom_endpoints_path(&app_handle)?;
-    let previous_endpoint_ids = custom_endpoint_ids_from_file(&path);
-    let next_endpoint_ids: HashSet<String> = endpoints
-        .iter()
-        .map(|endpoint| endpoint.id.clone())
-        .collect();
-
-    // Save api_key to keychain, strip from JSON file
-    for ep in &endpoints {
-        if !ep.api_key.is_empty() {
-            keychain::set_secret(&keychain::endpoint_key_name(&ep.id), &ep.api_key)?;
-        } else {
-            let _ = keychain::delete_secret(&keychain::endpoint_key_name(&ep.id));
-        }
-    }
-
-    let mut stripped = endpoints;
-    for ep in &mut stripped {
-        normalize_custom_endpoint_config(ep);
-        ep.api_key = String::new();
-    }
-
-    let json = serde_json::to_string_pretty(&stripped)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to save custom endpoints: {}", e))?;
-    for endpoint_id in previous_endpoint_ids.difference(&next_endpoint_ids) {
-        let _ = keychain::delete_secret(&keychain::endpoint_key_name(endpoint_id));
-    }
-    prune_stale_custom_model_refs(&next_endpoint_ids)?;
-    Ok(())
 }
 
 #[tauri::command]
@@ -1396,6 +1337,351 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
             Ok(truncate_str(&text, 120).to_string())
         }
     }
+}
+
+// ===== Custom providers (v2: one provider hosts many models) =====
+//
+// Stored in custom_providers.json; api keys stay in the keychain under the
+// legacy "endpoint/{provider_id}" name so migrated endpoints keep their
+// secret without a keychain rewrite. Model ids are addressed as
+// "custom/<provider_id>/<model_row_id>"; the legacy single-segment
+// "custom/<endpoint_id>" keeps resolving to the provider's first model.
+
+/// Which message-level field carries replayed reasoning text on OpenAI-chat
+/// requests (models.dev `interleaved.field`).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplayField {
+    ReasoningContent,
+    ReasoningDetails,
+    Reasoning,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomProviderModel {
+    /// Row id, unique within the provider, never contains '/'.
+    pub id: String,
+    pub api_model: String,
+    pub name: String,
+    #[serde(default = "default_context_length")]
+    pub context_length: u32,
+    #[serde(default)]
+    pub beta_flags: Vec<String>,
+    #[serde(default = "default_supported_reasoning_efforts")]
+    pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub reasoning_param_format: Option<CustomReasoningParamFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_reasoning_content: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_field: Option<ReasoningReplayField>,
+    #[serde(default)]
+    pub server_tools: CustomEndpointServerTools,
+    #[serde(default = "default_supports_vision")]
+    pub supports_vision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomProvider {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub api_format: ApiFormat,
+    /// Keychain-only; stripped before the JSON file is written.
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    #[serde(default)]
+    pub models: Vec<CustomProviderModel>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct CustomProvidersFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    providers: Vec<CustomProvider>,
+}
+
+const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 2;
+
+pub(crate) fn custom_providers_path() -> Result<std::path::PathBuf, String> {
+    Ok(persistent_config_dir()?.join("custom_providers.json"))
+}
+
+fn sanitize_id_segment(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c.is_whitespace() { '-' } else { c })
+        .collect();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+pub(crate) fn model_row_id_from_api_model(api_model: &str) -> String {
+    sanitize_id_segment(api_model, "model")
+}
+
+fn default_model_replay_reasoning_content(api_format: &ApiFormat) -> bool {
+    *api_format == ApiFormat::OpenaiChat
+}
+
+pub(crate) fn normalize_custom_provider_config(provider: &mut CustomProvider) {
+    provider.id = sanitize_id_segment(&provider.id, "provider");
+    let api_format = provider.api_format.clone();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for model in &mut provider.models {
+        if model.id.trim().is_empty() {
+            model.id = model_row_id_from_api_model(&model.api_model);
+        } else {
+            model.id = sanitize_id_segment(&model.id, "model");
+        }
+        if seen_ids.contains(&model.id) {
+            let base = model.id.clone();
+            let mut n = 2usize;
+            while seen_ids.contains(&format!("{base}-{n}")) {
+                n += 1;
+            }
+            model.id = format!("{base}-{n}");
+        }
+        seen_ids.insert(model.id.clone());
+
+        if model.name.trim().is_empty() {
+            model.name = model.api_model.clone();
+        }
+        model.supported_reasoning_efforts = model
+            .supported_reasoning_efforts
+            .iter()
+            .filter_map(|value| normalize_reasoning_effort(value))
+            .collect();
+        if model.supported_reasoning_efforts.is_empty() {
+            model.supported_reasoning_efforts = default_supported_reasoning_efforts();
+        }
+        if model.context_length == 0 {
+            model.context_length = default_context_length();
+        }
+        if model.reasoning_param_format.is_none() {
+            model.reasoning_param_format = Some(default_reasoning_param_format(&api_format));
+        }
+        if model.replay_reasoning_content.is_none() {
+            model.replay_reasoning_content =
+                Some(default_model_replay_reasoning_content(&api_format));
+        }
+    }
+}
+
+fn migrate_endpoint_to_provider(mut endpoint: CustomEndpoint) -> CustomProvider {
+    normalize_custom_endpoint_config(&mut endpoint);
+    let mut provider = CustomProvider {
+        id: endpoint.id,
+        name: endpoint.name,
+        endpoint: endpoint.endpoint,
+        api_format: endpoint.api_format,
+        api_key: String::new(),
+        catalog_id: None,
+        models: vec![CustomProviderModel {
+            id: model_row_id_from_api_model(&endpoint.api_model),
+            name: endpoint.api_model.clone(),
+            api_model: endpoint.api_model,
+            context_length: endpoint.context_length,
+            beta_flags: endpoint.beta_flags,
+            supported_reasoning_efforts: endpoint.supported_reasoning_efforts,
+            reasoning_param_format: endpoint.reasoning_param_format,
+            replay_reasoning_content: endpoint.replay_reasoning_content,
+            reasoning_replay_field: None,
+            server_tools: endpoint.server_tools,
+            supports_vision: endpoint.supports_vision,
+            catalog_model_id: None,
+        }],
+    };
+    normalize_custom_provider_config(&mut provider);
+    provider
+}
+
+/// Rewrite a legacy `custom/<endpoint_id>` reference to the migrated
+/// `custom/<provider_id>/<model_row_id>` form. Returns None when the value is
+/// not a legacy custom reference or the provider is unknown.
+fn rewrite_legacy_custom_model_ref(model_id: &str, providers: &[CustomProvider]) -> Option<String> {
+    let endpoint_id = model_id.trim().strip_prefix("custom/")?;
+    if endpoint_id.is_empty() || endpoint_id.contains('/') {
+        return None;
+    }
+    let provider = providers.iter().find(|p| p.id == endpoint_id)?;
+    let model = provider.models.first()?;
+    Some(format!("custom/{}/{}", provider.id, model.id))
+}
+
+fn rewrite_legacy_custom_model_refs(providers: &[CustomProvider]) {
+    let Ok(dir) = persistent_config_dir() else {
+        return;
+    };
+
+    let last_model_path = dir.join("last_model.txt");
+    if let Some(last_model) = read_nonempty_string(&last_model_path) {
+        if let Some(rewritten) = rewrite_legacy_custom_model_ref(&last_model, providers) {
+            let _ = std::fs::write(&last_model_path, rewritten);
+        }
+    }
+
+    let defaults_path = dir.join("model_defaults.json");
+    let Some(mut defaults) = std::fs::read_to_string(&defaults_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
+    else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(rewritten) = rewrite_legacy_custom_model_ref(&defaults.main_model, providers) {
+        defaults.main_model = rewritten;
+        changed = true;
+    }
+    if let Some(rewritten) = rewrite_legacy_custom_model_ref(&defaults.plan_model, providers) {
+        defaults.plan_model = rewritten;
+        changed = true;
+    }
+    for model_id in defaults.subagent_models.values_mut() {
+        if let Some(rewritten) = rewrite_legacy_custom_model_ref(model_id, providers) {
+            *model_id = rewritten;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(json) = serde_json::to_string_pretty(&defaults) {
+            let _ = std::fs::write(&defaults_path, json);
+        }
+    }
+}
+
+fn write_custom_providers_file(providers: &[CustomProvider]) -> Result<(), String> {
+    let path = custom_providers_path()?;
+    let file = CustomProvidersFile {
+        version: CUSTOM_PROVIDERS_FILE_VERSION,
+        providers: providers.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("Failed to serialize custom providers: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to save custom providers: {e}"))
+}
+
+/// Load providers (keys NOT filled in). Lazily migrates custom_endpoints.json
+/// on first read; the legacy file is left in place so downgrades still work.
+pub(crate) fn load_custom_providers() -> Result<Vec<CustomProvider>, String> {
+    let path = custom_providers_path()?;
+    if path.exists() {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read custom providers: {e}"))?;
+        let mut file: CustomProvidersFile = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse custom providers: {e}"))?;
+        for provider in &mut file.providers {
+            normalize_custom_provider_config(provider);
+        }
+        return Ok(file.providers);
+    }
+
+    let legacy_path = persistent_config_dir()?.join("custom_endpoints.json");
+    let endpoints: Vec<CustomEndpoint> = std::fs::read_to_string(&legacy_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let providers: Vec<CustomProvider> = endpoints
+        .into_iter()
+        .map(migrate_endpoint_to_provider)
+        .collect();
+    if !providers.is_empty() {
+        if let Err(error) = write_custom_providers_file(&providers) {
+            eprintln!("[Locus] custom provider migration write failed: {error}");
+        } else {
+            rewrite_legacy_custom_model_refs(&providers);
+        }
+    }
+    Ok(providers)
+}
+
+/// Resolve `custom/<provider_id>/<model_row_id>` (or the legacy
+/// `custom/<endpoint_id>`, which maps to the provider's first model).
+pub(crate) fn find_custom_provider_model(
+    model_id: &str,
+) -> Result<Option<(CustomProvider, CustomProviderModel)>, String> {
+    let Some(rest) = model_id.trim().strip_prefix("custom/") else {
+        return Ok(None);
+    };
+    let (provider_id, model_row_id) = match rest.split_once('/') {
+        Some((pid, mid)) => (pid, Some(mid)),
+        None => (rest, None),
+    };
+    let providers = load_custom_providers()?;
+    let Some(provider) = providers.into_iter().find(|p| p.id == provider_id) else {
+        return Ok(None);
+    };
+    let model = match model_row_id {
+        Some(mid) => provider.models.iter().find(|m| m.id == mid).cloned(),
+        None => provider.models.first().cloned(),
+    };
+    Ok(model.map(|m| (provider, m)))
+}
+
+fn valid_custom_model_refs(providers: &[CustomProvider]) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for provider in providers {
+        // Legacy single-segment references stay valid while the provider exists.
+        refs.insert(provider.id.clone());
+        for model in &provider.models {
+            refs.insert(format!("{}/{}", provider.id, model.id));
+        }
+    }
+    refs
+}
+
+#[tauri::command]
+pub async fn get_custom_providers() -> Result<Vec<CustomProvider>, AppError> {
+    let mut providers = load_custom_providers()?;
+    for provider in &mut providers {
+        if let Ok(Some(key)) = keychain::get_secret(&keychain::endpoint_key_name(&provider.id)) {
+            provider.api_key = key;
+        }
+    }
+    Ok(providers)
+}
+
+#[tauri::command]
+pub async fn save_custom_providers(providers: Vec<CustomProvider>) -> Result<(), AppError> {
+    let previous_ids: HashSet<String> = load_custom_providers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+
+    let mut normalized = providers;
+    for provider in &mut normalized {
+        normalize_custom_provider_config(provider);
+        if !provider.api_key.is_empty() {
+            keychain::set_secret(
+                &keychain::endpoint_key_name(&provider.id),
+                &provider.api_key,
+            )?;
+        } else {
+            let _ = keychain::delete_secret(&keychain::endpoint_key_name(&provider.id));
+        }
+        provider.api_key = String::new();
+    }
+
+    write_custom_providers_file(&normalized)?;
+
+    let next_ids: HashSet<String> = normalized.iter().map(|p| p.id.clone()).collect();
+    for stale in previous_ids.difference(&next_ids) {
+        let _ = keychain::delete_secret(&keychain::endpoint_key_name(stale));
+    }
+    prune_stale_custom_model_refs(&valid_custom_model_refs(&normalized))?;
+    Ok(())
 }
 
 fn truncate_str(s: &str, max: usize) -> &str {
@@ -2615,7 +2901,7 @@ pub async fn reset_all_config(
         }
     }
 
-    // Clear keychain secrets: custom endpoint API keys
+    // Clear keychain secrets: custom endpoint/provider API keys
     let ep_path = custom_endpoints_path(&app_handle)
         .unwrap_or_else(|_| data_dir.join("custom_endpoints.json"));
     if let Ok(content) = std::fs::read_to_string(&ep_path) {
@@ -2623,6 +2909,11 @@ pub async fn reset_all_config(
             for ep in &endpoints {
                 let _ = keychain::delete_secret(&keychain::endpoint_key_name(&ep.id));
             }
+        }
+    }
+    if let Ok(providers) = load_custom_providers() {
+        for provider in &providers {
+            let _ = keychain::delete_secret(&keychain::endpoint_key_name(&provider.id));
         }
     }
 
@@ -2655,6 +2946,8 @@ pub async fn reset_all_config(
             "codex_fast_mode.txt",
             "model_defaults.json",
             "custom_endpoints.json",
+            "custom_providers.json",
+            "model_catalog.json",
             "codex_model_config.json",
             crate::python_runtime::config_file_name(),
         ] {
@@ -2729,10 +3022,12 @@ pub async fn get_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_dir_entries, normalize_custom_endpoint_config,
+        collect_dir_entries, is_stale_custom_model_ref, migrate_endpoint_to_provider,
+        normalize_custom_endpoint_config, normalize_custom_provider_config,
         normalize_tool_permission_mode_request, normalize_workspace_sub_path,
-        resolve_workspace_dir_target, search_workspace_entries_in_dir,
-        workspace_entry_stat_for_path, workspace_search_score, CustomEndpoint,
+        resolve_workspace_dir_target, rewrite_legacy_custom_model_ref,
+        search_workspace_entries_in_dir, valid_custom_model_refs, workspace_entry_stat_for_path,
+        workspace_search_score, ApiFormat, CustomEndpoint, CustomProvider, CustomProviderModel,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -3088,5 +3383,130 @@ mod tests {
             .iter()
             .any(|entry| entry.rel_path == "Assets/Loop" && entry.is_dir));
         assert!(results.len() < 20);
+    }
+
+    fn legacy_endpoint(id: &str, api_model: &str) -> CustomEndpoint {
+        serde_json::from_str(&format!(
+            r#"{{
+                "id": "{id}",
+                "name": "My DeepSeek",
+                "apiModel": "{api_model}",
+                "endpoint": "https://api.deepseek.com",
+                "apiFormat": "openai_chat",
+                "contextLength": 131072,
+                "betaFlags": ["flag-a"],
+                "supportedReasoningEfforts": ["low", "high"],
+                "replayReasoningContent": true,
+                "supportsVision": false
+            }}"#
+        ))
+        .expect("legacy endpoint json")
+    }
+
+    #[test]
+    fn migrating_endpoint_keeps_id_and_model_settings() {
+        let provider = migrate_endpoint_to_provider(legacy_endpoint("ep-1", "deepseek-chat"));
+
+        assert_eq!(provider.id, "ep-1");
+        assert_eq!(provider.name, "My DeepSeek");
+        assert_eq!(provider.endpoint, "https://api.deepseek.com");
+        assert_eq!(provider.api_format, ApiFormat::OpenaiChat);
+        assert_eq!(provider.models.len(), 1);
+
+        let model = &provider.models[0];
+        assert_eq!(model.id, "deepseek-chat");
+        assert_eq!(model.api_model, "deepseek-chat");
+        assert_eq!(model.context_length, 131_072);
+        assert_eq!(model.beta_flags, vec!["flag-a".to_string()]);
+        assert_eq!(
+            model.supported_reasoning_efforts,
+            vec!["low".to_string(), "high".to_string()]
+        );
+        assert_eq!(model.replay_reasoning_content, Some(true));
+        assert!(model.reasoning_replay_field.is_none());
+        assert!(!model.supports_vision);
+    }
+
+    #[test]
+    fn migrating_endpoint_slugifies_api_model_with_slash() {
+        let provider = migrate_endpoint_to_provider(legacy_endpoint("ep-2", "zai-org/GLM-5.2"));
+        assert_eq!(provider.models[0].id, "zai-org-GLM-5.2");
+        assert_eq!(provider.models[0].api_model, "zai-org/GLM-5.2");
+    }
+
+    fn provider_with_models(id: &str, model_ids: &[&str]) -> CustomProvider {
+        CustomProvider {
+            id: id.to_string(),
+            name: id.to_string(),
+            endpoint: "https://example.com/v1".to_string(),
+            api_format: ApiFormat::OpenaiChat,
+            api_key: String::new(),
+            catalog_id: None,
+            models: model_ids
+                .iter()
+                .map(|mid| CustomProviderModel {
+                    id: mid.to_string(),
+                    api_model: mid.to_string(),
+                    name: mid.to_string(),
+                    context_length: 128_000,
+                    beta_flags: Vec::new(),
+                    supported_reasoning_efforts: vec!["high".to_string()],
+                    reasoning_param_format: None,
+                    replay_reasoning_content: None,
+                    reasoning_replay_field: None,
+                    server_tools: Default::default(),
+                    supports_vision: true,
+                    catalog_model_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn normalize_provider_dedupes_row_ids_and_fills_defaults() {
+        let mut provider = provider_with_models("prov", &["m", "m", ""]);
+        provider.models[2].api_model = "  ".to_string();
+        normalize_custom_provider_config(&mut provider);
+
+        assert_eq!(provider.models[0].id, "m");
+        assert_eq!(provider.models[1].id, "m-2");
+        assert_eq!(provider.models[2].id, "model");
+        assert_eq!(
+            provider.models[0].reasoning_param_format,
+            Some(super::CustomReasoningParamFormat::OpenaiChatReasoningEffort)
+        );
+        assert_eq!(provider.models[0].replay_reasoning_content, Some(true));
+    }
+
+    #[test]
+    fn legacy_custom_refs_rewrite_to_first_model() {
+        let providers = vec![provider_with_models("ep-1", &["chat", "reasoner"])];
+
+        assert_eq!(
+            rewrite_legacy_custom_model_ref("custom/ep-1", &providers),
+            Some("custom/ep-1/chat".to_string())
+        );
+        // Already two-segment or unknown ids stay untouched.
+        assert_eq!(
+            rewrite_legacy_custom_model_ref("custom/ep-1/reasoner", &providers),
+            None
+        );
+        assert_eq!(rewrite_legacy_custom_model_ref("custom/ghost", &providers), None);
+        assert_eq!(
+            rewrite_legacy_custom_model_ref("openrouter/claude-fable-5", &providers),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_pruning_accepts_both_legacy_and_two_segment_refs() {
+        let providers = vec![provider_with_models("ep-1", &["chat"])];
+        let valid = valid_custom_model_refs(&providers);
+
+        assert!(!is_stale_custom_model_ref("custom/ep-1", &valid));
+        assert!(!is_stale_custom_model_ref("custom/ep-1/chat", &valid));
+        assert!(is_stale_custom_model_ref("custom/ep-1/ghost", &valid));
+        assert!(is_stale_custom_model_ref("custom/ghost", &valid));
+        assert!(!is_stale_custom_model_ref("openrouter/claude-fable-5", &valid));
     }
 }

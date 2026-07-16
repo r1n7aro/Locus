@@ -455,6 +455,9 @@ pub enum LlmBackend {
         supported_reasoning_efforts: Vec<String>,
         reasoning_param_format: crate::commands::CustomReasoningParamFormat,
         replay_reasoning_content: bool,
+        /// Explicit message-level replay field (models.dev `interleaved.field`);
+        /// None falls back to model-name flavor detection.
+        reasoning_replay_field: Option<crate::commands::ReasoningReplayField>,
         server_tools: crate::commands::CustomEndpointServerTools,
         supports_vision: bool,
     },

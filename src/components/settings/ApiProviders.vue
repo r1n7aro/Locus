@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
+import BaseSwitch from "../ui/BaseSwitch.vue";
 import { computed } from "vue";
 import { locale, t } from "../../i18n";
 import type {
   ModelOption,
-  CustomEndpoint,
+  CustomProvider,
   ApiFormat,
   CodexTransportMode,
 } from "../../types";
@@ -46,12 +47,14 @@ const props = defineProps<{
   codexTransport: CodexTransportMode;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
   dynamicToolLoadingBusy?: boolean;
+  anthropicNativeLazyEnabled?: boolean;
+  anthropicNativeLazyBusy?: boolean;
   codexUserCode: string;
   codexUrl: string;
   codexCodeCopied: boolean;
   allModels: ModelOption[];
-  customEndpoints: CustomEndpoint[];
-  customEndpointSaving?: boolean;
+  customProviders: CustomProvider[];
+  customProviderSaving?: boolean;
   claudeCodeTestStatus?: "idle" | "testing" | "success" | "error";
   claudeCodeTestResult?: string;
   mode?: "full" | "onboarding";
@@ -81,9 +84,10 @@ const emit = defineEmits<{
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
-  startAddEndpoint: [];
-  startEditEndpoint: [ep: CustomEndpoint];
-  deleteEndpoint: [id: string];
+  "update:anthropicNativeLazyEnabled": [value: boolean];
+  startAddProvider: [];
+  startEditProvider: [provider: CustomProvider];
+  deleteProvider: [id: string];
   testClaudeCode: [];
   "update:editKey": [value: string];
   "update:oauthCode": [value: string];
@@ -162,6 +166,13 @@ function formatLabel(fmt: ApiFormat): string {
   }
 }
 
+function customProviderModelSummary(provider: CustomProvider): string {
+  const names = provider.models.map((model) => model.apiModel).filter(Boolean);
+  if (names.length === 0) return t("settings.custom.noModels");
+  const shown = names.slice(0, 3).join(", ");
+  return names.length > 3 ? `${shown} +${names.length - 3}` : shown;
+}
+
 const codexTransportOptions = [
   {
     value: "http",
@@ -176,6 +187,11 @@ const codexTransportOptions = [
 ] satisfies Array<{ value: CodexTransportMode; label: string; hint: string }>;
 
 const dynamicToolLoadingOptions = [
+  {
+    value: "native",
+    label: t("settings.dynamicToolLoading.native"),
+    hint: t("settings.dynamicToolLoading.nativeDesc"),
+  },
   {
     value: "metaTool",
     label: t("settings.dynamicToolLoading.metaTool"),
@@ -193,7 +209,10 @@ function updateCodexTransport(value: string) {
 }
 
 function updateDynamicToolLoadingMode(value: string) {
-  emit("update:dynamicToolLoadingMode", value === "direct" ? "direct" : "metaTool");
+  emit(
+    "update:dynamicToolLoadingMode",
+    value === "direct" || value === "native" ? value : "metaTool",
+  );
 }
 
 function focusSectionClass(section: "custom" | "codex") {
@@ -343,9 +362,11 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           <span class="provider-name">{{ t("settings.dynamicToolLoading.mode") }}</span>
           <span class="provider-desc">
             {{
-              dynamicToolLoadingMode === "direct"
-                ? t("settings.dynamicToolLoading.directDesc")
-                : t("settings.dynamicToolLoading.metaToolDesc")
+              dynamicToolLoadingMode === "native"
+                ? t("settings.dynamicToolLoading.nativeDesc")
+                : dynamicToolLoadingMode === "direct"
+                  ? t("settings.dynamicToolLoading.directDesc")
+                  : t("settings.dynamicToolLoading.metaToolDesc")
             }}
           </span>
         </div>
@@ -414,6 +435,19 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
             {{ t("settings.anthropic.logout") }}
           </BaseButton>
         </div>
+      </div>
+
+      <div class="provider-detail anthropic-lazy-detail">
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.anthropic.nativeLazyTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.anthropic.nativeLazyDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="anthropicNativeLazyEnabled ?? true"
+          :disabled="anthropicNativeLazyBusy"
+          :aria-label="t('settings.anthropic.nativeLazyTitle')"
+          @update:model-value="emit('update:anthropicNativeLazyEnabled', $event)"
+        />
       </div>
 
       <div
@@ -824,28 +858,30 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     <div class="section-label">{{ t("settings.custom.title") }}</div>
     <p class="section-desc">{{ t("settings.custom.desc") }}</p>
 
-    <div v-if="customEndpoints.length > 0" class="custom-endpoints-list">
+    <div v-if="customProviders.length > 0" class="custom-endpoints-list">
       <div
-        v-for="ep in customEndpoints"
-        :key="ep.id"
+        v-for="cp in customProviders"
+        :key="cp.id"
         class="provider-card"
       >
         <div class="provider-header">
           <div class="provider-info">
-            <span class="provider-name">{{ ep.name }}</span>
-            <span class="provider-desc">{{ ep.apiModel }} · {{ formatLabel(ep.apiFormat) }}</span>
+            <span class="provider-name">{{ cp.name }}</span>
+            <span class="provider-desc">
+              {{ t("settings.custom.modelCount", String(cp.models.length)) }} · {{ formatLabel(cp.apiFormat) }}
+            </span>
           </div>
-          <span class="provider-status active">{{ ep.endpoint }}</span>
+          <span class="provider-status active">{{ cp.endpoint }}</span>
         </div>
         <div class="provider-detail">
-          <span class="key-hint mono">{{ ep.apiKey ? ep.apiKey.slice(0, 8) + '...' : '(no key)' }}</span>
+          <span class="key-hint mono">{{ customProviderModelSummary(cp) }}</span>
           <div class="provider-actions">
             <BaseButton
               variant="neutral"
               size="sm"
               type="button"
-              :disabled="customEndpointSaving"
-              @click="emit('startEditEndpoint', ep)"
+              :disabled="customProviderSaving"
+              @click="emit('startEditProvider', cp)"
             >
               {{ t("settings.custom.edit") }}
             </BaseButton>
@@ -853,8 +889,8 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
               variant="danger"
               size="sm"
               type="button"
-              :disabled="customEndpointSaving"
-              @click="emit('deleteEndpoint', ep.id)"
+              :disabled="customProviderSaving"
+              @click="emit('deleteProvider', cp.id)"
             >
               {{ t("settings.custom.delete") }}
             </BaseButton>
@@ -864,16 +900,14 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
     <p v-else class="section-desc" style="opacity:0.5;">{{ t("settings.custom.noEndpoints") }}</p>
 
-    <BaseButton
-      variant="neutral"
-      size="sm"
-      style="margin-top: 8px;"
+    <button
+      class="add-provider-cta"
       type="button"
-      :disabled="customEndpointSaving"
-      @click="emit('startAddEndpoint')"
+      :disabled="customProviderSaving"
+      @click="emit('startAddProvider')"
     >
-      + {{ t("settings.custom.add") }}
-    </BaseButton>
+      + {{ t("settings.custom.addProvider") }}
+    </button>
   </div>
   </div>
 </template>
@@ -1305,6 +1339,34 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* Full-width dashed "add" affordance, matching the provider cards' shape. */
+.add-provider-cta {
+  width: 100%;
+  margin-top: 10px;
+  padding: 13px 16px;
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.add-provider-cta:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  color: var(--accent-color);
+  background: color-mix(in srgb, transparent 92%, var(--accent-soft) 8%);
+}
+
+.add-provider-cta:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .available-models-grid {

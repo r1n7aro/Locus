@@ -33,12 +33,16 @@ import {
   saveModelDefaults as serviceSaveModelDefaults,
   getCodexModelConfig,
   saveCodexModelConfig as serviceSaveCodexModelConfig,
-  getCustomEndpoints,
-  saveCustomEndpoints,
+  getCustomProviders,
+  saveCustomProviders,
   testCustomEndpoint,
+  getModelCatalog,
+  refreshModelCatalog,
 } from "../services/model";
 import {
+  getAnthropicNativeLazyEnabled,
   getDynamicToolLoadingMode,
+  setAnthropicNativeLazyEnabled as serviceSetAnthropicNativeLazyEnabled,
   setDynamicToolLoadingMode as serviceSetDynamicToolLoadingMode,
   type DynamicToolLoadingMode,
 } from "../services/system";
@@ -59,18 +63,27 @@ import { useNotificationStore } from "../stores/notification";
 import type {
   ModelDefaults,
   CustomEndpoint,
+  CustomProvider,
+  CustomProviderModel,
   EffortLevel,
   ApiFormat,
-  ReasoningParamFormat,
+  ModelCatalogResponse,
   CodexTransportMode,
   CodexModelConfig,
 } from "../types";
+import {
+  DEFAULT_CATALOG_CONTEXT_LENGTH,
+  DEFAULT_REASONING_EFFORTS,
+  defaultReasoningParamFormat,
+  modelRowIdFromApiModel,
+  newCustomProvider,
+} from "../services/modelCatalog";
 import { t } from "../i18n";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { useCopyFeedback } from "./useCopyFeedback";
 import { setThemePreference } from "./useTheme";
 
-const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH = 256_000;
+const DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH = DEFAULT_CATALOG_CONTEXT_LENGTH;
 
 export interface ProviderStatus {
   id: string;
@@ -146,7 +159,7 @@ type SettingsEmit = {
   (e: "authChanged"): void;
   (e: "modelDefaultsChanged", defaults: ModelDefaults): void;
   (e: "codexTransportChanged", config: CodexModelConfig): void;
-  (e: "customEndpointsChanged", endpoints: CustomEndpoint[]): void;
+  (e: "customProvidersChanged", providers: CustomProvider[]): void;
   (e: "resetOnboarding"): void;
 };
 
@@ -384,15 +397,15 @@ export function useSettingsState(emit: SettingsEmit) {
     permSaveMsg.value = "";
     dynamicToolLoadingMode.value = "metaTool";
     dynamicToolLoadingBusy.value = false;
-    customEndpoints.value = [];
-    editingEndpoint.value = null;
-    isAddingEndpoint.value = false;
-    customEndpointSaving.value = false;
+    customProviders.value = [];
+    editingCustomProvider.value = null;
+    isAddingCustomProvider.value = false;
+    customProviderSaving.value = false;
     testStatus.value = "idle";
     testResult.value = "";
     emit("authChanged");
     emit("modelDefaultsChanged", emptyDefaults);
-    emit("customEndpointsChanged", []);
+    emit("customProvidersChanged", []);
     emit("resetOnboarding");
   }
 
@@ -661,7 +674,8 @@ export function useSettingsState(emit: SettingsEmit) {
   const dynamicToolLoadingBusy = ref(false);
 
   function normalizeDynamicToolLoadingMode(value: string): DynamicToolLoadingMode {
-    return value === "direct" ? "direct" : "metaTool";
+    if (value === "direct" || value === "native") return value;
+    return "metaTool";
   }
 
   async function loadDynamicToolLoadingMode() {
@@ -696,6 +710,44 @@ export function useSettingsState(emit: SettingsEmit) {
       });
     } finally {
       dynamicToolLoadingBusy.value = false;
+    }
+  }
+
+  // ── Anthropic endpoint: native lazy tool loading ────────────────────
+  const anthropicNativeLazyEnabled = ref(true);
+  const anthropicNativeLazyBusy = ref(false);
+
+  async function loadAnthropicNativeLazyEnabled() {
+    try {
+      anthropicNativeLazyEnabled.value = await getAnthropicNativeLazyEnabled();
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.anthropic.nativeLazyLoadFailed", err.message), {
+        code: err.code,
+        operation: "loadAnthropicNativeLazyEnabled",
+        skipConsoleLog: true,
+      });
+    }
+  }
+
+  async function setAnthropicNativeLazyEnabled(value: boolean) {
+    if (anthropicNativeLazyEnabled.value === value) return;
+    const previous = anthropicNativeLazyEnabled.value;
+    anthropicNativeLazyEnabled.value = value;
+    anthropicNativeLazyBusy.value = true;
+    try {
+      await serviceSetAnthropicNativeLazyEnabled(value);
+      successMsg.value = t("settings.dynamicToolLoading.saved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      anthropicNativeLazyEnabled.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.anthropic.nativeLazySaveFailed", err.message), {
+        code: err.code,
+        operation: "saveAnthropicNativeLazyEnabled",
+      });
+    } finally {
+      anthropicNativeLazyBusy.value = false;
     }
   }
 
@@ -1162,26 +1214,21 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
-  // ── Custom endpoints ─────────────────────────────────────────────────
-  const customEndpoints = ref<CustomEndpoint[]>([]);
-  const editingEndpoint = ref<CustomEndpoint | null>(null);
-  const isAddingEndpoint = ref(false);
-  const customEndpointSaving = ref(false);
+  // ── Custom providers ─────────────────────────────────────────
+  const customProviders = ref<CustomProvider[]>([]);
+  const editingCustomProvider = ref<CustomProvider | null>(null);
+  const isAddingCustomProvider = ref(false);
+  const customProviderSaving = ref(false);
   const testStatus = ref<"idle" | "testing" | "success" | "error">("idle");
   const testResult = ref("");
-  const defaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+  const modelCatalog = ref<ModelCatalogResponse | null>(null);
+  const modelCatalogLoading = ref(false);
+  const modelCatalogRefreshing = ref(false);
+  const defaultReasoningEfforts: EffortLevel[] = DEFAULT_REASONING_EFFORTS;
   const legacyDefaultReasoningEfforts: EffortLevel[] = ["low", "medium", "high", "max"];
   const reasoningEffortSet = new Set<EffortLevel>(["none", "low", "medium", "high", "xhigh", "max"]);
-  let customEndpointMutationQueue: Promise<void> = Promise.resolve();
-  let pendingCustomEndpointMutations = 0;
-
-  function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
-    switch (apiFormat) {
-      case "openai_responses": return "openai_responses_reasoning_effort";
-      case "anthropic_messages": return "anthropic_thinking";
-      default: return "openai_chat_reasoning_effort";
-    }
-  }
+  let customProviderMutationQueue: Promise<void> = Promise.resolve();
+  let pendingCustomProviderMutations = 0;
 
   function normalizeReasoningEfforts(values?: EffortLevel[] | null): EffortLevel[] {
     const normalized = Array.isArray(values)
@@ -1197,173 +1244,223 @@ export function useSettingsState(emit: SettingsEmit) {
     return a.length === b.length && a.every((value, index) => value === b[index]);
   }
 
-  function defaultReplayReasoningContent(ep: CustomEndpoint): boolean {
-    return ep.apiFormat === "openai_chat";
-  }
-
-  function normalizeServerTools(value?: Partial<CustomEndpoint["serverTools"]> | null): CustomEndpoint["serverTools"] {
+  function normalizeServerTools(
+    value?: Partial<CustomProviderModel["serverTools"]> | null,
+  ): CustomProviderModel["serverTools"] {
     return {
       webSearch: value?.webSearch === true,
     };
   }
 
-  function normalizeCustomEndpoint(ep: CustomEndpoint): CustomEndpoint {
+  function normalizeProviderModel(
+    model: CustomProviderModel,
+    apiFormat: ApiFormat,
+  ): CustomProviderModel {
     return {
-      ...ep,
-      contextLength: Number.isFinite(ep.contextLength) && ep.contextLength > 0
-        ? ep.contextLength
+      ...model,
+      id: model.id?.trim() ? model.id.trim() : modelRowIdFromApiModel(model.apiModel),
+      name: model.name?.trim() ? model.name : model.apiModel,
+      contextLength: Number.isFinite(model.contextLength) && model.contextLength > 0
+        ? model.contextLength
         : DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
-      betaFlags: [...(ep.betaFlags ?? [])],
-      supportedReasoningEfforts: normalizeReasoningEfforts(ep.supportedReasoningEfforts),
-      reasoningParamFormat: ep.reasoningParamFormat ?? defaultReasoningParamFormat(ep.apiFormat),
-      replayReasoningContent: typeof ep.replayReasoningContent === "boolean"
-        ? ep.replayReasoningContent
-        : defaultReplayReasoningContent(ep),
-      serverTools: normalizeServerTools(ep.serverTools),
-      supportsToolLazyLoading: false,
-      supportsVision: ep.supportsVision !== false,
+      betaFlags: [...(model.betaFlags ?? [])],
+      supportedReasoningEfforts: normalizeReasoningEfforts(model.supportedReasoningEfforts),
+      reasoningParamFormat: model.reasoningParamFormat ?? defaultReasoningParamFormat(apiFormat),
+      replayReasoningContent: typeof model.replayReasoningContent === "boolean"
+        ? model.replayReasoningContent
+        : apiFormat === "openai_chat",
+      reasoningReplayField: model.reasoningReplayField ?? null,
+      serverTools: normalizeServerTools(model.serverTools),
+      supportsVision: model.supportsVision !== false,
     };
   }
 
-  function applyLoadedCustomEndpoints(endpoints: CustomEndpoint[]): CustomEndpoint[] {
-    const normalized = endpoints.map(normalizeCustomEndpoint);
-    customEndpoints.value = normalized;
-    setWarmup("settings:customEndpoints", normalized);
+  function normalizeCustomProvider(provider: CustomProvider): CustomProvider {
+    return {
+      ...provider,
+      models: (provider.models ?? []).map((model) =>
+        normalizeProviderModel(model, provider.apiFormat),
+      ),
+    };
+  }
+
+  /** Legacy single-model endpoint (e.g. Claude Code token import) mapped onto a provider. */
+  function endpointToProvider(ep: CustomEndpoint): CustomProvider {
+    return normalizeCustomProvider({
+      id: ep.id,
+      name: ep.name,
+      endpoint: ep.endpoint,
+      apiFormat: ep.apiFormat,
+      apiKey: ep.apiKey,
+      catalogId: null,
+      models: [{
+        id: modelRowIdFromApiModel(ep.apiModel),
+        apiModel: ep.apiModel,
+        name: ep.apiModel,
+        contextLength: ep.contextLength,
+        betaFlags: [...(ep.betaFlags ?? [])],
+        supportedReasoningEfforts: ep.supportedReasoningEfforts,
+        reasoningParamFormat: ep.reasoningParamFormat ?? null,
+        replayReasoningContent: ep.replayReasoningContent,
+        reasoningReplayField: null,
+        serverTools: normalizeServerTools(ep.serverTools),
+        supportsVision: ep.supportsVision !== false,
+      }],
+    });
+  }
+
+  function applyLoadedCustomProviders(providers: CustomProvider[]): CustomProvider[] {
+    const normalized = providers.map(normalizeCustomProvider);
+    customProviders.value = normalized;
+    setWarmup("settings:customProviders", normalized);
     return normalized;
   }
 
-  async function reloadCustomEndpointsAfterMutation() {
-    const latest = applyLoadedCustomEndpoints(await getCustomEndpoints());
-    emit("customEndpointsChanged", latest);
+  async function reloadCustomProvidersAfterMutation() {
+    const latest = applyLoadedCustomProviders(await getCustomProviders());
+    emit("customProvidersChanged", latest);
     return latest;
   }
 
-  function enqueueCustomEndpointMutation(task: () => Promise<void>): Promise<void> {
-    pendingCustomEndpointMutations += 1;
-    customEndpointSaving.value = true;
-    const run = customEndpointMutationQueue
+  function enqueueCustomProviderMutation(task: () => Promise<void>): Promise<void> {
+    pendingCustomProviderMutations += 1;
+    customProviderSaving.value = true;
+    const run = customProviderMutationQueue
       .catch(() => undefined)
       .then(task)
       .finally(() => {
-        pendingCustomEndpointMutations = Math.max(0, pendingCustomEndpointMutations - 1);
-        if (pendingCustomEndpointMutations === 0) {
-          customEndpointSaving.value = false;
+        pendingCustomProviderMutations = Math.max(0, pendingCustomProviderMutations - 1);
+        if (pendingCustomProviderMutations === 0) {
+          customProviderSaving.value = false;
         }
       });
-    customEndpointMutationQueue = run;
+    customProviderMutationQueue = run;
     return run;
   }
 
   async function saveImportedClaudeCodeCustomEndpoint(endpoint: CustomEndpoint) {
-    const ep = normalizeCustomEndpoint(endpoint);
-    await enqueueCustomEndpointMutation(async () => {
-      const list = [...customEndpoints.value];
-      const idx = list.findIndex((existing) => existing.id === ep.id);
+    const provider = endpointToProvider(endpoint);
+    await enqueueCustomProviderMutation(async () => {
+      const list = [...customProviders.value];
+      const idx = list.findIndex((existing) => existing.id === provider.id);
       if (idx >= 0) {
-        list[idx] = ep;
+        list[idx] = provider;
       } else {
-        list.push(ep);
+        list.push(provider);
       }
 
-      await saveCustomEndpoints(list);
-      await reloadCustomEndpointsAfterMutation();
+      await saveCustomProviders(list);
+      await reloadCustomProvidersAfterMutation();
     });
   }
 
-  function newEmptyEndpoint(): CustomEndpoint {
-    const apiFormat: ApiFormat = "openai_chat";
-    return {
-      id: crypto.randomUUID(),
-      name: "",
-      apiModel: "",
-      endpoint: "",
-      apiFormat,
-      apiKey: "",
-      contextLength: DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
-      betaFlags: [],
-      supportedReasoningEfforts: [...defaultReasoningEfforts],
-      reasoningParamFormat: defaultReasoningParamFormat(apiFormat),
-      replayReasoningContent: true,
-      serverTools: normalizeServerTools(),
-      supportsToolLazyLoading: false,
-      supportsVision: true,
-    };
-  }
-
-  async function loadCustomEndpoints() {
+  async function loadCustomProviders() {
     try {
-      applyLoadedCustomEndpoints(await getCustomEndpoints());
+      applyLoadedCustomProviders(await getCustomProviders());
     } catch (e) {
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("settings.custom.loadFailed", err.message), {
         code: err.code,
-        operation: "loadCustomEndpoints",
+        operation: "loadCustomProviders",
       });
     }
   }
 
-  function startAddEndpoint() {
-    editingEndpoint.value = newEmptyEndpoint();
-    isAddingEndpoint.value = true;
+  async function loadModelCatalog(force = false) {
+    if (modelCatalog.value && !force) return;
+    modelCatalogLoading.value = true;
+    try {
+      modelCatalog.value = await getModelCatalog();
+    } catch (e) {
+      console.warn("[settings] get_model_catalog:", e);
+    } finally {
+      modelCatalogLoading.value = false;
+    }
+  }
+
+  async function refreshCatalog() {
+    modelCatalogRefreshing.value = true;
+    try {
+      modelCatalog.value = await refreshModelCatalog();
+      successMsg.value = t("settings.custom.catalogRefreshed");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.custom.catalogRefreshFailed", err.message), {
+        code: err.code,
+        operation: "refreshModelCatalog",
+      });
+    } finally {
+      modelCatalogRefreshing.value = false;
+    }
+  }
+
+  function startAddCustomProvider() {
+    editingCustomProvider.value = newCustomProvider();
+    isAddingCustomProvider.value = true;
     testStatus.value = "idle";
     testResult.value = "";
   }
 
-  function startEditEndpoint(ep: CustomEndpoint) {
-    editingEndpoint.value = normalizeCustomEndpoint(ep);
-    isAddingEndpoint.value = false;
+  function startEditCustomProvider(provider: CustomProvider) {
+    editingCustomProvider.value = normalizeCustomProvider(
+      JSON.parse(JSON.stringify(provider)) as CustomProvider,
+    );
+    isAddingCustomProvider.value = false;
     testStatus.value = "idle";
     testResult.value = "";
   }
 
-  function cancelEditEndpoint() {
-    editingEndpoint.value = null;
-    isAddingEndpoint.value = false;
+  function cancelEditCustomProvider() {
+    editingCustomProvider.value = null;
+    isAddingCustomProvider.value = false;
   }
 
-  async function saveEndpoint() {
-    if (!editingEndpoint.value) return;
-    const ep = normalizeCustomEndpoint(editingEndpoint.value);
-    if (!ep.name.trim()) { errorMsg.value = t("settings.custom.nameRequired"); return; }
-    if (!ep.apiModel.trim()) { errorMsg.value = t("settings.custom.apiModelRequired"); return; }
-    if (!ep.endpoint.trim()) { errorMsg.value = t("settings.custom.endpointRequired"); return; }
+  async function saveCustomProvider() {
+    if (!editingCustomProvider.value) return;
+    const provider = normalizeCustomProvider(editingCustomProvider.value);
+    if (!provider.name.trim()) { errorMsg.value = t("settings.custom.nameRequired"); return; }
+    if (!provider.endpoint.trim()) { errorMsg.value = t("settings.custom.endpointRequired"); return; }
+    const models = provider.models.filter((model) => model.apiModel.trim());
+    if (models.length === 0) { errorMsg.value = t("settings.custom.apiModelRequired"); return; }
+    provider.models = models;
     errorMsg.value = "";
 
-    await enqueueCustomEndpointMutation(async () => {
-      const list = [...customEndpoints.value];
-      const idx = list.findIndex(e => e.id === ep.id);
+    await enqueueCustomProviderMutation(async () => {
+      const list = [...customProviders.value];
+      const idx = list.findIndex((p) => p.id === provider.id);
       if (idx >= 0) {
-        list[idx] = ep;
+        list[idx] = provider;
       } else {
-        list.push(ep);
+        list.push(provider);
       }
 
       try {
-        await saveCustomEndpoints(list);
-        await reloadCustomEndpointsAfterMutation();
-        editingEndpoint.value = null;
-        isAddingEndpoint.value = false;
+        await saveCustomProviders(list);
+        await reloadCustomProvidersAfterMutation();
+        editingCustomProvider.value = null;
+        isAddingCustomProvider.value = false;
         successMsg.value = t("settings.custom.saved");
         setTimeout(() => { successMsg.value = ""; }, 2000);
       } catch (e) {
         const err = normalizeAppError(e);
         useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
           code: err.code,
-          operation: "saveEndpoint",
+          operation: "saveCustomProvider",
         });
       }
     });
   }
 
-  async function deleteEndpoint(id: string) {
-    await enqueueCustomEndpointMutation(async () => {
-      const list = customEndpoints.value.filter(e => e.id !== id);
+  async function deleteCustomProvider(id: string) {
+    await enqueueCustomProviderMutation(async () => {
+      const list = customProviders.value.filter((p) => p.id !== id);
       try {
-        await saveCustomEndpoints(list);
-        await reloadCustomEndpointsAfterMutation();
-        if (editingEndpoint.value?.id === id) {
-          editingEndpoint.value = null;
-          isAddingEndpoint.value = false;
+        await saveCustomProviders(list);
+        await reloadCustomProvidersAfterMutation();
+        if (editingCustomProvider.value?.id === id) {
+          editingCustomProvider.value = null;
+          isAddingCustomProvider.value = false;
         }
         successMsg.value = t("settings.custom.deleted");
         setTimeout(() => { successMsg.value = ""; }, 2000);
@@ -1371,16 +1468,21 @@ export function useSettingsState(emit: SettingsEmit) {
         const err = normalizeAppError(e);
         useNotificationStore().addNotice("error", t("settings.custom.saveFailed", err.message), {
           code: err.code,
-          operation: "deleteEndpoint",
+          operation: "deleteCustomProvider",
         });
       }
     });
   }
 
-  async function testEndpoint() {
-    if (!editingEndpoint.value) return;
-    const ep = normalizeCustomEndpoint(editingEndpoint.value);
-    if (!ep.apiModel.trim() || !ep.endpoint.trim()) {
+  /** Connectivity test for the provider being edited, probing the given model
+   *  row (or the first row with an api model) via the legacy test payload. */
+  async function testCustomProvider(modelRowId?: string) {
+    if (!editingCustomProvider.value) return;
+    const provider = normalizeCustomProvider(editingCustomProvider.value);
+    const model = (modelRowId
+      ? provider.models.find((m) => m.id === modelRowId)
+      : undefined) ?? provider.models.find((m) => m.apiModel.trim());
+    if (!model || !provider.endpoint.trim()) {
       testStatus.value = "error";
       testResult.value = t("settings.custom.testMissingFields");
       return;
@@ -1388,7 +1490,23 @@ export function useSettingsState(emit: SettingsEmit) {
     testStatus.value = "testing";
     testResult.value = "";
     try {
-      const reply = await testCustomEndpoint(ep);
+      const reply = await testCustomEndpoint({
+        id: provider.id,
+        name: provider.name,
+        apiModel: model.apiModel,
+        endpoint: provider.endpoint,
+        apiFormat: provider.apiFormat,
+        apiKey: provider.apiKey,
+        contextLength: model.contextLength,
+        betaFlags: model.betaFlags,
+        supportedReasoningEfforts: model.supportedReasoningEfforts,
+        reasoningParamFormat: model.reasoningParamFormat
+          ?? defaultReasoningParamFormat(provider.apiFormat),
+        replayReasoningContent: model.replayReasoningContent === true,
+        serverTools: model.serverTools,
+        supportsToolLazyLoading: false,
+        supportsVision: model.supportsVision,
+      });
       testStatus.value = customEndpointTestStatusForReply(reply);
       testResult.value = reply;
     } catch (e) {
@@ -1397,8 +1515,8 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
-  function handleEndpointKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") cancelEditEndpoint();
+  function handleCustomProviderKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") cancelEditCustomProvider();
   }
 
   // ── Init ─────────────────────────────────────────────────────────────
@@ -1408,7 +1526,7 @@ export function useSettingsState(emit: SettingsEmit) {
     const cachedCodex = getWarmup<RemoteCodexStatus>("settings:codexStatus");
     const cachedDefaults = getWarmup<ModelDefaults>("settings:modelDefaults");
     const cachedPerms = getWarmup<Record<string, string>>("settings:toolPermissions");
-    const cachedEndpoints = getWarmup<CustomEndpoint[]>("settings:customEndpoints");
+    const cachedCustomProviders = getWarmup<CustomProvider[]>("settings:customProviders");
 
     if (cachedProviders) providers.value = cachedProviders;
     else await loadProviders();
@@ -1416,6 +1534,7 @@ export function useSettingsState(emit: SettingsEmit) {
       void loadAnthropicRateLimits();
     }
     await loadDynamicToolLoadingMode();
+    await loadAnthropicNativeLazyEnabled();
 
     if (cachedCodex) codexStatus.value = normalizeCodexStatus(cachedCodex);
     else await loadCodexStatus();
@@ -1438,8 +1557,11 @@ export function useSettingsState(emit: SettingsEmit) {
     }
     await loadFileToolWorkspaceBoundary();
 
-    if (cachedEndpoints) customEndpoints.value = cachedEndpoints.map(normalizeCustomEndpoint);
-    else await loadCustomEndpoints();
+    if (cachedCustomProviders) {
+      customProviders.value = cachedCustomProviders.map(normalizeCustomProvider);
+    } else {
+      await loadCustomProviders();
+    }
   });
 
   onUnmounted(() => {
@@ -1475,6 +1597,10 @@ export function useSettingsState(emit: SettingsEmit) {
     dynamicToolLoadingBusy,
     loadDynamicToolLoadingMode,
     setDynamicToolLoadingMode,
+    anthropicNativeLazyEnabled,
+    anthropicNativeLazyBusy,
+    loadAnthropicNativeLazyEnabled,
+    setAnthropicNativeLazyEnabled,
 
     // oauth
     oauthStep,
@@ -1537,21 +1663,25 @@ export function useSettingsState(emit: SettingsEmit) {
     saveToolPermissions,
     getToolMode,
 
-    // custom endpoints
-    customEndpoints,
-    editingEndpoint,
-    isAddingEndpoint,
-    customEndpointSaving,
+    // custom providers
+    customProviders,
+    editingCustomProvider,
+    isAddingCustomProvider,
+    customProviderSaving,
     testStatus,
     testResult,
-    newEmptyEndpoint,
-    loadCustomEndpoints,
-    startAddEndpoint,
-    startEditEndpoint,
-    cancelEditEndpoint,
-    saveEndpoint,
-    deleteEndpoint,
-    testEndpoint,
-    handleEndpointKeydown,
+    modelCatalog,
+    modelCatalogLoading,
+    modelCatalogRefreshing,
+    loadCustomProviders,
+    loadModelCatalog,
+    refreshCatalog,
+    startAddCustomProvider,
+    startEditCustomProvider,
+    cancelEditCustomProvider,
+    saveCustomProvider,
+    deleteCustomProvider,
+    testCustomProvider,
+    handleCustomProviderKeydown,
   };
 }

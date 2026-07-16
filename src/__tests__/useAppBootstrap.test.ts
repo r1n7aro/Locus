@@ -84,7 +84,7 @@ vi.mock("../services/auth", () => ({
 
 vi.mock("../services/model", () => ({
   getModelDefaults: vi.fn(),
-  getCustomEndpoints: vi.fn(),
+  getCustomProviders: vi.fn(),
 }));
 
 vi.mock("../services/permissions", () => ({
@@ -177,7 +177,7 @@ describe("useAppBootstrap onboarding completion", () => {
       loadLastModel: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
       loadCodexFastMode: vi.fn().mockResolvedValue(undefined),
-      loadCustomEndpoints: vi.fn().mockResolvedValue(undefined),
+      loadCustomProviders: vi.fn().mockResolvedValue(undefined),
       loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
       loadCodexAvailableModels: vi.fn().mockResolvedValue(undefined),
       resolveSelectedModel: vi.fn(),

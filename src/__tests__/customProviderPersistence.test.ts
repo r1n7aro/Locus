@@ -1,9 +1,11 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const modelServiceMocks = vi.hoisted(() => ({
-  getCustomEndpoints: vi.fn(),
-  saveCustomEndpoints: vi.fn(),
+  getCustomProviders: vi.fn(),
+  saveCustomProviders: vi.fn(),
   testCustomEndpoint: vi.fn(),
+  getModelCatalog: vi.fn(),
+  refreshModelCatalog: vi.fn(),
   getProviders: vi.fn(),
   saveProviderKey: vi.fn(),
   deleteProviderKey: vi.fn(),
@@ -59,9 +61,11 @@ vi.mock("../services/auth", () => ({
 }));
 
 vi.mock("../services/model", () => ({
-  getCustomEndpoints: modelServiceMocks.getCustomEndpoints,
-  saveCustomEndpoints: modelServiceMocks.saveCustomEndpoints,
+  getCustomProviders: modelServiceMocks.getCustomProviders,
+  saveCustomProviders: modelServiceMocks.saveCustomProviders,
   testCustomEndpoint: modelServiceMocks.testCustomEndpoint,
+  getModelCatalog: modelServiceMocks.getModelCatalog,
+  refreshModelCatalog: modelServiceMocks.refreshModelCatalog,
   getModelDefaults: modelServiceMocks.getModelDefaults,
   saveModelDefaults: modelServiceMocks.saveModelDefaults,
   getCodexModelConfig: modelServiceMocks.getCodexModelConfig,
@@ -100,79 +104,102 @@ vi.mock("../stores/notification", () => ({
 }));
 
 import { useSettingsState } from "../composables/useSettingsState";
-import type { CustomEndpoint } from "../types";
+import type { CustomEndpoint, CustomProvider, CustomProviderModel } from "../types";
 
-function endpoint(partial: Partial<CustomEndpoint> & Pick<CustomEndpoint, "id" | "name">): CustomEndpoint {
+function providerModel(partial: Partial<CustomProviderModel> = {}): CustomProviderModel {
   return {
+    id: "model",
     apiModel: "model",
-    endpoint: "https://example.com/v1",
-    apiFormat: "openai_chat",
-    apiKey: "",
+    name: "model",
     contextLength: 256000,
     betaFlags: [],
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
     replayReasoningContent: true,
+    reasoningReplayField: null,
     serverTools: { webSearch: false },
-    supportsToolLazyLoading: false,
     supportsVision: true,
     ...partial,
   };
 }
 
-describe("custom endpoint persistence", () => {
+function provider(
+  partial: Partial<CustomProvider> & Pick<CustomProvider, "id" | "name">,
+): CustomProvider {
+  return {
+    endpoint: "https://example.com/v1",
+    apiFormat: "openai_chat",
+    apiKey: "",
+    catalogId: null,
+    models: [providerModel()],
+    ...partial,
+  };
+}
+
+describe("custom provider persistence", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     modelServiceMocks.getWarmup.mockReturnValue(undefined);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValue([]);
-    modelServiceMocks.saveCustomEndpoints.mockResolvedValue(undefined);
+    modelServiceMocks.getCustomProviders.mockResolvedValue([]);
+    modelServiceMocks.saveCustomProviders.mockResolvedValue(undefined);
     modelServiceMocks.getFileToolWorkspaceBoundary.mockResolvedValue(false);
     modelServiceMocks.setFileToolWorkspaceBoundary.mockResolvedValue(undefined);
     modelServiceMocks.confirm.mockResolvedValue(true);
   });
 
-  it("reloads saved endpoints and refreshes the warmup cache", async () => {
+  it("reloads saved providers and refreshes the warmup cache", async () => {
     const emitted: unknown[][] = [];
     const state = useSettingsState(((...args: unknown[]) => {
       emitted.push(args);
     }) as never);
-    const saved = endpoint({ id: "saved", name: "Saved", apiKey: "sk-live" });
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([saved]);
+    const saved = provider({ id: "saved", name: "Saved", apiKey: "sk-live" });
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([saved]);
 
-    state.startAddEndpoint();
-    state.editingEndpoint.value = endpoint({
+    state.startAddCustomProvider();
+    state.editingCustomProvider.value = provider({
       id: "draft",
       name: "Draft",
-      apiModel: "draft-model",
       apiKey: "sk-draft",
+      models: [providerModel({ id: "draft-model", apiModel: "draft-model" })],
     });
 
-    await state.saveEndpoint();
+    await state.saveCustomProvider();
 
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenCalledWith([
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
       expect.objectContaining({ id: "draft", name: "Draft", apiKey: "sk-draft" }),
     ]);
-    expect(state.customEndpoints.value).toEqual([saved]);
-    expect(modelServiceMocks.setWarmup).toHaveBeenCalledWith("settings:customEndpoints", [saved]);
-    expect(emitted).toContainEqual(["customEndpointsChanged", [saved]]);
-    expect(state.customEndpointSaving.value).toBe(false);
-    expect(state.editingEndpoint.value).toBeNull();
+    expect(state.customProviders.value).toEqual([saved]);
+    expect(modelServiceMocks.setWarmup).toHaveBeenCalledWith("settings:customProviders", [saved]);
+    expect(emitted).toContainEqual(["customProvidersChanged", [saved]]);
+    expect(state.customProviderSaving.value).toBe(false);
+    expect(state.editingCustomProvider.value).toBeNull();
   });
 
-  it("starts new endpoints with the 256k context window default", () => {
+  it("starts new providers with one blank model row at the 256k default", () => {
     const state = useSettingsState((() => undefined) as never);
 
-    state.startAddEndpoint();
+    state.startAddCustomProvider();
 
-    expect(state.editingEndpoint.value?.contextLength).toBe(256000);
+    const draft = state.editingCustomProvider.value;
+    expect(draft?.models).toHaveLength(1);
+    expect(draft?.models[0].contextLength).toBe(256000);
+    expect(draft?.models[0].supportsVision).toBe(true);
+    expect(draft?.models[0].serverTools.webSearch).toBe(false);
+    expect(draft?.models[0].supportedReasoningEfforts).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 
-  it("imports Claude Code custom endpoint into custom endpoints", async () => {
+  it("imports a Claude Code custom endpoint as a single-model provider", async () => {
     const emitted: unknown[][] = [];
     const state = useSettingsState(((...args: unknown[]) => {
       emitted.push(args);
     }) as never);
-    const imported = endpoint({
+    const imported: CustomEndpoint = {
       id: "claude-code-import",
       name: "Claude Code",
       apiModel: "claude-opus-4-8",
@@ -180,9 +207,27 @@ describe("custom endpoint persistence", () => {
       apiFormat: "anthropic_messages",
       apiKey: "sk-cc",
       contextLength: 1_000_000,
+      betaFlags: [],
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
       reasoningParamFormat: "anthropic_thinking",
       replayReasoningContent: false,
-      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+      serverTools: { webSearch: false },
+      supportsToolLazyLoading: false,
+      supportsVision: true,
+    };
+    const savedProvider = provider({
+      id: "claude-code-import",
+      name: "Claude Code",
+      endpoint: "https://proxy.example/v1",
+      apiFormat: "anthropic_messages",
+      models: [providerModel({
+        id: "claude-opus-4-8",
+        apiModel: "claude-opus-4-8",
+        name: "claude-opus-4-8",
+        contextLength: 1_000_000,
+        reasoningParamFormat: "anthropic_thinking",
+        replayReasoningContent: false,
+      })],
     });
     modelServiceMocks.importClaudeCodeOAuth.mockResolvedValueOnce({
       kind: "custom_endpoint",
@@ -190,185 +235,184 @@ describe("custom endpoint persistence", () => {
       hasRefreshToken: false,
       customEndpoint: imported,
     });
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([imported]);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([savedProvider]);
 
     await state.importClaudeCodeOAuth();
 
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenCalledWith([
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
       expect.objectContaining({
         id: "claude-code-import",
         name: "Claude Code",
-        apiModel: "claude-opus-4-8",
         endpoint: "https://proxy.example/v1",
         apiFormat: "anthropic_messages",
         apiKey: "sk-cc",
+        models: [
+          expect.objectContaining({
+            apiModel: "claude-opus-4-8",
+            contextLength: 1_000_000,
+            reasoningParamFormat: "anthropic_thinking",
+            replayReasoningContent: false,
+          }),
+        ],
       }),
     ]);
     expect(modelServiceMocks.getProviders).not.toHaveBeenCalled();
-    expect(state.customEndpoints.value).toEqual([imported]);
-    expect(emitted).toContainEqual(["customEndpointsChanged", [imported]]);
+    expect(state.customProviders.value).toEqual([savedProvider]);
+    expect(emitted).toContainEqual(["customProvidersChanged", [savedProvider]]);
   });
 
-  it("starts new OpenAI Chat endpoints with reasoning content replay enabled", () => {
+  it("saves new OpenAI Chat models with reasoning content replay enabled", async () => {
     const state = useSettingsState((() => undefined) as never);
 
-    state.startAddEndpoint();
+    state.startAddCustomProvider();
+    const draft = state.editingCustomProvider.value!;
+    draft.name = "Chat";
+    draft.endpoint = "https://example.com/v1";
+    draft.models[0].apiModel = "chat-model";
 
-    expect(state.editingEndpoint.value?.replayReasoningContent).toBe(true);
-  });
+    await state.saveCustomProvider();
 
-  it("starts new endpoints with server web search disabled", () => {
-    const state = useSettingsState((() => undefined) as never);
-
-    state.startAddEndpoint();
-
-    expect(state.editingEndpoint.value?.serverTools.webSearch).toBe(false);
-  });
-
-  it("starts new endpoints with tool lazy loading disabled", () => {
-    const state = useSettingsState((() => undefined) as never);
-
-    state.startAddEndpoint();
-
-    expect(state.editingEndpoint.value?.supportsToolLazyLoading).toBe(false);
-  });
-
-  it("starts new endpoints with image understanding enabled", () => {
-    const state = useSettingsState((() => undefined) as never);
-
-    state.startAddEndpoint();
-
-    expect(state.editingEndpoint.value?.supportsVision).toBe(true);
-  });
-
-  it("starts new endpoints with xhigh and max reasoning efforts", () => {
-    const state = useSettingsState((() => undefined) as never);
-
-    state.startAddEndpoint();
-
-    expect(state.editingEndpoint.value?.supportedReasoningEfforts).toEqual([
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
+      expect.objectContaining({
+        models: [expect.objectContaining({ replayReasoningContent: true })],
+      }),
     ]);
   });
 
-  it("normalizes legacy OpenAI Chat endpoints to replay reasoning content", async () => {
+  it("normalizes legacy OpenAI Chat models to replay reasoning content", async () => {
     const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
         id: "openai-chat",
         name: "OpenAI Chat",
-        apiModel: "chat-model",
-        endpoint: "https://example.com/v1",
-        replayReasoningContent: undefined,
-      } as any),
-    ]);
-
-    await state.loadCustomEndpoints();
-
-    expect(state.customEndpoints.value[0].replayReasoningContent).toBe(true);
-  });
-
-  it("normalizes legacy Anthropic Messages endpoints to disabled reasoning replay", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
-        id: "anthropic-messages",
-        name: "Anthropic Messages",
-        apiFormat: "anthropic_messages",
-        reasoningParamFormat: "anthropic_thinking",
-        replayReasoningContent: undefined,
-      } as any),
-    ]);
-
-    await state.loadCustomEndpoints();
-
-    expect(state.customEndpoints.value[0].replayReasoningContent).toBe(false);
-  });
-
-  it("normalizes legacy endpoints to disabled server tools", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
-        id: "legacy-server-tools",
-        name: "Legacy Server Tools",
-        serverTools: undefined,
-      } as any),
-    ]);
-
-    await state.loadCustomEndpoints();
-
-    expect(state.customEndpoints.value[0].serverTools).toEqual({ webSearch: false });
-  });
-
-  it("normalizes legacy endpoints to disabled tool lazy loading", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
-        id: "legacy-tool-loading",
-        name: "Legacy Tool Loading",
-        supportsToolLazyLoading: undefined,
-      } as any),
-    ]);
-
-    await state.loadCustomEndpoints();
-
-    expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
-  });
-
-  it("normalizes saved endpoints to disabled tool lazy loading", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
-        id: "chat-tool-loading",
-        name: "Chat Tool Loading",
-        apiFormat: "openai_responses",
-        supportsToolLazyLoading: true,
+        models: [providerModel({ replayReasoningContent: undefined } as never)],
       }),
     ]);
 
-    await state.loadCustomEndpoints();
+    await state.loadCustomProviders();
 
-    expect(state.customEndpoints.value[0].supportsToolLazyLoading).toBe(false);
+    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(true);
   });
 
-  it("normalizes legacy endpoints to enabled image understanding", async () => {
+  it("normalizes legacy Anthropic Messages models to disabled reasoning replay", async () => {
     const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
-        id: "legacy-vision",
-        name: "Legacy Vision",
-        supportsVision: undefined,
-      } as any),
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "anthropic-messages",
+        name: "Anthropic Messages",
+        apiFormat: "anthropic_messages",
+        models: [providerModel({
+          reasoningParamFormat: "anthropic_thinking",
+          replayReasoningContent: undefined,
+        } as never)],
+      }),
     ]);
 
-    await state.loadCustomEndpoints();
+    await state.loadCustomProviders();
 
-    expect(state.customEndpoints.value[0].supportsVision).toBe(true);
+    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(false);
+  });
+
+  it("normalizes legacy models to disabled server tools", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "legacy-server-tools",
+        name: "Legacy Server Tools",
+        models: [providerModel({ serverTools: undefined } as never)],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    expect(state.customProviders.value[0].models[0].serverTools).toEqual({ webSearch: false });
+  });
+
+  it("normalizes legacy models to enabled image understanding", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "legacy-vision",
+        name: "Legacy Vision",
+        models: [providerModel({ supportsVision: undefined } as never)],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    expect(state.customProviders.value[0].models[0].supportsVision).toBe(true);
   });
 
   it("normalizes legacy default reasoning efforts to include xhigh", async () => {
     const state = useSettingsState((() => undefined) as never);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValueOnce([
-      endpoint({
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
         id: "legacy-efforts",
         name: "Legacy Efforts",
-        supportedReasoningEfforts: ["low", "medium", "high", "max"],
+        models: [providerModel({
+          supportedReasoningEfforts: ["low", "medium", "high", "max"],
+        })],
       }),
     ]);
 
-    await state.loadCustomEndpoints();
+    await state.loadCustomProviders();
 
-    expect(state.customEndpoints.value[0].supportedReasoningEfforts).toEqual([
+    expect(state.customProviders.value[0].models[0].supportedReasoningEfforts).toEqual([
       "low",
       "medium",
       "high",
       "xhigh",
       "max",
     ]);
+  });
+
+  it("fills empty model row ids from the api model", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "row-ids",
+        name: "Row Ids",
+        models: [providerModel({ id: "", apiModel: "zai-org/GLM-5.2" })],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    expect(state.customProviders.value[0].models[0].id).toBe("zai-org-GLM-5.2");
+  });
+
+  it("serializes delete mutations against the latest reloaded list", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    const first = provider({ id: "first", name: "First" });
+    const second = provider({ id: "second", name: "Second" });
+    state.customProviders.value = [first, second];
+
+    let releaseFirstSave!: () => void;
+    modelServiceMocks.saveCustomProviders
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        releaseFirstSave = resolve;
+      }))
+      .mockResolvedValueOnce(undefined);
+    modelServiceMocks.getCustomProviders
+      .mockResolvedValueOnce([second])
+      .mockResolvedValueOnce([]);
+
+    const firstDelete = state.deleteCustomProvider("first");
+    const secondDelete = state.deleteCustomProvider("second");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(state.customProviderSaving.value).toBe(true);
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledTimes(1);
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenNthCalledWith(1, [second]);
+
+    releaseFirstSave();
+    await Promise.all([firstDelete, secondDelete]);
+
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledTimes(2);
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenNthCalledWith(2, []);
+    expect(state.customProviders.value).toEqual([]);
+    expect(state.customProviderSaving.value).toBe(false);
   });
 
   it("loads and sorts detailed Codex usage reset credits", async () => {
@@ -459,39 +503,5 @@ describe("custom endpoint persistence", () => {
     expect(modelServiceMocks.codexRateLimits).toHaveBeenCalledOnce();
     expect(state.codexQuota.value.resetCreditsAvailable).toBe(3);
     expect(state.codexResetCreditBusyId.value).toBeNull();
-  });
-
-  it("serializes delete mutations against the latest reloaded list", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    const first = endpoint({ id: "first", name: "First" });
-    const second = endpoint({ id: "second", name: "Second" });
-    state.customEndpoints.value = [first, second];
-
-    let releaseFirstSave!: () => void;
-    modelServiceMocks.saveCustomEndpoints
-      .mockImplementationOnce(() => new Promise<void>((resolve) => {
-        releaseFirstSave = resolve;
-      }))
-      .mockResolvedValueOnce(undefined);
-    modelServiceMocks.getCustomEndpoints
-      .mockResolvedValueOnce([second])
-      .mockResolvedValueOnce([]);
-
-    const firstDelete = state.deleteEndpoint("first");
-    const secondDelete = state.deleteEndpoint("second");
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(state.customEndpointSaving.value).toBe(true);
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenCalledTimes(1);
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenNthCalledWith(1, [second]);
-
-    releaseFirstSave();
-    await Promise.all([firstDelete, secondDelete]);
-
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenCalledTimes(2);
-    expect(modelServiceMocks.saveCustomEndpoints).toHaveBeenNthCalledWith(2, []);
-    expect(state.customEndpoints.value).toEqual([]);
-    expect(state.customEndpointSaving.value).toBe(false);
   });
 });

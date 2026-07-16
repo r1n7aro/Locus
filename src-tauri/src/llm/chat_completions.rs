@@ -16,6 +16,28 @@ enum ChatCompletionsFlavor {
     MiniMax,
 }
 
+/// Body-level switch that asks the endpoint to emit reasoning at all
+/// (models that stay silent without it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingToggle {
+    /// DashScope/Qwen style: `"enable_thinking": true`.
+    EnableThinking,
+    /// Zhipu GLM style: `"thinking": {"type": "enabled"}`.
+    ThinkingType,
+}
+
+/// Reasoning knobs for a custom OpenAI-chat endpoint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CustomChatTuning<'a> {
+    pub reasoning_effort: Option<&'a str>,
+    pub thinking_level: Option<&'a str>,
+    pub replay_reasoning_content: bool,
+    /// Explicit message-level replay field (models.dev `interleaved.field`).
+    /// None keeps the legacy model-name flavor detection.
+    pub reasoning_replay_field: Option<crate::commands::ReasoningReplayField>,
+    pub thinking_toggle: Option<ThinkingToggle>,
+}
+
 pub async fn stream_chat<F, G, H>(
     api_key: &str,
     model: &str,
@@ -23,9 +45,7 @@ pub async fn stream_chat<F, G, H>(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     base_url: &str,
-    reasoning_effort: Option<&str>,
-    thinking_level: Option<&str>,
-    replay_reasoning_content: bool,
+    tuning: CustomChatTuning<'_>,
     debug: bool,
     on_text_delta: F,
     on_thinking_delta: G,
@@ -48,17 +68,11 @@ where
         system_prompt,
         history,
         flavor,
-        deepseek_thinking_mode_enabled(thinking_level),
-        replay_reasoning_content,
+        deepseek_thinking_mode_enabled(tuning.thinking_level),
+        tuning.replay_reasoning_content,
+        tuning.reasoning_replay_field,
     );
-    let body = build_request_body(
-        model,
-        messages,
-        tools,
-        reasoning_effort,
-        thinking_level,
-        flavor,
-    );
+    let body = build_request_body(model, messages, tools, flavor, tuning);
     // Serialize once and send these exact bytes, so debug dumps and rejected-body
     // diagnostics are byte-for-byte what went on the wire — server-side JSON parse
     // errors report line/column against the compact wire form (issue #106).
@@ -73,7 +87,7 @@ where
         history.len(),
         tools.len(),
         flavor,
-        replay_reasoning_content
+        tuning.replay_reasoning_content
     );
 
     let api_url = format!(
@@ -352,9 +366,8 @@ fn build_request_body(
     model: &str,
     messages: Vec<serde_json::Value>,
     tools: &[serde_json::Value],
-    reasoning_effort: Option<&str>,
-    thinking_level: Option<&str>,
     flavor: ChatCompletionsFlavor,
+    tuning: CustomChatTuning<'_>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -369,15 +382,26 @@ fn build_request_body(
 
     match flavor {
         ChatCompletionsFlavor::DeepSeek => {
-            apply_deepseek_thinking_params(&mut body, reasoning_effort, thinking_level);
+            apply_deepseek_thinking_params(&mut body, tuning.reasoning_effort, tuning.thinking_level);
         }
         ChatCompletionsFlavor::MiniMax => {
             body["reasoning_split"] = serde_json::json!(true);
-            apply_generic_reasoning_effort(&mut body, reasoning_effort);
+            apply_generic_reasoning_effort(&mut body, tuning.reasoning_effort);
         }
         ChatCompletionsFlavor::Generic => {
-            apply_generic_reasoning_effort(&mut body, reasoning_effort);
+            apply_generic_reasoning_effort(&mut body, tuning.reasoning_effort);
         }
+    }
+
+    // Explicit toggles win over flavor heuristics.
+    match tuning.thinking_toggle {
+        Some(ThinkingToggle::EnableThinking) => {
+            body["enable_thinking"] = serde_json::json!(true);
+        }
+        Some(ThinkingToggle::ThinkingType) => {
+            body["thinking"] = serde_json::json!({ "type": "enabled" });
+        }
+        None => {}
     }
 
     body
@@ -426,12 +450,64 @@ fn deepseek_thinking_mode_enabled(thinking_level: Option<&str>) -> bool {
         .is_some_and(|level| level.eq_ignore_ascii_case("none"))
 }
 
+fn minimax_reasoning_details(thinking: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "reasoning.text",
+        "id": "reasoning-text-1",
+        "format": "MiniMax-response-v1",
+        "index": 0,
+        "text": thinking,
+    }])
+}
+
+/// Replay assistant reasoning onto the outgoing message.
+///
+/// With an explicit field (models.dev `interleaved.field`) the string-valued
+/// fields are ALWAYS set — DeepSeek-style APIs expect `reasoning_content`
+/// back on every assistant turn even when it is empty. Without one, the
+/// legacy flavor heuristics apply (only non-empty reasoning is attached).
+fn apply_reasoning_replay(
+    message: &mut serde_json::Value,
+    thinking_content: Option<&str>,
+    flavor: ChatCompletionsFlavor,
+    replay_field: Option<crate::commands::ReasoningReplayField>,
+) {
+    use crate::commands::ReasoningReplayField;
+
+    let thinking = thinking_content.unwrap_or("");
+    match replay_field {
+        Some(ReasoningReplayField::ReasoningContent) => {
+            message["reasoning_content"] = serde_json::json!(thinking);
+        }
+        Some(ReasoningReplayField::Reasoning) => {
+            message["reasoning"] = serde_json::json!(thinking);
+        }
+        Some(ReasoningReplayField::ReasoningDetails) => {
+            // Structured array form: only attach real content.
+            if !thinking.trim().is_empty() {
+                message["reasoning_details"] = minimax_reasoning_details(thinking);
+            }
+        }
+        None => {
+            if thinking.trim().is_empty() {
+                return;
+            }
+            if flavor == ChatCompletionsFlavor::MiniMax {
+                message["reasoning_details"] = minimax_reasoning_details(thinking);
+            } else {
+                message["reasoning_content"] = serde_json::json!(thinking);
+            }
+        }
+    }
+}
+
 fn build_api_messages(
     system_prompt: &str,
     history: &[ChatMessage],
     flavor: ChatCompletionsFlavor,
     deepseek_thinking_enabled: bool,
     replay_reasoning_content: bool,
+    reasoning_replay_field: Option<crate::commands::ReasoningReplayField>,
 ) -> Vec<serde_json::Value> {
     let mut messages = Vec::new();
     if !system_prompt.is_empty() {
@@ -467,23 +543,12 @@ fn build_api_messages(
                     "content": msg.content,
                 });
                 if replay_reasoning_content {
-                    if let Some(thinking) = msg
-                        .thinking_content
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                    {
-                        if flavor == ChatCompletionsFlavor::MiniMax {
-                            m["reasoning_details"] = serde_json::json!([{
-                                "type": "reasoning.text",
-                                "id": "reasoning-text-1",
-                                "format": "MiniMax-response-v1",
-                                "index": 0,
-                                "text": thinking,
-                            }]);
-                        } else {
-                            m["reasoning_content"] = serde_json::json!(thinking);
-                        }
-                    }
+                    apply_reasoning_replay(
+                        &mut m,
+                        msg.thinking_content.as_deref(),
+                        flavor,
+                        reasoning_replay_field,
+                    );
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     if !tool_calls.is_empty() {
@@ -738,6 +803,14 @@ struct ChatStreamState {
     think_filter: ThinkTagFilter,
     reasoning_detail_text_by_key: std::collections::HashMap<String, String>,
     tool_calls_map: std::collections::HashMap<i64, PartialToolCall>,
+    /// Slot of the most recent tool-call delta; index-less fragments without
+    /// an id continue this entry.
+    last_tool_call_slot: Option<i64>,
+    /// Chunks that failed to deserialize and were skipped. A round that ends
+    /// with no usable output while chunks were dropped is reported as an
+    /// error instead of a silent empty reply (issue #77).
+    dropped_chunks: u32,
+    first_dropped_chunk_error: Option<String>,
     finish_reason: String,
     saw_finish_reason: bool,
     input_tokens: u32,
@@ -757,6 +830,9 @@ impl ChatStreamState {
             think_filter: ThinkTagFilter::new(super::think_tag_filter::strip_enabled()),
             reasoning_detail_text_by_key: std::collections::HashMap::new(),
             tool_calls_map: std::collections::HashMap::new(),
+            last_tool_call_slot: None,
+            dropped_chunks: 0,
+            first_dropped_chunk_error: None,
             finish_reason: String::from("stop"),
             saw_finish_reason: false,
             input_tokens: 0,
@@ -764,6 +840,44 @@ impl ChatStreamState {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cost_usd: 0.0,
+        }
+    }
+
+    /// Map a tool-call delta to its accumulation slot. With an explicit
+    /// `index` this is the OpenAI incremental protocol. Without one
+    /// (Gemini-style), fragments carrying an id get their own slot (reusing
+    /// it if the id was seen before), and id-less fragments continue the most
+    /// recent slot (argument streaming).
+    fn tool_call_slot(&mut self, delta: &StreamToolCallDelta) -> i64 {
+        let slot = if let Some(index) = delta.index {
+            index
+        } else if let Some(id) = delta
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.tool_calls_map
+                .iter()
+                .find(|(_, entry)| entry.id == id)
+                .map(|(&slot, _)| slot)
+                .unwrap_or_else(|| {
+                    self.tool_calls_map
+                        .keys()
+                        .max()
+                        .map_or(0, |max| max.saturating_add(1))
+                })
+        } else {
+            self.last_tool_call_slot.unwrap_or(0)
+        };
+        self.last_tool_call_slot = Some(slot);
+        slot
+    }
+
+    fn note_dropped_chunk(&mut self, error: &str, data: &str) {
+        self.dropped_chunks = self.dropped_chunks.saturating_add(1);
+        if self.first_dropped_chunk_error.is_none() {
+            let preview: String = data.chars().take(400).collect();
+            self.first_dropped_chunk_error = Some(format!("{error} | data: {preview}"));
         }
     }
 
@@ -1020,6 +1134,7 @@ where
                     "[Custom Chat] Failed to parse chunk: {} | data: {}",
                     e, data
                 );
+                state.note_dropped_chunk(&e.to_string(), data);
             }
         }
     }
@@ -1050,10 +1165,11 @@ fn apply_stream_chunk<F, G, H>(
         }
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc in tcs {
+                let slot = state.tool_call_slot(tc);
                 let entry =
                     state
                         .tool_calls_map
-                        .entry(tc.index)
+                        .entry(slot)
                         .or_insert_with(|| PartialToolCall {
                             id: String::new(),
                             name: String::new(),
@@ -1143,6 +1259,25 @@ fn finalize_stream_response(
     };
     if !tool_calls.is_empty() {
         state.finish_reason = "tool_calls".to_string();
+    }
+
+    // A "successful" round with nothing usable while chunks were dropped is a
+    // stream-schema mismatch, not an empty reply — surface it (issue #77:
+    // Gemini tool-call chunks failed to parse and the user saw no response).
+    if state.dropped_chunks > 0
+        && tool_calls.is_empty()
+        && state.full_text.trim().is_empty()
+        && state.thinking_text.trim().is_empty()
+    {
+        return Err(format!(
+            "{} stream produced no usable output while {} chunk(s) failed to parse — the endpoint's stream format is likely not OpenAI-compatible. First failure: {}",
+            tag,
+            state.dropped_chunks,
+            state
+                .first_dropped_chunk_error
+                .as_deref()
+                .unwrap_or("(unrecorded)")
+        ));
     }
 
     let resp = LlmResponse {
@@ -1376,7 +1511,11 @@ struct StreamReasoningDetail {
 
 #[derive(Debug, Deserialize)]
 struct StreamToolCallDelta {
-    index: i64,
+    /// OpenAI marks incremental tool-call fragments with `index`; some
+    /// compatible endpoints (Gemini's OpenAI layer, issue #77) omit it and
+    /// send each tool call complete instead — keep it optional.
+    #[serde(default)]
+    index: Option<i64>,
     id: Option<String>,
     function: Option<StreamFunctionDelta>,
 }
@@ -1393,7 +1532,8 @@ mod tests {
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
         detect_flavor, drain_sse_buffer, finalize_stream_response, first_incomplete_tool_call,
         server_json_parse_error_hint, summarize_recent_raw_chunk, ChatCompletionsFlavor,
-        ChatStreamState, PartialToolCall, StreamChunk, ThinkTagFilter,
+        ChatStreamState, CustomChatTuning, PartialToolCall, StreamChunk, ThinkTagFilter,
+        ThinkingToggle,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
@@ -1547,6 +1687,7 @@ mod tests {
             ChatCompletionsFlavor::DeepSeek,
             true,
             true,
+            None,
         );
 
         assert_eq!(messages[0]["content"], serde_json::json!("system"));
@@ -1580,6 +1721,7 @@ mod tests {
             ChatCompletionsFlavor::DeepSeek,
             true,
             true,
+            None,
         );
 
         assert_eq!(
@@ -1598,6 +1740,7 @@ mod tests {
             ChatCompletionsFlavor::Generic,
             false,
             true,
+            None,
         );
         assert_eq!(
             enabled[0]["reasoning_content"],
@@ -1610,6 +1753,7 @@ mod tests {
             ChatCompletionsFlavor::Generic,
             false,
             false,
+            None,
         );
         assert!(disabled[0].get("reasoning_content").is_none());
     }
@@ -1625,6 +1769,7 @@ mod tests {
             ChatCompletionsFlavor::Generic,
             false,
             false,
+            None,
         );
 
         assert_eq!(
@@ -1643,6 +1788,7 @@ mod tests {
             ChatCompletionsFlavor::MiniMax,
             false,
             true,
+            None,
         );
 
         assert!(messages[0].get("reasoning_content").is_none());
@@ -1670,6 +1816,7 @@ mod tests {
             ChatCompletionsFlavor::DeepSeek,
             true,
             true,
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -1697,6 +1844,7 @@ mod tests {
             ChatCompletionsFlavor::DeepSeek,
             false,
             true,
+            None,
         );
 
         assert_eq!(
@@ -1720,6 +1868,7 @@ mod tests {
             ChatCompletionsFlavor::Generic,
             false,
             false,
+            None,
         );
 
         let blocks = messages[1]["content"].as_array().unwrap();
@@ -1745,6 +1894,7 @@ mod tests {
             ChatCompletionsFlavor::Generic,
             false,
             false,
+            None,
         );
 
         assert_eq!(messages[0]["role"], serde_json::json!("tool"));
@@ -1765,9 +1915,12 @@ mod tests {
             "deepseek-v4-pro",
             Vec::new(),
             &[],
-            Some("low"),
-            Some("low"),
             ChatCompletionsFlavor::DeepSeek,
+            CustomChatTuning {
+                reasoning_effort: Some("low"),
+                thinking_level: Some("low"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             enabled["thinking"],
@@ -1779,15 +1932,108 @@ mod tests {
             "deepseek-v4-pro",
             Vec::new(),
             &[],
-            None,
-            Some("none"),
             ChatCompletionsFlavor::DeepSeek,
+            CustomChatTuning {
+                reasoning_effort: None,
+                thinking_level: Some("none"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             disabled["thinking"],
             serde_json::json!({ "type": "disabled" })
         );
         assert!(disabled.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn request_body_thinking_toggles_set_expected_fields() {
+        let enable_thinking = build_request_body(
+            "qwen3.7-plus",
+            Vec::new(),
+            &[],
+            ChatCompletionsFlavor::Generic,
+            CustomChatTuning {
+                thinking_toggle: Some(ThinkingToggle::EnableThinking),
+                ..Default::default()
+            },
+        );
+        assert_eq!(enable_thinking["enable_thinking"], serde_json::json!(true));
+        assert!(enable_thinking.get("thinking").is_none());
+
+        let thinking_type = build_request_body(
+            "glm-5.2",
+            Vec::new(),
+            &[],
+            ChatCompletionsFlavor::Generic,
+            CustomChatTuning {
+                thinking_toggle: Some(ThinkingToggle::ThinkingType),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            thinking_type["thinking"],
+            serde_json::json!({ "type": "enabled" })
+        );
+        assert!(thinking_type.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn explicit_replay_field_always_sends_reasoning_content() {
+        let mut assistant = assistant_message_with_tool_and_thinking();
+        assistant.thinking_content = None;
+
+        // DeepSeek semantics: with an explicit field the value is sent even
+        // when there is no reasoning to replay.
+        let messages = build_api_messages(
+            "",
+            &[assistant.clone()],
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+            Some(crate::commands::ReasoningReplayField::ReasoningContent),
+        );
+        assert_eq!(messages[0]["reasoning_content"], serde_json::json!(""));
+
+        let messages = build_api_messages(
+            "",
+            &[assistant.clone()],
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+            Some(crate::commands::ReasoningReplayField::Reasoning),
+        );
+        assert_eq!(messages[0]["reasoning"], serde_json::json!(""));
+        assert!(messages[0].get("reasoning_content").is_none());
+
+        // Structured details form only attaches real content.
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+            Some(crate::commands::ReasoningReplayField::ReasoningDetails),
+        );
+        assert!(messages[0].get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn explicit_replay_field_overrides_flavor_detection() {
+        let assistant = assistant_message_with_tool_and_thinking();
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::MiniMax,
+            false,
+            true,
+            Some(crate::commands::ReasoningReplayField::ReasoningContent),
+        );
+        assert!(messages[0].get("reasoning_details").is_none());
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            serde_json::json!("I should inspect the file.")
+        );
     }
 
     #[test]
@@ -1812,9 +2058,12 @@ mod tests {
             "MiniMax-M2.7",
             Vec::new(),
             &[],
-            Some("high"),
-            Some("high"),
             ChatCompletionsFlavor::MiniMax,
+            CustomChatTuning {
+                reasoning_effort: Some("high"),
+                thinking_level: Some("high"),
+                ..Default::default()
+            },
         );
 
         assert_eq!(body["reasoning_split"], serde_json::json!(true));
@@ -1847,6 +2096,145 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Think first."
         );
+    }
+
+    #[test]
+    fn gemini_tool_call_chunk_without_index_is_collected() {
+        // Verbatim shape from issue #77: Gemini's OpenAI-compatible layer
+        // omits `index` inside tool_calls and adds extra_content metadata.
+        let mut state = ChatStreamState::new();
+        let chunk: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "extra_content": { "google": { "thought_signature": "HCvI22HAQw51" } },
+                        "function": {
+                            "arguments": "{\"part\":\"body\",\"path\":\"skill/game-system-design-expert.md\"}",
+                            "name": "knowledge_read"
+                        },
+                        "id": "jdrz4leq",
+                        "type": "function"
+                    }]
+                },
+                "index": 0
+            }],
+            "created": 1780104752_i64,
+            "id": "Lj4aau6DJbai1e8PoebVqAo",
+            "model": "gemini-3.5-flash",
+            "object": "chat.completion.chunk",
+            "usage": { "completion_tokens": 32, "prompt_tokens": 17865, "total_tokens": 18096 }
+        }))
+        .expect("Gemini chunk without tool_calls[].index must deserialize");
+
+        apply_stream_chunk(chunk, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+
+        let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool call");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "jdrz4leq");
+        assert_eq!(tool_calls[0].name, "knowledge_read");
+        assert!(tool_calls[0].arguments.contains("game-system-design-expert"));
+    }
+
+    #[test]
+    fn index_less_tool_calls_with_distinct_ids_get_separate_slots() {
+        let mut state = ChatStreamState::new();
+        let chunk: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        { "id": "call_a", "function": { "name": "read", "arguments": "{}" } },
+                        { "id": "call_b", "function": { "name": "grep", "arguments": "{}" } }
+                    ]
+                },
+                "index": 0
+            }]
+        }))
+        .expect("chunk parses");
+
+        apply_stream_chunk(chunk, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+
+        let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool calls");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].name, "read");
+        assert_eq!(tool_calls[1].name, "grep");
+    }
+
+    #[test]
+    fn index_less_fragments_without_id_continue_the_last_slot() {
+        let mut state = ChatStreamState::new();
+        let head: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_a",
+                        "function": { "name": "read", "arguments": "{\"path\":" }
+                    }]
+                },
+                "index": 0
+            }]
+        }))
+        .expect("head parses");
+        let tail: StreamChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "function": { "arguments": "\"a.md\"}" }
+                    }]
+                },
+                "index": 0
+            }]
+        }))
+        .expect("tail parses");
+
+        apply_stream_chunk(head, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+        apply_stream_chunk(tail, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+
+        let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool call");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].arguments, "{\"path\":\"a.md\"}");
+    }
+
+    #[test]
+    fn empty_round_with_dropped_chunks_reports_an_error() {
+        let mut state = ChatStreamState::new();
+        state.note_dropped_chunk(
+            "missing field `whatever`",
+            "data: {\"choices\":[{\"delta\":{}}]}",
+        );
+
+        let result = finalize_stream_response(
+            "Custom Chat",
+            "gemini-3.5-flash",
+            "https://example.com/v1/chat/completions",
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+            state,
+            String::new(),
+            String::new(),
+        );
+
+        let error = result.expect_err("silent-empty round must surface the parse failure");
+        assert!(error.contains("failed to parse"));
+        assert!(error.contains("missing field `whatever`"));
+
+        // With usable output the dropped chunk stays a warning, not an error.
+        let mut state = ChatStreamState::new();
+        state.note_dropped_chunk("missing field `whatever`", "data: {}");
+        state.full_text.push_str("done");
+        let result = finalize_stream_response(
+            "Custom Chat",
+            "gemini-3.5-flash",
+            "https://example.com/v1/chat/completions",
+            ChatCompletionsFlavor::Generic,
+            false,
+            true,
+            state,
+            String::new(),
+            String::new(),
+        );
+        assert_eq!(result.expect("usable output passes through").text, "done");
     }
 
     #[test]

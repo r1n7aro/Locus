@@ -1,5 +1,12 @@
 import { ipcInvoke } from "./ipc";
-import type { ModelDefaults, CustomEndpoint, CodexModelConfig, ModelOption } from "../types";
+import type {
+  ModelDefaults,
+  CustomEndpoint,
+  CustomProvider,
+  CodexModelConfig,
+  ModelCatalogResponse,
+  ModelOption,
+} from "../types";
 
 export function getModelDefaults(): Promise<ModelDefaults> {
   return ipcInvoke<ModelDefaults>("get_model_defaults");
@@ -45,14 +52,22 @@ export function saveCodexFastMode(enabled: boolean): Promise<void> {
   return ipcInvoke("save_codex_fast_mode", { enabled });
 }
 
-export function getCustomEndpoints(): Promise<CustomEndpoint[]> {
-  return ipcInvoke<CustomEndpoint[]>("get_custom_endpoints");
+export function getCustomProviders(): Promise<CustomProvider[]> {
+  return ipcInvoke<CustomProvider[]>("get_custom_providers");
 }
 
-export function saveCustomEndpoints(endpoints: CustomEndpoint[]): Promise<void> {
-  return ipcInvoke("save_custom_endpoints", { endpoints });
+export function saveCustomProviders(providers: CustomProvider[]): Promise<void> {
+  return ipcInvoke("save_custom_providers", { providers });
 }
 
 export function testCustomEndpoint(endpoint: CustomEndpoint): Promise<string> {
   return ipcInvoke<string>("test_custom_endpoint", { endpoint });
+}
+
+export function getModelCatalog(): Promise<ModelCatalogResponse> {
+  return ipcInvoke<ModelCatalogResponse>("get_model_catalog");
+}
+
+export function refreshModelCatalog(): Promise<ModelCatalogResponse> {
+  return ipcInvoke<ModelCatalogResponse>("refresh_model_catalog");
 }

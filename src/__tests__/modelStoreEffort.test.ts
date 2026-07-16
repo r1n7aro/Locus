@@ -9,7 +9,7 @@ const modelServiceMocks = vi.hoisted(() => ({
   getLastModel: vi.fn(),
   getLastEffort: vi.fn(),
   getCodexFastMode: vi.fn(),
-  getCustomEndpoints: vi.fn(),
+  getCustomProviders: vi.fn(),
   getCodexModelConfig: vi.fn(),
   getCodexAvailableModels: vi.fn(),
   saveLastModel: vi.fn(),
@@ -31,7 +31,7 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelServiceMocks.getLastModel.mockResolvedValue("");
     modelServiceMocks.getLastEffort.mockResolvedValue("");
     modelServiceMocks.getCodexFastMode.mockResolvedValue(false);
-    modelServiceMocks.getCustomEndpoints.mockResolvedValue([]);
+    modelServiceMocks.getCustomProviders.mockResolvedValue([]);
     modelServiceMocks.getCodexModelConfig.mockResolvedValue({ transport: "websocket" });
     modelServiceMocks.getCodexAvailableModels.mockResolvedValue([]);
     modelServiceMocks.saveLastModel.mockResolvedValue(undefined);
@@ -222,23 +222,28 @@ describe("useModelStore OpenAI effort mapping", () => {
   it("keeps codex mini limited to medium and high on OpenAI Responses endpoints", () => {
     const modelStore = useModelStore();
 
-    modelStore.applyCustomEndpoints([{
+    modelStore.applyCustomProviders([{
       id: "endpoint-1",
       name: "OpenAI Responses",
-      apiModel: "gpt-5.1-codex-mini",
       endpoint: "https://example.com/v1/responses",
       apiFormat: "openai_responses",
       apiKey: "",
-      contextLength: 256000,
-      betaFlags: [],
-      supportedReasoningEfforts: ["medium", "high"],
-      reasoningParamFormat: "openai_responses_reasoning_effort",
-      replayReasoningContent: false,
-      serverTools: { webSearch: false },
-      supportsToolLazyLoading: false,
-      supportsVision: true,
+      catalogId: null,
+      models: [{
+        id: "gpt-5.1-codex-mini",
+        apiModel: "gpt-5.1-codex-mini",
+        name: "gpt-5.1-codex-mini",
+        contextLength: 256000,
+        betaFlags: [],
+        supportedReasoningEfforts: ["medium", "high"],
+        reasoningParamFormat: "openai_responses_reasoning_effort",
+        replayReasoningContent: false,
+        reasoningReplayField: null,
+        serverTools: { webSearch: false },
+        supportsVision: true,
+      }],
     }]);
-    modelStore.selectedModelId = "custom/endpoint-1";
+    modelStore.selectedModelId = "custom/endpoint-1/gpt-5.1-codex-mini";
 
     expect(modelStore.availableEfforts).toEqual(["medium", "high"]);
   });
@@ -246,21 +251,27 @@ describe("useModelStore OpenAI effort mapping", () => {
   it("defaults custom endpoints to low medium high xhigh max reasoning controls", () => {
     const modelStore = useModelStore();
 
-    modelStore.applyCustomEndpoints([{
+    modelStore.applyCustomProviders([{
       id: "endpoint-1",
       name: "Custom Chat",
-      apiModel: "deepseek-v4-pro",
       endpoint: "https://example.com/v1",
       apiFormat: "openai_chat",
       apiKey: "",
-      contextLength: 256000,
-      betaFlags: [],
-      reasoningParamFormat: "openai_chat_reasoning_effort",
-      replayReasoningContent: true,
-      serverTools: { webSearch: false },
-      supportsToolLazyLoading: false,
-      supportsVision: true,
-    } as any]);
+      catalogId: null,
+      models: [{
+        id: "deepseek-v4-pro",
+        apiModel: "deepseek-v4-pro",
+        name: "deepseek-v4-pro",
+        contextLength: 256000,
+        betaFlags: [],
+        reasoningParamFormat: "openai_chat_reasoning_effort",
+        replayReasoningContent: true,
+        reasoningReplayField: null,
+        serverTools: { webSearch: false },
+        supportsVision: true,
+      } as any],
+    }]);
+    // Legacy single-segment ids keep resolving to the provider's first model.
     modelStore.selectedModelId = "custom/endpoint-1";
 
     expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
@@ -270,23 +281,28 @@ describe("useModelStore OpenAI effort mapping", () => {
   it("upgrades legacy custom endpoint defaults to include xhigh", () => {
     const modelStore = useModelStore();
 
-    modelStore.applyCustomEndpoints([{
+    modelStore.applyCustomProviders([{
       id: "endpoint-1",
       name: "Custom Chat",
-      apiModel: "deepseek-v4-pro",
       endpoint: "https://example.com/v1",
       apiFormat: "openai_chat",
       apiKey: "",
-      contextLength: 256000,
-      betaFlags: [],
-      supportedReasoningEfforts: ["low", "medium", "high", "max"],
-      reasoningParamFormat: "openai_chat_reasoning_effort",
-      replayReasoningContent: true,
-      serverTools: { webSearch: false },
-      supportsToolLazyLoading: false,
-      supportsVision: true,
+      catalogId: null,
+      models: [{
+        id: "deepseek-v4-pro",
+        apiModel: "deepseek-v4-pro",
+        name: "deepseek-v4-pro",
+        contextLength: 256000,
+        betaFlags: [],
+        supportedReasoningEfforts: ["low", "medium", "high", "max"],
+        reasoningParamFormat: "openai_chat_reasoning_effort",
+        replayReasoningContent: true,
+        reasoningReplayField: null,
+        serverTools: { webSearch: false },
+        supportsVision: true,
+      }],
     }]);
-    modelStore.selectedModelId = "custom/endpoint-1";
+    modelStore.selectedModelId = "custom/endpoint-1/deepseek-v4-pro";
 
     expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });

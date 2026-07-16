@@ -5,7 +5,7 @@ import type {
   ModelOption,
   ModelDefaults,
   AgentInfo,
-  CustomEndpoint,
+  CustomProvider,
   CodexModelConfig,
 } from "../types";
 import { t, locale, setLocale } from "../i18n";
@@ -18,7 +18,7 @@ import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
-import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
+import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
@@ -39,7 +39,7 @@ const emit = defineEmits<{
   authChanged: [];
   modelDefaultsChanged: [defaults: ModelDefaults];
   codexTransportChanged: [config: CodexModelConfig];
-  customEndpointsChanged: [endpoints: CustomEndpoint[]];
+  customProvidersChanged: [providers: CustomProvider[]];
   resetOnboarding: [];
 }>();
 
@@ -49,6 +49,7 @@ const {
   claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
+  anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
   codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
@@ -56,8 +57,9 @@ const {
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
   fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
   setToolPermission, setFileToolWorkspaceBoundaryEnabled,
-  customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
-  startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
+  customProviders, editingCustomProvider, isAddingCustomProvider, customProviderSaving, testStatus, testResult,
+  modelCatalog, modelCatalogLoading, modelCatalogRefreshing, loadModelCatalog, refreshCatalog,
+  startAddCustomProvider, startEditCustomProvider, cancelEditCustomProvider, saveCustomProvider, deleteCustomProvider, testCustomProvider,
 } = useSettingsState(emit);
 
 const uiStore = useUiStore();
@@ -260,12 +262,14 @@ watch(
           :codex-transport="codexModelConfig.transport"
           :dynamic-tool-loading-mode="dynamicToolLoadingMode"
           :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
+          :anthropic-native-lazy-enabled="anthropicNativeLazyEnabled"
+          :anthropic-native-lazy-busy="anthropicNativeLazyBusy"
           :codex-user-code="codexUserCode"
           :codex-url="codexUrl"
           :codex-code-copied="codexCodeCopied"
           :all-models="allModels"
-          :custom-endpoints="customEndpoints"
-          :custom-endpoint-saving="customEndpointSaving"
+          :custom-providers="customProviders"
+          :custom-provider-saving="customProviderSaving"
           :claude-code-test-status="claudeCodeTestStatus"
           :claude-code-test-result="claudeCodeTestResult"
           @test-claude-code="testClaudeCode"
@@ -291,9 +295,10 @@ watch(
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
           @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
-          @start-add-endpoint="startAddEndpoint"
-          @start-edit-endpoint="startEditEndpoint"
-          @delete-endpoint="deleteEndpoint"
+          @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"
+          @start-add-provider="startAddCustomProvider"
+          @start-edit-provider="startEditCustomProvider"
+          @delete-provider="deleteCustomProvider"
           @update:edit-key="editKey = $event"
           @update:oauth-code="oauthCode = $event"
         />
@@ -385,15 +390,20 @@ watch(
       <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
     </div><!-- end settings-content -->
 
-    <CustomEndpointModal
-      v-model:endpoint="editingEndpoint"
-      :is-adding="isAddingEndpoint"
-      :saving="customEndpointSaving"
+    <CustomProviderModal
+      v-model:provider="editingCustomProvider"
+      :is-adding="isAddingCustomProvider"
+      :saving="customProviderSaving"
       :test-status="testStatus"
       :test-result="testResult"
-      @close="cancelEditEndpoint"
-      @save="saveEndpoint"
-      @test="testEndpoint"
+      :catalog="modelCatalog"
+      :catalog-loading="modelCatalogLoading"
+      :catalog-refreshing="modelCatalogRefreshing"
+      @close="cancelEditCustomProvider"
+      @save="saveCustomProvider"
+      @test="testCustomProvider"
+      @open-catalog="loadModelCatalog()"
+      @refresh-catalog="refreshCatalog"
     />
 
   </div>
