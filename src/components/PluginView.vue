@@ -1770,6 +1770,9 @@ async function setPluginEnabledState(plugin: InstalledPluginSummary, enabled: bo
   const key = selectedPluginIdentity(plugin);
   if (pluginEnableKey.value) return;
   pluginEnableKey.value = key;
+  // Optimistic flip so the switch responds on click; the authoritative
+  // summary replaces it when the backend answers, or rolls back on failure.
+  replaceInstalledPlugin({ ...plugin, enabled });
   try {
     const updated = await pluginSetEnabled(plugin.id, plugin.scope, enabled);
     replaceInstalledPlugin(updated);
@@ -1778,8 +1781,11 @@ async function setPluginEnabledState(plugin: InstalledPluginSummary, enabled: bo
       t(enabled ? "plugin.notice.enabled" : "plugin.notice.disabled", updated.name || updated.id),
       { operation: "pluginSetEnabled" },
     );
-    await refreshAll();
+    // Registry/dependency views reconcile in the background instead of
+    // holding the switch hostage to a full reload.
+    void refreshAll();
   } catch (error) {
+    replaceInstalledPlugin(plugin);
     notificationStore.addNotice("error", errorMessage(error), { operation: "pluginSetEnabled" });
   } finally {
     if (pluginEnableKey.value === key) {
@@ -2134,7 +2140,6 @@ onUnmounted(() => {
                 <BaseSwitch
                   class="plugin-enable-switch"
                   :model-value="plugin.enabled"
-                  :disabled="pluginEnableKey === `${plugin.scope}:${plugin.id}`"
                   :aria-label="plugin.enabled ? t('plugin.hub.disable') : t('plugin.hub.enable')"
                   @update:model-value="setPluginEnabledState(plugin, $event)"
                 />
@@ -2305,7 +2310,6 @@ onUnmounted(() => {
               <span>{{ selectedInstalledPlugin.enabled ? t("common.enabled") : t("common.disabled") }}</span>
               <BaseSwitch
                 :model-value="selectedInstalledPlugin.enabled"
-                :disabled="pluginEnableKey === `${selectedInstalledPlugin.scope}:${selectedInstalledPlugin.id}`"
                 :aria-label="selectedInstalledPlugin.enabled ? t('plugin.hub.disable') : t('plugin.hub.enable')"
                 @update:model-value="setPluginEnabledState(selectedInstalledPlugin, $event)"
               />
@@ -3704,14 +3708,6 @@ onUnmounted(() => {
   to {
     transform: rotate(360deg);
   }
-}
-
-:global(.plugin-list-context-menu .plugin-list-context-menu-item) {
-  gap: 8px;
-}
-
-:global(.plugin-list-context-menu .plugin-list-context-menu-item svg) {
-  flex: 0 0 auto;
 }
 
 .plugin-hub-config-header {
