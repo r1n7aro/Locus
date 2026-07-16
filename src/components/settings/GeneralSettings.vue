@@ -242,6 +242,13 @@ async function toggleDebug() {
   }
 }
 
+// Focused number inputs step on wheel in Chromium; swallow it so scrolling the page can't silently change saved values.
+function guardNumberInputWheel(event: WheelEvent) {
+  if (event.target === document.activeElement) {
+    event.preventDefault();
+  }
+}
+
 async function refreshLlmRetryMaxAttempts() {
   try {
     llmRetryMaxAttempts.value = await getLlmRetryMaxAttempts();
@@ -794,9 +801,9 @@ async function selectPythonRuntime(selectedId: string) {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.general.llmRetry") }}</div>
     <p class="section-desc">{{ t("settings.general.llmRetryDesc") }}</p>
-    <div class="llm-retry-row" :aria-busy="!llmRetryReady">
+    <div class="number-setting-row" :aria-busy="!llmRetryReady">
       <input
-        class="llm-retry-input"
+        class="number-setting-input"
         type="number"
         min="0"
         :max="LLM_RETRY_MAX"
@@ -804,6 +811,7 @@ async function selectPythonRuntime(selectedId: string) {
         :value="llmRetryMaxAttempts"
         :disabled="!llmRetryReady || llmRetryBusy"
         :aria-label="t('settings.general.llmRetry')"
+        @wheel="guardNumberInputWheel"
         @change="onLlmRetryChange"
       />
       <span class="debug-toggle-label">{{ llmRetryStatusLabel }}</span>
@@ -813,31 +821,37 @@ async function selectPythonRuntime(selectedId: string) {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.general.subagentLimits") }}</div>
     <p class="section-desc">{{ t("settings.general.subagentLimitsDesc") }}</p>
-    <div class="llm-retry-row" :aria-busy="!subagentLimitsReady">
-      <span class="debug-toggle-label">{{ t("settings.general.subagentMaxDepth") }}</span>
-      <input
-        class="llm-retry-input"
-        type="number"
-        min="1"
-        :max="SUBAGENT_DEPTH_MAX"
-        step="1"
-        :value="subagentMaxDepth"
-        :disabled="!subagentLimitsReady || subagentLimitsBusy"
-        :aria-label="t('settings.general.subagentMaxDepth')"
-        @change="onSubagentDepthChange"
-      />
-      <span class="debug-toggle-label">{{ t("settings.general.subagentMaxConcurrent") }}</span>
-      <input
-        class="llm-retry-input"
-        type="number"
-        min="1"
-        :max="SUBAGENT_CONCURRENT_MAX"
-        step="1"
-        :value="subagentMaxConcurrent"
-        :disabled="!subagentLimitsReady || subagentLimitsBusy"
-        :aria-label="t('settings.general.subagentMaxConcurrent')"
-        @change="onSubagentConcurrentChange"
-      />
+    <div class="number-setting-row" :aria-busy="!subagentLimitsReady">
+      <label class="number-setting-field">
+        <span class="number-setting-field-label">{{ t("settings.general.subagentMaxDepth") }}</span>
+        <input
+          class="number-setting-input"
+          type="number"
+          min="1"
+          :max="SUBAGENT_DEPTH_MAX"
+          step="1"
+          :value="subagentMaxDepth"
+          :disabled="!subagentLimitsReady || subagentLimitsBusy"
+          :aria-label="t('settings.general.subagentMaxDepth')"
+          @wheel="guardNumberInputWheel"
+          @change="onSubagentDepthChange"
+        />
+      </label>
+      <label class="number-setting-field">
+        <span class="number-setting-field-label">{{ t("settings.general.subagentMaxConcurrent") }}</span>
+        <input
+          class="number-setting-input"
+          type="number"
+          min="1"
+          :max="SUBAGENT_CONCURRENT_MAX"
+          step="1"
+          :value="subagentMaxConcurrent"
+          :disabled="!subagentLimitsReady || subagentLimitsBusy"
+          :aria-label="t('settings.general.subagentMaxConcurrent')"
+          @wheel="guardNumberInputWheel"
+          @change="onSubagentConcurrentChange"
+        />
+      </label>
       <span class="debug-toggle-label">{{ subagentLimitsStatusLabel }}</span>
     </div>
   </div>
@@ -1086,22 +1100,51 @@ async function selectPythonRuntime(selectedId: string) {
 .debug-toggle-label {
   font-size: 13px;
 }
-.llm-retry-row {
-  display: inline-flex;
+.number-setting-row {
+  display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 10px 14px;
   color: var(--text-color);
 }
-.llm-retry-input {
-  width: 72px;
-  padding: 5px 8px;
+.number-setting-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.number-setting-field-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.number-setting-input {
+  width: 64px;
+  padding: 6px 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--input-bg);
   color: var(--text-color);
   font-size: 13px;
+  font-family: inherit;
+  text-align: center;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  appearance: textfield;
+  -moz-appearance: textfield;
 }
-.llm-retry-input:disabled {
+.number-setting-input::-webkit-inner-spin-button,
+.number-setting-input::-webkit-outer-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+.number-setting-input:hover:not(:disabled):not(:focus) {
+  border-color: var(--border-strong);
+}
+.number-setting-input:focus {
+  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--input-bg) 88%, var(--accent-soft) 12%);
+}
+.number-setting-input:disabled {
   opacity: 0.55;
   cursor: default;
 }
