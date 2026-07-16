@@ -873,6 +873,11 @@ export function listSkills(): Promise<SkillManifest[]> {
   return ipcInvoke<SkillManifest[]>("list_skills");
 }
 
+/** Rescan the external agent skill directories (~/.claude/skills, ...). */
+export function refreshExternalSkills(): Promise<void> {
+  return ipcInvoke<void>("refresh_external_skills");
+}
+
 export function readSkillManifest(
   dirName: string,
   source?: string,

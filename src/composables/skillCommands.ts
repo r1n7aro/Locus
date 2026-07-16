@@ -1,8 +1,10 @@
 import {
   skillSurfaceAllowsAuto,
   skillSurfaceAllowsCommand,
+  type KnowledgeInjectMode,
   type SkillConfig,
   type SkillManifest,
+  type SkillSurface,
 } from "../types";
 
 export const BUILTIN_COMMAND_NAMES = ["/clear", "/compact", "/plan"] as const;
@@ -90,4 +92,49 @@ export function buildSkillConfigForCommandToggle(
     surface: commandEnabled ? (allowsAuto ? "both" : "command") : allowsAuto ? "auto" : "command",
     commandTrigger: normalizeSkillCommandTrigger(commandTrigger, skill.name),
   };
+}
+
+// ── Skill activation model ────────────────────────────────────
+// A skill has two independent channels gated by one master switch:
+//   - command channel: the slash trigger (surface command side)
+//   - auto channel: structure injection + model recall, active only when the
+//     surface auto side is on AND injectMode is path/excerpt
+// The UI edits the channels as "inject mode" (none/path/excerpt) and a
+// "command" toggle; the surface value is derived from the two.
+
+export type SkillInjectSelection = "none" | "path" | "excerpt";
+
+/** Effective auto-channel inject mode: none whenever the surface auto side is off. */
+export function effectiveSkillInjectMode(
+  surface: SkillSurface | null | undefined,
+  injectMode: KnowledgeInjectMode | null | undefined,
+): SkillInjectSelection {
+  if (surface != null && !skillSurfaceAllowsAuto(surface)) return "none";
+  return injectMode === "path" || injectMode === "excerpt" ? injectMode : "none";
+}
+
+/**
+ * Derive the stored surface from the two channel toggles. Both channels off
+ * is persisted as `auto` + injectMode none, which the recall gate treats as
+ * inactive; SkillSurface has no dedicated "none" variant.
+ */
+export function deriveSkillSurface(commandOn: boolean, autoOn: boolean): SkillSurface {
+  if (commandOn && autoOn) return "both";
+  if (commandOn) return "command";
+  return "auto";
+}
+
+/**
+ * True when the skill will not take effect through any channel — either the
+ * master switch is off, or both the command and auto channels are off. Used
+ * for the tree dimming and the detail-page warning.
+ */
+export function skillActivationInactive(item: {
+  skillEnabled?: boolean | null;
+  skillSurface?: SkillSurface | null;
+  injectMode?: KnowledgeInjectMode | null;
+}): boolean {
+  if (item.skillEnabled === false) return true;
+  if (skillSurfaceAllowsCommand(item.skillSurface ?? undefined)) return false;
+  return effectiveSkillInjectMode(item.skillSurface, item.injectMode) === "none";
 }

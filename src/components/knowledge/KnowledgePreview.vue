@@ -18,9 +18,12 @@ import { t } from "../../i18n";
 import { useNotificationStore } from "../../stores/notification";
 import { useSkills } from "../../composables/useSkills";
 import {
+  deriveSkillSurface,
+  effectiveSkillInjectMode,
   findSkillCommandConflict,
   isValidSkillCommandTrigger,
   normalizeSkillCommandTrigger,
+  skillActivationInactive,
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import BaseDropdown from "../ui/BaseDropdown.vue";
@@ -199,8 +202,15 @@ const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
 const scopeLabel = computed(() => labelForStoredScope(props.document));
 const injectMode = computed(() => props.document?.injectMode ?? "none");
+// Skill documents show the effective auto-channel mode: a surface without the
+// auto side reads as "none" regardless of the stored injectMode.
+const displayInjectMode = computed<KnowledgeInjectMode>(() => (
+  props.document?.type === "skill"
+    ? effectiveSkillInjectMode(props.document?.skillSurface, props.document?.injectMode)
+    : injectMode.value
+));
 const injectModeSelection = computed<InjectModeSelection>(() => (
-  props.document?.inheritInjectMode ? "inherit_parent" : (props.document?.injectMode ?? "none")
+  props.document?.inheritInjectMode ? "inherit_parent" : displayInjectMode.value
 ));
 const summaryEnabled = computed(() => !!props.document?.summaryEnabled);
 const editMode = computed<KnowledgeEditMode>(() => getKnowledgeEditMode(props.document));
@@ -270,7 +280,7 @@ const effectiveEditMode = computed<Exclude<KnowledgeEditMode, "inherit_parent">>
 });
 const injectModeDropdownLabel = computed(() => {
   if (!props.document) return "";
-  const effectiveLabel = labelForInjectMode(injectMode.value);
+  const effectiveLabel = labelForInjectMode(displayInjectMode.value);
   return props.document.inheritInjectMode
     ? labelForInheritedValue(effectiveLabel, props.document.injectModeSource)
     : effectiveLabel;
@@ -369,45 +379,32 @@ const skillEnabled = computed(() => (
 const currentSkillSurface = computed<SkillSurface | undefined>(() => (
   isSkillDocument.value ? (props.document?.skillSurface ?? "command") : undefined
 ));
-const skillSurfaceValue = computed(() => (
-  !isSkillDocument.value
-    ? "disabled"
-    : skillEnabled.value
-      ? currentSkillSurface.value ?? "command"
-      : "disabled"
+const skillCommandChannelOn = computed(() => (
+  isSkillDocument.value && skillSurfaceAllowsCommand(currentSkillSurface.value)
 ));
-const skillSurfaceOptions = computed(() => [
-  {
-    value: "disabled",
-    label: t("knowledge.skill.surfaceDisabled"),
-    hint: t("knowledge.skill.surfaceDisabledHint"),
-  },
-  {
-    value: "command",
-    label: t("knowledge.skill.surfaceCommand"),
-    hint: t("knowledge.skill.surfaceCommandHint"),
-  },
-  {
-    value: "auto",
-    label: t("knowledge.skill.surfaceAuto"),
-    hint: t("knowledge.skill.surfaceAutoHint"),
-  },
-  {
-    value: "both",
-    label: t("knowledge.skill.surfaceBoth"),
-    hint: t("knowledge.skill.surfaceBothHint"),
-  },
-]);
+const skillAutoChannelOn = computed(() => (
+  isSkillDocument.value
+    && effectiveSkillInjectMode(props.document?.skillSurface, props.document?.injectMode) !== "none"
+));
+const skillActivationWarningVisible = computed(() => (
+  isSkillDocument.value
+    && skillEnabled.value
+    && skillActivationInactive({
+      skillEnabled: props.document?.skillEnabled,
+      skillSurface: props.document?.skillSurface,
+      injectMode: props.document?.injectMode,
+    })
+));
 const currentSkillCommandTrigger = computed(() => {
   if (!isSkillDocument.value) return "";
   return normalizeSkillCommandTrigger(props.document?.commandTrigger ?? "", fallbackSkillName.value);
 });
+// Saving no longer disables the skill config controls: meta updates are
+// optimistic and serialized upstream, so no disabled-dim flash per toggle.
 const skillCommandInputDisabled = computed(() =>
-  isReadOnly.value || props.saveLoading || !skillEnabled.value || !skillSurfaceAllowsCommand(currentSkillSurface.value),
+  isReadOnly.value || !skillCommandChannelOn.value,
 );
-const showSkillCommandFields = computed(() =>
-  isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value),
-);
+const showSkillCommandFields = computed(() => skillCommandChannelOn.value);
 const skillPackageId = computed(() => {
   return packageIdForSkillDocument(props.document);
 });
@@ -1169,10 +1166,22 @@ function onInjectModeChange(value: string) {
     updateMeta({ inheritInjectMode: true });
     return;
   }
-  updateMeta({
+  const patch: KnowledgeDocumentPatch = {
     inheritInjectMode: false,
     injectMode: value as KnowledgeInjectMode,
-  });
+  };
+  // For skills the inject mode drives the auto channel, so it also derives
+  // the surface: L0/L1 turn the auto side on, none turns it off.
+  if (
+    props.document?.type === "skill" &&
+    (value === "none" || value === "path" || value === "excerpt")
+  ) {
+    patch.skillSurface = deriveSkillSurface(
+      skillCommandChannelOn.value,
+      value !== "none",
+    );
+  }
+  updateMeta(patch);
 }
 
 function onEditModeChange(value: string) {
@@ -1325,19 +1334,18 @@ function showSkillCommandError(message: string) {
   });
 }
 
-function onSkillSurfaceChange(value: string) {
+function onSkillEnabledChange(value: boolean) {
   if (!props.document || props.document.type !== "skill" || isReadOnly.value) return;
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
-  if (value === "disabled") {
-    updateMeta({ skillEnabled: false });
-    return;
-  }
+  updateMeta({ skillEnabled: value });
+}
 
-  const nextSurface = value as SkillSurface;
+function onSkillCommandChannelChange(value: boolean) {
+  if (!props.document || props.document.type !== "skill" || isReadOnly.value) return;
+  notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
   updateMeta({
-    skillEnabled: true,
-    skillSurface: nextSurface,
-    commandTrigger: skillSurfaceAllowsCommand(nextSurface)
+    skillSurface: deriveSkillSurface(value, skillAutoChannelOn.value),
+    commandTrigger: value
       ? currentSkillCommandTrigger.value
       : props.document.commandTrigger ?? null,
   });
@@ -1416,7 +1424,7 @@ function resetSupportPanels(document: KnowledgeDocument | null) {
 }
 
 function persistSkillArgumentHint() {
-  if (!props.document || props.document.type !== "skill" || isReadOnly.value || props.saveLoading) return;
+  if (!props.document || props.document.type !== "skill" || isReadOnly.value) return;
   const nextValue = normalizeNullableInput(skillArgumentHintDraft.value);
   const currentValue = normalizeNullableInput(props.document.argumentHint ?? "");
   if (nextValue === currentValue) {
@@ -1439,7 +1447,12 @@ function onSkillArgumentHintKeydown(event: KeyboardEvent) {
   }
 }
 
+let skillUnityStatusRequestId = 0;
+
 async function refreshSkillUnityStatus() {
+  // Guard against stale responses: rapid package switches must not let a slow
+  // earlier request overwrite the status of the currently shown package.
+  const requestId = ++skillUnityStatusRequestId;
   const packageId = skillPackageId.value;
   if (!packageId) {
     skillUnityStatus.value = null;
@@ -1447,11 +1460,18 @@ async function refreshSkillUnityStatus() {
   }
   skillUnityStatusLoading.value = true;
   try {
-    skillUnityStatus.value = await getSkillUnityInstallStatus(packageId);
+    const status = await getSkillUnityInstallStatus(packageId);
+    if (requestId === skillUnityStatusRequestId) {
+      skillUnityStatus.value = status;
+    }
   } catch {
-    skillUnityStatus.value = null;
+    if (requestId === skillUnityStatusRequestId) {
+      skillUnityStatus.value = null;
+    }
   } finally {
-    skillUnityStatusLoading.value = false;
+    if (requestId === skillUnityStatusRequestId) {
+      skillUnityStatusLoading.value = false;
+    }
   }
 }
 
@@ -1871,7 +1891,7 @@ function labelForProvider(provider?: string | null): string {
                   >
                     <BaseSwitch
                       :model-value="explicitRulesEnabled"
-                      :disabled="isReadOnly || saveLoading || explicitRulesLocked"
+                      :disabled="isReadOnly || explicitRulesLocked"
                       :aria-label="t('knowledge.meta.explicitMaintenanceRules')"
                       @update:model-value="onExplicitRulesChange"
                     />
@@ -1885,24 +1905,39 @@ function labelForProvider(provider?: string | null): string {
                       :model-value="injectModeSelection"
                       :selected-label="injectModeDropdownLabel"
                       :options="injectModeOptions"
-                      :disabled="isReadOnly || saveLoading"
+                      :disabled="isReadOnly"
                       :aria-label="t('knowledge.meta.injectMode')"
                       @update:model-value="onInjectModeChange"
                     />
                   </div>
                 </div>
                 <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.skill.surfaceLabel") }}</span>
+                  <span class="meta-label">{{ t("knowledge.skill.enabledLabel") }}</span>
                   <div class="meta-control">
-                    <BaseDropdown
-                      class="meta-dropdown"
-                      :model-value="skillSurfaceValue"
-                      :options="skillSurfaceOptions"
-                      :disabled="isReadOnly || saveLoading"
-                      :aria-label="t('knowledge.skill.surfaceLabel')"
-                      @update:model-value="onSkillSurfaceChange"
+                    <BaseSwitch
+                      :model-value="skillEnabled"
+                      :disabled="isReadOnly"
+                      :aria-label="t('knowledge.skill.enabledLabel')"
+                      @update:model-value="onSkillEnabledChange"
                     />
                   </div>
+                </div>
+                <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
+                  <span class="meta-label">{{ t("knowledge.skill.commandChannelLabel") }}</span>
+                  <div class="meta-control">
+                    <BaseSwitch
+                      :model-value="skillCommandChannelOn"
+                      :disabled="isReadOnly"
+                      :aria-label="t('knowledge.skill.commandChannelLabel')"
+                      @update:model-value="onSkillCommandChannelChange"
+                    />
+                  </div>
+                </div>
+                <div
+                  v-if="skillActivationWarningVisible"
+                  class="meta-row skill-activation-warning"
+                >
+                  {{ t("knowledge.skill.activationWarning") }}
                 </div>
                 <div v-if="showSkillCommandFields" class="meta-row meta-row-control">
                   <span class="meta-label">{{ t("knowledge.skill.commandTrigger") }}</span>
@@ -1925,7 +1960,7 @@ function labelForProvider(provider?: string | null): string {
                       v-model="skillArgumentHintDraft"
                       class="meta-text-input"
                       type="text"
-                      :disabled="isReadOnly || saveLoading"
+                      :disabled="isReadOnly"
                       @blur="persistSkillArgumentHint"
                       @keydown="onSkillArgumentHintKeydown"
                     />
@@ -1976,7 +2011,7 @@ function labelForProvider(provider?: string | null): string {
                       :model-value="editMode"
                       :selected-label="editModeDropdownLabel"
                       :options="editModeOptions"
-                      :disabled="isEditModeLocked || saveLoading"
+                      :disabled="isEditModeLocked"
                       :aria-label="t('knowledge.meta.editMode')"
                       @update:model-value="onEditModeChange"
                     />
@@ -2998,6 +3033,16 @@ function labelForProvider(provider?: string | null): string {
 .meta-text-input:disabled {
   opacity: 0.52;
   cursor: not-allowed;
+}
+
+.skill-activation-warning {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning-color, #d9a03f) 42%, var(--border-color));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warning-color, #d9a03f) 9%, transparent);
+  color: var(--text-color);
+  font-size: 11px;
+  line-height: 1.55;
 }
 
 .meta-text-input::placeholder {

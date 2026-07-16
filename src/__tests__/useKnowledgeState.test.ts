@@ -68,6 +68,7 @@ const knowledgeMocks = vi.hoisted(() => ({
   knowledgeDeactivateEmbedding: vi.fn(),
   knowledgeSaveEmbeddingConfig: vi.fn(),
   knowledgeSaveGeneralConfig: vi.fn(),
+  listSkills: vi.fn(),
   setSkillConfig: vi.fn(),
 }));
 
@@ -549,6 +550,7 @@ describe("useKnowledgeState", () => {
       async (config: any) => config,
     );
     knowledgeMocks.setSkillConfig.mockResolvedValue(undefined);
+    knowledgeMocks.listSkills.mockResolvedValue([]);
     knowledgeMocks.knowledgeActivateEmbedding.mockResolvedValue(undefined);
     knowledgeMocks.knowledgeDeactivateEmbedding.mockResolvedValue(undefined);
     knowledgeMocks.knowledgeDownloadLocalEmbeddingModel.mockResolvedValue(
@@ -2605,6 +2607,333 @@ describe("useKnowledgeState", () => {
     await state.deleteExplorerNode(packageNode);
     expect(knowledgeMocks.deleteSkillPackage).toHaveBeenCalledWith(
       "com.feishu.cli",
+    );
+  });
+
+  it("groups external skills under per-source folders and routes config to the external source", async () => {
+    const externalSkill: KnowledgeDocumentSummary = {
+      id: "skill-external-grill-me",
+      type: "skill",
+      path: "external/claude/grill-me/SKILL.md",
+      title: "grill-me",
+      injectMode: "excerpt",
+      summaryEnabled: true,
+      commandEnabled: false,
+      readOnly: true,
+      aiMaintained: false,
+      storageSource: "app",
+      explicitMaintenanceRules: false,
+      externalSource: {
+        provider: "package",
+        sourceId: "external/claude/grill-me",
+        locator: "external://user/claude/grill-me",
+      },
+      skillEnabled: false,
+      skillSurface: "both",
+      commandTrigger: "/grill-me",
+      argumentHint: "<plan>",
+      summary: "Interrogate a plan before coding.",
+      createdAt: 1,
+      updatedAt: 2,
+      hasSummary: true,
+    };
+    knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
+      input.type === "skill" ? [externalSkill] : [],
+    );
+    knowledgeMocks.knowledgeListDirectories.mockResolvedValue([]);
+
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.selectType("skill");
+    const externalFolder = state.visibleExplorerTree.value[0];
+    expect(externalFolder).toMatchObject({
+      kind: "folder",
+      relativePath: "external",
+      depth: 1,
+    });
+    if (externalFolder?.kind !== "folder") throw new Error("missing folder");
+    const providerFolder = externalFolder.children[0];
+    expect(providerFolder).toMatchObject({
+      kind: "folder",
+      relativePath: "external/claude",
+      depth: 2,
+    });
+    if (providerFolder?.kind !== "folder") throw new Error("missing provider");
+    const packageNode = providerFolder.children[0];
+    expect(packageNode).toMatchObject({
+      kind: "package",
+      name: "grill-me",
+      relativePath: "external/claude/grill-me",
+      path: "skill/external/claude/grill-me",
+      depth: 3,
+    });
+    if (packageNode?.kind !== "package") throw new Error("missing package");
+    expect(
+      packageNode.children.some(
+        (child) =>
+          child.kind === "document" &&
+          child.document.path === "external/claude/grill-me/SKILL.md" &&
+          child.depth === 4,
+      ),
+    ).toBe(true);
+
+    await state.selectPackage(packageNode.document);
+    expect(state.selectedPath.value).toBe("skill/external/claude/grill-me");
+
+    await state.updatePackageConfig({
+      skillEnabled: true,
+      skillSurface: "both",
+      commandTrigger: "/grill-me",
+    });
+    expect(knowledgeMocks.setSkillConfig).toHaveBeenCalledWith(
+      "skill/external/claude/grill-me",
+      "externalUser",
+      {
+        enabled: true,
+        surface: "both",
+        commandTrigger: "/grill-me",
+        injectMode: undefined,
+      },
+    );
+  });
+
+  function createSkillPackageFixture() {
+    const rootSkill: KnowledgeDocumentSummary = {
+      id: "skill-package-root",
+      type: "skill",
+      path: "com.feishu.cli/SKILL.md",
+      title: "Feishu CLI",
+      injectMode: "excerpt",
+      summaryEnabled: true,
+      commandEnabled: true,
+      readOnly: true,
+      aiMaintained: false,
+      storageSource: "app",
+      explicitMaintenanceRules: false,
+      externalSource: {
+        provider: "package",
+        sourceId: "com.feishu.cli",
+        locator: "skills/com.feishu.cli",
+      },
+      skillEnabled: true,
+      skillSurface: "both",
+      commandTrigger: "/feishu",
+      argumentHint: "[resource]",
+      summary: "Use Feishu safely.",
+      createdAt: 1,
+      updatedAt: 2,
+      hasSummary: true,
+    };
+    const childSkill: KnowledgeDocumentSummary = {
+      ...rootSkill,
+      id: "skill-package-child",
+      path: "com.feishu.cli/reference/auth.md",
+      title: "Auth",
+      commandTrigger: null,
+      argumentHint: null,
+      summary: "Authentication notes.",
+    };
+    knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
+      input.type === "skill" ? [childSkill, rootSkill] : [],
+    );
+    knowledgeMocks.knowledgeListDirectories.mockResolvedValue([]);
+    return { rootSkill, childSkill };
+  }
+
+  async function createSelectedSkillPackageState() {
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await state.selectType("skill");
+    const packageNode = state.visibleExplorerTree.value[0];
+    if (packageNode?.kind !== "package") {
+      throw new Error("missing package node");
+    }
+    await state.selectPackage(packageNode.document);
+    return state;
+  }
+
+  it("flips package config optimistically and skips the full reload", async () => {
+    createSkillPackageFixture();
+    const state = await createSelectedSkillPackageState();
+    expect(state.selectedPackageDocument.value?.skillEnabled).toBe(true);
+
+    let resolveSave: (() => void) | null = null;
+    knowledgeMocks.setSkillConfig.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveSave = resolve;
+        }),
+    );
+    const listCallsBefore = knowledgeMocks.knowledgeList.mock.calls.length;
+
+    const pending = state.updatePackageConfig({
+      skillEnabled: false,
+      skillSurface: "command",
+    });
+    // Optimistic: the switch value flips before the IPC round trip resolves.
+    expect(state.selectedPackageDocument.value?.skillEnabled).toBe(false);
+    expect(
+      state.documents.value.find((doc) => doc.id === "skill-package-root")
+        ?.skillEnabled,
+    ).toBe(false);
+    expect(state.savingDocument.value).toBe(true);
+
+    await flushPromises();
+    resolveSave!();
+    await pending;
+    await flushPromises();
+
+    expect(state.selectedPackageDocument.value?.skillEnabled).toBe(false);
+    expect(state.savingDocument.value).toBe(false);
+    // A config toggle must not trigger a full knowledge list reload.
+    expect(knowledgeMocks.knowledgeList.mock.calls.length).toBe(
+      listCallsBefore,
+    );
+  });
+
+  it("rolls back the optimistic package config when the save fails", async () => {
+    createSkillPackageFixture();
+    const state = await createSelectedSkillPackageState();
+    knowledgeMocks.setSkillConfig.mockRejectedValue(new Error("save failed"));
+
+    await state.updatePackageConfig({
+      skillEnabled: false,
+      skillSurface: "command",
+    });
+
+    expect(state.selectedPackageDocument.value?.skillEnabled).toBe(true);
+    expect(
+      state.documents.value.find((doc) => doc.id === "skill-package-root")
+        ?.skillEnabled,
+    ).toBe(true);
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith(
+      "error",
+      expect.stringContaining("save failed"),
+      expect.anything(),
+    );
+  });
+
+  it("keeps the package panel until the clicked document is ready, then swaps atomically", async () => {
+    const { childSkill } = createSkillPackageFixture();
+    const state = await createSelectedSkillPackageState();
+
+    let resolveRead: ((value: any) => void) | null = null;
+    knowledgeMocks.knowledgeRead.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRead = resolve;
+        }),
+    );
+
+    const pending = state.selectDocument(childSkill);
+    await flushPromises();
+    // Mid-flight: the package preview stays; no fallback panel frame.
+    expect(state.selectedPackageDocument.value).not.toBeNull();
+    expect(state.selectedDocument.value).toBeNull();
+
+    resolveRead!({
+      document: { ...childSkill, body: "auth body", maintenanceRules: null },
+    });
+    await pending;
+
+    expect(state.selectedPackageDocument.value).toBeNull();
+    expect(state.selectedDocument.value?.id).toBe("skill-package-child");
+  });
+
+  it("drops a stale document read when a newer selection supersedes it", async () => {
+    const { rootSkill, childSkill } = createSkillPackageFixture();
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await state.selectType("skill");
+
+    const pendingReads: Array<{
+      path: string;
+      resolve: (value: any) => void;
+    }> = [];
+    knowledgeMocks.knowledgeRead.mockImplementation(
+      (input: any) =>
+        new Promise((resolve) => {
+          pendingReads.push({ path: input.path, resolve });
+        }),
+    );
+
+    const first = state.selectDocument(rootSkill);
+    const second = state.selectDocument(childSkill);
+    await flushPromises();
+    expect(pendingReads).toHaveLength(2);
+
+    // The later selection resolves first...
+    pendingReads[1]!.resolve({
+      document: { ...childSkill, body: "", maintenanceRules: null },
+    });
+    await second;
+    expect(state.selectedDocument.value?.id).toBe("skill-package-child");
+
+    // ...then the stale first response lands and must be dropped.
+    pendingReads[0]!.resolve({
+      document: { ...rootSkill, body: "", maintenanceRules: null },
+    });
+    await first;
+    expect(state.selectedDocument.value?.id).toBe("skill-package-child");
+    expect(state.selectedDocumentId.value).toBe("skill-package-child");
+  });
+
+  it("applies edited meta precisely without reloading the whole type", async () => {
+    const { childSkill } = createSkillPackageFixture();
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await state.selectType("skill");
+    knowledgeMocks.knowledgeRead.mockResolvedValue({
+      document: { ...childSkill, body: "", maintenanceRules: null },
+    });
+    await state.selectDocument(childSkill);
+
+    const listCallsBefore = knowledgeMocks.knowledgeList.mock.calls.length;
+    knowledgeMocks.knowledgeEdit.mockResolvedValue({
+      document: {
+        ...childSkill,
+        body: "",
+        maintenanceRules: null,
+        skillEnabled: false,
+        updatedAt: 9,
+      },
+    });
+
+    const pending = state.updateMeta(childSkill.id, childSkill.path, {
+      skillEnabled: false,
+    });
+    // Optimistic flip before the backend answers.
+    expect(state.selectedDocument.value?.skillEnabled).toBe(false);
+    await pending;
+
+    expect(state.selectedDocument.value?.updatedAt).toBe(9);
+    expect(
+      state.documents.value.find((doc) => doc.id === childSkill.id)
+        ?.skillEnabled,
+    ).toBe(false);
+    expect(knowledgeMocks.knowledgeList.mock.calls.length).toBe(
+      listCallsBefore,
     );
   });
 

@@ -174,11 +174,16 @@ describe("KnowledgePreview layout", () => {
     expect(preview).toMatch(/\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-body,[\s\S]*\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-panel\s*\{[\s\S]*overflow:\s*visible;/);
   });
 
-  it("shows skill command fields only for command-capable skill surfaces", () => {
+  it("shows skill command fields only while the command channel is on", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain("const showSkillCommandFields = computed(() =>");
-    expect(preview).toContain("isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value)");
+    // The trigger/argument fields follow the command-channel toggle; the
+    // master enabled switch does not hide them so a disabled skill can still
+    // be configured before it is turned on.
+    expect(preview).toContain("const showSkillCommandFields = computed(() => skillCommandChannelOn.value);");
+    expect(preview).toContain(
+      "isSkillDocument.value && skillSurfaceAllowsCommand(currentSkillSurface.value)",
+    );
     expect(preview).toContain('v-if="showSkillCommandFields" class="meta-row meta-row-control"');
     expect(preview).toContain('t("knowledge.skill.commandTrigger")');
     expect(preview).toContain('t("knowledge.skill.argumentHint")');

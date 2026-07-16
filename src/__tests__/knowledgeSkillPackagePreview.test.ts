@@ -69,4 +69,19 @@ describe("knowledge skill package preview wiring", () => {
     expect(en).toContain('"knowledge.explorer.importSkillPackage": "Import Package"');
     expect(en).toContain('"knowledge.skillPackage.exported": "Exported package: {0}"');
   });
+
+  it("keeps config switches interactive while a save is in flight", () => {
+    const preview = read(
+      "src/components/knowledge/KnowledgeSkillPackagePreview.vue",
+    );
+    const state = read("src/composables/useKnowledgeState.ts");
+
+    // Optimistic updates replaced the disabled-dim flash: no config control
+    // is gated on saveLoading anymore.
+    expect(preview).not.toContain("configControlsDisabled");
+    // updatePackageConfig patches the summary before awaiting the backend and
+    // reconciles manifests in the background instead of a full reload.
+    expect(state).toContain("patchDocumentSummary(current.id, optimisticPatch)");
+    expect(state).toContain("void loadSkills({ force: true });");
+  });
 });

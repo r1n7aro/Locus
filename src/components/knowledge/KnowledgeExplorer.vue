@@ -3,11 +3,15 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import {
   BadgeInfo,
+  BookOpen,
   Check,
   ChevronRight,
   ChevronsDownUp,
+  Copy,
+  Download,
   FilePlus,
   Folder,
+  FolderCog,
   FolderInput,
   FolderOpen,
   FolderPlus,
@@ -16,6 +20,8 @@ import {
   Lock,
   Package,
   PackagePlus,
+  PencilLine,
+  Trash2,
   X,
 } from "lucide";
 import { t } from "../../i18n";
@@ -42,6 +48,11 @@ import {
   type KnowledgeListTag,
 } from "./knowledgeMetaLabels";
 import { buildFolderDisplayStats } from "./knowledgeExplorerFolderCounts";
+import {
+  effectiveSkillInjectMode,
+  skillActivationInactive,
+} from "../../composables/skillCommands";
+import { skillSurfaceAllowsCommand } from "../../types";
 import {
   pruneKnowledgeDragNodes,
   resolveKnowledgeContextSelection,
@@ -759,6 +770,30 @@ function isPluginManagedNode(node: ExplorerNode): boolean {
   return node.children.some(isPluginManagedNode);
 }
 
+// External skills are discovered from agent directories (~/.claude/skills,
+// ~/.agents/skills, ...) and are strictly read-only inside Locus: no rename,
+// move, delete, export, or content edits.
+function isExternalSkillNode(node: ExplorerNode): boolean {
+  if (node.kind === "package" || node.kind === "document") {
+    return !!node.document.externalSource?.locator?.startsWith("external://");
+  }
+  return node.children.some(isExternalSkillNode);
+}
+
+// Dim skills that will not take effect: master switch off, or both the
+// command and auto channels off. Package-internal documents (references/)
+// carry skillEnabled=false by design, so only the package root and plain
+// skill documents participate.
+function skillNodeInactive(node: ExplorerNode): boolean {
+  if (node.kind === "package") return skillActivationInactive(node.document);
+  if (node.kind !== "document") return false;
+  const document = node.document;
+  if (document.type !== "skill") return false;
+  const isPackageDocument = document.externalSource?.provider === "package";
+  if (isPackageDocument && !isSkillPackageRootDocument(document)) return false;
+  return skillActivationInactive(document);
+}
+
 // Skill package contents are read-only virtual paths mounted into the tree;
 // the package root node keeps its own lifecycle menu, but nodes inside a
 // package cannot be created, renamed, moved, or deleted from here.
@@ -771,12 +806,19 @@ function isPackageContentNode(node: ExplorerNode): boolean {
 }
 
 function isManagedNode(node: ExplorerNode): boolean {
-  return isPluginManagedNode(node) || isPackageContentNode(node);
+  return (
+    isPluginManagedNode(node) ||
+    isExternalSkillNode(node) ||
+    isPackageContentNode(node)
+  );
 }
 
 function managedHint(nodes: ExplorerNode[]): string | undefined {
   if (nodes.some(isPluginManagedNode)) {
     return t("knowledge.explorer.pluginManagedHint");
+  }
+  if (nodes.some(isExternalSkillNode)) {
+    return t("knowledge.explorer.externalManagedHint");
   }
   if (nodes.some(isPackageContentNode)) {
     return t("knowledge.explorer.packageManagedHint");
@@ -786,6 +828,7 @@ function managedHint(nodes: ExplorerNode[]): string | undefined {
 
 function rowLockTitle(node: ExplorerNode): string | null {
   if (isPluginManagedNode(node)) return t("knowledge.explorer.pluginManaged");
+  if (isExternalSkillNode(node)) return t("knowledge.explorer.externalManaged");
   if (isPackageContentNode(node)) return t("knowledge.explorer.packageManaged");
   return null;
 }
@@ -1290,8 +1333,11 @@ function documentTags(node: DocumentNode): Array<{
   // The package folder row already renders the command trigger via
   // packageTags(); its SKILL.md child reuses the same document, so skip it here
   // to avoid showing the same /command twice.
+  const isSkill = node.document.type === "skill";
   const trigger = node.document.commandTrigger?.trim();
-  if (trigger && !isSkillPackageRootDocument(node.document)) {
+  const commandChannelOn =
+    !isSkill || skillSurfaceAllowsCommand(node.document.skillSurface ?? undefined);
+  if (trigger && commandChannelOn && !isSkillPackageRootDocument(node.document)) {
     tags.push({
       text: trigger,
       tone: "command",
@@ -1300,7 +1346,11 @@ function documentTags(node: DocumentNode): Array<{
   }
   tags.push(
     ...buildKnowledgeListTags({
-      injectMode: node.document.injectMode,
+      // Skills show the effective auto-channel mode: a surface without the
+      // auto side reads as no injection regardless of the stored value.
+      injectMode: isSkill
+        ? effectiveSkillInjectMode(node.document.skillSurface, node.document.injectMode)
+        : node.document.injectMode,
       aiMaintained: node.document.aiMaintained,
     }),
   );
@@ -1409,17 +1459,21 @@ function packageTags(node: PackageNode): Array<{
     title: string;
   }> = [];
   const trigger = node.document.commandTrigger?.trim();
-  if (trigger) {
+  if (trigger && skillSurfaceAllowsCommand(node.document.skillSurface ?? undefined)) {
     tags.push({
       text: trigger,
       tone: "command",
       title: t("knowledge.skill.commandTrigger"),
     });
   }
-  if (node.document.injectMode === "excerpt") {
+  const effectiveInject = effectiveSkillInjectMode(
+    node.document.skillSurface,
+    node.document.injectMode,
+  );
+  if (effectiveInject === "excerpt") {
     tags.push(
       ...buildKnowledgeListTags({
-        injectMode: node.document.injectMode,
+        injectMode: effectiveInject,
         aiMaintained: false,
       }),
     );
@@ -1639,6 +1693,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 'kx-folder': entry.row.node.kind === 'folder',
                 'kx-package': entry.row.node.kind === 'package',
                 'kx-leaf': entry.row.node.kind === 'document',
+                'kx-skill-inactive': skillNodeInactive(entry.row.node),
                 'is-open': selectedPath === entry.row.node.path,
                 'is-marked': selectedPaths.has(entry.row.node.path),
                 'is-focused': focusedPath === entry.row.node.path,
@@ -1646,6 +1701,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 dragging: draggingPaths.has(entry.row.node.path),
                 'drop-target': dragTargetPath === entry.row.node.path,
               }"
+              :title="skillNodeInactive(entry.row.node) ? t('knowledge.explorer.skillInactiveHint') : undefined"
               role="treeitem"
               :aria-level="entry.row.node.depth"
               :aria-expanded="
@@ -1779,9 +1835,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 class="kx-row-side"
               >
                 <span
-                  v-if="isPluginManagedNode(entry.row.node)"
+                  v-if="isPluginManagedNode(entry.row.node) || isExternalSkillNode(entry.row.node)"
                   class="kx-lock"
-                  :title="t('knowledge.explorer.pluginManaged')"
+                  :title="rowLockTitle(entry.row.node) ?? undefined"
                 >
                   <LucideIcon :icon="Lock" :size="11" :stroke-width="2.2" />
                 </span>
@@ -1930,6 +1986,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="openSelectedFolderConfig"
             >
+              <LucideIcon :icon="FolderCog" :size="13" />
               {{ t("knowledge.explorer.folderConfig") }}
             </button>
             <button
@@ -1942,6 +1999,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="managedHint(ctxMenu.targetNodes)"
               @click="startRenameSelection"
             >
+              <LucideIcon :icon="PencilLine" :size="13" />
               {{ t("knowledge.explorer.rename") }}
             </button>
             <button
@@ -1952,6 +2010,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="copySelectedRelativePath"
             >
+              <LucideIcon :icon="Copy" :size="13" />
               {{ t("knowledge.explorer.copyRelativePath") }}
             </button>
             <button
@@ -1962,6 +2021,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="openSelectedInFileSystem"
             >
+              <LucideIcon :icon="FolderOpen" :size="13" />
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
@@ -1975,6 +2035,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="createBlockHint(ctxMenu)"
               @click="openCreateInline('folder')"
             >
+              <LucideIcon :icon="FolderPlus" :size="13" />
               {{ t("knowledge.explorer.createFolder") }}
             </button>
             <button
@@ -1988,6 +2049,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="openExternalImportFolderDialog"
             >
+              <LucideIcon :icon="FolderInput" :size="13" />
               {{ t("knowledge.explorer.importExternalFolder") }}
             </button>
             <button
@@ -1996,6 +2058,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="importSkillPackageArchive"
             >
+              <LucideIcon :icon="PackagePlus" :size="13" />
               {{ t("knowledge.explorer.importSkillPackage") }}
             </button>
             <button
@@ -2009,6 +2072,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="createBlockHint(ctxMenu)"
               @click="openCreateInline('document')"
             >
+              <LucideIcon :icon="FilePlus" :size="13" />
               {{ t("knowledge.explorer.createDoc") }}
             </button>
             <button
@@ -2019,16 +2083,18 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
+              <LucideIcon :icon="Trash2" :size="13" />
               {{ deleteMenuLabel(ctxMenu) }}
             </button>
           </template>
           <template v-else-if="ctxMenu.kind === 'package'">
             <button
-              v-if="ctxMenu.targetNodes.length === 1"
+              v-if="ctxMenu.targetNodes.length === 1 && !isExternalSkillNode(ctxMenu.node)"
               type="button"
               class="kx-ctx-item"
               @click="exportSelectedPackage"
             >
+              <LucideIcon :icon="Download" :size="13" />
               {{ t("knowledge.explorer.exportSkillPackage") }}
             </button>
             <button
@@ -2037,6 +2103,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="copySelectedRelativePath"
             >
+              <LucideIcon :icon="Copy" :size="13" />
               {{ t("knowledge.explorer.copyRelativePath") }}
             </button>
             <button
@@ -2045,6 +2112,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="openSelectedInFileSystem"
             >
+              <LucideIcon :icon="FolderOpen" :size="13" />
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
@@ -2055,6 +2123,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
+              <LucideIcon :icon="Trash2" :size="13" />
               {{ deleteMenuLabel(ctxMenu) }}
             </button>
           </template>
@@ -2067,6 +2136,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="managedHint(ctxMenu.targetNodes)"
               @click="startRenameSelection"
             >
+              <LucideIcon :icon="PencilLine" :size="13" />
               {{ t("knowledge.explorer.rename") }}
             </button>
             <button
@@ -2075,6 +2145,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="copySelectedRelativePath"
             >
+              <LucideIcon :icon="Copy" :size="13" />
               {{ t("knowledge.explorer.copyRelativePath") }}
             </button>
             <button
@@ -2083,6 +2154,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               class="kx-ctx-item"
               @click="openSelectedInFileSystem"
             >
+              <LucideIcon :icon="FolderOpen" :size="13" />
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
             <button
@@ -2093,6 +2165,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               :title="managedHint(ctxMenu.targetNodes)"
               @click="requestDeleteSelectedNodes"
             >
+              <LucideIcon :icon="Trash2" :size="13" />
               {{ deleteMenuLabel(ctxMenu) }}
             </button>
           </template>
@@ -2107,6 +2180,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       @close="closeSearchContextMenu"
     >
       <button type="button" class="kx-ctx-item" @click="openSearchResultFromMenu">
+        <LucideIcon :icon="BookOpen" :size="13" />
         {{ t("knowledge.search.openResult") }}
       </button>
       <button
@@ -2114,6 +2188,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
         class="kx-ctx-item"
         @click="revealSearchResultFromMenu"
       >
+        <LucideIcon :icon="LocateFixed" :size="13" />
         {{ t("knowledge.search.revealInTree") }}
       </button>
       <button
@@ -2121,6 +2196,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
         class="kx-ctx-item"
         @click="copySearchResultPathFromMenu"
       >
+        <LucideIcon :icon="Copy" :size="13" />
         {{ t("knowledge.explorer.copyRelativePath") }}
       </button>
     </BaseContextMenu>
@@ -2560,6 +2636,14 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   font-family: var(--font-mono-identifier);
   font-size: 12px;
   color: var(--text-color);
+}
+
+/* Skills that will not take effect (disabled, or all channels off) render
+   dimmed so the inactive state is visible at a glance. */
+.kx-row-shell.kx-skill-inactive .kx-name,
+.kx-row-shell.kx-skill-inactive .kx-kind-icon,
+.kx-row-shell.kx-skill-inactive .kx-flag {
+  opacity: 0.48;
 }
 
 .kx-name-edit {

@@ -829,7 +829,7 @@ const managedDirectoryPath = computed(() =>
           </div>
           <BaseSwitch
             :model-value="lexicalEnabled"
-            :disabled="pending || !generalConfig"
+            :disabled="!generalConfig"
             :aria-label="t('knowledge.retrieval.lexicalTitle')"
             @update:model-value="emit('toggleLexical', $event)"
           />
@@ -886,7 +886,7 @@ const managedDirectoryPath = computed(() =>
           </div>
           <BaseSwitch
             :model-value="semanticEnabled"
-            :disabled="pending || !generalConfig"
+            :disabled="!generalConfig"
             :aria-label="t('knowledge.retrieval.semanticTitle')"
             @update:model-value="emit('toggleSemantic', $event)"
           />

@@ -60,6 +60,13 @@ pub struct SkillManifest {
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_scope: Option<String>,
+    /// Absolute on-disk directory of an external (generic-format) skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_path: Option<String>,
+    /// Frontmatter fields of an external skill that Locus does not consume
+    /// (license, metadata, allowed-tools, hooks, ...), shown in the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -68,6 +75,7 @@ pub enum SkillManifestKind {
     #[default]
     Document,
     Package,
+    External,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,7 +555,7 @@ pub(crate) fn normalize_and_validate_command_trigger(
     Ok(normalized)
 }
 
-fn resolve_config_command_trigger(config: &SkillConfig) -> Option<String> {
+pub(crate) fn resolve_config_command_trigger(config: &SkillConfig) -> Option<String> {
     let value = config.command_trigger.trim();
     if value.is_empty() {
         None
@@ -674,6 +682,8 @@ fn build_skill_manifest(
         has_l2: markdown_has_l_section(&document.body, "L2"),
         plugin_id: None,
         plugin_scope: None,
+        origin_path: None,
+        extra_metadata: None,
     }
 }
 
@@ -737,7 +747,7 @@ fn resolve_skill_create_package_id(
     normalize_package_id(&slug)
 }
 
-fn normalize_package_rel_path(value: &str) -> Result<String, String> {
+pub(crate) fn normalize_package_rel_path(value: &str) -> Result<String, String> {
     let normalized = value.trim().replace('\\', "/");
     if normalized.is_empty()
         || normalized.contains("..")
@@ -781,7 +791,7 @@ fn package_doc_rel_path_for_virtual_path(
     Ok(Some(rest.to_string()))
 }
 
-fn package_rel_path_is_markdown_document(rel_path: &str) -> bool {
+pub(crate) fn package_rel_path_is_markdown_document(rel_path: &str) -> bool {
     Path::new(rel_path)
         .extension()
         .and_then(|value| value.to_str())
@@ -1195,7 +1205,7 @@ fn markdown_l_section_text(body: &str, level: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn strip_utf8_bom(content: &str) -> &str {
+pub(crate) fn strip_utf8_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
@@ -1246,29 +1256,34 @@ fn find_package_frontmatter_close(content: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn split_optional_package_frontmatter(
+/// Split an optional leading YAML frontmatter block from a skill document,
+/// deserializing it into `T`. Missing frontmatter yields `T::default()`.
+pub(crate) fn split_optional_frontmatter<T: serde::de::DeserializeOwned + Default>(
     content: &str,
-) -> Result<(SkillPackageDocumentFrontmatter, String), String> {
+) -> Result<(T, String), String> {
     let content = strip_utf8_bom(content);
     let normalized = content.strip_prefix("\r\n").unwrap_or(content);
     let Some(after_open) = normalized
         .strip_prefix("---\r\n")
         .or_else(|| normalized.strip_prefix("---\n"))
     else {
-        return Ok((
-            SkillPackageDocumentFrontmatter::default(),
-            content.to_string(),
-        ));
+        return Ok((T::default(), content.to_string()));
     };
 
     let Some((yaml_end, rest_start)) = find_package_frontmatter_close(after_open) else {
-        return Err("Skill package document frontmatter is not terminated".to_string());
+        return Err("Skill document frontmatter is not terminated".to_string());
     };
     let yaml = &after_open[..yaml_end];
     let rest = &after_open[rest_start..];
-    let frontmatter = serde_yaml::from_str::<SkillPackageDocumentFrontmatter>(yaml)
-        .map_err(|e| format!("Failed to parse Skill package document frontmatter: {}", e))?;
+    let frontmatter = serde_yaml::from_str::<T>(yaml)
+        .map_err(|e| format!("Failed to parse skill document frontmatter: {}", e))?;
     Ok((frontmatter, rest.to_string()))
+}
+
+fn split_optional_package_frontmatter(
+    content: &str,
+) -> Result<(SkillPackageDocumentFrontmatter, String), String> {
+    split_optional_frontmatter::<SkillPackageDocumentFrontmatter>(content)
 }
 
 fn normalize_package_document_tool_names(
@@ -2843,6 +2858,7 @@ fn configured_package_model_recall_enabled(
 ) -> bool {
     configured_package_skill_enabled(manifest, override_config)
         && configured_package_skill_surface(manifest, override_config).allows_auto()
+        && configured_package_inject_mode(manifest, override_config) != KnowledgeInjectMode::None
 }
 
 /// Summary text injected for a package root document at the excerpt (L1) level:
@@ -2992,6 +3008,49 @@ pub(crate) fn read_skill_package_document_sync(
     };
 
     let configs = load_skill_config(working_dir);
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        let records = super::skill_external::list_external_skills_cached(working_dir);
+        let Some((record, doc_rel_path)) =
+            super::skill_external::external_record_and_doc_rel_path_for_virtual_path(
+                &records,
+                virtual_path,
+            )
+        else {
+            return Ok(None);
+        };
+        let config =
+            lookup_skill_config_override(&configs, record.scope.source(), &record.dir_name());
+        let Some(mut document) =
+            super::skill_external::external_to_document_for(&record, &doc_rel_path, config)
+        else {
+            return Err(format!("External skill document not found: {}", virtual_path));
+        };
+        match normalized_part {
+            "full" => {}
+            "summary" => {
+                document.body.clear();
+                document.maintenance_rules = None;
+                document.explicit_maintenance_rules = false;
+            }
+            "body" => {
+                document.summary = None;
+                document.summary_enabled = false;
+                document.maintenance_rules = None;
+                document.explicit_maintenance_rules = false;
+            }
+            "maintenanceRules" => {
+                document.summary = None;
+                document.summary_enabled = false;
+                document.body.clear();
+            }
+            _ => unreachable!("normalized_part only returns known values"),
+        }
+        return Ok(Some(knowledge_store::KnowledgeReadResult {
+            document,
+            part: normalized_part.to_string(),
+            file_metadata: None,
+        }));
+    }
     for record in list_skill_packages_sync_for_working_dir(working_dir) {
         let Some(doc_rel_path) =
             package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
@@ -3058,17 +3117,11 @@ fn package_dir_rel_path_for_virtual_path(
     Ok(Some(rest.to_string()))
 }
 
-fn package_directory_config_record(
-    record: &SkillPackageRecord,
-    dir_rel_path: &str,
-    dir_path: &Path,
+pub(crate) fn read_only_skill_directory_config_record(
+    path: String,
+    updated_at: i64,
+    external_sources: Vec<knowledge_store::KnowledgeExternalSource>,
 ) -> knowledge_store::KnowledgeDirectoryConfigRecord {
-    let manifest = &record.manifest;
-    let path = if dir_rel_path.is_empty() {
-        manifest.id.clone()
-    } else {
-        format!("{}/{}", manifest.id, dir_rel_path)
-    };
     let mut config = knowledge_store::default_directory_config_for_type(KnowledgeType::Skill);
     config.inject_mode = KnowledgeInjectMode::None;
     config.inherit_inject_mode = false;
@@ -3092,20 +3145,45 @@ fn package_directory_config_record(
         config_path: String::new(),
         exists: false,
         read_only: true,
-        updated_at: package_file_modified_at(dir_path, record.updated_at),
+        updated_at,
         inject_mode_source: Default::default(),
         ai_config_source: Default::default(),
         effective_lexical_search: default_search.clone(),
         effective_vector_search: default_search,
-        external_sources: package_source_summary(record).into_iter().collect(),
+        external_sources,
         config,
     }
+}
+
+fn package_directory_config_record(
+    record: &SkillPackageRecord,
+    dir_rel_path: &str,
+    dir_path: &Path,
+) -> knowledge_store::KnowledgeDirectoryConfigRecord {
+    let manifest = &record.manifest;
+    let path = if dir_rel_path.is_empty() {
+        manifest.id.clone()
+    } else {
+        format!("{}/{}", manifest.id, dir_rel_path)
+    };
+    read_only_skill_directory_config_record(
+        path,
+        package_file_modified_at(dir_path, record.updated_at),
+        package_source_summary(record).into_iter().collect(),
+    )
 }
 
 pub(crate) fn read_skill_package_directory_sync(
     working_dir: &str,
     virtual_path: &str,
 ) -> Result<Option<knowledge_store::KnowledgeDirectoryConfigRecord>, String> {
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        let records = super::skill_external::list_external_skills_cached(working_dir);
+        return Ok(super::skill_external::read_external_skill_directory(
+            &records,
+            virtual_path,
+        ));
+    }
     for record in list_skill_packages_sync_for_working_dir(working_dir) {
         let Some(dir_rel_path) =
             package_dir_rel_path_for_virtual_path(&record.manifest, virtual_path)?
@@ -3151,6 +3229,14 @@ pub(crate) fn ensure_skill_package_virtual_path_mutable(
     working_dir: &str,
     virtual_path: &str,
 ) -> Result<(), String> {
+    // The whole external/ namespace is reserved and read-only, whether or not
+    // a matching external skill currently exists.
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        return Err(format!(
+            "External skill content is read-only in Locus: {}",
+            virtual_path
+        ));
+    }
     if let Some(package_id) = skill_package_owning_virtual_path_sync(working_dir, virtual_path) {
         return Err(format!(
             "Skill package '{}' content is read-only: {}",
@@ -3505,7 +3591,7 @@ fn package_to_list_item(
     }
 }
 
-fn is_ignored_package_walk_dir(path: &Path) -> bool {
+pub(crate) fn is_ignored_package_walk_dir(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
@@ -3515,7 +3601,7 @@ fn is_ignored_package_walk_dir(path: &Path) -> bool {
     ) || name.starts_with('.')
 }
 
-fn is_ignored_package_walk_file(path: &Path) -> bool {
+pub(crate) fn is_ignored_package_walk_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
@@ -3602,7 +3688,7 @@ pub(crate) fn list_skill_package_knowledge_items_sync_with_hidden(
         })
         .unwrap_or_default();
     let configs = load_skill_config(working_dir);
-    list_skill_packages_sync_for_working_dir(working_dir)
+    let mut items = list_skill_packages_sync_for_working_dir(working_dir)
         .into_iter()
         .flat_map(|record| {
             let config =
@@ -3614,6 +3700,19 @@ pub(crate) fn list_skill_package_knowledge_items_sync_with_hidden(
             }
             package_to_list_items(&record, config)
         })
+        .collect::<Vec<_>>();
+    for record in super::skill_external::list_external_skills_cached(working_dir).iter() {
+        let config =
+            lookup_skill_config_override(&configs, record.scope.source(), &record.dir_name());
+        if !include_model_hidden
+            && !super::skill_external::configured_external_model_recall_enabled(record, config)
+        {
+            continue;
+        }
+        items.extend(super::skill_external::external_to_list_items(record, config));
+    }
+    items
+        .into_iter()
         .filter(|item| normalized_prefix.is_empty() || item.path.starts_with(&normalized_prefix))
         .collect()
 }
@@ -3637,6 +3736,10 @@ pub(crate) fn skill_package_path_prefix_targets_package_sync(
         .trim_matches('/');
     if normalized_prefix.is_empty() {
         return false;
+    }
+
+    if super::skill_external::external_skill_virtual_path_in_namespace(normalized_prefix) {
+        return true;
     }
 
     list_skill_packages_sync_for_working_dir(working_dir)
@@ -3672,7 +3775,7 @@ pub(crate) fn list_skill_package_knowledge_documents_sync_with_hidden(
         })
         .unwrap_or_default();
     let configs = load_skill_config(working_dir);
-    list_skill_packages_sync_for_working_dir(working_dir)
+    let mut documents = list_skill_packages_sync_for_working_dir(working_dir)
         .into_iter()
         .flat_map(|record| {
             let config =
@@ -3684,6 +3787,19 @@ pub(crate) fn list_skill_package_knowledge_documents_sync_with_hidden(
             }
             package_to_documents(&record, config)
         })
+        .collect::<Vec<_>>();
+    for record in super::skill_external::list_external_skills_cached(working_dir).iter() {
+        let config =
+            lookup_skill_config_override(&configs, record.scope.source(), &record.dir_name());
+        if !include_model_hidden
+            && !super::skill_external::configured_external_model_recall_enabled(record, config)
+        {
+            continue;
+        }
+        documents.extend(super::skill_external::external_to_documents(record, config));
+    }
+    documents
+        .into_iter()
         .filter(|document| {
             normalized_prefix.is_empty() || document.path.starts_with(&normalized_prefix)
         })
@@ -3695,6 +3811,24 @@ pub(crate) fn skill_package_virtual_path_allows_model_recall_sync(
     virtual_path: &str,
 ) -> Result<Option<bool>, String> {
     let configs = load_skill_config(working_dir);
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        let records = super::skill_external::list_external_skills_cached(working_dir);
+        return Ok(Some(
+            super::skill_external::external_record_and_doc_rel_path_for_virtual_path(
+                &records,
+                virtual_path,
+            )
+            .map(|(record, _)| {
+                let config = lookup_skill_config_override(
+                    &configs,
+                    record.scope.source(),
+                    &record.dir_name(),
+                );
+                super::skill_external::configured_external_model_recall_enabled(&record, config)
+            })
+            .unwrap_or(false),
+        ));
+    }
     for record in list_skill_packages_sync_for_working_dir(working_dir) {
         let Some(_doc_rel_path) =
             package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
@@ -3714,6 +3848,16 @@ pub(crate) fn skill_package_virtual_path_exists_sync(
     working_dir: &str,
     virtual_path: &str,
 ) -> Result<bool, String> {
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        let records = super::skill_external::list_external_skills_cached(working_dir);
+        return Ok(
+            super::skill_external::external_record_and_doc_rel_path_for_virtual_path(
+                &records,
+                virtual_path,
+            )
+            .is_some_and(|(record, doc_rel_path)| record.root.join(doc_rel_path).is_file()),
+        );
+    }
     for record in list_skill_packages_sync_for_working_dir(working_dir) {
         if package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?.is_some() {
             return Ok(true);
@@ -3776,6 +3920,8 @@ fn build_package_skill_manifest(
         has_l2: record.doc_levels.has_l2,
         plugin_id: record.plugin_id.clone(),
         plugin_scope: record.plugin_scope.map(|scope| scope.as_str().to_string()),
+        origin_path: None,
+        extra_metadata: None,
     }
 }
 
@@ -3818,6 +3964,13 @@ pub fn list_skills_sync(
             manifests.retain(|m| !skill_manifest_overridden_by_project(m, &ps));
             manifests.push(ps);
         }
+    }
+
+    for record in super::skill_external::list_external_skills_cached(working_dir).iter() {
+        let cfg = lookup_skill_config_override(&configs, record.scope.source(), &record.dir_name());
+        manifests.push(super::skill_external::build_external_skill_manifest(
+            record, cfg,
+        ));
     }
 
     manifests.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3894,6 +4047,12 @@ pub fn read_skill_manifest_sync(
     dir_name: &str,
     source: Option<&str>,
 ) -> Result<String, String> {
+    if super::skill_external::source_is_external_skill(source.unwrap_or("project")) {
+        let records = super::skill_external::list_external_skills_cached(working_dir);
+        let record = super::skill_external::external_record_for_dir_name(&records, dir_name)
+            .ok_or_else(|| format!("External skill not found: {}", dir_name))?;
+        return super::skill_external::read_external_skill_manifest(&record);
+    }
     if source.unwrap_or("project") == "app" || source.unwrap_or("project").starts_with("plugin") {
         if let Ok(package_id) = normalize_package_id(dir_name) {
             if let Ok(record) = find_skill_package_for_source(working_dir, &package_id, source) {
@@ -4024,7 +4183,7 @@ fn required_skill_create_text(value: Option<String>, field: &str) -> Result<Stri
     optional_trimmed(value).ok_or_else(|| format!("'{}' parameter is required.", field))
 }
 
-fn default_package_command_name(package_id: &str) -> String {
+pub(crate) fn default_package_command_name(package_id: &str) -> String {
     package_id
         .rsplit('.')
         .next()
@@ -4802,6 +4961,10 @@ fn normalize_skill_source(source: Option<&str>) -> Result<String, String> {
         Some("app") => Ok("app".to_string()),
         Some("pluginApp") => Ok("pluginApp".to_string()),
         Some("pluginProject") => Ok("pluginProject".to_string()),
+        // Read-only sources: valid for reload/list, never for create paths
+        // (skill creation resolves its own source independently).
+        Some("externalUser") => Ok("externalUser".to_string()),
+        Some("externalProject") => Ok("externalProject".to_string()),
         Some(other) => Err(format!("Invalid skill source: {}", other)),
     }
 }
@@ -4812,6 +4975,24 @@ pub fn reload_skill_manifest_sync(
     request: SkillReloadRequest,
 ) -> Result<SkillManifest, String> {
     let source = normalize_skill_source(request.source.as_deref())?;
+    if super::skill_external::source_is_external_skill(&source) {
+        return super::skill_external::reload_external_skill_manifest(
+            working_dir,
+            &request.name,
+            Some(&source),
+        );
+    }
+    // A dir name inside the external namespace targets an external skill
+    // even when the model omitted the source.
+    if request.source.is_none()
+        && super::skill_external::external_skill_virtual_path_in_namespace(&request.name)
+    {
+        return super::skill_external::reload_external_skill_manifest(
+            working_dir,
+            &request.name,
+            None,
+        );
+    }
     if source == "app" {
         if let Ok(record) = find_skill_package(&request.name) {
             let configs = load_skill_config(working_dir);
@@ -5634,6 +5815,22 @@ Create a project skill.
         .contains("read-only"));
         super::ensure_skill_package_virtual_path_mutable(&working_dir, "my-skill.md")
             .expect("workspace skill paths stay mutable");
+
+        // The external skill namespace is reserved and read-only even when no
+        // matching external skill exists.
+        assert!(super::ensure_skill_package_virtual_path_mutable(
+            &working_dir,
+            "external/claude/grill-me/SKILL.md"
+        )
+        .expect_err("external skill paths must be immutable")
+        .contains("read-only"));
+        assert!(super::ensure_skill_package_virtual_path_mutable(
+            &working_dir,
+            "skill/external/anything.md"
+        )
+        .is_err());
+        super::ensure_skill_package_virtual_path_mutable(&working_dir, "externals-notes.md")
+            .expect("non-namespace paths starting with 'external' stay mutable");
     }
 
     #[test]

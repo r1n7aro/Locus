@@ -349,19 +349,26 @@ pub fn list_item_has_injectable_content(item: &KnowledgeListItem) -> bool {
     }
 }
 
+/// A skill allows model recall only when it is enabled, its surface includes
+/// the auto side, AND it actually injects into the knowledge structure
+/// (`inject_mode != none`). Without a structure line the model has no channel
+/// to discover the skill, so recall is gated off to keep the config coherent.
 pub fn document_allows_model_recall(document: &KnowledgeDocument) -> bool {
     if document.doc_type != KnowledgeType::Skill {
         return true;
     }
     document.skill_enabled.unwrap_or(true)
         && document.skill_surface.unwrap_or_default().allows_auto()
+        && document.inject_mode != KnowledgeInjectMode::None
 }
 
 pub fn list_item_allows_model_recall(item: &KnowledgeListItem) -> bool {
     if item.doc_type != KnowledgeType::Skill {
         return true;
     }
-    item.skill_enabled.unwrap_or(true) && item.skill_surface.unwrap_or_default().allows_auto()
+    item.skill_enabled.unwrap_or(true)
+        && item.skill_surface.unwrap_or_default().allows_auto()
+        && item.inject_mode != KnowledgeInjectMode::None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

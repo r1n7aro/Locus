@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Download, Package, Terminal } from "lucide";
+import { Download, Package, RefreshCw, Terminal } from "lucide";
 import { t } from "../../i18n";
 import type {
   KnowledgeDocumentPatch,
@@ -9,12 +9,16 @@ import type {
   SkillManifest,
   SkillSurface,
 } from "../../types";
-import { skillSurfaceAllowsAuto, skillSurfaceAllowsCommand } from "../../types";
+import { skillSurfaceAllowsCommand } from "../../types";
+import { refreshExternalSkills } from "../../services/knowledge";
 import { useSkills } from "../../composables/useSkills";
 import {
+  deriveSkillSurface,
+  effectiveSkillInjectMode,
   findSkillCommandConflict,
   isValidSkillCommandTrigger,
   normalizeSkillCommandTrigger,
+  skillActivationInactive,
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import { useNotificationStore } from "../../stores/notification";
@@ -29,6 +33,7 @@ import {
 } from "../icons/unityAssetIcons";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const props = defineProps<{
   packageDocument: KnowledgeDocumentSummary;
@@ -60,42 +65,6 @@ function packageIdForDocument(document: KnowledgeDocumentSummary): string {
     ""
   );
 }
-
-function surfaceLabel(surface: SkillSurface | null | undefined): string {
-  switch (surface) {
-    case "auto":
-      return t("knowledge.skill.surfaceAuto");
-    case "both":
-      return t("knowledge.skill.surfaceBoth");
-    case "command":
-      return t("knowledge.skill.surfaceCommand");
-    default:
-      return t("knowledge.skill.surfaceCommand");
-  }
-}
-
-const skillSurfaceOptions = computed(() => [
-  {
-    value: "disabled",
-    label: t("knowledge.skill.surfaceDisabled"),
-    hint: t("knowledge.skill.surfaceDisabledHint"),
-  },
-  {
-    value: "command",
-    label: t("knowledge.skill.surfaceCommand"),
-    hint: t("knowledge.skill.surfaceCommandHint"),
-  },
-  {
-    value: "auto",
-    label: t("knowledge.skill.surfaceAuto"),
-    hint: t("knowledge.skill.surfaceAutoHint"),
-  },
-  {
-    value: "both",
-    label: t("knowledge.skill.surfaceBoth"),
-    hint: t("knowledge.skill.surfaceBothHint"),
-  },
-]);
 
 const injectModeOptions = computed(() => [
   {
@@ -148,11 +117,26 @@ function formatDateTime(value: number): string {
 
 const packageId = computed(() => packageIdForDocument(props.packageDocument));
 
+// External skills (generic SKILL.md format discovered from agent directories
+// such as ~/.claude/skills) reuse this panel in a read-only, rescanable mode.
+const isExternalSkill = computed(() =>
+  !!props.packageDocument.externalSource?.locator?.startsWith("external://"),
+);
+
+const externalLocatorParts = computed(() => {
+  const locator = props.packageDocument.externalSource?.locator ?? "";
+  const rest = locator.startsWith("external://")
+    ? locator.slice("external://".length)
+    : "";
+  const [scope = "", provider = ""] = rest.split("/");
+  return { scope, provider };
+});
+
 const manifest = computed<SkillManifest | null>(
   () =>
     skillItems.value.find(
       (item) =>
-        item.kind === "package" &&
+        (item.kind === "package" || item.kind === "external") &&
         (item.packageId === packageId.value || item.dirName === packageId.value),
     ) ?? null,
 );
@@ -226,12 +210,33 @@ const packageEnabled = computed(
 const packageSurface = computed<SkillSurface>(
   () => props.packageDocument.skillSurface ?? manifest.value?.skillSurface ?? "command",
 );
-const skillSurfaceValue = computed(() =>
-  packageEnabled.value ? packageSurface.value : "disabled",
+// The two activation channels behind the master switch: the command channel
+// (slash trigger) and the auto channel (structure injection + model recall,
+// live only when injectMode is path/excerpt).
+const commandChannelOn = computed(() =>
+  skillSurfaceAllowsCommand(packageSurface.value),
+);
+const effectiveInjectValue = computed(() =>
+  effectiveSkillInjectMode(packageSurface.value, injectMode.value),
+);
+const autoChannelOn = computed(() => effectiveInjectValue.value !== "none");
+const activationWarning = computed(
+  () =>
+    packageEnabled.value &&
+    skillActivationInactive({
+      skillEnabled: packageEnabled.value,
+      skillSurface: packageSurface.value,
+      injectMode: injectMode.value,
+    }),
 );
 const surfaceText = computed(() => {
   if (!packageEnabled.value) return t("knowledge.skill.surfaceDisabled");
-  return surfaceLabel(packageSurface.value);
+  if (commandChannelOn.value && autoChannelOn.value) {
+    return t("knowledge.skill.surfaceBoth");
+  }
+  if (commandChannelOn.value) return t("knowledge.skill.surfaceCommand");
+  if (autoChannelOn.value) return t("knowledge.skill.surfaceAuto");
+  return t("knowledge.skill.channelsNone");
 });
 const updatedLabel = computed(() =>
   formatDateTime(manifest.value?.updatedAt ?? props.packageDocument.updatedAt),
@@ -240,7 +245,7 @@ const injectMode = computed(
   () => props.packageDocument.injectMode ?? "none",
 );
 const injectModeDropdownLabel = computed(() =>
-  labelForInjectMode(injectMode.value),
+  labelForInjectMode(effectiveInjectValue.value),
 );
 const fallbackSkillName = computed(
   () => packageId.value || displayName.value,
@@ -248,26 +253,19 @@ const fallbackSkillName = computed(
 const currentSkillCommandTrigger = computed(() =>
   normalizeSkillCommandTrigger(commandTrigger.value, fallbackSkillName.value),
 );
-const showSkillCommandFields = computed(
-  () =>
-    packageEnabled.value &&
-    skillSurfaceAllowsCommand(packageSurface.value),
-);
+const showSkillCommandFields = computed(() => commandChannelOn.value);
+// Saving no longer disables the config controls: updates are optimistic and
+// serialized upstream, so a disabled-dim flash on every toggle is avoided.
 const skillCommandInputDisabled = computed(
-  () => !!props.saveLoading || !showSkillCommandFields.value,
+  () => !showSkillCommandFields.value,
 );
-const configControlsDisabled = computed(() => !!props.saveLoading);
 
 const capabilityTags = computed(() => {
   const tags: string[] = [];
-  if (
-    packageEnabled.value &&
-    skillSurfaceAllowsCommand(packageSurface.value) &&
-    commandTrigger.value
-  ) {
+  if (packageEnabled.value && commandChannelOn.value && commandTrigger.value) {
     tags.push(t("knowledge.skillPackage.command"));
   }
-  if (packageEnabled.value && skillSurfaceAllowsAuto(packageSurface.value)) {
+  if (packageEnabled.value && autoChannelOn.value) {
     tags.push(t("knowledge.skillPackage.auto"));
   }
   if (manifest.value?.hasUnity) tags.push(t("knowledge.skillPackage.unity"));
@@ -277,32 +275,90 @@ const capabilityTags = computed(() => {
   return tags;
 });
 
-const infoRows = computed(() => [
-  {
-    label: t("knowledge.skillPackage.packageId"),
-    value: packageId.value || "-",
-  },
-  {
-    label: t("knowledge.skillPackage.version"),
-    value: packageVersion.value,
-  },
-  {
-    label: t("knowledge.skillPackage.argumentHint"),
-    value: argumentHint.value || "-",
-  },
-  {
-    label: t("knowledge.skillPackage.packagePath"),
-    value: packagePath.value,
-  },
-  {
-    label: t("knowledge.skillPackage.sourcePath"),
-    value: packageSourcePath.value,
-  },
-  {
-    label: t("knowledge.skillPackage.updatedAt"),
-    value: updatedLabel.value,
-  },
+const externalScopeLabel = computed(() =>
+  externalLocatorParts.value.scope === "project"
+    ? t("knowledge.externalSkill.scopeProject")
+    : t("knowledge.externalSkill.scopeUser"),
+);
+
+// Frontmatter fields Locus recognizes but intentionally does not apply; they
+// render with a "not applied" badge so users know the declaration is inert.
+const NOT_APPLIED_METADATA_KEYS = new Set([
+  "allowed-tools",
+  "allowedTools",
+  "hooks",
+  "context",
+  "model",
+  "agent",
 ]);
+
+function formatMetadataValue(value: unknown): string {
+  if (value == null) return "-";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+const externalMetadataRows = computed(() => {
+  if (!isExternalSkill.value) return [];
+  const raw = manifest.value?.extraMetadata;
+  if (!raw || typeof raw !== "object") return [];
+  return Object.entries(raw).map(([key, value]) => ({
+    key,
+    value: formatMetadataValue(value),
+    notApplied: NOT_APPLIED_METADATA_KEYS.has(key),
+  }));
+});
+
+const infoRows = computed(() => {
+  const rows = [
+    {
+      label: t("knowledge.skillPackage.packageId"),
+      value: packageId.value || "-",
+    },
+    {
+      label: t("knowledge.skillPackage.version"),
+      value: packageVersion.value,
+    },
+    {
+      label: t("knowledge.skillPackage.argumentHint"),
+      value: argumentHint.value || "-",
+    },
+    {
+      label: t("knowledge.skillPackage.packagePath"),
+      value: packagePath.value,
+    },
+    {
+      label: t("knowledge.skillPackage.sourcePath"),
+      value: packageSourcePath.value,
+    },
+    {
+      label: t("knowledge.skillPackage.updatedAt"),
+      value: updatedLabel.value,
+    },
+  ];
+  if (isExternalSkill.value) {
+    rows.splice(
+      1,
+      0,
+      {
+        label: t("knowledge.externalSkill.provider"),
+        value: `${externalLocatorParts.value.provider || "-"} · ${externalScopeLabel.value}`,
+      },
+      {
+        label: t("knowledge.externalSkill.originPath"),
+        value: manifest.value?.originPath?.trim() || "-",
+      },
+    );
+  }
+  return rows;
+});
 
 watch(
   packageId,
@@ -328,26 +384,27 @@ function showSkillCommandError(message: string) {
   });
 }
 
+function onEnabledChange(value: boolean) {
+  notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
+  emit("updateConfig", { skillEnabled: value });
+}
+
+// The inject-mode dropdown drives the auto channel, so it also derives the
+// surface: picking L0/L1 turns the auto side on, picking none turns it off.
 function onInjectModeChange(value: string) {
   if (!["none", "path", "excerpt"].includes(value)) return;
   emit("updateConfig", {
     injectMode: value as KnowledgeInjectMode,
     inheritInjectMode: false,
+    skillSurface: deriveSkillSurface(commandChannelOn.value, value !== "none"),
   });
 }
 
-function onSkillSurfaceChange(value: string) {
+function onCommandChannelChange(value: boolean) {
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
-  if (value === "disabled") {
-    emit("updateConfig", { skillEnabled: false });
-    return;
-  }
-
-  const nextSurface = value as SkillSurface;
   emit("updateConfig", {
-    skillEnabled: true,
-    skillSurface: nextSurface,
-    commandTrigger: skillSurfaceAllowsCommand(nextSurface)
+    skillSurface: deriveSkillSurface(value, autoChannelOn.value),
+    commandTrigger: value
       ? currentSkillCommandTrigger.value
       : commandTrigger.value || null,
   });
@@ -365,7 +422,7 @@ function persistSkillCommandTrigger() {
   }
 
   const conflict = findSkillCommandConflict(normalizedTrigger, skillItems.value, {
-    source: "app",
+    source: manifest.value?.source ?? "app",
     dirName: manifest.value?.dirName ?? packageId.value,
   });
   if (conflict) {
@@ -409,6 +466,27 @@ function onExportPackage() {
   if (!packageId.value) return;
   emit("exportPackage", packageId.value);
 }
+
+const rescanning = ref(false);
+
+async function onRescanExternalSkills() {
+  if (rescanning.value) return;
+  rescanning.value = true;
+  try {
+    // The backend rescans the agent skill directories and emits
+    // knowledge-changed, which refreshes the tree; reload manifests here so
+    // this panel picks up metadata changes immediately.
+    await refreshExternalSkills();
+    await loadSkills({ force: true });
+  } catch (cause) {
+    notificationStore.addNotice(
+      "error",
+      cause instanceof Error ? cause.message : String(cause),
+    );
+  } finally {
+    rescanning.value = false;
+  }
+}
 </script>
 
 <template>
@@ -420,13 +498,29 @@ function onExportPackage() {
         </span>
         <div class="skill-package-title-main">
           <div class="skill-package-eyebrow">
-            {{ t("knowledge.skillPackage.badge") }}
+            {{
+              isExternalSkill
+                ? t("knowledge.externalSkill.badge")
+                : t("knowledge.skillPackage.badge")
+            }}
           </div>
           <h1 class="skill-package-title">{{ displayName }}</h1>
         </div>
       </div>
       <div class="skill-package-header-side">
         <BaseButton
+          v-if="isExternalSkill"
+          class="skill-package-header-action"
+          type="button"
+          :disabled="rescanning"
+          :title="t('knowledge.externalSkill.rescan')"
+          @click="onRescanExternalSkills"
+        >
+          <LucideIcon :icon="RefreshCw" :size="13" :stroke-width="2.2" />
+          <span>{{ t("knowledge.externalSkill.rescan") }}</span>
+        </BaseButton>
+        <BaseButton
+          v-else
           class="skill-package-header-action"
           type="button"
           :disabled="!packageId || saveLoading"
@@ -441,6 +535,11 @@ function onExportPackage() {
     </header>
 
     <main class="skill-package-body">
+      <div v-if="isExternalSkill" class="skill-package-external-note">
+        <p>{{ t("knowledge.externalSkill.readOnlyNote") }}</p>
+        <p>{{ t("knowledge.externalSkill.unsupportedNote") }}</p>
+      </div>
+
       <section class="skill-package-section">
         <div class="skill-package-section-title">
           {{ t("knowledge.skillPackage.description") }}
@@ -459,30 +558,40 @@ function onExportPackage() {
         <div class="skill-package-config-grid">
           <div class="skill-package-config-row">
             <span class="skill-package-config-label">
+              {{ t("knowledge.skill.enabledLabel") }}
+            </span>
+            <span class="skill-package-config-value">
+              <BaseSwitch
+                :model-value="packageEnabled"
+                :aria-label="t('knowledge.skill.enabledLabel')"
+                @update:model-value="onEnabledChange"
+              />
+            </span>
+          </div>
+          <div class="skill-package-config-row">
+            <span class="skill-package-config-label">
               {{ t("knowledge.meta.injectMode") }}
             </span>
             <BaseDropdown
               class="skill-package-dropdown"
-              :model-value="injectMode"
+              :model-value="effectiveInjectValue"
               :selected-label="injectModeDropdownLabel"
               :options="injectModeOptions"
-              :disabled="configControlsDisabled"
               :aria-label="t('knowledge.meta.injectMode')"
               @update:model-value="onInjectModeChange"
             />
           </div>
           <div class="skill-package-config-row">
             <span class="skill-package-config-label">
-              {{ t("knowledge.skill.surfaceLabel") }}
+              {{ t("knowledge.skill.commandChannelLabel") }}
             </span>
-            <BaseDropdown
-              class="skill-package-dropdown"
-              :model-value="skillSurfaceValue"
-              :options="skillSurfaceOptions"
-              :disabled="configControlsDisabled"
-              :aria-label="t('knowledge.skill.surfaceLabel')"
-              @update:model-value="onSkillSurfaceChange"
-            />
+            <span class="skill-package-config-value">
+              <BaseSwitch
+                :model-value="commandChannelOn"
+                :aria-label="t('knowledge.skill.commandChannelLabel')"
+                @update:model-value="onCommandChannelChange"
+              />
+            </span>
           </div>
           <div
             v-if="showSkillCommandFields"
@@ -510,6 +619,9 @@ function onExportPackage() {
             </span>
           </div>
         </div>
+        <div v-if="activationWarning" class="skill-package-warning">
+          {{ t("knowledge.skill.activationWarning") }}
+        </div>
       </section>
 
       <section class="skill-package-section">
@@ -524,6 +636,36 @@ function onExportPackage() {
           >
             <span class="skill-package-info-label">{{ row.label }}</span>
             <span class="skill-package-info-value">{{ row.value }}</span>
+          </div>
+        </div>
+      </section>
+
+      <section
+        v-if="externalMetadataRows.length"
+        class="skill-package-section"
+      >
+        <div class="skill-package-section-title">
+          {{ t("knowledge.externalSkill.metadata") }}
+        </div>
+        <div class="skill-package-info-grid">
+          <div
+            v-for="row in externalMetadataRows"
+            :key="row.key"
+            class="skill-package-info-row"
+          >
+            <span class="skill-package-info-label skill-package-metadata-key">
+              <span>{{ row.key }}</span>
+              <span
+                v-if="row.notApplied"
+                class="skill-package-metadata-badge"
+                :title="t('knowledge.externalSkill.unsupportedNote')"
+              >
+                {{ t("knowledge.externalSkill.notApplied") }}
+              </span>
+            </span>
+            <span class="skill-package-info-value skill-package-metadata-value">{{
+              row.value
+            }}</span>
           </div>
         </div>
       </section>
@@ -691,6 +833,59 @@ function onExportPackage() {
   min-height: 0;
   overflow: auto;
   padding: 18px 22px 28px;
+}
+
+.skill-package-external-note {
+  margin: 0 0 18px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-color) 6%, transparent);
+  max-width: 760px;
+}
+
+.skill-package-external-note p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.skill-package-external-note p + p {
+  margin-top: 4px;
+}
+
+.skill-package-warning {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning-color, #d9a03f) 42%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning-color, #d9a03f) 9%, transparent);
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 1.6;
+  max-width: 760px;
+}
+
+.skill-package-metadata-key {
+  gap: 6px;
+  align-items: baseline;
+}
+
+.skill-package-metadata-badge {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 34%, var(--border-color));
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.skill-package-metadata-value {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .skill-package-section {

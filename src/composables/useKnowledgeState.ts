@@ -73,6 +73,7 @@ import type {
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
 import { useUiStore } from "../stores/ui";
+import { useSkills } from "./useSkills";
 import { acquireSelectionLock } from "./useSelectionLock";
 import { openKnowledgeDownloadProgressWindow } from "../services/knowledgeDownloadWindow";
 import { openFeishuReferenceImportProgressWindow } from "../services/feishuReferenceImportWindow";
@@ -476,12 +477,24 @@ function isPluginSkillPackageDocument(
   );
 }
 
+export function isExternalSkillDocument(
+  document: KnowledgeDocumentSummary | KnowledgeDocument | null | undefined,
+): boolean {
+  return (
+    document?.type === "skill" &&
+    document.externalSource?.provider === "package" &&
+    !!document.externalSource.locator?.startsWith("external://")
+  );
+}
+
 function skillPackageConfigSource(
   document: KnowledgeDocumentSummary | KnowledgeDocument,
 ): string {
   const locator = document.externalSource?.locator ?? "";
   if (locator.startsWith("plugin://app/")) return "pluginApp";
   if (locator.startsWith("plugin://project/")) return "pluginProject";
+  if (locator.startsWith("external://project/")) return "externalProject";
+  if (locator.startsWith("external://")) return "externalUser";
   return "app";
 }
 
@@ -500,6 +513,10 @@ function createPackageNode(
   existingChildren: ExplorerNode[] = [],
 ): PackageNode {
   const packageId = skillPackageIdForDocument(document);
+  // External skills use a nested identity (external/<provider>/<slug>), so
+  // the package node sits inside per-source group folders instead of the root.
+  const segments = packageId.split("/").filter(Boolean);
+  const depth = Math.max(segments.length, 1);
   const normalizedDocumentPath = document.path
     .replace(/\\/g, "/")
     .replace(/^\/+/, "");
@@ -515,8 +532,8 @@ function createPackageNode(
     path: fullDocumentPath("skill", packageId),
     relativePath: packageId,
     packageId,
-    name: packageId,
-    depth: 1,
+    name: segments[segments.length - 1] ?? packageId,
+    depth,
     document,
     managedByPlugin: isPluginSkillPackageDocument(document),
     children: [
@@ -524,7 +541,7 @@ function createPackageNode(
         kind: "document",
         path: fullDocumentPath("skill", normalizedDocumentPath),
         name: "SKILL.md",
-        depth: 2,
+        depth: depth + 1,
         document,
       },
       ...children,
@@ -556,15 +573,23 @@ function buildExplorerTree(
           existingBranch?.children ?? [],
         );
         folderMap.set(packageNode.relativePath, packageNode);
+        const packageParentPath = packageId
+          .split("/")
+          .filter(Boolean)
+          .slice(0, -1)
+          .join("/");
+        const parentNode = packageParentPath
+          ? ensureFolderNode(folderMap, type, packageParentPath)
+          : rootNode;
         if (existingBranch) {
-          const existingIndex = rootNode.children.indexOf(existingBranch);
+          const existingIndex = parentNode.children.indexOf(existingBranch);
           if (existingIndex >= 0) {
-            rootNode.children.splice(existingIndex, 1, packageNode);
-          } else if (!rootNode.children.includes(packageNode)) {
-            rootNode.children.push(packageNode);
+            parentNode.children.splice(existingIndex, 1, packageNode);
+          } else if (!parentNode.children.includes(packageNode)) {
+            parentNode.children.push(packageNode);
           }
         } else {
-          rootNode.children.push(packageNode);
+          parentNode.children.push(packageNode);
         }
         continue;
       }
@@ -596,6 +621,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   const hasWorkspace = computed(() => !!props.workingDir.trim());
   const notificationStore = useNotificationStore();
   const uiStore = useUiStore();
+  const { loadSkills } = useSkills();
 
   const error = ref("");
   const sidebarWidth = ref(272);
@@ -678,6 +704,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let unityReferenceStatusPollTimer: ReturnType<typeof setTimeout> | null =
     null;
   let searchSeq = 0;
+  // Bumped on every selection change; async loads capture it and drop their
+  // commit when a newer selection superseded them (prevents slow responses
+  // from yanking the UI back to a previously clicked item).
+  let selectionSeq = 0;
   let mutationQueue = Promise.resolve();
   let pendingSaveCount = 0;
   let releaseSelectionLock: (() => void) | null = null;
@@ -1166,6 +1196,45 @@ export function useKnowledgeState(props: KnowledgeProps) {
     documents.value = Array.from(merged.values());
   }
 
+  // Precise single-entry updates: unlike the load/replace helpers above these
+  // keep every other summary's identity stable so a config toggle doesn't
+  // rebuild the whole explorer tree from scratch.
+  function patchDocumentSummary(
+    id: string,
+    patch: Partial<KnowledgeDocumentSummary>,
+  ): KnowledgeDocumentSummary | null {
+    let previous: KnowledgeDocumentSummary | null = null;
+    documents.value = documents.value.map((document) => {
+      if (document.id !== id) return document;
+      previous = document;
+      return { ...document, ...patch };
+    });
+    return previous;
+  }
+
+  function restoreDocumentSummary(previous: KnowledgeDocumentSummary) {
+    documents.value = documents.value.map((document) =>
+      document.id === previous.id ? previous : document,
+    );
+  }
+
+  // Reconcile the list with the authoritative document returned by
+  // knowledge_edit: drop the entry under the old path (rename) and merge the
+  // fresh summary, syncing the open preview when it is the edited document.
+  function applyEditedDocument(
+    previousPath: string,
+    updated: KnowledgeDocument,
+  ) {
+    if (previousPath !== updated.path) {
+      replaceDocumentPath(updated.type, previousPath, []);
+    }
+    mergeDocuments([updated]);
+    if (selectedDocumentId.value === updated.id) {
+      selectedDocument.value = updated;
+    }
+    expandAncestors(fullDocumentPath(updated.type, updated.path));
+  }
+
   function isDocumentInDirectory(
     document: KnowledgeDocumentSummary,
     directoryPath: string,
@@ -1557,6 +1626,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   function resetWorkspaceState() {
     workspaceRequestVersion += 1;
+    selectionSeq += 1;
     clearExternalRefreshQueue();
     stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
@@ -2021,15 +2091,16 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function loadSelectedDocument(
     target?: KnowledgeDocumentSummary | KnowledgeDocument | null,
     options?: { silent?: boolean },
-  ) {
-    if (!hasWorkspace.value) return;
+  ): Promise<boolean> {
+    if (!hasWorkspace.value) return false;
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey) return false;
+    const seq = selectionSeq;
     const refTarget = target ?? selectedDocumentSummary.value;
     if (!refTarget) {
       selectedDocument.value = null;
       selectedDocumentId.value = null;
-      return;
+      return false;
     }
 
     const silent = options?.silent ?? false;
@@ -2046,11 +2117,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
       });
       const doc = result.document;
       if (!doc) throw new Error("knowledge_read returned no document");
-      if (!isCurrentWorkspaceRequest(request)) {
-        return;
+      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
+        return false;
       }
+      // Commit atomically: the previous panel (package/directory preview)
+      // stays on screen until the document is ready, then the whole selection
+      // swaps within one tick — no intermediate fallback frame.
       selectedDocument.value = doc;
       selectedDocumentId.value = doc.id;
+      selectedPackageDocument.value = null;
+      selectedDirectoryPath.value = null;
+      selectedDirectoryConfig.value = null;
+      selectedDirectoryLoading.value = false;
       if (pendingSelectionPath.value === doc.path) {
         pendingSelectionPath.value = null;
       }
@@ -2063,13 +2141,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
         }
       }
       expandAncestors(fullDocumentPath(doc.type, doc.path));
+      return true;
     } catch (cause) {
-      if (!isCurrentWorkspaceRequest(request)) {
-        return;
+      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
+        return false;
       }
       notifyError("knowledge_read", cause);
+      return false;
     } finally {
-      if (isCurrentWorkspaceRequest(request) && !silent) {
+      // A superseding selection manages the shared loading flag itself; a
+      // stale finally must not clobber it.
+      if (isCurrentWorkspaceRequest(request) && !silent && seq === selectionSeq) {
         selectedDocumentLoading.value = false;
       }
     }
@@ -2079,6 +2161,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
     if (!request.workspaceKey) return;
+    const seq = selectionSeq;
     const refPath = normalizeDirectorySelectionPath(
       targetPath ?? selectedDirectoryPath.value ?? "",
     );
@@ -2099,19 +2182,19 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const config = result.directory;
       if (!config)
         throw new Error("knowledge_read returned no directory config");
-      if (!isCurrentWorkspaceRequest(request)) {
+      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
         return;
       }
       selectedDirectoryPath.value = config.path;
       selectedDirectoryConfig.value = config;
       expandAncestors(fullDocumentPath(config.type, config.path));
     } catch (cause) {
-      if (!isCurrentWorkspaceRequest(request)) {
+      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
         return;
       }
       notifyError("knowledge_read.directory", cause);
     } finally {
-      if (isCurrentWorkspaceRequest(request)) {
+      if (isCurrentWorkspaceRequest(request) && seq === selectionSeq) {
         selectedDirectoryLoading.value = false;
       }
     }
@@ -2350,20 +2433,29 @@ export function useKnowledgeState(props: KnowledgeProps) {
     summary: KnowledgeDocumentSummary,
     options?: { searchContext?: KnowledgeSearchSelectionContext | null },
   ) {
+    selectionSeq += 1;
+    const seq = selectionSeq;
     activeType.value = summary.type;
     selectedSearchContext.value = options?.searchContext ?? null;
-    clearSelectedPackageState();
-    selectedDirectoryPath.value = null;
-    selectedDirectoryConfig.value = null;
-    selectedDirectoryLoading.value = false;
+    const previousDocumentId = selectedDocumentId.value;
+    // The current panel (document/package/directory preview) stays on screen
+    // while the target loads; loadSelectedDocument swaps the selection
+    // atomically on success so no fallback panel flashes in between.
     selectedDocumentId.value = summary.id;
     pendingSelectionPath.value = summary.path;
-    await loadSelectedDocument(summary);
+    const loaded = await loadSelectedDocument(summary);
+    if (!loaded && seq === selectionSeq) {
+      // Load failed and the user hasn't moved on: restore the id so the
+      // explorer highlight matches the panel that is still showing.
+      selectedDocumentId.value = previousDocumentId;
+      pendingSelectionPath.value = null;
+    }
   }
 
   async function selectDirectory(path: string) {
     const normalized = normalizeDirectorySelectionPath(path);
     if (!normalized) return;
+    selectionSeq += 1;
     selectedSearchContext.value = null;
     clearSelectedPackageState();
     selectedDocumentId.value = null;
@@ -2377,6 +2469,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function selectPackage(summary: KnowledgeDocumentSummary) {
     const packageId = skillPackageIdForDocument(summary);
     if (!packageId) return;
+    selectionSeq += 1;
     activeType.value = summary.type;
     selectedSearchContext.value = null;
     selectedDocumentId.value = null;
@@ -2399,9 +2492,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await selectDocument(matched, { searchContext });
       return;
     }
+    selectionSeq += 1;
     activeType.value = result.type;
     selectedSearchContext.value = searchContext;
-    clearSelectedPackageState();
     selectedDocumentId.value = result.id;
     pendingSelectionPath.value = result.path;
     await Promise.all([
@@ -2427,6 +2520,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   }
 
   function clearSelection() {
+    selectionSeq += 1;
     selectedSearchContext.value = null;
     selectedDocumentId.value = null;
     selectedDocument.value = null;
@@ -2585,16 +2679,23 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function saveGeneralConfigPatch(
     patch: Partial<KnowledgeGeneralConfig>,
   ) {
-    if (!generalConfig.value) return;
+    const previous = generalConfig.value;
+    if (!previous) return;
+    // Optimistic: toggles flip on click; the authoritative config replaces
+    // the local merge when the save lands, or rolls back on failure.
+    generalConfig.value = { ...previous, ...patch };
     retrievalActionPending.value = true;
     error.value = "";
     try {
-      generalConfig.value = await knowledgeSaveGeneralConfig({
-        ...generalConfig.value,
-        ...patch,
-      });
+      generalConfig.value = await enqueueMutation(() =>
+        knowledgeSaveGeneralConfig({
+          ...previous,
+          ...patch,
+        }),
+      );
       await loadOverview();
     } catch (cause) {
+      generalConfig.value = previous;
       notifyError("knowledge_save_general_config", cause);
     } finally {
       retrievalActionPending.value = false;
@@ -2602,21 +2703,36 @@ export function useKnowledgeState(props: KnowledgeProps) {
   }
 
   async function setSemanticSearchEnabled(enabled: boolean) {
-    if (!generalConfig.value || !embeddingConfig.value) return;
+    const previousGeneral = generalConfig.value;
+    const previousEmbedding = embeddingConfig.value;
+    if (!previousGeneral || !previousEmbedding) return;
+    // Optimistic flip; runtime activation progress stays visible through the
+    // existing embedding status polling.
+    generalConfig.value = {
+      ...previousGeneral,
+      semanticSearchEnabled: enabled,
+    };
     retrievalActionPending.value = true;
     error.value = "";
     scheduleRetrievalStatusPoll(120);
     try {
-      generalConfig.value = await knowledgeSaveGeneralConfig({
-        ...generalConfig.value,
-        semanticSearchEnabled: enabled,
+      const savedConfigs = await enqueueMutation(async () => {
+        const general = await knowledgeSaveGeneralConfig({
+          ...previousGeneral,
+          semanticSearchEnabled: enabled,
+        });
+        const embedding = await knowledgeSaveEmbeddingConfig({
+          ...previousEmbedding,
+          enabled,
+        });
+        return { general, embedding };
       });
-      embeddingConfig.value = await knowledgeSaveEmbeddingConfig({
-        ...embeddingConfig.value,
-        enabled,
-      });
+      generalConfig.value = savedConfigs.general;
+      embeddingConfig.value = savedConfigs.embedding;
       await loadOverview();
     } catch (cause) {
+      generalConfig.value = previousGeneral;
+      embeddingConfig.value = previousEmbedding;
       notifyError("knowledge_save_embedding_config", cause);
     } finally {
       retrievalActionPending.value = false;
@@ -3134,14 +3250,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         return result.document;
       });
       if (!updated) throw new Error("knowledge_edit returned no document");
-      selectedDocument.value =
-        updated.id === selectedDocumentId.value
-          ? updated
-          : selectedDocument.value;
-      await Promise.all([
-        loadDocuments({ type: activeType.value }),
-        loadOverview(),
-      ]);
+      // Merge the authoritative document precisely instead of reloading the
+      // whole type: a debounced autosave must not churn the explorer tree.
+      applyEditedDocument(path, updated);
     } catch (cause) {
       notifyError("knowledge_edit.document.section", cause);
     } finally {
@@ -3155,6 +3266,30 @@ export function useKnowledgeState(props: KnowledgeProps) {
     meta: KnowledgeDocumentPatch,
   ) {
     if (!hasWorkspace.value) return;
+    // Optimistically flip the lightweight config fields (switches, dropdowns)
+    // so controls respond on click; content and rename fields wait for the
+    // authoritative document returned by the backend.
+    const {
+      id: _patchId,
+      type: _patchType,
+      newPath: _patchNewPath,
+      edits: _patchEdits,
+      body: _patchBody,
+      summary: _patchSummary,
+      maintenanceRules: _patchMaintenanceRules,
+      ...optimisticFields
+    } = meta;
+    const hasOptimisticFields = Object.keys(optimisticFields).length > 0;
+    const previousSummary = hasOptimisticFields
+      ? patchDocumentSummary(id, optimisticFields)
+      : null;
+    const previousSelected =
+      hasOptimisticFields && selectedDocument.value?.id === id
+        ? selectedDocument.value
+        : null;
+    if (previousSelected) {
+      selectedDocument.value = { ...previousSelected, ...optimisticFields };
+    }
     beginSave();
     error.value = "";
     try {
@@ -3171,12 +3306,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
         return result.document;
       });
       if (!updated) throw new Error("knowledge_edit returned no document");
-      selectedDocument.value =
-        updated.id === selectedDocumentId.value
-          ? updated
-          : selectedDocument.value;
-      await refreshKnowledgeData();
+      // Precise reconcile; the backend's knowledge-changed event still runs a
+      // targeted silent refresh as a safety net (no more full force reload).
+      applyEditedDocument(path, updated);
     } catch (cause) {
+      if (previousSummary) restoreDocumentSummary(previousSummary);
+      if (previousSelected && selectedDocument.value?.id === id) {
+        selectedDocument.value = previousSelected;
+      }
       notifyError("knowledge_edit.document.meta", cause);
     } finally {
       endSave();
@@ -3202,22 +3339,40 @@ export function useKnowledgeState(props: KnowledgeProps) {
       injectMode: meta.injectMode,
     };
 
+    // Optimistic flip before the IPC round trip so the switch responds on
+    // click; enqueueMutation serializes rapid toggles, so the last click wins
+    // on disk in the same order the UI showed.
+    const optimisticPatch: Partial<KnowledgeDocumentSummary> = {
+      injectMode: nextConfig.injectMode ?? current.injectMode,
+      inheritInjectMode: meta.inheritInjectMode ?? current.inheritInjectMode,
+      skillEnabled: nextConfig.enabled,
+      skillSurface: nextConfig.surface,
+      commandTrigger: nextConfig.commandTrigger,
+    };
+    const previousSummary = patchDocumentSummary(current.id, optimisticPatch);
+    const optimistic: KnowledgeDocumentSummary = {
+      ...current,
+      ...optimisticPatch,
+    };
+    selectedPackageDocument.value = optimistic;
+
     beginSave();
     error.value = "";
     try {
       await enqueueMutation(() =>
         setSkillConfig(`skill/${packageId}`, skillPackageConfigSource(current), nextConfig),
       );
-      selectedPackageDocument.value = {
-        ...current,
-        injectMode: nextConfig.injectMode ?? current.injectMode,
-        inheritInjectMode: meta.inheritInjectMode ?? current.inheritInjectMode,
-        skillEnabled: nextConfig.enabled,
-        skillSurface: nextConfig.surface,
-        commandTrigger: nextConfig.commandTrigger,
-      };
-      await refreshKnowledgeData();
+      // Manifest-driven bits (slash command availability, capability tags)
+      // reconcile in the background; stale-while-revalidate keeps the panel
+      // steady instead of re-rendering through a full knowledge reload.
+      void loadSkills({ force: true });
     } catch (cause) {
+      if (previousSummary) restoreDocumentSummary(previousSummary);
+      // ref() wraps stored objects in reactive proxies, so compare by id
+      // instead of identity: roll back only while this package stays selected.
+      if (selectedPackageDocument.value?.id === current.id) {
+        selectedPackageDocument.value = current;
+      }
       notifyError("knowledge_edit.skill.package_config", cause);
     } finally {
       endSave();
@@ -3898,6 +4053,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (cachedDocs) documents.value = cachedDocs;
     void refreshKnowledgeData({ force: false, includeOverview: false });
     void refreshRetrievalRuntimeStatus();
+    // Prime the shared skill manifest cache so the first package preview
+    // renders with real metadata instead of a "-" placeholder flash.
+    if (hasWorkspace.value) void loadSkills();
 
     const release = await listen<KnowledgeChangedEvent>(
       "knowledge-changed",
@@ -3967,6 +4125,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       void refreshKnowledgeData({ force: true, includeOverview: false });
       void refreshRetrievalRuntimeStatus();
+      void loadSkills({ force: true });
     },
   );
 
