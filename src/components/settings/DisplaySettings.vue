@@ -310,6 +310,15 @@ async function updateViewWindowsAboveMain(value: boolean) {
       <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
     </div>
 
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showViewLogBar"
+        :aria-label="t('settings.display.showViewLogBar')"
+        @update:model-value="setDisplay('showViewLogBar', $event)"
+      />
+      <span>{{ t("settings.display.showViewLogBar") }}</span>
+    </div>
+
     <div class="toggle-row" :class="{ disabled: !viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy }">
       <BaseSwitch
         :model-value="viewOpenInExistingWindow"

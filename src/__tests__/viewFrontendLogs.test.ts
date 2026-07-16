@@ -54,6 +54,37 @@ describe("View frontend logs", () => {
     expect(lib).toContain("commands::view_open_frontend_log");
   });
 
+  it("hides the View log bar by default behind a display setting", () => {
+    const host = read("src/components/ViewHostWindow.vue");
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const settingsPage = read("src/components/settings/DisplaySettings.vue");
+    const en = JSON.parse(read("src/language/en.json"));
+    const zh = JSON.parse(read("src/language/zh.json"));
+
+    // Default off; the toggle lives in Settings → Display.
+    expect(displaySettings).toContain("showViewLogBar: boolean");
+    expect(displaySettings).toContain("showViewLogBar: false");
+    expect(settingsPage).toContain("setDisplay('showViewLogBar', $event)");
+    expect(en["settings.display.showViewLogBar"]).toBeTruthy();
+    expect(zh["settings.display.showViewLogBar"]).toBeTruthy();
+
+    // Both render paths (inline statusbar slot + footer) respect the toggle,
+    // and the injected slot is removed when the bar is disabled.
+    expect(host).toContain("const showFrontendLogbar = computed(() => displaySettings.showViewLogBar);");
+    expect(host).toContain('<Teleport v-if="showFrontendLogbar && !usePersistentViewContentPool && embeddedLogbarSlot"');
+    expect(host).toContain('v-else-if="showFrontendLogbar && !usePersistentViewContentPool"');
+    const syncBlock = host.slice(
+      host.indexOf("function syncEmbeddedLogbarSlot()"),
+      host.indexOf("function scheduleEmbeddedLogbarSync()"),
+    );
+    expect(syncBlock).toContain("if (!showFrontendLogbar.value)");
+    expect(syncBlock).toContain("clearEmbeddedLogbarSlot()");
+    expect(host).toContain("watch(showFrontendLogbar, () => scheduleEmbeddedLogbarSync());");
+
+    // Settings changes reach already-open View windows via the storage event.
+    expect(displaySettings).toContain('window.addEventListener("storage", handleStorageChange)');
+  });
+
   it("logs caught View template errors to the frontend console", () => {
     const serializedTable = read("src-tauri/src/view/templates/serialized_table.rs");
     const serializedTableHelper = read("src/components/table/serializedTable.ts");

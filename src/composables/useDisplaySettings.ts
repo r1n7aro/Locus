@@ -58,6 +58,8 @@ export interface DisplaySettings {
   hideThinkingBlocks: boolean;
   /** Show View packages in the lower section of the session list */
   showViewsInSessionPanel: boolean;
+  /** Show the frontend log bar at the bottom of View windows */
+  showViewLogBar: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Hide Git command suggestions in Git terminal */
@@ -131,6 +133,7 @@ const defaults: DisplaySettings = {
   compactToolCalls: true,
   hideThinkingBlocks: true,
   showViewsInSessionPanel: true,
+  showViewLogBar: false,
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,
@@ -168,6 +171,20 @@ function save(s: DisplaySettings) {
 }
 
 const state = reactive<DisplaySettings>(load());
+
+/** Keep every window's copy in sync: View host/content windows are separate
+ *  webviews sharing the same origin, so a settings change in the main window
+ *  arrives here as a storage event (same mechanism as useTheme). */
+function handleStorageChange(event: StorageEvent) {
+  if (event.key !== null && event.key !== STORAGE_KEY) return;
+  const next = load();
+  Object.assign(state, next, { fonts: { ...next.fonts } });
+  applyFonts(state.fonts);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", handleStorageChange);
+}
 
 export function useDisplaySettings() {
   function set<K extends keyof DisplaySettings>(key: K, value: DisplaySettings[K]) {

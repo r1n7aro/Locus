@@ -18,6 +18,7 @@ import {
   type Window as TauriWindowHandle,
 } from "@tauri-apps/api/window";
 import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { t } from "../i18n";
 import { searchWorkspaceAssets } from "../services/asset";
 import {
@@ -143,6 +144,8 @@ const props = withDefaults(defineProps<{
 }>(), {
   embedded: false,
 });
+
+const { state: displaySettings } = useDisplaySettings();
 
 interface ViewHostTab {
   id: string;
@@ -410,6 +413,9 @@ const latestFrontendLogText = computed(() => {
   const message = firstLogLine(entry.message);
   return message ? `${entry.level.toUpperCase()} ${message}` : `${entry.level.toUpperCase()} empty message`;
 });
+// Logs still stream to frontend.log regardless; this only controls the bar.
+const showFrontendLogbar = computed(() => displaySettings.showViewLogBar);
+watch(showFrontendLogbar, () => scheduleEmbeddedLogbarSync());
 
 function viewHostContentLog(event: string, detail: Record<string, unknown> = {}) {
   if (!VIEW_HOST_CONTENT_DEBUG) return;
@@ -1884,6 +1890,10 @@ function ensureEmbeddedLogbarSlot(statusbar: HTMLElement | null) {
 }
 
 function syncEmbeddedLogbarSlot() {
+  if (!showFrontendLogbar.value) {
+    clearEmbeddedLogbarSlot();
+    return;
+  }
   ensureEmbeddedLogbarSlot(findRuntimeStatusbar());
 }
 
@@ -2989,7 +2999,7 @@ onUnmounted(() => {
       <div v-if="error" class="view-host-state view-host-state-error">{{ error }}</div>
       <div v-else-if="loading && !detail" class="view-host-state">{{ t("common.loading") }}</div>
     </section>
-    <Teleport v-if="!usePersistentViewContentPool && embeddedLogbarSlot" :to="embeddedLogbarSlot">
+    <Teleport v-if="showFrontendLogbar && !usePersistentViewContentPool && embeddedLogbarSlot" :to="embeddedLogbarSlot">
       <button
         type="button"
         class="view-host-logbar-inline"
@@ -3002,7 +3012,7 @@ onUnmounted(() => {
       </button>
     </Teleport>
     <footer
-      v-else-if="!usePersistentViewContentPool"
+      v-else-if="showFrontendLogbar && !usePersistentViewContentPool"
       class="view-host-logbar"
       :class="`level-${latestFrontendLogLevel}`"
       title="Double-click to open frontend.log"
