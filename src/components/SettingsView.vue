@@ -22,6 +22,7 @@ import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
+import McpSettings from "./settings/McpSettings.vue";
 import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
@@ -153,6 +154,16 @@ watch(
             <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
           </svg>
           <span>{{ t("settings.tab.permissions") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'mcp' }"
+          @click="activeCategory = 'mcp'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M6 3.5A1.5 1.5 0 0 1 7.5 2h1A1.5 1.5 0 0 1 10 3.5v1A1.5 1.5 0 0 1 8.5 6v1H14a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0v-1A.5.5 0 0 1 2 7h5.5V6A1.5 1.5 0 0 1 6 4.5v-1zM8.5 5a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1zM0 11.5A1.5 1.5 0 0 1 1.5 10h1A1.5 1.5 0 0 1 4 11.5v1A1.5 1.5 0 0 1 2.5 14h-1A1.5 1.5 0 0 1 0 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5A1.5 1.5 0 0 1 7.5 10h1a1.5 1.5 0 0 1 1.5 1.5v1A1.5 1.5 0 0 1 8.5 14h-1A1.5 1.5 0 0 1 6 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5a1.5 1.5 0 0 1 1.5-1.5h1a1.5 1.5 0 0 1 1.5 1.5v1a1.5 1.5 0 0 1-1.5 1.5h-1a1.5 1.5 0 0 1-1.5-1.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1z"/>
+          </svg>
+          <span>{{ t("settings.tab.mcp") }}</span>
         </button>
         <div class="sidebar-group-label">{{ t("settings.group.general") }}</div>
         <button
@@ -314,6 +325,10 @@ watch(
           @update:model-defaults="modelDefaults = $event"
           @save="saveModelDefaults"
         />
+      </template>
+
+      <template v-if="activeCategory === 'mcp'">
+        <McpSettings />
       </template>
 
       <template v-if="activeCategory === 'permissions'">

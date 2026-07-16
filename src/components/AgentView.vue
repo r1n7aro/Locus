@@ -108,14 +108,20 @@ const toolEnabledError = ref("");
 const availableToolItems = computed(() =>
   injectedItems.value.filter((item) => item.kind === "tools"),
 );
+const mcpToolItems = computed(() =>
+  availableToolItems.value.filter((item) => toolMetaString(item.meta, "toolSource") === "mcp"),
+);
+const nonMcpToolItems = computed(() =>
+  availableToolItems.value.filter((item) => toolMetaString(item.meta, "toolSource") !== "mcp"),
+);
 const directToolItems = computed(() =>
-  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "direct"),
+  nonMcpToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "direct"),
 );
 const lazyToolItems = computed(() =>
-  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "lazy"),
+  nonMcpToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "lazy"),
 );
 const skillToolItems = computed(() =>
-  availableToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "skill"),
+  nonMcpToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "skill"),
 );
 const injectedContextItems = computed(() =>
   injectedItems.value.filter((item) => item.kind !== "tools"),
@@ -131,6 +137,7 @@ const toolGroups = computed(() => [
   { key: "tools:direct", label: t("agent.directTools"), items: directToolItems.value },
   { key: "tools:lazy", label: t("agent.lazyTools"), items: lazyToolItems.value },
   { key: "tools:skill", label: t("agent.skillTools"), items: skillToolItems.value },
+  { key: "tools:mcp", label: t("agent.mcpTools"), items: mcpToolItems.value },
 ].filter((group) => group.items.length > 0));
 
 // ── Collapsible sections ──
@@ -140,6 +147,7 @@ const collapsedSections = ref<Record<string, boolean>>({
   "tools:direct": false,
   "tools:lazy": true,
   "tools:skill": true,
+  "tools:mcp": true,
 });
 
 function isSectionCollapsed(key: string): boolean {
@@ -165,6 +173,23 @@ function toolMetaRecord(meta: InjectedPromptItem["meta"]): Record<string, unknow
 function toolMetaBoolean(meta: InjectedPromptItem["meta"], key: string): boolean | null {
   const value = toolMetaRecord(meta)?.[key];
   return typeof value === "boolean" ? value : null;
+}
+
+function toolMetaString(meta: InjectedPromptItem["meta"], key: string): string {
+  const value = toolMetaRecord(meta)?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+/// MCP wire names render as the bare tool name; the persisted identity
+/// (item.title, override keys) stays the full wire name.
+function toolItemDisplayTitle(item: InjectedPromptItem): string {
+  const mcpToolName = toolMetaString(item.meta, "mcpToolName");
+  return mcpToolName || item.title;
+}
+
+function toolItemMcpServer(item: InjectedPromptItem): string {
+  return toolMetaString(item.meta, "mcpServerName")
+    || toolMetaString(item.meta, "mcpServerId");
 }
 
 const sidebarWidth = ref(160);
@@ -1166,7 +1191,11 @@ watch(
                     @update:model-value="setToolEnabledState(item, $event)"
                   />
                 </label>
-                <span class="item-title tool-title" :class="{ 'rule-title-disabled': !toolItemEnabled(item) }">{{ item.title }}</span>
+                <span class="item-title tool-title" :class="{ 'rule-title-disabled': !toolItemEnabled(item) }">{{ toolItemDisplayTitle(item) }}</span>
+                <span
+                  v-if="group.key === 'tools:mcp' && toolItemMcpServer(item)"
+                  class="tool-mcp-server-badge"
+                >{{ toolItemMcpServer(item) }}</span>
                 <span v-if="!toolItemEnabled(item)" class="rule-off-badge">OFF</span>
               </button>
             </template>
@@ -2470,6 +2499,21 @@ watch(
   background: color-mix(in srgb, var(--panel-bg) 72%, var(--hover-bg) 28%);
   color: var(--text-secondary);
   opacity: 0.5;
+}
+
+.tool-mcp-server-badge {
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: var(--radius-badge);
+  line-height: 1.2;
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  color: var(--text-secondary);
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 90px;
 }
 
 .injected-item {

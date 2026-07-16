@@ -1,0 +1,8 @@
+{
+  "description": "Reload MCP server connections from mcp_servers.json and report the result.\n- Reconnects added or changed servers, drops removed/disabled ones, and keeps healthy ones\n- The report doubles as a connection test: per server it shows connected/failed, the error (including the server's stderr) on failure, and the wire names of every available tool\n- Call this after editing %APPDATA%/locus/mcp_servers.json so the new tools become callable in this conversation (they are named mcp__<server>__<tool>)\n- Follow the guidance in the connect-software skill (skill/builtin/connect-software.md) when adding or fixing server configs",
+  "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  }
+}

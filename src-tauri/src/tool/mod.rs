@@ -129,7 +129,7 @@ pub fn built_in_tool_name_keys() -> BTreeSet<String> {
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "skill_list" | "skill_reload"
+        "skill_list" | "skill_reload" | "mcp_reload"
     ) {
         return ToolLoadMode::Skill;
     }
@@ -207,6 +207,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "skill_create",
     "skill_list",
     "skill_reload",
+    "mcp_reload",
     "plugin_list",
     "plugin_search",
     "plugin_install",

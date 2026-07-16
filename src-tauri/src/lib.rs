@@ -35,6 +35,7 @@ pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
 pub mod extra_workdirs;
+pub mod mcp;
 mod feishu_docs;
 pub mod file_log;
 pub mod keychain;
@@ -1026,6 +1027,28 @@ pub fn run() {
 
             tauri::async_runtime::spawn(model_catalog::background_refresh());
 
+            // Connect enabled MCP servers in the background; the agent tool
+            // snapshot stays empty until this (or a later mcp_reload /
+            // settings write) completes, so startup is never blocked on an
+            // external server.
+            mcp::manager::set_event_app_handle(app.handle().clone());
+            tauri::async_runtime::spawn(async {
+                let reports = mcp::manager::reconcile().await;
+                for report in &reports {
+                    match &report.error {
+                        Some(error) => eprintln!(
+                            "[Mcp] startup connect failed for '{}': {error}",
+                            report.id
+                        ),
+                        None => eprintln!(
+                            "[Mcp] startup connected '{}' ({} tools)",
+                            report.id,
+                            report.tool_names.len()
+                        ),
+                    }
+                }
+            });
+
             let knowledge_startup_state = knowledge_index_state.clone();
             let workspace_for_knowledge = workspace.clone();
             let app_handle_for_knowledge = app.handle().clone();
@@ -1119,6 +1142,15 @@ pub fn run() {
             commands::extra_workdirs_get,
             commands::extra_workdirs_set,
             commands::extra_workdirs_map,
+            commands::mcp_servers_get,
+            commands::mcp_servers_upsert,
+            commands::mcp_servers_remove,
+            commands::mcp_server_test,
+            commands::mcp_get_status,
+            commands::mcp_server_set_enabled,
+            commands::mcp_import_scan,
+            commands::mcp_import_apply,
+            commands::mcp_server_wire_tools,
             commands::open_dir_in_file_explorer,
             commands::list_dir_entries,
             commands::list_dir_entries_page,

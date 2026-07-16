@@ -3424,6 +3424,15 @@ impl AgentInstance {
         for tool_name in self.tool_registry.skill_tool_names() {
             push_unique_tool_name(&mut tools, &tool_name);
         }
+        // MCP tools ride on the manager's synchronous snapshot (updated by
+        // startup/settings/mcp_reload reconciles). ensure_fresh backstops
+        // config edits that bypassed all three (an agent writing
+        // mcp_servers.json via bash): one stat per assembly, a reconcile
+        // only when the file actually changed.
+        crate::mcp::manager::ensure_fresh().await;
+        for tool_name in crate::mcp::manager::wire_tool_names() {
+            push_unique_tool_name(&mut tools, &tool_name);
+        }
         tools
     }
 
@@ -3529,30 +3538,39 @@ impl AgentInstance {
     }
 
     fn canonical_tool_name(&self, name: &str) -> Option<String> {
-        self.tool_registry.canonical_name(name).or_else(|| {
-            crate::commands::canonical_skill_package_tool_name_for_working_dir(
-                &self.working_dir,
-                name,
-            )
-        })
+        self.tool_registry
+            .canonical_name(name)
+            .or_else(|| {
+                crate::commands::canonical_skill_package_tool_name_for_working_dir(
+                    &self.working_dir,
+                    name,
+                )
+            })
+            .or_else(|| crate::mcp::manager::resolve_wire_tool(name).map(|t| t.wire_name))
     }
 
     fn tool_description(&self, name: &str) -> Option<(String, serde_json::Value)> {
-        self.tool_registry.tool_description(name).or_else(|| {
-            crate::commands::skill_package_tool_description_sync_for_working_dir(
-                &self.working_dir,
-                name,
-            )
-        })
+        self.tool_registry
+            .tool_description(name)
+            .or_else(|| {
+                crate::commands::skill_package_tool_description_sync_for_working_dir(
+                    &self.working_dir,
+                    name,
+                )
+            })
+            .or_else(|| crate::mcp::manager::resolve_tool_description(name))
     }
 
     fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
-        self.tool_registry.resolve_api_tool(name).or_else(|| {
-            crate::commands::resolve_skill_package_api_tool_sync_for_working_dir(
-                &self.working_dir,
-                name,
-            )
-        })
+        self.tool_registry
+            .resolve_api_tool(name)
+            .or_else(|| {
+                crate::commands::resolve_skill_package_api_tool_sync_for_working_dir(
+                    &self.working_dir,
+                    name,
+                )
+            })
+            .or_else(|| crate::mcp::manager::resolve_api_tool_json(name))
     }
 
     fn resolve_api_tools(&self, tool_names: &[String]) -> Vec<serde_json::Value> {
@@ -3565,7 +3583,7 @@ impl AgentInstance {
     fn can_configure_direct_load_tool(&self, name: &str) -> bool {
         !self.disables_tool_load_configuration()
             && !Self::is_meta_tool(name)
-            && self.tool_registry.is_built_in(name)
+            && (self.tool_registry.is_built_in(name) || Self::is_mcp_wire_tool(name))
             && matches!(
                 self.default_tool_load_mode(name),
                 ToolLoadMode::Direct | ToolLoadMode::Lazy
@@ -3576,7 +3594,26 @@ impl AgentInstance {
         if Self::is_meta_tool(name) {
             return ToolLoadMode::Direct;
         }
+        // MCP tools default to lazy loading: external servers bring dozens
+        // of tools (blender-mcp alone ships 22, ~6.5k tokens of schemas), so
+        // they ride the provider-native deferred path / tool_load fallback
+        // and only enter context on demand. The server-level loadMode
+        // setting pins a whole server to direct; per-agent overrides can
+        // still pin individual tools either way.
+        if name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX) {
+            if let Some(tool) = crate::mcp::manager::resolve_wire_tool(name) {
+                if tool.load_mode == crate::mcp::config::McpLoadMode::Direct {
+                    return ToolLoadMode::Direct;
+                }
+                return ToolLoadMode::Lazy;
+            }
+        }
         self.tool_registry.default_load_mode(name)
+    }
+
+    fn is_mcp_wire_tool(name: &str) -> bool {
+        name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+            && crate::mcp::manager::resolve_wire_tool(name).is_some()
     }
 
     fn configured_tool_load_mode(
@@ -3591,7 +3628,9 @@ impl AgentInstance {
         if self.disables_tool_load_configuration() {
             return default_mode;
         }
-        if !self.tool_registry.is_built_in(name) {
+        // Built-ins and MCP wire tools accept per-agent direct/lazy
+        // overrides; skill-package tools stay on their manifest default.
+        if !self.tool_registry.is_built_in(name) && !Self::is_mcp_wire_tool(name) {
             return default_mode;
         }
         match overrides.get(name).copied() {
@@ -4149,7 +4188,14 @@ impl AgentInstance {
                     ToolLoadMode::Skill => "skill",
                 };
                 let is_built_in_tool = self.tool_registry.is_built_in(&name);
-                let tool_source = if is_built_in_tool { "builtIn" } else { "skill" };
+                let mcp_tool = crate::mcp::manager::resolve_wire_tool(&name);
+                let tool_source = if mcp_tool.is_some() {
+                    "mcp"
+                } else if is_built_in_tool {
+                    "builtIn"
+                } else {
+                    "skill"
+                };
                 let load_reason = if Self::is_meta_tool(&name) {
                     "meta_tool"
                 } else if direct_load_override == Some(true) {
@@ -4191,6 +4237,9 @@ impl AgentInstance {
                         "canToggleEnabled": can_toggle_enabled,
                         "nativeLazy": native_lazy,
                         "toolSource": tool_source,
+                        "mcpServerId": mcp_tool.as_ref().map(|t| t.server_id.clone()),
+                        "mcpServerName": mcp_tool.as_ref().map(|t| t.server_name.clone()),
+                        "mcpToolName": mcp_tool.as_ref().map(|t| t.tool_name.clone()),
                     })),
                 })
             })
@@ -11100,7 +11149,48 @@ impl AgentInstance {
             }
         }
 
-        if tc.name == "read" {
+        if tc.name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+            && crate::mcp::manager::resolve_wire_tool(&tc.name).is_some()
+        {
+            // Cancellation is handled inside call_tool (not await_tool_result)
+            // so the abandoned request also sends notifications/cancelled to
+            // the server before we stop waiting.
+            if self.is_cancel_requested() {
+                return Self::interrupted_tool_result();
+            }
+            let cancel_rx = self.cancel_waiter();
+            match crate::mcp::manager::call_tool(&tc.name, args.clone(), Some(cancel_rx)).await {
+                Ok(outcome) => {
+                    if outcome.images.is_empty() {
+                        ExecutedToolResult::from_tool_result(ToolResult {
+                            output: outcome.text,
+                            is_error: false,
+                        })
+                    } else if self.supports_image_understanding() {
+                        let images = outcome.images.clone();
+                        ExecutedToolResult::from_tool_result(ToolResult {
+                            output: outcome.text,
+                            is_error: false,
+                        })
+                        .with_images(images)
+                    } else {
+                        // Vision-less backend: keep the anti-hallucination
+                        // placeholder instead of an attachment it cannot see.
+                        ExecutedToolResult::from_tool_result(ToolResult {
+                            output: crate::mcp::manager::describe_images_as_placeholder(&outcome),
+                            is_error: false,
+                        })
+                    }
+                }
+                Err(e) if e == crate::mcp::types::MCP_CALL_CANCELLED => {
+                    Self::interrupted_tool_result()
+                }
+                Err(e) => ExecutedToolResult::from_tool_result(ToolResult {
+                    output: e,
+                    is_error: true,
+                }),
+            }
+        } else if tc.name == "read" {
             self.await_executed_tool_result(self.execute_read(app_handle, args))
                 .await
         } else if tc.name == "task" {

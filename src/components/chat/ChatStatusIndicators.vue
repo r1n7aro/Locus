@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BookOpen, Box, CodeXml, Database, Zap, type IconNode } from "lucide";
+import { BookOpen, Box, CodeXml, Database, Plug, Zap, type IconNode } from "lucide";
 import { t } from "../../i18n";
 import { listAgentInjectedItems } from "../../services/agent";
 import {
@@ -24,6 +24,12 @@ import {
   knowledgeGetLexicalRebuildStatus,
   knowledgeGetOverview,
 } from "../../services/knowledge";
+import {
+  mcpGetStatus,
+  mcpServerSetEnabled,
+  subscribeMcpStatus,
+  type McpServerRuntimeStatus,
+} from "../../services/mcp";
 import type {
   AssetDbScanEvent,
   CsharpCompileStatus,
@@ -42,12 +48,13 @@ import type {
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented, { type SegmentedOption } from "../ui/BaseSegmented.vue";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
+import BaseSwitch from "../ui/BaseSwitch.vue";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 
-type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload";
+type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload" | "mcp";
 type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
-type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload";
+type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload" | "mcp";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 type UnitySemanticPhaseTone = Record<string, StatusTone>;
@@ -81,6 +88,7 @@ const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   knowledge: BookOpen,
   code: CodeXml,
   hotReload: Zap,
+  mcp: Plug,
 };
 
 const props = defineProps<{
@@ -127,6 +135,11 @@ let unitySemanticDisposed = false;
 const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
 const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
 const embeddingStatus = ref<EmbeddingStatus | null>(null);
+const mcpStatus = ref<McpServerRuntimeStatus[]>([]);
+const mcpToggleBusyId = ref<string | null>(null);
+const mcpToggleError = ref("");
+let mcpUnsubscribe: RuntimeUnsubscribe | null = null;
+let mcpDisposed = false;
 const injectedItems = ref<InjectedPromptItem[]>([]);
 const knowledgeStatusLoading = ref(false);
 const knowledgeRetrievalError = ref("");
@@ -1469,6 +1482,71 @@ async function runHotReloadRecompile() {
   }
 }
 
+// ── MCP servers ─────────────────────────────────────────────────────────
+
+const mcpEnabledServers = computed(() => mcpStatus.value.filter((s) => s.enabled));
+const mcpConnectedCount = computed(
+  () => mcpEnabledServers.value.filter((s) => s.connected).length,
+);
+
+const mcpTone = computed<StatusTone>(() => {
+  const enabled = mcpEnabledServers.value.length;
+  if (enabled === 0) return "muted";
+  const connected = mcpConnectedCount.value;
+  if (connected === enabled) return "success";
+  if (connected > 0) return "warning";
+  return "danger";
+});
+
+const mcpSummary = computed(() => {
+  const enabled = mcpEnabledServers.value.length;
+  if (enabled === 0) return t("chat.status.mcp.allOff");
+  return t("chat.status.mcp.connectedSummary", mcpConnectedCount.value, enabled);
+});
+
+function mcpServerDetail(server: McpServerRuntimeStatus): string {
+  if (!server.enabled) return t("chat.status.mcp.serverOff");
+  if (server.connected) return t("chat.status.mcp.serverTools", server.toolsCount);
+  if (server.error) {
+    const firstLine = server.error.split("\n", 1)[0] ?? "";
+    return firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine;
+  }
+  return t("chat.status.mcp.serverDisconnected");
+}
+
+function mcpServerToneClass(server: McpServerRuntimeStatus): string {
+  if (!server.enabled) return "tone-muted";
+  if (server.connected) return "tone-success";
+  return "tone-danger";
+}
+
+async function refreshMcpStatus() {
+  try {
+    mcpStatus.value = await mcpGetStatus();
+  } catch {
+    // Runtime unavailable (browser preview) — leave the indicator hidden.
+  }
+}
+
+async function toggleMcpServer(server: McpServerRuntimeStatus) {
+  if (mcpToggleBusyId.value) return;
+  mcpToggleBusyId.value = server.id;
+  mcpToggleError.value = "";
+  const next = !server.enabled;
+  // Optimistic flip; the post-reconcile mcp-status event is authoritative.
+  mcpStatus.value = mcpStatus.value.map((s) =>
+    s.id === server.id ? { ...s, enabled: next, connected: next && s.connected } : s,
+  );
+  try {
+    await mcpServerSetEnabled(server.id, next);
+  } catch (e) {
+    mcpToggleError.value = normalizeAppError(e).message;
+    await refreshMcpStatus();
+  } finally {
+    mcpToggleBusyId.value = null;
+  }
+}
+
 const statusItems = computed<StatusItem[]>(() => [
   {
     id: "assetDb",
@@ -1541,6 +1619,22 @@ const statusItems = computed<StatusItem[]>(() => [
     actionDisabled: !hotReloadCanRecompile.value,
     actionVariant: "neutral",
   },
+  // The MCP badge only exists while at least one server is configured —
+  // per-server toggles live in its popover, so disabled-but-configured
+  // servers must keep the badge visible.
+  ...(mcpStatus.value.length > 0
+    ? [
+        {
+          id: "mcp" as const,
+          icon: "mcp" as const,
+          title: t("chat.status.mcp.title"),
+          summary: mcpSummary.value,
+          inlineLabel: mcpSummary.value,
+          tone: mcpTone.value,
+          rows: [],
+        },
+      ]
+    : []),
 ]);
 
 const activeItem = computed(() =>
@@ -1701,12 +1795,25 @@ onMounted(() => {
   csharpLspDisposed = false;
   hotReloadDisposed = false;
   unitySemanticDisposed = false;
+  mcpDisposed = false;
   void refreshUnitySemanticState();
   scheduleUnitySemanticPoll();
   void refreshCsharpLspStatus();
   void refreshHotReloadStatus();
   void refreshNativeBrokerStatus();
   void refreshStateProbeStatus();
+  void refreshMcpStatus();
+  subscribeMcpStatus((payload) => {
+    mcpStatus.value = payload;
+  })
+    .then((unsubscribe) => {
+      if (mcpDisposed) {
+        unsubscribe();
+      } else {
+        mcpUnsubscribe = unsubscribe;
+      }
+    })
+    .catch(() => {});
   subscribeCsharpLspStatus((payload) => {
     csharpLsp.value = payload;
   })
@@ -1759,11 +1866,14 @@ onUnmounted(() => {
   csharpLspDisposed = true;
   hotReloadDisposed = true;
   unitySemanticDisposed = true;
+  mcpDisposed = true;
   clearUnitySemanticPoll();
   csharpLspUnsubscribe?.();
   csharpLspUnsubscribe = null;
   hotReloadUnsubscribe?.();
   hotReloadUnsubscribe = null;
+  mcpUnsubscribe?.();
+  mcpUnsubscribe = null;
 });
 </script>
 
@@ -1876,6 +1986,35 @@ onUnmounted(() => {
           />
           <span v-if="hotReloadPlayModeReloadError" class="chat-status-codeopt-error">
             {{ hotReloadPlayModeReloadError }}
+          </span>
+        </div>
+        <div v-if="activeItem.id === 'mcp'" class="chat-status-mcp-list">
+          <div
+            v-for="server in mcpStatus"
+            :key="server.id"
+            class="chat-status-mcp-row"
+            :class="{ 'is-off': !server.enabled }"
+          >
+            <span class="chat-status-mcp-dot" :class="mcpServerToneClass(server)" aria-hidden="true" />
+            <div class="chat-status-mcp-info">
+              <span class="chat-status-mcp-name">{{ server.name }}</span>
+              <span
+                class="chat-status-mcp-detail"
+                :class="{ 'is-error': server.enabled && !server.connected && !!server.error }"
+                :title="server.error ?? undefined"
+              >
+                {{ mcpServerDetail(server) }}
+              </span>
+            </div>
+            <BaseSwitch
+              :model-value="server.enabled"
+              :disabled="mcpToggleBusyId !== null"
+              :aria-label="server.name"
+              @update:model-value="toggleMcpServer(server)"
+            />
+          </div>
+          <span v-if="mcpToggleError" class="chat-status-codeopt-error">
+            {{ mcpToggleError }}
           </span>
         </div>
         <dl v-if="activeMainRows.length > 0" class="chat-status-detail-list">
@@ -2211,5 +2350,72 @@ onUnmounted(() => {
     opacity: 1;
     transform: scale(1.04);
   }
+}
+
+.chat-status-mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.chat-status-mcp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 2px;
+}
+
+.chat-status-mcp-row.is-off .chat-status-mcp-info {
+  opacity: 0.6;
+}
+
+.chat-status-mcp-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.chat-status-mcp-dot.tone-success {
+  color: var(--status-good-fg);
+}
+
+.chat-status-mcp-dot.tone-danger {
+  color: var(--status-danger-fg);
+}
+
+.chat-status-mcp-dot.tone-muted {
+  color: var(--text-secondary);
+}
+
+.chat-status-mcp-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-status-mcp-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-color);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-status-mcp-detail {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-status-mcp-detail.is-error {
+  color: var(--status-danger-fg);
 }
 </style>

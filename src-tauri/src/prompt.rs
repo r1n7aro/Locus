@@ -59,6 +59,7 @@ pub mod tools {
     pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
+    pub const MCP_RELOAD: &str = include_str!("../../tools/mcp_reload.json");
     pub const PLUGIN_LIST: &str = include_str!("../../tools/plugin_list.json");
     pub const PLUGIN_SEARCH: &str = include_str!("../../tools/plugin_search.json");
     pub const PLUGIN_INSTALL: &str = include_str!("../../tools/plugin_install.json");

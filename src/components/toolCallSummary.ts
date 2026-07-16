@@ -1,5 +1,30 @@
 type ToolCallArguments = Record<string, unknown>;
 
+const MCP_TOOL_PREFIX = "mcp__";
+
+export interface McpToolNameParts {
+  serverId: string;
+  toolName: string;
+}
+
+/// `mcp__<server>__<tool>` → parts; null for non-MCP names. Best-effort
+/// string split — the backend owns the authoritative wire-name map.
+export function parseMcpToolName(name: string): McpToolNameParts | null {
+  if (!name.startsWith(MCP_TOOL_PREFIX)) return null;
+  const rest = name.slice(MCP_TOOL_PREFIX.length);
+  const sep = rest.indexOf("__");
+  if (sep <= 0 || sep + 2 >= rest.length) {
+    return { serverId: "", toolName: rest };
+  }
+  return { serverId: rest.slice(0, sep), toolName: rest.slice(sep + 2) };
+}
+
+/// UI display name for a tool call: MCP wire names shed their
+/// `mcp__<server>__` prefix, everything else passes through.
+export function toolCallDisplayName(name: string): string {
+  return parseMcpToolName(name)?.toolName ?? name;
+}
+
 function getStringArg(args: ToolCallArguments, keys: string[]): string {
   for (const key of keys) {
     const value = args[key];

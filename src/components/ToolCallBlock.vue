@@ -12,7 +12,7 @@ import { useThrottledStreamingText } from "../composables/streamingRenderThrottl
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
-import { buildToolCallArgsSummary } from "./toolCallSummary";
+import { buildToolCallArgsSummary, toolCallDisplayName } from "./toolCallSummary";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { agentGraphToolReopen } from "../services/agentGraphTool";
 import { normalizeViewError, viewRun } from "../services/view";
@@ -199,7 +199,7 @@ const displayName = computed(() => {
       return "task";
     }
   }
-  return props.toolCall.name;
+  return toolCallDisplayName(props.toolCall.name);
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");

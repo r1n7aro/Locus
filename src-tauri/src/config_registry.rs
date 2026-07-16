@@ -43,6 +43,7 @@ pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, Ap
     collect_models(&mut entries);
     collect_permissions(app_handle, &mut entries);
     collect_knowledge(app_handle, &mut entries);
+    collect_mcp(&mut entries);
 
     Ok(entries)
 }
@@ -60,11 +61,12 @@ pub fn collect_by_category(
         "models" => collect_models(&mut entries),
         "permissions" => collect_permissions(app_handle, &mut entries),
         "knowledge" => collect_knowledge(app_handle, &mut entries),
+        "mcp" => collect_mcp(&mut entries),
         _ => {
             return Err(AppError::new(
                 "invalid_category",
                 format!(
-                    "Unknown category '{}'. Valid: general, display, notifications, api, models, permissions, knowledge",
+                    "Unknown category '{}'. Valid: general, display, notifications, api, models, permissions, knowledge, mcp",
                     category
                 ),
             ));
@@ -648,4 +650,68 @@ fn collect_knowledge(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) 
             default_skill_package_namespace
         },
     });
+}
+
+// ── mcp ──────────────────────────────────────────────────────────────────────
+
+fn collect_mcp(out: &mut Vec<ConfigEntry>) {
+    let servers = crate::mcp::config::load_servers();
+    let enabled = servers.iter().filter(|s| s.enabled).count();
+    out.push(ConfigEntry {
+        key: "mcp.servers".into(),
+        category: "mcp".into(),
+        label: "MCP Servers".into(),
+        description:
+            "External MCP servers whose tools are exposed to agents as mcp__<server>__<tool>. \
+             Managed in Settings → MCP Servers; agents can edit the file via bash and apply it \
+             with the mcp_reload tool."
+                .into(),
+        storage: "persistent_config_dir/mcp_servers.json".into(),
+        current_value: format!("{} configured, {} enabled", servers.len(), enabled),
+    });
+    for server in servers {
+        let connection = match server.transport {
+            crate::mcp::config::McpTransport::Stdio => {
+                let mut command = server.command.clone();
+                if !server.args.is_empty() {
+                    command.push(' ');
+                    command.push_str(&server.args.join(" "));
+                }
+                format!("stdio: {command}")
+            }
+            crate::mcp::config::McpTransport::Http => format!("http: {}", server.url),
+        };
+        let mut facts = vec![
+            connection,
+            format!(
+                "load mode {}",
+                match server.load_mode {
+                    crate::mcp::config::McpLoadMode::Lazy => "lazy",
+                    crate::mcp::config::McpLoadMode::Direct => "direct",
+                }
+            ),
+            format!("timeout {}s", server.call_timeout_ms / 1000),
+        ];
+        if server.auto_restart {
+            facts.push("auto-restart on".into());
+        }
+        if !server.tool_allowlist.is_empty() {
+            facts.push(format!("allowlist {} tools", server.tool_allowlist.len()));
+        }
+        if !server.tool_denylist.is_empty() {
+            facts.push(format!("denylist {} tools", server.tool_denylist.len()));
+        }
+        out.push(ConfigEntry {
+            key: format!("mcp.servers.{}", server.id),
+            category: "mcp".into(),
+            label: server.name.clone(),
+            description: facts.join("; "),
+            storage: "persistent_config_dir/mcp_servers.json".into(),
+            current_value: if server.enabled {
+                "enabled".into()
+            } else {
+                "disabled".into()
+            },
+        });
+    }
 }

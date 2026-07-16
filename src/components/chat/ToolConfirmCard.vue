@@ -24,6 +24,7 @@ import {
 } from "./toolConfirmLabels";
 import UnityRunStatesPreview from "../tool-previews/UnityRunStatesPreview.vue";
 import { parseUnityRunStatesArguments } from "../../composables/unityRunStatesPreview";
+import { parseMcpToolName, toolCallDisplayName } from "../toolCallSummary";
 
 const props = defineProps<{
   toolConfirm: PendingToolConfirm;
@@ -70,6 +71,16 @@ const unityRunStatesPreview = computed(() => {
   if (!display || display.toolName !== "unity_run_states") return null;
   return parseUnityRunStatesArguments(display.arguments);
 });
+
+// MCP wire names shed their prefix for display, but approval must keep the
+// external-server origin visible — that is what the user is trusting.
+const basicMcpParts = computed(() =>
+  basicDisplay.value ? parseMcpToolName(basicDisplay.value.toolName) : null,
+);
+
+const basicToolDisplayName = computed(() =>
+  basicDisplay.value ? toolCallDisplayName(basicDisplay.value.toolName) : "",
+);
 
 const unityStatusChangeDisplay = computed(() =>
   isUnityEditorStatusChangeDisplay(props.toolConfirm.display)
@@ -184,7 +195,12 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
     </div>
     <template v-if="basicDisplay">
       <div class="tool-confirm-body">
-        <div class="tool-confirm-name">{{ basicDisplay.toolName }}</div>
+        <div class="tool-confirm-name">
+          {{ basicToolDisplayName }}
+          <span v-if="basicMcpParts" class="tool-confirm-mcp-origin">
+            MCP · {{ basicMcpParts.serverId || "server" }}
+          </span>
+        </div>
         <UnityRunStatesPreview
           v-if="unityRunStatesPreview"
           :preview="unityRunStatesPreview"
@@ -384,6 +400,18 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
   flex-direction: column;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.tool-confirm-mcp-origin {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  vertical-align: 1px;
+  white-space: nowrap;
 }
 
 .tool-confirm-card.is-unity-status-change .tool-confirm-name {
