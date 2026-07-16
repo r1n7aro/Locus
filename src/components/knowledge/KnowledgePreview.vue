@@ -224,8 +224,8 @@ const injectModeOptions = computed(() => [
   },
   {
     value: "none",
-    label: labelForInjectMode("none"),
-    hint: hintForInjectMode("none"),
+    label: labelForInjectMode("none", props.document?.type),
+    hint: hintForInjectMode("none", props.document?.type),
   },
   {
     value: "path",
@@ -280,7 +280,7 @@ const effectiveEditMode = computed<Exclude<KnowledgeEditMode, "inherit_parent">>
 });
 const injectModeDropdownLabel = computed(() => {
   if (!props.document) return "";
-  const effectiveLabel = labelForInjectMode(displayInjectMode.value);
+  const effectiveLabel = labelForInjectMode(displayInjectMode.value, props.document.type);
   return props.document.inheritInjectMode
     ? labelForInheritedValue(effectiveLabel, props.document.injectModeSource)
     : effectiveLabel;

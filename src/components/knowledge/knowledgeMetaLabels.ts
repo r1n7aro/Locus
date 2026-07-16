@@ -2,6 +2,7 @@ import { t } from "../../i18n";
 import type {
   FolderIndexRuleSetting,
   KnowledgeConfigSource,
+  KnowledgeDocumentType,
   KnowledgeEditMode,
   KnowledgeExternalSource,
   KnowledgeInjectMode,
@@ -16,7 +17,12 @@ export interface KnowledgeListTag {
 
 export type KnowledgeSearchTagKind = "lexical" | "semantic";
 
-export function labelForInjectMode(mode: KnowledgeInjectMode): string {
+// Skills gate model recall behind `inject_mode != none`, so "none" means the
+// auto channel is fully off for them — not "search only" like other types.
+export function labelForInjectMode(
+  mode: KnowledgeInjectMode,
+  docType?: KnowledgeDocumentType | null,
+): string {
   switch (mode) {
     case "path":
       return t("knowledge.meta.inject.path");
@@ -27,11 +33,16 @@ export function labelForInjectMode(mode: KnowledgeInjectMode): string {
     case "rule":
       return t("knowledge.meta.inject.rule");
     default:
-      return t("knowledge.meta.inject.none");
+      return docType === "skill"
+        ? t("knowledge.meta.inject.skillNone")
+        : t("knowledge.meta.inject.none");
   }
 }
 
-export function hintForInjectMode(mode: KnowledgeInjectMode): string {
+export function hintForInjectMode(
+  mode: KnowledgeInjectMode,
+  docType?: KnowledgeDocumentType | null,
+): string {
   switch (mode) {
     case "path":
       return t("knowledge.meta.inject.pathHint");
@@ -42,7 +53,9 @@ export function hintForInjectMode(mode: KnowledgeInjectMode): string {
     case "rule":
       return t("knowledge.meta.inject.ruleHint");
     default:
-      return t("knowledge.meta.inject.noneHint");
+      return docType === "skill"
+        ? t("knowledge.meta.inject.skillNoneHint")
+        : t("knowledge.meta.inject.noneHint");
   }
 }
 

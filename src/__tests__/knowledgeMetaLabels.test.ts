@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../i18n", () => ({
   t: (key: string) => ({
     "knowledge.meta.inject.none": "仅搜索",
+    "knowledge.meta.inject.skillNone": "不注入",
+    "knowledge.meta.inject.noneHint": "只参与检索与召回，不主动进入 Agent 上下文。",
+    "knowledge.meta.inject.skillNoneHint": "不注入结构行，模型无法自动召回该 Skill；仅可通过指令触发使用。",
     "knowledge.meta.inject.path": "L0 - 路径注入",
     "knowledge.meta.inject.excerpt": "L1 - 摘要注入",
     "knowledge.meta.inject.full": "L2 - 全文注入",
@@ -44,6 +47,7 @@ import {
   buildKnowledgeListTags,
   buildKnowledgeSearchMatchTags,
   hintForFolderSearchRule,
+  hintForInjectMode,
   labelForFolderSearchRule,
   labelForInjectMode,
 } from "../components/knowledge/knowledgeMetaLabels";
@@ -55,6 +59,19 @@ describe("knowledgeMetaLabels", () => {
     expect(labelForInjectMode("excerpt")).toBe("L1 - 摘要注入");
     expect(labelForInjectMode("full")).toBe("L2 - 全文注入");
     expect(labelForInjectMode("rule")).toBe("L3 - 全文规则注入");
+  });
+
+  it("labels skill 'none' as no-injection because recall is gated off for skills", () => {
+    expect(labelForInjectMode("none", "skill")).toBe("不注入");
+    expect(hintForInjectMode("none", "skill")).toBe(
+      "不注入结构行，模型无法自动召回该 Skill；仅可通过指令触发使用。",
+    );
+    // Non-skill types keep the search-only wording; other modes ignore docType.
+    expect(labelForInjectMode("none", "memory")).toBe("仅搜索");
+    expect(hintForInjectMode("none", "reference")).toBe(
+      "只参与检索与召回，不主动进入 Agent 上下文。",
+    );
+    expect(labelForInjectMode("excerpt", "skill")).toBe("L1 - 摘要注入");
   });
 
   it("builds explorer tags from inject mode and maintenance mode", () => {

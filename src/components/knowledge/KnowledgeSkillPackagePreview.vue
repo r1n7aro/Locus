@@ -69,8 +69,8 @@ function packageIdForDocument(document: KnowledgeDocumentSummary): string {
 const injectModeOptions = computed(() => [
   {
     value: "none",
-    label: labelForInjectMode("none"),
-    hint: hintForInjectMode("none"),
+    label: labelForInjectMode("none", "skill"),
+    hint: hintForInjectMode("none", "skill"),
   },
   {
     value: "path",
@@ -245,7 +245,7 @@ const injectMode = computed(
   () => props.packageDocument.injectMode ?? "none",
 );
 const injectModeDropdownLabel = computed(() =>
-  labelForInjectMode(effectiveInjectValue.value),
+  labelForInjectMode(effectiveInjectValue.value, "skill"),
 );
 const fallbackSkillName = computed(
   () => packageId.value || displayName.value,

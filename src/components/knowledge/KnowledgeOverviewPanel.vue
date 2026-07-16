@@ -11,6 +11,7 @@ import { listAgentInjectedItems } from "../../services/agent";
 import { useAgentStore } from "../../stores/agent";
 import type { ExplorerNode } from "../../composables/useKnowledgeState";
 import { estimateTextTokens } from "../../utils/tokenEstimate";
+import { labelForInjectMode } from "./knowledgeMetaLabels";
 import BaseButton from "../ui/BaseButton.vue";
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
@@ -461,7 +462,7 @@ const retrievalItems = computed(() => [
 ]);
 const injectModeItems = computed(() => [
   {
-    label: t("knowledge.meta.inject.none"),
+    label: labelForInjectMode("none", props.activeType),
     value: noneCount.value,
   },
   {
