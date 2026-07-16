@@ -37,7 +37,10 @@ describe("mcp settings page", () => {
   it("ships the connect-software builtin skill", () => {
     const skill = read("knowledge/skill/connect-software.md");
     expect(skill).toContain("id: kd_skill_builtin_connect_software");
-    expect(skill).toContain("skillSurface: auto");
+    // Dual surface: auto recall plus the /connect command.
+    expect(skill).toContain("skillSurface: both");
+    expect(skill).toContain("commandTrigger: /connect");
+    expect(skill).toContain("commandEnabled: true");
     expect(skill).toContain("mcp_servers.json");
     expect(skill).toContain("- bash");
     // The upgraded skill covers research, CLI/HTTP channels, and persistence.

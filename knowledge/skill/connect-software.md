@@ -5,13 +5,13 @@ path: connect-software.md
 title: Connect External Software
 injectMode: excerpt
 summaryEnabled: true
-commandEnabled: false
+commandEnabled: true
 readOnly: false
 aiMaintained: false
 skillEnabled: true
-skillSurface: auto
-commandTrigger:
-argumentHint:
+skillSurface: both
+commandTrigger: /connect
+argumentHint: <software-or-service>
 tools:
   - bash
   - mcp_reload
@@ -30,6 +30,8 @@ Use when the user wants Locus to connect to, control, or automate external softw
 ## Content
 
 You can research integration options, configure the connection (MCP server, CLI, or raw HTTP), verify it end to end, and persist what you learned — all without leaving the conversation. Do not tell the user a connection is unavailable before walking the channels below.
+
+Command arguments: `/connect <software-or-service>` names the connection target (e.g. `/connect obs`, `/connect github`). When invoked without arguments, ask what the user wants to connect. The workflow is the same either way.
 
 ## Choose the channel
 
