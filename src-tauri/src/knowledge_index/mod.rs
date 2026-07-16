@@ -1669,6 +1669,10 @@ where
         );
     }
 
+    // Backfill rewrites every embedding; when the new backend's vectors are
+    // smaller than the old ones the difference stays on the freelist.
+    reclaim_knowledge_db_space(db);
+
     Ok(report)
 }
 
@@ -2112,6 +2116,7 @@ where
         db.delete_managed_directory_snapshot(unity_docs::UNITY_REFERENCE_MANAGED_PATH)?;
     }
     refresh_unity_managed_retrieval_summary_cache(working_dir, app_knowledge_dir, db)?;
+    reclaim_knowledge_db_space(db);
 
     Ok(report)
 }
@@ -2167,6 +2172,19 @@ fn commit_unity_import_bulk_batch(
     db.apply_document_updates(&persist_updates)?;
     db.upsert_document_catalog_entries(catalog_rows)?;
     Ok(prepared.len())
+}
+
+/// Best-effort space reclamation after passes that delete or rewrite chunks
+/// and embeddings in bulk. Never fails the surrounding pass.
+fn reclaim_knowledge_db_space(db: &KnowledgeDb) {
+    match db.vacuum_if_fragmented() {
+        Ok(Some(freed_bytes)) => eprintln!(
+            "[KnowledgeIndex] knowledge db vacuum reclaimed {} MB",
+            freed_bytes / (1024 * 1024)
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("[KnowledgeIndex] knowledge db vacuum failed: {}", error),
+    }
 }
 
 fn reconcile_documents_sync<F>(
@@ -2427,6 +2445,7 @@ where
 
     persist_managed_directory_snapshots(db, &reuse_decision.snapshot_persistence)?;
     refresh_unity_managed_retrieval_summary_cache(working_dir, app_knowledge_dir, db)?;
+    reclaim_knowledge_db_space(db);
 
     Ok(report)
 }
@@ -3014,7 +3033,9 @@ pub fn remove_documents(state: Arc<KnowledgeIndexState>, doc_ids: &[String]) -> 
     let db = state.db();
     let tantivy = state.tantivy();
     tantivy.remove_docs(doc_ids)?;
-    db.delete_documents(doc_ids)
+    db.delete_documents(doc_ids)?;
+    reclaim_knowledge_db_space(&db);
+    Ok(())
 }
 
 pub fn remove_shadowed_documents_for_path(

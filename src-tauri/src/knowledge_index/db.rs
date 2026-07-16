@@ -816,6 +816,20 @@ impl KnowledgeDb {
             .map_err(|e| format!("Failed to commit knowledge document removal: {}", e))
     }
 
+    /// Reclaim file space after bulk chunk/embedding churn. Embedding BLOBs
+    /// dominate this database, and wiping them (documents removed, backend
+    /// switched, vector indexing disabled) only moves pages onto the SQLite
+    /// freelist — the file never shrinks on its own. Cheap (three PRAGMA
+    /// lookups) unless the fragmentation thresholds trip.
+    pub fn vacuum_if_fragmented(&self) -> Result<Option<u64>, String> {
+        let conn = self.conn.lock().unwrap();
+        crate::sqlite_maint::vacuum_if_fragmented(
+            &conn,
+            crate::sqlite_maint::VACUUM_MIN_FREE_BYTES,
+            crate::sqlite_maint::VACUUM_MIN_FREE_RATIO,
+        )
+    }
+
     pub fn upsert_index_states(&self, states: &[DocIndexState]) -> Result<(), String> {
         if states.is_empty() {
             return Ok(());
