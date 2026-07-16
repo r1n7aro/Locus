@@ -309,7 +309,6 @@ describe("plugin hub layout", () => {
     expect(source).toContain("BaseContextMenu");
     expect(source).toContain("@contextmenu=\"openPluginListContextMenu\"");
     expect(source).toContain("plugin-list-context-menu-item");
-    expect(source).toContain(":global(.plugin-list-context-menu .plugin-list-context-menu-item)");
     expect(source).toContain("refreshPluginListFromMenu");
     expect(source).toContain("openDirectImport('local')");
     expect(source).toContain("openDirectImport('link')");

@@ -10,7 +10,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, Settings2, Sparkles, X } from "lucide";
+import { Archive, Box, Check, ChevronRight, Folder, FolderInput, FolderOpen, FolderPlus, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
@@ -2076,7 +2076,7 @@ function ctxArchive() {
       @close="closeViewContextMenu"
     >
       <template v-if="viewCtxMenu.kind === 'root' || viewCtxMenu.kind === 'folder'">
-        <button type="button" class="sp-ctx-item" @click="beginCreateViewFolder">{{ t('view.tree.createFolder') }}</button>
+        <button type="button" class="sp-ctx-item" @click="beginCreateViewFolder"><LucideIcon :icon="FolderPlus" :size="13" />{{ t('view.tree.createFolder') }}</button>
         <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
       </template>
       <button
@@ -2085,6 +2085,7 @@ function ctxArchive() {
         class="sp-ctx-item"
         @click.stop="beginRenameViewEntry"
       >
+        <LucideIcon :icon="PencilLine" :size="13" />
         {{ t('view.tree.rename') }}
       </button>
       <button
@@ -2093,6 +2094,7 @@ function ctxArchive() {
         class="sp-ctx-item"
         @click.stop="beginMoveViewEntry"
       >
+        <LucideIcon :icon="FolderInput" :size="13" />
         {{ t('view.tree.moveTo') }}
       </button>
       <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
@@ -2102,6 +2104,7 @@ function ctxArchive() {
         class="sp-ctx-item"
         @click.stop="openViewContextInUnity"
       >
+        <LucideIcon :icon="Box" :size="13" />
         {{ t('view.action.openInUnity') }}
       </button>
       <button
@@ -2110,6 +2113,7 @@ function ctxArchive() {
         class="sp-ctx-item"
         @click.stop="revealViewContextLocation"
       >
+        <LucideIcon :icon="FolderOpen" :size="13" />
         {{ t('view.action.reveal') }}
       </button>
       <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
@@ -2119,6 +2123,7 @@ function ctxArchive() {
         class="sp-ctx-item danger"
         @click.stop="requestDeleteViewEntry"
       >
+        <LucideIcon :icon="Trash2" :size="13" />
         {{ t('view.tree.delete') }}
       </button>
       <template v-if="viewCtxMenu.kind === 'move'">
@@ -2168,17 +2173,17 @@ function ctxArchive() {
       @close="closeCtxMenu"
     >
       <template v-if="ctxMenu.ids.length <= 1">
-        <button type="button" class="sp-ctx-item" @click="startRename(ctxMenu!.session)">{{ t('chat.session.rename') }}</button>
-        <button type="button" class="sp-ctx-item" @click="ctxOpenSessionInUnity">{{ t('chat.session.openInUnity') }}</button>
-        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(true)">{{ t('chat.saveContextWithSystemPrompt') }}</button>
-        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(false)">{{ t('chat.saveContextWithoutSystemPrompt') }}</button>
+        <button type="button" class="sp-ctx-item" @click="startRename(ctxMenu!.session)"><LucideIcon :icon="PencilLine" :size="13" />{{ t('chat.session.rename') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxOpenSessionInUnity"><LucideIcon :icon="Box" :size="13" />{{ t('chat.session.openInUnity') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(true)"><LucideIcon :icon="Save" :size="13" />{{ t('chat.saveContextWithSystemPrompt') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxSaveContext(false)"><LucideIcon :icon="Save" :size="13" />{{ t('chat.saveContextWithoutSystemPrompt') }}</button>
         <div class="sp-ctx-sep"></div>
-        <button type="button" class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archive') }}</button>
-        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.delete') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxArchive"><LucideIcon :icon="Archive" :size="13" />{{ t('chat.session.archive') }}</button>
+        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete"><LucideIcon :icon="Trash2" :size="13" />{{ t('chat.session.delete') }}</button>
       </template>
       <template v-else>
-        <button type="button" class="sp-ctx-item" @click="ctxArchive">{{ t('chat.session.archiveMany', ctxMenu.ids.length) }}</button>
-        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete">{{ t('chat.session.deleteMany', ctxMenu.ids.length) }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxArchive"><LucideIcon :icon="Archive" :size="13" />{{ t('chat.session.archiveMany', ctxMenu.ids.length) }}</button>
+        <button type="button" class="sp-ctx-item danger" @click.stop="requestDelete"><LucideIcon :icon="Trash2" :size="13" />{{ t('chat.session.deleteMany', ctxMenu.ids.length) }}</button>
       </template>
     </BaseContextMenu>
 

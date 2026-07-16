@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
+import { ArchiveRestore, ArrowRightLeft, Copy, FolderOpen, GitBranch, GitBranchPlus, GitCommitHorizontal, GitCompareArrows, GitMerge, Minus, PencilLine, Plus, RotateCcw, Trash2, Undo2 } from "lucide";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, FileDiffRequest, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
 import { gitCommitAction, gitBranchAction, gitStashAction, gitDiscardFile } from "../services/git";
@@ -16,6 +17,7 @@ import MergeResolutionPanel from "./collab/MergeResolutionPanel.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 import { useCollabState } from "../composables/useCollabState";
 import { useProjectStore } from "../stores/project";
 import { useNotificationStore } from "../stores/notification";
@@ -1100,50 +1102,50 @@ function copyBranchName() {
       <!-- commit -->
       <template v-if="ctxMenu.target.kind === 'commit'">
         <template v-for="br in commitLocalBranches()" :key="br">
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCheckoutBranch(br)">Checkout Branch「{{ br }}」</button>
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCheckoutBranch(br)"><LucideIcon :icon="GitBranch" :size="13" />Checkout Branch「{{ br }}」</button>
         </template>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('checkoutDetached')">Checkout Detached HEAD</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('checkoutDetached')"><LucideIcon :icon="GitCommitHorizontal" :size="13" />Checkout Detached HEAD</button>
         <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'soft')">Soft Reset</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'mixed')">Mixed Reset</button>
-        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmResetHard()">Hard Reset</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'soft')"><LucideIcon :icon="RotateCcw" :size="13" />Soft Reset</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'mixed')"><LucideIcon :icon="RotateCcw" :size="13" />Mixed Reset</button>
+        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmResetHard()"><LucideIcon :icon="RotateCcw" :size="13" />Hard Reset</button>
         <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('revert')">Revert Commit</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptNewBranch()">Create Branch…</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('revert')"><LucideIcon :icon="Undo2" :size="13" />Revert Commit</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptNewBranch()"><LucideIcon :icon="GitBranchPlus" :size="13" />Create Branch…</button>
       </template>
       <!-- stash -->
       <template v-else-if="ctxMenu.target.kind === 'stash'">
         <template v-if="(ctxMenu.target.selectedStashes?.length ?? 1) <= 1">
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('apply')">Apply Stash</button>
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('pop')">Pop Stash</button>
-          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()">Drop Stash</button>
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('apply')"><LucideIcon :icon="ArchiveRestore" :size="13" />Apply Stash</button>
+          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('pop')"><LucideIcon :icon="ArchiveRestore" :size="13" />Pop Stash</button>
+          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()"><LucideIcon :icon="Trash2" :size="13" />Drop Stash</button>
         </template>
         <template v-else>
-          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()">Drop {{ ctxMenu.target.selectedStashes?.length }} Stashes</button>
+          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()"><LucideIcon :icon="Trash2" :size="13" />Drop {{ ctxMenu.target.selectedStashes?.length }} Stashes</button>
         </template>
       </template>
       <!-- local branch -->
       <template v-else-if="ctxMenu.target.kind === 'localBranch'">
-        <button type="button" class="ctx-item" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="doBranchAction('switch')">Switch to Branch</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="doBranchAction('switch')"><LucideIcon :icon="ArrowRightLeft" :size="13" />Switch to Branch</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')"><LucideIcon :icon="GitMerge" :size="13" />Merge into Current</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')"><LucideIcon :icon="GitCompareArrows" :size="13" />Rebase Current onto This</button>
         <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptRenameBranch()">Rename Branch…</button>
-        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="confirmDeleteBranch()">Delete Branch</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptRenameBranch()"><LucideIcon :icon="PencilLine" :size="13" />Rename Branch…</button>
+        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="confirmDeleteBranch()"><LucideIcon :icon="Trash2" :size="13" />Delete Branch</button>
         <div class="ctx-sep" />
-        <button type="button" class="ctx-item" @click="copyBranchName()">Copy Branch Name</button>
+        <button type="button" class="ctx-item" @click="copyBranchName()"><LucideIcon :icon="Copy" :size="13" />Copy Branch Name</button>
       </template>
       <!-- remote branch -->
       <template v-else-if="ctxMenu.target.kind === 'remoteBranch'">
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('checkoutTracking')">Checkout as Local Tracking</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')">Merge into Current</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')">Rebase Current onto This</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('checkoutTracking')"><LucideIcon :icon="GitBranchPlus" :size="13" />Checkout as Local Tracking</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')"><LucideIcon :icon="GitMerge" :size="13" />Merge into Current</button>
+        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')"><LucideIcon :icon="GitCompareArrows" :size="13" />Rebase Current onto This</button>
         <div class="ctx-sep" />
-        <button type="button" class="ctx-item" @click="copyBranchName()">Copy Remote Branch Name</button>
+        <button type="button" class="ctx-item" @click="copyBranchName()"><LucideIcon :icon="Copy" :size="13" />Copy Remote Branch Name</button>
       </template>
       <!-- file -->
       <template v-else-if="ctxMenu.target.kind === 'file'">
-        <button type="button" class="ctx-item" @click="doShowInFolder()">Show In Folder</button>
+        <button type="button" class="ctx-item" @click="doShowInFolder()"><LucideIcon :icon="FolderOpen" :size="13" />Show In Folder</button>
         <div class="ctx-sep" />
         <button
           v-if="ctxMenu.target.source === 'gitUnstaged'"
@@ -1151,21 +1153,21 @@ function copyBranchName() {
           class="ctx-item"
           :disabled="workspaceMutationBusy"
           @click="doFileStage()"
-        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</button>
+        ><LucideIcon :icon="Plus" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</button>
         <button
           v-else
           type="button"
           class="ctx-item"
           :disabled="workspaceMutationBusy"
           @click="doFileUnstage()"
-        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</button>
+        ><LucideIcon :icon="Minus" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</button>
         <div class="ctx-sep" />
         <button
           type="button"
           class="ctx-item ctx-danger"
           :disabled="workspaceMutationBusy"
           @click="confirmDiscardFile()"
-        >{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</button>
+        ><LucideIcon :icon="Undo2" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</button>
       </template>
     </BaseContextMenu>
 

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { Crosshair } from "lucide";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
 import {
   groupUnityPropertyFenceItems,
   parseUnityPropertyFence,
@@ -496,6 +498,7 @@ function shortTypeName(typeName: string): string {
         :disabled="!rowContextCanSelectInUnity"
         @click="selectContextRowInUnity"
       >
+        <LucideIcon :icon="Crosshair" :size="13" />
         {{ t("common.selectInUnity") }}
       </button>
     </BaseContextMenu>

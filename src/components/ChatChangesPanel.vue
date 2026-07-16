@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, onUnmounted } from "vue";
+import { Crosshair, ExternalLink, FileDiff, Undo2 } from "lucide";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useProjectStore } from "../stores/project";
@@ -14,6 +15,7 @@ import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 import type { ChangedFile, GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
@@ -796,6 +798,7 @@ function ctxRevertFile(ev: MouseEvent) {
       @close="closeFileCtxMenu"
     >
       <button type="button" class="changes-ctx-item" @click="ctxViewDiff">
+        <LucideIcon :icon="FileDiff" :size="13" />
         {{ t("chat.changes.viewDiff") }}
       </button>
       <button
@@ -804,6 +807,7 @@ function ctxRevertFile(ev: MouseEvent) {
         class="changes-ctx-item"
         @click="ctxSelectInUnity($event)"
       >
+        <LucideIcon :icon="Crosshair" :size="13" />
         {{ t("common.selectInUnity") }}
       </button>
       <button
@@ -812,6 +816,7 @@ function ctxRevertFile(ev: MouseEvent) {
         class="changes-ctx-item"
         @click="ctxOpenInEditor($event)"
       >
+        <LucideIcon :icon="ExternalLink" :size="13" />
         {{ t("common.openInEditor") }}
       </button>
       <template v-if="!chatStore.isStreaming">
@@ -822,6 +827,7 @@ function ctxRevertFile(ev: MouseEvent) {
           :disabled="isRevertingFile"
           @click="ctxRevertFile($event)"
         >
+          <LucideIcon :icon="Undo2" :size="13" />
           {{ t("chat.changes.revertFile") }}
         </button>
       </template>

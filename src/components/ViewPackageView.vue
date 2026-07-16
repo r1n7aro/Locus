@@ -10,12 +10,16 @@ import {
 } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
+  Box,
   Check,
   ChevronRight,
   Download,
   Folder,
   FolderOpen,
+  FolderPlus,
   PanelTopOpen,
+  PencilLine,
+  Trash2,
   Upload,
   X,
 } from "lucide";
@@ -1790,9 +1794,11 @@ onUnmounted(() => {
       >
             <template v-if="contextMenu.kind === 'root' || contextMenu.kind === 'folder'">
               <button type="button" class="view-ctx-item" @click="importViewPackageFromContext">
+                <LucideIcon :icon="Upload" :size="13" />
                 {{ importing ? t("view.action.importing") : t("view.action.import") }}
               </button>
               <button type="button" class="view-ctx-item" @click="beginCreateFolderFromContext">
+                <LucideIcon :icon="FolderPlus" :size="13" />
                 {{ t("view.tree.createFolder") }}
               </button>
               <div class="view-ctx-sep"></div>
@@ -1806,6 +1812,7 @@ onUnmounted(() => {
               class="view-ctx-item"
               @click.stop="beginRenameFromContext"
             >
+              <LucideIcon :icon="PencilLine" :size="13" />
               {{ t("view.tree.rename") }}
             </button>
             <div
@@ -1821,6 +1828,7 @@ onUnmounted(() => {
               class="view-ctx-item"
               @click.stop="openContextViewInUnity"
             >
+              <LucideIcon :icon="Box" :size="13" />
               {{ t("view.action.openInUnity") }}
             </button>
             <button
@@ -1830,6 +1838,7 @@ onUnmounted(() => {
               :disabled="!!exportingViewId"
               @click.stop="exportViewPackageFromContext"
             >
+              <LucideIcon :icon="Download" :size="13" />
               {{
                 exportingViewId === contextMenu.node.view?.id
                   ? t("view.action.exporting")
@@ -1846,6 +1855,7 @@ onUnmounted(() => {
               class="view-ctx-item danger"
               @click.stop="requestDeleteEntry"
             >
+              <LucideIcon :icon="Trash2" :size="13" />
               {{ t("view.tree.delete") }}
             </button>
       </BaseContextMenu>

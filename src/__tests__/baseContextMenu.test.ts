@@ -23,6 +23,8 @@ describe("BaseContextMenu", () => {
     expect(component).toContain('name="base-context-menu-fade" appear');
     expect(component).toContain("@contextmenu.prevent=\"close\"");
     expect(component).toContain(".base-context-menu :deep(button)");
+    expect(component).toContain("gap: 8px;");
+    expect(component).toContain(".base-context-menu :deep(button > svg)");
     expect(component).toContain(".base-context-menu-fade-enter-from .base-context-menu");
 
     for (const source of [app, chat, collab, sessionPanel, viewPackage, knowledgeExplorer, agent]) {

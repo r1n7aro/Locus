@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { Plus, Trash2 } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, setAgentToolEnabled, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
@@ -11,6 +12,7 @@ import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -1505,6 +1507,7 @@ watch(
         @close="closeRuleContextMenu"
       >
           <button type="button" class="agent-rule-ctx-item" @click="startCreateRule">
+            <LucideIcon :icon="Plus" :size="13" />
             {{ t("agent.newRule") }}
           </button>
           <div v-if="canEditRule(ruleContextMenu.rule)" class="agent-rule-ctx-sep"></div>
@@ -1514,6 +1517,7 @@ watch(
             class="agent-rule-ctx-item agent-rule-ctx-item-danger"
             @click="requestDeleteRuleFromContext"
           >
+            <LucideIcon :icon="Trash2" :size="13" />
             {{ t("common.delete") }}
           </button>
       </BaseContextMenu>

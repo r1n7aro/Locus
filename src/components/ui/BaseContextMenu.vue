@@ -163,6 +163,7 @@ onUnmounted(() => {
 .base-context-menu :deep(button) {
   display: flex;
   align-items: center;
+  gap: 8px;
   width: 100%;
   min-height: 28px;
   min-width: 0;
@@ -180,6 +181,10 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
+}
+
+.base-context-menu :deep(button > svg) {
+  flex: 0 0 auto;
 }
 
 .base-context-menu :deep(button:hover:not(:disabled)),
