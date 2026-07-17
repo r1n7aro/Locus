@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { t } from "../../i18n";
 import type { ModelOption, ModelDefaults, AgentInfo } from "../../types";
-import { isProviderVisible, visibleProviderOrder } from "../../config/providerVisibility";
+import { visibleProviderOrder } from "../../config/providerVisibility";
 import { formatModelDisplayName } from "../../utils/modelDisplay";
 
 interface ModelGroup {
@@ -67,12 +67,6 @@ function updateSubagentModel(agentId: string, value: string) {
   emit("save");
 }
 
-const claudeCodeVisible = isProviderVisible("claude_code");
-
-function updateClaudeCodeEnabled(value: boolean) {
-  emit("update:modelDefaults", { ...props.modelDefaults, claudeCodeEnabled: value });
-  emit("save");
-}
 </script>
 
 <template>
@@ -104,20 +98,6 @@ function updateClaudeCodeEnabled(value: boolean) {
           <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
         </optgroup>
       </select>
-    </div>
-
-    <div class="model-default-card compact" v-if="claudeCodeVisible">
-      <div class="model-default-row">
-        <div class="model-default-agent">
-          <span class="model-default-label">{{ t("settings.models.claudeCodeEnable") }}</span>
-          <span class="model-default-hint">{{ t("settings.models.claudeCodeEnableHint") }}</span>
-        </div>
-        <input
-          type="checkbox"
-          :checked="modelDefaults.claudeCodeEnabled === true"
-          @change="updateClaudeCodeEnabled(($event.target as HTMLInputElement).checked)"
-        />
-      </div>
     </div>
 
     <div class="section-label" style="margin-top: 8px;">{{ t("settings.models.subagent") }}</div>

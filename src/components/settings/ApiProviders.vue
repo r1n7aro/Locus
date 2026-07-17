@@ -55,6 +55,7 @@ const props = defineProps<{
   allModels: ModelOption[];
   customProviders: CustomProvider[];
   customProviderSaving?: boolean;
+  claudeCodeEnabled: boolean;
   claudeCodeTestStatus?: "idle" | "testing" | "success" | "error";
   claudeCodeTestResult?: string;
   mode?: "full" | "onboarding";
@@ -526,7 +527,7 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeProvider">
+  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeEnabled && claudeCodeProvider">
     <div class="section-label">{{ t("settings.claudeCode.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">

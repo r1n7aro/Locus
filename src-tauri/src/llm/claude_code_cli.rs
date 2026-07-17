@@ -74,6 +74,17 @@ const DISALLOWED_CLAUDE_BUILTINS: &[&str] = &[
     "Workflow",
 ];
 
+const CLAUDE_CODE_SETTINGS_ENV_ALLOWLIST: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING",
+    "CLAUDE_CODE_EXTRA_BODY",
+    "ENABLE_TOOL_SEARCH",
+];
+
 fn claude_session_map() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
     STORE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
@@ -199,12 +210,8 @@ pub enum ClaudeCliLoginState {
 /// it (a probe run would either bill a real API call when logged in or burn a
 /// subprocess startup per status refresh). Mirrors the CLI's own auth sources:
 /// explicit env vars, the OAuth credentials file under the Claude config dir,
-/// or an `apiKeyHelper` in settings.json.
-///
-/// This is only a fast heuristic — `settings.json`-based credentials are NOT
-/// honored at runtime because real turns spawn the CLI with
-/// `--setting-sources ""`. Use [`run_login_test`] for an authoritative check
-/// that exercises the actual endpoint and credentials.
+/// or allowlisted auth settings from settings.json. Use [`run_login_test`] for
+/// an authoritative check that exercises the actual endpoint and credentials.
 pub fn claude_cli_login_status() -> (ClaudeCliLoginState, String) {
     // `ANTHROPIC_AUTH_TOKEN` is the bearer-token variable used with custom
     // endpoints/gateways (alongside `ANTHROPIC_BASE_URL`); Locus forwards the
@@ -230,8 +237,8 @@ pub fn claude_cli_login_status() -> (ClaudeCliLoginState, String) {
                 "subscription login".to_string(),
             );
         }
-        if settings_has_api_key_helper(&dir.join("settings.json")) {
-            return (ClaudeCliLoginState::LoggedIn, "apiKeyHelper".to_string());
+        if let Some(source) = settings_auth_source(&dir.join("settings.json")) {
+            return (ClaudeCliLoginState::LoggedIn, source);
         }
     }
 
@@ -273,19 +280,63 @@ fn credentials_file_has_login(path: &Path) -> bool {
     })
 }
 
-fn settings_has_api_key_helper(path: &Path) -> bool {
+fn read_json_settings(path: &Path) -> Option<serde_json::Value> {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
+        return None;
     };
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("apiKeyHelper")
-                .and_then(|v| v.as_str())
-                .map(|helper| !helper.trim().is_empty())
+    serde_json::from_str(&raw).ok()
+}
+
+fn non_empty_string(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn settings_auth_source(path: &Path) -> Option<String> {
+    let value = read_json_settings(path)?;
+    if value
+        .get("apiKeyHelper")
+        .and_then(non_empty_string)
+        .is_some()
+    {
+        return Some("apiKeyHelper".to_string());
+    }
+
+    let env = value.get("env").and_then(|value| value.as_object())?;
+    for key in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        if env.get(key).and_then(non_empty_string).is_some() {
+            return Some(format!("{} (settings)", key));
+        }
+    }
+    None
+}
+
+fn claude_settings_env(path: &Path) -> Vec<(OsString, OsString)> {
+    read_json_settings(path)
+        .and_then(|value| value.get("env").and_then(|env| env.as_object()).cloned())
+        .map(|env| {
+            env.into_iter()
+                .filter_map(|(key, value)| {
+                    is_allowed_claude_settings_env_key(&key)
+                        .then(|| non_empty_string(&value))
+                        .flatten()
+                        .map(|value| (OsString::from(key), OsString::from(value)))
+                })
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+fn is_allowed_claude_settings_env_key(key: &str) -> bool {
+    CLAUDE_CODE_SETTINGS_ENV_ALLOWLIST
+        .iter()
+        .any(|allowed| key == *allowed || key.starts_with(allowed))
 }
 
 /// How long a resolved (or unresolved) Claude Code CLI location stays cached.
@@ -724,12 +775,15 @@ pub async fn run_turn<H: ClaudeCodeHost>(
 }
 
 /// Environment handed to every Claude Code CLI child: the full Locus process
-/// environment (so user-configured `ANTHROPIC_*` variables — including
-/// `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` for a custom default endpoint —
-/// flow straight through), plus the Locus entrypoint tag and resolved proxy
-/// settings. Callers add per-run extras (e.g. `LOCUS_SESSION_ID`) on top.
+/// environment plus allowlisted provider/auth variables from Claude settings.
+/// Process variables win, and settings never inject hooks such as NODE_OPTIONS.
 fn base_child_env() -> HashMap<OsString, OsString> {
     let mut envs: HashMap<OsString, OsString> = std::env::vars_os().collect();
+    if let Some(dir) = claude_config_dir() {
+        for (key, value) in claude_settings_env(&dir.join("settings.json")) {
+            envs.entry(key).or_insert(value);
+        }
+    }
     envs.entry(OsString::from("CLAUDE_CODE_ENTRYPOINT"))
         .or_insert_with(|| OsString::from("locus-rs"));
     crate::network::extend_proxy_env_map(&mut envs);
@@ -747,10 +801,10 @@ const LOGIN_TEST_TIMEOUT: Duration = Duration::from_secs(45);
 /// same hermetic flags and environment a real Locus turn uses, send a trivial
 /// prompt, and report whether the turn completed. Unlike
 /// [`claude_cli_login_status`] this exercises the genuine endpoint resolution
-/// (`ANTHROPIC_BASE_URL`), credentials, and proxy — so a setup that only works
-/// via `settings.json` (which `--setting-sources ""` disables) correctly fails
-/// here, matching real turns. Returns the model reply on success, or a
-/// human-readable error.
+/// (`ANTHROPIC_BASE_URL`), credentials, and proxy. Locus forwards only the
+/// allowlisted auth/routing environment from settings.json; hooks, plugins,
+/// and external MCP configuration remain disabled. Returns the model reply on
+/// success, or a human-readable error.
 pub async fn run_login_test() -> Result<String, String> {
     let cli_path = find_claude_cli().ok_or_else(|| {
         "Claude Code CLI not found. Install `@anthropic-ai/claude-code` and ensure `claude` is available in PATH.".to_string()
@@ -1683,6 +1737,7 @@ fn cli_binary_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn strips_sdk_mcp_prefix_from_model_tool_names() {
@@ -1784,5 +1839,75 @@ mod tests {
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["data"], "aW1hZ2U=");
         assert_eq!(content[1]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn settings_auth_source_accepts_auth_token_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        fs::write(
+            &settings,
+            r#"{
+              "env": {
+                "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721"
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert_eq!(
+            settings_auth_source(&settings),
+            Some("ANTHROPIC_AUTH_TOKEN (settings)".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_settings_env_allows_only_provider_routing_env() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        fs::write(
+            &settings,
+            r#"{
+              "env": {
+                "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "glm-5.1",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                "NODE_OPTIONS": "--require ./unexpected.js"
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        let envs: HashMap<String, String> = claude_settings_env(&settings)
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.to_string_lossy().to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("PROXY_MANAGED")
+        );
+        assert_eq!(
+            envs.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:15721")
+        );
+        assert_eq!(
+            envs.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")
+                .map(String::as_str),
+            Some("glm-5.1")
+        );
+        assert_eq!(
+            envs.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(!envs.contains_key("NODE_OPTIONS"));
     }
 }

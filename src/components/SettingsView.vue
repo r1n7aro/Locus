@@ -17,6 +17,7 @@ import ShortcutSettings from "./settings/ShortcutSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
+import ExperimentalFeaturesSettings from "./settings/ExperimentalFeaturesSettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
 import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
@@ -65,6 +66,11 @@ const {
 
 const uiStore = useUiStore();
 const chatStore = useChatStore();
+
+function setClaudeCodeEnabled(enabled: boolean) {
+  modelDefaults.value = { ...modelDefaults.value, claudeCodeEnabled: enabled };
+  void saveModelDefaults();
+}
 
 watch(
   () => uiStore.settingsCategoryHint,
@@ -178,6 +184,16 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'experimental' }"
+          @click="activeCategory = 'experimental'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M6 1a.75.75 0 0 0 0 1.5v3.19l-3.78 6.3A2 2 0 0 0 3.93 15h8.14a2 2 0 0 0 1.71-3.01L10 5.69V2.5A.75.75 0 0 0 10 1H6zm1.5 4.9V2.5h1v3.4l1.26 2.1H6.24L7.5 5.9zM5.34 9.5h5.32l1.84 3.07a.5.5 0 0 1-.43.75H3.93a.5.5 0 0 1-.43-.75L5.34 9.5z"/>
+          </svg>
+          <span>{{ t("settings.tab.experimental") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'display' }"
           @click="activeCategory = 'display'"
         >
@@ -281,6 +297,7 @@ watch(
           :all-models="allModels"
           :custom-providers="customProviders"
           :custom-provider-saving="customProviderSaving"
+          :claude-code-enabled="modelDefaults.claudeCodeEnabled === true"
           :claude-code-test-status="claudeCodeTestStatus"
           :claude-code-test-result="claudeCodeTestResult"
           @test-claude-code="testClaudeCode"
@@ -369,6 +386,13 @@ watch(
 
       <template v-if="activeCategory === 'display'">
         <DisplaySettings />
+      </template>
+
+      <template v-if="activeCategory === 'experimental'">
+        <ExperimentalFeaturesSettings
+          :claude-code-enabled="modelDefaults.claudeCodeEnabled === true"
+          @update:claude-code-enabled="setClaudeCodeEnabled"
+        />
       </template>
 
       <template v-if="activeCategory === 'notifications'">

@@ -1,7 +1,6 @@
 import { ref } from "vue";
 import { defineStore } from "pinia";
 import * as authService from "../services/auth";
-import { filterVisibleProviders } from "../config/providerVisibility";
 import { normalizeAppError } from "../services/errors";
 import type { AppErrorPayload } from "../types";
 
@@ -48,7 +47,7 @@ export const useAuthStore = defineStore("auth", () => {
   async function loadProviderStatus(): Promise<AuthStatusLoadFailure[]> {
     const failures: AuthStatusLoadFailure[] = [];
     try {
-      const providers = filterVisibleProviders(await authService.getProviders());
+      const providers = await authService.getProviders();
       const or = providers.find((p) => p.id === "openrouter");
       hasApiKey.value = !!or?.hasKey;
       const an = providers.find((p) => p.id === "anthropic");

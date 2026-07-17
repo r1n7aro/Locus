@@ -44,7 +44,6 @@ import type {
   KnowledgeChangedEvent,
   SessionContentChangedEvent,
 } from "../types";
-import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
 import {
   getKnowledgeLexicalProgressRunKey,
@@ -369,7 +368,7 @@ export function useAppBootstrap() {
       ]);
       setWarmup(
         "settings:providers",
-        filterVisibleProviders(providers),
+        providers,
         generation,
       );
       setWarmup("settings:codexStatus", codex, generation);
