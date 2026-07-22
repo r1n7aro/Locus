@@ -134,7 +134,7 @@ function createState(key: string): EmbeddedChatState {
     tokenUsage: emptyTokenUsage(),
     todos: [],
     showTodoPanel: false,
-    pendingQuestion: null as PendingQuestion | null,
+    pendingQuestions: [] as PendingQuestion[],
     pendingToolConfirms: [] as PendingToolConfirm[],
     undoableMessageIds: new Set<string>(),
     thinkingStream: markRaw(new StreamingTextChunks()),
@@ -392,7 +392,7 @@ function clearState(state: EmbeddedChatState) {
   state.localMergeGroupId = null;
   state.localFallbackMergeGroupId = null;
   state.messages = [];
-  state.pendingQuestion = null;
+  state.pendingQuestions = [];
   state.pendingToolConfirms = [];
   state.tokenUsage = emptyTokenUsage();
   state.todos = [];
@@ -409,7 +409,7 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
     state.currentRunId = null;
     state.isStreaming = false;
     state.pendingRun = false;
-    state.pendingQuestion = null;
+    state.pendingQuestions = [];
     state.pendingToolConfirms = [];
     state.isCompacting = false;
     resetRoundState(state);
@@ -443,9 +443,13 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
   state.thinkingStartTime = state.isThinking ? Date.now() : 0;
   state.thinkingDuration = runtime.thinkingDuration ?? 0;
   state.activeToolCalls = cloneRuntimeToolCalls(runtime.activeToolCalls);
-  state.pendingQuestion = runtime.pendingQuestion
-    ? cloneRuntimeJson(runtime.pendingQuestion)
-    : null;
+  if (runtime.pendingQuestions) {
+    state.pendingQuestions = cloneRuntimeJson(runtime.pendingQuestions);
+  } else if (runtime.pendingQuestion) {
+    state.pendingQuestions = [cloneRuntimeJson(runtime.pendingQuestion)];
+  } else {
+    state.pendingQuestions = [];
+  }
   state.pendingToolConfirms = cloneRuntimeJson(runtime.pendingToolConfirms ?? []);
   state.isCompacting = runtime.isCompacting === true;
 }
@@ -616,13 +620,13 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       resetRoundState(state);
       break;
     case "clearPendingInputs":
-      state.pendingQuestion = null;
+      state.pendingQuestions = [];
       state.pendingToolConfirms = [];
       break;
     case "clearPendingInput":
-      if (state.pendingQuestion?.questionId === mutation.questionId) {
-        state.pendingQuestion = null;
-      }
+      state.pendingQuestions = state.pendingQuestions.filter(
+        (item) => item.questionId !== mutation.questionId,
+      );
       state.pendingToolConfirms = state.pendingToolConfirms.filter(
         (item) => item.questionId !== mutation.questionId,
       );
@@ -630,8 +634,11 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
     case "updateUsage":
       state.tokenUsage = mutation.usage;
       break;
-    case "setQuestion":
-      state.pendingQuestion = mutation.question;
+    case "enqueueQuestion":
+      if (state.pendingQuestions.some((item) => item.questionId === mutation.question.questionId)) {
+        break;
+      }
+      state.pendingQuestions = [...state.pendingQuestions, mutation.question];
       break;
     case "enqueueToolConfirm": {
       state.pendingToolConfirms = [
@@ -1001,7 +1008,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     state.inputText = "";
     state.error = null;
-    state.pendingQuestion = null;
+    state.pendingQuestions = [];
     state.pendingToolConfirms = [];
     state.streamSequence = 0;
     state.isCompacting = false;
@@ -1135,9 +1142,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
   async function answerQuestion(answer: string) {
     const state = activeState.value;
-    const question = state.pendingQuestion;
+    const question = state.pendingQuestions[0];
     if (!question) return;
-    state.pendingQuestion = null;
+    state.pendingQuestions = state.pendingQuestions.slice(1);
     try {
       await sessionService.answerQuestion(question.questionId, answer);
     } catch (error) {
@@ -1226,7 +1233,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const isThinking = computed(() => activeState.value.isThinking);
   const thinkingDuration = computed(() => activeState.value.thinkingDuration);
   const activeToolCalls = computed(() => activeState.value.activeToolCalls);
-  const pendingQuestion = computed(() => activeState.value.pendingQuestion);
+  const pendingQuestion = computed(() => activeState.value.pendingQuestions[0] ?? null);
+  const pendingQuestionCount = computed(() => activeState.value.pendingQuestions.length);
   const pendingToolConfirms = computed(() => activeState.value.pendingToolConfirms);
   const queuedFollowUp = computed(() => {
     const inputs = visiblePendingInputs(activeState.value.pendingInputs);
@@ -1282,6 +1290,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     thinkingDuration,
     activeToolCalls,
     pendingQuestion,
+    pendingQuestionCount,
     pendingToolConfirms,
     queuedFollowUp,
     errorMessage,

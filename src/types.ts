@@ -444,6 +444,7 @@ export interface SessionRuntimeSnapshot {
   isThinking?: boolean;
   thinkingDuration?: number;
   pendingQuestion?: PendingQuestion | null;
+  pendingQuestions?: PendingQuestion[];
   pendingToolConfirms: PendingToolConfirm[];
   isCompacting: boolean;
 }

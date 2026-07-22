@@ -37,11 +37,40 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
     },
     todos: [],
     showTodoPanel: false,
-    pendingQuestion: null,
+    pendingQuestions: [],
     pendingToolConfirms: [],
     undoableMessageIds: new Set(),
     ...overrides,
   };
+}
+
+// Light-weight test-only applier for the mutations that touch the
+// question / tool-confirm queues. The round-trip helper further down
+// (`applyMutations`) only handles a subset of mutations, so this stays
+// separate and minimal.
+function applyTestMutation(state: StreamState, mutation: StreamMutation): void {
+  switch (mutation.type) {
+    case "enqueueQuestion":
+      if (state.pendingQuestions.some((q) => q.questionId === mutation.question.questionId)) {
+        return;
+      }
+      state.pendingQuestions = [...state.pendingQuestions, mutation.question];
+      return;
+    case "clearPendingInput":
+      state.pendingQuestions = state.pendingQuestions.filter(
+        (q) => q.questionId !== mutation.questionId,
+      );
+      state.pendingToolConfirms = state.pendingToolConfirms.filter(
+        (q) => q.questionId !== mutation.questionId,
+      );
+      return;
+    case "clearPendingInputs":
+      state.pendingQuestions = [];
+      state.pendingToolConfirms = [];
+      return;
+    default:
+      return;
+  }
 }
 
 describe("reduceStreamEvent", () => {
@@ -1133,12 +1162,12 @@ describe("reduceStreamEvent", () => {
       };
       const mutations = reduceStreamEvent(state, event);
 
-      const qMut = mutations.find((m) => m.type === "setQuestion");
+      const qMut = mutations.find((m) => m.type === "enqueueQuestion");
       expect(qMut).toBeDefined();
-      if (qMut?.type === "setQuestion") {
-        expect(qMut.question?.questionId).toBe("q1");
-        expect(qMut.question?.question).toBe("What file?");
-        expect(qMut.question?.sheet).toBeNull();
+      if (qMut?.type === "enqueueQuestion") {
+        expect(qMut.question.questionId).toBe("q1");
+        expect(qMut.question.question).toBe("What file?");
+        expect(qMut.question.sheet).toBeNull();
       }
     });
 
@@ -1162,13 +1191,70 @@ describe("reduceStreamEvent", () => {
       };
       const mutations = reduceStreamEvent(state, event);
 
-      const qMut = mutations.find((m) => m.type === "setQuestion");
+      const qMut = mutations.find((m) => m.type === "enqueueQuestion");
       expect(qMut).toBeDefined();
-      if (qMut?.type === "setQuestion") {
-        expect(qMut.question?.sheet?.confirmLabel).toBe("Publish");
-        expect(qMut.question?.sheet?.fields).toHaveLength(2);
-        expect(qMut.question?.sheet?.fields[0]?.readonly).toBe(true);
+      if (qMut?.type === "enqueueQuestion") {
+        expect(qMut.question.sheet?.confirmLabel).toBe("Publish");
+        expect(qMut.question.sheet?.fields).toHaveLength(2);
+        expect(qMut.question.sheet?.fields[0]?.readonly).toBe(true);
       }
+    });
+
+    it("queues multiple askUser events from the same LLM response (does not overwrite)", () => {
+      // Regression: the previous single-value `pendingQuestion` field meant
+      // that 3 parallel `ask_user_question` tool calls from one LLM response
+      // only ever showed the last one in the UI, and the other oneshot
+      // receivers in the backend were never resolved, so the run hung.
+      const state = makeState({ isStreaming: true });
+      const apply = (event: StreamEvent) => {
+        for (const m of reduceStreamEvent(state, event)) applyTestMutation(state, m);
+      };
+      const mkAsk = (questionId: string, q: string): StreamEvent => ({
+        runId: "test-run",
+        type: "askUser",
+        sessionId: "s1",
+        questionId,
+        toolCallId: `tc-${questionId}`,
+        question: q,
+        options: [{ label: "yes", description: "" }],
+      });
+
+      apply(mkAsk("q1", "Pick a name?"));
+      apply(mkAsk("q2", "Pick a license?"));
+      apply(mkAsk("q3", "Publish now?"));
+
+      expect(state.pendingQuestions).toHaveLength(3);
+      expect(state.pendingQuestions.map((q) => q.questionId)).toEqual(["q1", "q2", "q3"]);
+      expect(state.pendingQuestions[0].question).toBe("Pick a name?");
+      expect(state.pendingQuestions[2].question).toBe("Publish now?");
+
+      // inputAnswered for the head pops only that question from the queue.
+      apply({
+        runId: "test-run",
+        type: "inputAnswered",
+        sessionId: "s1",
+        questionId: "q1",
+      });
+      expect(state.pendingQuestions).toHaveLength(2);
+      expect(state.pendingQuestions[0].questionId).toBe("q2");
+      expect(state.pendingQuestions[1].questionId).toBe("q3");
+    });
+
+    it("de-duplicates enqueueQuestion by questionId", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "askUser",
+        sessionId: "s1",
+        questionId: "q1",
+        toolCallId: "tc1",
+        question: "Pick a name?",
+        options: [{ label: "yes", description: "" }],
+      };
+      for (const m of reduceStreamEvent(state, event)) applyTestMutation(state, m);
+      for (const m of reduceStreamEvent(state, event)) applyTestMutation(state, m);
+      for (const m of reduceStreamEvent(state, event)) applyTestMutation(state, m);
+      expect(state.pendingQuestions).toHaveLength(1);
     });
   });
 
@@ -1205,12 +1291,14 @@ describe("reduceStreamEvent", () => {
   describe("inputAnswered", () => {
     it("clears the matching pending input by question id", () => {
       const state = makeState({
-        pendingQuestion: {
-          questionId: "q1",
-          toolCallId: "ask-1",
-          question: "Continue?",
-          options: [],
-        },
+        pendingQuestions: [
+          {
+            questionId: "q1",
+            toolCallId: "ask-1",
+            question: "Continue?",
+            options: [],
+          },
+        ],
         pendingToolConfirms: [
           {
             questionId: "q2",
@@ -1236,6 +1324,24 @@ describe("reduceStreamEvent", () => {
         type: "clearPendingInput",
         questionId: "q2",
       });
+    });
+
+    it("removes only the matching entry from the pending question queue", () => {
+      const state = makeState({
+        pendingQuestions: [
+          { questionId: "q1", toolCallId: "tc1", question: "Q1?", options: [] },
+          { questionId: "q2", toolCallId: "tc2", question: "Q2?", options: [] },
+          { questionId: "q3", toolCallId: "tc3", question: "Q3?", options: [] },
+        ],
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "inputAnswered",
+        sessionId: "s1",
+        questionId: "q2",
+      };
+      for (const m of reduceStreamEvent(state, event)) applyTestMutation(state, m);
+      expect(state.pendingQuestions.map((q) => q.questionId)).toEqual(["q1", "q3"]);
     });
   });
 
