@@ -3584,6 +3584,12 @@ fn resolve_configurable_agent_tool(
     agent_id: &str,
     tool_name: &str,
 ) -> Result<String, String> {
+    // MCP wire tools are injected into every agent at request time (they are
+    // never listed in def.tools) and accept per-agent overrides keyed by
+    // their wire name.
+    if let Some(tool) = crate::mcp::manager::resolve_wire_tool(tool_name) {
+        return Ok(tool.wire_name);
+    }
     let canonical = tool_registry
         .canonical_name(tool_name)
         .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
@@ -3638,12 +3644,20 @@ pub async fn set_agent_tool_direct_load(
 
     let canonical = resolve_configurable_agent_tool(def, &tool_registry, &agent_id, &tool_name)?;
 
+    // MCP wire tools take their load-mode default from the server-level
+    // loadMode setting; the registry does not know them and would report
+    // the unknown-name fallback.
+    let default_direct_load = match crate::mcp::manager::resolve_wire_tool(&canonical) {
+        Some(tool) => tool.load_mode == crate::mcp::config::McpLoadMode::Direct,
+        None => tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Direct,
+    };
+
     save_tool_direct_load_override(
         &working_dir,
         &agent_id,
         &canonical,
         direct_load,
-        tool_registry.default_load_mode(&canonical) == crate::tool::ToolLoadMode::Direct,
+        default_direct_load,
     )
     .map_err(Into::into)
 }

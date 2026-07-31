@@ -1,17 +1,23 @@
-//! MCP (Model Context Protocol) client integration.
+//! MCP (Model Context Protocol) integration, both directions.
 //!
-//! Locus acts as an MCP *client*: it connects to external servers (a Blender
-//! bridge, a Figma desktop endpoint, ...) over stdio or Streamable HTTP and
-//! surfaces their tools to agents. This module owns configuration storage,
-//! the transports, the persistent connection registry (manager), config
-//! importers for other clients' formats, and the one-shot connection test
-//! used by the settings page (see plans/mcp-client-plan.md).
+//! As an MCP *client*, Locus connects to external servers (a Blender bridge,
+//! a Figma desktop endpoint, ...) over stdio or Streamable HTTP and surfaces
+//! their tools to agents: configuration storage, the transports, the
+//! persistent connection registry (manager), config importers for other
+//! clients' formats, and the one-shot connection test used by the settings
+//! page (see plans/mcp-client-plan.md).
+//!
+//! As an MCP *server* (`server/`), Locus exposes its own Unity-domain tools
+//! to external AI harnesses (Claude Code, Codex, OpenCode, ...) over a
+//! localhost Streamable HTTP endpoint, so a harness with its own model/key
+//! can drive the Unity editor through Locus (issue #120).
 
 pub mod client;
 pub mod config;
 pub mod http;
 pub mod import;
 pub mod manager;
+pub mod server;
 pub mod stdio;
 pub mod types;
 

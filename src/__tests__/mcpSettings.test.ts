@@ -64,6 +64,7 @@ describe("mcp settings page", () => {
       "mcp_import_scan",
       "mcp_import_apply",
       "mcp_server_wire_tools",
+      "mcp_server_tools_inventory",
     ]) {
       expect(rustApp).toContain(`commands::${command}`);
       expect(service).toContain(`"${command}"`);
@@ -92,6 +93,31 @@ describe("mcp settings page", () => {
     expect(service).toContain("MCP_PRESETS");
     expect(service).toContain("blender-mcp");
     expect(service).toContain("http://127.0.0.1:3845/mcp");
+  });
+
+  it("edits per-tool exposure as switches instead of hand-typed lists", () => {
+    const settings = read("src/components/settings/McpSettings.vue");
+    const service = read("src/services/mcp.ts");
+    const manager = read("src-tauri/src/mcp/manager.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    // The form renders one checkbox row per tool, fed by the unfiltered
+    // runtime inventory plus test results, and saves back as a denylist.
+    expect(settings).toContain("mcpServerToolsInventory");
+    expect(settings).toContain("mergeFormToolRows");
+    expect(settings).toContain("setFormToolEnabled");
+    expect(settings).toContain("formDisabledTools");
+    expect(settings).toContain("BaseCheckbox");
+    // The hand-typed textareas are gone.
+    expect(settings).not.toContain("formAllowText");
+    expect(settings).not.toContain("formDenyText");
+    expect(settings).not.toContain("toggleDenyTool");
+    // Inventory is pre-filter so hidden tools stay editable.
+    expect(manager).toContain("pub async fn server_tool_inventory");
+    expect(service).toContain("mcp_server_tools_inventory");
+    expect(zh).toContain('"settings.mcp.form.toolsEmpty"');
+    expect(en).toContain('"settings.mcp.form.toolsEmpty"');
   });
 
   it("keeps the import flow read-only until applied and disabled after", () => {
@@ -144,6 +170,20 @@ describe("mcp settings page", () => {
     expect(instance).toContain("return ToolLoadMode::Lazy;");
     expect(zh).toContain('"agent.mcpTools"');
     expect(en).toContain('"agent.mcpTools"');
+  });
+
+  it("lets agents toggle mcp tools on and off per agent", () => {
+    const instance = read("src-tauri/src/agent/instance/mod.rs");
+    const knowledge = read("src-tauri/src/commands/knowledge.rs");
+
+    // can_toggle_enabled_tool accepts MCP wire tools alongside built-ins,
+    // so the agent page's enable checkbox works for them.
+    expect(instance).toMatch(
+      /can_toggle_enabled_tool[\s\S]{0,400}is_mcp_wire_tool/,
+    );
+    // The override commands resolve MCP wire names directly (they are never
+    // listed in def.tools).
+    expect(knowledge).toContain("resolve_wire_tool");
   });
 
   it("wires the chat-bar mcp status badge", () => {

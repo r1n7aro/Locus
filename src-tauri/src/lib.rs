@@ -935,6 +935,7 @@ pub fn run() {
             app.manage(store);
             app.manage(registry);
             app.manage(tool_registry);
+            app.manage(std::sync::Arc::new(mcp::server::McpServerHandle::default()));
             app.manage(workspace.clone());
             app.manage(raw_context_store);
             app.manage(active_tasks);
@@ -1049,6 +1050,16 @@ pub fn run() {
                 }
             });
 
+            // Locus-as-MCP-server: start the localhost endpoint when the
+            // feature is enabled (no-op otherwise). Lives in the pre-window
+            // service section so a future headless mode inherits it.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    mcp::server::reconcile(app_handle).await;
+                });
+            }
+
             let knowledge_startup_state = knowledge_index_state.clone();
             let workspace_for_knowledge = workspace.clone();
             let app_handle_for_knowledge = app.handle().clone();
@@ -1151,6 +1162,14 @@ pub fn run() {
             commands::mcp_import_scan,
             commands::mcp_import_apply,
             commands::mcp_server_wire_tools,
+            commands::mcp_server_tools_inventory,
+            commands::mcp_server_get_state,
+            commands::mcp_server_update_settings,
+            commands::mcp_server_regenerate_token,
+            commands::mcp_server_tool_inventory,
+            commands::mcp_server_integrations,
+            commands::mcp_server_integration_apply,
+            commands::mcp_server_integration_remove,
             commands::open_dir_in_file_explorer,
             commands::list_dir_entries,
             commands::list_dir_entries_page,

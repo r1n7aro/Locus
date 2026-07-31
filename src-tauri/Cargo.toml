@@ -44,6 +44,13 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks"], default-features = false }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
+# MCP server (expose unity tools to external harnesses): hyper serves the
+# localhost Streamable HTTP endpoint; toml_edit rewrites Codex's config.toml
+# format-preservingly for one-click setup. All three are already in the
+# dependency tree transitively.
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
+toml_edit = "0.19"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 tower-service = "0.3"

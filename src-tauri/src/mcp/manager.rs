@@ -251,6 +251,26 @@ pub fn resolve_wire_tool(name: &str) -> Option<McpWireTool> {
     snapshot.iter().find(|t| t.wire_name == name).cloned()
 }
 
+/// Every tool one server reports, before allow/deny filtering — the settings
+/// form lists hidden tools too so they can be switched back on. Empty when
+/// the server has not connected yet (lazy servers before their first call).
+pub async fn server_tool_inventory(server_id: &str) -> Vec<crate::mcp::McpToolSummary> {
+    let entries = registry().lock().await;
+    entries
+        .get(server_id)
+        .map(|entry| {
+            entry
+                .tools
+                .iter()
+                .map(|tool| crate::mcp::McpToolSummary {
+                    name: tool.name.clone(),
+                    description: tool.description.clone().unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Wire names currently exposed for one server (drives the settings page's
 /// per-server approval bulk action).
 pub fn wire_tool_names_for_server(server_id: &str) -> Vec<String> {

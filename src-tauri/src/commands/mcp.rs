@@ -131,3 +131,114 @@ pub async fn mcp_import_apply(
 pub async fn mcp_server_wire_tools(id: String) -> Result<Vec<String>, AppError> {
     Ok(crate::mcp::manager::wire_tool_names_for_server(&id))
 }
+
+/// Full tool list one server reports, before allow/deny filtering; feeds the
+/// settings form's per-tool toggles.
+#[tauri::command]
+pub async fn mcp_server_tools_inventory(
+    id: String,
+) -> Result<Vec<crate::mcp::McpToolSummary>, AppError> {
+    Ok(crate::mcp::manager::server_tool_inventory(&id).await)
+}
+
+// ─── Locus-as-MCP-server (expose unity tools to external harnesses) ─────────
+
+use crate::mcp::server as mcp_server;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStateView {
+    pub settings: mcp_server::config::McpServerSettings,
+    pub status: mcp_server::McpServerStatus,
+    pub endpoint_url: String,
+}
+
+fn mcp_server_state(app: &tauri::AppHandle) -> McpServerStateView {
+    use tauri::Manager;
+    let settings = mcp_server::config::load_settings();
+    let handle = app.state::<std::sync::Arc<mcp_server::McpServerHandle>>();
+    McpServerStateView {
+        endpoint_url: settings.endpoint_url(),
+        status: mcp_server::status(&handle),
+        settings,
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_server_get_state(app: tauri::AppHandle) -> Result<McpServerStateView, AppError> {
+    Ok(mcp_server_state(&app))
+}
+
+/// Writes settings (token is preserved; use mcp_server_regenerate_token to
+/// rotate it) and restarts the listener to apply.
+#[tauri::command]
+pub async fn mcp_server_update_settings(
+    app: tauri::AppHandle,
+    enabled: bool,
+    port: u16,
+    disabled_tools: Vec<String>,
+    call_timeout_ms: u64,
+) -> Result<McpServerStateView, AppError> {
+    let mut settings = mcp_server::config::load_settings();
+    settings.enabled = enabled;
+    settings.port = if port == 0 {
+        mcp_server::config::DEFAULT_PORT
+    } else {
+        port
+    };
+    settings.disabled_tools = disabled_tools;
+    settings.call_timeout_ms = call_timeout_ms.clamp(
+        mcp_server::config::MIN_CALL_TIMEOUT_MS,
+        mcp_server::config::MAX_CALL_TIMEOUT_MS,
+    );
+    mcp_server::config::save_settings(&settings)
+        .map_err(|e| AppError::new("mcp_server.save_failed", e))?;
+    mcp_server::reconcile(app.clone()).await;
+    Ok(mcp_server_state(&app))
+}
+
+#[tauri::command]
+pub async fn mcp_server_regenerate_token(
+    app: tauri::AppHandle,
+) -> Result<McpServerStateView, AppError> {
+    let mut settings = mcp_server::config::load_settings();
+    settings.token = mcp_server::config::generate_token();
+    mcp_server::config::save_settings(&settings)
+        .map_err(|e| AppError::new("mcp_server.save_failed", e))?;
+    mcp_server::reconcile(app.clone()).await;
+    Ok(mcp_server_state(&app))
+}
+
+#[tauri::command]
+pub async fn mcp_server_tool_inventory(
+    app: tauri::AppHandle,
+) -> Result<Vec<mcp_server::tools::ExposedToolInfo>, AppError> {
+    Ok(mcp_server::tools::exposed_tool_inventory(&app))
+}
+
+#[tauri::command]
+pub async fn mcp_server_integrations(
+) -> Result<Vec<mcp_server::install::IntegrationStatus>, AppError> {
+    let settings = mcp_server::config::load_settings();
+    Ok(mcp_server::install::integration_statuses(
+        &settings.endpoint_url(),
+        &settings.token,
+    ))
+}
+
+#[tauri::command]
+pub async fn mcp_server_integration_apply(
+    id: String,
+) -> Result<mcp_server::install::IntegrationStatus, AppError> {
+    let settings = mcp_server::config::load_settings();
+    mcp_server::install::apply_integration(&id, &settings.endpoint_url(), &settings.token)
+        .map_err(|e| AppError::new("mcp_server.integration_failed", e))
+}
+
+#[tauri::command]
+pub async fn mcp_server_integration_remove(
+    id: String,
+) -> Result<mcp_server::install::IntegrationStatus, AppError> {
+    mcp_server::install::remove_integration(&id)
+        .map_err(|e| AppError::new("mcp_server.integration_failed", e))
+}

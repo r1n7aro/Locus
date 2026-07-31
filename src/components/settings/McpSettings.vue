@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from "vue";
 import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import {
@@ -14,12 +15,14 @@ import {
   mcpServersRemove,
   mcpServersUpsert,
   mcpServerTest,
+  mcpServerToolsInventory,
   mcpServerWireTools,
   type McpImportCandidate,
   type McpLoadMode,
   type McpPreset,
   type McpServerConfig,
   type McpServerTestResult,
+  type McpToolSummary,
   type McpTransport,
 } from "../../services/mcp";
 import { getToolPermissions, saveToolPermissions } from "../../services/permissions";
@@ -46,10 +49,21 @@ const formHeadersText = ref("");
 const formTimeoutSecs = ref(DEFAULT_MCP_CALL_TIMEOUT_MS / 1000);
 const formLoadMode = ref<McpLoadMode>("lazy");
 const formAutoRestart = ref(false);
-const formAllowText = ref("");
-const formDenyText = ref("");
 const formError = ref("");
 const formPresetNote = ref("");
+
+// ── Per-tool toggles ────────────────────────────────────────────────────
+// Rows merge every known source of tool names: the runtime inventory of a
+// saved server, a successful form test, and names already present in the
+// stored allow/deny lists (so stale entries stay editable). Saving encodes
+// the switches back as a denylist; new server tools default to enabled.
+const formToolRows = ref<McpToolSummary[]>([]);
+const formDisabledTools = ref<Set<string>>(new Set());
+const formToolsLoading = ref(false);
+// Allow/deny snapshot from when the form opened; decides the initial switch
+// state of tool names that arrive later (inventory fetch, test result).
+let formInitialAllowlist: string[] = [];
+let formInitialDenylist: string[] = [];
 
 // ── Connection test state ───────────────────────────────────────────────
 const testingId = ref<string | null>(null);
@@ -116,6 +130,21 @@ function buildFormConfig(): McpServerConfig {
   const base = editingId.value
     ? servers.value.find((s) => s.id === editingId.value) ?? emptyMcpServerConfig()
     : emptyMcpServerConfig();
+  // With tool rows on screen the switches carry the whole intent: disabled
+  // rows become the denylist and the allowlist clears, so tools the server
+  // adds later start enabled. Without rows (never connected, nothing
+  // configured) the stored lists pass through untouched.
+  const toolGovernance = formToolRows.value.length > 0
+    ? {
+        toolAllowlist: [],
+        toolDenylist: formToolRows.value
+          .filter((row) => formDisabledTools.value.has(row.name))
+          .map((row) => row.name),
+      }
+    : {
+        toolAllowlist: base.toolAllowlist ?? [],
+        toolDenylist: base.toolDenylist ?? [],
+      };
   return {
     ...base,
     id: editingId.value ?? "",
@@ -130,8 +159,7 @@ function buildFormConfig(): McpServerConfig {
     callTimeoutMs: Math.round(Math.max(1, formTimeoutSecs.value) * 1000),
     loadMode: formLoadMode.value,
     autoRestart: formTransport.value === "stdio" && formAutoRestart.value,
-    toolAllowlist: parseLinesText(formAllowText.value),
-    toolDenylist: parseLinesText(formDenyText.value),
+    ...toolGovernance,
   };
 }
 
@@ -147,8 +175,11 @@ function resetForm() {
   formTimeoutSecs.value = DEFAULT_MCP_CALL_TIMEOUT_MS / 1000;
   formLoadMode.value = "lazy";
   formAutoRestart.value = false;
-  formAllowText.value = "";
-  formDenyText.value = "";
+  formToolRows.value = [];
+  formDisabledTools.value = new Set();
+  formToolsLoading.value = false;
+  formInitialAllowlist = [];
+  formInitialDenylist = [];
   formError.value = "";
   formPresetNote.value = "";
   formTestResult.value = null;
@@ -176,8 +207,78 @@ function openEditForm(server: McpServerConfig) {
   formTimeoutSecs.value = Math.round(server.callTimeoutMs / 1000);
   formLoadMode.value = server.loadMode ?? "lazy";
   formAutoRestart.value = server.autoRestart ?? false;
-  formAllowText.value = (server.toolAllowlist ?? []).join("\n");
-  formDenyText.value = (server.toolDenylist ?? []).join("\n");
+  formInitialAllowlist = [...(server.toolAllowlist ?? [])];
+  formInitialDenylist = [...(server.toolDenylist ?? [])];
+  // Names already governed by the stored lists render immediately (without
+  // descriptions); the runtime inventory fills in the rest asynchronously.
+  mergeFormToolRows(
+    [...formInitialAllowlist, ...formInitialDenylist]
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0)
+      .map((name) => ({ name, description: "" })),
+  );
+  void loadServerToolInventory(server.id);
+}
+
+/// Mirrors the backend's `McpServerConfig::tool_exposed`: deny wins, then a
+/// non-empty allowlist restricts, otherwise everything is exposed.
+function toolExposedByInitialLists(name: string): boolean {
+  if (formInitialDenylist.some((t) => t.trim() === name)) return false;
+  const allow = formInitialAllowlist.map((t) => t.trim()).filter((t) => t.length > 0);
+  return allow.length === 0 || allow.includes(name);
+}
+
+/// Adds unseen tool names as rows (switch state derived from the stored
+/// lists) and backfills descriptions on rows seeded without one. Rows the
+/// user already toggled keep their state.
+function mergeFormToolRows(tools: McpToolSummary[]) {
+  const rows = formToolRows.value;
+  const known = new Map(rows.map((row) => [row.name, row]));
+  const disabled = new Set(formDisabledTools.value);
+  for (const tool of tools) {
+    const existing = known.get(tool.name);
+    if (existing) {
+      if (!existing.description && tool.description) {
+        existing.description = tool.description;
+      }
+      continue;
+    }
+    const row = { name: tool.name, description: tool.description };
+    rows.push(row);
+    known.set(tool.name, row);
+    if (!toolExposedByInitialLists(tool.name)) {
+      disabled.add(tool.name);
+    }
+  }
+  formDisabledTools.value = disabled;
+}
+
+function setFormToolEnabled(name: string, enabled: boolean) {
+  const disabled = new Set(formDisabledTools.value);
+  if (enabled) {
+    disabled.delete(name);
+  } else {
+    disabled.add(name);
+  }
+  formDisabledTools.value = disabled;
+}
+
+async function loadServerToolInventory(serverId: string) {
+  formToolsLoading.value = true;
+  try {
+    const tools = await mcpServerToolsInventory(serverId);
+    // The user may have switched to another server (or closed the form)
+    // while the request was in flight.
+    if (editingId.value !== serverId) return;
+    mergeFormToolRows(tools);
+  } catch {
+    // Lazy servers that never connected simply have no inventory yet; the
+    // empty-state hint points at the Test button.
+  } finally {
+    if (editingId.value === serverId) {
+      formToolsLoading.value = false;
+    }
+  }
 }
 
 function closeForm() {
@@ -317,7 +418,11 @@ async function testForm() {
   formTesting.value = true;
   formTestResult.value = null;
   try {
-    formTestResult.value = await mcpServerTest(config);
+    const result = await mcpServerTest(config);
+    formTestResult.value = result;
+    if (result.ok) {
+      mergeFormToolRows(result.tools);
+    }
   } catch (e) {
     formError.value = normalizeAppError(e).message;
   } finally {
@@ -330,22 +435,6 @@ function testSummary(result: McpServerTestResult): string {
   const version = result.serverVersion ? ` ${result.serverVersion}` : "";
   const protocol = result.protocolVersion || "?";
   return t("settings.mcp.test.summary", `${name}${version}`, protocol, result.tools.length, Math.round(result.elapsedMs / 100) / 10);
-}
-
-/// Clicking a tool chip in the form test result toggles it on the denylist.
-function toggleDenyTool(name: string) {
-  const denied = parseLinesText(formDenyText.value);
-  const index = denied.indexOf(name);
-  if (index >= 0) {
-    denied.splice(index, 1);
-  } else {
-    denied.push(name);
-  }
-  formDenyText.value = denied.join("\n");
-}
-
-function isDenied(name: string): boolean {
-  return parseLinesText(formDenyText.value).includes(name);
 }
 
 // ── Import ──────────────────────────────────────────────────────────────
@@ -700,27 +789,32 @@ onMounted(() => {
         {{ t("settings.mcp.form.autoRestartHint") }}
       </span>
 
-      <div class="mcp-field-pair">
-        <label class="mcp-field">
-          <span class="mcp-field-label">{{ t("settings.mcp.form.allowlist") }}</span>
-          <textarea
-            v-model="formAllowText"
-            class="mcp-input mcp-textarea"
-            rows="2"
-            spellcheck="false"
-          />
-          <span class="mcp-field-hint">{{ t("settings.mcp.form.allowlistHint") }}</span>
-        </label>
-        <label class="mcp-field">
-          <span class="mcp-field-label">{{ t("settings.mcp.form.denylist") }}</span>
-          <textarea
-            v-model="formDenyText"
-            class="mcp-input mcp-textarea"
-            rows="2"
-            spellcheck="false"
-          />
-          <span class="mcp-field-hint">{{ t("settings.mcp.form.denylistHint") }}</span>
-        </label>
+      <div class="mcp-field">
+        <span class="mcp-field-label">{{ t("settings.mcp.form.tools") }}</span>
+        <div v-if="formToolRows.length === 0" class="mcp-tools-empty">
+          {{ formToolsLoading ? t("settings.mcp.form.toolsLoading") : t("settings.mcp.form.toolsEmpty") }}
+        </div>
+        <template v-else>
+          <div class="mcp-tool-list">
+            <div v-for="row in formToolRows" :key="row.name" class="mcp-tool-toggle-row">
+              <BaseCheckbox
+                :model-value="!formDisabledTools.has(row.name)"
+                :aria-label="row.name"
+                @update:model-value="setFormToolEnabled(row.name, $event)"
+              />
+              <span
+                class="mcp-tool-toggle-name"
+                :class="{ 'is-off': formDisabledTools.has(row.name) }"
+              >{{ row.name }}</span>
+              <span
+                v-if="row.description"
+                class="mcp-tool-toggle-desc"
+                :title="row.description"
+              >{{ row.description }}</span>
+            </div>
+          </div>
+          <span class="mcp-field-hint">{{ t("settings.mcp.form.toolsHint") }}</span>
+        </template>
       </div>
 
       <div v-if="editingId" class="mcp-approval-block">
@@ -743,25 +837,9 @@ onMounted(() => {
         class="mcp-test-result mcp-form-test"
         :class="{ 'is-error': !formTestResult.ok }"
       >
-        <template v-if="formTestResult.ok">
-          <div class="mcp-test-summary">{{ testSummary(formTestResult) }}</div>
-          <div v-if="formTestResult.tools.length" class="mcp-tool-chips">
-            <button
-              v-for="tool in formTestResult.tools"
-              :key="tool.name"
-              type="button"
-              class="mcp-tool-chip mcp-tool-chip-toggle"
-              :class="{ 'is-denied': isDenied(tool.name) }"
-              :title="tool.description"
-              @click="toggleDenyTool(tool.name)"
-            >
-              {{ tool.name }}
-            </button>
-          </div>
-          <span v-if="formTestResult.tools.length" class="mcp-field-hint">
-            {{ t("settings.mcp.form.chipDenyHint") }}
-          </span>
-        </template>
+        <!-- Discovered tools land in the toggle list above, so the test
+             block only reports the connection outcome. -->
+        <div v-if="formTestResult.ok" class="mcp-test-summary">{{ testSummary(formTestResult) }}</div>
         <pre v-else class="mcp-test-error">{{ formTestResult.error }}</pre>
       </div>
 
@@ -908,18 +986,51 @@ onMounted(() => {
   color: var(--text-secondary);
   background: var(--panel-bg);
 }
-.mcp-tool-chip-toggle {
-  cursor: pointer;
-  transition: color 0.12s, border-color 0.12s, opacity 0.12s;
+.mcp-tool-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--panel-bg);
 }
-.mcp-tool-chip-toggle:hover {
-  border-color: var(--border-strong);
+.mcp-tool-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 10px;
+  min-width: 0;
+}
+.mcp-tool-toggle-row + .mcp-tool-toggle-row {
+  border-top: 1px solid var(--border-color);
+}
+.mcp-tool-toggle-name {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-family: var(--font-mono-identifier);
   color: var(--text-color);
 }
-.mcp-tool-chip-toggle.is-denied {
-  opacity: 0.55;
+.mcp-tool-toggle-name.is-off {
+  color: var(--text-secondary);
   text-decoration: line-through;
-  border-style: dashed;
+  opacity: 0.7;
+}
+.mcp-tool-toggle-desc {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-tools-empty {
+  padding: 12px 10px;
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 .mcp-form {
   margin-top: 10px;

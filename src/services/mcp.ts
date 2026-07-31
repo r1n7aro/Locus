@@ -154,6 +154,12 @@ export function mcpServerWireTools(id: string): Promise<string[]> {
   return ipcInvoke<string[]>("mcp_server_wire_tools", { id });
 }
 
+/// Full tool list one server reports, before allow/deny filtering; empty
+/// until the server has connected at least once.
+export function mcpServerToolsInventory(id: string): Promise<McpToolSummary[]> {
+  return ipcInvoke<McpToolSummary[]>("mcp_server_tools_inventory", { id });
+}
+
 export interface McpServerRuntimeStatus {
   id: string;
   name: string;
