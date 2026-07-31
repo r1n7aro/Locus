@@ -586,6 +586,25 @@ namespace Locus
             if (IsProjectAssetPath(normalized))
                 return normalized;
 
+            // Absolute paths are only trimmed when they actually live under
+            // THIS project's root. Blindly cutting at the first "Assets/"
+            // would alias D:/OtherProject/Assets/Scenes/Main.unity onto this
+            // project's same-named scene and silently return wrong data.
+            if (System.IO.Path.IsPathRooted(normalized))
+            {
+                string projectRoot = System.IO.Path
+                    .GetDirectoryName(Application.dataPath)
+                    ?.Replace('\\', '/');
+                if (string.IsNullOrEmpty(projectRoot))
+                    return null;
+                if (!projectRoot.EndsWith("/", StringComparison.Ordinal))
+                    projectRoot += "/";
+                if (!normalized.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
+                    return null;
+                string relative = normalized.Substring(projectRoot.Length);
+                return IsProjectAssetPath(relative) ? relative : null;
+            }
+
             string[] prefixes = { "Assets/", "Packages/" };
             foreach (string prefix in prefixes)
             {

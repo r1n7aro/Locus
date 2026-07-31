@@ -410,7 +410,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "mcp" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -1263,7 +1263,7 @@ export function useSettingsState(emit: SettingsEmit) {
       contextLength: Number.isFinite(model.contextLength) && model.contextLength > 0
         ? model.contextLength
         : DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
-      betaFlags: [...(model.betaFlags ?? [])],
+      supportsToolLazyLoading: model.supportsToolLazyLoading === true,
       supportedReasoningEfforts: normalizeReasoningEfforts(model.supportedReasoningEfforts),
       reasoningParamFormat: model.reasoningParamFormat ?? defaultReasoningParamFormat(apiFormat),
       replayReasoningContent: typeof model.replayReasoningContent === "boolean"
@@ -1298,7 +1298,7 @@ export function useSettingsState(emit: SettingsEmit) {
         apiModel: ep.apiModel,
         name: ep.apiModel,
         contextLength: ep.contextLength,
-        betaFlags: [...(ep.betaFlags ?? [])],
+        supportsToolLazyLoading: ep.supportsToolLazyLoading === true,
         supportedReasoningEfforts: ep.supportedReasoningEfforts,
         reasoningParamFormat: ep.reasoningParamFormat ?? null,
         replayReasoningContent: ep.replayReasoningContent,
@@ -1498,13 +1498,12 @@ export function useSettingsState(emit: SettingsEmit) {
         apiFormat: provider.apiFormat,
         apiKey: provider.apiKey,
         contextLength: model.contextLength,
-        betaFlags: model.betaFlags,
         supportedReasoningEfforts: model.supportedReasoningEfforts,
         reasoningParamFormat: model.reasoningParamFormat
           ?? defaultReasoningParamFormat(provider.apiFormat),
         replayReasoningContent: model.replayReasoningContent === true,
         serverTools: model.serverTools,
-        supportsToolLazyLoading: false,
+        supportsToolLazyLoading: model.supportsToolLazyLoading === true,
         supportsVision: model.supportsVision,
       });
       testStatus.value = customEndpointTestStatusForReply(reply);

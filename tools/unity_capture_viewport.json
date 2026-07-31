@@ -1,5 +1,5 @@
 {
-  "description": "Capture a PNG screenshot from the connected Unity Editor and return it as an image attachment in the tool result.\n\nUse this tool when the Agent needs to inspect the actual visual state of the Game view, Scene view, or a specific Editor window. The current workspace provides the Unity project. The tool always returns PNG image data and a short JSON metadata summary; do not request another format.\n\n`request_editor_status` declares the Unity Editor status required before capture. Locus verifies the Editor is connected and still in that status before requesting the screenshot.\n\nTargets:\n- `game`: captures the visible Game view.\n- `scene`: captures the last active Scene view, or the first available Scene view.\n- `editor_window`: captures an Editor window. Use `window_title` when a specific window should be captured; it matches window title, C# type name, or full type name. If omitted, Locus captures the currently focused Editor window.",
+  "description": "Capture a PNG screenshot from the connected Unity Editor and return it as an image attachment in the tool result.\n\nUse this tool when the Agent needs to inspect the actual visual state of the Game view, Scene view, or a specific Editor window. The current workspace provides the Unity project. The tool automatically resolves the capture area; do not calculate or pass screen coordinates. The tool always returns PNG image data and a short JSON metadata summary; do not request another format.\n\n`request_editor_status` declares the Unity Editor status required before capture. Locus verifies the Editor is connected and still in that status before requesting the screenshot.\n\nTargets:\n- `game`: captures the visible Game viewport without the Game view toolbar.\n- `scene`: captures the last active Scene viewport without the Scene view toolbar.\n- `editor_window`: captures the complete Editor window. Use `window_title` when a specific window should be captured; it matches window title, C# type name, or full type name. If omitted, Locus captures the currently focused Editor window.\n\n`max_long_edge` controls output resizing after the exact viewport has been captured. Omit it to use 1280, or pass 0 to preserve the source pixel dimensions.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -16,6 +16,13 @@
       "window_title": {
         "type": "string",
         "description": "Optional title or type-name match for target `editor_window`."
+      },
+      "max_long_edge": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 8192,
+        "default": 1280,
+        "description": "Maximum output width or height in pixels after capture. Use 0 to preserve the source pixel dimensions."
       }
     },
     "required": ["request_editor_status", "target"]

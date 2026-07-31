@@ -508,6 +508,17 @@ pub(crate) fn prefab_instance_is_unchanged(
                         a.target.source_file_id == b.target.source_file_id
                             && a.target.guid == b.target.guid
                     })
+                && old.removed_game_objects.len() == new.removed_game_objects.len()
+                && old
+                    .removed_game_objects
+                    .iter()
+                    .zip(&new.removed_game_objects)
+                    .all(|(a, b)| {
+                        a.target.source_file_id == b.target.source_file_id
+                            && a.target.guid == b.target.guid
+                    })
+                && old.added_game_object_count == new.added_game_object_count
+                && old.added_component_count == new.added_component_count
         }
         _ => false, // added/removed — not unchanged
     }

@@ -56,12 +56,6 @@ const REPLAY_FIELD_OPTIONS = [
   { value: "reasoning", label: "reasoning" },
 ] satisfies Array<{ value: ReasoningReplayField | ""; label: string }>;
 
-const BETA_FLAG_OPTIONS = [
-  { flag: "context-1m-2025-08-07", descKey: "settings.custom.betaContext1m" },
-  { flag: "interleaved-thinking-2025-05-14", descKey: "settings.custom.betaInterleavedThinking" },
-  { flag: "prompt-caching-scope-2026-01-05", descKey: "settings.custom.betaPromptCaching" },
-];
-
 /** null means "derive on save"; show the derived value instead of a blank. */
 const effectiveReasoningFormat = computed<ReasoningParamFormat>(
   () => props.model.reasoningParamFormat ?? defaultReasoningParamFormat(props.apiFormat),
@@ -84,14 +78,6 @@ function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
   const list = model.supportedReasoningEfforts ?? (model.supportedReasoningEfforts = []);
   const idx = list.indexOf(effort);
   if (enabled && idx < 0) list.push(effort);
-  else if (!enabled && idx >= 0) list.splice(idx, 1);
-}
-
-function setBetaFlagEnabled(flag: string, enabled: boolean) {
-  const model = props.model;
-  const list = model.betaFlags ?? (model.betaFlags = []);
-  const idx = list.indexOf(flag);
-  if (enabled && idx < 0) list.push(flag);
   else if (!enabled && idx >= 0) list.splice(idx, 1);
 }
 
@@ -214,20 +200,18 @@ function updateReplayField(value: string) {
     <template v-if="apiFormat === 'anthropic_messages'">
       <div class="form-section-title">{{ t("settings.custom.formSectionAnthropic") }}</div>
 
-      <span class="form-row-label form-row-label-top">{{ t("settings.custom.betaFlags") }}</span>
+      <span class="form-row-label form-row-label-top">{{ t("settings.custom.nativeToolLoading") }}</span>
       <div class="form-control">
-        <div class="form-options-list">
-          <div v-for="beta in BETA_FLAG_OPTIONS" :key="beta.flag" class="form-option-row">
-            <BaseCheckbox
-              :disabled="saving"
-              :model-value="model.betaFlags?.includes(beta.flag) ?? false"
-              :aria-label="beta.flag"
-              @update:model-value="setBetaFlagEnabled(beta.flag, $event)"
-            />
-            <div class="form-option-copy">
-              <span class="form-option-name mono">{{ beta.flag }}</span>
-              <span class="form-option-desc">{{ t(beta.descKey) }}</span>
-            </div>
+        <div class="form-option-row">
+          <BaseCheckbox
+            :disabled="saving"
+            :model-value="model.supportsToolLazyLoading === true"
+            :aria-label="t('settings.custom.nativeToolLoading')"
+            @update:model-value="model.supportsToolLazyLoading = $event"
+          />
+          <div class="form-option-copy">
+            <span class="form-option-name mono">defer_loading</span>
+            <span class="form-option-desc">{{ t("settings.custom.nativeToolLoadingDesc") }}</span>
           </div>
         </div>
       </div>
@@ -362,12 +346,6 @@ function updateReplayField(value: string) {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 16px;
-}
-
-.form-options-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
 }
 
 .form-option-row {

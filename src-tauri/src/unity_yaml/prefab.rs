@@ -5,7 +5,8 @@ use crate::asset_db::types::{
 
 use super::parser::YamlDoc;
 use super::tokenizer::{
-    count_braces, extract_field_name, extract_internal_file_id, extract_plain_value, extract_value,
+    closes_single_quoted, count_braces, extract_field_name, extract_internal_file_id,
+    extract_plain_value, extract_value, is_unclosed_single_quoted, trimmed_value_after,
 };
 
 pub fn extract_prefab_instance_irs(docs: &[YamlDoc], lines: &[&str]) -> Vec<PrefabInstanceIR> {
@@ -34,6 +35,16 @@ pub fn extract_stripped_mappings(docs: &[YamlDoc], lines: &[&str]) -> Vec<Stripp
         .collect()
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum PrefabModSection {
+    None,
+    Modifications,
+    RemovedComponents,
+    RemovedGameObjects,
+    AddedGameObjects,
+    AddedComponents,
+}
+
 #[allow(unused_assignments)]
 fn parse_single_prefab_instance_ir(doc: &YamlDoc, lines: &[&str]) -> Option<PrefabInstanceIR> {
     if doc.class_id != 1001 {
@@ -46,10 +57,12 @@ fn parse_single_prefab_instance_ir(doc: &YamlDoc, lines: &[&str]) -> Option<Pref
 
     let mut property_overrides = Vec::new();
     let mut removed_components = Vec::new();
+    let mut removed_game_objects = Vec::new();
+    let mut added_game_object_count = 0usize;
+    let mut added_component_count = 0usize;
     let mut instance_name = doc.m_name.clone();
 
-    let mut in_modifications = false;
-    let mut in_removed = false;
+    let mut section = PrefabModSection::None;
     let mut in_modification_entry = false;
 
     let mut cur_target: Option<PrefabSourceRef> = None;
@@ -90,9 +103,12 @@ fn parse_single_prefab_instance_ir(doc: &YamlDoc, lines: &[&str]) -> Option<Pref
         };
     }
 
-    for i in doc.line_start..doc.line_end.min(lines.len()) {
+    let end_line = doc.line_end.min(lines.len());
+    let mut i = doc.line_start;
+    while i < end_line {
         let line = lines[i];
         let trimmed = line.trim();
+        i += 1;
 
         if let Some(ref mut buf) = pending_line {
             buf.push(' ');
@@ -112,106 +128,136 @@ fn parse_single_prefab_instance_ir(doc: &YamlDoc, lines: &[&str]) -> Option<Pref
 
         let indent = line.len() - line.trim_start().len();
 
-        if trimmed == "m_Modifications:" {
-            in_modifications = true;
-            in_removed = false;
-            in_modification_entry = false;
-            continue;
-        }
-        if trimmed == "m_RemovedComponents:" {
+        let section_header = match trimmed {
+            "m_Modifications:" => Some(PrefabModSection::Modifications),
+            "m_RemovedComponents:" => Some(PrefabModSection::RemovedComponents),
+            "m_RemovedGameObjects:" => Some(PrefabModSection::RemovedGameObjects),
+            "m_AddedGameObjects:" => Some(PrefabModSection::AddedGameObjects),
+            "m_AddedComponents:" => Some(PrefabModSection::AddedComponents),
+            _ => None,
+        };
+        if let Some(next_section) = section_header {
             if in_modification_entry {
                 flush_modification!();
                 in_modification_entry = false;
             }
-            in_modifications = false;
-            in_removed = true;
+            section = next_section;
             continue;
         }
 
         if indent <= 4
             && !trimmed.starts_with('-')
             && trimmed.contains(':')
-            && !trimmed.starts_with("m_Modifications")
-            && !trimmed.starts_with("m_RemovedComponents")
+            && section != PrefabModSection::None
         {
-            if in_modifications || in_removed {
-                if in_modification_entry {
-                    flush_modification!();
-                    in_modification_entry = false;
-                }
-                in_modifications = false;
-                in_removed = false;
-            }
-        }
-
-        if in_modifications {
-            if trimmed.starts_with("- target:") {
-                if in_modification_entry {
-                    flush_modification!();
-                }
-                in_modification_entry = true;
-                cur_target = None;
-                cur_property_path = None;
-                cur_value = None;
-                cur_object_ref = None;
-
-                if trimmed.contains('{') {
-                    let balance = count_braces(trimmed);
-                    if balance > 0 {
-                        pending_line = Some(trimmed.to_string());
-                        pending_braces = balance;
-                    } else {
-                        cur_target = parse_source_ref_from_flow(trimmed);
-                    }
-                }
-                continue;
-            }
-
             if in_modification_entry {
-                // propertyPath / value / objectReference
-                if let Some(f) = extract_field_name(trimmed) {
-                    match f.as_str() {
-                        "propertyPath" => {
-                            cur_property_path = extract_plain_value(trimmed, "propertyPath:");
+                flush_modification!();
+                in_modification_entry = false;
+            }
+            section = PrefabModSection::None;
+        }
+
+        match section {
+            PrefabModSection::Modifications => {
+                if trimmed.starts_with("- target:") {
+                    if in_modification_entry {
+                        flush_modification!();
+                    }
+                    in_modification_entry = true;
+                    cur_target = None;
+                    cur_property_path = None;
+                    cur_value = None;
+                    cur_object_ref = None;
+
+                    if trimmed.contains('{') {
+                        let balance = count_braces(trimmed);
+                        if balance > 0 {
+                            pending_line = Some(trimmed.to_string());
+                            pending_braces = balance;
+                        } else {
+                            cur_target = parse_source_ref_from_flow(trimmed);
                         }
-                        "value" => {
-                            cur_value = extract_plain_value(trimmed, "value:");
-                        }
-                        "objectReference" => {
-                            if trimmed.contains('{') {
-                                let balance = count_braces(trimmed);
-                                if balance > 0 {
-                                    pending_line = Some(trimmed.to_string());
-                                    pending_braces = balance;
+                    }
+                    continue;
+                }
+
+                if in_modification_entry {
+                    // propertyPath / value / objectReference
+                    if let Some(f) = extract_field_name(trimmed) {
+                        match f.as_str() {
+                            "propertyPath" => {
+                                cur_property_path = extract_plain_value(trimmed, "propertyPath:");
+                            }
+                            "value" => {
+                                let raw = trimmed_value_after(trimmed, "value:");
+                                if is_unclosed_single_quoted(raw) {
+                                    // Multi-line single-quoted scalar (text
+                                    // overrides commonly span lines); join
+                                    // the continuation lines instead of
+                                    // storing a half scalar.
+                                    let (joined, consumed) =
+                                        take_multiline_single_quoted(raw, lines, i, end_line);
+                                    cur_value = Some(joined);
+                                    i += consumed;
                                 } else {
-                                    cur_object_ref = parse_source_ref_from_flow(trimmed);
+                                    cur_value = extract_plain_value(trimmed, "value:");
                                 }
                             }
-                        }
-                        "target" => {
-                            // continuation target (shouldn't happen normally, but handle)
-                            if trimmed.contains('{') {
-                                let balance = count_braces(trimmed);
-                                if balance > 0 {
-                                    pending_line = Some(trimmed.to_string());
-                                    pending_braces = balance;
-                                } else {
-                                    cur_target = parse_source_ref_from_flow(trimmed);
+                            "objectReference" => {
+                                if trimmed.contains('{') {
+                                    let balance = count_braces(trimmed);
+                                    if balance > 0 {
+                                        pending_line = Some(trimmed.to_string());
+                                        pending_braces = balance;
+                                    } else {
+                                        cur_object_ref = parse_source_ref_from_flow(trimmed);
+                                    }
                                 }
                             }
+                            "target" => {
+                                // continuation target (shouldn't happen normally, but handle)
+                                if trimmed.contains('{') {
+                                    let balance = count_braces(trimmed);
+                                    if balance > 0 {
+                                        pending_line = Some(trimmed.to_string());
+                                        pending_braces = balance;
+                                    } else {
+                                        cur_target = parse_source_ref_from_flow(trimmed);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-        }
-
-        if in_removed {
-            if trimmed.starts_with("- ") && trimmed.contains('{') {
-                if let Some(src) = parse_source_ref_from_flow(trimmed) {
-                    removed_components.push(RemovedComponent { target: src });
+            PrefabModSection::RemovedComponents => {
+                if trimmed.starts_with("- ") && trimmed.contains('{') {
+                    if let Some(src) = parse_source_ref_from_flow(trimmed) {
+                        removed_components.push(RemovedComponent { target: src });
+                    }
                 }
             }
+            PrefabModSection::RemovedGameObjects => {
+                if trimmed.starts_with("- ") && trimmed.contains('{') {
+                    if let Some(src) = parse_source_ref_from_flow(trimmed) {
+                        removed_game_objects.push(RemovedComponent { target: src });
+                    }
+                }
+            }
+            PrefabModSection::AddedGameObjects => {
+                // Entries are small maps (`- targetCorrespondingSourceObject:
+                // ...`); count entry heads only.
+                if trimmed.starts_with("- ") {
+                    added_game_object_count += 1;
+                }
+            }
+            PrefabModSection::AddedComponents => {
+                if trimmed.starts_with("- ") {
+                    added_component_count += 1;
+                }
+            }
+            PrefabModSection::None => {}
         }
     }
 
@@ -227,9 +273,53 @@ fn parse_single_prefab_instance_ir(doc: &YamlDoc, lines: &[&str]) -> Option<Pref
         instance_name,
         property_overrides,
         removed_components,
+        removed_game_objects,
+        added_game_object_count,
+        added_component_count,
         line_start: doc.line_start,
         line_end: doc.line_end,
     })
+}
+
+/// Join a multi-line single-quoted scalar starting at `first_raw` (the `'…`
+/// remainder of the `value:` line, missing its closing quote). Returns the
+/// unescaped joined text and how many continuation lines were consumed.
+fn take_multiline_single_quoted(
+    first_raw: &str,
+    lines: &[&str],
+    next: usize,
+    end: usize,
+) -> (String, usize) {
+    let mut out = first_raw[1..].replace("''", "'");
+    let end = end.min(lines.len());
+    let mut j = next;
+    while j < end && j - next < 200 {
+        let cont = lines[j].trim_start();
+        if closes_single_quoted(cont) {
+            // Content runs up to the first unescaped quote.
+            let bytes = cont.as_bytes();
+            let mut cut = cont.len();
+            let mut k = 0;
+            while k < bytes.len() {
+                if bytes[k] == b'\'' {
+                    if bytes.get(k + 1) == Some(&b'\'') {
+                        k += 2;
+                        continue;
+                    }
+                    cut = k;
+                    break;
+                }
+                k += 1;
+            }
+            out.push('\n');
+            out.push_str(&cont[..cut].replace("''", "'"));
+            return (out, j + 1 - next);
+        }
+        out.push('\n');
+        out.push_str(&cont.replace("''", "'"));
+        j += 1;
+    }
+    (out, j - next)
 }
 
 pub(super) fn parse_source_ref_from_flow(line: &str) -> Option<PrefabSourceRef> {

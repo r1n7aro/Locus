@@ -451,7 +451,9 @@ pub enum LlmBackend {
         endpoint: String,
         api_format: crate::commands::ApiFormat,
         context_length: u32,
-        beta_flags: Vec<String>,
+        /// Model-level opt-in for protocol-native lazy tool loading
+        /// (`defer_loading` + `tool_reference`) on Anthropic-format endpoints.
+        supports_tool_lazy_loading: bool,
         supported_reasoning_efforts: Vec<String>,
         reasoning_param_format: crate::commands::CustomReasoningParamFormat,
         replay_reasoning_content: bool,

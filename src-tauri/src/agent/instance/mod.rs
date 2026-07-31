@@ -746,7 +746,7 @@ pub(super) enum ToolRunOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ExecutedToolResult {
+pub(crate) struct ExecutedToolResult {
     output: String,
     is_error: bool,
     outcome: ToolRunOutcome,
@@ -802,6 +802,12 @@ impl ExecutedToolResult {
             self.nested_tool_calls = Some(nested_tool_calls);
         }
         self
+    }
+
+    /// The MCP server (crate::mcp::server) consumes shared unity tool
+    /// results without the agent-loop outcome machinery.
+    pub(crate) fn into_output_parts(self) -> (String, bool, Option<Vec<ImageData>>) {
+        (self.output, self.is_error, self.images)
     }
 }
 
@@ -2975,12 +2981,18 @@ impl AgentInstance {
             "unity_recompile" => require_non_empty("project_path", "to be set explicitly")
                 .or_else(|| require_absolute_without_workspace("project_path")),
             // Code analysis tools read arbitrary files via `file_path`; hold
-            // them to the same workspace boundary as read/write/edit.
+            // them to the same workspace boundary as read/write/edit. The
+            // unity_yaml_* tools read arbitrary files the same way (and
+            // unity_yaml_read echoes non-YAML file content back), so they get
+            // the same boundary.
             "code_find_references"
             | "code_goto_definition"
             | "code_diagnostics"
             | "code_hover"
-            | "unity_code_usages" => {
+            | "unity_code_usages"
+            | "unity_yaml_list"
+            | "unity_yaml_search"
+            | "unity_yaml_read" => {
                 if !has_working_dir {
                     Some(format!(
                         "Tool '{}' requires a selected working directory because it operates on workspace-scoped project data.",
@@ -2995,9 +3007,6 @@ impl AgentInstance {
             | "unity_capture_viewport"
             | "unity_ref_search"
             | "unity_asset_search"
-            | "unity_yaml_list"
-            | "unity_yaml_search"
-            | "unity_yaml_read"
             | "code_symbol_search"
             | "view_create"
             | "view_list"
@@ -3520,10 +3529,11 @@ impl AgentInstance {
 
     /// Whether the tool's per-agent availability may be toggled. Meta tools,
     /// skill-provided tools, and registry skill-mode tools are managed by the
-    /// system and stay enabled.
+    /// system and stay enabled; built-ins and MCP wire tools may be disabled
+    /// per agent.
     fn can_toggle_enabled_tool(&self, name: &str) -> bool {
         !Self::is_meta_tool(name)
-            && self.tool_registry.is_built_in(name)
+            && (self.tool_registry.is_built_in(name) || Self::is_mcp_wire_tool(name))
             && matches!(
                 self.default_tool_load_mode(name),
                 ToolLoadMode::Direct | ToolLoadMode::Lazy
@@ -3801,6 +3811,9 @@ impl AgentInstance {
     /// endpoint capability switch (`anthropic_native_lazy_enabled` — off for
     /// gateway `base_url`s that reject `defer_loading`/`tool_reference`, so
     /// their requests skip the per-request 400 + eager retry entirely).
+    /// Custom Anthropic-format endpoints opt in per model instead
+    /// (`supports_tool_lazy_loading`); a wrong guess there degrades through
+    /// the same request-level strip-and-retry.
     fn resolve_lazy_tool_renderer(
         &self,
         dynamic_mode: crate::config::DynamicToolLoadingMode,
@@ -3816,6 +3829,11 @@ impl AgentInstance {
             {
                 LazyToolRenderer::AnthropicNative
             }
+            LlmBackend::Custom {
+                api_format: crate::commands::ApiFormat::AnthropicMessages,
+                supports_tool_lazy_loading: true,
+                ..
+            } => LazyToolRenderer::AnthropicNative,
             LlmBackend::OpenAiCodex { base_url, .. }
                 if Self::codex_backend_supports_tool_search(base_url.as_deref())
                     && Self::codex_model_supports_tool_search(&self.effective_model) =>
@@ -6447,7 +6465,6 @@ impl AgentInstance {
                 api_model,
                 endpoint,
                 api_format,
-                beta_flags,
                 supported_reasoning_efforts,
                 reasoning_param_format,
                 replay_reasoning_content,
@@ -6583,7 +6600,6 @@ impl AgentInstance {
                             messages,
                             api_tools,
                             endpoint.as_str(),
-                            beta_flags,
                             thinking_level,
                             *replay_reasoning_content,
                             server_tools.web_search,
@@ -11248,23 +11264,38 @@ impl AgentInstance {
             self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
                 .await
         } else if tc.name == "unity_capture_viewport" {
-            self.await_executed_tool_result(self.execute_unity_capture_viewport(args))
+            self.await_executed_tool_result(Self::execute_unity_capture_viewport(
+                &self.working_dir,
+                args,
+            ))
                 .await
         } else if tc.name == "view_capture" {
             self.await_executed_tool_result(self.execute_view_capture(app_handle, args))
                 .await
         } else if tc.name == "unity_ref_search" {
-            ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
+            ExecutedToolResult::from_tool_result(Self::execute_unity_ref_search(app_handle, args))
         } else if tc.name == "unity_asset_search" {
-            ExecutedToolResult::from_tool_result(self.execute_unity_asset_search(app_handle, args))
+            ExecutedToolResult::from_tool_result(Self::execute_unity_asset_search(app_handle, args))
         } else if tc.name == "unity_yaml_list" {
-            self.await_tool_result(self.execute_unity_yaml_list(app_handle, args))
+            self.await_tool_result(Self::execute_unity_yaml_list(
+                app_handle,
+                &self.working_dir,
+                args,
+            ))
                 .await
         } else if tc.name == "unity_yaml_search" {
-            self.await_tool_result(self.execute_unity_yaml_search(app_handle, args))
+            self.await_tool_result(Self::execute_unity_yaml_search(
+                app_handle,
+                &self.working_dir,
+                args,
+            ))
                 .await
         } else if tc.name == "unity_yaml_read" {
-            self.await_tool_result(self.execute_unity_yaml_read(app_handle, args))
+            self.await_tool_result(Self::execute_unity_yaml_read(
+                app_handle,
+                &self.working_dir,
+                args,
+            ))
                 .await
         } else {
             let bash_git_knowledge_assessment = if tc.name == "bash" {
@@ -13911,8 +13942,7 @@ impl AgentInstance {
         }
     }
 
-    fn execute_unity_ref_search(
-        &self,
+    pub(crate) fn execute_unity_ref_search(
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
@@ -14303,8 +14333,10 @@ impl AgentInstance {
         }
 
         crate::unity_yaml::HierarchySummaryOptions {
-            max_depth: positive_usize(args, "max_depth"),
-            max_nodes: positive_usize(args, "max_nodes"),
+            // Upper clamps keep a hallucinated huge value from disabling the
+            // output caps (`max_nodes=1e9` would print an entire mega-scene).
+            max_depth: positive_usize(args, "max_depth").map(|v| v.min(512)),
+            max_nodes: positive_usize(args, "max_nodes").map(|v| v.min(20_000)),
             query: trimmed_string(args, "query"),
             component_filters,
             path_prefix: trimmed_string(args, "path_prefix"),
@@ -14374,13 +14406,13 @@ impl AgentInstance {
             component_filters,
             match_fields,
             path_prefix: trimmed_string(args, "path_prefix"),
-            limit: positive_usize(args, "limit"),
+            limit: positive_usize(args, "limit").map(|v| v.min(1000)),
         }
     }
 
     fn unity_yaml_project_context<'a>(
-        &self,
         app_handle: &'a AppHandle,
+        working_dir: &str,
         file_path_arg: &str,
     ) -> (
         Option<tauri::State<'a, crate::asset_db::AssetDbState>>,
@@ -14393,7 +14425,18 @@ impl AgentInstance {
         let project_root: Option<std::path::PathBuf> = ref_graph_state
             .as_ref()
             .and_then(|s| s.0.lock().ok())
-            .and_then(|g| g.as_ref().map(|rg| rg.project_root().to_path_buf()));
+            .and_then(|g| g.as_ref().map(|rg| rg.project_root().to_path_buf()))
+            .or_else(|| {
+                // AssetDb may not be loaded yet (cold start); fall back to the
+                // selected working directory rather than the process CWD so
+                // relative paths still resolve against the project.
+                let wd = working_dir.trim();
+                if wd.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(wd))
+                }
+            });
 
         let abs_path = if std::path::Path::new(file_path_arg).is_absolute() {
             std::path::PathBuf::from(file_path_arg)
@@ -14406,7 +14449,25 @@ impl AgentInstance {
         (ref_graph_state, project_root, abs_path)
     }
 
+    /// Cap on how much file the yaml tools will load. Force-Text scenes can
+    /// legitimately run to a couple hundred MB; anything past this is almost
+    /// certainly not something a text read should chew through.
+    const UNITY_YAML_MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
     fn read_unity_yaml_content(abs_path: &std::path::Path) -> Result<Vec<u8>, ToolResult> {
+        if let Ok(meta) = std::fs::metadata(abs_path) {
+            if meta.len() > Self::UNITY_YAML_MAX_FILE_BYTES {
+                return Err(ToolResult {
+                    output: format!(
+                        "File '{}' is {} MB, above the {} MB unity_yaml tool limit. Use unity_yaml_list/search with path_prefix on a scene, or open the asset in Unity instead.",
+                        abs_path.display(),
+                        meta.len() / (1024 * 1024),
+                        Self::UNITY_YAML_MAX_FILE_BYTES / (1024 * 1024)
+                    ),
+                    is_error: true,
+                });
+            }
+        }
         std::fs::read(abs_path).map_err(|e| ToolResult {
             output: format!("Failed to read file '{}': {}", abs_path.display(), e),
             is_error: true,
@@ -14418,16 +14479,45 @@ impl AgentInstance {
         header.contains("%YAML") || header.contains("!u!") || header.contains("--- !u!")
     }
 
+    /// NUL bytes in the head of the file mean binary serialization (asset
+    /// serialization mode Binary/Mixed) — echoing that as lossy text would
+    /// dump megabytes of replacement-character noise into context.
+    fn looks_binary_content(content: &[u8]) -> bool {
+        content[..content.len().min(4096)].contains(&0)
+    }
+
+    fn binary_asset_error(file_path_arg: &str) -> ToolResult {
+        ToolResult {
+            output: format!(
+                "'{}' is binary-serialized (not text YAML). Switch the project to Edit > Project Settings > Editor > Asset Serialization = Force Text, or inspect it through the live Unity Editor tools.",
+                file_path_arg
+            ),
+            is_error: true,
+        }
+    }
+
     fn format_plain_text_excerpt(content: &[u8]) -> String {
+        const MAX_LINES: usize = 2000;
+        const MAX_LINE_CHARS: usize = 500;
+
         let text = String::from_utf8_lossy(content);
         let lines: Vec<&str> = text.lines().collect();
-        let limit = 2000;
         let mut out = String::new();
-        for (i, line) in lines.iter().take(limit).enumerate() {
-            out.push_str(&format!("{:>5}\t{}\n", i + 1, line));
+        for (i, line) in lines.iter().take(MAX_LINES).enumerate() {
+            if line.chars().count() > MAX_LINE_CHARS {
+                let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
+                out.push_str(&format!(
+                    "{:>5}\t{}… ({} chars total)\n",
+                    i + 1,
+                    truncated,
+                    line.chars().count()
+                ));
+            } else {
+                out.push_str(&format!("{:>5}\t{}\n", i + 1, line));
+            }
         }
-        if lines.len() > limit {
-            out.push_str(&format!("... ({} more lines)\n", lines.len() - limit));
+        if lines.len() > MAX_LINES {
+            out.push_str(&format!("... ({} more lines)\n", lines.len() - MAX_LINES));
         }
         out
     }
@@ -14459,15 +14549,94 @@ impl AgentInstance {
         )
     }
 
+    /// The live path sends the raw `file_path` string and the C# side trims
+    /// it to an `Assets/...`-relative path, which the connected Editor then
+    /// resolves against *its own* project. An absolute path pointing at a
+    /// different project would silently alias to this project's same-named
+    /// asset — refuse the live path for those and let the disk parse handle
+    /// them.
+    fn unity_yaml_live_eligible(working_dir: &str, abs_path: &std::path::Path) -> bool {
+        if !Self::is_unity_editor_yaml_candidate(abs_path) {
+            return false;
+        }
+        if !abs_path.is_absolute() {
+            return true;
+        }
+        let wd = working_dir.trim();
+        if wd.is_empty() {
+            return false;
+        }
+        let root = dunce::canonicalize(wd).unwrap_or_else(|_| std::path::PathBuf::from(wd));
+        let resolved =
+            dunce::canonicalize(abs_path).unwrap_or_else(|_| abs_path.to_path_buf());
+        let mut root_components = root.components();
+        let mut child_components = resolved.components();
+        loop {
+            match (root_components.next(), child_components.next()) {
+                (None, _) => return true,
+                (Some(_), None) => return false,
+                (Some(a), Some(b)) => {
+                    let a = a.as_os_str().to_string_lossy();
+                    let b = b.as_os_str().to_string_lossy();
+                    // Windows paths are case-insensitive; comparing
+                    // case-sensitively here would spuriously reject valid
+                    // in-project paths.
+                    if !a.eq_ignore_ascii_case(&b) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Windowed view over a tool output: 1-based `offset` line, up to `limit`
+    /// lines. Applied uniformly to live and disk outputs of unity_yaml_read
+    /// so giant component dumps can't flood the context; the header line
+    /// makes truncation visible and self-serve pageable.
+    fn apply_unity_yaml_line_window(output: String, limit: usize, offset: usize) -> String {
+        let total = output.lines().count();
+        if offset == 0 && total <= limit {
+            return output;
+        }
+        let start = offset.min(total);
+        let windowed: Vec<&str> = output.lines().skip(start).take(limit).collect();
+        let end = start + windowed.len();
+        let mut out = format!(
+            "[showing lines {}-{} of {}; use offset={} to continue]\n",
+            start + 1,
+            end,
+            total,
+            end
+        );
+        out.push_str(&windowed.join("\n"));
+        out.push('\n');
+        out
+    }
+
+    fn parse_unity_yaml_read_window(args: &serde_json::Value) -> (usize, usize) {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .map(|v| (v as usize).min(10_000))
+            .unwrap_or(2000);
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        (limit, offset)
+    }
+
     async fn try_unity_yaml_editor_tool(
-        &self,
+        working_dir: &str,
         message_type: &str,
         payload: serde_json::Value,
     ) -> Result<ToolResult, String> {
         let payload_text =
             serde_json::to_string(&payload).map_err(|e| format!("invalid tool payload: {}", e))?;
         let resp =
-            crate::unity_bridge::send_message(&self.working_dir, message_type, &payload_text)
+            crate::unity_bridge::send_message(working_dir, message_type, &payload_text)
                 .await?;
 
         if !resp.ok {
@@ -14500,6 +14669,15 @@ impl AgentInstance {
         }
         if let Some(max_nodes) = options.max_nodes {
             payload["max_nodes"] = serde_json::json!(max_nodes);
+        }
+        // Not in the public list schema, but the parse layer accepts these
+        // and the disk fallback honors them — forward them so both paths
+        // behave identically if a caller supplies them anyway.
+        if let Some(query) = options.query.as_deref() {
+            payload["query"] = serde_json::json!(query);
+        }
+        if !options.component_filters.is_empty() {
+            payload["component_filter"] = serde_json::json!(options.component_filters.join(","));
         }
         payload
     }
@@ -14559,7 +14737,7 @@ impl AgentInstance {
     /// when no extension matches, and Err with a user-visible note when a
     /// matching extension could not run (fall back to the default output).
     async fn try_unity_yaml_read_extension(
-        &self,
+        working_dir: &str,
         file_path_arg: &str,
         abs_path: &std::path::Path,
         project_root: Option<&std::path::Path>,
@@ -14578,7 +14756,7 @@ impl AgentInstance {
             })
             .collect();
         let Some(extension) = crate::commands::find_unity_yaml_read_extension_for_working_dir(
-            &self.working_dir,
+            working_dir,
             &doc_keys,
         ) else {
             return Ok(None);
@@ -14590,7 +14768,7 @@ impl AgentInstance {
             extension.extension_name.clone()
         };
         let (connected, _status, _scene) =
-            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+            crate::unity_bridge::query_unity_status(working_dir).await;
         if !connected {
             return Err(format!(
                 "yaml-read extension '{}' (Skill package '{}') was skipped: Unity Editor is not connected.",
@@ -14625,7 +14803,7 @@ impl AgentInstance {
         });
 
         match crate::commands::run_unity_yaml_read_extension(
-            &self.working_dir,
+            working_dir,
             &extension,
             &invoke_args,
         )
@@ -14645,9 +14823,9 @@ impl AgentInstance {
         }
     }
 
-    async fn execute_unity_yaml_list(
-        &self,
+    pub(crate) async fn execute_unity_yaml_list(
         app_handle: &AppHandle,
+        working_dir: &str,
         args: &serde_json::Value,
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
@@ -14658,15 +14836,19 @@ impl AgentInstance {
         };
         let summary_options = Self::parse_unity_yaml_summary_options(args);
         let (ref_graph_state, _project_root, abs_path) =
-            self.unity_yaml_project_context(app_handle, &file_path_arg);
-        if Self::is_unity_editor_yaml_candidate(&abs_path) {
+            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
+        let mut live_fallback_reason: Option<String> = None;
+        if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
             let payload = Self::unity_yaml_list_editor_payload(&file_path_arg, &summary_options);
-            match self.try_unity_yaml_editor_tool("list_yaml", payload).await {
+            match Self::try_unity_yaml_editor_tool(working_dir, "list_yaml", payload).await {
                 Ok(result) => return result,
-                Err(err) => eprintln!(
-                    "[unity_yaml_list] Unity plugin path unavailable for '{}': {}",
-                    file_path_arg, err
-                ),
+                Err(err) => {
+                    eprintln!(
+                        "[unity_yaml_list] Unity plugin path unavailable for '{}': {}",
+                        file_path_arg, err
+                    );
+                    live_fallback_reason = Some(err);
+                }
             }
         }
 
@@ -14675,6 +14857,9 @@ impl AgentInstance {
             Err(result) => return result,
         };
         if !Self::is_unity_yaml_content(&content) {
+            if Self::looks_binary_content(&content) {
+                return Self::binary_asset_error(&file_path_arg);
+            }
             return ToolResult {
                 output: format!(
                     "unity_yaml_list only supports Unity text-serialized .unity/.prefab YAML files. '{}' does not look like Unity YAML.",
@@ -14695,8 +14880,8 @@ impl AgentInstance {
             };
         }
 
-        let docs = yaml_parser::parse_yaml_docs(&content);
         let text = String::from_utf8_lossy(&content);
+        let docs = yaml_parser::parse_yaml_docs_str(&text);
         let lines: Vec<&str> = text.lines().collect();
         let tree = yaml_parser::build_go_tree(&docs);
         if tree.is_empty() {
@@ -14711,29 +14896,44 @@ impl AgentInstance {
 
         let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
         let guid_map = if has_prefab_instances {
-            self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines)
+            Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines)
         } else {
             std::collections::HashMap::new()
         };
         let guid_resolver =
             |guid: &crate::asset_db::types::Guid| -> Option<String> { guid_map.get(guid).cloned() };
 
+        let mut output = Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
+        output.push_str(&yaml_parser::format_scene_summary_with_options(
+            &tree,
+            &docs,
+            &lines,
+            &guid_resolver,
+            &file_path_arg,
+            &summary_options,
+        ));
         ToolResult {
-            output: yaml_parser::format_scene_summary_with_options(
-                &tree,
-                &docs,
-                &lines,
-                &guid_resolver,
-                &file_path_arg,
-                &summary_options,
-            ),
+            output,
             is_error: false,
         }
     }
 
-    async fn execute_unity_yaml_search(
-        &self,
+    /// A one-line data-source banner for disk-parse results. When the live
+    /// Editor read was attempted and failed, the model needs to know the data
+    /// may lag unsaved Editor state.
+    fn unity_yaml_source_banner(live_fallback_reason: Option<&str>) -> String {
+        match live_fallback_reason {
+            Some(reason) => format!(
+                "[source: disk YAML — live Editor read unavailable: {}. Unsaved Editor changes are not reflected.]\n",
+                reason.trim()
+            ),
+            None => String::new(),
+        }
+    }
+
+    pub(crate) async fn execute_unity_yaml_search(
         app_handle: &AppHandle,
+        working_dir: &str,
         args: &serde_json::Value,
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
@@ -14749,20 +14949,39 @@ impl AgentInstance {
                 is_error: true,
             };
         }
+        // A broken `re:` pattern used to fall back to a literal substring
+        // match (including the "re:" prefix) and silently return 0 results;
+        // reject it up front instead.
+        if let Some(pattern) = search_options
+            .query
+            .as_deref()
+            .and_then(|q| q.strip_prefix("re:"))
+            .filter(|p| !p.is_empty())
+        {
+            if let Err(err) = regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
+                return ToolResult {
+                    output: format!("Invalid regular expression in query '{}': {}", pattern, err),
+                    is_error: true,
+                };
+            }
+        }
 
         let (ref_graph_state, _project_root, abs_path) =
-            self.unity_yaml_project_context(app_handle, &file_path_arg);
-        if Self::is_unity_editor_yaml_candidate(&abs_path) {
+            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
+        let mut live_fallback_reason: Option<String> = None;
+        if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
             let payload = Self::unity_yaml_search_editor_payload(&file_path_arg, &search_options);
-            match self
-                .try_unity_yaml_editor_tool("search_yaml", payload)
+            match Self::try_unity_yaml_editor_tool(working_dir, "search_yaml", payload)
                 .await
             {
                 Ok(result) => return result,
-                Err(err) => eprintln!(
-                    "[unity_yaml_search] Unity plugin path unavailable for '{}': {}",
-                    file_path_arg, err
-                ),
+                Err(err) => {
+                    eprintln!(
+                        "[unity_yaml_search] Unity plugin path unavailable for '{}': {}",
+                        file_path_arg, err
+                    );
+                    live_fallback_reason = Some(err);
+                }
             }
         }
 
@@ -14771,6 +14990,9 @@ impl AgentInstance {
             Err(result) => return result,
         };
         if !Self::is_unity_yaml_content(&content) {
+            if Self::looks_binary_content(&content) {
+                return Self::binary_asset_error(&file_path_arg);
+            }
             return ToolResult {
                 output: format!(
                     "unity_yaml_search only supports Unity text-serialized .unity/.prefab YAML files. '{}' does not look like Unity YAML.",
@@ -14791,8 +15013,8 @@ impl AgentInstance {
             };
         }
 
-        let docs = yaml_parser::parse_yaml_docs(&content);
         let text = String::from_utf8_lossy(&content);
+        let docs = yaml_parser::parse_yaml_docs_str(&text);
         let lines: Vec<&str> = text.lines().collect();
         let tree = yaml_parser::build_go_tree(&docs);
         if tree.is_empty() {
@@ -14807,29 +15029,31 @@ impl AgentInstance {
 
         let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
         let guid_map = if has_prefab_instances {
-            self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines)
+            Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines)
         } else {
             std::collections::HashMap::new()
         };
         let guid_resolver =
             |guid: &crate::asset_db::types::Guid| -> Option<String> { guid_map.get(guid).cloned() };
 
+        let mut output = Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
+        output.push_str(&yaml_parser::format_hierarchy_search_results(
+            &tree,
+            &docs,
+            &lines,
+            &guid_resolver,
+            &file_path_arg,
+            &search_options,
+        ));
         ToolResult {
-            output: yaml_parser::format_hierarchy_search_results(
-                &tree,
-                &docs,
-                &lines,
-                &guid_resolver,
-                &file_path_arg,
-                &search_options,
-            ),
+            output,
             is_error: false,
         }
     }
 
-    async fn execute_unity_yaml_read(
-        &self,
+    pub(crate) async fn execute_unity_yaml_read(
         app_handle: &AppHandle,
+        working_dir: &str,
         args: &serde_json::Value,
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
@@ -14850,9 +15074,19 @@ impl AgentInstance {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("");
+        if !matches!(detail, "" | "components" | "prefab_overrides" | "document") {
+            return ToolResult {
+                output: format!(
+                    "Invalid detail '{}'. Allowed values: components, prefab_overrides, document.",
+                    detail
+                ),
+                is_error: true,
+            };
+        }
+        let (window_limit, window_offset) = Self::parse_unity_yaml_read_window(args);
 
         let (ref_graph_state, project_root, abs_path) =
-            self.unity_yaml_project_context(app_handle, &file_path_arg);
+            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
         let ext = Self::unity_yaml_file_extension(&abs_path);
         let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
 
@@ -14862,16 +15096,43 @@ impl AgentInstance {
                 is_error: true,
             };
         }
+        if !is_hierarchical && object_path.is_some() && detail != "document" {
+            // Non-hierarchical assets have no object hierarchy; the parameter
+            // would otherwise be silently ignored.
+            eprintln!(
+                "[unity_yaml_read] object_path is ignored for non-hierarchical file '{}'",
+                file_path_arg
+            );
+        }
 
-        if Self::is_unity_editor_yaml_candidate(&abs_path) && detail != "document" {
+        let mut live_fallback_reason: Option<String> = None;
+        // detail=document wants raw serialized fields and
+        // detail=prefab_overrides wants the disk-side structured override
+        // analysis; both are answered by the text parse, not the live view.
+        if Self::unity_yaml_live_eligible(working_dir, &abs_path)
+            && detail != "document"
+            && detail != "prefab_overrides"
+        {
             if let Some(obj_path) = object_path.as_deref() {
                 let payload = Self::unity_yaml_read_editor_payload(&file_path_arg, obj_path, args);
-                match self.try_unity_yaml_editor_tool("read_yaml", payload).await {
-                    Ok(result) => return result,
-                    Err(err) => eprintln!(
-                        "[unity_yaml_read] Unity plugin path unavailable for '{}': {}",
-                        file_path_arg, err
-                    ),
+                match Self::try_unity_yaml_editor_tool(working_dir, "read_yaml", payload).await {
+                    Ok(result) => {
+                        return ToolResult {
+                            output: Self::apply_unity_yaml_line_window(
+                                result.output,
+                                window_limit,
+                                window_offset,
+                            ),
+                            is_error: result.is_error,
+                        };
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[unity_yaml_read] Unity plugin path unavailable for '{}': {}",
+                            file_path_arg, err
+                        );
+                        live_fallback_reason = Some(err);
+                    }
                 }
             }
         }
@@ -14881,25 +15142,33 @@ impl AgentInstance {
             Err(result) => return result,
         };
         if !Self::is_unity_yaml_content(&content) {
+            if Self::looks_binary_content(&content) {
+                return Self::binary_asset_error(&file_path_arg);
+            }
             return ToolResult {
-                output: Self::format_plain_text_excerpt(&content),
+                output: Self::apply_unity_yaml_line_window(
+                    Self::format_plain_text_excerpt(&content),
+                    window_limit,
+                    window_offset,
+                ),
                 is_error: false,
             };
         }
 
-        let docs = yaml_parser::parse_yaml_docs(&content);
+        let text_shared = String::from_utf8_lossy(&content).into_owned();
+        let docs = yaml_parser::parse_yaml_docs_str(&text_shared);
 
         let mut yaml_read_extension_note: Option<String> = None;
         if !is_hierarchical && (detail.is_empty() || detail == "components") {
-            match self
-                .try_unity_yaml_read_extension(
-                    &file_path_arg,
-                    &abs_path,
-                    project_root.as_deref(),
-                    &docs,
-                    args,
-                )
-                .await
+            match Self::try_unity_yaml_read_extension(
+                working_dir,
+                &file_path_arg,
+                &abs_path,
+                project_root.as_deref(),
+                &docs,
+                args,
+            )
+            .await
             {
                 Ok(Some(result)) => return result,
                 Ok(None) => {}
@@ -14910,11 +15179,10 @@ impl AgentInstance {
             }
         }
 
-        let text = String::from_utf8_lossy(&content);
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = text_shared.lines().collect();
         let world_transform_map = yaml_parser::build_world_transform_map(&docs, &lines);
 
-        let guid_map = self.build_guid_map_for_docs(app_handle, &ref_graph_state, &docs, &lines);
+        let guid_map = Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines);
         let internal_map = yaml_parser::build_internal_id_map(&docs);
         let internal_resolver = |fid: i64| -> Option<String> { internal_map.get(&fid).cloned() };
         let transform_hierarchy_labels = if is_hierarchical {
@@ -14925,17 +15193,29 @@ impl AgentInstance {
 
         let (output_header, doc_ranges): (String, Vec<usize>) = if is_hierarchical {
             let tree = yaml_parser::build_go_tree(&docs);
-            let obj_path = object_path.as_deref().unwrap();
+            let Some(obj_path) = object_path.as_deref() else {
+                return ToolResult {
+                    output: "unity_yaml_read requires object_path for .unity/.prefab files."
+                        .to_string(),
+                    is_error: true,
+                };
+            };
             let target_file_id = match yaml_parser::find_go_by_path(&tree, obj_path) {
                 Some(id) => id,
                 None => {
                     let roots: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+                    let slash_hint = if obj_path.split('/').count() > 1 {
+                        " Note: GameObject names containing '/' cannot be addressed through object_path (the '/' is read as a hierarchy separator); names are shown verbatim inside ⟦ ⟧ in unity_yaml_list output."
+                    } else {
+                        ""
+                    };
                     return ToolResult {
                         output: format!(
-                            "GameObject '{}' not found in '{}'. Available root objects: {}",
+                            "GameObject '{}' not found in '{}'. Available root objects: {}.{}",
                             obj_path,
                             file_path_arg,
-                            roots.join(", ")
+                            roots.join(", "),
+                            slash_hint
                         ),
                         is_error: true,
                     };
@@ -14975,7 +15255,7 @@ impl AgentInstance {
                     let guid_resolver_fn = |guid: &crate::asset_db::types::Guid| -> Option<String> {
                         guid_map.get(guid).cloned()
                     };
-                    let source_ctx = self.load_source_prefab_context(
+                    let source_ctx = Self::load_source_prefab_context(
                         &ir.source_prefab_guid,
                         &guid_map,
                         &project_root,
@@ -14987,8 +15267,15 @@ impl AgentInstance {
                         source_ctx.as_ref(),
                         &stripped,
                     );
+                    let mut output =
+                        Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
+                    output.push_str(&detail);
                     return ToolResult {
-                        output: detail,
+                        output: Self::apply_unity_yaml_line_window(
+                            output,
+                            window_limit,
+                            window_offset,
+                        ),
                         is_error: false,
                     };
                 }
@@ -15036,7 +15323,8 @@ impl AgentInstance {
             guid_map.get(&guid).cloned()
         };
 
-        let mut output = output_header;
+        let mut output = Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
+        output.push_str(&output_header);
         let mut wrote_transform_hierarchy = false;
         for &idx in &doc_ranges {
             let doc = &docs[idx];
@@ -15076,7 +15364,7 @@ impl AgentInstance {
         }
 
         ToolResult {
-            output,
+            output: Self::apply_unity_yaml_line_window(output, window_limit, window_offset),
             is_error: false,
         }
     }
@@ -15371,7 +15659,6 @@ impl AgentInstance {
     }
 
     fn load_source_prefab_context(
-        &self,
         source_guid: &crate::asset_db::types::Guid,
         guid_map: &std::collections::HashMap<crate::asset_db::types::Guid, String>,
         project_root: &Option<std::path::PathBuf>,
@@ -15395,10 +15682,10 @@ impl AgentInstance {
         Some(crate::unity_yaml::SourcePrefabContext { tree, docs })
     }
 
-    fn ensure_ref_graph_initialized(&self, app_handle: &AppHandle) {
+    fn ensure_ref_graph_initialized(app_handle: &AppHandle, working_dir: &str) {
         use crate::asset_db::{AssetDb, AssetDbState};
 
-        let project_root = std::path::Path::new(&self.working_dir);
+        let project_root = std::path::Path::new(working_dir);
         if !project_root.join("Assets").is_dir() {
             eprintln!("[unity_yaml_read] Not a Unity project, skip auto-scan");
             return;
@@ -15448,8 +15735,8 @@ impl AgentInstance {
     }
 
     fn build_guid_map_for_docs(
-        &self,
         app_handle: &AppHandle,
+        working_dir: &str,
         ref_graph_state: &Option<tauri::State<'_, crate::asset_db::AssetDbState>>,
         docs: &[crate::unity_yaml::YamlDoc],
         lines: &[&str],
@@ -15491,7 +15778,10 @@ impl AgentInstance {
         if !db_map.is_empty() {
             db_map
         } else {
-            self.ensure_ref_graph_initialized(app_handle);
+            // full_scan + reconcile can take seconds on big projects; keep
+            // the blocking work off the async worker so the executor isn't
+            // starved while the scan runs.
+            tokio::task::block_in_place(|| Self::ensure_ref_graph_initialized(app_handle, working_dir));
             ref_graph_state
                 .as_ref()
                 .and_then(|rgs| rgs.0.lock().ok())
@@ -15504,8 +15794,7 @@ impl AgentInstance {
         }
     }
 
-    fn execute_unity_asset_search(
-        &self,
+    pub(crate) fn execute_unity_asset_search(
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
@@ -17315,6 +17604,73 @@ PrefabInstance:
     }
 
     #[test]
+    fn custom_anthropic_endpoint_opts_into_native_renderer_per_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut instance = native_plan_test_instance(&temp);
+        let custom_backend = |api_format: crate::commands::ApiFormat, lazy: bool| {
+            crate::agent::instance::LlmBackend::Custom {
+                api_key: "key".to_string(),
+                api_model: "deepseek-v4".to_string(),
+                endpoint: "https://api.deepseek.com/anthropic/v1".to_string(),
+                api_format,
+                context_length: 256_000,
+                supports_tool_lazy_loading: lazy,
+                supported_reasoning_efforts: Vec::new(),
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::AnthropicThinking,
+                replay_reasoning_content: false,
+                reasoning_replay_field: None,
+                server_tools: Default::default(),
+                supports_vision: true,
+            }
+        };
+
+        instance.backend = custom_backend(crate::commands::ApiFormat::AnthropicMessages, true);
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                true
+            ),
+            LazyToolRenderer::AnthropicNative
+        );
+        // The per-model flag is the only endpoint gate here: the global
+        // switch concerns the official Anthropic backend, not custom ones.
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                false
+            ),
+            LazyToolRenderer::AnthropicNative
+        );
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::MetaTool,
+                true
+            ),
+            LazyToolRenderer::ToolLoadFallback
+        );
+
+        instance.backend = custom_backend(crate::commands::ApiFormat::AnthropicMessages, false);
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                true
+            ),
+            LazyToolRenderer::ToolLoadFallback
+        );
+
+        // The flag is inert outside the Anthropic wire format.
+        instance.backend = custom_backend(crate::commands::ApiFormat::OpenaiChat, true);
+        assert_eq!(
+            instance.resolve_lazy_tool_renderer(
+                crate::config::DynamicToolLoadingMode::Native,
+                true
+            ),
+            LazyToolRenderer::ToolLoadFallback
+        );
+    }
+
+    #[test]
     fn anthropic_native_lazy_model_gate_matrix() {
         for supported in [
             "claude-fable-5",
@@ -17581,7 +17937,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiChat,
                 context_length: 256_000,
-                beta_flags: Vec::new(),
+                supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiChatReasoningEffort,
@@ -17681,7 +18037,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
-                beta_flags: Vec::new(),
+                supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
@@ -17763,7 +18119,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
-                beta_flags: Vec::new(),
+                supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
                     crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,

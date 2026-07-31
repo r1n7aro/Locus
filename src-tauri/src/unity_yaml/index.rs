@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use super::{build_go_tree, parse_yaml_docs, HierarchyNode, YamlDoc};
+use super::{build_go_tree, HierarchyNode, YamlDoc};
 
 /// Minimal parsed Unity YAML view: docs + line-split text. Cheap to
 /// build — no hierarchy / index passes.
@@ -47,8 +47,10 @@ pub struct UnityYamlDocs {
 impl UnityYamlDocs {
     /// Parse `content` into docs + lines, with no derived indices.
     pub fn parse(content: &[u8]) -> Self {
-        let docs = parse_yaml_docs(content);
+        // Decode once and share it between the doc parse and the line split;
+        // decoding twice doubled peak memory on big scene files.
         let text = String::from_utf8_lossy(content);
+        let docs = super::parse_yaml_docs_str(&text);
         let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
         Self { docs, lines }
     }

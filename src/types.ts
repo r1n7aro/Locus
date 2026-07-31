@@ -538,7 +538,6 @@ export interface CustomEndpoint {
   apiFormat: ApiFormat;
   apiKey: string;
   contextLength: number;
-  betaFlags: string[];
   supportedReasoningEfforts: EffortLevel[];
   reasoningParamFormat: ReasoningParamFormat;
   replayReasoningContent: boolean;
@@ -553,7 +552,8 @@ export interface CustomProviderModel {
   apiModel: string;
   name: string;
   contextLength: number;
-  betaFlags: string[];
+  /** Protocol-native lazy tool loading (defer_loading/tool_reference); Anthropic format only. */
+  supportsToolLazyLoading: boolean;
   supportedReasoningEfforts: EffortLevel[];
   reasoningParamFormat: ReasoningParamFormat | null;
   replayReasoningContent?: boolean | null;

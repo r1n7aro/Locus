@@ -690,7 +690,6 @@ fn build_claude_code_custom_endpoint(config: ImportedClaudeCodeCustomEndpoint) -
         api_format: ApiFormat::AnthropicMessages,
         api_key: config.api_key.unwrap_or_default(),
         context_length: imported_claude_context_length(&api_model),
-        beta_flags: Vec::new(),
         supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
             .into_iter()
             .map(str::to_string)

@@ -27,6 +27,18 @@
         "minimum": 1,
         "default": 20,
         "description": "Optional live Editor array/list item limit when expanding Generic serialized fields. Defaults to 20 and is clamped to 200."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 2000,
+        "description": "Optional maximum number of output lines. Defaults to 2000 and is clamped to 10000. When output is truncated, a header line reports the window and the offset to continue from."
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 0,
+        "description": "Optional 0-based output line to start from, for paging through large reads together with limit."
       }
     },
     "required": ["file_path"]

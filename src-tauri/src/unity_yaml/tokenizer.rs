@@ -1,11 +1,46 @@
+/// Count `{` minus `}` outside quoted scalars. Quote awareness matters:
+/// a string value like `m_Text: 'HP {'` must NOT look brace-open, or the
+/// parser's multi-line flow-map joiner would swallow every following line
+/// (including `---` document headers) until a spare `}` shows up — silently
+/// dropping the rest of the file. A quote left unclosed at end of line (the
+/// start of a multi-line quoted scalar) keeps its braces ignored, which is
+/// exactly the safe reading.
 pub(super) fn count_braces(s: &str) -> i32 {
     let mut balance = 0i32;
-    for b in s.bytes() {
-        match b {
-            b'{' => balance += 1,
-            b'}' => balance -= 1,
-            _ => {}
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                // `''` is the single-quote escape; consume both and stay in.
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+        } else if in_double {
+            match b {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_double = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'{' => balance += 1,
+                b'}' => balance -= 1,
+                _ => {}
+            }
         }
+        i += 1;
     }
     balance
 }
@@ -68,6 +103,15 @@ pub(super) fn extract_field_name_ref(trimmed: &str) -> Option<&str> {
     }
 }
 
+/// The raw (still-quoted, undecoded) value text after `key` on this line;
+/// empty when the key is absent.
+pub(super) fn trimmed_value_after<'a>(line: &'a str, key: &str) -> &'a str {
+    match line.find(key) {
+        Some(start) => line[start + key.len()..].trim(),
+        None => "",
+    }
+}
+
 pub(super) fn extract_plain_value(line: &str, key: &str) -> Option<String> {
     let start = line.find(key)?;
     let after = &line[start + key.len()..];
@@ -101,23 +145,68 @@ fn decode_yaml_string(s: &str) -> String {
         return inner.to_string();
     }
     let mut result = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('u') | Some('U') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if hex.len() == 4 {
-                        if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                            if let Some(ch) = char::from_u32(code) {
+                // YAML double-quoted escapes: `\u` takes 4 hex digits, `\U`
+                // takes 8 (astral chars — emoji GameObject names land here).
+                // A high surrogate from `\u` pairs with a following `\uDC00..`
+                // escape the way .NET emitters write astral chars.
+                Some(u_kind @ ('u' | 'U')) => {
+                    let want = if u_kind == 'U' { 8 } else { 4 };
+                    let hex: String = chars.by_ref().take(want).collect();
+                    let decoded = (hex.len() == want)
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten();
+                    match decoded {
+                        Some(code) if (0xD800..0xDC00).contains(&code) => {
+                            // High surrogate: try to pair with a `\uXXXX` low
+                            // surrogate right behind it.
+                            let mut paired = None;
+                            if chars.peek() == Some(&'\\') {
+                                let mut ahead = chars.clone();
+                                ahead.next(); // '\\'
+                                if matches!(ahead.next(), Some('u' | 'U')) {
+                                    let low_hex: String = ahead.by_ref().take(4).collect();
+                                    if low_hex.len() == 4 {
+                                        if let Ok(low) = u32::from_str_radix(&low_hex, 16) {
+                                            if (0xDC00..0xE000).contains(&low) {
+                                                let combined = 0x10000
+                                                    + ((code - 0xD800) << 10)
+                                                    + (low - 0xDC00);
+                                                if let Some(ch) = char::from_u32(combined) {
+                                                    paired = Some((ch, ahead));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((ch, ahead)) = paired {
                                 result.push(ch);
-                                continue;
+                                chars = ahead;
+                            } else {
+                                result.push('\\');
+                                result.push(u_kind);
+                                result.push_str(&hex);
                             }
                         }
+                        Some(code) => {
+                            if let Some(ch) = char::from_u32(code) {
+                                result.push(ch);
+                            } else {
+                                result.push('\\');
+                                result.push(u_kind);
+                                result.push_str(&hex);
+                            }
+                        }
+                        None => {
+                            result.push('\\');
+                            result.push(u_kind);
+                            result.push_str(&hex);
+                        }
                     }
-                    result.push('\\');
-                    result.push('u');
-                    result.push_str(&hex);
                 }
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
@@ -134,6 +223,47 @@ fn decode_yaml_string(s: &str) -> String {
         }
     }
     result
+}
+
+/// True when `value` starts a single-quoted scalar whose closing quote is not
+/// on this line (Unity writes multi-line strings — prefab `value:` overrides,
+/// long names — as single-quoted scalars spilling across lines). `''` escapes
+/// are not closers.
+pub(super) fn is_unclosed_single_quoted(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix('\'') else {
+        return false;
+    };
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// True when this continuation line of a multi-line single-quoted scalar
+/// contains the closing quote (an odd trailing unescaped `'`).
+pub(super) fn closes_single_quoted(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 pub(super) fn extract_internal_file_id(line: &str) -> Option<i64> {
@@ -159,17 +289,43 @@ pub(super) fn extract_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
 
 pub(super) fn find_closing_brace(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0;
-    for i in start..bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
                 }
+                in_single = false;
             }
-            _ => {}
+        } else if in_double {
+            match b {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_double = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
         }
+        i += 1;
     }
     None
 }

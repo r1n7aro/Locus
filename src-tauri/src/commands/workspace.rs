@@ -1065,8 +1065,6 @@ pub struct CustomEndpoint {
     pub api_key: String,
     #[serde(default = "default_context_length")]
     pub context_length: u32,
-    #[serde(default)]
-    pub beta_flags: Vec<String>,
     #[serde(default = "default_supported_reasoning_efforts")]
     pub supported_reasoning_efforts: Vec<String>,
     #[serde(default)]
@@ -1303,9 +1301,6 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .header("anthropic-version", "2023-06-01");
-            if !endpoint.beta_flags.is_empty() {
-                req = req.header("anthropic-beta", endpoint.beta_flags.join(","));
-            }
             if !endpoint.api_key.is_empty() {
                 req = req
                     .header("x-api-key", &endpoint.api_key)
@@ -1366,8 +1361,10 @@ pub struct CustomProviderModel {
     pub name: String,
     #[serde(default = "default_context_length")]
     pub context_length: u32,
+    /// Protocol-native lazy tool loading (`defer_loading`/`tool_reference`)
+    /// for Anthropic-format endpoints; the endpoint must support it.
     #[serde(default)]
-    pub beta_flags: Vec<String>,
+    pub supports_tool_lazy_loading: bool,
     #[serde(default = "default_supported_reasoning_efforts")]
     pub supported_reasoning_efforts: Vec<String>,
     #[serde(default)]
@@ -1493,7 +1490,7 @@ fn migrate_endpoint_to_provider(mut endpoint: CustomEndpoint) -> CustomProvider 
             name: endpoint.api_model.clone(),
             api_model: endpoint.api_model,
             context_length: endpoint.context_length,
-            beta_flags: endpoint.beta_flags,
+            supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
             supported_reasoning_efforts: endpoint.supported_reasoning_efforts,
             reasoning_param_format: endpoint.reasoning_param_format,
             replay_reasoning_content: endpoint.replay_reasoning_content,
@@ -3394,7 +3391,6 @@ mod tests {
                 "endpoint": "https://api.deepseek.com",
                 "apiFormat": "openai_chat",
                 "contextLength": 131072,
-                "betaFlags": ["flag-a"],
                 "supportedReasoningEfforts": ["low", "high"],
                 "replayReasoningContent": true,
                 "supportsVision": false
@@ -3417,7 +3413,7 @@ mod tests {
         assert_eq!(model.id, "deepseek-chat");
         assert_eq!(model.api_model, "deepseek-chat");
         assert_eq!(model.context_length, 131_072);
-        assert_eq!(model.beta_flags, vec!["flag-a".to_string()]);
+        assert!(!model.supports_tool_lazy_loading);
         assert_eq!(
             model.supported_reasoning_efforts,
             vec!["low".to_string(), "high".to_string()]
@@ -3449,7 +3445,7 @@ mod tests {
                     api_model: mid.to_string(),
                     name: mid.to_string(),
                     context_length: 128_000,
-                    beta_flags: Vec::new(),
+                    supports_tool_lazy_loading: false,
                     supported_reasoning_efforts: vec!["high".to_string()],
                     reasoning_param_format: None,
                     replay_reasoning_content: None,

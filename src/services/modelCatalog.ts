@@ -32,7 +32,7 @@ export function newCustomProviderModel(): CustomProviderModel {
     apiModel: "",
     name: "",
     contextLength: DEFAULT_CATALOG_CONTEXT_LENGTH,
-    betaFlags: [],
+    supportsToolLazyLoading: false,
     supportedReasoningEfforts: [...DEFAULT_REASONING_EFFORTS],
     reasoningParamFormat: null,
     replayReasoningContent: null,
@@ -228,7 +228,7 @@ export function catalogModelToProviderModel(
     apiModel: catalogModelId,
     name: model.name || catalogModelId,
     contextLength: model.limit.context > 0 ? model.limit.context : DEFAULT_CATALOG_CONTEXT_LENGTH,
-    betaFlags: [],
+    supportsToolLazyLoading: false,
     supportedReasoningEfforts: efforts,
     reasoningParamFormat,
     replayReasoningContent:

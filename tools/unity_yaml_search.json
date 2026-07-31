@@ -26,7 +26,7 @@
       "limit": {
         "type": "integer",
         "minimum": 1,
-        "description": "Optional maximum number of search results to print. Defaults to 50."
+        "description": "Optional maximum number of search results to print. Defaults to 50 and is clamped to 1000."
       }
     },
     "required": ["file_path"]

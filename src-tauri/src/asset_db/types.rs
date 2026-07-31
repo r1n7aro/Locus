@@ -314,6 +314,14 @@ pub struct PrefabInstanceIR {
     pub instance_name: Option<String>,
     pub property_overrides: Vec<PropertyOverride>,
     pub removed_components: Vec<RemovedComponent>,
+    /// Unity 2022.2+ `m_RemovedGameObjects`: source-prefab objects deleted on
+    /// this instance. Empty on older serialization.
+    pub removed_game_objects: Vec<RemovedComponent>,
+    /// Unity 2022.2+ `m_AddedGameObjects` entry count (the added objects
+    /// themselves are ordinary documents in the same file).
+    pub added_game_object_count: usize,
+    /// Unity 2022.2+ `m_AddedComponents` entry count.
+    pub added_component_count: usize,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -369,6 +377,9 @@ pub struct OverrideSummary {
     pub total_override_count: usize,
     pub stripped_ref_count: usize,
     pub removed_component_count: usize,
+    pub removed_game_object_count: usize,
+    pub added_game_object_count: usize,
+    pub added_component_count: usize,
     pub transform_overrides: Vec<TransformOverrideSummary>,
     pub bulk_overrides: Vec<BulkPropertyOverride>,
     pub renderer_overrides: Vec<RendererOverrideSummary>,

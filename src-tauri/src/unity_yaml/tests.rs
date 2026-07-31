@@ -1909,3 +1909,299 @@ fn test_parse_yaml_docs_ignores_multibyte_source_prefab_guid() {
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].source_prefab_guid, None);
 }
+
+// ───────────────── 2026-07 hardening round ─────────────────
+
+#[test]
+fn test_rect_transform_parent_chain() {
+    // UI hierarchies parent through RectTransform (class 224), often mixed
+    // with plain Transform children. The tree builder must treat 224 as a
+    // full transform: parenting, m_Children ordering, path map, and
+    // component lists (which exclude RectTransform/CanvasRenderer noise).
+    let yaml = b"--- !u!1 &1\nGameObject:\n  m_Component:\n  - component: {fileID: 224001}\n  - component: {fileID: 223001}\n  m_Layer: 5\n  m_Name: Canvas\n  m_TagString: Untagged\n  m_IsActive: 1\n--- !u!224 &224001\nRectTransform:\n  m_GameObject: {fileID: 1}\n  m_Children:\n  - {fileID: 224002}\n  m_Father: {fileID: 0}\n  m_RootOrder: 0\n--- !u!223 &223001\nCanvas:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n--- !u!1 &2\nGameObject:\n  m_Component:\n  - component: {fileID: 224002}\n  - component: {fileID: 222001}\n  m_Name: Panel\n  m_IsActive: 1\n--- !u!224 &224002\nRectTransform:\n  m_GameObject: {fileID: 2}\n  m_Children:\n  - {fileID: 224003}\n  m_Father: {fileID: 224001}\n  m_RootOrder: 0\n--- !u!222 &222001\nCanvasRenderer:\n  m_GameObject: {fileID: 2}\n--- !u!1 &3\nGameObject:\n  m_Component:\n  - component: {fileID: 224003}\n  - component: {fileID: 114001}\n  m_Name: Label\n  m_IsActive: 1\n--- !u!224 &224003\nRectTransform:\n  m_GameObject: {fileID: 3}\n  m_Children: []\n  m_Father: {fileID: 224002}\n  m_RootOrder: 0\n--- !u!114 &114001\nMonoBehaviour:\n  m_GameObject: {fileID: 3}\n  m_Enabled: 1\n";
+    let docs = parse_yaml_docs(yaml);
+    let tree = build_go_tree(&docs);
+
+    assert_eq!(tree.len(), 1, "one root through the RectTransform chain");
+    assert_eq!(tree[0].name, "Canvas");
+    assert_eq!(tree[0].children.len(), 1);
+    assert_eq!(tree[0].children[0].name, "Panel");
+    assert_eq!(tree[0].children[0].children.len(), 1);
+    assert_eq!(tree[0].children[0].children[0].name, "Label");
+
+    // Component lists: RectTransform and CanvasRenderer are excluded noise.
+    assert_eq!(tree[0].components, vec!["Canvas".to_string()]);
+    assert!(tree[0].children[0].components.is_empty());
+    assert_eq!(
+        tree[0].children[0].children[0].components,
+        vec!["MonoBehaviour".to_string()]
+    );
+
+    let paths = build_hierarchy_path_map(&tree);
+    assert_eq!(
+        paths.get(&3).map(String::as_str),
+        Some("Canvas/Panel/Label")
+    );
+    assert_eq!(find_go_by_path(&tree, "Canvas/Panel/Label"), Some(3));
+}
+
+#[test]
+fn test_unbalanced_brace_in_string_does_not_poison_parser() {
+    // A string value with a net-open brace (`'HP {'`) used to flip the
+    // parser into its multi-line flow-map joiner, which then swallowed every
+    // following line — including `---` document headers — silently dropping
+    // the rest of the file.
+    let yaml = b"--- !u!114 &100\nMonoBehaviour:\n  m_Text: 'HP {'\n  m_Other: 1\n--- !u!1 &200\nGameObject:\n  m_Name: Survivor\n--- !u!1 &300\nGameObject:\n  m_Name: AlsoHere\n";
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs.len(), 3, "documents after the brace string must survive");
+    assert_eq!(docs[1].m_name.as_deref(), Some("Survivor"));
+    assert_eq!(docs[2].m_name.as_deref(), Some("AlsoHere"));
+
+    // Double-quoted variant with an escaped quote and an open brace.
+    let yaml2 = b"--- !u!114 &100\nMonoBehaviour:\n  m_Json: \"{\\\"a\\\": \\\"{\\\"\"\n--- !u!1 &200\nGameObject:\n  m_Name: StillHere\n";
+    let docs2 = parse_yaml_docs(yaml2);
+    assert_eq!(docs2.len(), 2);
+    assert_eq!(docs2[1].m_name.as_deref(), Some("StillHere"));
+}
+
+#[test]
+fn test_multiline_quoted_name_dropped_not_half_stored() {
+    // An m_Name spilling across lines can only yield its first fragment in
+    // the line scanner; storing `'part1` (dangling quote) is worse than no
+    // name at all — the tree falls back to "?" instead of a corrupt label.
+    let yaml = b"--- !u!1 &100\nGameObject:\n  m_Name: 'part one\n    part two'\n  m_Layer: 0\n--- !u!1 &200\nGameObject:\n  m_Name: Normal\n";
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].m_name, None, "half scalar must be dropped");
+    assert_eq!(docs[1].m_name.as_deref(), Some("Normal"));
+}
+
+#[test]
+fn test_decimal_display_preserves_small_values() {
+    // The old fixed two-decimal rendering displayed 0.001 as a misleading
+    // 0.00; the smart shortener keeps small values and still collapses
+    // float-noise like 0.30000001192092896 to 0.3.
+    let yaml = "--- !u!114 &100\nMonoBehaviour:\n  intensity: 0.001\n  weight: 0.30000001192092896\n  tiny: 1.5e-07\n  plain: 3.14\n";
+    let lines: Vec<&str> = yaml.lines().collect();
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|_| None);
+    assert!(out.contains("intensity: 0.001"), "got: {out}");
+    assert!(out.contains("weight: 0.3\n"), "got: {out}");
+    assert!(
+        out.contains("tiny: 1.5e-07"),
+        "scientific tiny value kept verbatim, got: {out}"
+    );
+    assert!(out.contains("plain: 3.14"), "got: {out}");
+}
+
+#[test]
+fn test_cjk_key_with_trailing_space_does_not_panic() {
+    // `line.trim()` also strips trailing whitespace; the old indent slice
+    // `&line[..line.len() - trimmed.len()]` counted those trailing bytes into
+    // the leading-indent width and could split a CJK key mid-codepoint
+    // (issue #97 class). C# permits CJK identifiers, so these keys are real.
+    let yaml = "--- !u!114 &100\nMonoBehaviour:\n  血量: 1.5 \n  攻击力: 0.30000001192092896 \n";
+    let lines: Vec<&str> = yaml.lines().collect();
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|_| None);
+    assert!(out.contains("血量"), "CJK key preserved intact, got: {out}");
+    assert!(out.contains("攻击力: 0.3"), "got: {out}");
+}
+
+#[test]
+fn test_cjk_field_next_to_reference_not_mangled() {
+    // Lines carrying a fileID reference used to be reassembled byte-by-byte
+    // (`bytes[i] as char`), turning any non-ASCII key/value on the same line
+    // into Latin-1 mojibake.
+    let yaml = "--- !u!114 &100\nMonoBehaviour:\n  目标对象: {fileID: 200}\n";
+    let lines: Vec<&str> = yaml.lines().collect();
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|fid| {
+        (fid == 200).then(|| "GO:Player".to_string())
+    });
+    assert!(out.contains("目标对象: {GO:Player}"), "got: {out}");
+}
+
+#[test]
+fn test_double_quoted_astral_escapes() {
+    // Unity/.NET emitters write astral characters either as an 8-digit \U
+    // escape or as a 😀 surrogate pair; both must decode to the
+    // real character (previously \U consumed only 4 digits and produced
+    // control-char garbage).
+    let yaml = b"--- !u!1 &100\nGameObject:\n  m_Name: \"\\U0001F600 Boss\"\n--- !u!1 &200\nGameObject:\n  m_Name: \"\\uD83D\\uDE00 Grunt\"\n--- !u!1 &300\nGameObject:\n  m_Name: \"\\u4E2D\\u6587\"\n";
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs[0].m_name.as_deref(), Some("\u{1F600} Boss"));
+    assert_eq!(docs[1].m_name.as_deref(), Some("\u{1F600} Grunt"));
+    assert_eq!(docs[2].m_name.as_deref(), Some("中文"));
+}
+
+#[test]
+fn test_nested_m_enabled_does_not_clobber_component_state() {
+    // A serialized user field named m_Enabled nested inside a component
+    // (Serializable settings blocks do this) must not overwrite the
+    // component's own document-level enabled flag.
+    let yaml = b"--- !u!114 &100\nMonoBehaviour:\n  m_Enabled: 1\n  settings:\n    m_Enabled: 0\n    volume: 3\n";
+    let docs = parse_yaml_docs(yaml);
+    assert_eq!(docs[0].m_enabled, Some(true));
+
+    // List items at indent 2 (`- m_Enabled: 0`) are not doc-level either.
+    let yaml2 = b"--- !u!114 &100\nMonoBehaviour:\n  m_Enabled: 1\n  entries:\n  - m_Enabled: 0\n";
+    let docs2 = parse_yaml_docs(yaml2);
+    assert_eq!(docs2[0].m_enabled, Some(true));
+}
+
+#[test]
+fn test_nested_m_game_object_does_not_reassign_component() {
+    // A user field named m_GameObject deeper in the component would
+    // previously win (last write) and reparent the component in the tree.
+    let yaml = b"--- !u!1 &1\nGameObject:\n  m_Component:\n  - component: {fileID: 401}\n  m_Name: Holder\n  m_IsActive: 1\n--- !u!4 &401\nTransform:\n  m_GameObject: {fileID: 1}\n  m_Father: {fileID: 0}\n  m_RootOrder: 0\n--- !u!114 &500\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n  m_Enabled: 1\n  binding:\n    m_GameObject: {fileID: 999}\n";
+    let docs = parse_yaml_docs(yaml);
+    let mono = docs.iter().find(|d| d.class_id == 114).unwrap();
+    assert_eq!(mono.m_game_object_id, Some(1), "nested field must not win");
+
+    let tree = build_go_tree(&docs);
+    assert_eq!(tree[0].components, vec!["MonoBehaviour".to_string()]);
+}
+
+#[test]
+fn test_multiline_modification_value_joined() {
+    // Text overrides on prefab instances routinely span lines; the value
+    // must come back joined instead of a half scalar with a dangling quote.
+    let yaml = b"--- !u!1001 &900\nPrefabInstance:\n  m_Modification:\n    m_Modifications:\n    - target: {fileID: 400000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      propertyPath: m_Text\n      value: 'line one\n        line two\n        line three'\n      objectReference: {fileID: 0}\n    - target: {fileID: 400001, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      propertyPath: m_Number\n      value: 7\n      objectReference: {fileID: 0}\n  m_SourcePrefab: {fileID: 100100000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n";
+    let docs = parse_yaml_docs(yaml);
+    let lines: Vec<&str> = std::str::from_utf8(yaml).unwrap().lines().collect();
+    let irs = extract_prefab_instance_irs(&docs, &lines);
+    assert_eq!(irs.len(), 1);
+    assert_eq!(irs[0].property_overrides.len(), 2);
+    assert_eq!(
+        irs[0].property_overrides[0].value.as_deref(),
+        Some("line one\nline two\nline three")
+    );
+    assert_eq!(irs[0].property_overrides[1].property_path, "m_Number");
+    assert_eq!(irs[0].property_overrides[1].value.as_deref(), Some("7"));
+}
+
+#[test]
+fn test_removed_game_objects_and_added_counts() {
+    // Unity 2022.2+ structural overrides: deleted source objects and
+    // added-object/component entries must surface in the IR and summary.
+    let yaml = b"--- !u!1001 &900\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {fileID: 0}\n    m_Modifications:\n    - target: {fileID: 400000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      propertyPath: m_Name\n      value: Boss\n      objectReference: {fileID: 0}\n    m_RemovedComponents:\n    - {fileID: 3300000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n    m_RemovedGameObjects:\n    - {fileID: 700001, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n    - {fileID: 700002, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n    m_AddedGameObjects:\n    - targetCorrespondingSourceObject: {fileID: 400000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      insertIndex: -1\n      addedObject: {fileID: 111}\n    m_AddedComponents:\n    - targetCorrespondingSourceObject: {fileID: 400000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      insertIndex: -1\n      addedObject: {fileID: 222}\n    - targetCorrespondingSourceObject: {fileID: 400001, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n      insertIndex: -1\n      addedObject: {fileID: 333}\n  m_SourcePrefab: {fileID: 100100000, guid: aaaa0000bbbb1111cccc2222dddd3333, type: 3}\n";
+    let docs = parse_yaml_docs(yaml);
+    let lines: Vec<&str> = std::str::from_utf8(yaml).unwrap().lines().collect();
+    let irs = extract_prefab_instance_irs(&docs, &lines);
+    assert_eq!(irs.len(), 1);
+    let ir = &irs[0];
+    assert_eq!(ir.property_overrides.len(), 1, "modifications still parsed");
+    assert_eq!(ir.removed_components.len(), 1);
+    assert_eq!(ir.removed_game_objects.len(), 2);
+    assert_eq!(ir.added_game_object_count, 1);
+    assert_eq!(ir.added_component_count, 2);
+    assert_eq!(ir.instance_name.as_deref(), Some("Boss"));
+
+    let summary = summarize_prefab_instance(ir, 0, Vec::new(), &|_| None);
+    assert_eq!(summary.removed_game_object_count, 2);
+    assert_eq!(summary.added_game_object_count, 1);
+    assert_eq!(summary.added_component_count, 2);
+    let text = format_override_summary(&summary);
+    assert!(
+        text.contains("2 removed GameObjects | 1 added GameObjects | 2 added components"),
+        "got: {text}"
+    );
+}
+
+#[test]
+fn test_literal_bracket_name_wins_over_ordinal() {
+    // An object literally named "Enemy[1]" must stay reachable even when
+    // duplicate "Enemy" siblings exist; ordinal syntax still works when no
+    // literal sibling matches.
+    fn go(name: &str, id: i64) -> HierarchyNode {
+        HierarchyNode {
+            name: name.to_string(),
+            file_id: id,
+            is_active: true,
+            ..Default::default()
+        }
+    }
+    let roots = vec![HierarchyNode {
+        name: "Root".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![go("Enemy", 10), go("Enemy", 11), go("Enemy[1]", 12)],
+        ..Default::default()
+    }];
+
+    assert_eq!(
+        find_go_by_path(&roots, "Root/Enemy[1]"),
+        Some(12),
+        "literal wins"
+    );
+    assert_eq!(
+        find_go_by_path(&roots, "Root/Enemy[2]"),
+        Some(11),
+        "ordinal fallback"
+    );
+    assert_eq!(find_go_by_path(&roots, "Root/Enemy"), Some(10));
+}
+
+#[test]
+fn test_trailing_space_name_addressable_and_marker_stripped() {
+    // Names with trailing spaces are exactly what the display wrapping
+    // exists to expose; the untrimmed path segment must reach them, and
+    // pasted wrapper marks are stripped defensively.
+    fn go(name: &str, id: i64) -> HierarchyNode {
+        HierarchyNode {
+            name: name.to_string(),
+            file_id: id,
+            is_active: true,
+            ..Default::default()
+        }
+    }
+    let roots = vec![HierarchyNode {
+        name: "Root".to_string(),
+        file_id: 1,
+        is_active: true,
+        children: vec![go("[Managers] ", 20), go("Plain", 21)],
+        ..Default::default()
+    }];
+
+    assert_eq!(find_go_by_path(&roots, "Root/[Managers] "), Some(20));
+    assert_eq!(find_go_by_path(&roots, "⟦Root⟧/⟦Plain⟧"), Some(21));
+    // Whitespace-tolerant retry still resolves trimmed requests.
+    assert_eq!(find_go_by_path(&roots, "Root / Plain"), Some(21));
+}
+
+#[test]
+fn test_yaml11_dot_inf_transform_values() {
+    // YAML 1.1 leading-dot special floats from external tools; Unity's own
+    // "Infinity" spelling is already accepted by Rust's parser.
+    let yaml = "--- !u!1 &1\nGameObject:\n  m_Component:\n  - component: {fileID: 400}\n  m_Name: Far\n  m_IsActive: 1\n--- !u!4 &400\nTransform:\n  m_GameObject: {fileID: 1}\n  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n  m_LocalPosition: {x: .inf, y: -.inf, z: 5}\n  m_LocalScale: {x: 1, y: 1, z: 1}\n  m_Father: {fileID: 0}\n  m_RootOrder: 0\n";
+    let docs = parse_yaml_docs(yaml.as_bytes());
+    let lines: Vec<&str> = yaml.lines().collect();
+    let world = build_world_transform_map(&docs, &lines);
+    let info = world.get(&400).expect("transform parsed");
+    assert!(info.position[0].is_infinite() && info.position[0] > 0.0);
+    assert!(info.position[1].is_infinite() && info.position[1] < 0.0);
+    assert!((info.position[2] - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_deep_chain_does_not_overflow_stack() {
+    // Procedurally generated 600-deep parent chains must not blow the stack;
+    // the tree builder truncates at its depth guard instead.
+    let mut yaml = String::new();
+    let count = 600i64;
+    for i in 0..count {
+        let go_id = 1000 + i;
+        let tr_id = 2000 + i;
+        let father = if i == 0 { 0 } else { 2000 + i - 1 };
+        yaml.push_str(&format!(
+            "--- !u!1 &{go_id}\nGameObject:\n  m_Component:\n  - component: {{fileID: {tr_id}}}\n  m_Name: Node{i}\n  m_IsActive: 1\n--- !u!4 &{tr_id}\nTransform:\n  m_GameObject: {{fileID: {go_id}}}\n  m_Father: {{fileID: {father}}}\n  m_RootOrder: 0\n"
+        ));
+    }
+    let docs = parse_yaml_docs(yaml.as_bytes());
+    let tree = build_go_tree(&docs);
+    assert_eq!(tree.len(), 1);
+    assert_eq!(tree[0].name, "Node0");
+
+    // World transforms over the same deep chain must also stay bounded.
+    let lines: Vec<&str> = yaml.lines().collect();
+    let world = build_world_transform_map(&docs, &lines);
+    assert!(!world.is_empty());
+}

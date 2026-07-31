@@ -131,6 +131,14 @@ namespace Locus
                 return "__ERROR__: Unity YAML editor tools only support .unity and .prefab files via Unity API";
 
             string objectPath = string.IsNullOrEmpty(args.object_path) ? null : args.object_path;
+            if (objectPath != null && (objectPath.IndexOf('⟦') >= 0 || objectPath.IndexOf('⟧') >= 0))
+            {
+                // The ⟦ ⟧ wrappers are display-only; strip them defensively
+                // when a caller pastes them back despite the instructions.
+                objectPath = objectPath.Replace("⟦", "").Replace("⟧", "");
+                if (objectPath.Length == 0)
+                    objectPath = null;
+            }
             var options = ReadYamlOptions.FromArgs(args);
 
             // Search-mode field matching must reach nested serialized data —
@@ -140,6 +148,11 @@ namespace Locus
             // the hard cap is affordable here.
             if (mode == UnityYamlModeSearch && args.max_field_depth <= 0)
                 options.SerializedFieldMaxDepth = HardSerializedFieldMaxDepth;
+            // Same reasoning for arrays: a field-value hit sitting at index
+            // 21+ of a list must not be a false negative just because the
+            // display default truncates at 20.
+            if (mode == UnityYamlModeSearch && args.max_array_items <= 0)
+                options.SerializedMaxArrayItems = HardSerializedMaxArrayItems;
 
             if (mode == UnityYamlModeRead && string.IsNullOrEmpty(objectPath))
                 return "__ERROR__: unity_yaml_read requires object_path for .unity/.prefab files";
@@ -164,15 +177,22 @@ namespace Locus
             ReadYamlOptions options,
             string mode)
         {
+            // Path comparison is case-insensitive: Windows paths routinely
+            // differ in casing from Unity's canonical asset path, and an
+            // Ordinal miss here silently falls back to (possibly stale) disk
+            // YAML.
             var activeScene = EditorSceneManager.GetActiveScene();
-            bool isActiveScene = activeScene.IsValid() && activeScene.path == scenePath;
+            bool isActiveScene = activeScene.IsValid()
+                && string.Equals(activeScene.path, scenePath, StringComparison.OrdinalIgnoreCase);
 
             if (!isActiveScene)
             {
                 for (int i = 0; i < EditorSceneManager.sceneCount; i++)
                 {
                     var s = EditorSceneManager.GetSceneAt(i);
-                    if (s.IsValid() && s.isLoaded && s.path == scenePath)
+                    if (s.IsValid()
+                        && s.isLoaded
+                        && string.Equals(s.path, scenePath, StringComparison.OrdinalIgnoreCase))
                     {
                         return ReadSceneContents(s, scenePath, objectPath, options, mode);
                     }
@@ -183,6 +203,21 @@ namespace Locus
             return ReadSceneContents(activeScene, scenePath, objectPath, options, mode);
         }
 
+        /// <summary>
+        /// One-line provenance banner so the model can tell live editor state
+        /// (possibly unsaved / play-mode) apart from disk YAML output.
+        /// </summary>
+        private static string BuildLiveSourceBanner(bool isDirty)
+        {
+            var traits = new List<string>();
+            if (EditorApplication.isPlaying)
+                traits.Add("play mode — runtime hierarchy");
+            if (isDirty)
+                traits.Add("unsaved changes");
+            string suffix = traits.Count > 0 ? " (" + string.Join(", ", traits) + ")" : "";
+            return "[source: live Unity Editor" + suffix + "]\n";
+        }
+
         private static string ReadSceneContents(
             UnityEngine.SceneManagement.Scene scene,
             string scenePath,
@@ -191,14 +226,22 @@ namespace Locus
             string mode)
         {
             var roots = scene.GetRootGameObjects();
+            string banner = BuildLiveSourceBanner(scene.isDirty);
 
             if (mode == UnityYamlModeRead)
-                return ReadGameObjectDetail(roots, objectPath, scenePath, options);
+                return PrependBannerUnlessError(banner, ReadGameObjectDetail(roots, objectPath, scenePath, options));
 
             if (mode == UnityYamlModeSearch)
-                return BuildHierarchySearchResults(roots, scenePath, options);
+                return PrependBannerUnlessError(banner, BuildHierarchySearchResults(roots, scenePath, options));
 
-            return BuildHierarchySummary(roots, scenePath, options);
+            return PrependBannerUnlessError(banner, BuildHierarchySummary(roots, scenePath, options));
+        }
+
+        private static string PrependBannerUnlessError(string banner, string output)
+        {
+            if (output == null || output.StartsWith("__ERROR__", StringComparison.Ordinal))
+                return output;
+            return banner + output;
         }
 
         // ───────────────── Prefab reading ─────────────────
@@ -217,26 +260,28 @@ namespace Locus
                 && prefabStage.prefabContentsRoot != null)
             {
                 var stageRoot = prefabStage.prefabContentsRoot;
+                string banner = BuildLiveSourceBanner(prefabStage.scene.isDirty);
                 if (mode == UnityYamlModeRead)
-                    return ReadGameObjectDetail(new[] { stageRoot }, objectPath, prefabPath, options);
+                    return PrependBannerUnlessError(banner, ReadGameObjectDetail(new[] { stageRoot }, objectPath, prefabPath, options));
 
                 if (mode == UnityYamlModeSearch)
-                    return BuildHierarchySearchResults(new[] { stageRoot }, prefabPath, options);
+                    return PrependBannerUnlessError(banner, BuildHierarchySearchResults(new[] { stageRoot }, prefabPath, options));
 
-                return BuildHierarchySummary(new[] { stageRoot }, prefabPath, options);
+                return PrependBannerUnlessError(banner, BuildHierarchySummary(new[] { stageRoot }, prefabPath, options));
             }
 
             var prefabAsset = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
             if (prefabAsset == null)
                 return "__ERROR__: failed to load prefab: " + prefabPath;
 
+            string assetBanner = "[source: live Unity Editor (imported prefab asset)]\n";
             if (mode == UnityYamlModeRead)
-                return ReadGameObjectDetail(new[] { prefabAsset }, objectPath, prefabPath, options);
+                return PrependBannerUnlessError(assetBanner, ReadGameObjectDetail(new[] { prefabAsset }, objectPath, prefabPath, options));
 
             if (mode == UnityYamlModeSearch)
-                return BuildHierarchySearchResults(new[] { prefabAsset }, prefabPath, options);
+                return PrependBannerUnlessError(assetBanner, BuildHierarchySearchResults(new[] { prefabAsset }, prefabPath, options));
 
-            return BuildHierarchySummary(new[] { prefabAsset }, prefabPath, options);
+            return PrependBannerUnlessError(assetBanner, BuildHierarchySummary(new[] { prefabAsset }, prefabPath, options));
         }
 
         // ───────────────── Hierarchy summary ─────────────────
@@ -264,6 +309,12 @@ namespace Locus
             public bool MatchFieldValue;
             public int SerializedFieldMaxDepth = DefaultSerializedFieldMaxDepth;
             public int SerializedMaxArrayItems = DefaultSerializedMaxArrayItems;
+            /// <summary>
+            /// Remaining component-walk allowance for match_fields searches;
+            /// decremented per SerializedObject visit (main-thread work).
+            /// </summary>
+            public int SerializedSearchBudget = 20000;
+            public bool SearchBudgetExhausted;
             public List<string> ComponentFilters = new List<string>();
             public List<string> MatchFieldLabels = new List<string>();
 
@@ -309,9 +360,13 @@ namespace Locus
                 {
                     try
                     {
+                        // MatchTimeout guards the editor main thread against
+                        // catastrophic-backtracking patterns; matching runs
+                        // per node on potentially long field values.
                         options.QueryRegex = new Regex(
                             options.Query.Substring(3),
-                            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
+                            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                            TimeSpan.FromSeconds(2)
                         );
                     }
                     catch
@@ -554,19 +609,10 @@ namespace Locus
             if (!string.IsNullOrEmpty(optionLine))
                 sb.AppendLine(optionLine);
 
-            var boneTransforms = new HashSet<Transform>();
-            if (roots.Length > 1)
-            {
-                foreach (var root in roots)
-                {
-                    foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
-                    {
-                        if (smr.bones == null) continue;
-                        foreach (var bone in smr.bones)
-                            if (bone != null) boneTransforms.Add(bone);
-                    }
-                }
-            }
+            // Bone folding applies to single-root prefabs too — a lone
+            // character prefab is exactly where a 200-node bone tree drowns
+            // the summary.
+            var boneTransforms = CollectBoneTransforms(roots);
 
             sb.AppendLine();
             sb.AppendLine("── Hierarchy ──");
@@ -598,24 +644,30 @@ namespace Locus
             return sb.ToString();
         }
 
+        private static HashSet<Transform> CollectBoneTransforms(GameObject[] roots)
+        {
+            var boneTransforms = new HashSet<Transform>();
+            foreach (var root in roots)
+            {
+                foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    if (smr.bones == null) continue;
+                    foreach (var bone in smr.bones)
+                        if (bone != null) boneTransforms.Add(bone);
+                }
+            }
+            return boneTransforms;
+        }
+
         private static string BuildHierarchySearchResults(
             GameObject[] roots,
             string filePath,
             ReadYamlOptions options)
         {
+            // No bone folding for search: a folded bone subtree has no child
+            // nodes, so anything under it would be unsearchable (false
+            // negatives for bone names / attachments hanging off bones).
             var boneTransforms = new HashSet<Transform>();
-            if (roots.Length > 1)
-            {
-                foreach (var root in roots)
-                {
-                    foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
-                    {
-                        if (smr.bones == null) continue;
-                        foreach (var bone in smr.bones)
-                            if (bone != null) boneTransforms.Add(bone);
-                    }
-                }
-            }
 
             var summaryRoots = BuildHierarchySummaryNodes(roots, boneTransforms);
             if (!string.IsNullOrEmpty(options.PathPrefix))
@@ -648,6 +700,12 @@ namespace Locus
             {
                 sb.AppendLine();
                 sb.AppendLine("... (" + (matches.Count - shown) + " more matches hidden by limit)");
+            }
+
+            if (options.SearchBudgetExhausted)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Note: serialized-field matching stopped early (component budget exhausted); results may be incomplete. Narrow with path_prefix.");
             }
 
             return sb.ToString();
@@ -1007,6 +1065,15 @@ namespace Locus
             List<HierarchySummaryNode> siblings,
             string segment)
         {
+            // Literal names win over ordinal syntax so an object actually
+            // named "Enemy[2]" stays reachable even next to duplicate
+            // "Enemy" siblings.
+            foreach (var node in siblings)
+            {
+                if (node.Name == segment)
+                    return node;
+            }
+
             string name;
             int ordinal;
             if (TryParseIndexedSegment(segment, out name, out ordinal))
@@ -1022,11 +1089,9 @@ namespace Locus
                 }
             }
 
-            foreach (var node in siblings)
-            {
-                if (node.Name == segment)
-                    return node;
-            }
+            string trimmed = segment.Trim();
+            if (trimmed != segment)
+                return FindSummaryNodeInSiblings(siblings, trimmed);
 
             return null;
         }
@@ -1103,7 +1168,16 @@ namespace Locus
                 return false;
 
             if (options.QueryRegex != null)
-                return options.QueryRegex.IsMatch(value);
+            {
+                try
+                {
+                    return options.QueryRegex.IsMatch(value);
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    return false;
+                }
+            }
 
             return ContainsIgnoreCase(value, options.Query.ToLowerInvariant());
         }
@@ -1120,11 +1194,27 @@ namespace Locus
             if (go == null || (!options.MatchFieldName && !options.MatchFieldValue))
                 return false;
 
+            // Field matching walks a SerializedObject per component on the
+            // main thread; on ten-thousand-object scenes an unbounded walk
+            // freezes the editor for the full request. The budget trades
+            // completeness for responsiveness and is reported in the output.
+            if (options.SerializedSearchBudget <= 0)
+            {
+                options.SearchBudgetExhausted = true;
+                return false;
+            }
+
             var components = go.GetComponents<Component>();
             foreach (var comp in components)
             {
                 if (comp == null)
                     continue;
+
+                if (--options.SerializedSearchBudget <= 0)
+                {
+                    options.SearchBudgetExhausted = true;
+                    return false;
+                }
 
                 SerializedObject so;
                 try
@@ -1136,13 +1226,20 @@ namespace Locus
                     continue;
                 }
 
-                var prop = so.GetIterator();
-                bool enterChildren = true;
-                while (prop.NextVisible(enterChildren))
+                try
                 {
-                    enterChildren = false;
-                    if (SerializedPropertyMatchesSearch(prop, options, 0))
-                        return true;
+                    var prop = so.GetIterator();
+                    bool enterChildren = true;
+                    while (prop.NextVisible(enterChildren))
+                    {
+                        enterChildren = false;
+                        if (SerializedPropertyMatchesSearch(prop, options, 0))
+                            return true;
+                    }
+                }
+                finally
+                {
+                    so.Dispose();
                 }
             }
 
@@ -1170,8 +1267,9 @@ namespace Locus
                     return true;
             }
 
-            if (prop.propertyType != SerializedPropertyType.Generic
-                || genericDepth >= options.SerializedFieldMaxDepth)
+            bool recursable = prop.propertyType == SerializedPropertyType.Generic
+                || prop.propertyType == SerializedPropertyType.ManagedReference;
+            if (!recursable || genericDepth >= options.SerializedFieldMaxDepth)
             {
                 return false;
             }
@@ -1470,7 +1568,10 @@ namespace Locus
             sb.AppendLine("  Tag: " + target.tag);
             if (PrefabUtility.IsPartOfAnyPrefab(target))
             {
-                var srcObj = PrefabUtility.GetCorrespondingObjectFromOriginalSource(target);
+                // Direct source, not the original root of the variant chain:
+                // a variant instance should report the variant asset it was
+                // instantiated from.
+                var srcObj = PrefabUtility.GetCorrespondingObjectFromSource(target);
                 if (srcObj != null)
                 {
                     string srcPath = AssetDatabase.GetAssetPath(srcObj);
@@ -1502,16 +1603,18 @@ namespace Locus
                     sb.AppendLine("  Enabled: " + (isEnabled ? "true" : "false"));
                 AppendWorldTransformFields(sb, comp);
 
-                var so = new SerializedObject(comp);
-                var prop = so.GetIterator();
-                bool enterChildren = true;
-
-                while (prop.NextVisible(enterChildren))
+                using (var so = new SerializedObject(comp))
                 {
-                    enterChildren = false;
-                    if (prop.name == "m_Enabled")
-                        continue;
-                    FormatSerializedProperty(sb, prop, 1, options, 0, null);
+                    var prop = so.GetIterator();
+                    bool enterChildren = true;
+
+                    while (prop.NextVisible(enterChildren))
+                    {
+                        enterChildren = false;
+                        if (prop.name == "m_Enabled")
+                            continue;
+                        FormatSerializedProperty(sb, prop, 1, options, 0, null);
+                    }
                 }
             }
 
@@ -1543,27 +1646,53 @@ namespace Locus
             if (grouped.Count == 0)
                 return;
 
+            // Heavily-overridden instance roots (rigged characters) can carry
+            // thousands of PropertyModifications; cap the dump so one section
+            // can't dominate the reply.
+            const int maxPrintedOverrides = 300;
+            int printed = 0;
+            int suppressed = 0;
+
             sb.AppendLine();
             sb.AppendLine("── Prefab Overrides ──");
             foreach (var entry in grouped)
             {
+                if (printed >= maxPrintedOverrides)
+                {
+                    suppressed += entry.Value.Count;
+                    continue;
+                }
+
                 sb.AppendLine();
                 sb.AppendLine("--- " + entry.Key + " ---");
                 foreach (var modification in entry.Value)
                 {
+                    if (printed >= maxPrintedOverrides)
+                    {
+                        suppressed++;
+                        continue;
+                    }
+                    printed++;
+
                     if (modification.objectReference != null)
                     {
                         sb.AppendLine("  " + modification.propertyPath + " = {" + FormatObjectReference(modification.objectReference) + "}");
                     }
                     else if (!string.IsNullOrEmpty(modification.value))
                     {
-                        sb.AppendLine("  " + modification.propertyPath + " = " + modification.value);
+                        sb.AppendLine("  " + modification.propertyPath + " = " + FormatStringForDisplay(modification.value));
                     }
                     else
                     {
                         sb.AppendLine("  " + modification.propertyPath + " = {none}");
                     }
                 }
+            }
+
+            if (suppressed > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  ... (" + suppressed + " more overrides hidden; use detail='prefab_overrides' for the structured disk-side summary)");
             }
         }
 
@@ -1627,7 +1756,10 @@ namespace Locus
                         + (isLast ? "   " : "│  ")
                         + "... ("
                         + hidden
-                        + " child nodes hidden by max_depth)"
+                        // read always shows one child level; max_depth is a
+                        // list-mode option and retrying with it here does
+                        // nothing — point at the actual drill-down instead.
+                        + " descendants; read the child's object_path for detail)"
                     );
             }
         }
@@ -1666,6 +1798,9 @@ namespace Locus
                 case SerializedPropertyType.Generic:
                     FormatGenericSerializedProperty(sb, prop, indentLevel, options, genericDepth, name);
                     break;
+                case SerializedPropertyType.ManagedReference:
+                    FormatManagedReferenceProperty(sb, prop, indentLevel, options, genericDepth, name);
+                    break;
                 case SerializedPropertyType.Integer:
                     sb.AppendLine(indent + name + ": " + prop.intValue);
                     break;
@@ -1676,7 +1811,7 @@ namespace Locus
                     sb.AppendLine(indent + name + ": " + prop.floatValue.ToString("G5"));
                     break;
                 case SerializedPropertyType.String:
-                    sb.AppendLine(indent + name + ": \"" + prop.stringValue + "\"");
+                    sb.AppendLine(indent + name + ": \"" + FormatStringForDisplay(prop.stringValue) + "\"");
                     break;
                 case SerializedPropertyType.Enum:
                     sb.AppendLine(indent + name + ": " + FormatSerializedEnumValue(prop));
@@ -1722,6 +1857,83 @@ namespace Locus
                     sb.AppendLine(indent + name + ": [" + prop.propertyType + "]");
                     break;
             }
+        }
+
+        /// <summary>
+        /// SerializeReference (polymorphic) fields: show the concrete type
+        /// and expand children like a Generic — previously these printed an
+        /// opaque "[ManagedReference]", leaving state machines / ability
+        /// configs unreadable in live mode. Reference cycles are bounded by
+        /// the same depth cap as Generic recursion.
+        /// </summary>
+        private static void FormatManagedReferenceProperty(
+            StringBuilder sb,
+            SerializedProperty prop,
+            int indentLevel,
+            ReadYamlOptions options,
+            int genericDepth,
+            string name)
+        {
+            string indent = new string(' ', indentLevel * 2);
+            string fullTypename = null;
+            try
+            {
+                fullTypename = prop.managedReferenceFullTypename;
+            }
+            catch
+            {
+            }
+
+            if (string.IsNullOrEmpty(fullTypename))
+            {
+                sb.AppendLine(indent + name + ": [SerializeReference] null");
+                return;
+            }
+
+            // "AssemblyName Namespace.Type" → keep the type part.
+            int space = fullTypename.LastIndexOf(' ');
+            string typeName = space >= 0 ? fullTypename.Substring(space + 1) : fullTypename;
+
+            if (genericDepth >= options.SerializedFieldMaxDepth)
+            {
+                sb.AppendLine(
+                    indent + name + ": [SerializeReference: " + typeName
+                    + "] (children hidden by max_field_depth=" + options.SerializedFieldMaxDepth + ")");
+                return;
+            }
+
+            sb.AppendLine(indent + name + ": [SerializeReference: " + typeName + "]");
+            var children = CollectVisibleChildProperties(prop);
+            foreach (var child in children)
+                FormatSerializedProperty(sb, child, indentLevel + 1, options, genericDepth + 1, null);
+        }
+
+        /// <summary>
+        /// Long / multi-line string values: cap the length and escape line
+        /// breaks so a stored blob can't flood the reply or fake the
+        /// "--- Component ---" section structure of this line-oriented format.
+        /// </summary>
+        private static string FormatStringForDisplay(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return value ?? "";
+
+            const int maxChars = 2048;
+            string result = value;
+            bool truncated = false;
+            if (result.Length > maxChars)
+            {
+                result = result.Substring(0, maxChars);
+                truncated = true;
+            }
+            result = result
+                .Replace("\\", "\\\\")
+                .Replace("\r\n", "\\n")
+                .Replace("\n", "\\n")
+                .Replace("\r", "\\n");
+            if (truncated)
+                result += "… (" + value.Length + " chars total)";
+            return result;
         }
 
         private static void FormatGenericSerializedProperty(
@@ -1867,9 +2079,18 @@ namespace Locus
 
         private static GameObject FindGameObjectInSiblings(GameObject[] siblings, string segment)
         {
+            // Literal match first (untrimmed — names with leading/trailing
+            // spaces are real and the ⟦ ⟧ display wrapping exists to expose
+            // them), then ordinal syntax, then a trimmed retry for tolerance.
+            foreach (var go in siblings)
+            {
+                if (go.name == segment)
+                    return go;
+            }
+
             string name;
             int ordinal;
-            if (TryParseIndexedSegment(segment.Trim(), out name, out ordinal))
+            if (TryParseIndexedSegment(segment, out name, out ordinal))
             {
                 int seen = 0;
                 foreach (var go in siblings)
@@ -1882,20 +2103,25 @@ namespace Locus
                 }
             }
 
-            foreach (var go in siblings)
-            {
-                if (go.name == segment.Trim())
-                    return go;
-            }
+            string trimmed = segment.Trim();
+            if (trimmed != segment)
+                return FindGameObjectInSiblings(siblings, trimmed);
 
             return null;
         }
 
         private static GameObject FindGameObjectInSiblings(Transform parent, string segment)
         {
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                var child = parent.GetChild(i).gameObject;
+                if (child.name == segment)
+                    return child;
+            }
+
             string name;
             int ordinal;
-            if (TryParseIndexedSegment(segment.Trim(), out name, out ordinal))
+            if (TryParseIndexedSegment(segment, out name, out ordinal))
             {
                 int seen = 0;
                 for (int i = 0; i < parent.childCount; i++)
@@ -1909,12 +2135,9 @@ namespace Locus
                 }
             }
 
-            for (int i = 0; i < parent.childCount; i++)
-            {
-                var child = parent.GetChild(i).gameObject;
-                if (child.name == segment.Trim())
-                    return child;
-            }
+            string trimmed = segment.Trim();
+            if (trimmed != segment)
+                return FindGameObjectInSiblings(parent, trimmed);
 
             return null;
         }
@@ -1930,7 +2153,7 @@ namespace Locus
             if (PrefabUtility.IsAnyPrefabInstanceRoot(go))
             {
                 count++;
-                var prefabAsset = PrefabUtility.GetCorrespondingObjectFromOriginalSource(go);
+                var prefabAsset = PrefabUtility.GetCorrespondingObjectFromSource(go);
                 if (prefabAsset != null)
                 {
                     string assetPath = AssetDatabase.GetAssetPath(prefabAsset);
@@ -1992,7 +2215,9 @@ namespace Locus
             if (!PrefabUtility.IsPartOfAnyPrefab(go))
                 return null;
 
-            var source = PrefabUtility.GetCorrespondingObjectFromOriginalSource(go);
+            // Direct source keeps variant instances attributed to the variant
+            // asset instead of the base prefab at the bottom of the chain.
+            var source = PrefabUtility.GetCorrespondingObjectFromSource(go);
             if (source == null)
                 return null;
 
@@ -2004,15 +2229,56 @@ namespace Locus
         /// </summary>
         private static string GetHierarchyPath(GameObject go)
         {
+            // Segments carry the same 1-based [n] ordinal as list/search
+            // paths when siblings share a name, so a reference label pasted
+            // into object_path resolves to the same object it labeled.
             var parts = new List<string>();
             Transform t = go.transform;
             while (t != null)
             {
-                parts.Add(t.name);
+                parts.Add(IndexedSegmentForTransform(t));
                 t = t.parent;
             }
             parts.Reverse();
             return string.Join("/", parts);
+        }
+
+        private static string IndexedSegmentForTransform(Transform t)
+        {
+            string name = t.name;
+            int total = 0;
+            int ordinal = 0;
+
+            var parent = t.parent;
+            if (parent != null)
+            {
+                for (int i = 0; i < parent.childCount; i++)
+                {
+                    var sibling = parent.GetChild(i);
+                    if (sibling.name != name)
+                        continue;
+                    total++;
+                    if (sibling == t)
+                        ordinal = total;
+                }
+            }
+            else
+            {
+                var scene = t.gameObject.scene;
+                if (scene.IsValid() && scene.isLoaded)
+                {
+                    foreach (var root in scene.GetRootGameObjects())
+                    {
+                        if (root.name != name)
+                            continue;
+                        total++;
+                        if (root.transform == t)
+                            ordinal = total;
+                    }
+                }
+            }
+
+            return total > 1 && ordinal > 0 ? name + "[" + ordinal + "]" : name;
         }
 
         /// <summary>
@@ -2049,6 +2315,8 @@ namespace Locus
                 parts.Add("Static");
             if (!go.activeSelf)
                 parts.Add("Inactive");
+            if ((go.hideFlags & HideFlags.HideInHierarchy) != 0)
+                parts.Add("Hidden");
             if (go.tag != "Untagged" && !string.IsNullOrEmpty(go.tag))
                 parts.Add("Tag:" + go.tag);
             if (go.layer != 0)

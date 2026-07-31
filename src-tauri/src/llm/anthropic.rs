@@ -35,6 +35,11 @@ pub struct WebSearchHit {
 }
 
 const BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20";
+
+/// Beta flag unlocking `defer_loading`/`tool_reference`. Custom Anthropic
+/// endpoints get it exactly when the request carries native lazy features;
+/// endpoints that key on the header see it, the rest ignore it.
+const NATIVE_LAZY_BETA_FLAG: &str = "advanced-tool-use-2025-11-20";
 const API_VERSION: &str = "2023-06-01";
 const API_BASE: &str = "https://api.anthropic.com";
 
@@ -658,7 +663,6 @@ pub async fn stream_chat_native<F, G, H>(
     history: &[ChatMessage],
     tools: &[serde_json::Value],
     base_url: &str,
-    extra_beta_flags: &[String],
     thinking_level: Option<&str>,
     replay_thinking_blocks: bool,
     include_web_search: bool,
@@ -686,10 +690,12 @@ where
             .http2_keep_alive_timeout(std::time::Duration::from_secs(15)),
     )?;
 
+    let tool_reference_names = tool_reference_names_for_request(tools);
+    let uses_native_lazy_tools = tool_reference_names.is_some();
     let mut messages = build_anthropic_messages(
         history,
         AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks)
-            .with_tool_reference_names(tool_reference_names_for_request(tools)),
+            .with_tool_reference_names(tool_reference_names),
     );
     // No ttl on custom endpoints: the 1h value needs the official
     // `extended-cache-ttl-2025-04-11` beta header, which this path does not
@@ -714,14 +720,19 @@ where
         output_config,
         tools: (!anthropic_tools.is_empty()).then_some(anthropic_tools),
     };
+    // `serde_json::Value` from here on so the strip-and-retry below can
+    // degrade the body in place, mirroring the official-endpoint path.
+    let mut body =
+        serde_json::to_value(&body).map_err(|e| format!("Failed to serialize request: {}", e))?;
 
-    let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+    let mut raw_request =
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
     // Compact body matches the bytes reqwest actually sends (`.json()` serializes
     // compact). Its length shares the same offset scale as the `line 1 column N`
     // position an upstream JSON parser reports, so it is the number to compare
     // against when diagnosing mid-transit truncation (#48).
-    let compact_body = serde_json::to_string(&body).unwrap_or_default();
-    let compact_body_len = compact_body.len();
+    let mut compact_body = serde_json::to_string(&body).unwrap_or_default();
+    let mut compact_body_len = compact_body.len();
 
     eprintln!(
         "[{}] POST model={} messages={} tools={} body_bytes={}",
@@ -733,7 +744,7 @@ where
     );
 
     let api_url = format!("{}/messages", base_url.trim_end_matches('/'));
-    let beta_flags = resolve_native_beta_flags(extra_beta_flags);
+    let beta_flags = uses_native_lazy_tools.then_some(NATIVE_LAZY_BETA_FLAG);
     let session_id = request_header_session_id(request_session_id);
     let client_request_id = uuid::Uuid::new_v4().to_string();
 
@@ -744,8 +755,8 @@ where
             ("x-api-key", "<token>"),
             ("anthropic-version", API_VERSION),
         ];
-        if !beta_flags.trim().is_empty() {
-            debug_headers.push(("anthropic-beta", beta_flags.as_str()));
+        if let Some(flags) = beta_flags {
+            debug_headers.push(("anthropic-beta", flags));
         }
         super::debug::save_request(
             "custom_anthropic_messages",
@@ -759,6 +770,7 @@ where
     const BASE_DELAY_MS: u64 = 1000;
 
     let mut last_error = String::new();
+    let mut retried_native_lazy_strip = false;
 
     for attempt in 0..=MAX_RETRIES {
         let headers = build_claude_code_headers(
@@ -766,7 +778,7 @@ where
             Some(api_key),
             &session_id,
             &client_request_id,
-            (!beta_flags.trim().is_empty()).then_some(beta_flags.as_str()),
+            beta_flags,
             attempt,
         );
         let mut req = client.post(&api_url);
@@ -842,6 +854,31 @@ where
                             path.display()
                         );
                     }
+                }
+
+                // A 400 naming the native lazy surface means this endpoint
+                // does not support `defer_loading`/`tool_reference` after
+                // all. Stripping is semantics-preserving — every deferred
+                // definition becomes an eager one — so the session keeps
+                // working; loud log so the misconfigured toggle is found.
+                if status.as_u16() == 400
+                    && !retried_native_lazy_strip
+                    && attempt < MAX_RETRIES
+                    && body_uses_native_lazy_features(&body)
+                    && error_mentions_native_lazy_features(&error_body)
+                {
+                    eprintln!(
+                        "[{}] HTTP 400 rejected native lazy tool loading, retrying with eager tool declarations: {}",
+                        tag,
+                        utf8_prefix_chars(&error_body, 300)
+                    );
+                    strip_native_lazy_features(&mut body);
+                    raw_request = serde_json::to_string_pretty(&body)
+                        .unwrap_or_else(|_| format!("{:?}", body));
+                    compact_body = serde_json::to_string(&body).unwrap_or_default();
+                    compact_body_len = compact_body.len();
+                    retried_native_lazy_strip = true;
+                    continue;
                 }
 
                 if is_retryable && attempt < MAX_RETRIES {
@@ -2336,10 +2373,6 @@ fn build_oauth_user_id_metadata(
     .to_string()
 }
 
-fn resolve_native_beta_flags(extra_beta_flags: &[String]) -> String {
-    extra_beta_flags.join(",")
-}
-
 fn build_claude_code_headers(
     bearer_token: &str,
     x_api_key: Option<&str>,
@@ -2505,7 +2538,7 @@ mod tests {
     use super::{
         apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
         build_oauth_system_blocks, build_text_blocks, build_thinking_params,
-        convert_tools_to_oauth_sdk_like_anthropic, next_sse_separator, resolve_native_beta_flags,
+        convert_tools_to_oauth_sdk_like_anthropic, next_sse_separator,
         rewrite_oauth_tool_use_blocks, sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions,
         AnthropicMessage, HistoryContentBlock, NativeChatRequest, NativeSystemBlock, ThinkingParam,
         CACHE_TTL,
@@ -2880,12 +2913,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_anthropic_beta_flags_are_explicit() {
-        assert_eq!(resolve_native_beta_flags(&[]), "");
-        assert_eq!(
-            resolve_native_beta_flags(&["interleaved-thinking-2025-05-14".to_string()]),
-            "interleaved-thinking-2025-05-14"
-        );
+    fn native_lazy_beta_flag_is_part_of_the_oauth_beta_set() {
+        // The custom-endpoint path derives its only beta header from this
+        // flag; keep it in lockstep with the official BETA_FLAGS set.
+        assert!(super::BETA_FLAGS.contains(super::NATIVE_LAZY_BETA_FLAG));
     }
 
     #[test]

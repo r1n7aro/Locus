@@ -49,6 +49,7 @@ namespace Locus
         {
             public string target;
             public string windowTitle;
+            public int maxLongEdge = 1280;
         }
 
         [Serializable]
@@ -61,6 +62,13 @@ namespace Locus
             public int height;
             public int originalWidth;
             public int originalHeight;
+            public int sourceWidth;
+            public int sourceHeight;
+            public int outputWidth;
+            public int outputHeight;
+            public int maxLongEdge;
+            public float pixelsPerPoint;
+            public string captureArea;
             public string mimeType;
         }
 

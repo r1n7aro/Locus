@@ -198,12 +198,15 @@ pub(super) fn unity_ref_search() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,
-        execute: Arc::new(|_args, _ctx| {
-            Box::pin(async {
-                ToolResult {
-                    output: "Error: unity_ref_search should be intercepted by agent loop, not executed directly".to_string(),
-                    is_error: true,
-                }
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let Some(app_handle) = ctx.app_handle.as_ref() else {
+                    return ToolResult {
+                        output: "unity_ref_search requires the Locus app context.".to_string(),
+                        is_error: true,
+                    };
+                };
+                crate::agent::instance::AgentInstance::execute_unity_ref_search(app_handle, &args)
             })
         }),
     }
@@ -218,12 +221,15 @@ pub(super) fn unity_asset_search() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,
-        execute: Arc::new(|_args, _ctx| {
-            Box::pin(async {
-                ToolResult {
-                    output: "Error: unity_asset_search should be intercepted by agent loop, not executed directly".to_string(),
-                    is_error: true,
-                }
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let Some(app_handle) = ctx.app_handle.as_ref() else {
+                    return ToolResult {
+                        output: "unity_asset_search requires the Locus app context.".to_string(),
+                        is_error: true,
+                    };
+                };
+                crate::agent::instance::AgentInstance::execute_unity_asset_search(app_handle, &args)
             })
         }),
     }
@@ -238,10 +244,13 @@ pub(super) fn unity_capture_viewport() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,
+        // Stays a stub: the real implementation returns images, which
+        // ToolResult cannot carry. Both the agent loop and the MCP server
+        // call AgentInstance::execute_unity_capture_viewport directly.
         execute: Arc::new(|_args, _ctx| {
             Box::pin(async {
                 ToolResult {
-                    output: "Error: unity_capture_viewport should be intercepted by agent loop, not executed directly".to_string(),
+                    output: "Error: unity_capture_viewport must be executed through the agent loop or the MCP server (its result carries images that ToolResult cannot).".to_string(),
                     is_error: true,
                 }
             })
@@ -251,39 +260,73 @@ pub(super) fn unity_capture_viewport() -> ToolDef {
 
 // ─── Unity YAML tools ────────────────────────────────────────────────────────
 
-fn intercepted_unity_yaml_tool(name: &str, prompt_json: &str) -> ToolDef {
-    let prompt = crate::prompt::parse_tool_prompt(prompt_json);
-    let tool_name = name.to_string();
-    ToolDef {
-        name: tool_name.clone(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        mutates_workspace: false,
-        execute: Arc::new(move |_args, _ctx| {
-            let tool_name = tool_name.clone();
-            Box::pin(async move {
-                ToolResult {
-                    output: format!(
-                        "Error: {} should be intercepted by agent loop, not executed directly",
-                        tool_name
-                    ),
-                    is_error: true,
-                }
-            })
-        }),
-    }
+/// Shared closure body for the three unity_yaml tools: resolve the app
+/// handle + working dir from the execution context, then run the same
+/// implementation the agent loop calls.
+macro_rules! unity_yaml_tool_def {
+    ($name:literal, $prompt:expr, $impl_fn:ident) => {{
+        let prompt = crate::prompt::parse_tool_prompt($prompt);
+        ToolDef {
+            name: $name.to_string(),
+            description: prompt.description,
+            parameters: prompt.parameters,
+            mutates_workspace: false,
+            execute: make_exec(|args, ctx| {
+                Box::pin(async move {
+                    let Some(app_handle) = ctx.app_handle.as_ref() else {
+                        return ToolResult {
+                            output: concat!($name, " requires the Locus app context.").to_string(),
+                            is_error: true,
+                        };
+                    };
+                    let working_dir = match ctx.working_dir {
+                        Some(ref wd) if !wd.trim().is_empty() => wd.trim().to_string(),
+                        _ => {
+                            return ToolResult {
+                                output: concat!(
+                                    "Tool '",
+                                    $name,
+                                    "' requires a selected Unity project working directory."
+                                )
+                                .to_string(),
+                                is_error: true,
+                            };
+                        }
+                    };
+                    crate::agent::instance::AgentInstance::$impl_fn(
+                        app_handle,
+                        &working_dir,
+                        &args,
+                    )
+                    .await
+                })
+            }),
+        }
+    }};
 }
 
 pub(super) fn unity_yaml_list() -> ToolDef {
-    intercepted_unity_yaml_tool("unity_yaml_list", crate::prompt::tools::UNITY_YAML_LIST)
+    unity_yaml_tool_def!(
+        "unity_yaml_list",
+        crate::prompt::tools::UNITY_YAML_LIST,
+        execute_unity_yaml_list
+    )
 }
 
 pub(super) fn unity_yaml_search() -> ToolDef {
-    intercepted_unity_yaml_tool("unity_yaml_search", crate::prompt::tools::UNITY_YAML_SEARCH)
+    unity_yaml_tool_def!(
+        "unity_yaml_search",
+        crate::prompt::tools::UNITY_YAML_SEARCH,
+        execute_unity_yaml_search
+    )
 }
 
 pub(super) fn unity_yaml_read() -> ToolDef {
-    intercepted_unity_yaml_tool("unity_yaml_read", crate::prompt::tools::UNITY_YAML_READ)
+    unity_yaml_tool_def!(
+        "unity_yaml_read",
+        crate::prompt::tools::UNITY_YAML_READ,
+        execute_unity_yaml_read
+    )
 }
 
 // ─── unity_hot_reload ────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@
         "type": "integer",
         "minimum": 1,
         "default": 1000,
-        "description": "Optional limit for the number of hierarchy entries printed. Defaults to 1000. Extra entries are counted and hidden to keep large scenes readable."
+        "description": "Optional limit for the number of hierarchy entries printed. Defaults to 1000 and is clamped to 20000. Extra entries are counted and hidden to keep large scenes readable."
       }
     },
     "required": ["file_path"]

@@ -587,7 +587,7 @@ fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError
         endpoint: provider.endpoint,
         api_format: provider.api_format,
         context_length: model.context_length,
-        beta_flags: model.beta_flags,
+        supports_tool_lazy_loading: model.supports_tool_lazy_loading,
         supported_reasoning_efforts: model.supported_reasoning_efforts,
         reasoning_param_format: model
             .reasoning_param_format
