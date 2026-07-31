@@ -6,6 +6,7 @@ import {
   unitySerializedValueToEditText,
   type UnitySelectOption,
 } from "./unitySerializedValue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 const props = withDefaults(defineProps<{
   modelValue: unknown;
@@ -30,6 +31,9 @@ const emit = defineEmits<{
 }>();
 
 const normalizedOptions = computed(() => normalizeUnityOptions(props.enumOptions));
+const dropdownOptions = computed<DropdownOption[]>(() =>
+  normalizedOptions.value.map((option) => ({ value: option.value, label: option.label })),
+);
 const selectedValue = computed(() => {
   const index = unityEnumIndexValue(props.modelValue, props.enumValueIndex);
   if (index >= 0 && normalizedOptions.value.some((option) => option.index === index || option.value === String(index))) {
@@ -37,10 +41,14 @@ const selectedValue = computed(() => {
   }
   return unitySerializedValueToEditText("Enum", props.modelValue);
 });
+/* Out-of-list values (mixed/unknown enum states) still render as text. */
+const selectedDisplayLabel = computed(() => {
+  const match = dropdownOptions.value.find((option) => option.value === selectedValue.value);
+  return match?.label ?? String(selectedValue.value ?? "");
+});
 
-function update(event: Event) {
+function update(value: string) {
   if (props.disabled || props.readonly) return;
-  const value = (event.target as HTMLSelectElement | null)?.value ?? "";
   const option = normalizedOptions.value.find((item) => item.value === value);
   const next = option && option.index != null
     ? {
@@ -57,54 +65,32 @@ function update(event: Event) {
 </script>
 
 <template>
-  <select
+  <BaseDropdown
     class="unity-enum-field"
-    :value="selectedValue"
+    :model-value="selectedValue"
+    :options="dropdownOptions"
+    :selected-label="selectedDisplayLabel"
     :disabled="disabled || readonly"
     :title="title || undefined"
     :aria-label="ariaLabel || undefined"
-    @change="update"
-  >
-    <option v-for="option in normalizedOptions" :key="option.value" :value="option.value">
-      {{ option.label }}
-    </option>
-  </select>
+    size="sm"
+    menu-align="start"
+    teleport
+    @update:model-value="update"
+  />
 </template>
 
 <style scoped>
 .unity-enum-field {
   width: 100%;
   min-width: 0;
+}
+
+.unity-enum-field :deep(.base-dropdown-trigger) {
+  min-width: 0;
   min-height: 26px;
-  padding: 0 22px 0 7px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background:
-    linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%) right 11px center / 5px 5px no-repeat,
-    linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%) right 7px center / 5px 5px no-repeat,
-    var(--input-bg);
-  color: var(--text-color);
+  padding: 0 7px;
+  background: var(--input-bg);
   font: inherit;
-  box-sizing: border-box;
-  appearance: none;
-}
-
-.unity-enum-field:focus {
-  outline: none;
-  border-color: color-mix(in srgb, var(--text-secondary) 68%, var(--border-color) 32%);
-}
-
-.unity-enum-field option {
-  background: color-mix(in srgb, var(--input-bg) 76%, var(--panel-bg) 24%);
-  color: var(--text-color);
-}
-
-.unity-enum-field option:checked {
-  background: color-mix(in srgb, var(--text-secondary) 36%, var(--input-bg) 64%);
-  color: var(--text-color);
-}
-
-.unity-enum-field:disabled {
-  opacity: 0.65;
 }
 </style>

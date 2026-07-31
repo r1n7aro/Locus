@@ -168,7 +168,11 @@ describe("KnowledgePreview layout", () => {
     const dropdown = read("src/components/ui/BaseDropdown.vue");
 
     expect(dropdown).toContain(':class="[`size-${size}`, { open }]"');
-    expect(dropdown).not.toContain("<Teleport");
+    // BaseDropdown teleport is opt-in and defaults off; the metadata rail
+    // relies on in-place menus plus the :has() z-index raise below.
+    expect(dropdown).toContain("teleport?: boolean");
+    expect(dropdown).toContain("teleport: false");
+    expect(dropdown).toContain('<Teleport to="body" :disabled="!teleport">');
     expect(preview).not.toContain("teleport");
     expect(preview).toMatch(/\.preview-side-rail:has\(\.meta-dropdown\.open\)\s*\{[\s\S]*z-index:\s*20;[\s\S]*overflow:\s*visible;/);
     expect(preview).toMatch(/\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-body,[\s\S]*\.preview-side-rail:has\(\.meta-dropdown\.open\) \.preview-side-rail-panel\s*\{[\s\S]*overflow:\s*visible;/);

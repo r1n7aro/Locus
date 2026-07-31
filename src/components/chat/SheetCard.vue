@@ -4,6 +4,7 @@ import { computed, reactive, ref, watch } from "vue";
 import type { PendingQuestion, SheetField } from "../../types";
 import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 const props = defineProps<{
   question: PendingQuestion;
@@ -40,10 +41,11 @@ function isChanged(field: SheetField): boolean {
   return !field.readonly && (values[field.key] ?? field.value) !== field.value;
 }
 
-function selectOptions(field: SheetField): string[] {
+function selectOptions(field: SheetField): DropdownOption[] {
   const options = field.options ?? [];
   const current = values[field.key] ?? field.value;
-  return options.includes(current) ? options : [current, ...options];
+  const list = options.includes(current) ? options : [current, ...options];
+  return list.map((option) => ({ value: option, label: option }));
 }
 
 function submitConfirm() {
@@ -80,14 +82,17 @@ function submitFeedback() {
         </label>
         <div v-if="field.description" class="sheet-field-desc">{{ field.description }}</div>
         <div v-if="field.readonly" class="sheet-field-readonly">{{ field.value }}</div>
-        <select
+        <BaseDropdown
           v-else-if="(field.options?.length ?? 0) > 0"
-          :id="fieldId(field)"
-          v-model="values[field.key]"
-          class="sheet-field-control sheet-field-select"
-        >
-          <option v-for="option in selectOptions(field)" :key="option" :value="option">{{ option }}</option>
-        </select>
+          class="sheet-field-select"
+          :model-value="values[field.key] ?? field.value"
+          :options="selectOptions(field)"
+          size="md"
+          menu-align="start"
+          teleport
+          :aria-label="field.label"
+          @update:model-value="values[field.key] = $event"
+        />
         <textarea
           v-else-if="field.multiline"
           :id="fieldId(field)"
@@ -215,6 +220,14 @@ function submitFeedback() {
 }
 
 .sheet-field.is-changed .sheet-field-control {
+  border-color: color-mix(in srgb, var(--accent-color) 60%, var(--border-color) 40%);
+}
+
+.sheet-field-select {
+  width: 100%;
+}
+
+.sheet-field.is-changed .sheet-field-select :deep(.base-dropdown-trigger) {
   border-color: color-mix(in srgb, var(--accent-color) 60%, var(--border-color) 40%);
 }
 

@@ -16,6 +16,7 @@ import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 type SuiteStatus = "idle" | "queued" | "running" | "passed" | "failed" | "cancelled";
 type RunState = "idle" | "running" | "passed" | "failed" | "cancelled";
@@ -66,6 +67,10 @@ const installPlugin = ref(true);
 const openUnity = ref(true);
 const forceEditMode = ref(true);
 const typeIndexSampleMode = ref<TypeIndexSampleMode>("sample32");
+const typeIndexSampleOptions = computed<DropdownOption[]>(() => [
+  { value: "sample32", label: t("settings.testing.typeIndexSample32") },
+  { value: "all", label: t("settings.testing.typeIndexSampleAll") },
+]);
 const { copied: outputCopied, copyText: copyOutputText } = useCopyFeedback();
 
 // Stand-alone recompile probe (independent of the suite run above).
@@ -588,10 +593,17 @@ onUnmounted(() => {
       </label>
       <div class="option-row option-select-row">
         <span class="option-text">{{ t("settings.testing.typeIndexSample") }}</span>
-        <select v-model="typeIndexSampleMode" class="sample-select" :disabled="running">
-          <option value="sample32">{{ t("settings.testing.typeIndexSample32") }}</option>
-          <option value="all">{{ t("settings.testing.typeIndexSampleAll") }}</option>
-        </select>
+        <BaseDropdown
+          class="sample-select"
+          :model-value="typeIndexSampleMode"
+          :options="typeIndexSampleOptions"
+          :disabled="running"
+          size="sm"
+          menu-align="end"
+          teleport
+          :aria-label="t('settings.testing.typeIndexSample')"
+          @update:model-value="typeIndexSampleMode = $event as TypeIndexSampleMode"
+        />
       </div>
     </div>
   </div>
@@ -960,18 +972,7 @@ onUnmounted(() => {
 
 .sample-select {
   width: 150px;
-  height: 28px;
-  padding: 0 9px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font-size: 12px;
-  outline: none;
-}
-
-.sample-select:focus {
-  border-color: var(--accent-border);
+  flex-shrink: 0;
 }
 
 @media (max-width: 720px) {

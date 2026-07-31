@@ -5,6 +5,7 @@ import {
   createAnimationFrameResizeObserver,
   type ResizeObserverHandle,
 } from "../../../composables/resizeObserver";
+import BaseDropdown, { type DropdownOption } from "../../ui/BaseDropdown.vue";
 import type { UnityAnimationCurveValue } from "../unitySerializedValue";
 import {
   applyCurveTangentMode,
@@ -254,6 +255,7 @@ const tangentModes: Array<{ id: UnityCurveTangentMode; label: string }> = [
 ];
 
 const wrapModes = ["ClampForever", "Once", "Loop", "PingPong"];
+const wrapModeOptions: DropdownOption[] = wrapModes.map((mode) => ({ value: mode, label: mode }));
 
 function emitChange() {
   emit("change", curveValuePayload(state.value));
@@ -379,10 +381,9 @@ function applyPreset(presetId: string) {
   emitChange();
 }
 
-function setWrapMode(side: "preWrapMode" | "postWrapMode", event: Event) {
+function setWrapMode(side: "preWrapMode" | "postWrapMode", mode: string) {
   if (!editable.value) return;
-  const value = (event.target as HTMLSelectElement | null)?.value || "ClampForever";
-  state.value[side] = value;
+  state.value[side] = mode || "ClampForever";
   emitChange();
 }
 
@@ -555,15 +556,31 @@ onBeforeUnmount(() => {
       <div class="unity-curve-wraps">
         <label class="unity-curve-wrap">
           <span>{{ t("unity.valueEditor.curve.preWrap") }}</span>
-          <select :value="state.preWrapMode" :disabled="!editable" @change="setWrapMode('preWrapMode', $event)">
-            <option v-for="mode in wrapModes" :key="mode" :value="mode">{{ mode }}</option>
-          </select>
+          <BaseDropdown
+            class="unity-curve-wrap-dropdown"
+            :model-value="state.preWrapMode"
+            :options="wrapModeOptions"
+            :disabled="!editable"
+            size="sm"
+            menu-align="start"
+            teleport
+            :aria-label="t('unity.valueEditor.curve.preWrap')"
+            @update:model-value="setWrapMode('preWrapMode', $event)"
+          />
         </label>
         <label class="unity-curve-wrap">
           <span>{{ t("unity.valueEditor.curve.postWrap") }}</span>
-          <select :value="state.postWrapMode" :disabled="!editable" @change="setWrapMode('postWrapMode', $event)">
-            <option v-for="mode in wrapModes" :key="mode" :value="mode">{{ mode }}</option>
-          </select>
+          <BaseDropdown
+            class="unity-curve-wrap-dropdown"
+            :model-value="state.postWrapMode"
+            :options="wrapModeOptions"
+            :disabled="!editable"
+            size="sm"
+            menu-align="start"
+            teleport
+            :aria-label="t('unity.valueEditor.curve.postWrap')"
+            @update:model-value="setWrapMode('postWrapMode', $event)"
+          />
         </label>
         <span class="unity-curve-eval" :title="t('unity.valueEditor.curve.valueAtOne')">
           f(1) = {{ selectedValueAt(1) }}
@@ -778,14 +795,14 @@ onBeforeUnmount(() => {
   font-size: 11px;
 }
 
-.unity-curve-wrap select {
+.unity-curve-wrap-dropdown {
+  width: 118px;
+}
+
+.unity-curve-wrap-dropdown :deep(.base-dropdown-trigger) {
+  min-width: 0;
   min-height: 26px;
-  padding: 0 6px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
   background: var(--input-bg);
-  color: var(--text-color);
-  font: inherit;
   font-size: 11px;
 }
 

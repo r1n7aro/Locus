@@ -185,7 +185,7 @@
     },
     {
       "path": "src/components/unity/UnityEnumField.vue",
-      "bytes": 3071
+      "bytes": 2638
     },
     {
       "path": "src/components/unity/UnityFlagsField.vue",
@@ -217,7 +217,7 @@
     },
     {
       "path": "src/components/unity/UnitySerializedPropertyTree.vue",
-      "bytes": 43431
+      "bytes": 43862
     },
     {
       "path": "src/components/unity/UnityVectorField.vue",
@@ -257,7 +257,7 @@
     },
     {
       "path": "src/components/ui/BaseDropdown.vue",
-      "bytes": 9568
+      "bytes": 14370
     },
     {
       "path": "src/components/ui/BaseSegmented.vue",
@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 242211
+      "bytes": 242128
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 236291
+      "bytes": 236207
     },
     {
       "path": "src/services/asset.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 78279
+      "bytes": 78367
     }
   ]
 }

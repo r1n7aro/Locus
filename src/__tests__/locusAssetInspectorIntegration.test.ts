@@ -181,7 +181,7 @@ describe("Locus asset inspector integration", () => {
     expect(displayPanel).toContain("assetRefClickActionOptions");
     expect(displayPanel).toContain("unityEmbedAssetRefClickActionOptions");
     // Both pickers are dropdowns with a per-option description (hint).
-    expect(displayPanel).toContain('import BaseDropdown from "../ui/BaseDropdown.vue";');
+    expect(displayPanel).toContain('import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";');
     expect(displayPanel).toContain('value: "locusInspectorAuto"');
     expect(displayPanel).toContain('hint: t("settings.display.assetRefClickInspectorAutoDesc")');
     expect(displayPanel).toContain('value: "unityInspector"');

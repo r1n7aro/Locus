@@ -27,6 +27,7 @@ import {
   tryParseUnitySerializedEditValue,
 } from "./unitySerializedValue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import { t } from "../../i18n";
 
 type ArrayDragEdge = "before" | "after";
@@ -183,6 +184,14 @@ const managedTypeOptions = computed<InspectorManagedReferenceTypeOption[]>(() =>
   if (!selected || options.some((option) => option.value === selected.value)) return options;
   return managedTypeQuery.value.trim() ? [...options, selected] : [selected, ...options];
 });
+const managedTypeDropdownOptions = computed<DropdownOption[]>(() => [
+  { value: "", label: t("unity.property.managedType.none") },
+  ...managedTypeOptions.value.map((option) => ({
+    value: option.value,
+    label: option.label,
+    labelStyle: { fontFamily: "var(--font-mono-identifier)" },
+  })),
+]);
 
 watch(selectedManagedType, () => {
   managedTypeQuery.value = "";
@@ -722,10 +731,9 @@ function commitFirstManagedType() {
   if (option) emitCommit(property, property.createManagedReferenceTypeCommit(option).value);
 }
 
-function commitManagedType(event: Event) {
+function commitManagedType(value: string) {
   const property = inspectorProperty.value;
   if (!canEdit.value) return;
-  const value = (event.target as HTMLSelectElement | null)?.value || "";
   if (!property) return;
   const option = property.managedReferenceTypes.find((item) => item.value === value) ?? value;
   emitCommit(property, property.createManagedReferenceTypeCommit(option).value);
@@ -845,18 +853,18 @@ function commitManagedType(event: Event) {
             @input="updateManagedTypeQuery"
             @keydown.enter.prevent="commitFirstManagedType"
           />
-          <select
+          <BaseDropdown
             class="managed-type-select"
-            :value="selectedManagedType"
+            :model-value="selectedManagedType"
+            :options="managedTypeDropdownOptions"
             :disabled="!canEdit"
             :title="inspectorProperty.propertyPath"
-            @change="commitManagedType"
-          >
-            <option value="">{{ t("unity.property.managedType.none") }}</option>
-            <option v-for="option in managedTypeOptions" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
+            size="sm"
+            menu-align="end"
+            teleport
+            :aria-label="inspectorProperty.propertyPath"
+            @update:model-value="commitManagedType"
+          />
         </div>
       </div>
       <div v-if="children.length" class="property-children">
@@ -1102,8 +1110,7 @@ function commitManagedType(event: Event) {
 }
 
 .array-size-input,
-.managed-type-search,
-.managed-type-select {
+.managed-type-search {
   width: 100%;
   min-width: 0;
   min-height: 26px;
@@ -1116,18 +1123,30 @@ function commitManagedType(event: Event) {
   box-sizing: border-box;
 }
 
+.managed-type-select {
+  width: 100%;
+  min-width: 0;
+}
+
+.managed-type-select :deep(.base-dropdown-trigger) {
+  min-width: 0;
+  min-height: 26px;
+  padding: 0 7px;
+  background: var(--input-bg);
+  font: inherit;
+  font-family: var(--font-mono-identifier);
+}
+
 .property-leaf.hide-leaf-label {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.managed-type-search,
-.managed-type-select {
+.managed-type-search {
   font-family: var(--font-mono-identifier);
 }
 
 .array-size-input:focus,
-.managed-type-search:focus,
-.managed-type-select:focus {
+.managed-type-search:focus {
   outline: none;
   border-color: var(--accent-color);
 }
@@ -1281,8 +1300,7 @@ button:focus-visible {
 
 button:disabled,
 .array-size-input:disabled,
-.managed-type-search:disabled,
-.managed-type-select:disabled {
+.managed-type-search:disabled {
   opacity: 0.58;
 }
 

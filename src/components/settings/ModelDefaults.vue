@@ -1,14 +1,11 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { t } from "../../i18n";
 import type { ModelOption, ModelDefaults, AgentInfo } from "../../types";
-import { isProviderVisible, visibleProviderOrder } from "../../config/providerVisibility";
+import { visibleProviderOrder, isProviderVisible } from "../../config/providerVisibility";
 import { formatModelDisplayName } from "../../utils/modelDisplay";
-
-interface ModelGroup {
-  provider: string;
-  label: string;
-  models: ModelOption[];
-}
+import { groupModelsForSelector, modelListEntryName } from "../../utils/modelGrouping";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 const props = defineProps<{
   modelDefaults: ModelDefaults;
@@ -23,33 +20,42 @@ const emit = defineEmits<{
   save: [];
 }>();
 
-function providerLabel(provider: string): string {
-  const labels: Record<string, string> = {
-    openrouter: "OpenRouter",
-    anthropic: t("model.provider.anthropic"),
-    claude_code: t("model.provider.claude_code"),
-    openai_codex: t("model.provider.openai"),
-    custom: t("model.provider.custom"),
-  };
-  return labels[provider] || provider;
+const providerLabels = computed<Record<string, string>>(() => ({
+  openrouter: "OpenRouter",
+  anthropic: t("model.provider.anthropic"),
+  claude_code: t("model.provider.claude_code"),
+  openai_codex: t("model.provider.openai"),
+  custom: t("model.provider.custom"),
+}));
+
+function optionDisplayName(model: ModelOption): string {
+  if (model.provider === "custom") return modelListEntryName(model);
+  return formatModelDisplayName(model.name);
 }
 
-function groupedAllModels(): ModelGroup[] {
-  const map = new Map<string, ModelOption[]>();
-  for (const m of props.allModels) {
-    const list = map.get(m.provider) || [];
-    list.push(m);
-    map.set(m.provider, list);
-  }
-  const groups: ModelGroup[] = [];
-  for (const provider of visibleProviderOrder) {
-    const models = map.get(provider);
-    if (models && models.length > 0) {
-      groups.push({ provider, label: providerLabel(provider), models });
-    }
-  }
-  return groups;
+const modelOptions = computed<DropdownOption[]>(() =>
+  groupModelsForSelector(props.allModels, visibleProviderOrder, providerLabels.value)
+    .flatMap((group) => group.models.map((model) => ({
+      value: model.id,
+      label: optionDisplayName(model),
+      group: group.label,
+    }))),
+);
+
+function optionsWithDefault(defaultLabel: string): DropdownOption[] {
+  return [{ value: "", label: defaultLabel }, ...modelOptions.value];
 }
+
+/** Keeps a stale model id readable instead of collapsing to a blank trigger. */
+function selectedModelLabel(id: string): string {
+  if (!id) return "";
+  const model = props.allModels.find((item) => item.id === id);
+  return model ? optionDisplayName(model) : id;
+}
+
+/** Every agent the task tool can spawn gets a model override slot: top-level
+ *  agents (default first) plus the subagent-only definitions. */
+const spawnableAgents = computed<AgentInfo[]>(() => [...props.agents, ...props.subagents]);
 
 function updateMainModel(value: string) {
   emit("update:modelDefaults", { ...props.modelDefaults, mainModel: value });
@@ -85,12 +91,17 @@ function updateClaudeCodeEnabled(value: boolean) {
         <span class="model-default-label">{{ t("settings.models.main") }}</span>
         <span class="model-default-hint">{{ t("settings.models.mainHint") }}</span>
       </div>
-      <select :value="modelDefaults.mainModel" class="model-select" @change="updateMainModel(($event.target as HTMLSelectElement).value)">
-        <option value="">{{ t("settings.models.mainDefault") }}</option>
-        <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
-        </optgroup>
-      </select>
+      <BaseDropdown
+        class="model-default-dropdown"
+        :model-value="modelDefaults.mainModel"
+        :options="optionsWithDefault(t('settings.models.mainDefault'))"
+        :selected-label="selectedModelLabel(modelDefaults.mainModel)"
+        size="md"
+        menu-align="start"
+        teleport
+        :aria-label="t('settings.models.main')"
+        @update:model-value="updateMainModel"
+      />
     </div>
 
     <div class="model-default-card">
@@ -98,12 +109,17 @@ function updateClaudeCodeEnabled(value: boolean) {
         <span class="model-default-label">{{ t("settings.models.plan") }}</span>
         <span class="model-default-hint">{{ t("settings.models.planHint") }}</span>
       </div>
-      <select :value="modelDefaults.planModel" class="model-select" @change="updatePlanModel(($event.target as HTMLSelectElement).value)">
-        <option value="">{{ t("settings.models.planDefault") }}</option>
-        <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-          <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
-        </optgroup>
-      </select>
+      <BaseDropdown
+        class="model-default-dropdown"
+        :model-value="modelDefaults.planModel"
+        :options="optionsWithDefault(t('settings.models.planDefault'))"
+        :selected-label="selectedModelLabel(modelDefaults.planModel)"
+        size="md"
+        menu-align="start"
+        teleport
+        :aria-label="t('settings.models.plan')"
+        @update:model-value="updatePlanModel"
+      />
     </div>
 
     <div class="model-default-card compact" v-if="claudeCodeVisible">
@@ -124,7 +140,7 @@ function updateClaudeCodeEnabled(value: boolean) {
     <p class="section-desc">{{ t("settings.models.subagentDesc") }}</p>
 
     <div
-      v-for="agent in subagents"
+      v-for="agent in spawnableAgents"
       :key="agent.id"
       class="model-default-card compact"
     >
@@ -133,16 +149,17 @@ function updateClaudeCodeEnabled(value: boolean) {
           <span class="model-default-label">{{ agent.name }}</span>
           <span class="model-default-hint">{{ agent.description }}</span>
         </div>
-        <select
-          :value="modelDefaults.subagentModels[agent.id] || ''"
-          class="model-select inline"
-          @change="updateSubagentModel(agent.id, ($event.target as HTMLSelectElement).value)"
-        >
-          <option value="">{{ t("settings.models.subagentDefault") }}</option>
-          <optgroup v-for="group in groupedAllModels()" :key="group.provider" :label="group.label">
-            <option v-for="m in group.models" :key="m.id" :value="m.id">{{ formatModelDisplayName(m.name) }}</option>
-          </optgroup>
-        </select>
+        <BaseDropdown
+          class="model-default-dropdown inline"
+          :model-value="modelDefaults.subagentModels[agent.id] || ''"
+          :options="optionsWithDefault(t('settings.models.subagentDefault'))"
+          :selected-label="selectedModelLabel(modelDefaults.subagentModels[agent.id] || '')"
+          size="md"
+          menu-align="end"
+          teleport
+          :aria-label="agent.name"
+          @update:model-value="updateSubagentModel(agent.id, $event)"
+        />
       </div>
     </div>
   </div>

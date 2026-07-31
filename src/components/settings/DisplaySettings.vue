@@ -12,7 +12,7 @@ import {
   setViewWindowsAboveMain,
 } from "../../services/system";
 import { useNotificationStore } from "../../stores/notification";
-import BaseDropdown from "../ui/BaseDropdown.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
@@ -105,6 +105,15 @@ const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
 ];
 
 const systemFonts = ref<string[]>([]);
+
+const fontOptions = computed<DropdownOption[]>(() => [
+  { value: "", label: t("settings.display.fontDefault") },
+  ...systemFonts.value.map((name) => ({
+    value: name,
+    label: name,
+    labelStyle: { fontFamily: name },
+  })),
+]);
 
 onMounted(async () => {
   void refreshViewOpenInExistingWindow();
@@ -441,19 +450,16 @@ async function updateViewWindowsAboveMain(value: boolean) {
     <div class="font-grid">
       <template v-for="f in fontSlots" :key="f.slot">
         <label class="font-label">{{ t(f.labelKey) }}</label>
-        <select
+        <BaseDropdown
           class="font-select"
-          :value="display.fonts[f.slot]"
-          @change="setFont(f.slot, ($event.target as HTMLSelectElement).value)"
-        >
-          <option value="">{{ t("settings.display.fontDefault") }}</option>
-          <option
-            v-for="name in systemFonts"
-            :key="name"
-            :value="name"
-            :style="{ fontFamily: name }"
-          >{{ name }}</option>
-        </select>
+          :model-value="display.fonts[f.slot]"
+          :options="fontOptions"
+          size="md"
+          menu-align="start"
+          teleport
+          :aria-label="t(f.labelKey)"
+          @update:model-value="setFont(f.slot, $event)"
+        />
       </template>
     </div>
   </div>
@@ -545,18 +551,5 @@ async function updateViewWindowsAboveMain(value: boolean) {
 .font-select {
   width: 100%;
   min-width: 0;
-  padding: 5px 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 5px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font-size: 13px;
-  outline: none;
-  cursor: pointer;
-  transition: border-color 0.15s;
-}
-
-.font-select:focus {
-  border-color: var(--accent-color);
 }
 </style>

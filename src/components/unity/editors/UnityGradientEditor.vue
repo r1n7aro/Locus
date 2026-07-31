@@ -2,6 +2,12 @@
 import { computed, ref, shallowRef, watch } from "vue";
 import { t } from "../../../i18n";
 import type { UnityGradientValue } from "../unitySerializedValue";
+import BaseDropdown, { type DropdownOption } from "../../ui/BaseDropdown.vue";
+
+const gradientModeOptions: DropdownOption[] = [
+  { value: "Blend", label: "Blend" },
+  { value: "Fixed", label: "Fixed" },
+];
 
 const props = withDefaults(defineProps<{
   value: UnityGradientValue | null;
@@ -299,10 +305,9 @@ function commitSelectedLocation(event: Event) {
   emitChange();
 }
 
-function setMode(event: Event) {
+function setMode(mode: string) {
   if (!editable.value) return;
-  const value = (event.target as HTMLSelectElement | null)?.value === "Fixed" ? "Fixed" : "Blend";
-  state.value.mode = value;
+  state.value.mode = mode === "Fixed" ? "Fixed" : "Blend";
   emitChange();
 }
 
@@ -401,10 +406,17 @@ function alphaSwatchStyle(stop: GradientAlphaStop) {
       </button>
       <label class="unity-gradient-field unity-gradient-mode">
         <span>{{ t("unity.valueEditor.gradient.mode") }}</span>
-        <select :value="state.mode" :disabled="!editable" @change="setMode">
-          <option value="Blend">Blend</option>
-          <option value="Fixed">Fixed</option>
-        </select>
+        <BaseDropdown
+          class="unity-gradient-mode-dropdown"
+          :model-value="state.mode"
+          :options="gradientModeOptions"
+          :disabled="!editable"
+          size="sm"
+          menu-align="end"
+          teleport
+          :aria-label="t('unity.valueEditor.gradient.mode')"
+          @update:model-value="setMode"
+        />
       </label>
     </div>
   </div>
@@ -533,14 +545,14 @@ function alphaSwatchStyle(stop: GradientAlphaStop) {
   cursor: default;
 }
 
-.unity-gradient-mode select {
+.unity-gradient-mode-dropdown {
+  width: 96px;
+}
+
+.unity-gradient-mode-dropdown :deep(.base-dropdown-trigger) {
+  min-width: 0;
   min-height: 26px;
-  padding: 0 6px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
   background: var(--input-bg);
-  color: var(--text-color);
-  font: inherit;
   font-size: 11px;
 }
 </style>

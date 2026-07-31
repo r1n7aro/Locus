@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch, type CSSProperties } from "vue";
 
 export interface DropdownOption {
   value: string;
   label: string;
   hint?: string;
   disabled?: boolean;
+  /** Section header; consecutive options sharing a group render under one header. */
+  group?: string;
+  /** Inline style for the option label (e.g. font preview). */
+  labelStyle?: CSSProperties;
 }
 
 const props = withDefaults(defineProps<{
@@ -17,6 +21,9 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   ariaLabel?: string;
   disabled?: boolean;
+  /** Render the menu on <body> with fixed positioning so it escapes
+   *  overflow-clipping ancestors (scroll containers, embedded panels). */
+  teleport?: boolean;
 }>(), {
   selectedLabel: "",
   size: "sm",
@@ -24,6 +31,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   ariaLabel: "",
   disabled: false,
+  teleport: false,
 });
 
 const emit = defineEmits<{
@@ -36,6 +44,7 @@ const rootRef = ref<HTMLElement | null>(null);
 const triggerRef = ref<HTMLButtonElement | null>(null);
 const listboxRef = ref<HTMLElement | null>(null);
 const activeIndex = ref(-1);
+const menuFixedStyle = ref<CSSProperties>({});
 const listboxId = `dropdown-${Math.random().toString(36).slice(2, 10)}`;
 
 const selectedOption = computed(() =>
@@ -46,6 +55,12 @@ const activeDescendant = computed(() => {
   const option = props.options[activeIndex.value];
   return option ? `${listboxId}-option-${option.value}` : undefined;
 });
+
+function isGroupStart(index: number): boolean {
+  const option = props.options[index];
+  if (!option?.group) return false;
+  return index === 0 || props.options[index - 1]?.group !== option.group;
+}
 
 function toggleOpen() {
   if (props.disabled) return;
@@ -72,9 +87,10 @@ function select(value: string, disabled?: boolean) {
 }
 
 function onDocumentClick(event: MouseEvent) {
-  if (rootRef.value && !rootRef.value.contains(event.target as Node)) {
-    close();
-  }
+  const target = event.target as Node;
+  if (rootRef.value?.contains(target)) return;
+  if (listboxRef.value?.contains(target)) return;
+  close();
 }
 
 function focusOptionAt(index: number) {
@@ -103,13 +119,90 @@ function moveActive(step: 1 | -1) {
   activeIndex.value = enabledIndexes[nextPos];
 }
 
+// Keep in sync with the .base-dropdown-menu max-height rule below.
+const MENU_MAX_HEIGHT = 420;
+const MENU_GAP = 6;
+const MENU_MARGIN = 8;
+
+function repositionMenu() {
+  if (!props.teleport) return;
+  const trigger = triggerRef.value;
+  const menu = listboxRef.value;
+  if (!trigger || !menu) return;
+  const rect = trigger.getBoundingClientRect();
+  const viewport = { width: window.innerWidth, height: window.innerHeight };
+
+  // The menu never renders narrower than the trigger (minWidth below), so
+  // horizontal math must use the floored width, not the raw measurement.
+  const menuWidth = Math.max(menu.getBoundingClientRect().width, rect.width);
+  const borderChrome = menu.offsetHeight - menu.clientHeight;
+  const desiredHeight = Math.min(menu.scrollHeight + borderChrome, MENU_MAX_HEIGHT);
+
+  // Pick the roomier side and shrink the menu into it instead of letting it
+  // cover the trigger or run past the viewport edge.
+  const spaceBelow = viewport.height - rect.bottom - MENU_GAP - MENU_MARGIN;
+  const spaceAbove = rect.top - MENU_GAP - MENU_MARGIN;
+  const placeBelow = spaceBelow >= desiredHeight || spaceBelow >= spaceAbove;
+  const maxHeight = Math.max(80, Math.min(desiredHeight, placeBelow ? spaceBelow : spaceAbove));
+  const height = Math.min(desiredHeight, maxHeight);
+  const top = placeBelow ? rect.bottom + MENU_GAP : rect.top - MENU_GAP - height;
+
+  const rawLeft = props.menuAlign === "end" ? rect.right - menuWidth : rect.left;
+  const maxLeft = Math.max(MENU_MARGIN, viewport.width - menuWidth - MENU_MARGIN);
+  const left = Math.min(Math.max(rawLeft, MENU_MARGIN), maxLeft);
+
+  menuFixedStyle.value = {
+    position: "fixed",
+    top: `${Math.max(MENU_MARGIN, top)}px`,
+    left: `${left}px`,
+    minWidth: `${rect.width}px`,
+    maxHeight: `${maxHeight}px`,
+  };
+}
+
+function onWindowScroll(event: Event) {
+  if (!open.value) return;
+  const target = event.target as Node | null;
+  if (target && listboxRef.value && target !== (document as unknown as Node) && listboxRef.value.contains(target)) {
+    return;
+  }
+  repositionMenu();
+}
+
+function onWindowResize() {
+  if (open.value) repositionMenu();
+}
+
 function openMenu() {
   const wasOpen = open.value;
   open.value = true;
   activeIndex.value = selectedEnabledIndex();
+  if (props.teleport) {
+    const triggerWidth = triggerRef.value?.getBoundingClientRect().width ?? 0;
+    menuFixedStyle.value = {
+      position: "fixed",
+      top: "0px",
+      left: "0px",
+      minWidth: `${triggerWidth}px`,
+      visibility: "hidden",
+    };
+    nextTick(() => {
+      repositionMenu();
+      scrollActiveIntoView();
+    });
+  } else {
+    nextTick(scrollActiveIntoView);
+  }
   if (!wasOpen) {
     emit("open");
   }
+}
+
+function scrollActiveIntoView() {
+  if (!open.value) return;
+  const option = props.options[activeIndex.value];
+  if (!option) return;
+  document.getElementById(`${listboxId}-option-${option.value}`)?.scrollIntoView({ block: "nearest" });
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -156,12 +249,29 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+watch(activeIndex, () => {
+  if (open.value) nextTick(scrollActiveIntoView);
+});
+
+watch(open, (isOpen) => {
+  if (!props.teleport) return;
+  if (isOpen) {
+    window.addEventListener("scroll", onWindowScroll, true);
+    window.addEventListener("resize", onWindowResize);
+  } else {
+    window.removeEventListener("scroll", onWindowScroll, true);
+    window.removeEventListener("resize", onWindowResize);
+  }
+});
+
 onMounted(() => {
   document.addEventListener("click", onDocumentClick, true);
 });
 
 onUnmounted(() => {
   document.removeEventListener("click", onDocumentClick, true);
+  window.removeEventListener("scroll", onWindowScroll, true);
+  window.removeEventListener("resize", onWindowResize);
 });
 </script>
 
@@ -184,35 +294,39 @@ onUnmounted(() => {
       <span class="base-dropdown-chevron" :class="{ open }">&#9662;</span>
     </button>
 
-    <Transition name="dropdown">
-      <div
-        v-if="open"
-        :id="listboxId"
-        ref="listboxRef"
-        class="base-dropdown-menu"
-        :class="[`align-${menuAlign}`]"
-        role="listbox"
-        tabindex="-1"
-      >
-        <button
-          v-for="(option, index) in options"
-          :key="option.value"
-          :id="`${listboxId}-option-${option.value}`"
-          type="button"
-          class="base-dropdown-item"
-          :class="{ active: modelValue === option.value, focused: activeIndex === index }"
-          role="option"
-          :aria-selected="modelValue === option.value"
-          :disabled="option.disabled"
-          @click="select(option.value, option.disabled)"
-          @focus="focusOptionAt(index)"
-          @mousemove="focusOptionAt(index)"
+    <Teleport to="body" :disabled="!teleport">
+      <Transition name="dropdown">
+        <div
+          v-if="open"
+          :id="listboxId"
+          ref="listboxRef"
+          class="base-dropdown-menu"
+          :class="[`align-${menuAlign}`, `size-${size}`, { teleported: teleport }]"
+          :style="teleport ? menuFixedStyle : undefined"
+          role="listbox"
+          tabindex="-1"
         >
-          <span class="base-dropdown-item-label">{{ option.label }}</span>
-          <span v-if="option.hint" class="base-dropdown-item-hint">{{ option.hint }}</span>
-        </button>
-      </div>
-    </Transition>
+          <template v-for="(option, index) in options" :key="option.value">
+            <div v-if="isGroupStart(index)" class="base-dropdown-group-label">{{ option.group }}</div>
+            <button
+              :id="`${listboxId}-option-${option.value}`"
+              type="button"
+              class="base-dropdown-item"
+              :class="{ active: modelValue === option.value, focused: activeIndex === index }"
+              role="option"
+              :aria-selected="modelValue === option.value"
+              :disabled="option.disabled"
+              @click="select(option.value, option.disabled)"
+              @focus="focusOptionAt(index)"
+              @mousemove="focusOptionAt(index)"
+            >
+              <span class="base-dropdown-item-label" :style="option.labelStyle">{{ option.label }}</span>
+              <span v-if="option.hint" class="base-dropdown-item-hint">{{ option.hint }}</span>
+            </button>
+          </template>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -274,9 +388,13 @@ onUnmounted(() => {
 .base-dropdown-menu {
   position: absolute;
   top: calc(100% + 6px);
+  box-sizing: border-box;
   min-width: max(220px, 100%);
   width: max-content;
   max-width: min(720px, calc(100vw - 32px));
+  /* 420 mirrors MENU_MAX_HEIGHT in the script. */
+  max-height: min(420px, calc(100vh - 24px));
+  overflow-y: auto;
   padding: 4px;
   border: 1px solid var(--border-color);
   border-radius: 10px;
@@ -291,6 +409,30 @@ onUnmounted(() => {
 
 .base-dropdown-menu.align-end {
   right: 0;
+}
+
+.base-dropdown-menu.teleported {
+  min-width: 0;
+  left: auto;
+  right: auto;
+  top: auto;
+  z-index: 2000;
+}
+
+.base-dropdown-group-label {
+  padding: 6px 10px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.base-dropdown-group-label:not(:first-child) {
+  margin-top: 4px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 8px;
 }
 
 .base-dropdown-item {
@@ -354,7 +496,7 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
-.size-sm .base-dropdown-item {
+.base-dropdown-menu.size-sm .base-dropdown-item {
   padding: 8px 10px;
 }
 
@@ -364,7 +506,7 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
-.size-md .base-dropdown-item {
+.base-dropdown-menu.size-md .base-dropdown-item {
   padding: 9px 12px;
 }
 
