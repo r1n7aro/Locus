@@ -157,6 +157,8 @@ pub struct SessionRuntimeSnapshot {
     pub thinking_duration: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_questions: Vec<PendingQuestion>,
     #[serde(default)]
     pub pending_tool_confirms: Vec<PendingToolConfirm>,
     #[serde(default)]

@@ -238,6 +238,7 @@ fn fallback_runtime_snapshot(session_id: &str, run_id: &str) -> SessionRuntimeSn
         is_thinking: false,
         thinking_duration: 0,
         pending_question: None,
+        pending_questions: Vec::new(),
         pending_tool_confirms: Vec::new(),
         is_compacting: false,
     }

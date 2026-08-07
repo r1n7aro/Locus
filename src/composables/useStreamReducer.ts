@@ -21,7 +21,7 @@ export interface StreamState {
   tokenUsage: TokenUsage;
   todos: TodoItem[];
   showTodoPanel: boolean;
-  pendingQuestion: PendingQuestion | null;
+  pendingQuestions: PendingQuestion[];
   pendingToolConfirms: PendingToolConfirm[];
   undoableMessageIds: Set<string>;
 }
@@ -56,7 +56,7 @@ export type StreamMutation =
   | { type: "clearPendingInputs" }
   | { type: "clearPendingInput"; questionId: string }
   | { type: "updateUsage"; usage: TokenUsage }
-  | { type: "setQuestion"; question: PendingQuestion | null }
+  | { type: "enqueueQuestion"; question: PendingQuestion }
   | { type: "enqueueToolConfirm"; confirm: PendingToolConfirm }
   | { type: "addUndoable"; messageId: string }
   | { type: "setTodos"; runId: string; todos: TodoItem[] }
@@ -733,7 +733,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
 
     case "askUser":
       mutations.push({
-        type: "setQuestion",
+        type: "enqueueQuestion",
         question: {
           questionId: event.questionId,
           toolCallId: event.toolCallId,
