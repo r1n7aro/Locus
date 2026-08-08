@@ -108,6 +108,32 @@ export function currentUnityEmbedWindowId(): string | null {
   }
 }
 
+export function getUnityEmbedEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_unity_embed_enabled");
+}
+
+export function setUnityEmbedEnabled(value: boolean): Promise<boolean> {
+  return ipcInvoke<boolean>("set_unity_embed_enabled", { value });
+}
+
+export interface UnityTestToolsWorkspaceStatus {
+  enabled: boolean;
+  packageInstalled: boolean;
+  available: boolean;
+}
+
+export function getUnityTestToolsWorkspaceStatus(): Promise<UnityTestToolsWorkspaceStatus> {
+  return ipcInvoke<UnityTestToolsWorkspaceStatus>("get_unity_test_tools_workspace_status");
+}
+
+export function setUnityTestToolsWorkspaceEnabled(
+  value: boolean,
+): Promise<UnityTestToolsWorkspaceStatus> {
+  return ipcInvoke<UnityTestToolsWorkspaceStatus>("set_unity_test_tools_workspace_enabled", {
+    value,
+  });
+}
+
 export function openUnityEmbeddedFrontendWindow(
   request: UnityEmbeddedFrontendWindowRequest,
 ): Promise<UnityEmbeddedFrontendWindowResult> {
@@ -230,6 +256,23 @@ export interface UnityConsoleTextPayload {
   entries?: UnityEmbedTextDropEntry[];
   title?: string;
   source?: string;
+}
+
+const UNITY_CONSOLE_ERROR_LEVEL_MARKERS = ["error", "assert", "exception", "fatal"] as const;
+
+export function isUnityConsoleErrorLevel(level: string | null | undefined): boolean {
+  const normalized = level?.trim().toLowerCase() ?? "";
+  return UNITY_CONSOLE_ERROR_LEVEL_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+export function filterUnityConsoleErrorPayload(
+  payload: UnityConsoleTextPayload,
+): UnityConsoleTextPayload {
+  return {
+    ...payload,
+    text: "",
+    entries: (payload.entries ?? []).filter((entry) => isUnityConsoleErrorLevel(entry.level)),
+  };
 }
 
 export interface LocusFileDropRef {
@@ -380,6 +423,7 @@ export interface WorkspaceFilePreview {
 export function previewWorkspaceFile(
   filePath: string,
   line?: number,
+  full = false,
 ): Promise<WorkspaceFilePreview> {
-  return ipcInvoke<WorkspaceFilePreview>("preview_workspace_file", { filePath, line });
+  return ipcInvoke<WorkspaceFilePreview>("preview_workspace_file", { filePath, line, full });
 }
