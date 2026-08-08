@@ -4,18 +4,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { openPath } from "@tauri-apps/plugin-opener";
-import type { ApiFormat, CodexModelConfig, CustomProvider, GitProbeResult, ModelCatalogModel, ModelCatalogProvider, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
+import type { CodexModelConfig, CustomProvider, GitProbeResult, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
 import { t, setLocale, locale, type Locale } from "../i18n";
 import { useTheme, type ThemePreference } from "../composables/useTheme";
 import { useSettingsState } from "../composables/useSettingsState";
 import { normalizeAppError } from "../services/errors";
-import {
-  customEndpointTestDetail as formatCustomEndpointTestDetail,
-  customEndpointTestHtmlPath as extractCustomEndpointTestHtmlPath,
-} from "../services/customEndpointTestResult";
-import ModelCatalogPicker from "./settings/ModelCatalogPicker.vue";
-import { applyCatalogSelection } from "../services/modelCatalog";
 import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
@@ -23,9 +16,9 @@ import { setWorkingDir, getWorkingDir } from "../services/project";
 import { checkUnityPlugin, checkUnityPluginInstallPlan, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
 import { assetDbScanStart } from "../services/asset";
-import BaseDropdown from "./ui/BaseDropdown.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import GitMissingHelp from "./git/GitMissingHelp.vue";
+import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import {
   canInitOnboardingGit,
   resolveOnboardingGitInitTargetPath,
@@ -104,8 +97,6 @@ function emitSettingsState(
 }
 
 const {
-  errorMsg: settingsErrorMsg,
-  successMsg: settingsSuccessMsg,
   codexStep: settingsCodexStep,
   codexStatus: settingsCodexStatus,
   codexUserCode: settingsCodexUserCode,
@@ -117,6 +108,7 @@ const {
   requestCodexLogin: settingsRequestCodexLogin,
   customProviders: settingsCustomProviders,
   editingCustomProvider: settingsEditingProvider,
+  isAddingCustomProvider: settingsIsAddingProvider,
   customProviderSaving: settingsCustomProviderSaving,
   testStatus: settingsEndpointTestStatus,
   testResult: settingsEndpointTestResult,
@@ -129,38 +121,14 @@ const {
   startEditCustomProvider: settingsStartEditProvider,
   cancelEditCustomProvider: settingsCancelEditProvider,
   saveCustomProvider: settingsSaveProvider,
-  deleteCustomProvider: settingsDeleteProvider,
   testCustomProvider: settingsTestProvider,
 } = useSettingsState(emitSettingsState);
 
-const authExpanded = ref<"custom" | "codex" | null>("custom");
+const authExpanded = ref<"codex" | null>(null);
 const customEndpointConfigured = computed(() => settingsCustomProviders.value.length > 0);
 const codexConfigured = computed(() =>
   settingsCodexStatus.value.authenticated || settingsCodexStep.value === "success",
 );
-const editingProviderModels = computed(() =>
-  (settingsEditingProvider.value?.models ?? []).filter((m) => m.apiModel.trim()),
-);
-const customEndpointReady = computed(() => {
-  const provider = settingsEditingProvider.value;
-  return !!provider?.name.trim() && !!provider.endpoint.trim()
-    && editingProviderModels.value.length > 0;
-});
-const customEndpointTestReady = computed(() => {
-  const provider = settingsEditingProvider.value;
-  return !!provider && !!provider.endpoint.trim() && editingProviderModels.value.length > 0;
-});
-const customEndpointTestDetail = computed(() =>
-  formatCustomEndpointTestDetail(settingsEndpointTestResult.value),
-);
-const customEndpointTestHtmlPath = computed(() =>
-  extractCustomEndpointTestHtmlPath(settingsEndpointTestResult.value),
-);
-const customApiFormatOptions = computed(() => [
-  { value: "openai_chat" as ApiFormat, label: t("settings.custom.formatOpenaiChat") },
-  { value: "openai_responses" as ApiFormat, label: t("settings.custom.formatOpenaiResponses") },
-  { value: "anthropic_messages" as ApiFormat, label: t("settings.custom.formatAnthropicMessages") },
-]);
 
 async function handleSettingsAuthChanged() {
   await authStore.loadProviderStatus();
@@ -168,60 +136,17 @@ async function handleSettingsAuthChanged() {
   modelStore.resolveSelectedModel(true);
 }
 
-function toggleAuthProvider(provider: "custom" | "codex") {
-  authExpanded.value = authExpanded.value === provider ? null : provider;
-  if (provider === "custom" && authExpanded.value === "custom") {
-    void settingsLoadModelCatalog();
-    if (settingsCustomProviders.value.length === 0 && !settingsEditingProvider.value) {
-      settingsStartAddProvider();
-    }
+function openCustomProviderConfiguration() {
+  const provider = settingsCustomProviders.value[0];
+  if (provider) {
+    settingsStartEditProvider(provider);
+    return;
   }
+  settingsStartAddProvider();
 }
 
-function updateInlineEndpointApiFormat(value: string) {
-  if (!settingsEditingProvider.value) return;
-  settingsEditingProvider.value.apiFormat = value as ApiFormat;
-  for (const model of settingsEditingProvider.value.models) {
-    model.reasoningParamFormat = null; // re-derived from the new format on save
-  }
-}
-
-function handleInlineEndpointKeydown(e: KeyboardEvent) {
-  if (settingsCustomProviderSaving.value) return;
-  if (e.key === "Enter") {
-    e.preventDefault();
-    void settingsSaveProvider();
-  } else if (e.key === "Escape") {
-    settingsCancelEditProvider();
-  }
-}
-
-function handleOnboardingCatalogSelect(
-  providerId: string,
-  catalogProvider: ModelCatalogProvider,
-  modelId: string,
-  model: ModelCatalogModel,
-) {
-  if (!settingsEditingProvider.value) return;
-  applyCatalogSelection(settingsEditingProvider.value, providerId, catalogProvider, modelId, model);
-}
-
-function removeEditingProviderModel(index: number) {
-  settingsEditingProvider.value?.models.splice(index, 1);
-}
-
-async function openCustomEndpointTestHtml() {
-  if (!customEndpointTestHtmlPath.value) return;
-  try {
-    await openPath(customEndpointTestHtmlPath.value);
-  } catch (e) {
-    const err = normalizeAppError(e);
-    settingsEndpointTestResult.value = t(
-      "settings.custom.openTestHtmlFailed",
-      customEndpointTestHtmlPath.value,
-      err.message,
-    );
-  }
+function toggleCodexProvider() {
+  authExpanded.value = authExpanded.value === "codex" ? null : "codex";
 }
 
 const projectPath = ref("");
@@ -478,12 +403,6 @@ async function startScan() {
 }
 
 watch(step, async (s) => {
-  if (s === 1 && authExpanded.value === "custom") {
-    void settingsLoadModelCatalog();
-    if (settingsCustomProviders.value.length === 0 && !settingsEditingProvider.value) {
-      settingsStartAddProvider();
-    }
-  }
   if (s === 3) {
     await checkPlugin();
     if (!unlistenPlugin) {
@@ -494,19 +413,6 @@ watch(step, async (s) => {
   }
   if (s === 4) await checkGit();
 });
-
-watch(
-  () => [step.value, authExpanded.value, settingsCustomProviders.value.length] as const,
-  ([s, expanded, providerCount]) => {
-    if (s === 1 && expanded === "custom") {
-      void settingsLoadModelCatalog();
-      if (providerCount === 0 && !settingsEditingProvider.value) {
-        settingsStartAddProvider();
-      }
-    }
-  },
-  { immediate: true },
-);
 
 function scanProgressText(): string {
   if (!scanPhase.value) return "";
@@ -626,216 +532,32 @@ onUnmounted(() => {
       </div>
 
       <div class="provider-list">
-        <div class="provider-card" :class="{ expanded: authExpanded === 'custom' }">
-          <div class="provider-header" @click="toggleAuthProvider('custom')">
-            <div class="provider-left">
+        <div class="provider-card">
+          <button
+            class="provider-header"
+            type="button"
+            @click="openCustomProviderConfiguration"
+          >
+            <span class="provider-left">
               <span class="provider-name">{{ t("onboarding.auth.customEndpoint") }}</span>
               <span class="provider-desc-text">{{ t("onboarding.auth.customEndpointDesc") }}</span>
-            </div>
+            </span>
             <span class="provider-badge" :class="{ configured: customEndpointConfigured }">
               {{ customEndpointConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
             </span>
-          </div>
-          <div v-if="authExpanded === 'custom'" class="provider-body custom-endpoint-body" @click.stop>
-            <div v-if="settingsSuccessMsg" class="msg success">{{ settingsSuccessMsg }}</div>
-            <div v-if="settingsErrorMsg" class="msg error">{{ settingsErrorMsg }}</div>
-
-            <div
-              v-if="settingsCustomProviders.length > 0 && !settingsEditingProvider"
-              class="custom-endpoints-inline-list"
-            >
-              <div
-                v-for="cp in settingsCustomProviders"
-                :key="cp.id"
-                class="custom-endpoint-summary"
-              >
-                <div class="custom-endpoint-summary-main">
-                  <span class="custom-endpoint-summary-name">{{ cp.name }}</span>
-                  <span class="custom-endpoint-summary-meta">
-                    {{ cp.models.map((m) => m.apiModel).filter(Boolean).slice(0, 3).join(", ") }}
-                  </span>
-                </div>
-                <div class="custom-endpoint-summary-actions">
-                  <button
-                    class="ob-btn secondary small"
-                    type="button"
-                    :disabled="settingsCustomProviderSaving"
-                    @click="settingsStartEditProvider(cp)"
-                  >
-                    {{ t("settings.custom.edit") }}
-                  </button>
-                  <button
-                    class="ob-btn secondary small"
-                    type="button"
-                    :disabled="settingsCustomProviderSaving"
-                    @click="settingsDeleteProvider(cp.id)"
-                  >
-                    {{ t("settings.custom.delete") }}
-                  </button>
-                </div>
-              </div>
-              <button
-                class="ob-btn secondary"
-                type="button"
-                :disabled="settingsCustomProviderSaving"
-                @click="settingsStartAddProvider"
-              >
-                {{ t("settings.custom.addProvider") }}
-              </button>
-            </div>
-
-            <div v-if="settingsEditingProvider" class="custom-endpoint-fields">
-              <div class="custom-endpoint-field">
-                <span class="custom-endpoint-label custom-endpoint-label-with-hint">
-                  <span>{{ t("settings.catalog.pickTitle") }}</span>
-                  <span class="custom-endpoint-hint">{{ t("settings.catalog.pickHint") }}</span>
-                </span>
-                <ModelCatalogPicker
-                  :catalog="settingsModelCatalog"
-                  :loading="settingsModelCatalogLoading"
-                  :refreshing="settingsModelCatalogRefreshing"
-                  @select="handleOnboardingCatalogSelect"
-                  @refresh="settingsRefreshCatalog"
-                />
-              </div>
-
-              <div v-if="editingProviderModels.length > 0" class="custom-endpoint-field">
-                <span class="custom-endpoint-label">{{ t("settings.custom.models") }}</span>
-                <div class="onboarding-model-chips">
-                  <span
-                    v-for="(model, index) in settingsEditingProvider.models"
-                    :key="model.id || index"
-                    class="onboarding-model-chip"
-                  >
-                    <span class="mono">{{ model.apiModel }}</span>
-                    <button
-                      type="button"
-                      class="onboarding-model-chip-remove"
-                      :disabled="settingsCustomProviderSaving"
-                      :aria-label="t('settings.custom.removeModel')"
-                      @click="removeEditingProviderModel(index)"
-                    >×</button>
-                  </span>
-                </div>
-              </div>
-
-              <label class="custom-endpoint-field">
-                <span class="custom-endpoint-label">{{ t("settings.custom.name") }}</span>
-                <input
-                  v-model="settingsEditingProvider.name"
-                  class="ob-input"
-                  type="text"
-                  :disabled="settingsCustomProviderSaving"
-                  :placeholder="t('settings.custom.namePlaceholder')"
-                  @keydown="handleInlineEndpointKeydown"
-                />
-              </label>
-              <label class="custom-endpoint-field">
-                <span class="custom-endpoint-label">{{ t("settings.custom.endpoint") }}</span>
-                <input
-                  v-model="settingsEditingProvider.endpoint"
-                  class="ob-input"
-                  type="text"
-                  :disabled="settingsCustomProviderSaving"
-                  :placeholder="t('settings.custom.endpointPlaceholder')"
-                  @keydown="handleInlineEndpointKeydown"
-                />
-              </label>
-              <label class="custom-endpoint-field">
-                <span class="custom-endpoint-label">{{ t("settings.custom.apiFormat") }}</span>
-                <BaseDropdown
-                  class="custom-endpoint-format-dropdown"
-                  :model-value="settingsEditingProvider.apiFormat"
-                  :options="customApiFormatOptions"
-                  :aria-label="t('settings.custom.apiFormat')"
-                  :disabled="settingsCustomProviderSaving"
-                  menu-align="start"
-                  size="md"
-                  @update:model-value="updateInlineEndpointApiFormat"
-                />
-              </label>
-              <label class="custom-endpoint-field">
-                <span class="custom-endpoint-label custom-endpoint-label-with-hint">
-                  <span>{{ t("settings.custom.apiKey") }}</span>
-                  <span class="custom-endpoint-hint">{{ t("settings.custom.apiKeyOptional") }}</span>
-                </span>
-                <input
-                  v-model="settingsEditingProvider.apiKey"
-                  class="ob-input"
-                  type="password"
-                  :disabled="settingsCustomProviderSaving"
-                  :placeholder="t('settings.custom.apiKeyPlaceholder')"
-                  @keydown="handleInlineEndpointKeydown"
-                />
-              </label>
-            </div>
-
-            <div
-              v-if="settingsEndpointTestStatus !== 'idle'"
-              class="custom-endpoint-test-result"
-              :class="settingsEndpointTestStatus"
-            >
-              <span v-if="settingsEndpointTestStatus === 'testing'" class="custom-endpoint-spinner"></span>
-              <span v-if="settingsEndpointTestStatus === 'testing'">{{ t("settings.custom.testing") }}</span>
-              <span v-else-if="settingsEndpointTestStatus === 'success'" class="custom-endpoint-test-heading">
-                {{ t("settings.custom.testOk") }}
-              </span>
-              <span v-else-if="settingsEndpointTestStatus === 'error'" class="custom-endpoint-test-heading">
-                {{ t("settings.custom.testFail") }}
-              </span>
-              <span v-if="customEndpointTestDetail" class="custom-endpoint-test-detail">
-                {{ customEndpointTestDetail }}
-              </span>
-              <button
-                v-if="customEndpointTestHtmlPath"
-                class="custom-endpoint-test-link"
-                type="button"
-                @click="openCustomEndpointTestHtml"
-              >
-                {{ t("settings.custom.openInBrowser") }}
-              </button>
-            </div>
-
-            <div v-if="settingsEditingProvider" class="custom-endpoint-actions">
-              <button
-                class="ob-btn secondary"
-                type="button"
-                :disabled="settingsCustomProviderSaving || settingsEndpointTestStatus === 'testing' || !customEndpointTestReady"
-                @click="settingsTestProvider()"
-              >
-                {{ settingsEndpointTestStatus === "testing" ? "..." : t("settings.custom.test") }}
-              </button>
-              <button
-                v-if="customEndpointConfigured"
-                class="ob-btn secondary"
-                type="button"
-                :disabled="settingsCustomProviderSaving"
-                @click="settingsCancelEditProvider"
-              >
-                {{ t("settings.custom.cancel") }}
-              </button>
-              <button
-                class="ob-btn primary"
-                type="button"
-                :disabled="settingsCustomProviderSaving || !customEndpointReady"
-                @click="settingsSaveProvider"
-              >
-                {{ settingsCustomProviderSaving ? "..." : t("settings.custom.save") }}
-              </button>
-            </div>
-          </div>
+          </button>
         </div>
 
         <div class="provider-card" :class="{ expanded: authExpanded === 'codex' }">
-          <div class="provider-header" @click="toggleAuthProvider('codex')">
-            <div class="provider-left">
+          <button class="provider-header" type="button" @click="toggleCodexProvider">
+            <span class="provider-left">
               <span class="provider-name">{{ t("onboarding.auth.codex") }}</span>
               <span class="provider-desc-text">{{ t("onboarding.auth.codexDesc") }}</span>
-            </div>
+            </span>
             <span class="provider-badge" :class="{ configured: codexConfigured }">
               {{ codexConfigured ? t("onboarding.auth.configured") : t("onboarding.auth.notConfigured") }}
             </span>
-          </div>
+          </button>
           <div v-if="authExpanded === 'codex'" class="provider-body" @click.stop>
             <template v-if="settingsCodexStatus.authenticated && settingsCodexStep === 'idle'">
               <div class="status-row ok">{{ t("settings.codex.loggedIn") }}</div>
@@ -1101,6 +823,21 @@ onUnmounted(() => {
     </div>
     </div>
 
+    <CustomProviderModal
+      v-model:provider="settingsEditingProvider"
+      :is-adding="settingsIsAddingProvider"
+      :saving="settingsCustomProviderSaving"
+      :test-status="settingsEndpointTestStatus"
+      :test-result="settingsEndpointTestResult"
+      :catalog="settingsModelCatalog"
+      :catalog-loading="settingsModelCatalogLoading"
+      :catalog-refreshing="settingsModelCatalogRefreshing"
+      @close="settingsCancelEditProvider"
+      @save="settingsSaveProvider"
+      @test="settingsTestProvider"
+      @open-catalog="settingsLoadModelCatalog()"
+      @refresh-catalog="settingsRefreshCatalog"
+    />
   </div>
 
 </template>
@@ -1384,7 +1121,13 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  width: 100%;
   padding: 12px 16px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   transition: background 0.15s;
   gap: 14px;
   cursor: pointer;
@@ -1429,230 +1172,6 @@ onUnmounted(() => {
   gap: 10px;
 }
 
-.custom-endpoints-inline-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.onboarding-model-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.onboarding-model-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 6px 3px 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 999px;
-  background: var(--input-bg);
-  font-size: 11px;
-  color: var(--text-color);
-}
-
-.onboarding-model-chip .mono {
-  font-family: var(--font-mono-identifier);
-}
-
-.onboarding-model-chip-remove {
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  padding: 0 2px;
-}
-
-.onboarding-model-chip-remove:hover:not(:disabled) {
-  color: var(--status-danger-fg);
-}
-
-.custom-endpoint-summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--input-bg);
-}
-
-.custom-endpoint-summary-main {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.custom-endpoint-summary-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-color);
-}
-
-.custom-endpoint-summary-meta {
-  font-size: 12px;
-  color: var(--text-secondary);
-  font-family: var(--font-mono-identifier);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.custom-endpoint-summary-actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.custom-endpoint-fields {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
-}
-
-.custom-endpoint-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-height: 0;
-  min-width: 0;
-}
-
-.custom-endpoint-field:nth-child(3),
-.custom-endpoint-field:nth-child(5) {
-  grid-column: 1 / -1;
-}
-
-.custom-endpoint-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.custom-endpoint-label-with-hint {
-  align-items: flex-start;
-  justify-content: space-between;
-}
-
-.custom-endpoint-label-with-hint > span:first-child {
-  flex-shrink: 0;
-}
-
-.custom-endpoint-hint {
-  flex-shrink: 0;
-  font-weight: 400;
-  color: var(--text-secondary);
-  opacity: 0.8;
-  line-height: 1.35;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.custom-endpoint-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.custom-endpoint-test-result {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.5;
-  flex-wrap: wrap;
-}
-
-.custom-endpoint-test-result.testing {
-  background: var(--hover-bg);
-  color: var(--text-secondary);
-}
-
-.custom-endpoint-test-result.success {
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
-}
-
-.custom-endpoint-test-result.error {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
-
-.custom-endpoint-test-heading {
-  font-weight: 600;
-}
-
-.custom-endpoint-test-detail {
-  min-width: 0;
-  word-break: break-word;
-}
-
-.custom-endpoint-test-link {
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--accent-color);
-  font: inherit;
-  cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-.custom-endpoint-spinner {
-  width: 10px;
-  height: 10px;
-  margin-top: 3px;
-  border: 2px solid var(--border-color);
-  border-top-color: var(--accent-color);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  flex-shrink: 0;
-}
-
-.ob-input {
-  flex: 1;
-  width: 100%;
-  min-width: 0;
-  box-sizing: border-box;
-  padding: 8px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--input-bg);
-  color: var(--text-color);
-  font-size: 13px;
-  font-family: inherit;
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-.ob-input:focus {
-  border-color: var(--accent-color);
-}
-
-.custom-endpoint-format-dropdown {
-  width: 100%;
-}
-
-.custom-endpoint-format-dropdown :deep(.base-dropdown-menu) {
-  width: 100%;
-  min-width: 100%;
-  max-width: 100%;
-}
-
 .ob-btn {
   padding: 8px 16px;
   border-radius: 8px;
@@ -1683,10 +1202,6 @@ onUnmounted(() => {
 .ob-btn.secondary:hover {
   color: var(--text-color);
   background: var(--hover-bg);
-}
-.ob-btn.small {
-  padding: 4px 10px;
-  font-size: 12px;
 }
 .ob-btn.finish {
   min-width: 120px;
@@ -1720,23 +1235,6 @@ onUnmounted(() => {
 
   .provider-header {
     align-items: flex-start;
-  }
-
-  .custom-endpoint-fields {
-    grid-template-columns: 1fr;
-  }
-
-  .custom-endpoint-field:nth-child(3),
-  .custom-endpoint-field:nth-child(5) {
-    grid-column: auto;
-  }
-
-  .custom-endpoint-actions {
-    justify-content: stretch;
-  }
-
-  .custom-endpoint-actions .ob-btn {
-    flex: 1;
   }
 }
 
