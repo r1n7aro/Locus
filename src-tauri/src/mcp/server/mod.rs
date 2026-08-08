@@ -11,9 +11,9 @@ pub mod config;
 pub mod http;
 pub mod install;
 pub mod protocol;
-pub mod tools;
 #[cfg(test)]
 mod tests;
+pub mod tools;
 
 use std::sync::{Arc, Mutex};
 
@@ -84,9 +84,9 @@ pub async fn reconcile(app: AppHandle) {
         Arc::new(move |name, args| {
             let app = app.clone();
             let runtime_state = runtime_state.clone();
-            Box::pin(
-                async move { tools::execute_tool(app, name, args, timeout_ms, runtime_state).await },
-            )
+            Box::pin(async move {
+                tools::execute_tool(app, name, args, timeout_ms, runtime_state).await
+            })
         })
     };
     let list_tools: http::ToolListProvider = {

@@ -26,11 +26,19 @@ pub struct ToolExecutionContext {
     pub working_dir: Option<String>,
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
+    pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    pub progress: Option<crate::async_tasks::TaskProgressReporter>,
 }
 
 impl ToolExecutionContext {
     pub fn is_unity_connected(&self) -> bool {
         self.unity_connected.unwrap_or(false)
+    }
+
+    pub fn report_progress(&self, progress: impl Into<String>) {
+        if let Some(report) = self.progress.as_ref() {
+            report(progress.into());
+        }
     }
 
     pub fn should_redirect_unity_asset_read(&self, file_path: &str) -> bool {
@@ -88,6 +96,7 @@ pub type ToolExecuteFn = Arc<
         + Sync,
 >;
 
+#[derive(Clone)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
@@ -106,6 +115,7 @@ pub enum ToolLoadMode {
     Skill,
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     built_in_tools: HashSet<String>,
@@ -129,21 +139,18 @@ pub fn built_in_tool_name_keys() -> BTreeSet<String> {
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "skill_list" | "skill_reload" | "mcp_reload"
+        "create_skill_package" | "skill_list" | "skill_reload" | "mcp_reload"
     ) {
         return ToolLoadMode::Skill;
     }
 
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "knowledge_delete"
-            | "knowledge_move"
-            | "graph_view"
-            | "sheet"
-            | "skill_create"
-            | "unity_capture_viewport"
+        "unity_capture_viewport"
             | "unity_run_states"
             | "web_fetch"
+            | "get_task_status"
+            | "cancel_task"
     ) {
         ToolLoadMode::Lazy
     } else {
@@ -166,15 +173,21 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "grep",
     "list",
     "bash",
+    "get_task_status",
+    "cancel_task",
     // Planning, delegation & user interaction.
     "todowrite",
     "task",
     "ask_user_question",
     "exit_plan_mode",
     // Unity editor actions.
+    "unity_set_play_mode",
     "unity_execute",
     "unity_recompile",
     "unity_hot_reload",
+    "unity_get_console_log",
+    "unity_test_list",
+    "unity_test_run",
     // Unity project search & inspection.
     "unity_asset_search",
     "unity_ref_search",
@@ -190,21 +203,13 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "code_hover",
     // Knowledge base.
     "knowledge_query",
-    "knowledge_read",
-    "knowledge_list",
-    "knowledge_create",
-    "knowledge_edit",
     // Low-frequency utilities (mostly lazy-loaded).
     "web_fetch",
     "unity_run_states",
     "unity_capture_viewport",
-    "graph_view",
-    "sheet",
-    "knowledge_move",
-    "knowledge_delete",
     "config_query",
     // Skill & plugin management.
-    "skill_create",
+    "create_skill_package",
     "skill_list",
     "skill_reload",
     "mcp_reload",
@@ -274,6 +279,12 @@ impl ToolRegistry {
         self.tools.insert(key, tool);
     }
 
+    pub fn register_runtime(&mut self, tool: ToolDef, load_mode: ToolLoadMode) {
+        let key = normalize_tool_name_key(&tool.name);
+        self.load_modes.insert(key.clone(), load_mode);
+        self.tools.insert(key, tool);
+    }
+
     pub fn register_builtin(&mut self, tool: ToolDef) {
         let mode = default_load_mode_for_builtin_tool(&tool.name);
         self.register_builtin_with_load_mode(tool, mode);
@@ -322,6 +333,21 @@ impl ToolRegistry {
             .tools
             .iter()
             .filter_map(|(key, def)| (!self.built_in_tools.contains(key)).then(|| def.name.clone()))
+            .collect::<Vec<_>>();
+        names.extend(crate::commands::skill_package_tool_names_sync());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Canonical names for every tool currently registered in this process.
+    /// Dynamic MCP tools are maintained by the MCP manager and are appended by
+    /// callers that need the complete agent-facing inventory.
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut names = self
+            .tools
+            .values()
+            .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
         names.extend(crate::commands::skill_package_tool_names_sync());
         names.sort();
@@ -609,22 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn builtins_register_graph_view_as_lazy() {
+    fn removed_display_tools_are_not_registered() {
         let registry = ToolRegistry::with_builtins();
 
-        assert_eq!(
-            registry.canonical_name("graph_view").as_deref(),
-            Some("graph_view")
-        );
-        assert_eq!(registry.default_load_mode("graph_view"), ToolLoadMode::Lazy);
-    }
-
-    #[test]
-    fn builtins_register_sheet_as_lazy() {
-        let registry = ToolRegistry::with_builtins();
-
-        assert_eq!(registry.canonical_name("sheet").as_deref(), Some("sheet"));
-        assert_eq!(registry.default_load_mode("sheet"), ToolLoadMode::Lazy);
+        for removed in ["sheet", "graph_view"] {
+            assert_eq!(registry.canonical_name(removed), None);
+        }
     }
 
     #[test]
@@ -642,23 +658,38 @@ mod tests {
     }
 
     #[test]
-    fn builtins_register_knowledge_create_as_direct() {
+    fn builtins_register_only_knowledge_query() {
         let registry = ToolRegistry::with_builtins();
 
         assert_eq!(
-            registry.canonical_name("knowledge_create").as_deref(),
-            Some("knowledge_create")
+            registry.canonical_name("knowledge_query").as_deref(),
+            Some("knowledge_query")
         );
-        assert_eq!(
-            registry.default_load_mode("knowledge_create"),
-            ToolLoadMode::Direct
-        );
+        for removed in [
+            "knowledge_list",
+            "knowledge_read",
+            "knowledge_create",
+            "knowledge_edit",
+            "knowledge_move",
+            "knowledge_delete",
+        ] {
+            assert_eq!(registry.canonical_name(removed), None);
+        }
     }
 
     #[test]
     fn builtins_register_skill_lifecycle_tools_as_skill_loaded() {
         let registry = ToolRegistry::with_builtins();
 
+        assert_eq!(registry.canonical_name("skill_create"), None);
+        assert_eq!(
+            registry.canonical_name("create_skill_package").as_deref(),
+            Some("create_skill_package")
+        );
+        assert_eq!(
+            registry.default_load_mode("create_skill_package"),
+            ToolLoadMode::Skill
+        );
         assert_eq!(
             registry.default_load_mode("skill_list"),
             ToolLoadMode::Skill
@@ -676,6 +707,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            ..Default::default()
         };
 
         assert!(context.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
@@ -690,6 +722,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(false),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            ..Default::default()
         };
         assert!(!disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
 
@@ -698,6 +731,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            ..Default::default()
         };
         assert!(!connected.should_redirect_unity_asset_read("src/main.rs"));
     }

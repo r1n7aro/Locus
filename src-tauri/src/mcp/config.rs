@@ -99,11 +99,7 @@ impl McpServerConfig {
     /// Applies the allow/deny lists to one tool name (raw MCP name, not the
     /// wire name).
     pub fn tool_exposed(&self, tool_name: &str) -> bool {
-        if self
-            .tool_denylist
-            .iter()
-            .any(|t| t.trim() == tool_name)
-        {
+        if self.tool_denylist.iter().any(|t| t.trim() == tool_name) {
             return false;
         }
         let allow: Vec<&str> = self
@@ -157,21 +153,22 @@ pub fn load_servers() -> Vec<McpServerConfig> {
     };
     file.servers
         .into_iter()
-        .filter_map(|value| match serde_json::from_value::<McpServerConfig>(value) {
-            Ok(server) => Some(server),
-            Err(e) => {
-                eprintln!("[Mcp] skipping unparsable server entry: {e}");
-                None
-            }
-        })
+        .filter_map(
+            |value| match serde_json::from_value::<McpServerConfig>(value) {
+                Ok(server) => Some(server),
+                Err(e) => {
+                    eprintln!("[Mcp] skipping unparsable server entry: {e}");
+                    None
+                }
+            },
+        )
         .collect()
 }
 
 pub fn save_servers(servers: &[McpServerConfig]) -> Result<(), String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
     }
     let file = McpServersFile {
         servers: servers
@@ -315,10 +312,8 @@ pub fn expand_env_refs(value: &str) -> String {
         match after.find('}') {
             Some(end) => {
                 let var = &after[..end];
-                let valid = !var.is_empty()
-                    && var
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                let valid =
+                    !var.is_empty() && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
                 match std::env::var(var) {
                     Ok(v) if valid => out.push_str(&v),
                     _ => {
@@ -431,7 +426,10 @@ mod tests {
     fn expand_env_refs_expands_known_and_keeps_unknown() {
         std::env::set_var("LOCUS_MCP_TEST_VAR", "hello");
         assert_eq!(expand_env_refs("v=${LOCUS_MCP_TEST_VAR}!"), "v=hello!");
-        assert_eq!(expand_env_refs("${LOCUS_MCP_MISSING_VAR}"), "${LOCUS_MCP_MISSING_VAR}");
+        assert_eq!(
+            expand_env_refs("${LOCUS_MCP_MISSING_VAR}"),
+            "${LOCUS_MCP_MISSING_VAR}"
+        );
         assert_eq!(expand_env_refs("${not closed"), "${not closed");
         assert_eq!(expand_env_refs("plain"), "plain");
     }

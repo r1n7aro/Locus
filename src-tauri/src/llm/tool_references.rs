@@ -83,16 +83,19 @@ mod tests {
         let mut output = "loaded skill".to_string();
         append_tool_reference_marker(
             &mut output,
-            &["pdf_export".to_string(), "sheet".to_string()],
+            &["pdf_export".to_string(), "view_run".to_string()],
         );
         assert_eq!(
             output,
-            "loaded skill\n\n<locus-tool-references>pdf_export, sheet</locus-tool-references>"
+            "loaded skill\n\n<locus-tool-references>pdf_export, view_run</locus-tool-references>"
         );
 
         let (text, names) = split_tool_reference_marker(&output);
         assert_eq!(text, "loaded skill");
-        assert_eq!(names, vec!["pdf_export".to_string(), "sheet".to_string()]);
+        assert_eq!(
+            names,
+            vec!["pdf_export".to_string(), "view_run".to_string()]
+        );
     }
 
     #[test]
@@ -115,7 +118,10 @@ mod tests {
             "sample mentions {TOOL_REFERENCE_MARKER_OPEN} inline\n{TOOL_REFERENCE_MARKER_OPEN}a, b, a{TOOL_REFERENCE_MARKER_CLOSE}"
         );
         let (text, names) = split_tool_reference_marker(&content);
-        assert_eq!(text, format!("sample mentions {TOOL_REFERENCE_MARKER_OPEN} inline"));
+        assert_eq!(
+            text,
+            format!("sample mentions {TOOL_REFERENCE_MARKER_OPEN} inline")
+        );
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
     }
 

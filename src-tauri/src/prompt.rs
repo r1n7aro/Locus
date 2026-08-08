@@ -25,14 +25,20 @@ pub mod tools {
     pub const WRITE: &str = include_str!("../../tools/write.json");
     pub const EDIT: &str = include_str!("../../tools/edit.json");
     pub const BASH: &str = include_str!("../../tools/bash.json");
+    pub const GET_TASK_STATUS: &str = include_str!("../../tools/get_task_status.json");
+    pub const CANCEL_TASK: &str = include_str!("../../tools/cancel_task.json");
     pub const GREP: &str = include_str!("../../tools/grep.json");
     pub const WEB_FETCH: &str = include_str!("../../tools/web_fetch.json");
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
-    pub const GRAPH_VIEW: &str = include_str!("../../tools/graph_view.json");
+    pub const UNITY_SET_PLAY_MODE: &str = include_str!("../../tools/unity_set_play_mode.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
         include_str!("../../tools/unity_capture_viewport.json");
+    pub const UNITY_GET_CONSOLE_LOG: &str =
+        include_str!("../../tools/unity_get_console_log.json");
+    pub const UNITY_TEST_LIST: &str = include_str!("../../tools/unity_test_list.json");
+    pub const UNITY_TEST_RUN: &str = include_str!("../../tools/unity_test_run.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
     pub const UNITY_ASSET_SEARCH: &str = include_str!("../../tools/unity_asset_search.json");
     pub const UNITY_YAML_LIST: &str = include_str!("../../tools/unity_yaml_list.json");
@@ -48,15 +54,8 @@ pub mod tools {
     pub const UNITY_CODE_USAGES: &str = include_str!("../../tools/unity_code_usages.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
-    pub const SHEET: &str = include_str!("../../tools/sheet.json");
-    pub const KNOWLEDGE_LIST: &str = include_str!("../../tools/knowledge_list.json");
     pub const KNOWLEDGE_QUERY: &str = include_str!("../../tools/knowledge_query.json");
-    pub const KNOWLEDGE_READ: &str = include_str!("../../tools/knowledge_read.json");
-    pub const KNOWLEDGE_CREATE: &str = include_str!("../../tools/knowledge_create.json");
-    pub const KNOWLEDGE_DELETE: &str = include_str!("../../tools/knowledge_delete.json");
-    pub const KNOWLEDGE_MOVE: &str = include_str!("../../tools/knowledge_move.json");
-    pub const KNOWLEDGE_EDIT: &str = include_str!("../../tools/knowledge_edit.json");
-    pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
+    pub const CREATE_SKILL_PACKAGE: &str = include_str!("../../tools/create_skill_package.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
     pub const MCP_RELOAD: &str = include_str!("../../tools/mcp_reload.json");
@@ -129,13 +128,18 @@ mod tests {
             ("write", tools::WRITE),
             ("edit", tools::EDIT),
             ("bash", tools::BASH),
+            ("get_task_status", tools::GET_TASK_STATUS),
+            ("cancel_task", tools::CANCEL_TASK),
             ("grep", tools::GREP),
             ("web_fetch", tools::WEB_FETCH),
             ("todowrite", tools::TODOWRITE),
-            ("graph_view", tools::GRAPH_VIEW),
+            ("unity_set_play_mode", tools::UNITY_SET_PLAY_MODE),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
             ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
+            ("unity_get_console_log", tools::UNITY_GET_CONSOLE_LOG),
+            ("unity_test_list", tools::UNITY_TEST_LIST),
+            ("unity_test_run", tools::UNITY_TEST_RUN),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
             ("unity_yaml_list", tools::UNITY_YAML_LIST),
@@ -151,15 +155,8 @@ mod tests {
             ("unity_code_usages", tools::UNITY_CODE_USAGES),
             ("list", tools::LIST),
             ("ask", tools::ASK),
-            ("sheet", tools::SHEET),
-            ("knowledge_list", tools::KNOWLEDGE_LIST),
             ("knowledge_query", tools::KNOWLEDGE_QUERY),
-            ("knowledge_read", tools::KNOWLEDGE_READ),
-            ("knowledge_create", tools::KNOWLEDGE_CREATE),
-            ("knowledge_delete", tools::KNOWLEDGE_DELETE),
-            ("knowledge_move", tools::KNOWLEDGE_MOVE),
-            ("knowledge_edit", tools::KNOWLEDGE_EDIT),
-            ("skill_create", tools::SKILL_CREATE),
+            ("create_skill_package", tools::CREATE_SKILL_PACKAGE),
             ("skill_reload", tools::SKILL_RELOAD),
             ("skill_list", tools::SKILL_LIST),
             ("plugin_list", tools::PLUGIN_LIST),
@@ -214,5 +211,26 @@ mod tests {
             "skill/profiler.md is referenced by the unity_run_states tool prompt but missing at {:?}",
             path
         );
+    }
+
+    #[test]
+    fn unity_execution_tools_expose_default_on_non_public_access() {
+        for (name, source) in [
+            ("unity_execute", tools::UNITY_EXECUTE),
+            ("unity_run_states", tools::UNITY_RUN_STATES),
+        ] {
+            let prompt = parse_tool_prompt(source);
+            assert!(
+                prompt.description.contains("directly without reflection"),
+                "{name} should describe direct private/internal access"
+            );
+            let property = prompt
+                .parameters
+                .get("properties")
+                .and_then(|value| value.get("enable_non_public_access"))
+                .unwrap_or_else(|| panic!("{name} missing enable_non_public_access"));
+            assert_eq!(property.get("type").and_then(|value| value.as_str()), Some("boolean"));
+            assert_eq!(property.get("default").and_then(|value| value.as_bool()), Some(true));
+        }
     }
 }

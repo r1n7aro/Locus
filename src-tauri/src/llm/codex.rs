@@ -41,11 +41,18 @@ pub struct TurnState {
     sticky_routing_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CodexStreamOptions {
     pub include_web_search: bool,
     pub use_session_continuation: bool,
     pub fast_mode: bool,
+    structured_output: Option<CodexStructuredOutput>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexStructuredOutput {
+    name: String,
+    schema: serde_json::Value,
 }
 
 impl Default for CodexStreamOptions {
@@ -54,6 +61,7 @@ impl Default for CodexStreamOptions {
             include_web_search: true,
             use_session_continuation: true,
             fast_mode: false,
+            structured_output: None,
         }
     }
 }
@@ -64,11 +72,24 @@ impl CodexStreamOptions {
             include_web_search: false,
             use_session_continuation: false,
             fast_mode: false,
+            structured_output: None,
         }
     }
 
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
+        self
+    }
+
+    pub fn with_output_schema(
+        mut self,
+        name: impl Into<String>,
+        schema: serde_json::Value,
+    ) -> Self {
+        self.structured_output = Some(CodexStructuredOutput {
+            name: name.into(),
+            schema,
+        });
         self
     }
 }
@@ -427,6 +448,14 @@ fn build_request_body(
 
     apply_reasoning_effort(&mut body, model, thinking_level);
     apply_text_verbosity_default(&mut body, model);
+    if let Some(output) = options.structured_output.as_ref() {
+        body["text"]["format"] = serde_json::json!({
+            "type": "json_schema",
+            "name": output.name,
+            "strict": true,
+            "schema": output.schema,
+        });
+    }
     if options.fast_mode {
         body["service_tier"] = serde_json::json!("priority");
     }
@@ -450,16 +479,19 @@ fn build_tool_search_declaration(description: &str) -> serde_json::Value {
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query for deferred tools."
-                },
-                "limit": {
-                    "type": "number",
-                    "description": "Maximum number of tools to return. Defaults to 8."
+                "wire_names": {
+                    "type": "array",
+                    "description": "One to eight complete deferred-tool wire names copied verbatim from the prompt, a Skill document, or a tool result. Include only tools required for the current step. Natural-language queries and aliases are rejected.",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "uniqueItems": true
                 }
             },
-            "required": ["query"],
+            "required": ["wire_names"],
             "additionalProperties": false
         }
     })
@@ -1861,17 +1893,17 @@ where
                                 })
                                 .unwrap_or_default();
                             if !call_id.is_empty() {
-                                let entry = state
-                                    .tool_calls_map
-                                    .entry(item_id)
-                                    .or_insert_with(|| PartialToolCall {
-                                        call_id,
-                                        name: TOOL_SEARCH_HISTORY_TOOL_NAME.to_string(),
-                                        arguments: String::new(),
-                                        arguments_done: false,
-                                        item_done: false,
-                                        notified: false,
-                                        start_order: None,
+                                let entry =
+                                    state.tool_calls_map.entry(item_id).or_insert_with(|| {
+                                        PartialToolCall {
+                                            call_id,
+                                            name: TOOL_SEARCH_HISTORY_TOOL_NAME.to_string(),
+                                            arguments: String::new(),
+                                            arguments_done: false,
+                                            item_done: false,
+                                            notified: false,
+                                            start_order: None,
+                                        }
                                     });
                                 if !arguments.is_empty() {
                                     entry.arguments = arguments;
@@ -2171,7 +2203,7 @@ where
             session_id,
             response_request_metadata,
             turn_state,
-            options,
+            options.clone(),
             on_text_delta,
             on_thinking_delta,
             on_tool_call_start,
@@ -2240,7 +2272,7 @@ where
         thinking_level,
         session_id,
         response_request_metadata,
-        options,
+        options.clone(),
     );
     let transport_session_id = options
         .use_session_continuation
@@ -3091,9 +3123,9 @@ mod tests {
     use super::{
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
-        build_request_body, build_request_body_with_tool_search,
-        build_websocket_transport_request, codex_websocket_url, collect_complete_tool_calls,
-        drain_sse_buffer, establish_http_connect_tunnel, extract_compaction_encrypted_content,
+        build_request_body, build_request_body_with_tool_search, build_websocket_transport_request,
+        codex_websocket_url, collect_complete_tool_calls, drain_sse_buffer,
+        establish_http_connect_tunnel, extract_compaction_encrypted_content,
         process_sse_event_block, request_without_input, uri_host_port,
         websocket_event_error_message, websocket_proxy_match_uri, CodexStreamOptions,
         CodexStreamState, LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
@@ -3290,7 +3322,7 @@ mod tests {
 
     #[test]
     fn build_input_replays_tool_search_round_as_typed_items() {
-        let output_json = r#"{"tools":[{"type":"function","name":"pdf_export","description":"Export PDF.","parameters":{"type":"object"},"defer_loading":true}]}"#;
+        let output_json = r#"{"tools":[{"type":"function","name":"pdf_export","description":"Export PDF.","parameters":{"type":"object"},"defer_loading":true},{"type":"function","name":"pdf_preview","description":"Preview PDF.","parameters":{"type":"object"},"defer_loading":true}]}"#;
         let input = build_input(&[
             assistant_message_with_tool_calls(
                 "assistant-1",
@@ -3298,7 +3330,7 @@ mod tests {
                 Some("resp_prev"),
                 vec![tool_search_call_info(
                     "search-1",
-                    r#"{"limit":2,"query":"pdf export"}"#,
+                    r#"{"wire_names":["pdf_export","pdf_preview"]}"#,
                 )],
             ),
             tool_message("tool-1", "search-1", output_json),
@@ -3310,7 +3342,7 @@ mod tests {
         assert_eq!(input[0]["execution"], serde_json::json!("client"));
         assert_eq!(
             input[0]["arguments"],
-            serde_json::json!({"query": "pdf export", "limit": 2})
+            serde_json::json!({"wire_names": ["pdf_export", "pdf_preview"]})
         );
         assert_eq!(input[1]["type"], serde_json::json!("tool_search_output"));
         assert_eq!(input[1]["call_id"], serde_json::json!("search-1"));
@@ -3323,6 +3355,10 @@ mod tests {
             input[1]["tools"][0]["defer_loading"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            input[1]["tools"][1]["name"],
+            serde_json::json!("pdf_preview")
+        );
     }
 
     #[test]
@@ -3331,7 +3367,10 @@ mod tests {
             "assistant-1",
             "",
             Some("resp_prev"),
-            vec![tool_search_call_info("search-1", r#"{"query":"pdf"}"#)],
+            vec![tool_search_call_info(
+                "search-1",
+                r#"{"wire_names":["pdf_export"]}"#,
+            )],
         )]);
 
         assert_eq!(input.len(), 2);
@@ -3347,9 +3386,16 @@ mod tests {
                 "assistant-1",
                 "",
                 Some("resp_prev"),
-                vec![tool_search_call_info("search-1", r#"{"query":"pdf"}"#)],
+                vec![tool_search_call_info(
+                    "search-1",
+                    r#"{"wire_names":["pdf_export"]}"#,
+                )],
             ),
-            tool_message("tool-1", "search-1", "query must not be empty"),
+            tool_message(
+                "tool-1",
+                "search-1",
+                "tool_search requires a `wire_names` array of exact deferred-tool names.",
+            ),
         ]);
 
         assert_eq!(input.len(), 2);
@@ -3379,8 +3425,39 @@ mod tests {
         assert_eq!(search["execution"], serde_json::json!("client"));
         assert_eq!(
             search["parameters"]["required"],
-            serde_json::json!(["query"])
+            serde_json::json!(["wire_names"])
         );
+        assert!(
+            search["parameters"]["properties"]["wire_names"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("complete deferred-tool wire names")
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["wire_names"]["items"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["wire_names"]["items"]["minLength"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["wire_names"]["minItems"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["wire_names"]["maxItems"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            search["parameters"]["properties"]["wire_names"]["uniqueItems"],
+            serde_json::json!(true)
+        );
+        assert!(search["parameters"]["properties"]
+            .get("wire_name")
+            .is_none());
+        assert!(search["parameters"]["properties"].get("query").is_none());
+        assert!(search["parameters"]["properties"].get("limit").is_none());
 
         // The declaration is excluded from the continuation signature the
         // same way every tool is.
@@ -3572,7 +3649,7 @@ mod tests {
         )
         .expect("output_item.added should parse");
         process_sse_event_block(
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"tool_search_call\",\"call_id\":\"search_1\",\"status\":\"completed\",\"execution\":\"client\",\"arguments\":{\"limit\":2,\"query\":\"pdf export\"}}}",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"item_1\",\"type\":\"tool_search_call\",\"call_id\":\"search_1\",\"status\":\"completed\",\"execution\":\"client\",\"arguments\":{\"wire_names\":[\"pdf_export\",\"pdf_preview\"]}}}",
             false,
             &mut state,
             &ignore_text,
@@ -3588,8 +3665,10 @@ mod tests {
         assert_eq!(collected[0].tool_call.name, TOOL_SEARCH_HISTORY_TOOL_NAME);
         let arguments: serde_json::Value =
             serde_json::from_str(&collected[0].tool_call.arguments).expect("arguments JSON");
-        assert_eq!(arguments["query"], serde_json::json!("pdf export"));
-        assert_eq!(arguments["limit"], serde_json::json!(2));
+        assert_eq!(
+            arguments["wire_names"],
+            serde_json::json!(["pdf_export", "pdf_preview"])
+        );
 
         let started = started.lock().expect("tool mutex poisoned");
         assert_eq!(started.len(), 1);
@@ -3878,6 +3957,39 @@ mod tests {
     }
 
     #[test]
+    fn request_body_includes_strict_structured_output_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "maxLength": 36 }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+        });
+        let body = build_request_body(
+            "gpt-5.6-luna",
+            "Generate a title",
+            &[user_message_with_images("Fix OAuth callback", vec![])],
+            &[],
+            Some("low"),
+            None,
+            None,
+            CodexStreamOptions::compact().with_output_schema("session_title", schema.clone()),
+        );
+
+        assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+        assert_eq!(body["text"]["format"]["type"].as_str(), Some("json_schema"));
+        assert_eq!(
+            body["text"]["format"]["name"].as_str(),
+            Some("session_title")
+        );
+        assert_eq!(body["text"]["format"]["strict"].as_bool(), Some(true));
+        assert_eq!(body["text"]["format"]["schema"], schema);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
     fn build_request_body_injects_priority_service_tier_for_fast_mode() {
         let body = build_request_body(
             "gpt-5.6-sol",
@@ -3997,7 +4109,7 @@ mod tests {
             None,
             Some("session-1"),
             None,
-            options,
+            options.clone(),
         );
 
         assert!(!options.include_web_search);

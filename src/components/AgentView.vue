@@ -123,8 +123,14 @@ const lazyToolItems = computed(() =>
 const skillToolItems = computed(() =>
   nonMcpToolItems.value.filter((item) => toolMetaLoadMode(item.meta) === "skill"),
 );
+const injectedRuleItems = computed(() =>
+  injectedItems.value.filter((item) => item.kind === "rule"),
+);
 const injectedContextItems = computed(() =>
-  injectedItems.value.filter((item) => item.kind !== "tools"),
+  injectedItems.value.filter((item) => item.kind === "context"),
+);
+const ruleSectionEntryCount = computed(() =>
+  ruleItems.value.length + injectedRuleItems.value.length,
 );
 const injectedContextEntryCount = computed(() =>
   injectedContextItems.value.length + 1,
@@ -887,7 +893,7 @@ function onRuleListContextMenu(event: MouseEvent) {
   const target = event.target;
   if (
     target instanceof Element
-    && target.closest(".rule-item, .inline-create-row")
+    && target.closest(".rule-item, .rule-injected-item, .inline-create-row")
   ) {
     return;
   }
@@ -1066,10 +1072,10 @@ watch(
             >
               <span class="section-chevron" :class="{ collapsed: isSectionCollapsed('rules') }">&#9662;</span>
               <span class="section-name">Rule</span>
-              <span v-if="ruleItems.length" class="section-count">{{ ruleItems.length }}</span>
+              <span v-if="ruleSectionEntryCount" class="section-count">{{ ruleSectionEntryCount }}</span>
             </button>
             <template v-if="!isSectionCollapsed('rules')">
-              <div v-if="ruleLoading && ruleItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
+              <div v-if="(ruleLoading || injectedLoading) && ruleSectionEntryCount === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
               <div class="rule-drag-zone" @dragover.prevent>
                 <button
                   v-for="(rule, idx) in ruleItems"
@@ -1106,6 +1112,18 @@ watch(
                   <span v-if="!rule.enabled" class="rule-off-badge">OFF</span>
                 </button>
               </div>
+              <button
+                v-for="item in injectedRuleItems"
+                :key="item.id"
+                type="button"
+                class="kb-item injected-item rule-injected-item"
+                :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+                @click="selectInjectedItem(item)"
+              >
+                <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
+                <span class="item-title">{{ item.title }}</span>
+                <span class="injected-kind-badge">{{ injectedItemBadge(item.kind) }}</span>
+              </button>
               <div v-if="ruleCreating" class="kb-item inline-create-row">
                 <input
                   v-model="ruleNewName"

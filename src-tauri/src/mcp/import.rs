@@ -35,7 +35,10 @@ pub fn scan_import_candidates(existing: &[McpServerConfig]) -> Vec<McpImportCand
             continue;
         };
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
-            eprintln!("[Mcp] import: {} is not valid JSON; skipping", path.display());
+            eprintln!(
+                "[Mcp] import: {} is not valid JSON; skipping",
+                path.display()
+            );
             continue;
         };
         for server in parse_external_config(&value) {

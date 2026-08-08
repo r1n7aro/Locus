@@ -46,6 +46,12 @@ export function useCommandRegistry(
         commandType: "unity-console",
       },
       {
+        name: "/console-error",
+        description: t("chat.command.unityConsoleErrorDesc"),
+        commandKind: "action",
+        commandType: "unity-console-error",
+      },
+      {
         name: "/plan",
         description: t("chat.command.planDesc"),
         commandKind: "intent",

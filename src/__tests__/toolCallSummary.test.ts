@@ -22,10 +22,51 @@ describe("toolCallSummary", () => {
     }))).toBe("Assets/Materials/Ground.mat");
   });
 
-  it("keeps compact file summaries for regular file tools", () => {
+  it("keeps project-relative file summaries from Assets", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
       file_path: "Assets/Scripts/Gameplay/PlayerController.cs",
-    }))).toBe("…/Gameplay/PlayerController.cs");
+    }))).toBe("Assets/Scripts/Gameplay/PlayerController.cs");
+  });
+
+  it("makes absolute workspace paths project-relative", () => {
+    expect(buildToolCallArgsSummary("read", JSON.stringify({
+      file_path: "F:\\SampleGame-6.5\\Assets\\Scripts\\ECS\\Runtime\\Time\\TimelineTypes.cs",
+    }), {
+      workingDir: "f:/samplegame-6.5/",
+    })).toBe("Assets/Scripts/ECS/Runtime/Time/TimelineTypes.cs");
+  });
+
+  it("keeps other Unity project roots project-relative", () => {
+    expect(buildToolCallArgsSummary("read", JSON.stringify({
+      file_path: "F:/SampleGame-6.5/Packages/com.example.tool/Editor/Tool.cs",
+    }), {
+      workingDir: "F:/SampleGame-6.5",
+    })).toBe("Packages/com.example.tool/Editor/Tool.cs");
+  });
+
+  it("uses the attached directory name as the external root", () => {
+    expect(buildToolCallArgsSummary("read", JSON.stringify({
+      file_path: "D:/SharedTools/Scripts/Build.cs",
+    }), {
+      workingDir: "F:/SampleGame-6.5",
+      extraWorkdirs: ["D:/SharedTools"],
+    })).toBe("SharedTools/Scripts/Build.cs");
+  });
+
+  it("keeps a system root for unregistered paths containing Assets", () => {
+    expect(buildToolCallArgsSummary("read", JSON.stringify({
+      file_path: "D:/OtherProject/Assets/Scripts/Runtime/Time/TimelineTypes.cs",
+    }), {
+      workingDir: "F:/SampleGame-6.5",
+    })).toBe("D:/OtherProject/Assets/…/Time/TimelineTypes.cs");
+  });
+
+  it("matches workspace roots on complete path segments", () => {
+    expect(buildToolCallArgsSummary("read", JSON.stringify({
+      file_path: "F:/SampleGame-6.5-copy/Assets/Scripts/Player.cs",
+    }), {
+      workingDir: "F:/SampleGame-6.5",
+    })).toBe("F:/SampleGame-6.5-copy/Assets/Scripts/Player.cs");
   });
 
   it("shows url summaries for web_fetch", () => {
@@ -35,11 +76,4 @@ describe("toolCallSummary", () => {
     }))).toBe("https://example.com/docs");
   });
 
-  it("uses graph_view title for compact summaries", () => {
-    expect(buildToolCallArgsSummary("graph_view", JSON.stringify({
-      title: "WaterNew.shader readable Shader Graph",
-      description: "This field is hidden from the tool call block.",
-      nodes: [{ id: "surface" }],
-    }))).toBe("WaterNew.shader readable Shader Graph");
-  });
 });

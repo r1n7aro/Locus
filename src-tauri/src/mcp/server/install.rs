@@ -233,12 +233,7 @@ fn current_entry(integration: &Integration, config_path: &Path) -> Result<Option
     }
 }
 
-fn status_of(
-    integration: &Integration,
-    home: &Path,
-    url: &str,
-    token: &str,
-) -> IntegrationStatus {
+fn status_of(integration: &Integration, home: &Path, url: &str, token: &str) -> IntegrationStatus {
     let config_path = join_rel(home, integration.config_rel);
     let detected = if integration.detect_rel.is_empty() {
         config_path.exists()
@@ -284,13 +279,14 @@ pub(super) fn apply_at(
                     config_path.display()
                 ));
             }
-            let map = json_server_map(&mut document, integration.json_map_path, true)
-                .ok_or_else(|| {
+            let map = json_server_map(&mut document, integration.json_map_path, true).ok_or_else(
+                || {
                     format!(
                         "{} has an unexpected shape; refusing to modify it",
                         config_path.display()
                     )
-                })?;
+                },
+            )?;
             map.insert(
                 SERVER_ENTRY_NAME.to_string(),
                 json_entry(integration.id, url, token),
@@ -343,9 +339,8 @@ pub(super) fn remove_at(home: &Path, id: &str) -> Result<IntegrationStatus, Stri
                     .map(|servers| servers.remove(SERVER_ENTRY_NAME).is_some())
                     .unwrap_or(false);
                 if removed {
-                    std::fs::write(&config_path, document.to_string()).map_err(|e| {
-                        format!("Failed to write {}: {e}", config_path.display())
-                    })?;
+                    std::fs::write(&config_path, document.to_string())
+                        .map_err(|e| format!("Failed to write {}: {e}", config_path.display()))?;
                 }
             }
         }

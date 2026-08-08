@@ -14,6 +14,7 @@ Your Environment section contains "Current Unity State" with Unity Editor Status
 * Confirm the Unity Editor is running and the project is open before calling `unity_execute`.
 * If Editor state is unclear or unavailable, prefer file-level operations.
 * Do not automatically attribute `unity_execute` failure to script logic — first check Editor runtime state and connectivity.
+* Use `unity_set_play_mode` to enter, resume, or exit Play Mode. Use `unity_execute` for live C# inspection inside the requested state.
 
 ## Runtime / editor-time boundary
 

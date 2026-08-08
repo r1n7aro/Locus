@@ -26,8 +26,12 @@ fn intercepted_skill_tool(name: &str, prompt: &str, mutates_workspace: bool) -> 
     }
 }
 
-pub(super) fn skill_create_tool() -> ToolDef {
-    intercepted_skill_tool("skill_create", crate::prompt::tools::SKILL_CREATE, true)
+pub(super) fn create_skill_package_tool() -> ToolDef {
+    intercepted_skill_tool(
+        "create_skill_package",
+        crate::prompt::tools::CREATE_SKILL_PACKAGE,
+        true,
+    )
 }
 
 pub(super) fn skill_reload_tool() -> ToolDef {

@@ -95,27 +95,46 @@ describe("parseAgentToolDefinition", () => {
     ]);
   });
 
-  it("exposes exact knowledge sections through knowledge_read", () => {
-    const raw = readFileSync(resolve(cwd, "tools/knowledge_read.json"), "utf8");
+  it("returns directly readable physical locations through knowledge_query", () => {
+    const raw = readFileSync(resolve(cwd, "tools/knowledge_query.json"), "utf8");
     const definition = JSON.parse(raw);
     const tool = parseAgentToolDefinition({
-      name: "knowledge_read",
+      name: "knowledge_query",
       ...definition,
     });
 
     expect(tool).not.toBeNull();
     expect(definition.parameters.additionalProperties).toBe(false);
-    expect(tool?.topLevelRequired).toEqual(["path"]);
-    expect(tool?.parameterRows.some((row) => row.path === "kind")).toBe(false);
-    expect(tool?.parameterRows.find((row) => row.path === "part")?.enumValues).toEqual([
-      "full",
-      "summary",
-      "body",
-      "maintenanceRules",
-    ]);
-    expect(tool?.parameterRows.find((row) => row.path === "part")?.defaultValue).toBe("full");
-    expect(definition.description).toContain("exactly the stored text");
-    expect(definition.description).toContain("no heading, trimming, placeholder, added newline, or runtime annotation");
+    expect(definition.description).toContain("real file path");
+    expect(definition.description).toContain("physical line range");
+    expect(definition.description).toContain("Use `read`");
+    expect(definition.description).toContain("titles are omitted");
+    expect(definition.parameters.properties.includeSummary.default).toBe(false);
+    expect(definition.parameters.properties.includeHitContext.default).toBe(true);
+    expect(definition.parameters.properties.hitContextMaxChars).toMatchObject({
+      default: 220,
+      minimum: 80,
+      maximum: 1000,
+    });
+  });
+
+  it("documents read outline mode as an opt-in C# and Markdown outline", () => {
+    const raw = readFileSync(resolve(cwd, "tools/read.json"), "utf8");
+    const definition = JSON.parse(raw);
+    const tool = parseAgentToolDefinition({
+      name: "read",
+      ...definition,
+    });
+
+    expect(tool).not.toBeNull();
+    expect(definition.parameters.properties.outline).toMatchObject({
+      type: "boolean",
+      default: false,
+    });
+    expect(definition.description).toContain("C# (.cs)");
+    expect(definition.description).toContain("Markdown (.md)");
+    expect(definition.description).toContain("instead of original file content");
+    expect(definition.description).toContain("unsupported file types return an error");
   });
 
   it("keeps edit limited to one public file edit", () => {
@@ -139,55 +158,34 @@ describe("parseAgentToolDefinition", () => {
     expect(tool?.parameterRows.find((row) => row.path === "replaceAll")?.defaultValue).toBe("false");
   });
 
-  it("keeps knowledge_edit limited to one targeted document edit", () => {
-    const raw = readFileSync(resolve(cwd, "tools/knowledge_edit.json"), "utf8");
+  it("documents automatic knowledge frontmatter in write", () => {
+    const raw = readFileSync(resolve(cwd, "tools/write.json"), "utf8");
     const definition = JSON.parse(raw);
     const tool = parseAgentToolDefinition({
-      name: "knowledge_edit",
+      name: "write",
       ...definition,
     });
 
     expect(tool).not.toBeNull();
-    expect(definition.parameters.additionalProperties).toBe(false);
-    expect(tool?.topLevelRequired).toEqual(["path", "section", "oldString", "newString"]);
-    expect(tool?.parameterRows.map((row) => row.path)).toEqual([
-      "path",
-      "section",
-      "oldString",
-      "newString",
-    ]);
-    expect(tool?.parameterRows.every((row) => row.required)).toBe(true);
-    expect(tool?.parameterRows.find((row) => row.path === "section")?.enumValues).toEqual([
-      "summary",
-      "body",
-      "maintenanceRules",
-    ]);
-    expect(definition.description).toContain("`part` equal to `section`");
-    expect(definition.description).toContain("`full` is a rendered reading view");
+    expect(tool?.topLevelRequired).toEqual(["filePath", "content"]);
+    expect(definition.description).toContain("provide Markdown body content only");
+    expect(definition.description).toContain("reports every generated field");
   });
 
-  it("keeps knowledge_create free of metadata and directory config patches", () => {
-    const raw = readFileSync(resolve(cwd, "tools/knowledge_create.json"), "utf8");
+  it("keeps create_skill_package package-only", () => {
+    const raw = readFileSync(resolve(cwd, "tools/create_skill_package.json"), "utf8");
     const definition = JSON.parse(raw);
     const tool = parseAgentToolDefinition({
-      name: "knowledge_create",
+      name: "create_skill_package",
       ...definition,
     });
 
     expect(tool).not.toBeNull();
     expect(definition.parameters.additionalProperties).toBe(false);
-    expect(definition.parameters.properties.document.additionalProperties).toBe(false);
-    expect(tool?.parameterRows.some((row) => row.path === "config")).toBe(false);
-    expect(tool?.parameterRows.some((row) => row.path === "document.title")).toBe(false);
-    expect(tool?.parameterRows.some((row) => row.path === "document.injectMode")).toBe(false);
-    expect(tool?.parameterRows).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: "kind" }),
-        expect.objectContaining({ path: "path" }),
-        expect.objectContaining({ path: "document.summary" }),
-        expect.objectContaining({ path: "document.body" }),
-        expect.objectContaining({ path: "document.maintenanceRules" }),
-      ]),
-    );
+    expect(tool?.topLevelRequired).toEqual(["name", "version", "summary"]);
+    expect(tool?.parameterRows.map((row) => row.path)).not.toContain("kind");
+    expect(tool?.parameterRows.map((row) => row.path)).not.toContain("path");
+    expect(tool?.parameterRows.map((row) => row.path)).not.toContain("tools");
+    expect(definition.description).toContain("app Skill package");
   });
 });

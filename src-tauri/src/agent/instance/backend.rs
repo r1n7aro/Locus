@@ -133,7 +133,9 @@ mod tests {
             "input length and `max_tokens` exceed context limit: 195122 + 8192 > 200000"
         ));
         // OpenAI-compatible servers (code and prose).
-        assert!(is_prompt_too_long_error("error code: context_length_exceeded"));
+        assert!(is_prompt_too_long_error(
+            "error code: context_length_exceeded"
+        ));
         assert!(is_prompt_too_long_error(
             "This model's maximum context length is 65536 tokens. However, you requested 70000 tokens"
         ));
@@ -144,7 +146,9 @@ mod tests {
         assert!(is_prompt_too_long_error(
             "requested tokens are larger than the context size"
         ));
-        assert!(is_prompt_too_long_error("Input is too long for requested model."));
+        assert!(is_prompt_too_long_error(
+            "Input is too long for requested model."
+        ));
     }
 
     #[test]
@@ -324,7 +328,9 @@ mod tests {
     fn keyword_heuristics_still_apply_without_a_status_shape() {
         // Errors that don't carry the "<tag> API error (NNN" shape keep the
         // historical keyword classification.
-        assert!(is_retryable_llm_error("Stream read error: connection reset"));
+        assert!(is_retryable_llm_error(
+            "Stream read error: connection reset"
+        ));
         assert!(is_retryable_llm_error(
             "Request failed: error sending request"
         ));

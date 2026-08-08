@@ -8,10 +8,11 @@ let loadSkillsRequestId = 0;
 let inflightLoad: Promise<void> | null = null;
 
 export function useSkills() {
-  // Stale-while-revalidate: the previous list stays rendered until the fresh
-  // scan lands. Concurrent non-forced callers share the in-flight request so
-  // rapid package switches don't fan out duplicate full manifest scans.
+  // Skill manifests are invalidated explicitly by workspace/knowledge change
+  // handlers. Reuse the warm list for ordinary mounts so opening a package or
+  // document cannot trigger another full manifest scan.
   function loadSkills(options?: { force?: boolean }): Promise<void> {
+    if (!options?.force && skillsLoaded.value) return Promise.resolve();
     if (!options?.force && inflightLoad) return inflightLoad;
     const requestId = ++loadSkillsRequestId;
     let request: Promise<void> | null = null;

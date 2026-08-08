@@ -130,6 +130,8 @@ pub(super) fn bash() -> ToolDef {
         mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
+                let mut cancel_rx = ctx.cancel_rx.clone();
+                let progress = ctx.progress.clone();
                 let command = match args.get("command").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
                     None => {
@@ -197,14 +199,28 @@ pub(super) fn bash() -> ToolDef {
                 let envs = collect_shell_env(python.as_ref());
 
                 if interactive {
-                    return run_interactive_command(
+                    if let Some(report) = progress.as_ref() {
+                        report(format!("Interactive command running: {}", command));
+                    }
+                    let interactive_sh_command = sh_command();
+                    let run = run_interactive_command(
                         &command,
-                        &sh_command(),
+                        &interactive_sh_command,
                         workdir.as_deref().unwrap_or_default(),
                         &envs,
                         timeout_ms,
-                    )
-                    .await;
+                    );
+                    return if let Some(ref mut cancel_rx) = cancel_rx {
+                        tokio::select! {
+                            result = run => result,
+                            _ = cancel_rx.changed() => ToolResult {
+                                output: "Command cancelled.".to_string(),
+                                is_error: true,
+                            },
+                        }
+                    } else {
+                        run.await
+                    };
                 }
 
                 let mut cmd = if cfg!(target_os = "windows") {
@@ -226,6 +242,7 @@ pub(super) fn bash() -> ToolDef {
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
+                cmd.kill_on_drop(true);
 
                 for (key, value) in &envs {
                     cmd.env(key, value);
@@ -235,11 +252,26 @@ pub(super) fn bash() -> ToolDef {
                     cmd.current_dir(dir);
                 }
 
-                let result = tokio::time::timeout(
+                if let Some(report) = progress.as_ref() {
+                    report(format!("Command running: {}", command));
+                }
+                let execution = tokio::time::timeout(
                     std::time::Duration::from_millis(timeout_ms),
                     cmd.output(),
-                )
-                .await;
+                );
+                let result = if let Some(ref mut cancel_rx) = cancel_rx {
+                    tokio::select! {
+                        result = execution => result,
+                        _ = cancel_rx.changed() => {
+                            return ToolResult {
+                                output: "Command cancelled.".to_string(),
+                                is_error: true,
+                            };
+                        }
+                    }
+                } else {
+                    execution.await
+                };
 
                 match result {
                     Ok(Ok(output)) => {
@@ -301,6 +333,9 @@ fn collect_shell_env(
 
     envs.push(("PYTHONIOENCODING".to_string(), OsString::from("utf-8")));
     envs.push(("PYTHONUTF8".to_string(), OsString::from("1")));
+    for (key, value) in crate::python_runtime::locus_sdk_invocation_env() {
+        envs.push((key, OsString::from(value)));
+    }
     // Non-interactive agent session: no pagers, no ANSI color noise.
     envs.push(("PAGER".to_string(), OsString::from("cat")));
     envs.push(("GIT_PAGER".to_string(), OsString::from("cat")));
@@ -837,5 +872,42 @@ mod tests {
         assert!(encoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    }
+
+    #[tokio::test]
+    async fn bash_stops_waiting_when_the_execution_context_is_cancelled() {
+        let definition = bash();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let command = match detect_shell() {
+            ShellKind::Sh => "sleep 30",
+            ShellKind::Cmd => "ping -n 30 127.0.0.1 >nul",
+        };
+        let context = crate::tool::ToolExecutionContext {
+            working_dir: Some(
+                std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            cancel_rx: Some(cancel_rx),
+            ..Default::default()
+        };
+        let execution = (definition.execute)(
+            serde_json::json!({
+                "command": command,
+                "workdir": context.working_dir.clone().unwrap(),
+                "timeout": 60_000
+            }),
+            context,
+        );
+        tokio::pin!(execution);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_tx.send_replace(true);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), execution)
+            .await
+            .expect("cancelled command should return promptly");
+        assert!(result.is_error);
+        assert_eq!(result.output, "Command cancelled.");
     }
 }

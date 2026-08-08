@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use tauri::AppHandle;
@@ -6,6 +6,10 @@ use tauri::AppHandle;
 use super::{
     emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
     AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
+};
+use crate::agent::workspace_execution_lock::{
+    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockMode,
+    WorkspaceExecutionLockOwner,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::claude_code_cli::{
@@ -31,6 +35,10 @@ struct PendingAssistantRound {
     has_unity_execute: bool,
     unity_edit_session_started: bool,
     queued_unity_asset_paths: Vec<String>,
+    workspace_guard: Option<WorkspaceExecutionGuard>,
+    confirmations_prepared: bool,
+    confirmation_preapproved: HashSet<String>,
+    confirmation_rejections: HashMap<String, ExecutedToolResult>,
 }
 
 struct CliRoundCompletion {
@@ -38,6 +46,7 @@ struct CliRoundCompletion {
     undo_guard: Option<crate::vcs::undo::UndoRoundGuard>,
     has_unity_execute: bool,
     queued_unity_asset_paths: Vec<String>,
+    workspace_guard: Option<WorkspaceExecutionGuard>,
 }
 
 struct ClaudeCodeRoundHost<'a> {
@@ -300,6 +309,153 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         );
     }
 
+    fn cli_round_workspace_policy(
+        &self,
+        current_tool_name: &str,
+    ) -> Result<Option<(WorkspaceExecutionLockMode, Vec<String>)>, String> {
+        let mut tools = Vec::new();
+        let mut needs_write = false;
+        if let Some(round) = self.pending_round.as_ref() {
+            for tool_call in &round.tool_calls {
+                let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                normalize_tool_args(&mut args);
+                let effective_name = self
+                    .agent
+                    .effective_tool_name_for_round(&tool_call.name, &args);
+                needs_write |= self
+                    .agent
+                    .tool_call_needs_undo_tracking(&tool_call.name, &args)
+                    || AgentInstance::is_unity_execution_barrier_tool(&effective_name);
+                tools.push(effective_name);
+            }
+        }
+        if tools.is_empty() {
+            tools.push(current_tool_name.to_string());
+            needs_write = self
+                .agent
+                .tool_registry
+                .mutates_workspace(current_tool_name)
+                || AgentInstance::is_unity_execution_barrier_tool(current_tool_name);
+        }
+
+        let has_ask = tools.iter().any(|name| name == "ask_user_question");
+        let has_task = tools.iter().any(|name| name == "task");
+        let has_external_mcp = tools
+            .iter()
+            .any(|name| name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX));
+        let allowed_kind = if has_ask && tools.len() > 1 {
+            Some("ask_user_question")
+        } else if has_task && tools.iter().any(|name| name != "task") {
+            Some("task")
+        } else if has_external_mcp
+            && tools
+                .iter()
+                .any(|name| !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX))
+        {
+            Some("external MCP")
+        } else {
+            None
+        };
+        if let Some(allowed_kind) = allowed_kind {
+            let current_allowed = match allowed_kind {
+                "ask_user_question" => current_tool_name == "ask_user_question",
+                "task" => current_tool_name == "task",
+                _ => current_tool_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
+            };
+            if !current_allowed {
+                return Err(format!(
+                    "Tool '{}' was skipped by the Claude Code tool-round scheduler: {} calls must run without local sibling tools. Retry it in the next tool round.",
+                    current_tool_name, allowed_kind
+                ));
+            }
+            return Ok(None);
+        }
+        if has_ask || has_task || has_external_mcp {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            if needs_write {
+                WorkspaceExecutionLockMode::Write
+            } else {
+                WorkspaceExecutionLockMode::Read
+            },
+            tools,
+        )))
+    }
+
+    async fn ensure_cli_round_confirmations_prepared(&mut self) {
+        let Some(round) = self.pending_round.as_mut() else {
+            return;
+        };
+        if round.confirmations_prepared {
+            return;
+        }
+
+        // Mark first because this method spans user-driven awaits. The host is
+        // mutably borrowed while awaiting, so the round cannot execute a tool
+        // concurrently, and the flag prevents accidental repeated prompts.
+        round.confirmations_prepared = true;
+        let tool_calls = round.tool_calls.clone();
+        let mut approved = HashSet::new();
+        let mut rejected = HashMap::new();
+
+        for tool_call in tool_calls {
+            let mut args = match serde_json::from_str::<serde_json::Value>(&tool_call.arguments) {
+                Ok(args) => args,
+                Err(_) => continue,
+            };
+            normalize_tool_args(&mut args);
+            let effective_name = self
+                .agent
+                .effective_tool_name_for_round(&tool_call.name, &args);
+            if matches!(
+                effective_name.as_str(),
+                "tool_load" | super::CODEX_TOOL_SEARCH_TOOL_NAME | "exit_plan_mode"
+            ) {
+                continue;
+            }
+            let Some((confirm_name, confirm_arguments, confirm_args)) =
+                self.agent.tool_round_confirmation_target(&tool_call, &args)
+            else {
+                continue;
+            };
+            let decision = self
+                .agent
+                .request_tool_confirm(
+                    self.app_handle,
+                    &tool_call.id,
+                    &confirm_name,
+                    &confirm_arguments,
+                    &confirm_args,
+                    self.run_id,
+                )
+                .await;
+            if let Some(result) = self
+                .agent
+                .confirmation_rejection_result(&confirm_name, decision)
+            {
+                rejected.insert(tool_call.id, result);
+            } else {
+                approved.insert(tool_call.id);
+            }
+        }
+
+        if let Some(round) = self.pending_round.as_mut() {
+            eprintln!(
+                "[Agent {}] Claude Code tool round confirmations prepared session={} run={} approved={} rejected={}",
+                self.agent.id,
+                self.agent.session_id,
+                self.run_id,
+                approved.len(),
+                rejected.len()
+            );
+            round.confirmation_preapproved = approved;
+            round.confirmation_rejections = rejected;
+        }
+    }
+
     async fn ensure_cli_round_undo_checkpoint(
         &mut self,
         tool_name: &str,
@@ -439,10 +595,12 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             undo_guard: round.undo_guard.take(),
             has_unity_execute: round.has_unity_execute,
             queued_unity_asset_paths: std::mem::take(&mut round.queued_unity_asset_paths),
+            workspace_guard: round.workspace_guard.take(),
         })
     }
 
     async fn finish_cli_round_external_side_effects(&self, completion: CliRoundCompletion) {
+        let workspace_guard = completion.workspace_guard;
         if !completion.queued_unity_asset_paths.is_empty() {
             crate::unity_bridge::import_assets_fire_and_forget(
                 &self.agent.working_dir,
@@ -451,9 +609,11 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
 
         let Some(undo_guard) = completion.undo_guard else {
+            drop(workspace_guard);
             return;
         };
         let Some(undo_mgr) = self.agent.undo_manager.as_ref() else {
+            drop(workspace_guard);
             return;
         };
         let recorded = undo_mgr
@@ -495,6 +655,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                 self.agent.id, self.agent.session_id, completion.message_id, error
             ),
         }
+        drop(workspace_guard);
     }
 }
 
@@ -558,7 +719,6 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 );
             }
         }
-
         let text_part = (!message.text.is_empty()).then(|| {
             self.render_order
                 .mark_text(self.run_id, "claude-code-round-text")
@@ -644,6 +804,10 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             has_unity_execute: false,
             unity_edit_session_started: false,
             queued_unity_asset_paths: Vec::new(),
+            workspace_guard: None,
+            confirmations_prepared: false,
+            confirmation_preapproved: HashSet::new(),
+            confirmation_rejections: HashMap::new(),
         });
         self.last_persisted_assistant_message_id = Some(message_id);
         self.streamed_text.clear();
@@ -704,23 +868,135 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             self.agent
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
 
-            self.ensure_cli_round_undo_checkpoint(&tool_call.name, &args_for_exec)
-                .await;
-            self.prepare_cli_unity_tool(&tool_call, &args_for_exec)
-                .await;
+            let workspace_policy = self.cli_round_workspace_policy(&tool_call.name);
+            let mut confirmation_preapproved = false;
+            let mut result_override = match workspace_policy.as_ref() {
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] Claude Code tool round policy blocked tool='{}' id={} session={} run={} reason={}",
+                        self.agent.id,
+                        tool_call.name,
+                        tool_call.id,
+                        self.agent.session_id,
+                        self.run_id,
+                        error
+                    );
+                    Some(ExecutedToolResult::from_tool_result(
+                        crate::tool::ToolResult {
+                            output: error.clone(),
+                            is_error: true,
+                        },
+                    ))
+                }
+                Ok(_) => None,
+            };
 
-            let result = self
-                .agent
-                .execute_single_tool(
-                    self.app_handle,
-                    self.store,
-                    &tool_call,
-                    &args_for_exec,
-                    self.run_id,
-                    self.mode,
-                    self.active_skill_tool_names,
-                )
-                .await;
+            if result_override.is_none() && workspace_policy.as_ref().is_ok_and(Option::is_some) {
+                if self.pending_round.is_some() {
+                    self.ensure_cli_round_confirmations_prepared().await;
+                    if let Some(round) = self.pending_round.as_ref() {
+                        if let Some(result) = round.confirmation_rejections.get(&tool_call.id) {
+                            result_override = Some(result.clone());
+                        } else {
+                            confirmation_preapproved =
+                                round.confirmation_preapproved.contains(&tool_call.id);
+                        }
+                    }
+                } else if !matches!(
+                    tool_call.name.as_str(),
+                    "tool_load" | super::CODEX_TOOL_SEARCH_TOOL_NAME | "exit_plan_mode"
+                ) {
+                    let decision = self
+                        .agent
+                        .request_tool_confirm(
+                            self.app_handle,
+                            &tool_call.id,
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            &args_for_exec,
+                            self.run_id,
+                        )
+                        .await;
+                    if let Some(result) = self
+                        .agent
+                        .confirmation_rejection_result(&tool_call.name, decision)
+                    {
+                        result_override = Some(result);
+                    } else {
+                        confirmation_preapproved = true;
+                    }
+                }
+            }
+
+            let mut _single_tool_workspace_guard: Option<WorkspaceExecutionGuard> = None;
+            if result_override.is_none() {
+                if let Ok(Some((lock_mode, tools))) = workspace_policy.as_ref() {
+                    let already_locked = self
+                        .pending_round
+                        .as_ref()
+                        .is_some_and(|round| round.workspace_guard.is_some());
+                    if !already_locked {
+                        eprintln!(
+                            "[Agent {}] Claude Code tool round acquiring workspace lock mode={:?} session={} run={} tools=[{}]",
+                            self.agent.id,
+                            lock_mode,
+                            self.agent.session_id,
+                            self.run_id,
+                            tools.join(",")
+                        );
+                        let owner = WorkspaceExecutionLockOwner {
+                            session_id: self.agent.session_id.clone(),
+                            run_id: self.run_id.to_string(),
+                            iteration: 0,
+                            workspace: self.agent.working_dir.clone(),
+                            tools: tools.clone(),
+                        };
+                        match process_workspace_execution_lock()
+                            .acquire(*lock_mode, owner, self.agent.cancel_waiter())
+                            .await
+                        {
+                            Ok(guard) => {
+                                if let Some(round) = self.pending_round.as_mut() {
+                                    round.workspace_guard = Some(guard);
+                                } else {
+                                    _single_tool_workspace_guard = Some(guard);
+                                }
+                            }
+                            Err(_) => {
+                                result_override = Some(AgentInstance::interrupted_tool_result());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let assistant_message_id = self
+                .pending_round
+                .as_ref()
+                .map(|round| round.message_id.clone())
+                .or_else(|| self.last_persisted_assistant_message_id.clone())
+                .unwrap_or_default();
+            let result = if let Some(result) = result_override {
+                result
+            } else {
+                self.ensure_cli_round_undo_checkpoint(&tool_call.name, &args_for_exec)
+                    .await;
+                self.prepare_cli_unity_tool(&tool_call, &args_for_exec)
+                    .await;
+                self.agent
+                    .execute_single_tool(
+                        self.app_handle,
+                        self.store,
+                        &tool_call,
+                        &args_for_exec,
+                        self.run_id,
+                        &assistant_message_id,
+                        self.mode,
+                        self.active_skill_tool_names,
+                        confirmation_preapproved,
+                    )
+                    .await
+            };
 
             if !self.agent.run_is_current_for_session(
                 self.store,
@@ -968,8 +1244,11 @@ impl AgentInstance {
                 + turn.cache_read_tokens
                 + turn.cache_write_tokens;
             let context_limit = super::model_context_limit(&self.effective_model);
-            match store.record_token_usage(
+            match store.record_model_usage(
                 &self.session_id,
+                &self.effective_model,
+                "Claude Code CLI",
+                "completion",
                 turn.input_tokens as u64,
                 turn.output_tokens as u64,
                 turn.cache_read_tokens as u64,

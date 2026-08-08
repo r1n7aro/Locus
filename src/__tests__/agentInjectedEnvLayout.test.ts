@@ -32,4 +32,23 @@ describe("AgentView injected env entry", () => {
             :class="{ selected: selected?.type === 'env' }"`,
     );
   });
+
+  it("places injected rule items in the rule section", () => {
+    const source = read("src/components/AgentView.vue");
+
+    expect(source).toContain("const injectedRuleItems = computed(() =>");
+    expect(source).toContain('item.kind === "rule"');
+    expect(source).toContain("const ruleSectionEntryCount = computed(() =>");
+    expect(source).toContain('item.kind === "context"');
+
+    const ruleSectionStart = source.indexOf('class="rule-section"');
+    const injectedSectionStart = source.indexOf('class="injected-section"');
+    const injectedRuleList = source.indexOf('v-for="item in injectedRuleItems"');
+    const injectedContextList = source.indexOf('v-for="item in injectedContextItems"');
+
+    expect(ruleSectionStart).toBeGreaterThan(-1);
+    expect(injectedRuleList).toBeGreaterThan(ruleSectionStart);
+    expect(injectedRuleList).toBeLessThan(injectedSectionStart);
+    expect(injectedContextList).toBeGreaterThan(injectedSectionStart);
+  });
 });

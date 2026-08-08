@@ -22,10 +22,7 @@ fn test_context(workspace: Arc<Mutex<String>>) -> Arc<ServerContext> {
         let workspace = workspace.clone();
         Arc::new(
             move |name: String, args: Value| -> BoxFuture<'static, ToolCallOutcome> {
-                let workspace = workspace
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let workspace = workspace.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 Box::pin(async move {
                     ToolCallOutcome {
                         output: format!("echo {name}: {args}"),
@@ -65,9 +62,7 @@ fn test_context(workspace: Arc<Mutex<String>>) -> Arc<ServerContext> {
     ))
 }
 
-async fn start_test_server(
-    workspace: Arc<Mutex<String>>,
-) -> (u16, tokio::task::JoinHandle<()>) {
+async fn start_test_server(workspace: Arc<Mutex<String>>) -> (u16, tokio::task::JoinHandle<()>) {
     let (addr, task) = http::start(0, test_context(workspace))
         .await
         .expect("test server binds");

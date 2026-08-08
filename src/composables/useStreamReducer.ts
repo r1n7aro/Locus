@@ -739,7 +739,6 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           toolCallId: event.toolCallId,
           question: event.question,
           options: event.options,
-          sheet: event.sheet ?? null,
         },
       });
       break;

@@ -200,7 +200,10 @@ mod tests {
     fn negotiates_known_versions_and_falls_back() {
         assert_eq!(negotiate_version(Some("2024-11-05")), "2024-11-05");
         assert_eq!(negotiate_version(Some("2025-06-18")), "2025-06-18");
-        assert_eq!(negotiate_version(Some("2099-01-01")), LATEST_PROTOCOL_VERSION);
+        assert_eq!(
+            negotiate_version(Some("2099-01-01")),
+            LATEST_PROTOCOL_VERSION
+        );
         assert_eq!(negotiate_version(None), LATEST_PROTOCOL_VERSION);
     }
 
@@ -210,7 +213,10 @@ mod tests {
         assert_eq!(value["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(value["result"]["serverInfo"]["name"], "locus");
         assert_eq!(value["result"]["instructions"], "Active project: X");
-        assert_eq!(value["result"]["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(
+            value["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
     }
 
     #[test]

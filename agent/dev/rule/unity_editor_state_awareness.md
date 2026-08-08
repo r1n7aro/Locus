@@ -11,6 +11,7 @@ The Unity Editor status and active scene are announced in the conversation: the 
 * Before calling `unity_execute`, confirm that the Unity Editor has been launched and the project is open.
 * If the Editor state is unclear or unavailable, prefer file-level operations.
 * Do not automatically attribute a `unity_execute` failure to script logic; first check the Editor runtime state and connection state.
+* Use `unity_set_play_mode` to enter, resume, or exit Play Mode. Use `unity_execute` for C# operations inside the requested Editor state.
 
 ### Unity Editor Status Schema
 

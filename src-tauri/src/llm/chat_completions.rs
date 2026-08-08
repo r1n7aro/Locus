@@ -382,7 +382,11 @@ fn build_request_body(
 
     match flavor {
         ChatCompletionsFlavor::DeepSeek => {
-            apply_deepseek_thinking_params(&mut body, tuning.reasoning_effort, tuning.thinking_level);
+            apply_deepseek_thinking_params(
+                &mut body,
+                tuning.reasoning_effort,
+                tuning.thinking_level,
+            );
         }
         ChatCompletionsFlavor::MiniMax => {
             body["reasoning_split"] = serde_json::json!(true);
@@ -851,11 +855,7 @@ impl ChatStreamState {
     fn tool_call_slot(&mut self, delta: &StreamToolCallDelta) -> i64 {
         let slot = if let Some(index) = delta.index {
             index
-        } else if let Some(id) = delta
-            .id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
+        } else if let Some(id) = delta.id.as_deref().filter(|value| !value.trim().is_empty()) {
             self.tool_calls_map
                 .iter()
                 .find(|(_, entry)| entry.id == id)
@@ -969,8 +969,12 @@ impl ChatStreamState {
         self.apply_think_emit(emit, on_text_delta, on_thinking_delta);
     }
 
-    fn apply_think_emit<F, G>(&mut self, emit: ThinkTagEmit, on_text_delta: &F, on_thinking_delta: &G)
-    where
+    fn apply_think_emit<F, G>(
+        &mut self,
+        emit: ThinkTagEmit,
+        on_text_delta: &F,
+        on_thinking_delta: &G,
+    ) where
         F: Fn(String) + Send + 'static,
         G: Fn(String) + Send + 'static,
     {
@@ -1166,16 +1170,15 @@ fn apply_stream_chunk<F, G, H>(
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc in tcs {
                 let slot = state.tool_call_slot(tc);
-                let entry =
-                    state
-                        .tool_calls_map
-                        .entry(slot)
-                        .or_insert_with(|| PartialToolCall {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                            notified: false,
-                        });
+                let entry = state
+                    .tool_calls_map
+                    .entry(slot)
+                    .or_insert_with(|| PartialToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                        notified: false,
+                    });
                 if let Some(ref id) = tc.id {
                     assign_non_empty(&mut entry.id, id);
                 }
@@ -1542,12 +1545,9 @@ mod tests {
     fn json_parse_error_hint_fires_on_client_error_with_parser_markers() {
         // Verbatim shape of the issue #106 rejection (Spring/Jackson gateway).
         let issue_106_body = r#"{"error":{"message":"JSON parse error: Unexpected character (',' (code 44)): was expecting a colon to separate field name and value","code":"400"}}"#;
-        let hint = server_json_parse_error_hint(
-            reqwest::StatusCode::BAD_REQUEST,
-            issue_106_body,
-            104_213,
-        )
-        .expect("Jackson-style parse error must produce a hint");
+        let hint =
+            server_json_parse_error_hint(reqwest::StatusCode::BAD_REQUEST, issue_106_body, 104_213)
+                .expect("Jackson-style parse error must produce a hint");
         assert!(hint.contains("104213 bytes"));
 
         assert!(server_json_parse_error_hint(
@@ -2127,13 +2127,21 @@ mod tests {
         }))
         .expect("Gemini chunk without tool_calls[].index must deserialize");
 
-        apply_stream_chunk(chunk, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+        apply_stream_chunk(
+            chunk,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
 
         let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool call");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "jdrz4leq");
         assert_eq!(tool_calls[0].name, "knowledge_read");
-        assert!(tool_calls[0].arguments.contains("game-system-design-expert"));
+        assert!(tool_calls[0]
+            .arguments
+            .contains("game-system-design-expert"));
     }
 
     #[test]
@@ -2152,7 +2160,13 @@ mod tests {
         }))
         .expect("chunk parses");
 
-        apply_stream_chunk(chunk, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+        apply_stream_chunk(
+            chunk,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
 
         let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool calls");
         assert_eq!(tool_calls.len(), 2);
@@ -2187,8 +2201,20 @@ mod tests {
         }))
         .expect("tail parses");
 
-        apply_stream_chunk(head, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
-        apply_stream_chunk(tail, &mut state, &ignore_text, &ignore_thinking, &ignore_tool);
+        apply_stream_chunk(
+            head,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
+        apply_stream_chunk(
+            tail,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
 
         let tool_calls = collect_tool_calls(&state.tool_calls_map).expect("complete tool call");
         assert_eq!(tool_calls.len(), 1);
@@ -2323,8 +2349,19 @@ mod tests {
 
         // Open tag split across deltas, reasoning streamed, close tag plus
         // prose in the final delta — the wire shape vLLM/Ollama relays emit.
-        for delta in ["<thi", "nk>先分析问题", "，再给结论", "</think>\n\n结论如下"] {
-            apply_stream_chunk(content_chunk(delta), &mut state, &on_text, &on_thinking, &ignore_tool);
+        for delta in [
+            "<thi",
+            "nk>先分析问题",
+            "，再给结论",
+            "</think>\n\n结论如下",
+        ] {
+            apply_stream_chunk(
+                content_chunk(delta),
+                &mut state,
+                &on_text,
+                &on_thinking,
+                &ignore_tool,
+            );
         }
         state.flush_think_filter(&on_text, &on_thinking);
 
@@ -2334,7 +2371,10 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "先分析问题，再给结论"
         );
-        assert_eq!(text.lock().expect("text mutex poisoned").as_str(), "结论如下");
+        assert_eq!(
+            text.lock().expect("text mutex poisoned").as_str(),
+            "结论如下"
+        );
     }
 
     #[test]

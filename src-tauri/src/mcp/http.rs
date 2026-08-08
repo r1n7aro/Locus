@@ -245,8 +245,9 @@ impl HttpMcpClient {
                 return Err("MCP server accepted initialize without a response".to_string());
             }
         }
-        let note = serde_json::to_value(JsonRpcNotification::new("notifications/initialized", None))
-            .map_err(|e| e.to_string())?;
+        let note =
+            serde_json::to_value(JsonRpcNotification::new("notifications/initialized", None))
+                .map_err(|e| e.to_string())?;
         let _ = self.post_message(&note, None, false).await?;
         Ok(())
     }
@@ -275,7 +276,8 @@ impl HttpMcpClient {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, String> {
-        self.request_cancellable(method, params, timeout, None).await
+        self.request_cancellable(method, params, timeout, None)
+            .await
     }
 
     /// Sends one request. On session expiry (404) the client re-initializes
@@ -430,10 +432,7 @@ impl HttpMcpClient {
                 for (key, value) in &headers {
                     req = req.header(key, value);
                 }
-                if let Some(session) = session_id
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone()
+                if let Some(session) = session_id.lock().unwrap_or_else(|p| p.into_inner()).clone()
                 {
                     req = req.header("Mcp-Session-Id", session);
                 }
@@ -522,7 +521,10 @@ impl HttpMcpClient {
         let Some(session) = session else {
             return;
         };
-        let mut req = self.http.delete(&self.url).header("Mcp-Session-Id", session);
+        let mut req = self
+            .http
+            .delete(&self.url)
+            .header("Mcp-Session-Id", session);
         for (key, value) in &self.headers {
             req = req.header(key, value);
         }

@@ -1,0 +1,14 @@
+{
+  "description": "Request cancellation of a running asynchronous tool task by id. Calling this for a finished task is safe and returns its final state.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "The task id returned by a tool started with async='async' or async='notify'."
+      }
+    },
+    "required": ["task_id"],
+    "additionalProperties": false
+  }
+}

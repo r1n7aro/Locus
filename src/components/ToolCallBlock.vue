@@ -5,6 +5,7 @@ import { PanelTopOpen } from "lucide";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
 import ToolResultImages from "./ToolResultImages.vue";
+import ToolSearchOutput from "./ToolSearchOutput.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import hljs, { langFromPath } from "../hljs";
@@ -14,13 +15,16 @@ import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary, toolCallDisplayName } from "./toolCallSummary";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
-import { agentGraphToolReopen } from "../services/agentGraphTool";
 import { normalizeViewError, viewRun } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
+import { parseToolSearchOutput } from "./toolSearchOutput";
+import { resolveToolFilePreviewPayload } from "./toolFilePreviewActions";
+import { normalizeAppError } from "../services/errors";
+import { openToolFilePreviewWindow } from "../services/toolFilePreviewWindow";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -44,8 +48,8 @@ function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
 }
 
 const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));
-const openingGraphView = ref(false);
 const openingViewTool = ref(false);
+const openingFilePreview = ref(false);
 const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
@@ -203,9 +207,13 @@ const displayName = computed(() => {
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
-const showGraphViewOpenButton = computed(() =>
-  props.toolCall.name === "graph_view" && props.toolCall.status !== "running",
-);
+const toolFilePreviewPayload = computed(() => resolveToolFilePreviewPayload({
+  name: props.toolCall.name,
+  arguments: props.toolCall.arguments,
+  status: props.toolCall.status,
+  output: displayedToolOutput.value || props.toolCall.output,
+}));
+const showToolFilePreviewButton = computed(() => toolFilePreviewPayload.value !== null);
 const viewToolOpenId = computed(() =>
   resolveViewToolOpenId({
     name: props.toolCall.name,
@@ -215,7 +223,6 @@ const viewToolOpenId = computed(() =>
   }),
 );
 const showViewOpenButton = computed(() => viewToolOpenId.value.length > 0);
-const GRAPH_VIEW_HIDDEN_ARG_KEYS = new Set(["description"]);
 
 interface EditDiffItem {
   oldStr: string;
@@ -339,7 +346,6 @@ const parsedArgs = computed(() => {
     return Object.entries(args)
       .filter(([key]) => !isTask || key === "prompt")
       .filter(([key]) => !isEdit || !editDiffKeys.includes(key))
-      .filter(([key]) => props.toolCall.name !== "graph_view" || !GRAPH_VIEW_HIDDEN_ARG_KEYS.has(key))
       .map(([key, value]) => ({
         key,
         value,
@@ -371,31 +377,30 @@ function prettifyKey(key: string): string {
     .toLowerCase();
 }
 
+const toolPathSummaryContext = computed(() => ({
+  workingDir: projectStore.workingDir,
+  extraWorkdirs: (projectStore.extraWorkdirs[projectStore.workingDir] ?? [])
+    .map((entry) => entry.path),
+}));
 const argsSummary = computed(() =>
-  buildToolCallArgsSummary(props.toolCall.name, props.toolCall.arguments),
+  buildToolCallArgsSummary(
+    props.toolCall.name,
+    props.toolCall.arguments,
+    toolPathSummaryContext.value,
+  ),
 );
+const argsSummaryTitle = computed(() => {
+  const filePath = getFilePath();
+  return typeof filePath === "string" && filePath.trim()
+    ? filePath.trim().replace(/\\/g, "/")
+    : argsSummary.value;
+});
 const skillLoadedMarker = computed(() =>
   resolveSkillLoadedMarkerForToolCall(props.toolCall, displayedToolOutput.value || undefined),
 );
 const skillLoadedLabel = computed(() =>
   skillLoadedMarker.value ? t("tool.knowledgeRead.skillLoaded", skillLoadedMarker.value.name) : "",
 );
-
-async function reopenGraphView() {
-  if (openingGraphView.value) return;
-  openingGraphView.value = true;
-  try {
-    await agentGraphToolReopen({
-      toolCallId: props.toolCall.id,
-      arguments: props.toolCall.arguments,
-      output: props.toolCall.output,
-    });
-  } catch {
-    // ipcInvoke reports the error through the notification store.
-  } finally {
-    openingGraphView.value = false;
-  }
-}
 
 async function openViewTool() {
   if (openingViewTool.value) return;
@@ -416,6 +421,25 @@ async function openViewTool() {
   }
 }
 
+async function openToolFilePreview() {
+  if (openingFilePreview.value) return;
+  const payload = toolFilePreviewPayload.value;
+  if (!payload) return;
+  openingFilePreview.value = true;
+  try {
+    await openToolFilePreviewWindow(payload);
+  } catch (cause) {
+    const error = normalizeAppError(cause);
+    notificationStore.addNotice("error", error.message, {
+      code: error.code,
+      operation: "openToolFilePreviewWindow",
+      replaceOperation: true,
+    });
+  } finally {
+    openingFilePreview.value = false;
+  }
+}
+
 function getFilePath(): string {
   try {
     const args = JSON.parse(props.toolCall.arguments);
@@ -433,6 +457,20 @@ const outputDisplay = computed(() => {
 const displayOutput = computed(() => outputDisplay.value.text);
 const isDeletedOutput = computed(() => outputDisplay.value.kind === "deleted");
 const deletedOutputPath = computed(() => outputDisplay.value.path || "");
+const toolSearchOutput = computed(() => {
+  if (props.toolCall.name !== "tool_search" || outputDisplay.value.kind !== "normal") {
+    return null;
+  }
+  return parseToolSearchOutput(displayOutput.value);
+});
+const headerSummary = computed(() => {
+  if (!toolSearchOutput.value) return argsSummary.value;
+  const resultCount = t("tool.toolSearch.summary", toolSearchOutput.value.tools.length);
+  return [argsSummary.value, resultCount].filter(Boolean).join(" · ");
+});
+const headerSummaryTitle = computed(() =>
+  props.toolCall.name === "tool_search" ? headerSummary.value : argsSummaryTitle.value,
+);
 const toolResultImages = computed(() => props.toolCall.images ?? []);
 const hasToolResultImages = computed(() => toolResultImages.value.length > 0);
 
@@ -496,20 +534,12 @@ const highlightedOutput = computed(() => {
           <span v-else class="tool-call-status-dot"></span>
         </span>
         <span class="tool-call-name">{{ displayName }}</span>
-        <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
+        <span
+          v-if="headerSummary"
+          class="tool-call-summary"
+          :title="headerSummaryTitle"
+        >{{ headerSummary }}</span>
         <span v-if="skillLoadedLabel" class="tool-call-inline-note">· {{ skillLoadedLabel }}</span>
-      </button>
-      <button
-        v-if="showGraphViewOpenButton"
-        type="button"
-        class="tool-call-action-button"
-        :title="t('tool.graphView.open')"
-        :aria-label="t('tool.graphView.open')"
-        :disabled="openingGraphView"
-        @click.stop="reopenGraphView"
-      >
-        <LucideIcon :icon="PanelTopOpen" :size="13" />
-        <span>{{ t("tool.graphView.open") }}</span>
       </button>
       <button
         v-if="showViewOpenButton"
@@ -522,6 +552,18 @@ const highlightedOutput = computed(() => {
       >
         <LucideIcon :icon="PanelTopOpen" :size="13" />
         <span>{{ t("tool.view.open") }}</span>
+      </button>
+      <button
+        v-if="showToolFilePreviewButton"
+        type="button"
+        class="tool-call-action-button tool-file-preview-action"
+        :title="t('tool.filePreview.open')"
+        :aria-label="t('tool.filePreview.open')"
+        :disabled="openingFilePreview"
+        @click.stop="openToolFilePreview"
+      >
+        <LucideIcon :icon="PanelTopOpen" :size="13" />
+        <span>{{ t("tool.filePreview.open") }}</span>
       </button>
     </div>
     <div v-if="showRecompileHint" class="recompile-hint">
@@ -613,6 +655,10 @@ const highlightedOutput = computed(() => {
               {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
             </code>
           </div>
+          <ToolSearchOutput
+            v-else-if="toolSearchOutput"
+            :tools="toolSearchOutput.tools"
+          />
           <pre v-else-if="displayedToolOutput && highlightedOutput" class="tool-call-pre ui-select-text hljs" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre" v-html="highlightedOutput"></pre>
           <pre v-else-if="displayedToolOutput" class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre">{{ displayOutput }}</pre>
           <ToolResultImages v-if="hasToolResultImages" :images="toolResultImages" />
@@ -819,6 +865,25 @@ const highlightedOutput = computed(() => {
 .tool-call-action-button:disabled {
   cursor: wait;
   opacity: 0.58;
+}
+
+.tool-file-preview-action {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tool-call-header-row:hover > .tool-file-preview-action,
+.tool-call-header-row:focus-within > .tool-file-preview-action,
+.tool-file-preview-action:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .tool-file-preview-action {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .tool-call-detail {

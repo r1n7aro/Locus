@@ -65,21 +65,34 @@ pub async fn get_plan_file_content(
     app_handle: AppHandle,
 ) -> Result<PlanFileContentPayload, AppError> {
     let plan_root = crate::commands::resolve_runtime_storage_dir(&app_handle)
-        .map_err(|e| AppError::new("plan.path_failed", format!("Failed to get data dir: {}", e)).operation("plan"))?
+        .map_err(|e| {
+            AppError::new("plan.path_failed", format!("Failed to get data dir: {}", e))
+                .operation("plan")
+        })?
         .join("plan");
-    let plan_root = dunce::canonicalize(&plan_root)
-        .map_err(|e| AppError::new("plan.path_failed", format!("Plan root unavailable: {}", e)).operation("plan"))?;
-    let requested = dunce::canonicalize(std::path::Path::new(&path))
-        .map_err(|e| AppError::new("plan.read_failed", format!("Plan file unavailable: {}", e)).operation("plan"))?;
+    let plan_root = dunce::canonicalize(&plan_root).map_err(|e| {
+        AppError::new("plan.path_failed", format!("Plan root unavailable: {}", e)).operation("plan")
+    })?;
+    let requested = dunce::canonicalize(std::path::Path::new(&path)).map_err(|e| {
+        AppError::new("plan.read_failed", format!("Plan file unavailable: {}", e)).operation("plan")
+    })?;
     if !requested.starts_with(&plan_root) {
         return Err(AppError::new(
             "plan.path_forbidden",
-            format!("Path is outside the plan directory: {}", requested.to_string_lossy()),
+            format!(
+                "Path is outside the plan directory: {}",
+                requested.to_string_lossy()
+            ),
         )
         .operation("plan"));
     }
-    let content = std::fs::read_to_string(&requested)
-        .map_err(|e| AppError::new("plan.read_failed", format!("Failed to read plan file: {}", e)).operation("plan"))?;
+    let content = std::fs::read_to_string(&requested).map_err(|e| {
+        AppError::new(
+            "plan.read_failed",
+            format!("Failed to read plan file: {}", e),
+        )
+        .operation("plan")
+    })?;
     Ok(PlanFileContentPayload {
         plan_file_path: requested.to_string_lossy().to_string(),
         content,

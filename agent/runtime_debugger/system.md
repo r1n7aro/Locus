@@ -69,6 +69,7 @@ For complex multi-step debugging sessions:
 
 # Tool usage
 
+* `unity_set_play_mode` — start, resume, or stop Play Mode
 * `unity_execute` — primary tool for all runtime queries
 * `read` / `grep` / `list` — for reading source code to understand the implementation behind runtime behavior
 * `unity_asset_search` / `unity_ref_search` — for finding related assets and references

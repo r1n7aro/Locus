@@ -303,28 +303,6 @@ pub(super) fn todowrite() -> ToolDef {
     }
 }
 
-// ─── graph_view ─────────────────────────────────────────────────────────────
-
-pub(super) fn graph_view() -> ToolDef {
-    let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
-        Box::pin(async {
-            ToolResult {
-                output: "Error: graph_view tool should be intercepted by agent loop".to_string(),
-                is_error: true,
-            }
-        })
-    });
-
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::GRAPH_VIEW);
-    ToolDef {
-        name: "graph_view".to_string(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        mutates_workspace: false,
-        execute,
-    }
-}
-
 // ─── ask ─────────────────────────────────────────────────────────────────────
 
 pub(super) fn ask() -> ToolDef {
@@ -340,28 +318,6 @@ pub(super) fn ask() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::ASK);
     ToolDef {
         name: "ask_user_question".to_string(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        mutates_workspace: false,
-        execute,
-    }
-}
-
-// ─── sheet ───────────────────────────────────────────────────────────────────
-
-pub(super) fn sheet() -> ToolDef {
-    let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
-        Box::pin(async {
-            ToolResult {
-                output: "Error: sheet tool should be intercepted by agent loop".to_string(),
-                is_error: true,
-            }
-        })
-    });
-
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::SHEET);
-    ToolDef {
-        name: "sheet".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,

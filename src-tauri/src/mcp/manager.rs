@@ -507,8 +507,9 @@ pub async fn call_tool(
     arguments: Value,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<McpCallOutcome, String> {
-    let target = resolve_wire_tool(wire_name)
-        .ok_or_else(|| format!("Unknown MCP tool '{wire_name}'. Run mcp_reload to refresh the tool list."))?;
+    let target = resolve_wire_tool(wire_name).ok_or_else(|| {
+        format!("Unknown MCP tool '{wire_name}'. Run mcp_reload to refresh the tool list.")
+    })?;
 
     let mut restarted = false;
     let acquire = {
@@ -610,7 +611,9 @@ fn render_tool_call_result(result: &Value) -> Result<McpCallOutcome, String> {
                         parts.push(format!("[image {} attached]", images.len()));
                     }
                 }
-                Some("audio") => parts.push("[audio returned by MCP tool; not audible to you]".to_string()),
+                Some("audio") => {
+                    parts.push("[audio returned by MCP tool; not audible to you]".to_string())
+                }
                 Some(other) => parts.push(format!("[{other} content returned by MCP tool]")),
                 None => {}
             }
@@ -768,9 +771,7 @@ async fn ping_round() {
                     continue;
                 }
                 let strikes = {
-                    let mut failures = ping_failures()
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let mut failures = ping_failures().lock().unwrap_or_else(|p| p.into_inner());
                     let entry = failures.entry(id.clone()).or_insert(0);
                     *entry += 1;
                     *entry
@@ -981,7 +982,10 @@ mod tests {
 
     #[test]
     fn wire_tool_name_prefixes_and_sanitizes() {
-        assert_eq!(wire_tool_name("blender", "get_scene_info"), "mcp__blender__get_scene_info");
+        assert_eq!(
+            wire_tool_name("blender", "get_scene_info"),
+            "mcp__blender__get_scene_info"
+        );
         assert_eq!(wire_tool_name("a b", "x.y"), "mcp__a_b__x_y");
     }
 
@@ -1047,5 +1051,4 @@ mod tests {
         assert_eq!(register_crash("crash-test-server"), 1);
         assert_eq!(register_crash("crash-test-server"), 2);
     }
-
 }

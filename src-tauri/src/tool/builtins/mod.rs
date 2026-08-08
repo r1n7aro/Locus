@@ -5,6 +5,7 @@ mod knowledge;
 mod mcp;
 mod misc;
 mod plugin;
+mod read_outline;
 mod search;
 mod shell;
 mod skill;
@@ -23,16 +24,21 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::write());
     registry.register_builtin(filesystem::edit());
     registry.register_builtin(shell::bash());
+    registry.register_builtin_with_load_mode(get_task_status_tool(), ToolLoadMode::Lazy);
+    registry.register_builtin_with_load_mode(cancel_task_tool(), ToolLoadMode::Lazy);
     registry.register_builtin(search::grep());
     registry.register_builtin(unity::unity_asset_search());
     registry.register_builtin(misc::web_fetch());
     registry.register_builtin(misc::todowrite());
-    registry.register_builtin(misc::graph_view());
 
     registry.register_builtin(filesystem::list());
+    registry.register_builtin(unity::unity_set_play_mode());
     registry.register_builtin(unity::unity_execute());
     registry.register_builtin(unity::unity_run_states());
     registry.register_builtin(unity::unity_capture_viewport());
+    registry.register_builtin(unity::unity_get_console_log());
+    registry.register_builtin(unity::unity_test_list());
+    registry.register_builtin(unity::unity_test_run());
     registry.register_builtin(unity::unity_recompile());
     registry.register_builtin(unity::unity_hot_reload());
     registry.register_builtin(unity::unity_ref_search());
@@ -46,15 +52,9 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_yaml_search());
     registry.register_builtin(unity::unity_yaml_read());
     registry.register_builtin(misc::ask());
-    registry.register_builtin(misc::sheet());
-    registry.register_builtin(knowledge::knowledge_list_tool());
     registry.register_builtin(knowledge::knowledge_query_tool());
-    registry.register_builtin(knowledge::knowledge_read_tool());
-    registry.register_builtin(knowledge::knowledge_create_tool());
-    registry.register_builtin(knowledge::knowledge_delete_tool());
-    registry.register_builtin(knowledge::knowledge_move_tool());
-    registry.register_builtin(knowledge::knowledge_edit_tool());
-    registry.register_builtin(skill::skill_create_tool());
+    registry
+        .register_builtin_with_load_mode(skill::create_skill_package_tool(), ToolLoadMode::Skill);
     registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
     registry.register_builtin(mcp::mcp_reload_tool());
@@ -141,6 +141,80 @@ fn config_query_tool() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CONFIG_QUERY);
     ToolDef {
         name: "config_query".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
+}
+
+fn get_task_status_tool() -> ToolDef {
+    let execute: ToolExecuteFn = std::sync::Arc::new(|args, ctx| {
+        Box::pin(async move {
+            let Some(task_id) = args
+                .get("task_id")
+                .or_else(|| args.get("taskId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return ToolResult {
+                    output: "Missing required parameter: task_id".to_string(),
+                    is_error: true,
+                };
+            };
+            let Some(app_handle) = ctx.app_handle else {
+                return ToolResult {
+                    output: "Async task manager is unavailable.".to_string(),
+                    is_error: true,
+                };
+            };
+            use tauri::Manager;
+            app_handle
+                .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
+                .status_result(task_id)
+        })
+    });
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::GET_TASK_STATUS);
+    ToolDef {
+        name: crate::async_tasks::GET_TASK_STATUS_TOOL_NAME.to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
+}
+
+fn cancel_task_tool() -> ToolDef {
+    let execute: ToolExecuteFn = std::sync::Arc::new(|args, ctx| {
+        Box::pin(async move {
+            let Some(task_id) = args
+                .get("task_id")
+                .or_else(|| args.get("taskId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return ToolResult {
+                    output: "Missing required parameter: task_id".to_string(),
+                    is_error: true,
+                };
+            };
+            let Some(app_handle) = ctx.app_handle else {
+                return ToolResult {
+                    output: "Async task manager is unavailable.".to_string(),
+                    is_error: true,
+                };
+            };
+            use tauri::Manager;
+            app_handle
+                .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
+                .cancel_result(task_id)
+        })
+    });
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CANCEL_TASK);
+    ToolDef {
+        name: crate::async_tasks::CANCEL_TASK_TOOL_NAME.to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,

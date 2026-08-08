@@ -100,8 +100,8 @@ pub(crate) fn status_retry_delay_ms(
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_max_retries, is_retryable_http_status, parse_retry_after_secs,
-        status_retry_delay_ms, MAX_RETRIES_LIMIT, RETRY_AFTER_CAP_SECS,
+        clamp_max_retries, is_retryable_http_status, parse_retry_after_secs, status_retry_delay_ms,
+        MAX_RETRIES_LIMIT, RETRY_AFTER_CAP_SECS,
     };
     use reqwest::StatusCode;
 
@@ -129,7 +129,10 @@ mod tests {
         assert_eq!(parse_retry_after_secs("5"), Some(5));
         assert_eq!(parse_retry_after_secs(" 30 "), Some(30));
         assert_eq!(parse_retry_after_secs("120"), Some(RETRY_AFTER_CAP_SECS));
-        assert_eq!(parse_retry_after_secs("18446744073709551615"), Some(RETRY_AFTER_CAP_SECS));
+        assert_eq!(
+            parse_retry_after_secs("18446744073709551615"),
+            Some(RETRY_AFTER_CAP_SECS)
+        );
     }
 
     #[test]
@@ -178,12 +181,30 @@ mod tests {
 
     #[test]
     fn backoff_bases_differ_for_429_and_5xx() {
-        assert_eq!(status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 0), 5000);
-        assert_eq!(status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 1), 10000);
-        assert_eq!(status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 2), 20000);
-        assert_eq!(status_retry_delay_ms(StatusCode::INTERNAL_SERVER_ERROR, None, 0), 1000);
-        assert_eq!(status_retry_delay_ms(StatusCode::BAD_GATEWAY, None, 1), 2000);
-        assert_eq!(status_retry_delay_ms(StatusCode::SERVICE_UNAVAILABLE, None, 2), 4000);
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 0),
+            5000
+        );
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 1),
+            10000
+        );
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::TOO_MANY_REQUESTS, None, 2),
+            20000
+        );
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::INTERNAL_SERVER_ERROR, None, 0),
+            1000
+        );
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::BAD_GATEWAY, None, 1),
+            2000
+        );
+        assert_eq!(
+            status_retry_delay_ms(StatusCode::SERVICE_UNAVAILABLE, None, 2),
+            4000
+        );
     }
 
     #[test]

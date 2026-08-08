@@ -106,8 +106,7 @@ pub fn load_settings() -> McpServerSettings {
 pub fn save_settings(settings: &McpServerSettings) -> Result<(), String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
     }
     let data = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize mcp_server.json: {e}"))?;

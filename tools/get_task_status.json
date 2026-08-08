@@ -1,0 +1,14 @@
+{
+  "description": "Get the latest progress or final result of an asynchronous tool task by id.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task_id": {
+        "type": "string",
+        "description": "The task id returned by a tool started with async='async' or async='notify'."
+      }
+    },
+    "required": ["task_id"],
+    "additionalProperties": false
+  }
+}

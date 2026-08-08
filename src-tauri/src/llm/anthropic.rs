@@ -2197,7 +2197,6 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
     match internal_name {
         "ask_user_question" => "AskUserQuestion".to_string(),
         "config_query" => "ConfigQuery".to_string(),
-        "sheet" => "Sheet".to_string(),
         "knowledge_list" => "KnowledgeList".to_string(),
         "knowledge_query" => "KnowledgeQuery".to_string(),
         "knowledge_read" => "KnowledgeRead".to_string(),
@@ -2209,6 +2208,7 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "unity_asset_search" => "UnityAssetSearch".to_string(),
         "unity_capture_viewport" => "UnityCaptureViewport".to_string(),
         "unity_execute" => "UnityExecute".to_string(),
+        "unity_set_play_mode" => "UnitySetPlayMode".to_string(),
         "unity_run_states" => "UnityRunStates".to_string(),
         "unity_recompile" => "UnityRecompile".to_string(),
         "unity_ref_search" => "UnityRefSearch".to_string(),
@@ -2316,8 +2316,7 @@ fn build_tool_result_content(
     // them and re-emit references for tools declared in this request.
     let (text, reference_names) = match tool_reference_names {
         Some(declared) => {
-            let (clean, names) =
-                crate::llm::tool_references::split_tool_reference_marker(text);
+            let (clean, names) = crate::llm::tool_references::split_tool_reference_marker(text);
             let names: Vec<String> = names
                 .into_iter()
                 .filter(|name| declared.contains(name))

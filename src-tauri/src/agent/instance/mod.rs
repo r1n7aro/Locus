@@ -8,6 +8,7 @@ mod view_capture;
 pub use backend::resolve_openrouter_model;
 pub use backend::{LlmBackend, RawContextStore, RawRound};
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -21,6 +22,10 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 use crate::agent::definition::{AgentDef, AgentDefRegistry};
+use crate::agent::workspace_execution_lock::{
+    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockMode,
+    WorkspaceExecutionLockOwner,
+};
 use crate::commands::{
     BasicToolConfirmDisplay, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
     KnowledgeToolConfirmPreview, StreamEvent, ToolConfirmDisplay,
@@ -58,6 +63,12 @@ fn compact_trigger(force_compact: bool, attempt_kind: &str) -> crate::commands::
     } else {
         crate::commands::CompactTrigger::Auto
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeContextLimits {
+    effective_context_window: u32,
+    codex_auto_compact_token_limit: Option<u32>,
 }
 
 fn is_codex_unauthorized_error(error: &str) -> bool {
@@ -245,6 +256,7 @@ pub struct AgentInstance {
     task_tool_suppressed: bool,
     effort: Option<String>,
     codex_fast_mode: bool,
+    async_tasks_enabled: bool,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
     knowledge_access_mode: KnowledgeAccessMode,
@@ -331,8 +343,14 @@ pub(super) struct PreparedRequestTools {
 /// session history for replay.
 pub(super) const CODEX_TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 
-/// Default result cap for `tool_search`, matching the codex client.
-const CODEX_TOOL_SEARCH_DEFAULT_LIMIT: usize = 8;
+/// Keeps an explicit multi-tool lookup bounded while allowing a prompt or
+/// Skill to load the small set of deferred tools it names in one round.
+const CODEX_TOOL_SEARCH_MAX_WIRE_NAMES: usize = 8;
+
+/// Stable system/tool guidance for deterministic deferred-tool lookups. Exact
+/// wire names come from prompts, Skill documents, and tool reports such as
+/// mcp_reload; each call loads only the explicitly listed registered names.
+const CODEX_TOOL_SEARCH_EXACT_NAME_GUIDANCE: &str = "`tool_search` accepts an explicit `wire_names` array containing 1–8 deferred-tool wire names. Copy each complete name verbatim from the prompt, Skill document, or tool result, and include only the tools required for the current step. Natural-language task descriptions, keywords, synonyms, aliases, duplicate names, and combined names inside one array item are invalid inputs.";
 
 /// Tool names inside a persisted `tool_search` result (`{"tools":[...]}`).
 pub(super) fn codex_tool_search_output_tool_names(content: &str) -> Vec<String> {
@@ -754,6 +772,12 @@ pub(crate) struct ExecutedToolResult {
     images: Option<Vec<ImageData>>,
 }
 
+#[derive(Debug)]
+struct CompletedToolResult {
+    executed: ExecutedToolResult,
+    stored_output: String,
+}
+
 impl ToolRunOutcome {
     pub(super) fn as_stream_outcome(self) -> crate::commands::ToolCallOutcome {
         match self {
@@ -1025,12 +1049,15 @@ struct AgentKnowledgeSearchHit {
     #[serde(rename = "type")]
     doc_type: crate::knowledge_store::KnowledgeType,
     path: String,
-    title: String,
+    summary: Option<String>,
     snippet: String,
-    matched_section: Option<crate::knowledge_store::KnowledgeSearchMatchSection>,
     score: f32,
     match_kind: String,
     matched_terms: Vec<String>,
+    start_line: u32,
+    end_line: u32,
+    summary_start_line: Option<u32>,
+    body_start_line: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1174,11 +1201,12 @@ fn resolve_existing_directory_mode(
         .map(crate::knowledge_store::ensure_directory_path)
         .transpose()?;
 
-    let config = if let Some(path) = directory_path.as_deref() {
-        crate::knowledge_store::read_directory_config(working_dir, doc_type, path)?.config
-    } else {
-        crate::knowledge_store::default_directory_config_for_type(doc_type)
-    };
+    let config = crate::knowledge_store::read_directory_config(
+        working_dir,
+        doc_type,
+        directory_path.as_deref().unwrap_or_default(),
+    )?
+    .config;
 
     Ok((
         directory_path
@@ -1651,6 +1679,7 @@ fn assess_knowledge_tool_confirmation_decision(
 struct PromptTreeFile {
     name: String,
     desc: String,
+    bypass_visibility_limit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1660,13 +1689,13 @@ struct PromptKnowledgeItem {
     title: String,
     inject_mode: crate::knowledge_store::KnowledgeInjectMode,
     summary: Option<String>,
-    body_excerpt: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
 struct PromptTreeNode {
     desc: Option<String>,
     label_suffix: Option<String>,
+    max_visible_files: Option<usize>,
     dirs: BTreeMap<String, PromptTreeNode>,
     notes: Vec<String>,
     files: Vec<PromptTreeFile>,
@@ -1742,14 +1771,12 @@ fn prompt_item_from_document(
 ) -> PromptKnowledgeItem {
     let summary =
         crate::knowledge_store::active_summary(&doc).map(|value| value.trim().to_string());
-    let body_excerpt = prompt_optional_excerpt(&doc.body, 160);
     PromptKnowledgeItem {
         doc_type: doc.doc_type,
         path: doc.path,
         title: doc.title,
         inject_mode: doc.inject_mode,
         summary,
-        body_excerpt,
     }
 }
 
@@ -1765,7 +1792,6 @@ fn prompt_item_from_list_item(
             .summary
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        body_excerpt: None,
     }
 }
 
@@ -1782,9 +1808,24 @@ fn prompt_items_from_list_items(
 }
 
 fn prompt_item_is_structure_injected(item: &PromptKnowledgeItem) -> bool {
-    !matches!(
+    match item.inject_mode {
+        crate::knowledge_store::KnowledgeInjectMode::None => false,
+        crate::knowledge_store::KnowledgeInjectMode::Excerpt => item
+            .summary
+            .as_deref()
+            .is_some_and(|summary| !summary.trim().is_empty()),
+        crate::knowledge_store::KnowledgeInjectMode::Path
+        | crate::knowledge_store::KnowledgeInjectMode::Full
+        | crate::knowledge_store::KnowledgeInjectMode::Rule => true,
+    }
+}
+
+fn prompt_item_bypasses_visibility_limit(item: &PromptKnowledgeItem) -> bool {
+    matches!(
         item.inject_mode,
-        crate::knowledge_store::KnowledgeInjectMode::None
+        crate::knowledge_store::KnowledgeInjectMode::Excerpt
+            | crate::knowledge_store::KnowledgeInjectMode::Full
+            | crate::knowledge_store::KnowledgeInjectMode::Rule
     )
 }
 
@@ -1857,9 +1898,6 @@ fn prompt_file_desc(item: &PromptKnowledgeItem) -> String {
             .and_then(|value| prompt_optional_excerpt(value, 160))
         {
             return summary;
-        }
-        if let Some(body_excerpt) = item.body_excerpt.as_deref() {
-            return body_excerpt.to_string();
         }
     }
     let title = item.title.trim();
@@ -1954,6 +1992,30 @@ fn insert_prompt_tree_note(node: &mut PromptTreeNode, parts: &[String], note: &s
     insert_prompt_tree_note(child, &parts[1..], note);
 }
 
+fn set_prompt_tree_visibility_limit(
+    node: &mut PromptTreeNode,
+    parts: &[String],
+    max_visible_files: usize,
+) {
+    if parts.is_empty() {
+        node.max_visible_files = Some(max_visible_files);
+        return;
+    }
+    let child = node.dirs.entry(parts[0].clone()).or_default();
+    set_prompt_tree_visibility_limit(child, &parts[1..], max_visible_files);
+}
+
+fn prompt_tree_node_mut<'a>(
+    node: &'a mut PromptTreeNode,
+    parts: &[String],
+) -> &'a mut PromptTreeNode {
+    if parts.is_empty() {
+        return node;
+    }
+    let child = node.dirs.entry(parts[0].clone()).or_default();
+    prompt_tree_node_mut(child, &parts[1..])
+}
+
 fn sort_prompt_tree(node: &mut PromptTreeNode) {
     node.notes.sort();
     node.files
@@ -2023,6 +2085,7 @@ fn build_prompt_tree(
         let file = PromptTreeFile {
             name: file_name,
             desc: prompt_file_desc(item),
+            bypass_visibility_limit: prompt_item_bypasses_visibility_limit(item),
         };
         let parts: Vec<String> = if flatten_skill {
             vec![file.name.clone()]
@@ -2049,6 +2112,7 @@ fn render_tree_lines(
     show_files: bool,
     max_visible_files: usize,
 ) -> Vec<String> {
+    let max_visible_files = node.max_visible_files.unwrap_or(max_visible_files);
     let mut entries: Vec<(String, Vec<String>)> = Vec::new();
 
     for (dir_name, child) in &node.dirs {
@@ -2072,29 +2136,25 @@ fn render_tree_lines(
         entries.push((note.clone(), Vec::new()));
     }
 
-    if show_files {
-        for file in node.files.iter().take(max_visible_files) {
+    let mut limited_visible_files = 0usize;
+    let mut hidden = node.hidden_files;
+    for file in &node.files {
+        let visible = file.bypass_visibility_limit
+            || (show_files && limited_visible_files < max_visible_files);
+        if visible {
             entries.push((format!("{} :: {}", file.name, file.desc), Vec::new()));
+            if !file.bypass_visibility_limit {
+                limited_visible_files += 1;
+            }
+        } else {
+            hidden += 1;
         }
-        let hidden = node
-            .files
-            .len()
-            .saturating_sub(max_visible_files)
-            .saturating_add(node.hidden_files);
-        if hidden > 0 {
-            entries.push((
-                format!("<{} {} hidden>", hidden, pluralize_files(hidden)),
-                Vec::new(),
-            ));
-        }
-    } else {
-        let hidden = node.files.len().saturating_add(node.hidden_files);
-        if hidden > 0 {
-            entries.push((
-                format!("<{} {} hidden>", hidden, pluralize_files(hidden)),
-                Vec::new(),
-            ));
-        }
+    }
+    if hidden > 0 {
+        entries.push((
+            format!("<{} {} hidden>", hidden, pluralize_files(hidden)),
+            Vec::new(),
+        ));
     }
 
     if entries.is_empty() {
@@ -2114,12 +2174,301 @@ fn render_tree_lines(
     lines
 }
 
+fn prompt_type_root_description(
+    doc_type: crate::knowledge_store::KnowledgeType,
+    access_mode: KnowledgeAccessMode,
+) -> &'static str {
+    match (doc_type, access_mode) {
+        (crate::knowledge_store::KnowledgeType::Design, KnowledgeAccessMode::ReadOnly) => {
+            "Project design direction discussed with the user, including game design and technical architecture"
+        }
+        (crate::knowledge_store::KnowledgeType::Design, _) => {
+            "Project design direction discussed with the user, including game design and technical architecture | Update only when the user introduces design direction. The user reviews the update"
+        }
+        (crate::knowledge_store::KnowledgeType::Reference, _) => {
+            "External material | Read-only"
+        }
+        (crate::knowledge_store::KnowledgeType::Skill, KnowledgeAccessMode::ReadOnly) => {
+            "Standard workflows for getting work done"
+        }
+        (crate::knowledge_store::KnowledgeType::Skill, _) => {
+            "Standard workflows for getting work done. Update a skill when technical changes affect its flow. Suggest a new skill when a task looks reusable"
+        }
+        (crate::knowledge_store::KnowledgeType::Memory, KnowledgeAccessMode::ReadOnly) => {
+            "Project memory and long-term working context"
+        }
+        (crate::knowledge_store::KnowledgeType::Memory, _) => {
+            "User context, long-term preferences, and project background | Update when the user explicitly provides durable context"
+        }
+    }
+}
+
+struct PromptPhysicalRoot {
+    physical_root: std::path::PathBuf,
+    display_root: String,
+    storage_source: crate::knowledge_store::KnowledgeStorageSource,
+    source_ids: HashSet<String>,
+    items: Vec<PromptKnowledgeItem>,
+    directories: Vec<crate::knowledge_store::KnowledgeDirectoryConfigRecord>,
+    label_suffix: Option<String>,
+    desc: Option<String>,
+    managed_library: Option<(String, String, String)>,
+}
+
+fn prompt_source_group_root(
+    source: &crate::knowledge_source_registry::KnowledgeSource,
+) -> std::path::PathBuf {
+    match source.kind {
+        crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+        | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge => source
+            .physical_root
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| source.physical_root.clone()),
+        _ => source.physical_root.clone(),
+    }
+}
+
+fn prompt_physical_root_key(path: &std::path::Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+fn prompt_relative_physical_path(path: &std::path::Path, root: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn ensure_prompt_physical_root<'a>(
+    roots: &'a mut BTreeMap<String, PromptPhysicalRoot>,
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    source: &crate::knowledge_source_registry::KnowledgeSource,
+) -> &'a mut PromptPhysicalRoot {
+    let physical_root = prompt_source_group_root(source);
+    let key = prompt_physical_root_key(&physical_root);
+    roots.entry(key).or_insert_with(|| PromptPhysicalRoot {
+        display_root: registry.display_path(&physical_root),
+        physical_root,
+        storage_source: source.storage_source,
+        source_ids: HashSet::new(),
+        items: Vec::new(),
+        directories: Vec::new(),
+        label_suffix: matches!(
+            source.kind,
+            crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
+                | crate::knowledge_source_registry::KnowledgeSourceKind::PluginSkillPackage
+                | crate::knowledge_source_registry::KnowledgeSourceKind::ExternalSkill
+        )
+        .then(|| "[package]".to_string()),
+        desc: None,
+        managed_library: None,
+    })
+}
+
+fn add_prompt_items_to_physical_roots(
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    roots: &mut BTreeMap<String, PromptPhysicalRoot>,
+    items: Vec<PromptKnowledgeItem>,
+) {
+    for mut item in items {
+        let Some(resolved) = registry.resolve_logical(item.doc_type, &item.path) else {
+            continue;
+        };
+        let Some(source) = registry
+            .sources()
+            .iter()
+            .find(|source| source.source_id == resolved.source_id)
+        else {
+            continue;
+        };
+        let root = ensure_prompt_physical_root(roots, registry, source);
+        root.source_ids.insert(source.source_id.clone());
+        item.path = prompt_relative_physical_path(&resolved.physical_path, &root.physical_root);
+        let is_package_root = root.label_suffix.is_some()
+            && item.path.eq_ignore_ascii_case("SKILL.md")
+            && prompt_item_is_structure_injected(&item);
+        if is_package_root {
+            root.desc = Some(prompt_file_desc(&item));
+        } else {
+            root.items.push(item);
+        }
+    }
+}
+
+fn add_prompt_directories_to_physical_roots(
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    roots: &mut BTreeMap<String, PromptPhysicalRoot>,
+    directories: Vec<crate::knowledge_store::KnowledgeDirectoryConfigRecord>,
+) {
+    for mut directory in directories {
+        let candidates = registry
+            .sources()
+            .iter()
+            .filter(|source| source.doc_type == directory.doc_type)
+            .filter(|source| {
+                matches!(
+                    source.kind,
+                    crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                        | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
+                )
+            })
+            .map(|source| {
+                let target = source.physical_root.join(&directory.path);
+                (source, target)
+            })
+            .collect::<Vec<_>>();
+        let desired_writable = !directory.read_only;
+        let selected = candidates
+            .iter()
+            .find(|(source, target)| {
+                target.is_dir() && source.mutability.is_writable() == desired_writable
+            })
+            .or_else(|| candidates.iter().find(|(_, target)| target.is_dir()))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(source, _)| source.mutability.is_writable() == desired_writable)
+            });
+        let Some((source, target)) = selected else {
+            continue;
+        };
+        let root = ensure_prompt_physical_root(roots, registry, source);
+        root.source_ids.insert(source.source_id.clone());
+        directory.path = prompt_relative_physical_path(target, &root.physical_root);
+        root.directories.push(directory);
+    }
+}
+
+fn build_prompt_physical_root_tree(
+    root: &PromptPhysicalRoot,
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    access_mode: KnowledgeAccessMode,
+) -> PromptTreeNode {
+    let mut tree = build_prompt_tree(&root.items, &root.directories, false);
+    if let Some((path, desc, note)) = root.managed_library.as_ref() {
+        let parts = prompt_path_parts(path);
+        insert_prompt_tree_directory(&mut tree, &parts, Some(desc), None);
+        insert_prompt_tree_note(&mut tree, &parts, note);
+    }
+    for source in registry
+        .sources()
+        .iter()
+        .filter(|source| root.source_ids.contains(&source.source_id))
+        .filter(|source| {
+            matches!(
+                source.kind,
+                crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                    | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
+            )
+        })
+    {
+        let relative_root =
+            prompt_relative_physical_path(&source.physical_root, &root.physical_root);
+        let parts = prompt_path_parts(&relative_root);
+        let suffix = if source.kind
+            == crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
+            || access_mode == KnowledgeAccessMode::ReadOnly
+        {
+            Some("[read-only]")
+        } else {
+            None
+        };
+        insert_prompt_tree_directory(
+            &mut tree,
+            &parts,
+            Some(prompt_type_root_description(source.doc_type, access_mode)),
+            suffix,
+        );
+        let visible_files = match source.doc_type {
+            crate::knowledge_store::KnowledgeType::Design => 2,
+            crate::knowledge_store::KnowledgeType::Reference => 0,
+            crate::knowledge_store::KnowledgeType::Skill
+            | crate::knowledge_store::KnowledgeType::Memory => 3,
+        };
+        set_prompt_tree_visibility_limit(&mut tree, &parts, visible_files);
+    }
+    tree
+}
+
+fn prompt_physical_root_label(root: &PromptPhysicalRoot) -> String {
+    let mut label = format!("{}/", root.display_root.trim_end_matches('/'));
+    if let Some(suffix) = root.label_suffix.as_deref() {
+        label.push(' ');
+        label.push_str(suffix);
+    }
+    if let Some(desc) = root
+        .desc
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        label.push_str(" :: ");
+        label.push_str(desc);
+    }
+    label
+}
+
+fn prompt_physical_root_is_package(root: &PromptPhysicalRoot) -> bool {
+    root.label_suffix.as_deref() == Some("[package]")
+}
+
+fn render_prompt_physical_root(
+    root: &PromptPhysicalRoot,
+    packages: &[&PromptPhysicalRoot],
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    access_mode: KnowledgeAccessMode,
+) -> Vec<String> {
+    let mut tree = build_prompt_physical_root_tree(root, registry, access_mode);
+    if !packages.is_empty() {
+        if let Some(skill_source) = registry.sources().iter().find(|source| {
+            root.source_ids.contains(&source.source_id)
+                && source.doc_type == crate::knowledge_store::KnowledgeType::Skill
+                && matches!(
+                    source.kind,
+                    crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                        | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
+                )
+        }) {
+            let relative_root =
+                prompt_relative_physical_path(&skill_source.physical_root, &root.physical_root);
+            let skill_parts = prompt_path_parts(&relative_root);
+            let skill_node = prompt_tree_node_mut(&mut tree, &skill_parts);
+            for package in packages {
+                let mut package_tree =
+                    build_prompt_physical_root_tree(package, registry, access_mode);
+                package_tree.label_suffix = package.label_suffix.clone();
+                package_tree.desc = package.desc.clone();
+                skill_node.dirs.insert(
+                    package.display_root.trim_end_matches('/').to_string(),
+                    package_tree,
+                );
+            }
+        }
+    }
+
+    let label = prompt_physical_root_label(root);
+    let mut lines = vec![label];
+    lines.extend(render_tree_lines(&tree, true, 3));
+    lines
+}
+
 fn build_structure_section(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
     access_mode: KnowledgeAccessMode,
 ) -> Result<String, String> {
     crate::knowledge_store::ensure_memory_builtin_documents(working_dir)?;
+    let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+        working_dir,
+        app_knowledge_dir,
+    );
 
     let excluded_reference_prefixes = if crate::unity_docs::has_managed_store(working_dir) {
         vec![(
@@ -2148,7 +2497,7 @@ fn build_structure_section(
     );
     // Skill lines in the always-on structure exist to let the model discover
     // and auto-recall skills, so they pass the same recall gate as
-    // knowledge_read: enabled + auto surface + a non-none inject mode.
+    // Generic read activation: enabled + auto surface + a non-none inject mode.
     // Command-only skills stay reachable through the slash menu and the
     // skill_list tool instead.
     let mut skill_items = prompt_items_from_documents(
@@ -2199,104 +2548,107 @@ fn build_structure_section(
         app_knowledge_dir,
         crate::knowledge_store::KnowledgeType::Memory,
     )?;
-    let empty_skill_directories: &[crate::knowledge_store::KnowledgeDirectoryConfigRecord] = &[];
-
-    let design_tree = build_prompt_tree(&design_items, &design_directories, false);
-    let mut reference_tree = build_prompt_tree(&reference_items, &reference_directories, false);
-    if crate::unity_docs::has_managed_store(working_dir) {
-        insert_prompt_tree_directory(
-            &mut reference_tree,
-            &[crate::unity_docs::UNITY_REFERENCE_MANAGED_DIR.to_string()],
-            Some(
-                "Unity official reference library. Keep the always-on prompt compact here and use `knowledge_query` or concrete `reference/unity-official-docs/...` paths when needed.",
-            ),
-            None,
-        );
-        let unity_note = crate::unity_docs::managed_document_count_hint(working_dir)?
-            .map(|count| format!("<{} {} managed externally>", count, pluralize_files(count)))
-            .unwrap_or_else(|| "<managed externally>".to_string());
-        insert_prompt_tree_note(
-            &mut reference_tree,
-            &[crate::unity_docs::UNITY_REFERENCE_MANAGED_DIR.to_string()],
-            &unity_note,
-        );
+    let mut physical_roots = BTreeMap::new();
+    for source in registry.sources().iter().filter(|source| {
+        source.kind == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+    }) {
+        let root = ensure_prompt_physical_root(&mut physical_roots, &registry, source);
+        root.source_ids.insert(source.source_id.clone());
     }
-    let skill_tree = build_prompt_tree(&skill_items, empty_skill_directories, false);
-    let memory_tree = build_prompt_tree(&memory_items, &memory_directories, false);
+    for source in registry.sources().iter().filter(|source| {
+        source.kind == crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
+            && source.doc_type == crate::knowledge_store::KnowledgeType::Skill
+    }) {
+        let root = ensure_prompt_physical_root(&mut physical_roots, &registry, source);
+        root.source_ids.insert(source.source_id.clone());
+    }
+    add_prompt_items_to_physical_roots(&registry, &mut physical_roots, design_items);
+    add_prompt_items_to_physical_roots(&registry, &mut physical_roots, reference_items);
+    add_prompt_items_to_physical_roots(&registry, &mut physical_roots, skill_items);
+    add_prompt_items_to_physical_roots(&registry, &mut physical_roots, memory_items);
+    add_prompt_directories_to_physical_roots(&registry, &mut physical_roots, design_directories);
+    add_prompt_directories_to_physical_roots(&registry, &mut physical_roots, reference_directories);
+    add_prompt_directories_to_physical_roots(&registry, &mut physical_roots, memory_directories);
 
-    let top_entries = if access_mode == KnowledgeAccessMode::ReadOnly {
-        vec![
-            (
-                "design/ :: Project design direction discussed with the user, including game design and technical architecture".to_string(),
-                render_tree_lines(&design_tree, true, 2),
-            ),
-            (
-                "reference/ :: External material".to_string(),
-                render_tree_lines(&reference_tree, false, 0),
-            ),
-            (
-                "skill/ :: Standard workflows for getting work done".to_string(),
-                render_tree_lines(&skill_tree, true, 3),
-            ),
-            (
-                "memory/ :: Project memory and long-term working context".to_string(),
-                render_tree_lines(&memory_tree, true, 3),
-            ),
-        ]
-    } else {
-        vec![
-            (
-                "design/ :: Project design direction discussed with the user, including game design and technical architecture | Update only when the user introduces design direction. The user reviews the update".to_string(),
-                render_tree_lines(&design_tree, true, 2),
-            ),
-            (
-                "reference/ :: External material | Read-only".to_string(),
-                render_tree_lines(&reference_tree, false, 0),
-            ),
-            (
-                "skill/ :: Standard workflows for getting work done. Update a skill when technical changes affect its flow. Suggest a new skill when a task looks reusable".to_string(),
-                render_tree_lines(&skill_tree, true, 3),
-            ),
-            (
-                "memory/ :: All of your memory | Very important. Update and maintain it frequently".to_string(),
-                render_tree_lines(&memory_tree, true, 3),
-            ),
-        ]
-    };
-
-    let mut lines = vec![
-        "### Structure".to_string(),
-        String::new(),
-        "```tree".to_string(),
-        "knowledge/".to_string(),
-    ];
-    let mut rendered = Vec::new();
-    for (index, (label, nested)) in top_entries.iter().enumerate() {
-        let is_last = index + 1 == top_entries.len();
-        let branch = if is_last { "└─ " } else { "├─ " };
-        let child_prefix = if is_last { "   " } else { "│  " };
-        rendered.push(format!("{}{}", branch, label));
-        for line in nested {
-            rendered.push(format!("{}{}", child_prefix, line));
+    if crate::unity_docs::has_managed_store(working_dir) {
+        if let Some(source) = registry.sources().iter().find(|source| {
+            source.kind == crate::knowledge_source_registry::KnowledgeSourceKind::ManagedReference
+        }) {
+            let root = ensure_prompt_physical_root(&mut physical_roots, &registry, source);
+            root.source_ids.insert(source.source_id.clone());
+            root.label_suffix = Some("[managed]".to_string());
+            root.desc = Some("Unity official reference materialization directory".to_string());
+            let managed_desc = format!(
+                "Unity official reference library. Keep the always-on prompt compact here and use `knowledge_query` or concrete `{}/{}/...` paths when needed.",
+                root.display_root.trim_end_matches('/'),
+                crate::unity_docs::UNITY_REFERENCE_MANAGED_DIR,
+            );
+            let unity_note = crate::unity_docs::managed_document_count_hint(working_dir)?
+                .map(|count| format!("<{} {} managed externally>", count, pluralize_files(count)))
+                .unwrap_or_else(|| "<managed externally>".to_string());
+            root.managed_library = Some((
+                crate::unity_docs::UNITY_REFERENCE_MANAGED_DIR.to_string(),
+                managed_desc,
+                unity_note,
+            ));
         }
     }
-    lines.extend(rendered);
-    lines.push("```".to_string());
+
+    let render_roots = |storage_source| {
+        let scoped_roots = physical_roots
+            .values()
+            .filter(|root| root.storage_source == storage_source)
+            .collect::<Vec<_>>();
+        let packages = scoped_roots
+            .iter()
+            .copied()
+            .filter(|root| prompt_physical_root_is_package(root))
+            .collect::<Vec<_>>();
+        scoped_roots
+            .into_iter()
+            .filter(|root| !prompt_physical_root_is_package(root))
+            .map(|root| render_prompt_physical_root(root, &packages, &registry, access_mode))
+            .collect::<Vec<_>>()
+    };
+    let project_roots = render_roots(crate::knowledge_store::KnowledgeStorageSource::Project);
+    let app_roots = render_roots(crate::knowledge_store::KnowledgeStorageSource::App);
+    let render_scope = |title: &str, roots: Vec<Vec<String>>| {
+        let mut scope = vec![format!("#### {}", title), "```tree".to_string()];
+        if roots.is_empty() {
+            scope.push("<empty>".to_string());
+        } else {
+            for (index, root) in roots.into_iter().enumerate() {
+                if index > 0 {
+                    scope.push(String::new());
+                }
+                scope.extend(root);
+            }
+        }
+        scope.push("```".to_string());
+        scope.join("\n")
+    };
+    let lines = [
+        "### Structure".to_string(),
+        String::new(),
+        render_scope("Project", project_roots),
+        String::new(),
+        render_scope("App", app_roots),
+    ];
     Ok(lines.join("\n"))
 }
 
 fn build_search_section(semantic_search_enabled: bool) -> String {
     let mut lines = vec!["### Search"];
     if semantic_search_enabled {
-        lines.push("1. Start with `knowledge_query` across all roots first; usually leave `pathPrefix` empty on the first search so `design/`, `memory/`, `skill/`, and `reference/` can all match. Split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.");
+        lines.push("1. Use `knowledge_query` when the injected context does not already answer the task. Split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.");
     } else {
-        lines.push("1. Start with `knowledge_query` across all roots first; usually leave `pathPrefix` empty on the first search so `design/`, `memory/`, `skill/`, and `reference/` can all match. Put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
+        lines.push("1. Use `knowledge_query` when the injected context does not already answer the task. Put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
     }
     lines.extend([
-        "2. Use `knowledge_read` when you know the target document path or need a specific document. For `skill/<package-id>/ [package]` structure entries, read `skill/<package-id>` for the root `SKILL.md`.",
-        "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
-        "4. In user-facing replies, wrap knowledge document references in single backticks with their full type-prefixed paths, such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`; the UI cannot recover omitted path segments.",
-        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`.",
+        "2. Query results return a real path and physical line range. Use `read` with that exact path plus `offset` and `limit`; line 1 is the first physical file line, including frontmatter.",
+        "3. `Structure` lists registered physical directories directly. Paths inside the selected workspace are workspace-relative; registered package and external knowledge outside the workspace use absolute physical paths.",
+        "4. Use `list` and `grep` for ordinary filesystem browsing after a query identifies a relevant directory.",
+        "5. Reuse already injected or already read content. Read again only when another line range is required or the file changed.",
     ]);
     lines.join("\n")
 }
@@ -2306,7 +2658,7 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
         return [
             "### Access",
             "- Knowledge is read-only for this request.",
-            "- Use knowledge search and read tools for context when useful.",
+            "- Use `knowledge_query` and ordinary filesystem `read` for context when useful.",
         ]
         .join("\n");
     }
@@ -2314,7 +2666,7 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
     [
         "### Maintenance",
         "- When the user gives you new project information, or your changes affect the correctness of knowledge documents, keep the knowledge base current and structurally sound, and report your update to the user.",
-        "- For Memory, think of it as all of yourself. Read and write it actively so future work goes more smoothly.",
+        "- Create knowledge Markdown with `write`, update it with `edit`, and use `bash` for deletion or movement. In writable knowledge directories, `write` generates frontmatter automatically and reports the generated fields.",
         "- Respect existing maintenance rules on any document or folder you maintain.",
     ]
     .join("\n")
@@ -2325,6 +2677,10 @@ fn build_l2_full_document_section(
     app_knowledge_dir: Option<&std::path::PathBuf>,
 ) -> Result<String, String> {
     crate::knowledge_store::ensure_memory_builtin_documents(working_dir)?;
+    let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+        working_dir,
+        app_knowledge_dir,
+    );
     let mut blocks = Vec::new();
     for doc_type in [
         crate::knowledge_store::KnowledgeType::Design,
@@ -2352,10 +2708,14 @@ fn build_l2_full_document_section(
             } else {
                 remap_document_body_headings(&doc.body, 4)
             };
+            let display_path = registry
+                .resolve_logical(doc.doc_type, &doc.path)
+                .map(|resolved| resolved.display_path)
+                .unwrap_or_else(|| format!("{}/{}", doc.doc_type, doc.path));
 
             blocks.push(
                 [
-                    format!("#### {}/{}", doc.doc_type, doc.path),
+                    format!("#### {}", display_path),
                     String::new(),
                     "Rules:".to_string(),
                     rules.to_string(),
@@ -2380,7 +2740,10 @@ fn build_l2_full_document_section(
 
 const KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT: usize = 6000;
 
-fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument) -> String {
+fn build_knowledge_focus_section(
+    doc: &crate::knowledge_store::KnowledgeDocument,
+    display_path: &str,
+) -> String {
     let scope = match doc.storage_source {
         crate::knowledge_store::KnowledgeStorageSource::App => "user (app-level)",
         _ => "project",
@@ -2389,7 +2752,7 @@ fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument
         "## Active Knowledge Document".to_string(),
         "The user has this knowledge document open in the Knowledge panel, and this conversation is scoped to it. When the user says \"this document\" or \"当前文档\", they mean this one. Prioritize working on it.".to_string(),
         format!("- Title: {}", doc.title),
-        format!("- Path: {}/{}", doc.doc_type, doc.path),
+        format!("- Path: {}", display_path),
         format!("- Type: {}", doc.doc_type),
         format!("- Scope: {}", scope),
         format!("- Read-only: {}", if doc.read_only { "yes (do not edit; discuss content and produce suggestions only)" } else { "no" }),
@@ -2428,7 +2791,7 @@ fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument
     } else {
         let excerpt: String = body.chars().take(KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT).collect();
         lines.push(format!(
-            "### Body (truncated to the first {} characters; use `knowledge_read` with the path above for the full document)",
+            "### Body (truncated to the first {} characters; use `read` with the path above for the required line range)",
             KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT
         ));
         lines.push(remap_document_body_headings(&excerpt, 4));
@@ -2619,6 +2982,7 @@ fn build_l3_rule_entries(
                 doc_type,
                 &item.path,
                 "full",
+                false,
             )?
             .document;
 
@@ -3002,9 +3366,13 @@ impl AgentInstance {
                     require_workspace_bound("file_path")
                 }
             }
-            "unity_execute"
+            "unity_set_play_mode"
+            | "unity_execute"
             | "unity_run_states"
             | "unity_capture_viewport"
+            | "unity_get_console_log"
+            | "unity_test_list"
+            | "unity_test_run"
             | "unity_ref_search"
             | "unity_asset_search"
             | "code_symbol_search"
@@ -3151,6 +3519,7 @@ impl AgentInstance {
             task_tool_suppressed: false,
             effort: effective_effort,
             codex_fast_mode: false,
+            async_tasks_enabled: false,
             app_knowledge_dir,
             app_agent_dir,
             knowledge_access_mode,
@@ -3173,6 +3542,10 @@ impl AgentInstance {
 
     pub fn set_codex_fast_mode(&mut self, enabled: bool) {
         self.codex_fast_mode = enabled;
+    }
+
+    pub fn set_async_tasks_enabled(&mut self, enabled: bool) {
+        self.async_tasks_enabled = enabled;
     }
 
     /// Marks this instance as a subagent whose parent session is in plan
@@ -3205,10 +3578,7 @@ impl AgentInstance {
         matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Main { .. }))
     }
 
-    fn resolve_plan_file_path(
-        &self,
-        app_handle: &AppHandle,
-    ) -> Result<std::path::PathBuf, String> {
+    fn resolve_plan_file_path(&self, app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
         crate::commands::plan_file_path_for_session(app_handle, &self.working_dir, &self.session_id)
     }
 
@@ -3285,11 +3655,7 @@ impl AgentInstance {
 
     /// Compares a tool call's `filePath` argument against the plan file,
     /// tolerating relative paths, separator style, and case differences.
-    fn args_target_plan_file(
-        &self,
-        args: &serde_json::Value,
-        plan_file: &std::path::Path,
-    ) -> bool {
+    fn args_target_plan_file(&self, args: &serde_json::Value, plan_file: &std::path::Path) -> bool {
         let Some(raw) = args
             .get("filePath")
             .or_else(|| args.get("file_path"))
@@ -3370,12 +3736,21 @@ impl AgentInstance {
         self.knowledge_focus = focus;
     }
 
+    fn tool_context_requires_unity_probe(tool_name: &str, args: &serde_json::Value) -> bool {
+        tool_name == "read"
+            && args
+                .get("filePath")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(crate::tool::is_unity_yaml_candidate_path)
+    }
+
     async fn build_tool_execution_context(
         &self,
         app_handle: &AppHandle,
         tool_name: &str,
+        args: &serde_json::Value,
     ) -> ToolExecutionContext {
-        let unity_connected = if tool_name == "read" {
+        let unity_connected = if Self::tool_context_requires_unity_probe(tool_name, args) {
             Some(crate::unity_bridge::is_unity_connected(&self.working_dir).await)
         } else {
             None
@@ -3390,6 +3765,8 @@ impl AgentInstance {
             },
             unity_connected,
             runtime_state: Some(self.tool_runtime_state.clone()),
+            cancel_rx: Some(self.cancel_waiter()),
+            progress: None,
         }
     }
 
@@ -3399,9 +3776,7 @@ impl AgentInstance {
             .tools
             .iter()
             .filter(|tool_name| match tool_name.as_str() {
-                "knowledge_list" | "knowledge_query" | "knowledge_read" | "knowledge_create"
-                | "knowledge_delete" | "knowledge_move" | "knowledge_edit" | "skill_create"
-                | "skill_reload" | "skill_list" => {
+                "knowledge_query" | "create_skill_package" | "skill_reload" | "skill_list" => {
                     self.has_selected_working_dir()
                         && self.knowledge_access_mode.allows_tool(tool_name.as_str())
                 }
@@ -3426,12 +3801,20 @@ impl AgentInstance {
                 "unity_hot_reload" => {
                     crate::unity_hotreload::is_enabled() && crate::csharp_compile::is_enabled()
                 }
+                "unity_test_list" | "unity_test_run" => {
+                    self.has_selected_working_dir()
+                        && crate::workspace::unity_test_tools_available(&self.working_dir)
+                }
                 _ => true,
             })
             .cloned()
             .collect();
         for tool_name in self.tool_registry.skill_tool_names() {
             push_unique_tool_name(&mut tools, &tool_name);
+        }
+        if self.async_tasks_enabled {
+            push_unique_tool_name(&mut tools, crate::async_tasks::GET_TASK_STATUS_TOOL_NAME);
+            push_unique_tool_name(&mut tools, crate::async_tasks::CANCEL_TASK_TOOL_NAME);
         }
         // MCP tools ride on the manager's synchronous snapshot (updated by
         // startup/settings/mcp_reload reconciles). ensure_fresh backstops
@@ -3471,28 +3854,12 @@ impl AgentInstance {
     fn is_knowledge_tool_name(name: &str) -> bool {
         matches!(
             name,
-            "knowledge_list"
-                | "knowledge_query"
-                | "knowledge_read"
-                | "knowledge_create"
-                | "knowledge_delete"
-                | "knowledge_move"
-                | "knowledge_edit"
-                | "skill_create"
-                | "skill_reload"
-                | "skill_list"
+            "knowledge_query" | "create_skill_package" | "skill_reload" | "skill_list"
         )
     }
 
     fn is_knowledge_mutation_tool_name(name: &str) -> bool {
-        matches!(
-            name,
-            "knowledge_create"
-                | "knowledge_delete"
-                | "knowledge_move"
-                | "knowledge_edit"
-                | "skill_create"
-        )
+        matches!(name, "create_skill_package")
     }
 
     fn tool_direct_load_overrides(&self) -> HashMap<String, bool> {
@@ -3694,7 +4061,9 @@ impl AgentInstance {
             if Self::is_meta_tool(&canonical) {
                 continue;
             }
-            if self.default_tool_load_mode(&canonical) == ToolLoadMode::Skill {
+            if self.default_tool_load_mode(&canonical) == ToolLoadMode::Skill
+                && self.knowledge_access_mode.allows_tool(&canonical)
+            {
                 allowed.insert(canonical);
             }
         }
@@ -3866,23 +4235,62 @@ impl AgentInstance {
             .unwrap_or_default()
     }
 
-    /// Context-window budget for the active backend/model. Codex models
-    /// prefer the per-model effective window from the cached /models
-    /// manifest; the static `model_context_limit` table only guesses
-    /// per-family budgets and mis-sizes new variants.
-    fn context_limit(&self) -> u32 {
+    /// Context-window budgets for the active backend/model. Codex models use
+    /// the same raw-window/effective-window distinction as codex-rs so their
+    /// auto-compaction threshold can be resolved independently.
+    fn context_limits(&self) -> RuntimeContextLimits {
         match &self.backend {
-            LlmBackend::Custom { context_length, .. } => *context_length,
-            LlmBackend::OpenAiCodex { .. } => crate::commands::persistent_config_dir()
-                .ok()
-                .and_then(|cache_dir| {
-                    crate::llm::codex_models::cached_effective_context_window(
-                        &cache_dir,
-                        &self.effective_model,
-                    )
-                })
-                .unwrap_or_else(|| model_context_limit(&self.effective_model)),
-            _ => model_context_limit(&self.effective_model),
+            LlmBackend::Custom { context_length, .. } => RuntimeContextLimits {
+                effective_context_window: *context_length,
+                codex_auto_compact_token_limit: None,
+            },
+            LlmBackend::OpenAiCodex { .. } => {
+                let config = crate::commands::load_codex_model_config().unwrap_or_default();
+                let cache_dir = crate::commands::persistent_config_dir().ok();
+                if let Some(limits) = crate::llm::codex_models::resolve_context_limits(
+                    cache_dir.as_deref(),
+                    &self.effective_model,
+                    config.extended_context,
+                ) {
+                    return RuntimeContextLimits {
+                        effective_context_window: limits.effective_context_window,
+                        codex_auto_compact_token_limit: Some(limits.auto_compact_token_limit),
+                    };
+                }
+
+                let effective_context_window = model_context_limit(&self.effective_model);
+                RuntimeContextLimits {
+                    effective_context_window,
+                    codex_auto_compact_token_limit: Some(compact::codex_auto_compact_token_limit(
+                        effective_context_window,
+                    )),
+                }
+            }
+            _ => RuntimeContextLimits {
+                effective_context_window: model_context_limit(&self.effective_model),
+                codex_auto_compact_token_limit: None,
+            },
+        }
+    }
+
+    fn context_limit(&self) -> u32 {
+        self.context_limits().effective_context_window
+    }
+
+    fn model_usage_provider(&self) -> String {
+        match &self.backend {
+            LlmBackend::OpenRouter { .. } => "OpenRouter".to_string(),
+            LlmBackend::Anthropic { .. } => "Anthropic".to_string(),
+            LlmBackend::ClaudeCodeCli => "Claude Code CLI".to_string(),
+            LlmBackend::OpenAiCodex { .. } => "OpenAI Codex".to_string(),
+            LlmBackend::Custom { .. } => self
+                .effective_model
+                .split('/')
+                .nth(1)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("Custom · {}", value))
+                .unwrap_or_else(|| "Custom".to_string()),
         }
     }
 
@@ -4369,7 +4777,7 @@ impl AgentInstance {
     }
 
     fn knowledge_query_lexical_only_description() -> &'static str {
-        "Search the unified knowledge store with `lexicalQuery`. When lexical indexing is off, `lexicalQuery` falls back to direct text scanning. Returns plain-text ranked results with canonical type-prefixed `.md` document path, title, match metadata, matched lexical terms, and snippets from summary or body."
+        "Search registered Design, Memory, Reference, and Skill sources with `lexicalQuery`. When lexical indexing is off, the query falls back to direct text scanning. Returns ranked plain-text results with directly readable paths, physical line ranges, optional summaries, and bounded hit context. Titles are omitted because they match file names."
     }
 
     fn remove_knowledge_query_semantic_parameter(parameters: &mut serde_json::Value) {
@@ -4393,7 +4801,7 @@ impl AgentInstance {
         description: String,
         mut parameters: serde_json::Value,
     ) -> (String, serde_json::Value) {
-        if name == "task" {
+        let contextualized = if name == "task" {
             let subagents = self.registry.list_task_agent_descriptions();
             let agent_list = subagents
                 .iter()
@@ -4412,7 +4820,16 @@ impl AgentInstance {
             )
         } else {
             (description, parameters)
+        };
+        let (description, mut parameters) = contextualized;
+        if self.async_tasks_enabled && crate::async_tasks::supports_async_mode(name) {
+            let mut tool = serde_json::json!({
+                "function": { "parameters": parameters }
+            });
+            crate::async_tasks::augment_tool_schema(name, &mut tool);
+            parameters = tool["function"]["parameters"].take();
         }
+        (description, parameters)
     }
 
     fn contextualize_api_tool(&self, mut tool: serde_json::Value) -> serde_json::Value {
@@ -4420,7 +4837,8 @@ impl AgentInstance {
             .get("function")
             .and_then(|function| function.get("name"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         if name == "task" {
             let subagents = self.registry.list_task_agent_descriptions();
             let agent_list = subagents
@@ -4452,6 +4870,9 @@ impl AgentInstance {
                     Self::remove_knowledge_query_semantic_parameter(parameters);
                 }
             }
+        }
+        if self.async_tasks_enabled {
+            crate::async_tasks::augment_tool_schema(&name, &mut tool);
         }
         tool
     }
@@ -4494,8 +4915,7 @@ impl AgentInstance {
                         .and_then(|f| f.get_mut("description"))
                     {
                         if let Some(text) = description.as_str() {
-                            *description =
-                                serde_json::json!(format!("{}\n\n{}", text, manifest));
+                            *description = serde_json::json!(format!("{}\n\n{}", text, manifest));
                         }
                     }
                     break;
@@ -4605,9 +5025,10 @@ impl AgentInstance {
         }
 
         Some(format!(
-            "# Tool discovery\n\nSearches over deferred tool metadata and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{}`) to search for the required tools.",
+            "# Deferred tool loading\n\nLoads explicitly named deferred tools by exact wire name and exposes them for the next model call.\n\nYou have access to deferred tools from the following sources:\n{}\nSome tools may not have been provided upfront. Use `{}` with the exact wire names supplied by the prompt, Skill document, or a tool result.\n\n## Exact-name contract\n\n{}",
             sources.join("\n"),
-            CODEX_TOOL_SEARCH_TOOL_NAME
+            CODEX_TOOL_SEARCH_TOOL_NAME,
+            CODEX_TOOL_SEARCH_EXACT_NAME_GUIDANCE,
         ))
     }
 
@@ -4896,8 +5317,16 @@ impl AgentInstance {
                     &focus.path,
                 ) {
                     Ok(doc) => {
+                        let display_path =
+                            crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+                                &self.working_dir,
+                                self.app_knowledge_dir.as_ref().as_ref(),
+                            )
+                            .resolve_logical(doc.doc_type, &doc.path)
+                            .map(|resolved| resolved.display_path)
+                            .unwrap_or_else(|| format!("{}/{}", doc.doc_type, doc.path));
                         env.push_str("\n\n");
-                        env.push_str(&build_knowledge_focus_section(&doc));
+                        env.push_str(&build_knowledge_focus_section(&doc, &display_path));
                     }
                     Err(error) => {
                         eprintln!(
@@ -4955,6 +5384,11 @@ impl AgentInstance {
                 env.push_str("\n\n");
                 env.push_str(&lazy_tool_manifest);
             }
+        }
+
+        if self.cached_lazy_tool_renderer() == LazyToolRenderer::CodexNative {
+            env.push_str("\n\n## Deferred Tool Loading\n\n");
+            env.push_str(CODEX_TOOL_SEARCH_EXACT_NAME_GUIDANCE);
         }
 
         let rules_started_at = Instant::now();
@@ -5669,13 +6103,25 @@ impl AgentInstance {
         working_dir: &str,
         app_knowledge_dir: Option<&std::path::PathBuf>,
     ) -> Vec<std::path::PathBuf> {
-        let mut roots = Vec::new();
+        let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+            working_dir,
+            app_knowledge_dir,
+        );
+        let mut roots = registry
+            .sources()
+            .iter()
+            .map(|source| source.physical_root.clone())
+            .collect::<Vec<_>>();
         if Self::has_selected_working_dir_value(working_dir) {
             roots.push(crate::knowledge_store::knowledge_root(working_dir));
         }
         if let Some(app_root) = app_knowledge_dir {
             roots.push(app_root.clone());
         }
+        roots.sort_by_key(|path| Self::normalize_path_for_compare(path));
+        roots.dedup_by(|left, right| {
+            Self::normalize_path_for_compare(left) == Self::normalize_path_for_compare(right)
+        });
         roots
     }
 
@@ -5769,28 +6215,15 @@ impl AgentInstance {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
-        fn knowledge_tool_routing_error() -> String {
-            "Knowledge roots are reserved for knowledge tools. Use `knowledge_list` / `knowledge_query` / `knowledge_read` for inspection, `knowledge_create` / `knowledge_edit` / `knowledge_move` / `knowledge_delete` for non-Skill writes, and `skill_create` / `skill_reload` for Skill lifecycle work."
-                .to_string()
-        }
-
         let app_root = self.app_knowledge_dir.as_ref().as_ref();
-        match tool_name {
+        let touches_knowledge = match tool_name {
             "read" | "write" | "edit" => {
                 let file_path = args.get("filePath").and_then(|value| value.as_str())?;
-                if Self::path_targets_knowledge_root(&self.working_dir, app_root, file_path) {
-                    Some(knowledge_tool_routing_error())
-                } else {
-                    None
-                }
+                Self::path_targets_knowledge_root(&self.working_dir, app_root, file_path)
             }
             "grep" | "list" => {
                 let path = args.get("path").and_then(|value| value.as_str())?;
-                if Self::path_targets_knowledge_root(&self.working_dir, app_root, path) {
-                    Some(knowledge_tool_routing_error())
-                } else {
-                    None
-                }
+                Self::path_targets_knowledge_root(&self.working_dir, app_root, path)
             }
             "bash" => {
                 let workdir = args
@@ -5801,23 +6234,25 @@ impl AgentInstance {
                     .get("command")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                if Self::path_targets_knowledge_root(&self.working_dir, app_root, workdir)
+                Self::path_targets_knowledge_root(&self.working_dir, app_root, workdir)
                     || Self::shell_command_mentions_knowledge_root(
                         &self.working_dir,
                         app_root,
                         command,
                     )
-                {
-                    if Self::assess_bash_git_knowledge_command(&self.working_dir, app_root, args)
-                        .is_some()
-                    {
-                        None
-                    } else {
-                        Some(knowledge_tool_routing_error())
-                    }
-                } else {
-                    None
-                }
+            }
+            _ => false,
+        };
+        if !touches_knowledge || self.knowledge_access_mode == KnowledgeAccessMode::Full {
+            return None;
+        }
+
+        match self.knowledge_access_mode {
+            KnowledgeAccessMode::Disabled => {
+                Some("Knowledge access is disabled for this request.".to_string())
+            }
+            KnowledgeAccessMode::ReadOnly if matches!(tool_name, "write" | "edit" | "bash") => {
+                Some("Knowledge is read-only for this request.".to_string())
             }
             _ => None,
         }
@@ -5858,7 +6293,11 @@ impl AgentInstance {
 
     fn prefix_knowledge_search_hit_paths(items: &mut [crate::knowledge_store::KnowledgeSearchHit]) {
         for item in items {
-            item.path = Self::prefix_knowledge_tool_path(item.doc_type, &item.path);
+            if item.display_path.trim().is_empty() {
+                item.path = Self::prefix_knowledge_tool_path(item.doc_type, &item.path);
+            } else {
+                item.path = item.display_path.clone();
+            }
         }
     }
 
@@ -5869,6 +6308,11 @@ impl AgentInstance {
     fn prefix_knowledge_directory_record_path(
         directory: &mut crate::knowledge_store::KnowledgeDirectoryConfigRecord,
     ) {
+        if directory.path.trim().is_empty() {
+            directory.path = directory.doc_type.as_str().to_string();
+            directory.config_path = format!("Locus/knowledge/{}", directory.config_path);
+            return;
+        }
         directory.path = Self::prefix_knowledge_tool_path(directory.doc_type, &directory.path);
         directory.config_path =
             Self::prefix_knowledge_tool_path(directory.doc_type, &directory.config_path);
@@ -5944,18 +6388,64 @@ impl AgentInstance {
 
     fn sanitize_knowledge_search_hits(
         items: Vec<crate::knowledge_store::KnowledgeSearchHit>,
+        summaries: Vec<Option<String>>,
     ) -> Vec<AgentKnowledgeSearchHit> {
+        let mut summaries = summaries.into_iter();
         items
             .into_iter()
             .map(|item| AgentKnowledgeSearchHit {
                 doc_type: item.doc_type,
                 path: item.path,
-                title: item.title,
+                summary: summaries.next().flatten(),
                 snippet: item.snippet,
-                matched_section: item.matched_section,
                 score: item.score,
                 match_kind: item.match_kind,
                 matched_terms: item.matched_terms,
+                start_line: item.start_line.max(1),
+                end_line: item.end_line.max(item.start_line).max(1),
+                summary_start_line: item.summary_start_line,
+                body_start_line: item.body_start_line.max(1),
+            })
+            .collect()
+    }
+
+    fn knowledge_query_summaries(
+        &self,
+        items: &[crate::knowledge_store::KnowledgeSearchHit],
+    ) -> Vec<Option<String>> {
+        let package_documents = items
+            .iter()
+            .any(|item| item.doc_type == crate::knowledge_store::KnowledgeType::Skill)
+            .then(|| {
+                crate::commands::list_skill_package_knowledge_documents_sync_with_hidden(
+                    &self.working_dir,
+                    None,
+                    false,
+                )
+            })
+            .unwrap_or_default();
+
+        items
+            .iter()
+            .map(|item| {
+                crate::knowledge_store::load_document_by_path_with_app_root(
+                    &self.working_dir,
+                    self.app_knowledge_dir.as_ref().as_ref(),
+                    item.doc_type,
+                    &item.path,
+                )
+                .ok()
+                .or_else(|| {
+                    package_documents
+                        .iter()
+                        .find(|document| {
+                            document.doc_type == item.doc_type && document.path == item.path
+                        })
+                        .cloned()
+                })
+                .and_then(|document| {
+                    crate::knowledge_store::active_summary(&document).map(str::to_string)
+                })
             })
             .collect()
     }
@@ -6036,7 +6526,167 @@ impl AgentInstance {
             .join("\n")
     }
 
-    fn format_knowledge_query_output(items: &[AgentKnowledgeSearchHit]) -> String {
+    fn knowledge_hit_context_anchor(
+        chars: &[char],
+        matched_terms: &[String],
+    ) -> Option<(usize, usize)> {
+        let folded_chars = chars
+            .iter()
+            .map(|ch| ch.to_lowercase().collect::<String>())
+            .collect::<Vec<_>>();
+        let mut best: Option<(usize, usize)> = None;
+
+        for term in matched_terms {
+            let folded_term = term
+                .trim()
+                .chars()
+                .map(|ch| ch.to_lowercase().collect::<String>())
+                .collect::<Vec<_>>();
+            if folded_term.is_empty() || folded_term.len() > folded_chars.len() {
+                continue;
+            }
+
+            if let Some(start) = folded_chars
+                .windows(folded_term.len())
+                .position(|window| window == folded_term.as_slice())
+            {
+                let candidate = (start, start + folded_term.len());
+                if best
+                    .map(|current| candidate.1 - candidate.0 > current.1 - current.0)
+                    .unwrap_or(true)
+                {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        best
+    }
+
+    fn knowledge_hit_context_boundary(ch: char) -> bool {
+        matches!(
+            ch,
+            '\n' | '\r'
+                | '.'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '。'
+                | '，'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '、'
+        )
+    }
+
+    fn truncate_knowledge_hit_context(
+        value: &str,
+        matched_terms: &[String],
+        max_chars: usize,
+    ) -> String {
+        let value = value.trim();
+        let chars = value.chars().collect::<Vec<_>>();
+        if chars.len() <= max_chars {
+            return value.to_string();
+        }
+
+        if max_chars == 0 {
+            return String::new();
+        }
+        if max_chars <= 2 {
+            return chars.iter().take(max_chars).collect();
+        }
+
+        if let Some((anchor_start, anchor_end)) =
+            Self::knowledge_hit_context_anchor(&chars, matched_terms)
+        {
+            let content_budget = max_chars.saturating_sub(2).max(1);
+            let before_budget = content_budget / 3;
+            let mut start = anchor_start.saturating_sub(before_budget);
+            let mut end = (start + content_budget).min(chars.len());
+            if anchor_end > end {
+                if anchor_end.saturating_sub(anchor_start) >= content_budget {
+                    start = anchor_start;
+                    end = (start + content_budget).min(chars.len());
+                } else {
+                    end = anchor_end.min(chars.len());
+                    start = end.saturating_sub(content_budget);
+                }
+            }
+            if end == chars.len() {
+                start = end.saturating_sub(content_budget);
+            }
+
+            if start > 0 {
+                if let Some(boundary) = chars[start..anchor_start]
+                    .iter()
+                    .rposition(|ch| Self::knowledge_hit_context_boundary(*ch))
+                {
+                    start += boundary + 1;
+                    while start < anchor_start && chars[start].is_whitespace() {
+                        start += 1;
+                    }
+                }
+            }
+            if anchor_end < end && end < chars.len() {
+                if let Some(boundary) = chars[anchor_end..end]
+                    .iter()
+                    .rposition(|ch| Self::knowledge_hit_context_boundary(*ch))
+                {
+                    end = anchor_end + boundary + 1;
+                }
+            }
+
+            let has_prefix = start > 0;
+            let has_suffix = end < chars.len();
+            let ellipsis_count = usize::from(has_prefix) + usize::from(has_suffix);
+            let allowed_content = max_chars.saturating_sub(ellipsis_count);
+            if end.saturating_sub(start) > allowed_content {
+                end = start + allowed_content;
+            }
+
+            let mut truncated = String::new();
+            if has_prefix {
+                truncated.push('…');
+            }
+            truncated.extend(chars[start..end].iter());
+            if has_suffix {
+                truncated.push('…');
+            }
+            return truncated;
+        }
+
+        let content_budget = max_chars.saturating_sub(1);
+        let minimum_boundary = content_budget / 2;
+        let boundary = chars
+            .iter()
+            .take(content_budget)
+            .enumerate()
+            .filter_map(|(index, ch)| {
+                (index + 1 >= minimum_boundary && Self::knowledge_hit_context_boundary(*ch))
+                    .then_some(index + 1)
+            })
+            .last()
+            .unwrap_or(content_budget);
+        let mut truncated = chars[..boundary]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        truncated.push('…');
+        truncated
+    }
+
+    fn format_knowledge_query_output(
+        items: &[AgentKnowledgeSearchHit],
+        include_summary: bool,
+        include_hit_context: bool,
+        hit_context_max_chars: usize,
+    ) -> String {
         if items.is_empty() {
             return "No results.".to_string();
         }
@@ -6047,32 +6697,61 @@ impl AgentInstance {
                 output.push_str("\n\n");
             }
 
+            output.push_str("path: ");
             output.push_str(&item.path);
             output.push('\n');
-            output.push_str("  ");
-            output.push_str(item.title.trim());
+            output.push_str("lines: ");
+            output.push_str(&format!("{}-{}", item.start_line, item.end_line));
             output.push('\n');
-            output.push_str("  match=");
-            output.push_str(item.match_kind.trim());
-            if let Some(section) = item.matched_section {
-                output.push_str(" | section=");
-                output.push_str(match section {
-                    crate::knowledge_store::KnowledgeSearchMatchSection::Summary => "summary",
-                    crate::knowledge_store::KnowledgeSearchMatchSection::MaintenanceRules => {
-                        "maintenance_rules"
+            if include_summary {
+                output.push_str("summary:");
+                match item
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(summary) => {
+                        for line in summary.lines() {
+                            output.push('\n');
+                            output.push_str("  ");
+                            output.push_str(line.trim_end());
+                        }
                     }
-                    crate::knowledge_store::KnowledgeSearchMatchSection::Body => "body",
-                });
+                    None => output.push_str(" empty"),
+                }
+                output.push('\n');
+            } else {
+                output.push_str("summary_start_line: ");
+                match item.summary_start_line {
+                    Some(line) => output.push_str(&line.to_string()),
+                    None => output.push_str("empty"),
+                }
+                output.push('\n');
+                output.push_str("body_start_line: ");
+                output.push_str(&item.body_start_line.to_string());
+                output.push('\n');
             }
+            output.push_str("match: ");
+            output.push_str(item.match_kind.trim());
             output.push_str(&format!(" | score={:.3}", item.score));
             if !item.matched_terms.is_empty() {
                 output.push_str(" | terms=");
                 output.push_str(&item.matched_terms.join(", "));
             }
 
-            let snippet = item.snippet.trim();
-            if !snippet.is_empty() {
-                for line in snippet.lines() {
+            let context = include_hit_context
+                .then(|| {
+                    Self::truncate_knowledge_hit_context(
+                        &item.snippet,
+                        &item.matched_terms,
+                        hit_context_max_chars,
+                    )
+                })
+                .unwrap_or_default();
+            if !context.is_empty() {
+                output.push_str("\ncontext:");
+                for line in context.lines() {
                     output.push('\n');
                     output.push_str("  ");
                     output.push_str(line.trim_end());
@@ -6277,6 +6956,7 @@ impl AgentInstance {
         );
         child.subagent_depth = self.subagent_depth + 1;
         child.subagent_active = self.subagent_active.clone();
+        child.async_tasks_enabled = self.async_tasks_enabled;
         child.codex_fast_mode = self.codex_fast_mode;
         Ok(child)
     }
@@ -7393,8 +8073,12 @@ impl AgentInstance {
             } else {
                 0
             };
-            match store.record_token_usage(
+            let provider = self.model_usage_provider();
+            match store.record_model_usage(
                 &self.session_id,
+                &self.effective_model,
+                &provider,
+                "compaction",
                 summary_response.input_tokens as u64,
                 summary_response.output_tokens as u64,
                 summary_response.cache_read_tokens as u64,
@@ -8211,6 +8895,7 @@ impl AgentInstance {
                 user_intent,
                 run_id,
                 None,
+                None,
             )
             .await
         })
@@ -8227,6 +8912,7 @@ impl AgentInstance {
         user_intent: Option<crate::session::models::UserIntentPayload>,
         run_id: String,
         accepted_pending_input_id: Option<String>,
+        internal_system_reminder: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -8384,7 +9070,9 @@ impl AgentInstance {
 
         let user_text_started_at = Instant::now();
         let actual_user_text: String;
-        if crate::unity_bridge::is_unity_project(&self.working_dir) {
+        if internal_system_reminder.is_some() {
+            actual_user_text = String::new();
+        } else if crate::unity_bridge::is_unity_project(&self.working_dir) {
             // The status probe can stall on a busy editor; race it against the
             // cancel signal so a cancel during prep reacts immediately.
             let mut cancel_rx = self.cancel_waiter();
@@ -8475,8 +9163,9 @@ impl AgentInstance {
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
         // The raw composer text (not actual_user_text, which may carry an
         // editor-state prefix) is the argument string for skill placeholders.
-        let user_prompt_suffix =
-            self.build_user_prompt_suffix(app_handle, store, user_intent.as_ref(), user_text);
+        let user_prompt_suffix = internal_system_reminder.clone().or_else(|| {
+            self.build_user_prompt_suffix(app_handle, store, user_intent.as_ref(), user_text)
+        });
         let first_user_message_id = store.first_user_message_id(&self.session_id)?;
         let current_prompt_prefix = if first_user_message_id.is_none() {
             env_prompt_prefix.as_deref()
@@ -8510,10 +9199,12 @@ impl AgentInstance {
                     self.session_id, current_message_id
                 )
             })?;
-        emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
-            session_id: self.session_id.clone(),
-            message: current_user_message.clone(),
-        });
+        if internal_system_reminder.is_none() {
+            emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
+                session_id: self.session_id.clone(),
+                message: current_user_message.clone(),
+            });
+        }
         if let Some(pending_input_id) = accepted_pending_input_id.as_deref() {
             emit_stream(app_handle, &run_id, StreamEvent::PendingInputAccepted {
                 session_id: self.session_id.clone(),
@@ -8592,6 +9283,7 @@ impl AgentInstance {
             LlmBackend::OpenAiCodex { .. } => "OpenAI Codex",
             LlmBackend::Custom { .. } => "Custom",
         };
+        let usage_provider = self.model_usage_provider();
         eprintln!(
             "[Agent {}] starting loop, backend={}, model={}, tools={}, mode={}, cwd={}",
             self.id,
@@ -8661,6 +9353,19 @@ impl AgentInstance {
                 return Ok(String::new());
             }
 
+            let injected_async_notifications =
+                self.persist_async_notifications(app_handle, store)?;
+            if injected_async_notifications > 0 {
+                eprintln!(
+                    "[Agent {}] injected {} async completion reminder(s): session={} run={} iteration={}",
+                    self.id,
+                    injected_async_notifications,
+                    self.session_id,
+                    run_id,
+                    iteration
+                );
+            }
+
             let messages = store.get_messages_for_prompt(&self.session_id)?;
 
             let session_id = self.session_id.clone();
@@ -8676,7 +9381,8 @@ impl AgentInstance {
                 }
                 parts
             };
-            let ctx_limit = self.context_limit();
+            let runtime_context_limits = self.context_limits();
+            let ctx_limit = runtime_context_limits.effective_context_window;
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             let prepared_tools = self
@@ -8714,8 +9420,14 @@ impl AgentInstance {
                 compact::auto_compact_buffer(ctx_limit),
             );
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
+            let codex_auto_compact_token_limit = runtime_context_limits
+                .codex_auto_compact_token_limit
+                .unwrap_or_else(|| compact::codex_auto_compact_token_limit(ctx_limit));
             let should_preflight_compact = if is_codex_backend {
-                compact::should_codex_auto_compact(effective_input_tokens, ctx_limit)
+                compact::should_codex_auto_compact(
+                    effective_input_tokens,
+                    codex_auto_compact_token_limit,
+                )
             } else {
                 compact::should_auto_compact(effective_input_tokens, ctx_limit)
             };
@@ -8759,7 +9471,10 @@ impl AgentInstance {
                         estimate_calibration_sample = None;
                         let still_over_threshold = post_compact_tokens > 0
                             && if is_codex_backend {
-                                compact::should_codex_auto_compact(post_compact_tokens, ctx_limit)
+                                compact::should_codex_auto_compact(
+                                    post_compact_tokens,
+                                    codex_auto_compact_token_limit,
+                                )
                             } else {
                                 compact::should_auto_compact(post_compact_tokens, ctx_limit)
                             };
@@ -8782,7 +9497,11 @@ impl AgentInstance {
             }
 
             if is_codex_backend
-                && compact::should_codex_block_normal_send(effective_input_tokens, ctx_limit)
+                && compact::should_codex_block_normal_send(
+                    effective_input_tokens,
+                    ctx_limit,
+                    codex_auto_compact_token_limit,
+                )
             {
                 let reason = preflight_compact_error
                     .unwrap_or_else(|| "Codex request is too close to the context limit".to_string());
@@ -9201,7 +9920,7 @@ impl AgentInstance {
                                 && if is_codex_backend {
                                     compact::should_codex_auto_compact(
                                         post_compact_tokens,
-                                        ctx_limit,
+                                        codex_auto_compact_token_limit,
                                     )
                                 } else {
                                     compact::should_auto_compact(post_compact_tokens, ctx_limit)
@@ -9297,8 +10016,11 @@ impl AgentInstance {
                     + response.cache_write_tokens
                     + response.output_tokens;
                 let context_limit = self.context_limit();
-                match store.record_token_usage(
+                match store.record_model_usage(
                     &self.session_id,
+                    &self.effective_model,
+                    &usage_provider,
+                    "completion",
                     response.input_tokens as u64,
                     response.output_tokens as u64,
                     response.cache_read_tokens as u64,
@@ -9497,12 +10219,231 @@ impl AgentInstance {
                     prepared.push((tc.clone(), args));
                 }
 
-                let needs_undo = prepared
+                let effective_tool_names: HashMap<String, String> = prepared
                     .iter()
-                    .any(|(tc, args)| self.tool_call_needs_undo_tracking(&tc.name, args));
-                let has_unity_execute = prepared
+                    .map(|(tc, args)| {
+                        (
+                            tc.id.clone(),
+                            self.effective_tool_name_for_round(&tc.name, args),
+                        )
+                    })
+                    .collect();
+                let effective_name = |tc: &ToolCallInfo| {
+                    effective_tool_names
+                        .get(&tc.id)
+                        .cloned()
+                        .unwrap_or_else(|| tc.name.clone())
+                };
+
+                // Calls that can wait for user input, run child agents, or re-enter
+                // through an external MCP server never share a round-level workspace
+                // lock with local tools. Blocking the mixed siblings gives the model
+                // a deterministic retry path and prevents parent/child lock cycles.
+                let mut blocked_results: HashMap<String, ExecutedToolResult> = HashMap::new();
+                let has_ask = prepared
                     .iter()
-                    .any(|(tc, _)| tc.name == "unity_execute" || tc.name == "unity_run_states");
+                    .any(|(tc, _)| effective_name(tc) == "ask_user_question");
+                let has_task = prepared
+                    .iter()
+                    .any(|(tc, _)| effective_name(tc) == "task");
+                let has_external_mcp = prepared.iter().any(|(tc, _)| {
+                    effective_name(tc).starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                });
+                let mixed_round_reason = if has_ask && prepared.len() > 1 {
+                    Some(("ask_user_question", "user-input tools must run alone"))
+                } else if has_task
+                    && prepared
+                        .iter()
+                        .any(|(tc, _)| effective_name(tc) != "task")
+                {
+                    Some(("task", "sub-agent calls must run without local sibling tools"))
+                } else if has_external_mcp
+                    && prepared.iter().any(|(tc, _)| {
+                        !effective_name(tc).starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                    })
+                {
+                    Some((
+                        "external MCP",
+                        "external MCP calls must run without local sibling tools",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((allowed_kind, reason)) = mixed_round_reason {
+                    for (tc, _) in &prepared {
+                        let name = effective_name(tc);
+                        let allowed = match allowed_kind {
+                            "ask_user_question" => name == "ask_user_question",
+                            "task" => name == "task",
+                            _ => name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
+                        };
+                        if allowed {
+                            continue;
+                        }
+                        let output = format!(
+                            "Tool '{}' was skipped by the tool-round scheduler: {}. Retry it in the next tool round.",
+                            name, reason
+                        );
+                        eprintln!(
+                            "[Agent {}] tool round policy blocked tool='{}' id={} session={} run={} reason={}",
+                            self.id, name, tc.id, self.session_id, run_id, reason
+                        );
+                        blocked_results.insert(
+                            tc.id.clone(),
+                            ExecutedToolResult::from_tool_result(ToolResult {
+                                output,
+                                is_error: true,
+                            }),
+                        );
+                    }
+                }
+
+                let is_local_active_round = prepared
+                    .iter()
+                    .any(|(tc, _)| !blocked_results.contains_key(&tc.id))
+                    && prepared
+                        .iter()
+                        .filter(|(tc, _)| !blocked_results.contains_key(&tc.id))
+                        .all(|(tc, _)| {
+                            let name = effective_name(tc);
+                            name != "task"
+                                && name != "ask_user_question"
+                                && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                        });
+
+                // Confirm every local call before taking the process-wide lock.
+                // A confirmation dialog can remain open indefinitely; holding a
+                // read/write guard while waiting would stall every other agent.
+                let mut confirmation_preapproved: HashSet<String> = HashSet::new();
+                if is_local_active_round {
+                    for (tc, args) in &prepared {
+                        if blocked_results.contains_key(&tc.id)
+                            || args.get("__parse_error").is_some()
+                        {
+                            continue;
+                        }
+                        if matches!(
+                            effective_name(tc).as_str(),
+                            "tool_load" | CODEX_TOOL_SEARCH_TOOL_NAME | "exit_plan_mode"
+                        ) {
+                            continue;
+                        }
+                        let Some((confirm_name, confirm_arguments, confirm_args)) =
+                            self.tool_round_confirmation_target(tc, args)
+                        else {
+                            continue;
+                        };
+                        let decision = self
+                            .request_tool_confirm(
+                                app_handle,
+                                &tc.id,
+                                &confirm_name,
+                                &confirm_arguments,
+                                &confirm_args,
+                                &run_id,
+                            )
+                            .await;
+                        if let Some(result) =
+                            self.confirmation_rejection_result(&confirm_name, decision)
+                        {
+                            blocked_results.insert(tc.id.clone(), result);
+                        } else {
+                            confirmation_preapproved.insert(tc.id.clone());
+                        }
+                    }
+                }
+
+                let is_active = |tc: &ToolCallInfo| !blocked_results.contains_key(&tc.id);
+                let needs_undo = prepared.iter().any(|(tc, args)| {
+                    is_active(tc)
+                        && !self.tool_call_runs_in_background(&effective_name(tc), args)
+                        && self.tool_call_needs_undo_tracking(&tc.name, args)
+                });
+                let has_unity_execute = prepared.iter().any(|(tc, _)| {
+                    is_active(tc) && Self::is_unity_execute_undo_tool(&effective_name(tc))
+                });
+                let has_unity_execution_barrier = prepared.iter().any(|(tc, args)| {
+                    is_active(tc)
+                        && !self.tool_call_runs_in_background(&effective_name(tc), args)
+                        && Self::is_unity_execution_barrier_tool(&effective_name(tc))
+                });
+                let active_local_call_count = prepared
+                    .iter()
+                    .filter(|(tc, _)| {
+                        if !is_active(tc) {
+                            return false;
+                        }
+                        let name = effective_name(tc);
+                        name != "task"
+                            && name != "ask_user_question"
+                            && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                    })
+                    .count();
+                let workspace_lock_mode = if active_local_call_count == 0 {
+                    None
+                } else if needs_undo || has_unity_execution_barrier {
+                    Some(WorkspaceExecutionLockMode::Write)
+                } else {
+                    Some(WorkspaceExecutionLockMode::Read)
+                };
+                let execute_sequentially = workspace_lock_mode
+                    == Some(WorkspaceExecutionLockMode::Write)
+                    || has_ask;
+                eprintln!(
+                    "[Agent {}] tool round policy session={} run={} iteration={} strategy={} workspace_lock={} active={} blocked={} tools=[{}]",
+                    self.id,
+                    self.session_id,
+                    run_id,
+                    iteration,
+                    if execute_sequentially { "sequential" } else { "parallel" },
+                    workspace_lock_mode
+                        .map(|mode| match mode {
+                            WorkspaceExecutionLockMode::Read => "read",
+                            WorkspaceExecutionLockMode::Write => "write",
+                        })
+                        .unwrap_or("none"),
+                    prepared.len().saturating_sub(blocked_results.len()),
+                    blocked_results.len(),
+                    prepared
+                        .iter()
+                        .map(|(tc, _)| effective_name(tc))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+
+                let mut workspace_round_guard: Option<WorkspaceExecutionGuard> =
+                    if let Some(lock_mode) = workspace_lock_mode {
+                        let owner = WorkspaceExecutionLockOwner {
+                            session_id: self.session_id.clone(),
+                            run_id: run_id.clone(),
+                            iteration,
+                            workspace: self.working_dir.clone(),
+                            tools: prepared
+                                .iter()
+                                .filter(|(tc, _)| is_active(tc))
+                                .map(|(tc, _)| effective_name(tc).to_string())
+                                .collect(),
+                        };
+                        match process_workspace_execution_lock()
+                            .acquire(lock_mode, owner, self.cancel_waiter())
+                            .await
+                        {
+                            Ok(guard) => Some(guard),
+                            Err(_) => {
+                                self.clear_pending_knowledge_proposal(app_handle).await;
+                                self.emit_cancelled(
+                                    app_handle,
+                                    store,
+                                    &run_id,
+                                    (iteration == 1 && !assistant_round_persisted)
+                                        .then_some(&current_user_message),
+                                );
+                                return Ok(String::new());
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                 let pre_checkpoint = if needs_undo {
                     if let Some(ref undo_mgr) = self.undo_manager {
@@ -9535,9 +10476,9 @@ impl AgentInstance {
                 } else { None };
 
                 let has_unity_asset_writes = crate::unity_bridge::is_unity_project(&self.working_dir)
-                    && prepared
-                        .iter()
-                        .any(|(tc, args)| self.is_unity_asset_write_call(tc, args));
+                    && prepared.iter().any(|(tc, args)| {
+                        is_active(tc) && self.is_unity_asset_write_call(tc, args)
+                    });
                 if has_unity_asset_writes {
                     match crate::unity_bridge::begin_edit_session(&self.working_dir, &self.session_id).await {
                         Ok(msg) => eprintln!(
@@ -9551,50 +10492,78 @@ impl AgentInstance {
                     }
                 }
 
-                let has_unity_recompile = prepared.iter().any(|(tc, _)| tc.name == "unity_recompile");
-                // unity_hot_reload reads the just-edited files from disk;
-                // running it concurrently with the same round's write/edit
-                // calls would race them, so it shares the sequential barrier.
-                let has_unity_execution_barrier = has_unity_execute
-                    || has_unity_recompile
-                    || prepared.iter().any(|(tc, _)| tc.name == "unity_hot_reload");
-                let results = if has_unity_execution_barrier {
+                let completed_results = if execute_sequentially {
                     eprintln!(
-                        "[Agent {}] executing tool round sequentially because a Unity tool is a barrier",
-                        self.id
+                        "[Agent {}] executing tool round sequentially session={} run={} mutation={} unity_barrier={}",
+                        self.id, self.session_id, run_id, needs_undo, has_unity_execution_barrier
                     );
                     let mut results = Vec::with_capacity(prepared.len());
                     let mut queued_asset_paths: Vec<String> = Vec::new();
                     for (tc, args) in &prepared {
-                        if tc.name == "unity_recompile" && !queued_asset_paths.is_empty() {
-                            match crate::unity_bridge::import_assets(&self.working_dir, &queued_asset_paths).await {
-                                Ok(msg) => eprintln!(
-                                    "[Agent {}] queued changed Unity assets before recompile: {}",
-                                    self.id, msg
-                                ),
-                                Err(e) => eprintln!(
-                                    "[Agent {}] failed to queue changed Unity assets before recompile: {}",
-                                    self.id, e
-                                ),
+                        let result = if let Some(result) = blocked_results.get(&tc.id) {
+                            result.clone()
+                        } else {
+                            if effective_name(tc) == "unity_recompile"
+                                && !queued_asset_paths.is_empty()
+                            {
+                                match crate::unity_bridge::import_assets(
+                                    &self.working_dir,
+                                    &queued_asset_paths,
+                                )
+                                .await
+                                {
+                                    Ok(msg) => eprintln!(
+                                        "[Agent {}] queued changed Unity assets before recompile: {}",
+                                        self.id, msg
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[Agent {}] failed to queue changed Unity assets before recompile: {}",
+                                        self.id, e
+                                    ),
+                                }
+                                queued_asset_paths.clear();
                             }
-                            queued_asset_paths.clear();
-                        }
 
-                        let result = self
-                            .execute_single_tool(
-                                app_handle,
-                                store,
-                                tc,
-                                args,
-                                &run_id,
-                                &mode,
-                                &active_skill_tool_names,
-                            )
-                            .await;
-                        if let Some(asset_path) = self.unity_asset_relative_path(tc, args, &result) {
-                            queued_asset_paths.push(asset_path);
+                            let result = self
+                                .execute_single_tool(
+                                    app_handle,
+                                    store,
+                                    tc,
+                                    args,
+                                    &run_id,
+                                    &assistant_msg_id,
+                                    &mode,
+                                    &active_skill_tool_names,
+                                    confirmation_preapproved.contains(&tc.id),
+                                )
+                                .await;
+                            if let Some(asset_path) =
+                                self.unity_asset_relative_path(tc, args, &result)
+                            {
+                                queued_asset_paths.push(asset_path);
+                            }
+                            result
+                        };
+
+                        if !self.run_is_current_for_session(
+                            store,
+                            &run_id,
+                            "tool_result_completed",
+                            Some(&tc.id),
+                        ) {
+                            return Ok(String::new());
                         }
-                        results.push(result);
+                        let stored_output = self.stream_completed_tool_result(
+                            app_handle,
+                            store,
+                            &run_id,
+                            tc,
+                            &result,
+                        );
+                        results.push(CompletedToolResult {
+                            executed: result,
+                            stored_output,
+                        });
                     }
 
                     if !queued_asset_paths.is_empty() {
@@ -9606,18 +10575,72 @@ impl AgentInstance {
                     results
                 } else {
                     let mode_ref = mode.as_str();
-                    let futures: Vec<_> = prepared.iter().map(|(tc, args)| {
-                        self.execute_single_tool(
+                    let run_id_ref = run_id.as_str();
+                    let assistant_msg_id_ref = assistant_msg_id.as_str();
+                    let active_skill_tool_names_ref = &active_skill_tool_names;
+                    let agent = &*self;
+                    let mut pending = futures::stream::FuturesUnordered::new();
+                    for (index, (tc, args)) in prepared.iter().enumerate() {
+                        let blocked_result = blocked_results.get(&tc.id).cloned();
+                        let confirmation_preapproved =
+                            confirmation_preapproved.contains(&tc.id);
+                        pending.push(async move {
+                            let result = if let Some(result) = blocked_result {
+                                result
+                            } else {
+                                agent
+                                    .execute_single_tool(
+                                        app_handle,
+                                        store,
+                                        tc,
+                                        args,
+                                        run_id_ref,
+                                        assistant_msg_id_ref,
+                                        mode_ref,
+                                        active_skill_tool_names_ref,
+                                        confirmation_preapproved,
+                                    )
+                                    .await
+                            };
+                            (index, result)
+                        });
+                    }
+
+                    let mut results_by_index: Vec<Option<CompletedToolResult>> =
+                        std::iter::repeat_with(|| None)
+                            .take(prepared.len())
+                            .collect();
+                    while let Some((index, result)) = pending.next().await {
+                        let (tc, _) = &prepared[index];
+                        if !self.run_is_current_for_session(
+                            store,
+                            &run_id,
+                            "tool_result_completed",
+                            Some(&tc.id),
+                        ) {
+                            return Ok(String::new());
+                        }
+                        let stored_output = self.stream_completed_tool_result(
                             app_handle,
                             store,
-                            tc,
-                            args,
                             &run_id,
-                            mode_ref,
-                            &active_skill_tool_names,
-                        )
-                    }).collect();
-                    futures::future::join_all(futures).await
+                            tc,
+                            &result,
+                        );
+                        results_by_index[index] = Some(CompletedToolResult {
+                            executed: result,
+                            stored_output,
+                        });
+                    }
+                    let Some(results) = results_by_index.into_iter().collect::<Option<Vec<_>>>()
+                    else {
+                        eprintln!(
+                            "[Agent {}] parallel tool round ended without every result: session={} run={}",
+                            self.id, self.session_id, run_id
+                        );
+                        return Ok(String::new());
+                    };
+                    results
                 };
 
                 if !self.run_is_current_for_session(store, &run_id, "tool_round_results", None) {
@@ -9635,12 +10658,12 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
-                if !has_unity_execution_barrier {
+                if !execute_sequentially {
                     let queued_asset_paths: Vec<String> = prepared
                         .iter()
-                        .zip(results.iter())
-                        .filter_map(|((tc, args), result)| {
-                            self.unity_asset_relative_path(tc, args, result)
+                        .zip(completed_results.iter())
+                        .filter_map(|((tc, args), completed)| {
+                            self.unity_asset_relative_path(tc, args, &completed.executed)
                         })
                         .collect();
 
@@ -9652,38 +10675,15 @@ impl AgentInstance {
                     }
                 }
 
-                for ((tc, _), result) in prepared.iter().zip(results.iter()) {
-                    let stored_output = match store.rewrite_tool_result_for_storage(
-                        &self.session_id,
-                        &tc.id,
-                        &tc.name,
-                        &result.output,
-                    ) {
-                        Ok(output) => output,
-                        Err(e) => {
-                            eprintln!(
-                                "[Agent {}] failed to persist tool_result for '{}' (id={}): {}",
-                                self.id, tc.name, tc.id, e
-                            );
-                            result.output.clone()
-                        }
-                    };
-                    eprintln!(
-                        "[Agent {}] tool '{}' result: outcome={:?}, is_error={}, output_len={} (stored={})",
-                        self.id,
-                        tc.name,
-                        result.outcome,
-                        result.is_error,
-                        result.output.len(),
-                        stored_output.len()
-                    );
-
+                // Persist in request order so history/model context stays deterministic,
+                // even though each completion was already streamed to the UI.
+                for ((tc, _), completed) in prepared.iter().zip(completed_results.iter()) {
                     match store.add_tool_result_with_images_for_run(
                         &self.session_id,
                         &run_id,
                         &tc.id,
-                        &stored_output,
-                        result.images.as_deref(),
+                        &completed.stored_output,
+                        completed.executed.images.as_deref(),
                     ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
@@ -9700,39 +10700,14 @@ impl AgentInstance {
                             );
                         }
                     }
-
-                    emit_stream(app_handle, &run_id, StreamEvent::ToolCallDone {
-                        session_id: self.session_id.clone(),
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        output: stored_output.clone(),
-                        outcome: result.outcome.as_stream_outcome(),
-                        images: result.images.clone(),
-                    });
-                    if let Some(ref parent) = self.parent_tool_call {
-                        let truncated_output = if stored_output.chars().count() > 500 {
-                            let s: String = stored_output.chars().take(500).collect();
-                            format!("{}…({} chars)", s, result.output.chars().count())
-                        } else {
-                            stored_output.clone()
-                        };
-                        emit_parent_stream(
-                            app_handle,
-                            parent.subagent_tool_call_done(
-                                tc.id.clone(),
-                                tc.name.clone(),
-                                truncated_output,
-                                result.outcome.as_stream_outcome(),
-                                result.images.clone(),
-                            ),
-                        );
-                    }
                 }
 
                 let results_by_id: BTreeMap<&str, &ExecutedToolResult> = prepared
                     .iter()
-                    .zip(results.iter())
-                    .map(|((tool_call, _), result)| (tool_call.id.as_str(), result))
+                    .zip(completed_results.iter())
+                    .map(|((tool_call, _), completed)| {
+                        (tool_call.id.as_str(), &completed.executed)
+                    })
                     .collect();
                 let finalized_tool_calls: Vec<ToolCallInfo> = ordered_tool_calls
                     .iter()
@@ -9819,6 +10794,11 @@ impl AgentInstance {
                         }
                     }
                 }
+
+                // The mutation lock intentionally covers the Undo checkpoint,
+                // tool execution, result persistence, and after-round diff. It
+                // is released before frontend events or the next model turn.
+                drop(workspace_round_guard.take());
 
                 emit_stream(app_handle, &run_id, StreamEvent::ToolCallRoundDone {
                     session_id: self.session_id.clone(),
@@ -10157,12 +11137,13 @@ impl AgentInstance {
                 | "grep"
                 | "list"
                 | "ask_user_question"
-                | "sheet"
                 | "todowrite"
-                | "graph_view"
                 | "unity_ref_search"
                 | "unity_asset_search"
                 | "unity_capture_viewport"
+                | "unity_get_console_log"
+                | "unity_test_list"
+                | "unity_test_run"
                 | "unity_yaml_list"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
@@ -10170,6 +11151,7 @@ impl AgentInstance {
                 // domain but never modifies sources — plan mode keeps it so
                 // plans can be validated against compile diagnostics.
                 | "unity_recompile"
+                | "unity_set_play_mode"
                 | "code_find_references"
                 | "code_goto_definition"
                 | "code_symbol_search"
@@ -10211,6 +11193,98 @@ impl AgentInstance {
         };
 
         self.tool_registry.mutates_workspace(target_name)
+    }
+
+    fn effective_tool_name_for_round(&self, name: &str, args: &serde_json::Value) -> String {
+        if name != "tool_call" {
+            return name.to_string();
+        }
+        let Some(target_name) = args
+            .get("toolName")
+            .or_else(|| args.get("tool_name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return name.to_string();
+        };
+        self.canonical_tool_name(target_name)
+            .unwrap_or_else(|| target_name.to_string())
+    }
+
+    fn tool_round_confirmation_target(
+        &self,
+        tool_call: &ToolCallInfo,
+        args: &serde_json::Value,
+    ) -> Option<(String, String, serde_json::Value)> {
+        if tool_call.name != "tool_call" {
+            return Some((
+                tool_call.name.clone(),
+                tool_call.arguments.clone(),
+                args.clone(),
+            ));
+        }
+
+        let (target_name, mut target_args) =
+            parse_meta_tool_call_arguments(&tool_call.arguments).ok()?;
+        let canonical = self.canonical_tool_name(&target_name)?;
+        normalize_tool_args(&mut target_args);
+        self.inject_working_dir(&canonical, &mut target_args);
+        let target_arguments =
+            serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".to_string());
+        Some((canonical, target_arguments, target_args))
+    }
+
+    pub(crate) fn is_unity_execution_barrier_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "unity_execute"
+                | "unity_run_states"
+                | "unity_test_list"
+                | "unity_test_run"
+                | "unity_recompile"
+                | "unity_hot_reload"
+                | "unity_set_play_mode"
+        )
+    }
+
+    fn is_unity_execute_undo_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "unity_execute" | "unity_run_states" | "unity_test_list" | "unity_test_run"
+        )
+    }
+
+    fn confirmation_rejection_result(
+        &self,
+        tool_name: &str,
+        decision: ToolConfirmDecision,
+    ) -> Option<ExecutedToolResult> {
+        match decision {
+            ToolConfirmDecision::Allow => None,
+            ToolConfirmDecision::Deny { feedback } => {
+                if self.is_cancel_requested() {
+                    return Some(Self::interrupted_tool_result());
+                }
+                let output = match feedback {
+                    Some(feedback) => format!(
+                        "Tool '{}' was rejected by user feedback. Revise the proposal before trying again.\nUser feedback: {}",
+                        tool_name, feedback
+                    ),
+                    None => format!("Tool '{}' was denied by user", tool_name),
+                };
+                Some(ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                }))
+            }
+            ToolConfirmDecision::PreflightError { output } => {
+                Some(ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                }))
+            }
+        }
     }
 
     fn workspace_path_touches_view_tree(path: &str) -> bool {
@@ -10531,6 +11605,43 @@ impl AgentInstance {
 
         let mut knowledge_preview: Option<KnowledgeToolConfirmPreview> = None;
         let mut knowledge_governance_triggered = false;
+        if matches!(tool_name, "write" | "edit") {
+            if let Some(file_path) = args.get("filePath").and_then(|value| value.as_str()) {
+                let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+                    &self.working_dir,
+                    self.app_knowledge_dir.as_ref().as_ref(),
+                );
+                if let Some(target) = registry.classify_path_string(file_path) {
+                    if target.kind
+                        == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                    {
+                        let parent_path = parent_knowledge_path(&target.logical_path);
+                        let mode = if tool_name == "write" {
+                            resolve_child_directory_mode(
+                                &self.working_dir,
+                                target.doc_type,
+                                parent_path.as_deref(),
+                            )
+                        } else {
+                            resolve_existing_directory_mode(
+                                &self.working_dir,
+                                target.doc_type,
+                                parent_path.as_deref(),
+                            )
+                        };
+                        match mode {
+                            Ok((_, KnowledgeToolConfirmDirectoryMode::Approval)) => {
+                                knowledge_governance_triggered = true;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                return knowledge_tool_confirm_preflight_error(tool_name, error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if matches!(
             tool_name,
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete"
@@ -10551,6 +11662,24 @@ impl AgentInstance {
             }
         }
         if tool_name == "bash" {
+            let workdir = args
+                .get("workdir")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let command = args
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let touches_registered_knowledge = Self::path_targets_knowledge_root(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+                workdir,
+            ) || Self::shell_command_mentions_knowledge_root(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+                command,
+            );
+            knowledge_governance_triggered |= touches_registered_knowledge;
             if let Some(assessment) = Self::assess_bash_git_knowledge_command(
                 &self.working_dir,
                 self.app_knowledge_dir.as_ref().as_ref(),
@@ -10751,7 +11880,13 @@ impl AgentInstance {
             },
         );
         let decision = self
-            .await_tool_confirm_decision(app_handle, tool_call_id, "exit_plan_mode", display, run_id)
+            .await_tool_confirm_decision(
+                app_handle,
+                tool_call_id,
+                "exit_plan_mode",
+                display,
+                run_id,
+            )
             .await;
 
         match decision {
@@ -10944,6 +12079,277 @@ impl AgentInstance {
         }
     }
 
+    fn clone_for_background_task(&self, cancel_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        let mut instance = AgentInstance::new(
+            self.def.clone(),
+            &self.session_id,
+            self.backend.clone(),
+            self.debug,
+            self.registry.clone(),
+            self.tool_registry.clone(),
+            self.working_dir.clone(),
+            self.raw_store.clone(),
+            self.workspace_id.clone(),
+            self.effective_model.clone(),
+            self.effort.clone(),
+            self.app_knowledge_dir.clone(),
+            self.app_agent_dir.clone(),
+            self.knowledge_access_mode,
+            self.undo_manager.clone(),
+            self.subagent_model_overrides.clone(),
+            cancel_rx,
+        );
+        instance.parent_tool_call = self.parent_tool_call.clone();
+        instance.subagent_depth = self.subagent_depth;
+        instance.subagent_active = self.subagent_active.clone();
+        instance.task_tool_suppressed = self.task_tool_suppressed;
+        instance.codex_fast_mode = self.codex_fast_mode;
+        instance.async_tasks_enabled = self.async_tasks_enabled;
+        instance.knowledge_focus = self.knowledge_focus.clone();
+        instance.set_plan_runtime(self.plan_runtime_snapshot());
+        instance
+    }
+
+    fn tool_call_runs_in_background(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.async_tasks_enabled
+            && crate::async_tasks::supports_async_mode(tool_name)
+            && crate::async_tasks::AsyncMode::parse(args, true)
+                .map(crate::async_tasks::AsyncMode::is_background)
+                .unwrap_or(false)
+    }
+
+    fn persist_async_notifications(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+    ) -> Result<usize, String> {
+        let manager = app_handle
+            .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
+            .inner()
+            .clone();
+        let notifications = manager.take_notifications(&self.session_id);
+        if notifications.is_empty() {
+            return Ok(0);
+        }
+        let count = notifications.len();
+        let reminder = notifications.join("\n\n");
+        store.add_message_with_images_asset_refs_and_signature(
+            &self.session_id,
+            MessageRole::User,
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some(&reminder),
+        )?;
+        Ok(count)
+    }
+
+    async fn start_async_tool(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        tc: &ToolCallInfo,
+        args: &serde_json::Value,
+        run_id: &str,
+        assistant_message_id: &str,
+        async_mode: crate::async_tasks::AsyncMode,
+    ) -> ExecutedToolResult {
+        let manager = app_handle
+            .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
+            .inner()
+            .clone();
+        let started = manager.create_task(&self.session_id, &tc.name, async_mode.should_notify());
+        let immediate = manager.start_result(&started.task_id);
+        let task_id = started.task_id.clone();
+        let app_handle = app_handle.clone();
+        let store = store.clone();
+        let tool_name = tc.name.clone();
+        let tool_call_id = tc.id.clone();
+        let args = crate::async_tasks::remove_async_mode(args);
+        let run_id = run_id.to_string();
+        let assistant_message_id = assistant_message_id.to_string();
+        let session_id = self.session_id.clone();
+        let working_dir = self.working_dir.clone();
+        let mutates_workspace = self.tool_registry.mutates_workspace(&tool_name);
+        let executor = self.clone_for_background_task(started.cancel_rx.clone());
+
+        tauri::async_runtime::spawn(async move {
+            let mut run_guard = manager.run_guard(&task_id);
+            manager.mark_running(&task_id, format!("Running {}", tool_name));
+            let owner = WorkspaceExecutionLockOwner {
+                session_id: session_id.clone(),
+                run_id: format!("async:{}", task_id),
+                iteration: 0,
+                workspace: working_dir.clone(),
+                tools: vec![tool_name.clone()],
+            };
+            let mut cancel_rx = started.cancel_rx.clone();
+            let _workspace_guard = if tool_name == "task" {
+                None
+            } else {
+                let mode = if mutates_workspace {
+                    WorkspaceExecutionLockMode::Write
+                } else {
+                    WorkspaceExecutionLockMode::Read
+                };
+                match process_workspace_execution_lock()
+                    .acquire(mode, owner, cancel_rx.clone())
+                    .await
+                {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        manager.mark_cancelled(&task_id);
+                        run_guard.complete();
+                        return;
+                    }
+                }
+            };
+
+            let undo_round = if mutates_workspace {
+                match executor.undo_manager.as_ref() {
+                    Some(undo) => undo
+                        .before_round(&working_dir, &format!("async {}", tool_name))
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let progress_manager = manager.clone();
+            let progress_task_id = task_id.clone();
+            let progress: crate::async_tasks::TaskProgressReporter = Arc::new(move |text| {
+                progress_manager.report_progress(&progress_task_id, text);
+            });
+            let result = if tool_name == "task" {
+                tokio::select! {
+                    result = executor.execute_task(&app_handle, &store, &args, &tool_call_id, &run_id) => result,
+                    _ = cancel_rx.changed() => AgentInstance::interrupted_tool_result(),
+                }
+            } else {
+                let mut context = executor
+                    .build_tool_execution_context(&app_handle, &tool_name, &args)
+                    .await;
+                context.cancel_rx = Some(cancel_rx.clone());
+                context.progress = Some(progress);
+                ExecutedToolResult::from_tool_result(
+                    executor
+                        .tool_registry
+                        .execute_with_context(&tool_name, &args, context)
+                        .await,
+                )
+            };
+
+            let cancellation_failed = tool_name == "unity_test_run"
+                && result
+                    .output
+                    .contains("Unity Test cancellation ")
+                && (result.output.contains("unavailable:")
+                    || result.output.contains("failed:"));
+            let was_cancelled = result.outcome == ToolRunOutcome::Interrupted
+                || (*cancel_rx.borrow() && !cancellation_failed);
+
+            if let (Some(undo), Some(round)) = (executor.undo_manager.as_ref(), undo_round) {
+                if let Err(error) = undo
+                    .after_round(
+                        &session_id,
+                        &assistant_message_id,
+                        Some(&run_id),
+                        round,
+                        tool_name == "unity_test_run",
+                        &working_dir,
+                    )
+                    .await
+                {
+                    eprintln!("[Agent async] undo checkpoint finalize failed: {}", error);
+                }
+            }
+
+            if was_cancelled {
+                manager.mark_cancelled(&task_id);
+                run_guard.complete();
+                return;
+            }
+
+            let result = result.into_tool_result();
+            manager.finish(&task_id, &result);
+            run_guard.complete();
+        });
+
+        ExecutedToolResult::from_tool_result(immediate)
+    }
+
+    fn stream_completed_tool_result(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        tool_call: &ToolCallInfo,
+        result: &ExecutedToolResult,
+    ) -> String {
+        let stored_output = match store.rewrite_tool_result_for_storage(
+            &self.session_id,
+            &tool_call.id,
+            &tool_call.name,
+            &result.output,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] failed to prepare tool_result for '{}' (id={}): {}",
+                    self.id, tool_call.name, tool_call.id, error
+                );
+                result.output.clone()
+            }
+        };
+        eprintln!(
+            "[Agent {}] tool '{}' completed: outcome={:?}, is_error={}, output_len={} (stored={})",
+            self.id,
+            tool_call.name,
+            result.outcome,
+            result.is_error,
+            result.output.len(),
+            stored_output.len()
+        );
+
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::ToolCallDone {
+                session_id: self.session_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                output: stored_output.clone(),
+                outcome: result.outcome.as_stream_outcome(),
+                images: result.images.clone(),
+            },
+        );
+        if let Some(ref parent) = self.parent_tool_call {
+            let truncated_output = if stored_output.chars().count() > 500 {
+                let prefix: String = stored_output.chars().take(500).collect();
+                format!("{}…({} chars)", prefix, result.output.chars().count())
+            } else {
+                stored_output.clone()
+            };
+            emit_parent_stream(
+                app_handle,
+                parent.subagent_tool_call_done(
+                    tool_call.id.clone(),
+                    tool_call.name.clone(),
+                    truncated_output,
+                    result.outcome.as_stream_outcome(),
+                    result.images.clone(),
+                ),
+            );
+        }
+
+        stored_output
+    }
+
     async fn execute_single_tool(
         &self,
         app_handle: &AppHandle,
@@ -10951,8 +12357,10 @@ impl AgentInstance {
         tc: &ToolCallInfo,
         args: &serde_json::Value,
         run_id: &str,
+        assistant_message_id: &str,
         mode: &str,
         active_skill_tool_names: &HashSet<String>,
+        confirmation_preapproved: bool,
     ) -> ExecutedToolResult {
         if let Some(parse_err) = args.get("__parse_error").and_then(|v| v.as_str()) {
             return ExecutedToolResult::from_tool_result(ToolResult {
@@ -10963,34 +12371,32 @@ impl AgentInstance {
 
         if tc.name == "tool_load" {
             let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
-            return ExecutedToolResult::from_tool_result(
-                match self.cached_lazy_tool_renderer() {
-                    LazyToolRenderer::AnthropicNative => {
-                        self.execute_tool_load_native(args, active_skill_tool_names)
-                            .await
-                    }
-                    // tool_load is not declared on the codex-native path; a
-                    // stray call (history habit) gets the schema-text answer
-                    // with direct-call guidance. The loaded-set side effect is
-                    // inert here — native assembly never reads it.
-                    LazyToolRenderer::CodexNative => {
-                        self.execute_tool_load_with_mode_and_skills(
-                            args,
-                            crate::config::DynamicToolLoadingMode::Direct,
-                            active_skill_tool_names,
-                        )
+            return ExecutedToolResult::from_tool_result(match self.cached_lazy_tool_renderer() {
+                LazyToolRenderer::AnthropicNative => {
+                    self.execute_tool_load_native(args, active_skill_tool_names)
                         .await
-                    }
-                    LazyToolRenderer::ToolLoadFallback => {
-                        self.execute_tool_load_with_mode_and_skills(
-                            args,
-                            dynamic_mode,
-                            active_skill_tool_names,
-                        )
-                        .await
-                    }
-                },
-            );
+                }
+                // tool_load is not declared on the codex-native path; a
+                // stray call (history habit) gets the schema-text answer
+                // with direct-call guidance. The loaded-set side effect is
+                // inert here — native assembly never reads it.
+                LazyToolRenderer::CodexNative => {
+                    self.execute_tool_load_with_mode_and_skills(
+                        args,
+                        crate::config::DynamicToolLoadingMode::Direct,
+                        active_skill_tool_names,
+                    )
+                    .await
+                }
+                LazyToolRenderer::ToolLoadFallback => {
+                    self.execute_tool_load_with_mode_and_skills(
+                        args,
+                        dynamic_mode,
+                        active_skill_tool_names,
+                    )
+                    .await
+                }
+            });
         }
 
         if tc.name == CODEX_TOOL_SEARCH_TOOL_NAME
@@ -11054,8 +12460,10 @@ impl AgentInstance {
                 &target_call,
                 &target_args,
                 run_id,
+                assistant_message_id,
                 mode,
                 active_skill_tool_names,
+                confirmation_preapproved,
             ))
             .await;
         }
@@ -11111,7 +12519,20 @@ impl AgentInstance {
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.file_tool_workspace_boundary_enabled())
             .unwrap_or(false);
-        if !plan_file_write_grant {
+        let registered_knowledge_path_grant = match tc.name.as_str() {
+            "read" | "write" | "edit" => args.get("filePath").and_then(|value| value.as_str()),
+            "grep" | "list" => args.get("path").and_then(|value| value.as_str()),
+            _ => None,
+        }
+        .is_some_and(|path| {
+            crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+                &self.working_dir,
+                self.app_knowledge_dir.as_ref().as_ref(),
+            )
+            .classify_path_string(path)
+            .is_some()
+        });
+        if !plan_file_write_grant && !registered_knowledge_path_grant {
             if let Some(error) = Self::validate_tool_path_requirements(
                 &self.working_dir,
                 &tc.name,
@@ -11136,32 +12557,43 @@ impl AgentInstance {
             return Self::interrupted_tool_result();
         }
 
-        match self
-            .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id)
-            .await
-        {
-            ToolConfirmDecision::Allow => {}
-            ToolConfirmDecision::Deny { feedback } => {
-                if self.is_cancel_requested() {
-                    return Self::interrupted_tool_result();
-                }
-                let output = match feedback {
-                    Some(feedback) => format!(
-                        "Tool '{}' was rejected by user feedback. Revise the proposal before trying again.\nUser feedback: {}",
-                        tc.name, feedback
-                    ),
-                    None => format!("Tool '{}' was denied by user", tc.name),
-                };
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output,
-                    is_error: true,
-                });
+        if confirmation_preapproved {
+            eprintln!(
+                "[Agent {}] using preapproved confirmation for tool='{}' id={} session={} run={}",
+                self.id, tc.name, tc.id, self.session_id, run_id
+            );
+        } else {
+            let decision = self
+                .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id)
+                .await;
+            if let Some(result) = self.confirmation_rejection_result(&tc.name, decision) {
+                return result;
             }
-            ToolConfirmDecision::PreflightError { output } => {
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output,
-                    is_error: true,
-                });
+        }
+
+        if crate::async_tasks::supports_async_mode(&tc.name) {
+            let async_mode =
+                match crate::async_tasks::AsyncMode::parse(args, self.async_tasks_enabled) {
+                    Ok(mode) => mode,
+                    Err(output) => {
+                        return ExecutedToolResult::from_tool_result(ToolResult {
+                            output,
+                            is_error: true,
+                        });
+                    }
+                };
+            if async_mode.is_background() {
+                return self
+                    .start_async_tool(
+                        app_handle,
+                        store,
+                        tc,
+                        args,
+                        run_id,
+                        assistant_message_id,
+                        async_mode,
+                    )
+                    .await;
             }
         }
 
@@ -11207,7 +12639,7 @@ impl AgentInstance {
                 }),
             }
         } else if tc.name == "read" {
-            self.await_executed_tool_result(self.execute_read(app_handle, args))
+            self.await_executed_tool_result(self.execute_read(app_handle, args, &tc.id, run_id))
                 .await
         } else if tc.name == "task" {
             self.await_executed_tool_result(
@@ -11217,11 +12649,6 @@ impl AgentInstance {
         } else if tc.name == "ask_user_question" {
             self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
                 .await
-        } else if tc.name == "sheet" {
-            self.await_tool_result(self.execute_sheet(app_handle, &tc.id, args, run_id))
-                .await
-        } else if tc.name == "graph_view" {
-            self.execute_graph_view(app_handle, &tc.id, args).await
         } else if tc.name == "todowrite" {
             ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args, run_id))
         } else if tc.name == "config_query" {
@@ -11246,14 +12673,19 @@ impl AgentInstance {
         } else if tc.name == "knowledge_delete" {
             self.await_tool_result(self.execute_knowledge_delete(app_handle, args))
                 .await
-        } else if tc.name == "skill_create" {
-            self.await_tool_result(self.execute_skill_create(app_handle, args))
+        } else if tc.name == "create_skill_package" {
+            self.await_tool_result(self.execute_create_skill_package(app_handle, args))
                 .await
         } else if tc.name == "skill_reload" {
             self.await_tool_result(self.execute_skill_reload(app_handle, args))
                 .await
         } else if tc.name == "skill_list" {
             ExecutedToolResult::from_tool_result(self.execute_skill_list(args))
+        } else if tc.name == "unity_set_play_mode" {
+            self.await_tool_result(
+                self.execute_unity_set_play_mode(app_handle, &tc.id, args, run_id),
+            )
+            .await
         } else if tc.name == "unity_execute" {
             self.execute_unity_execute(app_handle, &tc.id, args, run_id)
                 .await
@@ -11268,7 +12700,7 @@ impl AgentInstance {
                 &self.working_dir,
                 args,
             ))
-                .await
+            .await
         } else if tc.name == "view_capture" {
             self.await_executed_tool_result(self.execute_view_capture(app_handle, args))
                 .await
@@ -11282,21 +12714,21 @@ impl AgentInstance {
                 &self.working_dir,
                 args,
             ))
-                .await
+            .await
         } else if tc.name == "unity_yaml_search" {
             self.await_tool_result(Self::execute_unity_yaml_search(
                 app_handle,
                 &self.working_dir,
                 args,
             ))
-                .await
+            .await
         } else if tc.name == "unity_yaml_read" {
             self.await_tool_result(Self::execute_unity_yaml_read(
                 app_handle,
                 &self.working_dir,
                 args,
             ))
-                .await
+            .await
         } else {
             let bash_git_knowledge_assessment = if tc.name == "bash" {
                 Self::assess_bash_git_knowledge_command(
@@ -11308,7 +12740,7 @@ impl AgentInstance {
                 None
             };
             let tool_context = self
-                .build_tool_execution_context(app_handle, &tc.name)
+                .build_tool_execution_context(app_handle, &tc.name, args)
                 .await;
             let mut result = self
                 .await_tool_result(self.tool_registry.execute_with_context(
@@ -11472,77 +12904,85 @@ impl AgentInstance {
         names
     }
 
-    /// Client-side handler for the codex-native `tool_search` round.
-    /// Substring scoring over name + description; matched Skill tools are
-    /// activated (session-scoped) so their subsequent direct calls pass the
-    /// allowed-tool gate. The result JSON is replayed verbatim as the
-    /// `tool_search_output` wire item.
+    /// Client-side handler for the codex-native `tool_search` round. Every
+    /// input item must equal one registered deferred-tool wire name. The
+    /// request is atomic: any invalid or duplicate name rejects the whole
+    /// lookup. Matched Skill tools are activated (session-scoped) so their
+    /// subsequent direct calls pass the allowed-tool gate. The result JSON is
+    /// replayed verbatim as the `tool_search_output` wire item.
     async fn execute_codex_tool_search(
         &self,
         args: &serde_json::Value,
         _active_skill_tool_names: &HashSet<String>,
     ) -> ToolResult {
-        let query = args
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if query.is_empty() {
+        let Some(wire_name_values) = args.get("wire_names").and_then(|value| value.as_array())
+        else {
             return ToolResult {
-                output: "query must not be empty".to_string(),
+                output: "tool_search requires a `wire_names` array of exact deferred-tool names."
+                    .to_string(),
+                is_error: true,
+            };
+        };
+        if wire_name_values.is_empty() || wire_name_values.len() > CODEX_TOOL_SEARCH_MAX_WIRE_NAMES
+        {
+            return ToolResult {
+                output: format!(
+                    "tool_search requires 1–{} exact deferred-tool wire names.",
+                    CODEX_TOOL_SEARCH_MAX_WIRE_NAMES
+                ),
                 is_error: true,
             };
         }
-        let limit = args
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-            .filter(|value| *value > 0)
-            .unwrap_or(CODEX_TOOL_SEARCH_DEFAULT_LIMIT);
 
-        let tokens: Vec<String> = query
-            .split_whitespace()
-            .map(|token| token.to_ascii_lowercase())
-            .filter(|token| !token.is_empty())
-            .collect();
-
-        let mut scored: Vec<(i64, String, serde_json::Value)> = Vec::new();
-        for name in self.codex_tool_search_universe().await {
-            let Some(tool) = self.resolve_api_tool(&name) else {
-                continue;
+        let mut wire_names = Vec::with_capacity(wire_name_values.len());
+        let mut seen = HashSet::new();
+        for value in wire_name_values {
+            let Some(name) = value.as_str() else {
+                return ToolResult {
+                    output: "Every `wire_names` item must be one exact non-empty wire name."
+                        .to_string(),
+                    is_error: true,
+                };
             };
-            let tool = self.contextualize_api_tool(tool);
-            let description = tool
-                .get("function")
-                .and_then(|f| f.get("description"))
-                .and_then(|d| d.as_str())
-                .unwrap_or_default();
-            let name_lower = name.to_ascii_lowercase();
-            let description_lower = description.to_ascii_lowercase();
-
-            let mut score = 0i64;
-            for token in &tokens {
-                if name_lower == *token {
-                    score += 8;
-                } else if name_lower.contains(token) {
-                    score += 3;
-                }
-                if description_lower.contains(token) {
-                    score += 1;
-                }
+            if name.is_empty() || name.trim() != name {
+                return ToolResult {
+                    output: "Every `wire_names` item must be one exact non-empty wire name."
+                        .to_string(),
+                    is_error: true,
+                };
             }
-            if score > 0 {
-                scored.push((score, name, tool));
+            if !seen.insert(name.to_string()) {
+                return ToolResult {
+                    output: format!("Duplicate deferred-tool wire name `{}`.", name),
+                    is_error: true,
+                };
             }
+            wire_names.push(name.to_string());
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        scored.truncate(limit);
+
+        let universe: HashSet<String> = self
+            .codex_tool_search_universe()
+            .await
+            .into_iter()
+            .collect();
+        if let Some(unknown) = wire_names.iter().find(|name| !universe.contains(*name)) {
+            return ToolResult {
+                output: format!("No deferred tool has the exact wire name `{}`.", unknown),
+                is_error: true,
+            };
+        }
 
         let mut activated = Vec::new();
-        let mut tools_json = Vec::new();
-        for (_score, name, tool) in scored {
-            if self.default_tool_load_mode(&name) == ToolLoadMode::Skill {
+        let mut tools_json = Vec::with_capacity(wire_names.len());
+        for name in &wire_names {
+            let Some(tool) = self.resolve_api_tool(name) else {
+                return ToolResult {
+                    output: format!("Deferred tool `{}` is unavailable.", name),
+                    is_error: true,
+                };
+            };
+            let tool = self.contextualize_api_tool(tool);
+            if self.default_tool_load_mode(name) == ToolLoadMode::Skill {
                 activated.push(name.clone());
             }
             let function = tool.get("function").cloned().unwrap_or_default();
@@ -11559,11 +12999,10 @@ impl AgentInstance {
         }
 
         eprintln!(
-            "[Agent {}] tool_search: query_len={} matches={} activated_skill_tools={}",
+            "[Agent {}] tool_search: exact_wire_names={} activated_skill_tools={}",
             self.id,
-            query.len(),
-            tools_json.len(),
-            activated.len()
+            wire_names.len(),
+            activated.len(),
         );
 
         ToolResult {
@@ -11994,6 +13433,9 @@ impl AgentInstance {
             semantic_query: Option<String>,
             limit: Option<usize>,
             path_prefix: Option<String>,
+            include_summary: Option<bool>,
+            include_hit_context: Option<bool>,
+            hit_context_max_chars: Option<usize>,
         }
 
         let parsed = match serde_json::from_value::<KnowledgeQueryArgs>(args.clone()) {
@@ -12018,6 +13460,10 @@ impl AgentInstance {
             truncated.push_str("...");
             truncated
         }
+
+        let include_summary = parsed.include_summary.unwrap_or(false);
+        let include_hit_context = parsed.include_hit_context.unwrap_or(true);
+        let hit_context_max_chars = parsed.hit_context_max_chars.unwrap_or(220).clamp(80, 1000);
 
         let lexical_query = parsed
             .lexical_query
@@ -12128,10 +13574,20 @@ impl AgentInstance {
                     Some(0.96),
                     "running",
                 );
+                let summaries = if include_summary {
+                    self.knowledge_query_summaries(&items)
+                } else {
+                    vec![None; items.len()]
+                };
                 Self::prefix_knowledge_search_hit_paths(&mut items);
-                let items = Self::sanitize_knowledge_search_hits(items);
+                let items = Self::sanitize_knowledge_search_hits(items, summaries);
                 ToolResult {
-                    output: Self::format_knowledge_query_output(&items),
+                    output: Self::format_knowledge_query_output(
+                        &items,
+                        include_summary,
+                        include_hit_context,
+                        hit_context_max_chars,
+                    ),
                     is_error: false,
                 }
             }
@@ -12214,6 +13670,7 @@ impl AgentInstance {
             path: parsed.path.clone(),
             doc_type: None,
             part: parsed.part.clone(),
+            include_history: false,
         };
 
         match crate::commands::execute_knowledge_read_request(
@@ -12227,8 +13684,7 @@ impl AgentInstance {
                     .as_ref()
                     .map(|document| document.document.tools.clone())
                     .unwrap_or_default();
-                let activated_tools =
-                    self.activate_document_skill_tool_names(&document_tool_names);
+                let activated_tools = self.activate_document_skill_tool_names(&document_tool_names);
                 // Reference every tool the document declares (not just the
                 // newly activated ones): after a compact or restart the model
                 // may re-read the document, and the references must re-expand
@@ -12761,49 +14217,36 @@ impl AgentInstance {
             .join("\n")
     }
 
-    async fn execute_skill_create(
+    async fn execute_create_skill_package(
         &self,
         app_handle: &AppHandle,
         args: &serde_json::Value,
     ) -> ToolResult {
-        let parsed =
-            match serde_json::from_value::<crate::commands::SkillCreateRequest>(args.clone()) {
-                Ok(value) if !value.name.trim().is_empty() => value,
-                Ok(_) => {
-                    return ToolResult {
-                        output: "Error: 'name' parameter is required.".to_string(),
-                        is_error: true,
-                    };
-                }
-                Err(error) => {
-                    return ToolResult {
-                        output: format!("Error parsing skill_create arguments: {}", error),
-                        is_error: true,
-                    };
-                }
-            };
-
-        if args
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
-        {
-            return ToolResult {
-                output: "Error: 'kind' parameter is required.".to_string(),
-                is_error: true,
-            };
-        }
+        let parsed = match serde_json::from_value::<crate::commands::SkillPackageCreateRequest>(
+            args.clone(),
+        ) {
+            Ok(value) if !value.name.trim().is_empty() => value,
+            Ok(_) => {
+                return ToolResult {
+                    output: "Error: 'name' parameter is required.".to_string(),
+                    is_error: true,
+                };
+            }
+            Err(error) => {
+                return ToolResult {
+                    output: format!("Error parsing create_skill_package arguments: {}", error),
+                    is_error: true,
+                };
+            }
+        };
 
         let default_namespace = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.default_skill_package_namespace())
             .unwrap_or_default();
 
-        match crate::commands::create_skill_sync_with_default_package_namespace(
-            &self.working_dir,
-            parsed,
+        match crate::commands::create_skill_package_sync_with_default_namespace(
+            parsed.into(),
             Some(&default_namespace),
         ) {
             Ok(skill) => match self.reconcile_knowledge_workspace(app_handle).await {
@@ -12817,7 +14260,7 @@ impl AgentInstance {
                 },
             },
             Err(error) => ToolResult {
-                output: format!("Error creating Skill: {}", error),
+                output: format!("Error creating Skill package: {}", error),
                 is_error: true,
             },
         }
@@ -12891,149 +14334,6 @@ impl AgentInstance {
                 output: format!("Error listing Skills: {}", error),
                 is_error: true,
             },
-        }
-    }
-
-    async fn execute_graph_view(
-        &self,
-        app_handle: &AppHandle,
-        tool_call_id: &str,
-        args: &serde_json::Value,
-    ) -> ExecutedToolResult {
-        if self.is_cancel_requested() {
-            return Self::interrupted_tool_result();
-        }
-
-        let mut request =
-            match crate::commands::agent_graph_tool_request_from_args(args, tool_call_id) {
-                Ok(request) => request,
-                Err(error) => {
-                    return ExecutedToolResult::from_tool_result(ToolResult {
-                        output: format!("Error parsing graph_view arguments: {}", error),
-                        is_error: true,
-                    });
-                }
-            };
-        let layout_image_requested = request.return_image;
-        let layout_image_enabled = layout_image_requested && self.supports_image_understanding();
-        request.return_image = layout_image_enabled;
-        let request_id = request.request_id.clone();
-        let editable = request.editable;
-        let (tx, rx) = if editable {
-            let (tx, rx) = tokio::sync::oneshot::channel::<crate::commands::AgentGraphToolAnswer>();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        let graph_store: tauri::State<'_, crate::commands::AgentGraphToolStore> =
-            app_handle.state();
-        let graph_store = graph_store.inner().clone();
-        crate::commands::insert_agent_graph_tool_request(&graph_store, request.clone(), tx).await;
-
-        let open_result = match crate::commands::open_agent_graph_tool_window(app_handle, &request)
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = crate::commands::remove_agent_graph_tool_request(&graph_store, &request_id)
-                    .await;
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: error,
-                    is_error: true,
-                });
-            }
-        };
-
-        if !editable {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "opened",
-                    "requestId": open_result.request_id,
-                    "windowLabel": open_result.window_label,
-                    "hostUrl": open_result.host_url,
-                    "editable": false,
-                }))
-                .unwrap_or_else(|_| "Graph window opened.".to_string()),
-                is_error: false,
-            });
-        }
-
-        eprintln!(
-            "[Agent {}] graph_view: waiting for editable graph response (request_id={})",
-            self.id, request_id
-        );
-
-        let mut cancel_rx = self.cancel_waiter();
-        let Some(rx) = rx else {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: "Internal error: editable graph_view missing receiver.".to_string(),
-                is_error: true,
-            });
-        };
-        let answer_result = tokio::select! {
-            result = rx => Some(result),
-            _ = cancel_rx.changed() => None,
-        };
-
-        match answer_result {
-            Some(Ok(crate::commands::AgentGraphToolAnswer::Submitted(answer))) => {
-                eprintln!(
-                    "[Agent {}] graph_view: user submitted graph (request_id={})",
-                    self.id, request_id
-                );
-                let images = if layout_image_enabled {
-                    answer.images.unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let mut output = serde_json::json!({
-                    "status": "submitted",
-                    "requestId": answer.request_id,
-                    "option": answer.option,
-                    "graph": answer.graph,
-                });
-                if layout_image_requested {
-                    output["layoutImage"] = serde_json::Value::String(
-                        if layout_image_enabled && !images.is_empty() {
-                            "attached"
-                        } else if layout_image_enabled {
-                            "missing"
-                        } else {
-                            "skipped_endpoint_without_image_understanding"
-                        }
-                        .to_string(),
-                    );
-                }
-                ExecutedToolResult::from_tool_result(ToolResult {
-                    output: serde_json::to_string_pretty(&output)
-                        .unwrap_or_else(|_| "Graph submitted.".to_string()),
-                    is_error: false,
-                })
-                .with_images(images)
-            }
-            Some(Ok(crate::commands::AgentGraphToolAnswer::Cancelled)) => {
-                eprintln!(
-                    "[Agent {}] graph_view: graph window cancelled (request_id={})",
-                    self.id, request_id
-                );
-                ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Graph editing was cancelled before confirmation.".to_string(),
-                    is_error: true,
-                })
-            }
-            Some(Err(_)) => ExecutedToolResult::from_tool_result(ToolResult {
-                output: "Graph response channel was closed.".to_string(),
-                is_error: true,
-            }),
-            None => {
-                let _ = crate::commands::cancel_agent_graph_tool_request_by_id(
-                    &graph_store,
-                    &request_id,
-                )
-                .await;
-                crate::commands::close_agent_graph_tool_window(app_handle, &request_id);
-                Self::interrupted_tool_result()
-            }
         }
     }
 
@@ -13120,7 +14420,6 @@ impl AgentInstance {
                 tool_call_id: tool_call_id.to_string(),
                 question: question.clone(),
                 options: options.clone(),
-                sheet: None,
             },
         );
 
@@ -13156,282 +14455,113 @@ impl AgentInstance {
         }
     }
 
-    fn parse_sheet_request(
-        args: &serde_json::Value,
-    ) -> Result<(String, crate::commands::SheetRequest), String> {
-        const MAX_SHEET_FIELDS: usize = 24;
-
-        let title = args
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
-        if title.is_empty() {
-            return Err("Missing required parameter: title".to_string());
-        }
-
-        let optional_text = |key: &str| {
-            args.get(key)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-
-        let raw_fields = args
-            .get("fields")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if raw_fields.is_empty() {
-            return Err("sheet requires a non-empty fields array".to_string());
-        }
-        if raw_fields.len() > MAX_SHEET_FIELDS {
-            return Err(format!(
-                "sheet supports at most {} fields, got {}",
-                MAX_SHEET_FIELDS,
-                raw_fields.len()
-            ));
-        }
-
-        let mut seen_keys = HashSet::new();
-        let mut fields = Vec::with_capacity(raw_fields.len());
-        for (index, item) in raw_fields.iter().enumerate() {
-            let key = item
-                .get("key")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            if key.is_empty() {
-                return Err(format!("fields[{}] is missing a non-empty key", index));
-            }
-            if !seen_keys.insert(key.to_string()) {
-                return Err(format!("fields[{}] duplicates key '{}'", index, key));
-            }
-
-            let label = item
-                .get("label")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            if label.is_empty() {
-                return Err(format!("fields[{}] is missing a non-empty label", index));
-            }
-
-            let value = match item.get("value") {
-                Some(serde_json::Value::String(text)) => text.clone(),
-                Some(serde_json::Value::Number(number)) => number.to_string(),
-                Some(serde_json::Value::Bool(flag)) => flag.to_string(),
-                Some(serde_json::Value::Null) | None => String::new(),
-                Some(other) => serde_json::to_string(other).unwrap_or_default(),
-            };
-
-            let options = item
-                .get("options")
-                .and_then(|v| v.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|option| option.as_str())
-                        .map(str::trim)
-                        .filter(|option| !option.is_empty())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            fields.push(crate::commands::SheetField {
-                key: key.to_string(),
-                label: label.to_string(),
-                value,
-                description: item
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-                multiline: item
-                    .get("multiline")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                options,
-                readonly: item
-                    .get("readonly")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            });
-        }
-
-        Ok((
-            title.to_string(),
-            crate::commands::SheetRequest {
-                description: optional_text("description"),
-                confirm_label: optional_text("confirmLabel"),
-                fields,
-            },
-        ))
-    }
-
-    fn sheet_result_from_answer(
-        title: &str,
-        sheet: &crate::commands::SheetRequest,
-        answer: &str,
-    ) -> ToolResult {
-        let parsed: serde_json::Value =
-            serde_json::from_str(answer).unwrap_or(serde_json::Value::Null);
-        let feedback = parsed
-            .get("feedback")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-
-        if parsed.get("action").and_then(|v| v.as_str()) != Some("confirm") {
-            // Unknown answer shapes are treated as a change request so the agent
-            // never proceeds on input it cannot interpret as a confirmation.
-            let feedback_text = feedback.unwrap_or_else(|| answer.trim().to_string());
-            return ToolResult {
-                output: format!(
-                    "User requested changes to '{}' instead of confirming.\nFeedback: {}\nRevise the proposal and present an updated sheet before proceeding.",
-                    title,
-                    if feedback_text.is_empty() {
-                        "(none)"
-                    } else {
-                        feedback_text.as_str()
-                    }
-                ),
-                is_error: false,
-            };
-        }
-
-        let submitted = parsed
-            .get("values")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        let mut values = serde_json::Map::new();
-        let mut changed_keys = Vec::new();
-        for field in &sheet.fields {
-            let submitted_value = if field.readonly {
-                None
-            } else {
-                submitted.get(&field.key).and_then(|v| v.as_str())
-            };
-            let final_value = submitted_value.unwrap_or(field.value.as_str());
-            if final_value != field.value {
-                changed_keys.push(serde_json::Value::String(field.key.clone()));
-            }
-            values.insert(
-                field.key.clone(),
-                serde_json::Value::String(final_value.to_string()),
-            );
-        }
-
-        let mut report = serde_json::Map::new();
-        report.insert("confirmed".to_string(), serde_json::Value::Bool(true));
-        report.insert(
-            "title".to_string(),
-            serde_json::Value::String(title.to_string()),
-        );
-        report.insert("values".to_string(), serde_json::Value::Object(values));
-        if !changed_keys.is_empty() {
-            report.insert(
-                "changedKeys".to_string(),
-                serde_json::Value::Array(changed_keys),
-            );
-        }
-        if let Some(feedback) = feedback {
-            report.insert("note".to_string(), serde_json::Value::String(feedback));
-        }
-
-        ToolResult {
-            output: format!(
-                "User confirmed the sheet.\n{}",
-                serde_json::to_string_pretty(&serde_json::Value::Object(report))
-                    .unwrap_or_else(|_| "{}".to_string())
-            ),
-            is_error: false,
-        }
-    }
-
-    async fn execute_sheet(
+    async fn execute_unity_set_play_mode(
         &self,
         app_handle: &AppHandle,
         tool_call_id: &str,
         args: &serde_json::Value,
         run_id: &str,
     ) -> ToolResult {
-        let (title, sheet) = match Self::parse_sheet_request(args) {
-            Ok(parsed) => parsed,
-            Err(message) => {
+        let mode = match args
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(mode) => mode,
+            None => {
                 return ToolResult {
-                    output: message,
+                    output: "Missing required parameter: mode".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+        let requested_status = match crate::unity_bridge::play_mode_target_status(mode) {
+            Ok(status) => status,
+            Err(output) => {
+                return ToolResult {
+                    output,
                     is_error: true,
                 };
             }
         };
 
-        let question_id = uuid::Uuid::new_v4().to_string();
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        let wait_target = self.user_wait_target(run_id);
-
-        {
-            let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
-            let mut store = question_store.lock().await;
-            store.insert(
-                question_id.clone(),
-                crate::PendingQuestionResponse {
-                    session_id: wait_target.session_id.clone(),
-                    run_id: wait_target.run_id.clone(),
-                    tx,
-                },
-            );
+        if !self.has_selected_working_dir() {
+            return ToolResult {
+                output: "Tool 'unity_set_play_mode' requires a selected Unity project working directory."
+                    .to_string(),
+                is_error: true,
+            };
         }
 
-        emit_stream(
-            app_handle,
-            &wait_target.run_id,
-            crate::commands::StreamEvent::AskUser {
-                session_id: wait_target.session_id.clone(),
-                question_id: question_id.clone(),
-                tool_call_id: tool_call_id.to_string(),
-                question: title.clone(),
-                options: Vec::new(),
-                sheet: Some(sheet.clone()),
-            },
-        );
+        let (connected, current_status, _scene) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return ToolResult {
+                output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            };
+        }
+        if current_status == requested_status {
+            return ToolResult {
+                output: crate::unity_bridge::format_play_mode_tool_result(mode, false),
+                is_error: false,
+            };
+        }
 
-        eprintln!(
-            "[Agent {}] sheet tool: waiting for user confirmation (question_id={})",
-            self.id, question_id
-        );
-
-        let mut cancel_rx = self.cancel_waiter();
-        let answer_result = tokio::select! {
-            result = rx => Some(result),
-            _ = cancel_rx.changed() => None,
-        };
-
-        match answer_result {
-            Some(Ok(answer)) => {
-                eprintln!(
-                    "[Agent {}] sheet tool: got user response ({} chars)",
-                    self.id,
-                    answer.len()
-                );
-                Self::sheet_result_from_answer(&title, &sheet, &answer)
+        match self
+            .request_unity_editor_status_change_confirm(
+                app_handle,
+                "unity_set_play_mode",
+                tool_call_id,
+                current_status,
+                requested_status,
+                run_id,
+            )
+            .await
+        {
+            ToolConfirmDecision::Allow => {}
+            ToolConfirmDecision::Deny { feedback } => {
+                let output = match feedback {
+                    Some(feedback) => format!(
+                        "Unity Editor status change was rejected by user feedback.\nUser feedback: {}",
+                        feedback
+                    ),
+                    None => "user_denied_editor_state_change".to_string(),
+                };
+                return ToolResult {
+                    output,
+                    is_error: true,
+                };
             }
-            Some(Err(_)) => ToolResult {
-                output: "Sheet confirmation was cancelled".to_string(),
+            ToolConfirmDecision::PreflightError { output } => {
+                return ToolResult {
+                    output,
+                    is_error: true,
+                };
+            }
+        }
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Changing editor status",
+            format!("{} -> {}", current_status, requested_status),
+            None,
+            "running",
+        );
+
+        match crate::unity_bridge::set_editor_status(&self.working_dir, requested_status).await {
+            Ok(()) => ToolResult {
+                output: crate::unity_bridge::format_play_mode_tool_result(mode, true),
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: format!("Failed to change Unity Editor mode: {error}"),
                 is_error: true,
             },
-            None => {
-                let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
-                let mut store = question_store.lock().await;
-                store.remove(&question_id);
-                Self::interrupted_tool_result().into_tool_result()
-            }
         }
     }
 
@@ -13455,6 +14585,16 @@ impl AgentInstance {
                 });
             }
         };
+        let enable_non_public_access =
+            match crate::csharp_compile::resolve_tool_non_public_access(args) {
+                Ok(value) => value,
+                Err(output) => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output,
+                        is_error: true,
+                    });
+                }
+            };
 
         let requested_status = match args
             .get("request_editor_status")
@@ -13612,9 +14752,10 @@ impl AgentInstance {
         let result_run_id = progress_run_id.clone();
 
         let cancel_rx = self.cancel_waiter();
-        match crate::unity_bridge::unity_execute_code_with_progress_cancellable(
+        match crate::unity_bridge::unity_execute_code_with_progress_cancellable_non_public_access(
             &self.working_dir,
             code,
+            enable_non_public_access,
             cancel_rx,
             move |snapshot| {
                 if !snapshot.active {
@@ -13758,6 +14899,17 @@ impl AgentInstance {
         args: &serde_json::Value,
         run_id: &str,
     ) -> ToolResult {
+        let enable_non_public_access =
+            match crate::csharp_compile::resolve_tool_non_public_access(args) {
+                Ok(value) => value,
+                Err(output) => {
+                    return ToolResult {
+                        output,
+                        is_error: true,
+                    };
+                }
+            };
+
         if !self.has_selected_working_dir() {
             return ToolResult {
                 output: "unity_run_states requires a selected Unity project working directory."
@@ -13813,7 +14965,13 @@ impl AgentInstance {
             "running",
         );
 
-        if let Err(error) = crate::unity_bridge::compile_run_states(&self.working_dir, args).await {
+        if let Err(error) = crate::unity_bridge::compile_run_states_with_non_public_access(
+            &self.working_dir,
+            args,
+            enable_non_public_access,
+        )
+        .await
+        {
             emit_tool_progress(
                 app_handle,
                 run_id,
@@ -13914,7 +15072,13 @@ impl AgentInstance {
             "running",
         );
 
-        match crate::unity_bridge::unity_run_states(&self.working_dir, args).await {
+        match crate::unity_bridge::unity_run_states_with_non_public_access(
+            &self.working_dir,
+            args,
+            enable_non_public_access,
+        )
+        .await
+        {
             Ok(output) => ToolResult {
                 output: if output.trim().is_empty() {
                     "unity_run_states completed with no output.".to_string()
@@ -14567,8 +15731,7 @@ impl AgentInstance {
             return false;
         }
         let root = dunce::canonicalize(wd).unwrap_or_else(|_| std::path::PathBuf::from(wd));
-        let resolved =
-            dunce::canonicalize(abs_path).unwrap_or_else(|_| abs_path.to_path_buf());
+        let resolved = dunce::canonicalize(abs_path).unwrap_or_else(|_| abs_path.to_path_buf());
         let mut root_components = root.components();
         let mut child_components = resolved.components();
         loop {
@@ -14636,8 +15799,7 @@ impl AgentInstance {
         let payload_text =
             serde_json::to_string(&payload).map_err(|e| format!("invalid tool payload: {}", e))?;
         let resp =
-            crate::unity_bridge::send_message(working_dir, message_type, &payload_text)
-                .await?;
+            crate::unity_bridge::send_message(working_dir, message_type, &payload_text).await?;
 
         if !resp.ok {
             return Err(resp
@@ -14755,10 +15917,9 @@ impl AgentInstance {
                     .map(crate::asset_db::types::guid_to_hex),
             })
             .collect();
-        let Some(extension) = crate::commands::find_unity_yaml_read_extension_for_working_dir(
-            working_dir,
-            &doc_keys,
-        ) else {
+        let Some(extension) =
+            crate::commands::find_unity_yaml_read_extension_for_working_dir(working_dir, &doc_keys)
+        else {
             return Ok(None);
         };
 
@@ -14802,12 +15963,8 @@ impl AgentInstance {
             "matchedFileId": extension.matched_file_id,
         });
 
-        match crate::commands::run_unity_yaml_read_extension(
-            working_dir,
-            &extension,
-            &invoke_args,
-        )
-        .await
+        match crate::commands::run_unity_yaml_read_extension(working_dir, &extension, &invoke_args)
+            .await
         {
             Ok(output) => Ok(Some(ToolResult {
                 output: format!(
@@ -14958,7 +16115,10 @@ impl AgentInstance {
             .and_then(|q| q.strip_prefix("re:"))
             .filter(|p| !p.is_empty())
         {
-            if let Err(err) = regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
+            if let Err(err) = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+            {
                 return ToolResult {
                     output: format!("Invalid regular expression in query '{}': {}", pattern, err),
                     is_error: true,
@@ -14971,9 +16131,7 @@ impl AgentInstance {
         let mut live_fallback_reason: Option<String> = None;
         if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
             let payload = Self::unity_yaml_search_editor_payload(&file_path_arg, &search_options);
-            match Self::try_unity_yaml_editor_tool(working_dir, "search_yaml", payload)
-                .await
-            {
+            match Self::try_unity_yaml_editor_tool(working_dir, "search_yaml", payload).await {
                 Ok(result) => return result,
                 Err(err) => {
                     eprintln!(
@@ -15156,7 +16314,7 @@ impl AgentInstance {
         }
 
         let text_shared = String::from_utf8_lossy(&content).into_owned();
-        let docs = yaml_parser::parse_yaml_docs_str(&text_shared);
+        let (docs, raw_refs) = yaml_parser::parse_yaml_docs_with_refs(text_shared.as_bytes());
 
         let mut yaml_read_extension_note: Option<String> = None;
         if !is_hierarchical && (detail.is_empty() || detail == "components") {
@@ -15182,7 +16340,9 @@ impl AgentInstance {
         let lines: Vec<&str> = text_shared.lines().collect();
         let world_transform_map = yaml_parser::build_world_transform_map(&docs, &lines);
 
-        let guid_map = Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines);
+        let guid_map =
+            Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines);
+        let asset_object_map = Self::build_asset_object_map_for_refs(&ref_graph_state, &raw_refs);
         let internal_map = yaml_parser::build_internal_id_map(&docs);
         let internal_resolver = |fid: i64| -> Option<String> { internal_map.get(&fid).cloned() };
         let transform_hierarchy_labels = if is_hierarchical {
@@ -15255,6 +16415,10 @@ impl AgentInstance {
                     let guid_resolver_fn = |guid: &crate::asset_db::types::Guid| -> Option<String> {
                         guid_map.get(guid).cloned()
                     };
+                    let object_resolver_fn =
+                        |guid: &crate::asset_db::types::Guid, file_id: i64| -> Option<String> {
+                            asset_object_map.get(&(*guid, file_id)).cloned()
+                        };
                     let source_ctx = Self::load_source_prefab_context(
                         &ir.source_prefab_guid,
                         &guid_map,
@@ -15264,6 +16428,7 @@ impl AgentInstance {
                     let detail = yaml_parser::format_prefab_instance_detail(
                         ir,
                         &guid_resolver_fn,
+                        &object_resolver_fn,
                         source_ctx.as_ref(),
                         &stripped,
                     );
@@ -15318,9 +16483,11 @@ impl AgentInstance {
             )
         };
 
-        let guid_resolver = |hex: &str| -> Option<String> {
+        let external_resolver = |hex: &str, file_id: Option<i64>| -> Option<String> {
             let guid = crate::asset_db::types::parse_guid_hex(hex)?;
-            guid_map.get(&guid).cloned()
+            file_id
+                .and_then(|file_id| asset_object_map.get(&(guid, file_id)).cloned())
+                .or_else(|| guid_map.get(&guid).cloned())
         };
 
         let mut output = Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
@@ -15335,7 +16502,10 @@ impl AgentInstance {
                 ));
                 wrote_transform_hierarchy = true;
             }
-            output.push_str(&format!("\n--- {} ---\n", doc.type_name));
+            output.push_str(&format!(
+                "\n--- {} ---\n",
+                yaml_parser::format_doc_display_label(doc)
+            ));
             output.push_str(&yaml_parser::format_doc_state_lines(doc));
             if let Some(info) = world_transform_map.get(&doc.file_id) {
                 if doc.class_id == 4 || doc.class_id == 224 {
@@ -15352,7 +16522,7 @@ impl AgentInstance {
                 &lines,
                 content_start,
                 doc.line_end,
-                &guid_resolver,
+                &external_resolver,
                 &internal_resolver,
                 skipped_fields,
             );
@@ -15734,6 +16904,51 @@ impl AgentInstance {
         }
     }
 
+    fn build_asset_object_map_for_refs(
+        ref_graph_state: &Option<tauri::State<'_, crate::asset_db::AssetDbState>>,
+        refs: &[crate::unity_yaml::RawYamlRef],
+    ) -> std::collections::HashMap<(crate::asset_db::types::Guid, i64), String> {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        let object_refs: Vec<(crate::asset_db::types::Guid, i64)> = refs
+            .iter()
+            .filter_map(|reference| {
+                let file_id = reference.dst_file_id.filter(|file_id| *file_id != 0)?;
+                let key = (reference.dst_guid, file_id);
+                seen.insert(key).then_some(key)
+            })
+            .collect();
+
+        if object_refs.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
+        ref_graph_state
+            .as_ref()
+            .and_then(|state| state.0.lock().ok())
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .and_then(|graph| graph.batch_resolve_asset_objects(&object_refs).ok())
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, identity)| {
+                let label = if identity.is_sub_asset && !identity.name.trim().is_empty() {
+                    format!(
+                        "{}/{}",
+                        identity.path.trim_end_matches('/'),
+                        identity.name.trim()
+                    )
+                } else {
+                    identity.path
+                };
+                (key, label)
+            })
+            .collect()
+    }
+
     fn build_guid_map_for_docs(
         app_handle: &AppHandle,
         working_dir: &str,
@@ -15781,7 +16996,9 @@ impl AgentInstance {
             // full_scan + reconcile can take seconds on big projects; keep
             // the blocking work off the async worker so the executor isn't
             // starved while the scan runs.
-            tokio::task::block_in_place(|| Self::ensure_ref_graph_initialized(app_handle, working_dir));
+            tokio::task::block_in_place(|| {
+                Self::ensure_ref_graph_initialized(app_handle, working_dir)
+            });
             ref_graph_state
                 .as_ref()
                 .and_then(|rgs| rgs.0.lock().ok())
@@ -16234,7 +17451,12 @@ impl AgentInstance {
 
         let (max_depth, max_concurrent) = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
-            .map(|config| (config.subagent_max_depth(), config.subagent_max_concurrent()))
+            .map(|config| {
+                (
+                    config.subagent_max_depth(),
+                    config.subagent_max_concurrent(),
+                )
+            })
             .unwrap_or((
                 crate::config::DEFAULT_SUBAGENT_MAX_DEPTH,
                 crate::config::DEFAULT_SUBAGENT_MAX_CONCURRENT,
@@ -16250,20 +17472,22 @@ impl AgentInstance {
         }
         // Hold a concurrency slot for the child's whole lifetime; the guard
         // drops (and frees the slot) on every exit path below.
-        let _subagent_slot =
-            match SubagentSlotGuard::try_acquire(&self.subagent_active, max_concurrent) {
-                Some(slot) => slot,
-                None => {
-                    let running = self.subagent_active.load(Ordering::Relaxed);
-                    return ExecutedToolResult::from_tool_result(ToolResult {
+        let _subagent_slot = match SubagentSlotGuard::try_acquire(
+            &self.subagent_active,
+            max_concurrent,
+        ) {
+            Some(slot) => slot,
+            None => {
+                let running = self.subagent_active.load(Ordering::Relaxed);
+                return ExecutedToolResult::from_tool_result(ToolResult {
                         output: format!(
                             "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this task call was rejected. Issue at most {} task calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
                             running, max_concurrent, max_concurrent
                         ),
                         is_error: true,
                     });
-                }
-            };
+            }
+        };
 
         match self
             .run_subagent_task(
@@ -16313,7 +17537,7 @@ mod tests {
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
         update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
-        KnowledgeReadResult, KnowledgeSearchMatchSection, KnowledgeTargetKind, KnowledgeType,
+        KnowledgeReadResult, KnowledgeTargetKind, KnowledgeType,
     };
     use crate::session::models::{ToolCallInfo, UserIntentPayload, UserIntentSkill};
     use crate::tool::{ToolDef, ToolRegistry, ToolResult};
@@ -16393,122 +17617,6 @@ mod tests {
         });
 
         assert_eq!(result.outcome, ToolRunOutcome::Interrupted);
-    }
-
-    #[test]
-    fn parse_sheet_request_validates_title_fields_and_keys() {
-        assert!(AgentInstance::parse_sheet_request(&json!({ "fields": [] })).is_err());
-        assert!(AgentInstance::parse_sheet_request(&json!({ "title": "Publish" })).is_err());
-        assert!(AgentInstance::parse_sheet_request(&json!({
-            "title": "Publish",
-            "fields": [
-                { "key": "id", "label": "Plugin id", "value": "asset-tools" },
-                { "key": "id", "label": "Duplicate", "value": "x" },
-            ],
-        }))
-        .is_err());
-        assert!(AgentInstance::parse_sheet_request(&json!({
-            "title": "Publish",
-            "fields": [{ "key": "id", "label": "", "value": "asset-tools" }],
-        }))
-        .is_err());
-
-        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
-            "title": "Publish plugin asset-tools 0.1.0",
-            "description": "Creates the zip and installs it locally.",
-            "confirmLabel": "Publish",
-            "fields": [
-                {
-                    "key": "id",
-                    "label": "Plugin id",
-                    "value": "asset-tools",
-                    "readonly": true,
-                },
-                {
-                    "key": "version",
-                    "label": "Version",
-                    "value": 0.1,
-                    "options": ["0.1.0", "0.2.0", ""],
-                },
-                {
-                    "key": "summary",
-                    "label": "Summary",
-                    "value": "Tools",
-                    "multiline": true,
-                    "description": "  Shown in the registry.  ",
-                },
-            ],
-        }))
-        .expect("valid sheet request");
-
-        assert_eq!(title, "Publish plugin asset-tools 0.1.0");
-        assert_eq!(sheet.confirm_label.as_deref(), Some("Publish"));
-        assert_eq!(sheet.fields.len(), 3);
-        assert!(sheet.fields[0].readonly);
-        assert_eq!(sheet.fields[1].value, "0.1");
-        assert_eq!(sheet.fields[1].options, vec!["0.1.0", "0.2.0"]);
-        assert!(sheet.fields[2].multiline);
-        assert_eq!(
-            sheet.fields[2].description.as_deref(),
-            Some("Shown in the registry.")
-        );
-    }
-
-    #[test]
-    fn sheet_answer_confirm_reports_final_values_and_changed_keys() {
-        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
-            "title": "Publish",
-            "fields": [
-                { "key": "id", "label": "Plugin id", "value": "asset-tools", "readonly": true },
-                { "key": "version", "label": "Version", "value": "0.1.0" },
-                { "key": "name", "label": "Name", "value": "Asset Tools" },
-            ],
-        }))
-        .expect("valid sheet request");
-
-        let result = AgentInstance::sheet_result_from_answer(
-            &title,
-            &sheet,
-            r#"{"action":"confirm","values":{"id":"hacked","version":"0.2.0","unknown":"x"},"feedback":" ship it "}"#,
-        );
-
-        assert!(!result.is_error);
-        assert!(result.output.starts_with("User confirmed the sheet."));
-        let report: serde_json::Value =
-            serde_json::from_str(result.output.splitn(2, '\n').nth(1).expect("json body"))
-                .expect("valid report json");
-        assert_eq!(report["confirmed"], json!(true));
-        // readonly fields keep the proposed value even if the answer tries to change them
-        assert_eq!(report["values"]["id"], json!("asset-tools"));
-        assert_eq!(report["values"]["version"], json!("0.2.0"));
-        assert_eq!(report["values"]["name"], json!("Asset Tools"));
-        assert_eq!(report["values"].as_object().map(|map| map.len()), Some(3));
-        assert_eq!(report["changedKeys"], json!(["version"]));
-        assert_eq!(report["note"], json!("ship it"));
-    }
-
-    #[test]
-    fn sheet_answer_feedback_or_unknown_shape_requests_changes() {
-        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
-            "title": "Publish",
-            "fields": [{ "key": "id", "label": "Plugin id", "value": "asset-tools" }],
-        }))
-        .expect("valid sheet request");
-
-        let feedback = AgentInstance::sheet_result_from_answer(
-            &title,
-            &sheet,
-            r#"{"action":"feedback","feedback":"use a namespaced id"}"#,
-        );
-        assert!(!feedback.is_error);
-        assert!(feedback.output.contains("requested changes"));
-        assert!(feedback.output.contains("use a namespaced id"));
-        assert!(feedback.output.contains("present an updated sheet"));
-
-        let legacy = AgentInstance::sheet_result_from_answer(&title, &sheet, "plain text answer");
-        assert!(!legacy.is_error);
-        assert!(legacy.output.contains("requested changes"));
-        assert!(legacy.output.contains("plain text answer"));
     }
 
     #[test]
@@ -16672,11 +17780,7 @@ mod tests {
             "unity_execute",
             "unity_run_states",
             "view_create",
-            "knowledge_create",
-            "knowledge_edit",
-            "knowledge_move",
-            "knowledge_delete",
-            "skill_create",
+            "create_skill_package",
             "plugin_install",
             "plugin_uninstall",
             "plugin_set_enabled",
@@ -16692,7 +17796,7 @@ mod tests {
             "read",
             "grep",
             "list",
-            "knowledge_read",
+            "knowledge_query",
             "plugin_list",
             "unity_recompile",
             "view_list",
@@ -17420,6 +18524,45 @@ PrefabInstance:
         }
     }
 
+    #[tokio::test]
+    async fn async_task_schema_is_hidden_until_experimental_gate_is_enabled() {
+        let mut instance = test_agent_instance_with_tools_and_mode(
+            String::new(),
+            vec!["bash".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+        let off = instance.build_api_tools(&["bash".to_string()]).await;
+        assert!(off[0]["function"]["parameters"]["properties"]
+            .get("async")
+            .is_none());
+
+        instance.set_async_tasks_enabled(true);
+        let on = instance.build_api_tools(&["bash".to_string()]).await;
+        assert_eq!(
+            on[0]["function"]["parameters"]["properties"]["async"]["enum"],
+            serde_json::json!(["sync", "async", "notify"])
+        );
+
+        let names = instance.resolve_effective_tool_names().await;
+        assert!(names.contains(&"get_task_status".to_string()));
+        assert!(names.contains(&"cancel_task".to_string()));
+
+        let preview_items = instance.available_tool_prompt_items().await;
+        assert!(preview_items
+            .iter()
+            .any(|item| item.title == "get_task_status"));
+        assert!(preview_items.iter().any(|item| item.title == "cancel_task"));
+        let bash = preview_items
+            .iter()
+            .find(|item| item.title == "bash")
+            .expect("bash should appear in Agent preview");
+        assert_eq!(
+            bash.meta.as_ref().unwrap()["function"]["parameters"]["properties"]["async"]
+                ["enum"],
+            serde_json::json!(["sync", "async", "notify"])
+        );
+    }
+
     fn tool_load_mode(items: &[InjectedPromptItem], name: &str) -> String {
         items
             .iter()
@@ -17457,12 +18600,8 @@ PrefabInstance:
                     "unity_execute".to_string(),
                     "unity_run_states".to_string(),
                     "unity_capture_viewport".to_string(),
-                    "graph_view".to_string(),
                     "web_fetch".to_string(),
-                    "knowledge_create".to_string(),
-                    "knowledge_edit".to_string(),
-                    "knowledge_move".to_string(),
-                    "knowledge_delete".to_string(),
+                    "knowledge_query".to_string(),
                 ],
                 sub_agents: Vec::new(),
                 default: false,
@@ -17490,7 +18629,6 @@ PrefabInstance:
 
         let request_tool_names = instance.build_request_tool_names().await;
         assert!(!request_tool_names.contains(&"unity_capture_viewport".to_string()));
-        assert!(!request_tool_names.contains(&"graph_view".to_string()));
 
         let items = instance.available_tool_prompt_items().await;
 
@@ -17499,13 +18637,9 @@ PrefabInstance:
         assert_eq!(tool_load_mode(&items, "read"), "direct");
         assert_eq!(tool_load_mode(&items, "edit"), "direct");
         assert_eq!(tool_load_mode(&items, "unity_execute"), "direct");
-        assert_eq!(tool_load_mode(&items, "knowledge_create"), "direct");
-        assert_eq!(tool_load_mode(&items, "knowledge_edit"), "direct");
-        assert_eq!(tool_load_mode(&items, "knowledge_move"), "lazy");
-        assert_eq!(tool_load_mode(&items, "knowledge_delete"), "lazy");
+        assert_eq!(tool_load_mode(&items, "knowledge_query"), "direct");
         assert_eq!(tool_load_mode(&items, "unity_run_states"), "lazy");
         assert_eq!(tool_load_mode(&items, "unity_capture_viewport"), "lazy");
-        assert_eq!(tool_load_mode(&items, "graph_view"), "lazy");
         assert_eq!(tool_load_mode(&items, "web_fetch"), "lazy");
         assert_eq!(
             tool_meta_bool(&items, "unity_capture_viewport", "directLoaded"),
@@ -17577,28 +18711,22 @@ PrefabInstance:
         instance.effective_model = "claude-opus-4-8".to_string();
 
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true),
             LazyToolRenderer::AnthropicNative
         );
         // Endpoint opted out: the run degrades to the fallback renderer
         // instead of paying a 400 + eager retry on every request.
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                false
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, false),
             LazyToolRenderer::ToolLoadFallback
         );
         // The switch only concerns the Anthropic endpoint: outside Native
         // mode it changes nothing.
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::MetaTool,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::MetaTool, true),
             LazyToolRenderer::ToolLoadFallback
         );
     }
@@ -17627,45 +18755,35 @@ PrefabInstance:
 
         instance.backend = custom_backend(crate::commands::ApiFormat::AnthropicMessages, true);
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true),
             LazyToolRenderer::AnthropicNative
         );
         // The per-model flag is the only endpoint gate here: the global
         // switch concerns the official Anthropic backend, not custom ones.
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                false
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, false),
             LazyToolRenderer::AnthropicNative
         );
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::MetaTool,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::MetaTool, true),
             LazyToolRenderer::ToolLoadFallback
         );
 
         instance.backend = custom_backend(crate::commands::ApiFormat::AnthropicMessages, false);
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true),
             LazyToolRenderer::ToolLoadFallback
         );
 
         // The flag is inert outside the Anthropic wire format.
         instance.backend = custom_backend(crate::commands::ApiFormat::OpenaiChat, true);
         assert_eq!(
-            instance.resolve_lazy_tool_renderer(
-                crate::config::DynamicToolLoadingMode::Native,
-                true
-            ),
+            instance
+                .resolve_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true),
             LazyToolRenderer::ToolLoadFallback
         );
     }
@@ -17756,6 +18874,96 @@ PrefabInstance:
     }
 
     #[tokio::test]
+    async fn codex_tool_search_prompt_requires_explicit_exact_name_lookups() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+        let plan = instance
+            .build_native_request_tool_plan(LazyToolRenderer::CodexNative, &HashSet::new())
+            .await;
+
+        let description = instance
+            .codex_tool_search_description(&plan)
+            .expect("tool_search description");
+        assert!(description.contains("## Exact-name contract"));
+        assert!(description.contains("explicit `wire_names` array"));
+        assert!(description.contains("1–8 deferred-tool wire names"));
+        assert!(description.contains("prompt, Skill document, or tool result"));
+
+        *instance
+            .lazy_tool_renderer
+            .lock()
+            .expect("lazy renderer lock") = LazyToolRenderer::CodexNative;
+        let prompt_parts = instance.build_system_prompt_parts().await;
+        assert!(prompt_parts.env_prompt.contains("## Deferred Tool Loading"));
+        assert!(prompt_parts.env_prompt.contains("`wire_names` array"));
+    }
+
+    #[tokio::test]
+    async fn codex_tool_search_exact_names_return_only_those_tools_in_order() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let result = instance
+            .execute_codex_tool_search(
+                &serde_json::json!({
+                    "wire_names": ["unity_run_states", "web_fetch"],
+                }),
+                &HashSet::new(),
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        let output: serde_json::Value =
+            serde_json::from_str(&result.output).expect("tool_search output");
+        let tools = output["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], serde_json::json!("unity_run_states"));
+        assert_eq!(tools[1]["name"], serde_json::json!("web_fetch"));
+    }
+
+    #[tokio::test]
+    async fn codex_tool_search_rejects_natural_language_duplicates_and_legacy_inputs() {
+        let temp = tempdir().expect("temp dir");
+        let instance = native_plan_test_instance(&temp);
+
+        let natural_language = instance
+            .execute_codex_tool_search(
+                &serde_json::json!({
+                    "wire_names": ["Unity console logs clear read"],
+                }),
+                &HashSet::new(),
+            )
+            .await;
+        assert!(natural_language.is_error);
+        assert!(natural_language.output.contains("exact wire name"));
+
+        let duplicates = instance
+            .execute_codex_tool_search(
+                &serde_json::json!({
+                    "wire_names": ["web_fetch", "web_fetch"],
+                }),
+                &HashSet::new(),
+            )
+            .await;
+        assert!(duplicates.is_error);
+        assert!(duplicates.output.contains("Duplicate"));
+
+        let legacy_query = instance
+            .execute_codex_tool_search(
+                &serde_json::json!({
+                    "query": "unity_run_states",
+                    "limit": 8,
+                }),
+                &HashSet::new(),
+            )
+            .await;
+        assert!(legacy_query.is_error);
+        assert!(legacy_query
+            .output
+            .contains("requires a `wire_names` array"));
+    }
+
+    #[tokio::test]
     async fn native_plan_declares_activated_skill_tools_deferred() {
         let temp = tempdir().expect("temp dir");
         let instance = native_plan_test_instance(&temp);
@@ -17782,7 +18990,10 @@ PrefabInstance:
             .await;
 
         let tool_name = |tool: &serde_json::Value| {
-            tool["function"]["name"].as_str().unwrap_or_default().to_string()
+            tool["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         };
         let deferred_flag = |tool: &serde_json::Value| {
             tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true)
@@ -17812,8 +19023,13 @@ PrefabInstance:
 
         // Eager tools precede deferred ones so the serializer breakpoint
         // stays on the eager section.
-        let first_deferred = api_tools.iter().position(deferred_flag).expect("deferred present");
-        assert!(api_tools[..first_deferred].iter().all(|tool| !deferred_flag(tool)));
+        let first_deferred = api_tools
+            .iter()
+            .position(deferred_flag)
+            .expect("deferred present");
+        assert!(api_tools[..first_deferred]
+            .iter()
+            .all(|tool| !deferred_flag(tool)));
         assert!(api_tools[first_deferred..].iter().all(deferred_flag));
 
         // Codex renderer keeps deferred definitions client-side entirely.
@@ -17821,7 +19037,9 @@ PrefabInstance:
             .build_api_tools_for_plan(LazyToolRenderer::CodexNative, &plan)
             .await;
         assert!(codex_tools.iter().all(|tool| !deferred_flag(tool)));
-        assert!(codex_tools.iter().all(|tool| tool_name(tool) != "web_fetch"));
+        assert!(codex_tools
+            .iter()
+            .all(|tool| tool_name(tool) != "web_fetch"));
     }
 
     #[tokio::test]
@@ -17882,10 +19100,7 @@ PrefabInstance:
         }];
 
         instance
-            .seed_native_skill_activations_from_history(
-                LazyToolRenderer::AnthropicNative,
-                &history,
-            )
+            .seed_native_skill_activations_from_history(LazyToolRenderer::AnthropicNative, &history)
             .await;
 
         let plan = instance
@@ -17904,7 +19119,7 @@ PrefabInstance:
         crate::commands::save_tool_direct_load_override(
             &working_dir,
             "test",
-            "knowledge_create",
+            "knowledge_query",
             false,
             true,
         )
@@ -17920,7 +19135,7 @@ PrefabInstance:
                 env_template: String::new(),
                 tools: vec![
                     "edit".to_string(),
-                    "knowledge_create".to_string(),
+                    "knowledge_query".to_string(),
                     "unity_run_states".to_string(),
                     "web_fetch".to_string(),
                 ],
@@ -17966,12 +19181,12 @@ PrefabInstance:
         assert!(request_tool_names.contains(&"tool_load".to_string()));
         assert!(request_tool_names.contains(&"tool_call".to_string()));
         assert!(request_tool_names.contains(&"edit".to_string()));
-        assert!(request_tool_names.contains(&"knowledge_create".to_string()));
+        assert!(request_tool_names.contains(&"knowledge_query".to_string()));
         assert!(!request_tool_names.contains(&"unity_run_states".to_string()));
         assert!(!request_tool_names.contains(&"web_fetch".to_string()));
 
         let manifest_names = instance.lazy_tool_manifest_names().await;
-        assert!(!manifest_names.contains(&"knowledge_create".to_string()));
+        assert!(!manifest_names.contains(&"knowledge_query".to_string()));
         assert!(manifest_names.contains(&"unity_run_states".to_string()));
         assert!(manifest_names.contains(&"web_fetch".to_string()));
         assert!(!manifest_names.contains(&"edit".to_string()));
@@ -17980,11 +19195,11 @@ PrefabInstance:
         assert_eq!(tool_load_mode(&items, "tool_load"), "direct");
         assert_eq!(tool_load_mode(&items, "tool_call"), "direct");
         assert_eq!(tool_load_mode(&items, "edit"), "direct");
-        assert_eq!(tool_load_mode(&items, "knowledge_create"), "direct");
+        assert_eq!(tool_load_mode(&items, "knowledge_query"), "direct");
         assert_eq!(tool_load_mode(&items, "unity_run_states"), "lazy");
         assert_eq!(tool_load_mode(&items, "web_fetch"), "lazy");
         assert_eq!(
-            tool_meta_bool(&items, "knowledge_create", "canConfigureDirectLoad"),
+            tool_meta_bool(&items, "knowledge_query", "canConfigureDirectLoad"),
             Some(false)
         );
         assert_eq!(
@@ -17992,7 +19207,7 @@ PrefabInstance:
             Some(false)
         );
         assert_eq!(
-            tool_meta_bool(&items, "knowledge_create", "directLoadOverride"),
+            tool_meta_bool(&items, "knowledge_query", "directLoadOverride"),
             None
         );
 
@@ -18021,7 +19236,7 @@ PrefabInstance:
                 env_template: String::new(),
                 tools: vec![
                     "edit".to_string(),
-                    "knowledge_create".to_string(),
+                    "knowledge_query".to_string(),
                     "web_fetch".to_string(),
                 ],
                 sub_agents: Vec::new(),
@@ -18066,7 +19281,7 @@ PrefabInstance:
         assert!(request_tool_names.contains(&"tool_load".to_string()));
         assert!(request_tool_names.contains(&"tool_call".to_string()));
         assert!(request_tool_names.contains(&"edit".to_string()));
-        assert!(request_tool_names.contains(&"knowledge_create".to_string()));
+        assert!(request_tool_names.contains(&"knowledge_query".to_string()));
         assert!(!request_tool_names.contains(&"web_fetch".to_string()));
 
         let api_tools = instance.build_api_tools(&request_tool_names).await;
@@ -18078,7 +19293,7 @@ PrefabInstance:
             .lazy_tool_manifest_prompt()
             .await
             .expect("lazy manifest");
-        assert!(!manifest.contains("- `knowledge_create`"));
+        assert!(!manifest.contains("- `knowledge_query`"));
         assert!(manifest.contains("- `web_fetch`"));
 
         let load_result = instance
@@ -18191,11 +19406,9 @@ PrefabInstance:
                 tools: vec![
                     "read".to_string(),
                     "web_fetch".to_string(),
-                    "knowledge_create".to_string(),
-                    "knowledge_delete".to_string(),
+                    "knowledge_query".to_string(),
                     "unity_run_states".to_string(),
                     "unity_capture_viewport".to_string(),
-                    "graph_view".to_string(),
                 ],
                 sub_agents: Vec::new(),
                 default: false,
@@ -18223,11 +19436,9 @@ PrefabInstance:
 
         let parts = instance.build_system_prompt_parts().await;
         assert!(parts.env_prompt.contains("## Lazy Loaded Tools"));
-        assert!(!parts.env_prompt.contains("- `knowledge_create`"));
-        assert!(parts.env_prompt.contains("- `knowledge_delete`"));
+        assert!(!parts.env_prompt.contains("- `knowledge_query`"));
         assert!(parts.env_prompt.contains("- `unity_run_states`"));
         assert!(parts.env_prompt.contains("- `unity_capture_viewport`"));
-        assert!(parts.env_prompt.contains("- `graph_view`"));
         assert!(parts.env_prompt.contains("- `web_fetch`"));
         assert!(!parts.env_prompt.contains("- `read`"));
         assert!(
@@ -18243,11 +19454,9 @@ PrefabInstance:
             .find(|item| item.id == "lazy_tool_names")
             .expect("lazy tool manifest item");
         assert_eq!(manifest.kind, "context");
-        assert!(!manifest.content.contains("- `knowledge_create`"));
-        assert!(manifest.content.contains("- `knowledge_delete`"));
+        assert!(!manifest.content.contains("- `knowledge_query`"));
         assert!(manifest.content.contains("- `unity_run_states`"));
         assert!(manifest.content.contains("- `unity_capture_viewport`"));
-        assert!(manifest.content.contains("- `graph_view`"));
         assert!(manifest.content.contains("- `web_fetch`"));
         assert!(!manifest.content.contains("- `read`"));
     }
@@ -18267,7 +19476,7 @@ PrefabInstance:
                 env_template: String::new(),
                 tools: vec![
                     "read".to_string(),
-                    "knowledge_create".to_string(),
+                    "knowledge_query".to_string(),
                     "skill_special".to_string(),
                 ],
                 sub_agents: Vec::new(),
@@ -18295,7 +19504,7 @@ PrefabInstance:
         );
 
         let manifest_names = instance.lazy_tool_manifest_names().await;
-        assert!(!manifest_names.contains(&"knowledge_create".to_string()));
+        assert!(!manifest_names.contains(&"knowledge_query".to_string()));
         assert!(!manifest_names.contains(&"read".to_string()));
         assert!(!manifest_names.contains(&"skill_special".to_string()));
 
@@ -18385,13 +19594,11 @@ PrefabInstance:
     async fn knowledge_access_mode_filters_knowledge_tools() {
         let temp = tempdir().expect("temp dir");
         let tools = vec![
-            "knowledge_list".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "edit".to_string(),
+            "bash".to_string(),
             "knowledge_query".to_string(),
-            "knowledge_read".to_string(),
-            "knowledge_create".to_string(),
-            "knowledge_edit".to_string(),
-            "knowledge_move".to_string(),
-            "knowledge_delete".to_string(),
         ];
 
         let disabled = test_agent_instance_with_tools_and_mode(
@@ -18400,9 +19607,9 @@ PrefabInstance:
             KnowledgeAccessMode::Disabled,
         );
         let disabled_tools = disabled.allowed_tool_set().await;
-        assert!(disabled_tools
-            .iter()
-            .all(|name| !AgentInstance::is_knowledge_tool_name(name)));
+        assert!(!disabled_tools.contains("knowledge_query"));
+        assert!(disabled_tools.contains("read"));
+        assert!(disabled_tools.contains("write"));
 
         let read_only = test_agent_instance_with_tools_and_mode(
             temp.path().to_string_lossy().to_string(),
@@ -18410,17 +19617,19 @@ PrefabInstance:
             KnowledgeAccessMode::ReadOnly,
         );
         let read_only_tools = read_only.allowed_tool_set().await;
-        for tool in ["knowledge_list", "knowledge_query", "knowledge_read"] {
+        for tool in ["read", "write", "edit", "bash", "knowledge_query"] {
             assert!(read_only_tools.contains(tool));
         }
-        for tool in [
-            "knowledge_create",
-            "knowledge_edit",
-            "knowledge_move",
-            "knowledge_delete",
-        ] {
-            assert!(!read_only_tools.contains(tool));
-        }
+
+        let carried_skill_tools = HashSet::from([
+            "create_skill_package".to_string(),
+            "skill_reload".to_string(),
+        ]);
+        let read_only_with_skill = read_only
+            .allowed_tool_set_for_active_skills(&carried_skill_tools)
+            .await;
+        assert!(!read_only_with_skill.contains("create_skill_package"));
+        assert!(read_only_with_skill.contains("skill_reload"));
     }
 
     #[tokio::test]
@@ -18491,7 +19700,7 @@ PrefabInstance:
         let temp = tempdir().expect("temp dir");
         let instance = test_agent_instance_with_tools_and_mode(
             temp.path().to_string_lossy().to_string(),
-            vec!["read".to_string(), "knowledge_read".to_string()],
+            vec!["read".to_string(), "knowledge_query".to_string()],
             KnowledgeAccessMode::Disabled,
         );
 
@@ -18532,7 +19741,7 @@ PrefabInstance:
                 tools: vec![
                     "edit".to_string(),
                     "unity_run_states".to_string(),
-                    "knowledge_create".to_string(),
+                    "knowledge_query".to_string(),
                 ],
                 sub_agents: Vec::new(),
                 default: false,
@@ -18562,7 +19771,7 @@ PrefabInstance:
 
         assert_eq!(tool_load_mode(&items, "edit"), "lazy");
         assert_eq!(tool_load_mode(&items, "unity_run_states"), "direct");
-        assert_eq!(tool_load_mode(&items, "knowledge_create"), "direct");
+        assert_eq!(tool_load_mode(&items, "knowledge_query"), "direct");
         assert_eq!(
             tool_meta_bool(&items, "edit", "directLoadOverride"),
             Some(false)
@@ -18708,7 +19917,7 @@ skillSurface: command
 commandTrigger: /create-skill
 argumentHint:
 tools:
-  - skill_create
+  - create_skill_package
   - skill_reload
   - skill_list
 createdAt: 1
@@ -18734,11 +19943,7 @@ Create a reusable Skill.
                 description: String::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
-                tools: vec![
-                    "skill_create".to_string(),
-                    "skill_reload".to_string(),
-                    "skill_list".to_string(),
-                ],
+                tools: vec!["skill_reload".to_string(), "skill_list".to_string()],
                 sub_agents: Vec::new(),
                 default: false,
                 default_effort: None,
@@ -18774,9 +19979,17 @@ Create a reusable Skill.
         };
         let active_skill_tool_names = agent.selected_skill_tool_names(Some(&intent));
 
-        assert!(active_skill_tool_names.contains("skill_create"));
+        assert!(active_skill_tool_names.contains("create_skill_package"));
         assert!(active_skill_tool_names.contains("skill_reload"));
         assert!(active_skill_tool_names.contains("skill_list"));
+
+        let unselected_request_tool_names = agent
+            .build_request_tool_names_for_mode_and_skills(
+                crate::config::DynamicToolLoadingMode::MetaTool,
+                &HashSet::new(),
+            )
+            .await;
+        assert!(!unselected_request_tool_names.contains(&"create_skill_package".to_string()));
 
         let request_tool_names = agent
             .build_request_tool_names_for_mode_and_skills(
@@ -18785,7 +19998,7 @@ Create a reusable Skill.
             )
             .await;
 
-        assert!(request_tool_names.contains(&"skill_create".to_string()));
+        assert!(request_tool_names.contains(&"create_skill_package".to_string()));
         assert!(request_tool_names.contains(&"skill_reload".to_string()));
         assert!(request_tool_names.contains(&"skill_list".to_string()));
     }
@@ -18978,7 +20191,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn knowledge_routing_rejects_generic_fs_tools_for_knowledge_root() {
+    fn knowledge_routing_allows_generic_fs_tools_for_knowledge_root_in_full_mode() {
         let root = tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(workspace.join("Locus/knowledge/design"))
@@ -18990,8 +20203,6 @@ Search, install, audit, and export a plugin.
         .expect("write knowledge doc");
 
         let agent = test_agent_instance(workspace.to_string_lossy().to_string());
-        let expected = "Knowledge roots are reserved for knowledge tools. Use `knowledge_list` / `knowledge_query` / `knowledge_read` for inspection, `knowledge_create` / `knowledge_edit` / `knowledge_move` / `knowledge_delete` for non-Skill writes, and `skill_create` / `skill_reload` for Skill lifecycle work.".to_string();
-
         for (tool_name, args) in [
             (
                 "read",
@@ -19033,8 +20244,8 @@ Search, install, audit, and export a plugin.
         ] {
             assert_eq!(
                 agent.validate_knowledge_tool_routing(tool_name, &args),
-                Some(expected.clone()),
-                "tool {tool_name} should be rejected for knowledge paths"
+                None,
+                "tool {tool_name} should be allowed for knowledge paths"
             );
         }
     }
@@ -19082,18 +20293,58 @@ Search, install, audit, and export a plugin.
             );
         }
 
-        assert!(agent
-            .validate_knowledge_tool_routing(
+        assert_eq!(
+            agent.validate_knowledge_tool_routing(
                 "bash",
                 &json!({"workdir":".","command":"git clean -fd Locus/knowledge/design"})
-            )
-            .is_some());
-        assert!(agent
-            .validate_knowledge_tool_routing(
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn knowledge_routing_enforces_read_only_mode_for_generic_mutations() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("Locus/knowledge/design"))
+            .expect("create knowledge dir");
+        let agent = test_agent_instance_with_tools_and_mode(
+            workspace.to_string_lossy().to_string(),
+            vec![
+                "read".to_string(),
+                "write".to_string(),
+                "edit".to_string(),
+                "bash".to_string(),
+            ],
+            KnowledgeAccessMode::ReadOnly,
+        );
+
+        assert_eq!(
+            agent.validate_knowledge_tool_routing(
+                "read",
+                &json!({"filePath":"Locus/knowledge/design/core-loop.md"})
+            ),
+            None
+        );
+        for (tool, args) in [
+            (
+                "write",
+                json!({"filePath":"Locus/knowledge/design/new.md","content":"body"}),
+            ),
+            (
+                "edit",
+                json!({"filePath":"Locus/knowledge/design/core-loop.md","oldString":"a","newString":"b"}),
+            ),
+            (
                 "bash",
-                &json!({"workdir":".","command":"git -c core.quotePath=false diff --unified=1 -- Assets/PlayerHealthBar.cs Assets/PlayerPlatformerController.cs ProjectSettings/ProjectSettings.asset | sed -n '220,520p'\nprintf '%s\\n' '--- knowledge files ---'\nfind Locus/knowledge/design/system -maxdepth 3 -type f | sort"})
-            )
-            .is_some());
+                json!({"workdir":".","command":"rm Locus/knowledge/design/core-loop.md"}),
+            ),
+        ] {
+            assert_eq!(
+                agent.validate_knowledge_tool_routing(tool, &args),
+                Some("Knowledge is read-only for this request.".to_string())
+            );
+        }
     }
 
     #[test]
@@ -19763,7 +21014,6 @@ Search, install, audit, and export a plugin.
                 title: "PSD To UGUI".to_string(),
                 inject_mode: KnowledgeInjectMode::None,
                 summary: Some("Parse PSD layer structure".to_string()),
-                body_excerpt: Some("Package body should stay hidden".to_string()),
             },
             PromptKnowledgeItem {
                 doc_type: KnowledgeType::Skill,
@@ -19771,7 +21021,6 @@ Search, install, audit, and export a plugin.
                 title: "PSD Tools".to_string(),
                 inject_mode: KnowledgeInjectMode::None,
                 summary: None,
-                body_excerpt: None,
             },
             PromptKnowledgeItem {
                 doc_type: KnowledgeType::Skill,
@@ -19779,7 +21028,6 @@ Search, install, audit, and export a plugin.
                 title: "PSD Structure".to_string(),
                 inject_mode: KnowledgeInjectMode::None,
                 summary: None,
-                body_excerpt: None,
             },
         ];
 
@@ -19898,7 +21146,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn structure_section_uses_excerpt_summary_and_body_fallback() {
+    fn structure_section_hides_excerpt_documents_without_summary() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
 
@@ -19979,8 +21227,10 @@ Search, install, audit, and export a plugin.
             "{}",
             structure
         );
+        assert!(!structure.contains("body.md"), "{}", structure);
+        assert!(!structure.contains("Body Design"), "{}", structure);
         assert!(
-            structure.contains("body.md :: Fallback body excerpt enters the structure tree."),
+            !structure.contains("Fallback body excerpt enters the structure tree."),
             "{}",
             structure
         );
@@ -19994,7 +21244,6 @@ Search, install, audit, and export a plugin.
             title: "View".to_string(),
             inject_mode: KnowledgeInjectMode::Excerpt,
             summary: Some("Use for explicit Locus View UI package requests.".to_string()),
-            body_excerpt: None,
         }];
 
         let tree = build_prompt_tree(&items, &[], false);
@@ -20007,6 +21256,65 @@ Search, install, audit, and export a plugin.
             rendered
         );
         assert!(!rendered.contains("SKILL.md ::"), "{}", rendered);
+    }
+
+    #[test]
+    fn prompt_tree_never_limits_l1_l2_or_l3_documents() {
+        let mut items = Vec::new();
+        for (prefix, inject_mode) in [
+            ("l1", KnowledgeInjectMode::Excerpt),
+            ("l2", KnowledgeInjectMode::Full),
+            ("l3", KnowledgeInjectMode::Rule),
+        ] {
+            for index in 0..5 {
+                items.push(PromptKnowledgeItem {
+                    doc_type: KnowledgeType::Memory,
+                    path: format!("group/{}-{}.md", prefix, index),
+                    title: format!("{} document {}", prefix, index),
+                    inject_mode,
+                    summary: (prefix == "l1")
+                        .then(|| format!("{} document {} summary", prefix, index)),
+                });
+            }
+        }
+        for index in 0..4 {
+            items.push(PromptKnowledgeItem {
+                doc_type: KnowledgeType::Memory,
+                path: format!("group/l0-{}.md", index),
+                title: format!("l0 document {}", index),
+                inject_mode: KnowledgeInjectMode::Path,
+                summary: None,
+            });
+        }
+
+        let tree = build_prompt_tree(&items, &[], false);
+        let rendered = render_tree_lines(&tree, true, 3).join("\n");
+        for prefix in ["l1", "l2", "l3"] {
+            for index in 0..5 {
+                assert!(
+                    rendered.contains(&format!("{}-{}.md", prefix, index)),
+                    "{}",
+                    rendered
+                );
+            }
+        }
+        assert!(rendered.contains("l0-0.md"), "{}", rendered);
+        assert!(rendered.contains("l0-1.md"), "{}", rendered);
+        assert!(rendered.contains("l0-2.md"), "{}", rendered);
+        assert!(!rendered.contains("l0-3.md"), "{}", rendered);
+        assert!(rendered.contains("<1 file hidden>"), "{}", rendered);
+
+        let collapsed = render_tree_lines(&tree, false, 0).join("\n");
+        for prefix in ["l1", "l2", "l3"] {
+            for index in 0..5 {
+                assert!(
+                    collapsed.contains(&format!("{}-{}.md", prefix, index)),
+                    "{}",
+                    collapsed
+                );
+            }
+        }
+        assert!(collapsed.contains("<4 files hidden>"), "{}", collapsed);
     }
 
     #[test]
@@ -20033,6 +21341,18 @@ Search, install, audit, and export a plugin.
 
         let structure = build_structure_section(&working_dir, None, KnowledgeAccessMode::Full)
             .expect("build structure");
+        assert!(
+            structure.contains("#### Project\n```tree\nLocus/knowledge/"),
+            "{}",
+            structure
+        );
+        assert!(structure.contains("#### App\n```tree"), "{}", structure);
+        assert_eq!(structure.matches("```tree").count(), 2, "{}", structure);
+        assert!(
+            !structure.contains("```tree\nknowledge/\n"),
+            "{}",
+            structure
+        );
         assert!(structure.contains("combat/"));
         assert!(structure.contains("└─ <empty>"));
     }
@@ -20104,7 +21424,7 @@ Search, install, audit, and export a plugin.
         );
         assert!(
             structure.contains(
-                "use `knowledge_query` or concrete `reference/unity-official-docs/...` paths when needed."
+                "use `knowledge_query` or concrete `Library/Locus/KnowledgeSources/reference/unity-official-docs/...` paths when needed."
             ),
             "{}",
             structure
@@ -20339,7 +21659,9 @@ Search, install, audit, and export a plugin.
         // Knowledge tool usage lives in the tool schemas and the lazy tool
         // manifest; the knowledge block must not duplicate it.
         assert!(!prompt_parts.knowledge_prompt.contains("### Tools"));
-        assert!(!prompt_parts.knowledge_prompt.contains("`skill_create`:"));
+        assert!(!prompt_parts
+            .knowledge_prompt
+            .contains("`create_skill_package`:"));
         assert!(!prompt_parts.knowledge_prompt.contains("`skill_reload`:"));
         assert!(!prompt_parts.knowledge_prompt.contains("`skill_list`:"));
         assert!(!prompt_parts.knowledge_prompt.contains("## L3 Rules"));
@@ -20463,24 +21785,88 @@ Search, install, audit, and export a plugin.
 
     #[test]
     fn knowledge_query_output_uses_plain_text_blocks() {
-        let output = AgentInstance::format_knowledge_query_output(&[AgentKnowledgeSearchHit {
-            doc_type: KnowledgeType::Design,
-            path: "design/project-overview.md".to_string(),
-            title: "Project Overview".to_string(),
-            snippet: "Core loop summary".to_string(),
-            matched_section: Some(KnowledgeSearchMatchSection::Summary),
-            score: 0.875,
-            match_kind: "lexical".to_string(),
-            matched_terms: vec!["core".to_string(), "loop".to_string()],
-        }]);
+        let output = AgentInstance::format_knowledge_query_output(
+            &[AgentKnowledgeSearchHit {
+                doc_type: KnowledgeType::Design,
+                path: "design/project-overview.md".to_string(),
+                summary: None,
+                snippet: "Core loop summary".to_string(),
+                score: 0.875,
+                match_kind: "lexical".to_string(),
+                matched_terms: vec!["core".to_string(), "loop".to_string()],
+                start_line: 18,
+                end_line: 24,
+                summary_start_line: Some(4),
+                body_start_line: 12,
+            }],
+            false,
+            true,
+            220,
+        );
 
         assert!(output.contains("design/project-overview.md"));
-        assert!(output.contains("Project Overview"));
-        assert!(output.contains("match=lexical | section=summary | score=0.875"));
+        assert!(output.contains("lines: 18-24"));
+        assert!(output.contains("summary_start_line: 4"));
+        assert!(output.contains("body_start_line: 12"));
+        assert!(output.contains("match: lexical | score=0.875"));
         assert!(output.contains("terms=core, loop"));
-        assert!(output.contains("Core loop summary"));
+        assert!(output.contains("context:\n  Core loop summary"));
+        assert!(!output.contains("title:"));
         assert!(!output.trim_start().starts_with('{'));
         assert!(!output.trim_start().starts_with('['));
+    }
+
+    #[test]
+    fn knowledge_query_output_can_include_summary_without_hit_context() {
+        let output = AgentInstance::format_knowledge_query_output(
+            &[AgentKnowledgeSearchHit {
+                doc_type: KnowledgeType::Memory,
+                path: "memory/preferences.md".to_string(),
+                summary: Some("Stable preferences\nAcross projects".to_string()),
+                snippet: "Hidden hit context".to_string(),
+                score: 0.75,
+                match_kind: "semantic".to_string(),
+                matched_terms: Vec::new(),
+                start_line: 8,
+                end_line: 10,
+                summary_start_line: Some(3),
+                body_start_line: 7,
+            }],
+            true,
+            false,
+            220,
+        );
+
+        assert!(output.contains("summary:\n  Stable preferences\n  Across projects"));
+        assert!(!output.contains("summary_start_line"));
+        assert!(!output.contains("body_start_line"));
+        assert!(!output.contains("context:"));
+        assert!(!output.contains("Hidden hit context"));
+    }
+
+    #[test]
+    fn knowledge_query_hit_context_truncates_at_text_boundaries() {
+        let context = AgentInstance::truncate_knowledge_hit_context(
+            "First sentence is short. Second sentence is intentionally long and keeps going",
+            &[],
+            40,
+        );
+
+        assert_eq!(context, "First sentence is short.…");
+        assert!(context.chars().count() <= 40);
+    }
+
+    #[test]
+    fn knowledge_query_hit_context_keeps_the_match_inside_a_bounded_window() {
+        let context = AgentInstance::truncate_knowledge_hit_context(
+            "A long prefix that would otherwise consume the entire context window before the actual Character Motor match and its nearby explanation.",
+            &["Character Motor".to_string()],
+            60,
+        );
+
+        assert!(context.contains("Character Motor"));
+        assert!(context.contains("nearby"));
+        assert!(context.chars().count() <= 60);
     }
 
     #[test]
@@ -20865,7 +22251,14 @@ Search, install, audit, and export a plugin.
         let instance = test_agent_instance("C:/Project".to_string());
         let runtime = super::PlanRuntime::Subagent;
 
-        for tool in ["write", "edit", "bash", "task", "web_fetch", "exit_plan_mode"] {
+        for tool in [
+            "write",
+            "edit",
+            "bash",
+            "task",
+            "web_fetch",
+            "exit_plan_mode",
+        ] {
             assert!(
                 instance
                     .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
@@ -20939,10 +22332,8 @@ Search, install, audit, and export a plugin.
         // `with_builtins()` does not register `task` (the real app registers
         // it with the live agent list), so the fixture registers it here.
         let mut tool_registry = ToolRegistry::with_builtins();
-        tool_registry.register_task_tool(&[(
-            "explorer".to_string(),
-            "codebase exploration".to_string(),
-        )]);
+        tool_registry
+            .register_task_tool(&[("explorer".to_string(), "codebase exploration".to_string())]);
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         let mut instance = AgentInstance::new(
             Arc::new(AgentDef {
@@ -21018,6 +22409,26 @@ Search, install, audit, and export a plugin.
         let rendered = AgentInstance::render_plan_reminder(&existing);
         assert!(rendered.contains("A plan file already exists"));
         assert!(rendered.contains("refine it if this continues the same task"));
+    }
+
+    #[test]
+    fn tool_context_probes_unity_only_for_yaml_candidate_reads() {
+        assert!(AgentInstance::tool_context_requires_unity_probe(
+            "read",
+            &serde_json::json!({ "filePath": "Assets/Scenes/Main.unity" }),
+        ));
+        assert!(AgentInstance::tool_context_requires_unity_probe(
+            "read",
+            &serde_json::json!({ "filePath": "Assets/Config/Game.asset" }),
+        ));
+        assert!(!AgentInstance::tool_context_requires_unity_probe(
+            "read",
+            &serde_json::json!({ "filePath": "Assets/Scripts/Gameplay.cs" }),
+        ));
+        assert!(!AgentInstance::tool_context_requires_unity_probe(
+            "grep",
+            &serde_json::json!({ "filePath": "Assets/Scenes/Main.unity" }),
+        ));
     }
 
     #[test]

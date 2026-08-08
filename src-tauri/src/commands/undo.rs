@@ -8,8 +8,7 @@ use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::KnowledgeType;
 use crate::session::store::SessionStore;
 use crate::vcs::undo::{
-    ChangedFile, UndoConflict, UndoEntry, UndoPerformError, UndoPerformOptions,
-    UndoRevertFileError,
+    ChangedFile, UndoConflict, UndoEntry, UndoPerformError, UndoPerformOptions, UndoRevertFileError,
 };
 use crate::workspace::Workspace;
 use crate::UndoManagerHandle;

@@ -17,16 +17,23 @@ use super::config::McpServerSettings;
 use super::http::ToolCallOutcome;
 use super::protocol::ToolListing;
 use crate::agent::instance::AgentInstance;
+use crate::agent::workspace_execution_lock::{
+    process_workspace_execution_lock, WorkspaceExecutionLockMode, WorkspaceExecutionLockOwner,
+};
 use crate::tool::{ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
 
 /// Every tool the MCP server can expose, in tools/list order.
 pub const EXPOSED_TOOLS: &[&str] = &[
     "unity_project_info",
+    "unity_set_play_mode",
     "unity_execute",
     "unity_recompile",
     "unity_hot_reload",
     "unity_run_states",
     "unity_capture_viewport",
+    "unity_get_console_log",
+    "unity_test_list",
+    "unity_test_run",
     "unity_asset_search",
     "unity_ref_search",
     "unity_code_usages",
@@ -49,10 +56,13 @@ const RECOMPILE_MCP_NOTE: &str = "\n\n(MCP note: editor_status / project_path pa
 /// Feature gate per tool, mirroring resolve_effective_tool_names
 /// (agent/instance/mod.rs) so the external surface matches what the in-app
 /// agent would get.
-fn tool_available(name: &str) -> (bool, Option<String>) {
+fn tool_available(name: &str, working_dir: Option<&str>) -> (bool, Option<String>) {
     match name {
-        "code_find_references" | "code_goto_definition" | "code_symbol_search"
-        | "code_diagnostics" | "code_hover" => {
+        "code_find_references"
+        | "code_goto_definition"
+        | "code_symbol_search"
+        | "code_diagnostics"
+        | "code_hover" => {
             if !crate::csharp_lsp::is_enabled() {
                 return (
                     false,
@@ -83,12 +93,44 @@ fn tool_available(name: &str) -> (bool, Option<String>) {
             } else {
                 (
                     false,
-                    Some("Hot reload (or the compile server) is disabled in Locus settings".to_string()),
+                    Some(
+                        "Hot reload (or the compile server) is disabled in Locus settings"
+                            .to_string(),
+                    ),
                 )
             }
         }
+        "unity_test_list" | "unity_test_run" => {
+            let Some(working_dir) = working_dir.filter(|value| !value.trim().is_empty()) else {
+                return (false, Some("No Unity workspace is active".to_string()));
+            };
+            let status = crate::workspace::unity_test_tools_workspace_status(working_dir);
+            if !status.enabled {
+                return (
+                    false,
+                    Some("Unity Test tools are disabled for this workspace".to_string()),
+                );
+            }
+            if !status.package_installed {
+                return (
+                    false,
+                    Some("Unity Test Framework is not installed in this project".to_string()),
+                );
+            }
+            (true, None)
+        }
         _ => (true, None),
     }
+}
+
+fn active_workspace_path(app: &AppHandle) -> Option<String> {
+    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
+    workspace
+        .path
+        .try_read()
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
 }
 
 fn empty_object_schema() -> Value {
@@ -124,10 +166,11 @@ fn listing_for(registry: &ToolRegistry, name: &str) -> Option<ToolListing> {
 /// Tools currently visible to external harnesses (enabled + feature-gated).
 pub fn listed_tools(app: &AppHandle, settings: &McpServerSettings) -> Vec<ToolListing> {
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+    let working_dir = active_workspace_path(app);
     EXPOSED_TOOLS
         .iter()
         .filter(|name| settings.tool_enabled(name))
-        .filter(|name| tool_available(name).0)
+        .filter(|name| tool_available(name, working_dir.as_deref()).0)
         .filter_map(|name| listing_for(&registry, name))
         .collect()
 }
@@ -146,10 +189,11 @@ pub struct ExposedToolInfo {
 pub fn exposed_tool_inventory(app: &AppHandle) -> Vec<ExposedToolInfo> {
     let settings = super::config::load_settings();
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+    let working_dir = active_workspace_path(app);
     EXPOSED_TOOLS
         .iter()
         .map(|name| {
-            let (available, unavailable_reason) = tool_available(name);
+            let (available, unavailable_reason) = tool_available(name, working_dir.as_deref());
             let description = match *name {
                 "unity_project_info" => PROJECT_INFO_DESCRIPTION.to_string(),
                 _ => registry
@@ -254,10 +298,21 @@ async fn run_unity_execute(working_dir: &str, args: &Value) -> ToolResult {
         Ok(status) => status,
         Err(result) => return result,
     };
+    let enable_non_public_access = match crate::csharp_compile::resolve_tool_non_public_access(args)
+    {
+        Ok(value) => value,
+        Err(error) => return err(&error),
+    };
     if let Err(e) = ensure_editor_status(working_dir, &requested).await {
         return err(&e);
     }
-    match crate::unity_bridge::unity_execute_code(working_dir, code).await {
+    match crate::unity_bridge::unity_execute_code_with_non_public_access(
+        working_dir,
+        code,
+        enable_non_public_access,
+    )
+    .await
+    {
         Ok(output) => {
             let trimmed = output.trim();
             ok(if trimmed.is_empty() {
@@ -296,17 +351,34 @@ async fn run_unity_run_states(working_dir: &str, args: &Value) -> ToolResult {
         Ok(status) => status,
         Err(result) => return result,
     };
+    let enable_non_public_access = match crate::csharp_compile::resolve_tool_non_public_access(args)
+    {
+        Ok(value) => value,
+        Err(error) => return err(&error),
+    };
     let (connected, _status, _scene) = crate::unity_bridge::query_unity_status(working_dir).await;
     if !connected {
         return err("Unity Editor not connected");
     }
-    if let Err(e) = crate::unity_bridge::compile_run_states(working_dir, args).await {
+    if let Err(e) = crate::unity_bridge::compile_run_states_with_non_public_access(
+        working_dir,
+        args,
+        enable_non_public_access,
+    )
+    .await
+    {
         return err(&e);
     }
     if let Err(e) = ensure_editor_status(working_dir, &requested).await {
         return err(&e);
     }
-    match crate::unity_bridge::unity_run_states(working_dir, args).await {
+    match crate::unity_bridge::unity_run_states_with_non_public_access(
+        working_dir,
+        args,
+        enable_non_public_access,
+    )
+    .await
+    {
         Ok(output) => {
             if output.trim().is_empty() {
                 ok("unity_run_states completed with no output.")
@@ -396,7 +468,46 @@ pub async fn execute_tool(
         );
     }
 
-    let fut = execute_workspace_tool(&app, &name, &arguments, &working_dir, runtime_state);
+    let request_run_id = format!("mcp-{}", uuid::Uuid::new_v4());
+    let fut = async {
+        let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+        let lock_mode = if registry.mutates_workspace(&name)
+            || AgentInstance::is_unity_execution_barrier_tool(&name)
+        {
+            WorkspaceExecutionLockMode::Write
+        } else {
+            WorkspaceExecutionLockMode::Read
+        };
+        let owner = WorkspaceExecutionLockOwner {
+            session_id: "mcp-server".to_string(),
+            run_id: request_run_id,
+            iteration: 0,
+            workspace: working_dir.clone(),
+            tools: vec![name.clone()],
+        };
+        // The sender stays alive for the acquisition lifetime. If the outer
+        // timeout drops this future, waiter registration and any acquired
+        // guard are both released by Drop and leave an abandoned/released log.
+        let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
+        let workspace_guard = match process_workspace_execution_lock()
+            .acquire(lock_mode, owner, lock_cancel_rx)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                return outcome_from_tool_result(
+                    err(&format!(
+                        "Tool '{name}' was cancelled while waiting for the workspace lock."
+                    )),
+                    None,
+                );
+            }
+        };
+        let outcome =
+            execute_workspace_tool(&app, &name, &arguments, &working_dir, runtime_state).await;
+        drop(workspace_guard);
+        outcome
+    };
     let outcome = match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
         Ok(outcome) => outcome,
         Err(_) => outcome_from_tool_result(
@@ -483,10 +594,18 @@ async fn execute_workspace_tool(
             let context = ToolExecutionContext {
                 app_handle: Some(app.clone()),
                 working_dir: Some(working_dir.to_string()),
-                unity_connected: Some(crate::unity_bridge::is_unity_connected(working_dir).await),
+                // Registry tools that need Unity perform their own authoritative
+                // request. Eagerly probing here duplicated status traffic and
+                // could race the real request; this field is only consumed by
+                // the built-in file reader's Unity-YAML redirect.
+                unity_connected: None,
                 runtime_state: Some(runtime_state),
+                cancel_rx: None,
+                progress: None,
             };
-            let result = registry.execute_with_context(name, arguments, context).await;
+            let result = registry
+                .execute_with_context(name, arguments, context)
+                .await;
             outcome_from_tool_result(result, None)
         }
     }
