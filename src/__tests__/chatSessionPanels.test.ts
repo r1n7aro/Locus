@@ -67,7 +67,10 @@ const agentStoreMocks = vi.hoisted(() => ({
 }));
 
 const modelStoreMocks = vi.hoisted(() => ({
-  availableModels: [{ id: "model-a", name: "Model A", provider: "custom" as const }],
+  availableModels: [
+    { id: "model-a", name: "Model A", provider: "custom" as const },
+    { id: "model-b", name: "Model B", provider: "custom" as const },
+  ],
   modelDefaults: {
     mainModel: "model-a",
     planModel: "",
@@ -75,8 +78,13 @@ const modelStoreMocks = vi.hoisted(() => ({
   },
   selectedModelId: "model-a",
   effort: "none" as const,
+  defaultEffort: "none" as const,
   effortSupported: false,
   codexFastModeForModel: vi.fn(() => false),
+  applySessionModel: vi.fn(),
+  applyContextEffort: vi.fn(),
+  loadLastEffort: vi.fn().mockResolvedValue(undefined),
+  resolveSelectedModel: vi.fn(),
 }));
 
 const notificationStoreMocks = vi.hoisted(() => ({
@@ -164,6 +172,19 @@ describe("chat session panel state", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.resetAllMocks();
+
+    modelStoreMocks.selectedModelId = "model-a";
+    modelStoreMocks.applySessionModel.mockImplementation((modelId: string | null | undefined) => {
+      if (modelId && modelStoreMocks.availableModels.some((model) => model.id === modelId)) {
+        modelStoreMocks.selectedModelId = modelId;
+      }
+    });
+    modelStoreMocks.applyContextEffort.mockImplementation((effort: typeof modelStoreMocks.effort) => {
+      modelStoreMocks.effort = effort;
+    });
+    modelStoreMocks.resolveSelectedModel.mockImplementation(() => {
+      modelStoreMocks.selectedModelId = modelStoreMocks.modelDefaults.mainModel;
+    });
 
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.showWelcomeSubtitle = true;
@@ -302,6 +323,54 @@ describe("chat session panel state", () => {
     expect(chatStore.tokenUsage.contextLimit).toBe(258400);
   });
 
+  it("restores the last sent model for an existing session and resets new chats to the default", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [],
+      agentId: null,
+      lastModelId: "model-b",
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    });
+
+    await chatStore.selectSession("s1");
+
+    expect(modelStoreMocks.applySessionModel).toHaveBeenCalledWith("model-b");
+    expect(modelStoreMocks.selectedModelId).toBe("model-b");
+
+    chatStore.newChat();
+
+    expect(modelStoreMocks.resolveSelectedModel).toHaveBeenCalledWith(true);
+    expect(modelStoreMocks.selectedModelId).toBe("model-a");
+  });
+
+  it("restores the last sent effort for an existing session", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [],
+      agentId: null,
+      lastModelId: "model-b",
+      lastEffort: "xhigh",
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    });
+
+    await chatStore.selectSession("s1");
+
+    expect(modelStoreMocks.applyContextEffort).toHaveBeenCalledWith("xhigh");
+    expect(chatStore.sessionEffort).toBe("xhigh");
+  });
+
   it("restores the persisted active session after refreshing sessions", async () => {
     const chatStore = useChatStore();
 
@@ -336,6 +405,44 @@ describe("chat session panel state", () => {
     await chatStore.syncActiveSessionSelection(null);
 
     expect(chatStore.activeSessionId).toBeNull();
+    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+  });
+
+  it("keeps an isolated window on new chat across session refreshes", async () => {
+    const chatStore = useChatStore();
+    chatStore.setActiveSessionSelectionPersistence(false);
+    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue("s1");
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Persisted elsewhere",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+      },
+    ]);
+
+    await chatStore.refreshSessions();
+    expect(chatStore.activeSessionId).toBe("s1");
+
+    chatStore.newChat();
+    await chatStore.refreshSessions();
+
+    expect(chatStore.activeSessionId).toBeNull();
+    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+  });
+
+  it("does not publish implicit session selection from an isolated window", async () => {
+    const chatStore = useChatStore();
+    chatStore.setActiveSessionSelectionPersistence(false);
+    sessionServiceMocks.chat.mockResolvedValueOnce({
+      sessionId: "isolated-new",
+      runId: "run-isolated",
+    });
+
+    await chatStore.sendMessage("Create locally");
+
+    expect(chatStore.activeSessionId).toBe("isolated-new");
     expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
   });
 

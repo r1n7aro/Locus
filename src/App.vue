@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
-import { FolderCog, FolderOpen, ListX } from "lucide";
+import { AppWindow, FolderCog, FolderOpen, ListX } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -50,9 +50,15 @@ import {
   openExtraWorkdirsWindow,
 } from "./services/extraWorkdirsWindow";
 import { prepareSubWindowPool } from "./services/subWindow";
+import {
+  isWorkspacePageId,
+  isWorkspacePageWindowLocation,
+  openWorkspacePageWindow,
+  WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
+  type WorkspacePageId,
+} from "./services/workspacePageWindow";
 import type { ExtraWorkdirStatus } from "./services/extraWorkdirs";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
-import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
   canStartWindowDragFromTarget,
   getCurrentTauriWindowLabel,
@@ -73,12 +79,12 @@ const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
+const isWorkspacePageWindow = isWorkspacePageWindowLocation();
 const isPlanViewWindow = isPlanViewWindowLocation();
 const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
 const isViewContentWindow = isViewContentWindowLocation();
-const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
@@ -88,12 +94,12 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isReferenceExternalImportWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow
+  || isWorkspacePageWindow
   || isPlanViewWindow
   || isUnityValueEditorWindow
   || isExtraWorkdirsWindow
   || isViewHostWindow
-  || isViewContentWindow
-  || isAgentGraphToolWindow;
+  || isViewContentWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
 const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeLexicalProgressWindow.vue"));
@@ -102,11 +108,11 @@ const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
 const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
 const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
+const WorkspacePageWindow = defineAsyncComponent(() => import("./components/WorkspacePageWindow.vue"));
 const PlanViewWindow = defineAsyncComponent(() => import("./components/PlanViewWindow.vue"));
 const UnityValueEditorWindow = defineAsyncComponent(() => import("./components/UnityValueEditorWindow.vue"));
 const ExtraWorkdirsConfigWindow = defineAsyncComponent(() => import("./components/ExtraWorkdirsConfigWindow.vue"));
 const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
-const AgentGraphToolWindow = defineAsyncComponent(() => import("./components/AgentGraphToolWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
@@ -135,6 +141,7 @@ let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
 let knowledgeRuntimeStartupPollsRemaining = 0;
 let appCloseRequestUnlisten: UnlistenFn | null = null;
 let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
+let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -142,7 +149,9 @@ const diffOverlay = provideDiffOverlay();
 // windows fall back to the dedicated inspector window.
 const locusAssetInspectorPanel = useLocusAssetInspectorPanel();
 setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow);
-const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, refreshAfterSettings, onOnboardingCompleted } = useAppBootstrap();
+const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, refreshAfterSettings, onOnboardingCompleted } = useAppBootstrap({
+  handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow,
+});
 const {
   handleUnityAssetDrag: handleMainUnityAssetDrag,
   handleUnityAssetDrop: handleMainUnityAssetDrop,
@@ -283,9 +292,47 @@ const topTabs = computed<TopTabItem[]>(() => [
 ]);
 
 const visibleTopTabs = computed(() => topTabs.value.filter((tab) => tab.visible));
+const topTabContextMenu = ref<{ x: number; y: number; tab: TopTabItem } | null>(null);
 
 function isTopTabVisible(tab: AppTab) {
   return visibleTopTabs.value.some((item) => item.id === tab);
+}
+
+function canOpenTopTabInWindow(tab: AppTab): tab is WorkspacePageId {
+  return isWorkspacePageId(tab);
+}
+
+async function openTopTabInWindow(tab: TopTabItem) {
+  topTabContextMenu.value = null;
+  if (!canOpenTopTabInWindow(tab.id)) return;
+  try {
+    await openWorkspacePageWindow({
+      page: tab.id,
+      title: t(tab.labelKey),
+    });
+  } catch (cause) {
+    const error = normalizeAppError(cause);
+    notificationStore.addNotice("error", error.message, {
+      code: error.code,
+      operation: "openWorkspacePageWindow",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+function onTopTabClick(event: MouseEvent, tab: TopTabItem) {
+  if (event.ctrlKey && canOpenTopTabInWindow(tab.id)) {
+    void openTopTabInWindow(tab);
+    return;
+  }
+  uiStore.setTab(tab.id);
+}
+
+function openTopTabContextMenu(event: MouseEvent, tab: TopTabItem) {
+  if (!canOpenTopTabInWindow(tab.id)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  topTabContextMenu.value = { x: event.clientX, y: event.clientY, tab };
 }
 
 watch(() => uiStore.activeTab, (tab) => {
@@ -664,7 +711,7 @@ function onResetOnboarding() {
 async function handleSettingsAuthChanged() {
   await authStore.loadProviderStatus();
   await modelStore.loadCodexAvailableModels();
-  modelStore.resolveSelectedModel(true);
+  modelStore.resolveSelectedModel(!chatStore.activeSessionId);
 }
 
 function closeAppUpdateModal() {
@@ -819,6 +866,10 @@ onMounted(async () => {
   document.addEventListener("click", handleDirClickOutside, true);
   await registerAppCloseRequestListener();
   await registerExtraWorkdirsUpdatedListener();
+  workspacePageResetOnboardingUnlisten = await listen(
+    WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
+    onResetOnboarding,
+  );
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
   await bootstrapCritical();
@@ -863,6 +914,8 @@ onUnmounted(() => {
   appCloseRequestUnlisten = null;
   extraWorkdirsUpdatedUnlisten?.();
   extraWorkdirsUpdatedUnlisten = null;
+  workspacePageResetOnboardingUnlisten?.();
+  workspacePageResetOnboardingUnlisten = null;
   notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
   clearKnowledgeRuntimeStatusTimer();
   cleanup();
@@ -893,12 +946,12 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
+  <WorkspacePageWindow v-else-if="isWorkspacePageWindow" />
   <PlanViewWindow v-else-if="isPlanViewWindow" />
   <UnityValueEditorWindow v-else-if="isUnityValueEditorWindow" />
   <ExtraWorkdirsConfigWindow v-else-if="isExtraWorkdirsWindow" />
   <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
-  <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
@@ -922,7 +975,8 @@ watch(() => projectStore.workingDir, () => {
           :key="tab.id"
           class="tab-item"
           :class="{ active: uiStore.activeTab === tab.id }"
-          @click="uiStore.setTab(tab.id)"
+          @click="onTopTabClick($event, tab)"
+          @contextmenu="openTopTabContextMenu($event, tab)"
         >{{ t(tab.labelKey) }}</button>
         <button
           v-if="projectStore.pluginToast"
@@ -1185,6 +1239,24 @@ watch(() => projectStore.workingDir, () => {
     @view="openAppUpdateRelease"
   />
   <BaseContextMenu
+    v-if="topTabContextMenu"
+    class="top-tab-ctx-menu"
+    :x="topTabContextMenu.x"
+    :y="topTabContextMenu.y"
+    :min-width="170"
+    :z-index="260"
+    @close="topTabContextMenu = null"
+  >
+    <button
+      type="button"
+      class="top-tab-ctx-item"
+      @click="openTopTabInWindow(topTabContextMenu.tab)"
+    >
+      <LucideIcon :icon="AppWindow" :size="13" />
+      {{ t("app.tab.openInWindow") }}
+    </button>
+  </BaseContextMenu>
+  <BaseContextMenu
     v-if="recentDirContextMenu"
     class="recent-dir-ctx-menu"
     :x="recentDirContextMenu.x"
@@ -1320,4 +1392,3 @@ watch(() => projectStore.workingDir, () => {
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
   <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
 </template>
-

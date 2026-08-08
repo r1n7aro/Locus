@@ -91,7 +91,7 @@ describe("display settings transcript alignment", () => {
     expect(app).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
     expect(app).toContain('{ id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab }');
     expect(app).toContain('v-for="tab in visibleTopTabs"');
-    expect(app).toContain('@click="uiStore.setTab(tab.id)"');
+    expect(app).toContain('@click="onTopTabClick($event, tab)"');
     expect(app).toContain('if (isTopTabVisible(uiStore.activeTab)) return;');
     expect(app).not.toContain("showChatTab");
     expect(app).not.toContain("showSettingsTab");

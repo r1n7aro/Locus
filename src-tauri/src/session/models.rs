@@ -39,6 +39,10 @@ pub struct SessionDetail {
     pub id: String,
     pub title: String,
     pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,8 +125,6 @@ pub struct PendingQuestion {
     pub tool_call_id: String,
     pub question: String,
     pub options: Vec<crate::commands::AskOption>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sheet: Option<crate::commands::SheetRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,7 +285,7 @@ pub struct ImageData {
     pub mime_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetRefData {
     pub path: String,

@@ -17,9 +17,9 @@ describe("chatMessageDraft", () => {
       "使用图片向我展示 store",
       "",
       "<locus-references>",
-      "Use Unity refs as exact asset anchors. Use project knowledge refs as exact knowledge_read paths.",
+      "Use Unity refs as exact asset anchors. Use project knowledge refs as exact filesystem paths.",
       "- asset: {@Assets/UI/Store.prefab}",
-      "- project knowledge: `skill/ui.md` (use `knowledge_read`)",
+      "- project knowledge: `Locus/knowledge/skill/ui.md` (use `read`)",
       "</locus-references>",
       "",
       "<locus-local-files>",
@@ -59,7 +59,7 @@ describe("chatMessageDraft", () => {
     expect(draft.assetRefs.map((ref) => `${ref.kind}:${ref.path}`)).toEqual([
       "asset:Assets/Textures/store.png",
       "asset:Assets/UI/Store.prefab",
-      "knowledge:skill/ui.md",
+      "knowledge:Locus/knowledge/skill/ui.md",
     ]);
     expect(draft.localFiles).toEqual([{
       path: "E:/cache/store.png",
@@ -87,7 +87,7 @@ describe("chatMessageDraft", () => {
     const draft = readUserMessageDraftFromClipboardData(clipboardData);
 
     expect(payload.text).toBe("使用图片向我展示 store");
-    expect(draft?.assetRefs.map((ref) => ref.path)).toContain("skill/ui.md");
+    expect(draft?.assetRefs.map((ref) => ref.path)).toContain("Locus/knowledge/skill/ui.md");
     expect(draft?.images).toHaveLength(1);
     expect(draft?.intent.skills[0]?.dirName).toBe("view");
   });

@@ -14,9 +14,13 @@ export interface ExtractedChatAssetRefs {
   refs: string[];
 }
 
-const UNITY_ASSET_REF_START_RE = /`@?(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|\{@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\/|@(?:Assets|Packages|ProjectSettings|design|memory|skill|reference)\//gi;
+const REFERENCE_ROOT = "(?:Assets|Packages|ProjectSettings|Locus/knowledge/(?:design|memory|skill|reference)|design|memory|skill|reference)";
+const UNITY_ASSET_REF_START_RE = new RegExp(
+  `\`@?${REFERENCE_ROOT}/|\\{@${REFERENCE_ROOT}/|@${REFERENCE_ROOT}/`,
+  "gi",
+);
 const UNITY_ASSET_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)\//i;
-const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
+const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:Locus\/knowledge\/)?(?:design|memory|skill|reference)\/.+\.md$/i;
 const PROJECT_KNOWLEDGE_TYPE_PREFIX_RE = /^(?:design|memory|skill|reference)\//i;
 
 export function buildProjectKnowledgeRefPath(

@@ -45,6 +45,8 @@ const props = defineProps<{
   codexResetCreditBusyId: string | null;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
+  codexExtendedContext: boolean;
+  codexSessionTitleGeneration: boolean;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
   dynamicToolLoadingBusy?: boolean;
   anthropicNativeLazyEnabled?: boolean;
@@ -83,6 +85,8 @@ const emit = defineEmits<{
   consumeCodexResetCredit: [creditId: string | null];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
+  "update:codexExtendedContext": [value: boolean];
+  "update:codexSessionTitleGeneration": [value: boolean];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
   "update:anthropicNativeLazyEnabled": [value: boolean];
   startAddProvider: [];
@@ -775,6 +779,33 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           :model-value="codexTransport"
           :options="codexTransportOptions"
           @update:model-value="updateCodexTransport"
+        />
+      </div>
+
+      <div v-if="codexStep !== 'waiting'" class="provider-detail">
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.extendedContextTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.extendedContextDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="codexExtendedContext"
+          :aria-label="t('settings.codex.extendedContextTitle')"
+          @update:model-value="emit('update:codexExtendedContext', $event)"
+        />
+      </div>
+
+      <div
+        v-if="codexStep !== 'waiting' && codexStatus.authenticated && !codexStatus.validationFailed"
+        class="provider-detail"
+      >
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.sessionTitleTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.sessionTitleDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="codexSessionTitleGeneration"
+          :aria-label="t('settings.codex.sessionTitleTitle')"
+          @update:model-value="emit('update:codexSessionTitleGeneration', $event)"
         />
       </div>
     </div>

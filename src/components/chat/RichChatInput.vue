@@ -56,7 +56,9 @@ import {
 } from "../../composables/useChatInputSettings";
 import {
   checkUnityConnectionStatus,
+  filterUnityConsoleErrorPayload,
   getUnityConsoleText,
+  isUnityConsoleErrorLevel,
   subscribeLocusFileDrop,
   subscribeLocusFileDragState,
   subscribeUnityEmbedAssetDrop,
@@ -315,7 +317,8 @@ const commandToken = computed(() =>
 );
 
 const allowActionCommands = computed(() =>
-  !!activeOperator.value
+  !props.isStreaming
+  && !!activeOperator.value
   && activeOperator.value.kind === "slash"
   && props.modelValue.trim() === activeOperator.value.token.trim(),
 );
@@ -792,13 +795,6 @@ function dismissOperatorPopupForCursor(text: string, cursor: number) {
 
 function syncOperatorState() {
   const previousOperator = activeOperator.value;
-  if (props.isStreaming) {
-    activeOperator.value = null;
-    showCommandPopup.value = false;
-    closeMentionPopup();
-    return;
-  }
-
   const textarea = getComposerTextarea();
   if (!textarea) return;
 
@@ -1243,12 +1239,7 @@ function consoleTextSource(item: Pick<ConsoleTextAttachment, "source">) {
 function consoleTextLevelClass(level: string) {
   const normalized = level.trim().toLowerCase();
   if (normalized.includes("warning")) return "level-warning";
-  if (
-    normalized.includes("error")
-    || normalized.includes("assert")
-    || normalized.includes("exception")
-    || normalized.includes("fatal")
-  ) {
+  if (isUnityConsoleErrorLevel(normalized)) {
     return "level-error";
   }
   return "level-log";
@@ -1506,12 +1497,16 @@ function buildAssetRefsPromptBlock(assetRefs: AssetRefAttachment[]) {
   if (assetRefs.length === 0) return "";
   const lines = assetRefs.map((assetRef) => {
     if (assetRef.kind === "knowledge") {
-      return `- project knowledge: \`${assetRef.path}\` (use \`knowledge_read\`)`;
+      const path = assetRef.path.replace(/\\/g, "/").replace(/^\/+/, "");
+      const readablePath = path.startsWith("Locus/knowledge/")
+        ? path
+        : `Locus/knowledge/${path}`;
+      return `- project knowledge: \`${readablePath}\` (use \`read\`)`;
     }
     const label = assetRef.kind === "sceneObject" ? "scene object" : "asset";
     return `- ${label}: {@${assetRef.path}}`;
   });
-  return `<locus-references>\nUse Unity refs as exact asset anchors. Use project knowledge refs as exact knowledge_read paths.\n${lines.join("\n")}\n</locus-references>`;
+  return `<locus-references>\nUse Unity refs as exact asset anchors. Use project knowledge refs as exact filesystem paths.\n${lines.join("\n")}\n</locus-references>`;
 }
 
 function appendAssetRefsPromptBlock(text: string, assetRefs: AssetRefAttachment[]) {
@@ -1681,25 +1676,32 @@ function clearActionCommandInput() {
   });
 }
 
-async function attachUnityConsoleFromCommand() {
+async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
   if (unityConsoleCommandPending.value) return;
 
+  const operation = filter === "error" ? "unityConsoleErrorCommand" : "unityConsoleCommand";
   unityConsoleCommandPending.value = true;
   try {
     const status = await checkUnityConnectionStatus();
     if (!status.connected) {
       notificationStore.addNotice("error", t("chat.command.unityConsoleDisconnected"), {
-        operation: "unityConsoleCommand",
+        operation,
         replaceOperation: true,
       });
       return;
     }
 
-    const payload = await getUnityConsoleText();
+    const consolePayload = await getUnityConsoleText();
+    const payload = filter === "error"
+      ? filterUnityConsoleErrorPayload(consolePayload)
+      : consolePayload;
     if (!hasUnityConsolePayloadText(payload)) {
       clearActionCommandInput();
-      notificationStore.addNotice("warning", t("chat.command.unityConsoleEmpty"), {
-        operation: "unityConsoleCommand",
+      const messageKey = filter === "error"
+        ? "chat.command.unityConsoleErrorEmpty"
+        : "chat.command.unityConsoleEmpty";
+      notificationStore.addNotice("warning", t(messageKey), {
+        operation,
         replaceOperation: true,
       });
       return;
@@ -1711,7 +1713,7 @@ async function attachUnityConsoleFromCommand() {
     const normalized = normalizeAppError(error);
     notificationStore.addNotice("error", t("chat.command.unityConsoleFailed", normalized.message), {
       code: normalized.code,
-      operation: "unityConsoleCommand",
+      operation,
       replaceOperation: true,
     });
   } finally {
@@ -1775,6 +1777,11 @@ function executeActionCommand(command: CommandDef): boolean {
 
   if (command.commandType === "unity-console") {
     void attachUnityConsoleFromCommand();
+    return true;
+  }
+
+  if (command.commandType === "unity-console-error") {
+    void attachUnityConsoleFromCommand("error");
     return true;
   }
 

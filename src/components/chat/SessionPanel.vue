@@ -10,7 +10,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { Archive, Box, Check, ChevronRight, Folder, FolderInput, FolderOpen, FolderPlus, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
+import { AppWindow, Archive, Box, Check, ChevronRight, Folder, FolderInput, FolderOpen, FolderPlus, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
@@ -35,6 +35,10 @@ import {
   type ViewPackageSummary,
 } from "../../services/view";
 import { openUnityEmbeddedSessionWindow } from "../../services/unity";
+import {
+  openChatSessionWindow,
+  openNewChatSessionWindow,
+} from "../../services/chatSessionWindow";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import { useProjectStore } from "../../stores/project";
@@ -1404,7 +1408,16 @@ function onRowClick(row: VisibleTreeRow, e: MouseEvent) {
   if (!row.node.selectable || !row.node.sessionId) return;
   const id = row.node.sessionId;
 
-  if (e.ctrlKey || e.metaKey) {
+  if (e.ctrlKey) {
+    const session = row.node.session
+      ?? props.sessions.find((candidate) => candidate.id === id);
+    if (session) {
+      void openSessionInWindow(session);
+    }
+    return;
+  }
+
+  if (e.metaKey) {
     const next = new Set(selectedIds.value);
     if (next.has(id)) {
       next.delete(id);
@@ -1451,6 +1464,8 @@ const ctxMenu = ref<{
   ids: string[]; // targets — may include the single right-clicked session or the whole selection
 } | null>(null);
 
+const newSessionCtxMenu = ref<{ x: number; y: number } | null>(null);
+
 const DELETE_CONFIRM_WIDTH = 244;
 const DELETE_CONFIRM_HEIGHT = 136;
 const DELETE_CONFIRM_GAP = 8;
@@ -1464,6 +1479,7 @@ const deleteConfirm = ref<{
 function onContextMenu(e: MouseEvent, session: SessionSummary) {
   e.preventDefault();
   e.stopPropagation();
+  newSessionCtxMenu.value = null;
   deleteConfirm.value = null;
   let ids: string[];
   if (selectedIds.value.size > 1 && selectedIds.value.has(session.id)) {
@@ -1479,7 +1495,24 @@ function onContextMenu(e: MouseEvent, session: SessionSummary) {
 
 function closeCtxMenu() {
   ctxMenu.value = null;
+  newSessionCtxMenu.value = null;
   deleteConfirm.value = null;
+}
+
+function onNewSessionContextMenu(e: MouseEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  ctxMenu.value = null;
+  deleteConfirm.value = null;
+  newSessionCtxMenu.value = { x: e.clientX, y: e.clientY };
+}
+
+function onNewSessionClick(e: MouseEvent) {
+  if (e.ctrlKey) {
+    void openNewSessionInWindow();
+    return;
+  }
+  emit("newChat");
 }
 
 /* Inline rename */
@@ -1601,6 +1634,44 @@ async function ctxOpenSessionInUnity() {
   }
 }
 
+async function openSessionInWindow(session: SessionSummary) {
+  try {
+    await openChatSessionWindow({
+      sessionId: session.id,
+      title: session.title || session.id,
+    });
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openChatSessionWindow",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+async function ctxOpenSessionInWindow() {
+  const menu = ctxMenu.value;
+  if (!menu || menu.ids.length !== 1) return;
+  const session = menu.session;
+  closeCtxMenu();
+  await openSessionInWindow(session);
+}
+
+async function openNewSessionInWindow() {
+  closeCtxMenu();
+  try {
+    await openNewChatSessionWindow(t("chat.session.newSession"));
+  } catch (error) {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openNewChatSessionWindow",
+      skipConsoleLog: true,
+    });
+  }
+}
+
 function ctxArchive() {
   if (ctxMenu.value) performArchive(ctxMenu.value.ids);
 }
@@ -1635,7 +1706,8 @@ function ctxArchive() {
         class="sp-session-item sp-new-session-item"
         :class="{ active: activeSessionId === null }"
         :title="newChatTitle"
-        @click="emit('newChat')"
+        @click="onNewSessionClick"
+        @contextmenu="onNewSessionContextMenu"
       >
         <span class="sp-expand-spacer">
           <span class="sp-new-session-plus" aria-hidden="true">+</span>
@@ -2165,6 +2237,20 @@ function ctxArchive() {
     </Teleport>
 
     <BaseContextMenu
+      v-if="newSessionCtxMenu"
+      class="sp-ctx-menu"
+      :x="newSessionCtxMenu.x"
+      :y="newSessionCtxMenu.y"
+      :min-width="120"
+      @close="closeCtxMenu"
+    >
+      <button type="button" class="sp-ctx-item" @click="openNewSessionInWindow">
+        <LucideIcon :icon="AppWindow" :size="13" />
+        {{ t('chat.session.openInWindow') }}
+      </button>
+    </BaseContextMenu>
+
+    <BaseContextMenu
       v-if="ctxMenu"
       class="sp-ctx-menu"
       :x="ctxMenu.x"
@@ -2174,6 +2260,7 @@ function ctxArchive() {
     >
       <template v-if="ctxMenu.ids.length <= 1">
         <button type="button" class="sp-ctx-item" @click="startRename(ctxMenu!.session)"><LucideIcon :icon="PencilLine" :size="13" />{{ t('chat.session.rename') }}</button>
+        <button type="button" class="sp-ctx-item" @click="ctxOpenSessionInWindow"><LucideIcon :icon="AppWindow" :size="13" />{{ t('chat.session.openInWindow') }}</button>
         <button type="button" class="sp-ctx-item" @click="ctxOpenSessionInUnity"><LucideIcon :icon="Box" :size="13" />{{ t('chat.session.openInUnity') }}</button>
         <button type="button" class="sp-ctx-item" @click="ctxSaveContext(true)"><LucideIcon :icon="Save" :size="13" />{{ t('chat.saveContextWithSystemPrompt') }}</button>
         <button type="button" class="sp-ctx-item" @click="ctxSaveContext(false)"><LucideIcon :icon="Save" :size="13" />{{ t('chat.saveContextWithoutSystemPrompt') }}</button>

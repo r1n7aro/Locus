@@ -41,6 +41,7 @@ import type {
   SessionRunSummary,
   AssistantRenderPart,
   PendingSessionInput,
+  EffortLevel,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -352,6 +353,7 @@ export const useChatStore = defineStore("chat", () => {
   const localFallbackPendingInputGroups = new Set<string>();
   const sessionScrollStates = ref(new Map<string, SessionScrollState>());
   const sessionAgentId = ref<string | null>(null);
+  const sessionEffort = ref<EffortLevel | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
   const sessionAgentLocked = computed(() => !!activeSessionId.value && !!sessionAgentId.value);
   const todoRunBoundaryId = computed(() => {
@@ -447,6 +449,7 @@ export const useChatStore = defineStore("chat", () => {
   const cancelRequestedRunIds = new Map<string, string>();
   let activeSessionSelectionRestoreAttempted = false;
   let activeSessionSelectionPersistSeq = 0;
+  let activeSessionSelectionPersistenceEnabled = true;
   // A cancel clicked while the chat launch is still in flight (no run id yet)
   // is remembered here and re-fired once the run is registered.
   const pendingLaunchCancelRequested = ref(false);
@@ -554,9 +557,25 @@ export const useChatStore = defineStore("chat", () => {
       // Sticky plan mode badge follows the backend session store.
       void refreshSessionPlanState(sessionId);
     }
-    if (options.persist !== false) {
+    if (options.persist ?? activeSessionSelectionPersistenceEnabled) {
       persistActiveSessionSelection(sessionId);
     }
+  }
+
+  function setActiveSessionSelectionPersistence(enabled: boolean) {
+    activeSessionSelectionPersistenceEnabled = enabled;
+  }
+
+  function applyActiveSessionExecutionState(
+    sessionId: string,
+    modelId: string,
+    effort: EffortLevel,
+  ) {
+    if (!sessionId || activeSessionId.value !== sessionId) return;
+    const modelStore = useModelStore();
+    modelStore.applySessionModel(modelId);
+    modelStore.applyContextEffort(effort);
+    sessionEffort.value = effort;
   }
 
   async function restoreActiveSessionSelection(nextSessions: SessionSummary[]) {
@@ -576,7 +595,9 @@ export const useChatStore = defineStore("chat", () => {
 
     const restoredSession = nextSessions.find((session) => session.id === normalizedSessionId);
     if (!restoredSession) {
-      persistActiveSessionSelection(null);
+      if (activeSessionSelectionPersistenceEnabled) {
+        persistActiveSessionSelection(null);
+      }
       return;
     }
 
@@ -635,6 +656,10 @@ export const useChatStore = defineStore("chat", () => {
     undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
     sessionAgentId.value = detail.agentId ?? null;
     activeSessionType.value = detail.sessionType;
+    const modelStore = useModelStore();
+    modelStore.applySessionModel(detail.lastModelId);
+    sessionEffort.value = detail.lastEffort ?? modelStore.defaultEffort;
+    modelStore.applyContextEffort(sessionEffort.value);
     if (detail.agentId) {
       useAgentStore().selectAgent(detail.agentId);
     }
@@ -654,6 +679,7 @@ export const useChatStore = defineStore("chat", () => {
     todoMode.value = "current";
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
+    sessionEffort.value = null;
     activeSessionType.value = null;
     pendingQuestion.value = null;
     pendingToolConfirms.value = [];
@@ -978,6 +1004,10 @@ export const useChatStore = defineStore("chat", () => {
         sessionService.getTodos(id),
         undoEntriesPromise,
       ]);
+
+      if (!detail.lastEffort) {
+        await useModelStore().loadLastEffort();
+      }
 
       if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
       useChatChangesStore().setLatestCompletedRunId(
@@ -1956,11 +1986,14 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  function newChat(options: { persistSelection?: boolean } = {}) {
+  function newChat(options: {
+    persistSelection?: boolean;
+    resetRestoreAttempt?: boolean;
+  } = {}) {
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
-    setActiveSessionSelection(null, { persist: options.persistSelection !== false });
-    if (options.persistSelection === false) {
+    setActiveSessionSelection(null, { persist: options.persistSelection });
+    if (options.resetRestoreAttempt === true) {
       activeSessionSelectionRestoreAttempted = false;
     }
     activeSessionType.value = null;
@@ -1987,7 +2020,9 @@ export const useChatStore = defineStore("chat", () => {
     thinkingPanelContent.value = "";
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
+    sessionEffort.value = null;
     useAgentStore().resetToDefault();
+    useModelStore().resolveSelectedModel(true);
 
     // Clear chat changes for the old session
     useChatChangesStore().clear(oldSessionId);
@@ -2029,7 +2064,9 @@ export const useChatStore = defineStore("chat", () => {
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
     sessionAgentId.value = null;
+    sessionEffort.value = null;
     useAgentStore().resetToDefault();
+    useModelStore().resolveSelectedModel(true);
     const chatChangesStore = useChatChangesStore();
     chatChangesStore.clear(oldSessionId);
     chatChangesStore.closeInlineDiff();
@@ -2374,6 +2411,7 @@ export const useChatStore = defineStore("chat", () => {
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
+      modelStore.applySessionModel(model);
       logChatStreamDebug("chat request resolved", {
         sessionId: sid,
         runId,
@@ -2400,6 +2438,7 @@ export const useChatStore = defineStore("chat", () => {
         activeSessionType.value = resolveSessionType(sid) ?? "chat";
         currentRunId.value = runId;
         sessionAgentId.value = agentStore.selectedAgentId || null;
+        sessionEffort.value = modelStore.effort;
         await refreshSessions();
       }
       if (pendingLaunchCancelRequested.value) {
@@ -2498,6 +2537,7 @@ export const useChatStore = defineStore("chat", () => {
       managedStreamingSessionIds.add(sid);
       currentRunId.value = runId;
       sessionAgentId.value = agentStore.selectedAgentId || null;
+      sessionEffort.value = modelStore.effort;
       await refreshSessions();
       if (pendingLaunchCancelRequested.value) {
         pendingLaunchCancelRequested.value = false;
@@ -2727,6 +2767,21 @@ export const useChatStore = defineStore("chat", () => {
     await loadSessionState(sessionId);
   }
 
+  function applySessionTitleUpdate(sessionId: string, title: string): void {
+    const normalizedTitle = title.trim();
+    if (!sessionId || !normalizedTitle) return;
+
+    const index = sessions.value.findIndex((session) => session.id === sessionId);
+    if (index < 0) {
+      void refreshSessions();
+      return;
+    }
+
+    sessions.value = sessions.value.map((session, sessionIndex) =>
+      sessionIndex === index ? { ...session, title: normalizedTitle } : session,
+    );
+  }
+
   async function checkUndoConflicts(assistantMessageId: string): Promise<UndoConflictInfo[]> {
     if (!activeSessionId.value) return [];
     return undoService.undoCheckConflicts(activeSessionId.value, assistantMessageId);
@@ -2922,6 +2977,7 @@ export const useChatStore = defineStore("chat", () => {
     getSessionScrollState,
     clearSessionScrollState,
     sessionAgentId,
+    sessionEffort,
     toolPermissionMode,
     sessionAgentLocked,
     sessionPlanModes,
@@ -2935,6 +2991,8 @@ export const useChatStore = defineStore("chat", () => {
     toggleToolPermissionMode,
     selectSession,
     syncActiveSessionSelection,
+    setActiveSessionSelectionPersistence,
+    applyActiveSessionExecutionState,
     newChat,
     resetWorkspaceScope,
     openThinkingPanel,
@@ -2954,6 +3012,7 @@ export const useChatStore = defineStore("chat", () => {
     ignoreKnowledgeProposal,
     applyKnowledgeProposal,
     refreshSessionAfterExternalChange,
+    applySessionTitleUpdate,
     checkUndoConflicts,
     checkUndoDirty,
     performUndo,

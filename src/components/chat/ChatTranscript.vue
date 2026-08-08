@@ -131,6 +131,8 @@ const props = withDefaults(defineProps<{
   waitingLabel?: string;
   compactingLabel?: string;
   compactedLabel?: string;
+  compactedContextOpenLabel?: string;
+  enableCompactedContextOpen?: boolean;
   thinkingActiveLabel?: string;
   thoughtDurationLabel?: string;
   thoughtMomentLabel?: string;
@@ -159,6 +161,8 @@ const props = withDefaults(defineProps<{
   waitingLabel: "Waiting for response…",
   compactingLabel: "Compacting context…",
   compactedLabel: "Context compacted",
+  compactedContextOpenLabel: "View compacted context",
+  enableCompactedContextOpen: false,
   thinkingActiveLabel: "Thinking…",
   thoughtDurationLabel: "Thought for {0}s",
   thoughtMomentLabel: "Thought for a moment",
@@ -174,6 +178,7 @@ const emit = defineEmits<{
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
   (e: "openThinking", content: string): void;
   (e: "openImage", src: string): void;
+  (e: "openCompactedContext", messageId: string): void;
   (e: "scroll", event: Event): void;
   (e: "contentClick", event: MouseEvent): void;
   (e: "contentContextmenu", event: MouseEvent): void;
@@ -1449,6 +1454,8 @@ const historyStaticRenderMemoKey = computed(() => [
   props.assistantLabel,
   props.handoffLabel,
   props.compactedLabel,
+  props.compactedContextOpenLabel,
+  props.enableCompactedContextOpen ? "open-compact" : "static-compact",
   props.thoughtDurationLabel,
   props.thoughtMomentLabel,
   displaySettings.rightAlignUserMessages ? "align-user" : "left-user",
@@ -2588,6 +2595,13 @@ function isCompactMarkerGroup(group: MessageGroup) {
   return group.items.length > 0 && group.items.every((item) => isCompactHandoffMessage(item.message));
 }
 
+function openCompactedContext(group: MessageGroup) {
+  if (!props.enableCompactedContextOpen) return;
+  const messageId = group.items[0]?.id;
+  if (!messageId) return;
+  emit("openCompactedContext", messageId);
+}
+
 function shouldRightAlignUserMessageGroup(group: Pick<MessageGroup, "role">) {
   return props.variant === "session" && displaySettings.rightAlignUserMessages && group.role === "user";
 }
@@ -2702,17 +2716,22 @@ function openImage(src: string) {
           v-for="(group, idx) in groupedMessages"
           :key="group.id"
         >
-          <div
+          <button
             v-if="isCompactMarkerGroup(group)"
             v-memo="[group, idx, historyGroupMemoKey(group, idx)]"
+            type="button"
             class="chat-transcript-compact-marker"
-            :class="`is-${variant}`"
+            :class="[`is-${variant}`, { 'is-interactive': enableCompactedContextOpen }]"
+            :disabled="!enableCompactedContextOpen"
+            :title="enableCompactedContextOpen ? compactedContextOpenLabel : undefined"
+            :aria-label="enableCompactedContextOpen ? compactedContextOpenLabel : undefined"
             :data-scroll-anchor-id="group.items[0]?.id"
+            @click.stop="openCompactedContext(group)"
           >
             <span class="chat-transcript-compact-marker-line"></span>
             <span class="chat-transcript-compact-marker-label">{{ compactedLabel }}</span>
             <span class="chat-transcript-compact-marker-line"></span>
-          </div>
+          </button>
 
           <div
             v-else
@@ -3123,7 +3142,7 @@ function openImage(src: string) {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: stable both-edges;
 }
 
 .chat-transcript-content {
@@ -3143,6 +3162,8 @@ function openImage(src: string) {
 
 .chat-transcript-scroll.is-session > .chat-transcript-content {
   box-sizing: border-box;
+  width: min(100%, var(--chat-workspace-content-max-width, 980px));
+  margin-inline: auto;
   padding-bottom: var(--chat-transcript-session-bottom-gap);
 }
 
@@ -3254,13 +3275,41 @@ function openImage(src: string) {
 }
 
 .chat-transcript-compact-marker {
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
+  border: 0;
+  margin: 0;
   color: var(--text-secondary);
+  font: inherit;
   font-size: 12px;
   line-height: 1;
+  text-align: left;
   user-select: none;
+}
+
+.chat-transcript-compact-marker:disabled {
+  opacity: 1;
+}
+
+.chat-transcript-compact-marker.is-interactive {
+  cursor: pointer;
+}
+
+.chat-transcript-compact-marker.is-interactive:hover .chat-transcript-compact-marker-label,
+.chat-transcript-compact-marker.is-interactive:focus-visible .chat-transcript-compact-marker-label {
+  color: var(--text-color);
+}
+
+.chat-transcript-compact-marker.is-interactive:hover .chat-transcript-compact-marker-line,
+.chat-transcript-compact-marker.is-interactive:focus-visible .chat-transcript-compact-marker-line {
+  background: var(--border-strong);
+}
+
+.chat-transcript-compact-marker:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent-color) 55%, transparent);
+  outline-offset: -2px;
 }
 
 .chat-transcript-compact-marker.is-session {

@@ -31,11 +31,15 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
+import { isChatSessionWindowLocation } from "./services/chatSessionWindow";
+import { isWorkspacePageWindowLocation } from "./services/workspacePageWindow";
 import { isPlanViewWindowLocation } from "./services/planViewWindow";
+import { isContextCompactionWindowLocation } from "./services/contextCompactionWindow";
+import { isKnowledgeMarkdownPreviewWindowLocation } from "./services/knowledgeMarkdownPreviewWindow";
+import { isToolFilePreviewWindowLocation } from "./services/toolFilePreviewWindow";
 import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
 import { isExtraWorkdirsWindowLocation } from "./services/extraWorkdirsWindow";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
-import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import SubWindowLoading from "./components/SubWindowLoading.vue";
 
 // Router for the lightweight window.html entry: resolves which standalone
@@ -96,9 +100,34 @@ const WINDOW_KINDS: WindowKindEntry[] = [
     component: asyncWindowComponent(() => import("./components/ChatDiffReviewWindow.vue")),
   },
   {
+    kind: "chat-session",
+    matches: isChatSessionWindowLocation,
+    component: asyncWindowComponent(() => import("./components/ChatSessionWindow.vue")),
+  },
+  {
+    kind: "workspace-page",
+    matches: isWorkspacePageWindowLocation,
+    component: asyncWindowComponent(() => import("./components/WorkspacePageWindow.vue")),
+  },
+  {
     kind: "plan-view",
     matches: isPlanViewWindowLocation,
     component: asyncWindowComponent(() => import("./components/PlanViewWindow.vue")),
+  },
+  {
+    kind: "context-compaction",
+    matches: isContextCompactionWindowLocation,
+    component: asyncWindowComponent(() => import("./components/ContextCompactionWindow.vue")),
+  },
+  {
+    kind: "knowledge-markdown-preview",
+    matches: isKnowledgeMarkdownPreviewWindowLocation,
+    component: asyncWindowComponent(() => import("./components/KnowledgeMarkdownPreviewWindow.vue")),
+  },
+  {
+    kind: "tool-file-preview",
+    matches: isToolFilePreviewWindowLocation,
+    component: asyncWindowComponent(() => import("./components/ToolFilePreviewWindow.vue")),
   },
   {
     kind: "unity-value-editor",
@@ -122,11 +151,6 @@ const WINDOW_KINDS: WindowKindEntry[] = [
     matches: isViewHostWindowLocation,
     component: asyncWindowComponent(() => import("./components/ViewHostWindow.vue")),
     selfRevealing: true,
-  },
-  {
-    kind: "agent-graph",
-    matches: isAgentGraphToolWindowLocation,
-    component: asyncWindowComponent(() => import("./components/AgentGraphToolWindow.vue")),
   },
 ];
 

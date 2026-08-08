@@ -25,7 +25,7 @@ use crate::session::models::{
     TodoSnapshot, UserIntentPayload,
 };
 use crate::session::pending_inputs::QueuePendingInputRequest;
-use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
+use crate::session::store::{CompactedContextOutput, SessionStore, CHILD_SESSION_FORK_ERROR};
 use crate::tool::ToolRegistry;
 use crate::workspace::Workspace;
 use crate::{
@@ -486,6 +486,7 @@ pub async fn get_agent_rendered_env_prompt(
     agent_id: String,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
@@ -503,7 +504,7 @@ pub async fn get_agent_rendered_env_prompt(
         workspace.workspace_id.read().await.clone()
     };
 
-    let instance = AgentInstance::new(
+    let mut instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
         LlmBackend::ClaudeCodeCli,
@@ -522,6 +523,7 @@ pub async fn get_agent_rendered_env_prompt(
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
     );
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance.rendered_env_prompt().await)
 }
@@ -531,6 +533,7 @@ pub async fn get_agent_system_prompt_stats(
     agent_id: String,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
@@ -548,7 +551,7 @@ pub async fn get_agent_system_prompt_stats(
         workspace.workspace_id.read().await.clone()
     };
 
-    let instance = AgentInstance::new(
+    let mut instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
         LlmBackend::ClaudeCodeCli,
@@ -567,6 +570,7 @@ pub async fn get_agent_system_prompt_stats(
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
     );
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance.system_prompt_stats().await)
 }
@@ -696,6 +700,7 @@ pub async fn list_agent_injected_items(
     knowledge_mode: Option<String>,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
     workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
@@ -715,7 +720,7 @@ pub async fn list_agent_injected_items(
     let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
         .map_err(|error| AppError::new("agent.invalid_knowledge_mode", error))?;
 
-    let instance = AgentInstance::new(
+    let mut instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
         LlmBackend::ClaudeCodeCli,
@@ -734,6 +739,7 @@ pub async fn list_agent_injected_items(
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
     );
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance.list_injected_prompt_items().await)
 }
@@ -820,6 +826,7 @@ pub async fn chat(
     text: String,
     session_title: Option<String>,
     agent_id: Option<String>,
+    sdk_agent: Option<crate::sdk::SdkAgentSpec>,
     model: Option<String>,
     effort: Option<String>,
     fast_mode: Option<bool>,
@@ -856,21 +863,50 @@ pub async fn chat(
         workspace.workspace_id.read().await.clone()
     };
 
-    let requested_agent_id = agent_id
+    let is_new_session = session_id.is_none();
+    let session_kind = session_type.as_deref().unwrap_or("chat");
+    let explicit_session_title = session_title
         .as_deref()
-        .map(canonical_agent_id)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
         .map(str::to_string);
+    let codex_model_config = crate::commands::load_codex_model_config().unwrap_or_default();
+    let codex_title_generation_enabled = if codex_model_config.generate_session_titles {
+        let status = codex.lock().await.status();
+        status.authenticated && !status.validation_failed
+    } else {
+        false
+    };
+    let prepared_title_prompt = (is_new_session
+        && session_kind == "chat"
+        && explicit_session_title.is_none()
+        && codex_title_generation_enabled)
+        .then(|| crate::session::title::prepare_session_title_prompt(&text))
+        .flatten();
+    let generated_title_fallback = prepared_title_prompt
+        .as_deref()
+        .and_then(crate::session::title::fallback_session_title);
+
+    let inline_agent_def = sdk_agent.as_ref().map(crate::sdk::SdkAgentSpec::agent_def);
+    let requested_agent_id = inline_agent_def
+        .as_ref()
+        .map(|def| def.id.clone())
+        .or_else(|| {
+            agent_id
+                .as_deref()
+                .map(canonical_agent_id)
+                .map(str::to_string)
+        });
     let sid = match session_id {
         Some(id) => id,
         None => {
-            let title = session_title
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| text.chars().take(20).collect());
+            let title = explicit_session_title.unwrap_or_else(|| text.chars().take(20).collect());
+            let title = generated_title_fallback.unwrap_or(title);
             store.create_session(
                 &title,
                 None,
                 ws_id.as_deref(),
-                session_type.as_deref().unwrap_or("chat"),
+                session_kind,
                 requested_agent_id.as_deref(),
             )?
         }
@@ -881,26 +917,47 @@ pub async fn chat(
         emit_knowledge_proposal_message(&app_handle, store.inner().as_ref(), &sid, message);
     }
 
-    // Enforce session-agent binding: if session already has an agent, use it
-    let effective_agent_id = match store.get_session_agent_id(&sid) {
-        Ok(Some(stored)) => Some(canonical_agent_id(&stored).to_string()),
-        _ => requested_agent_id.clone(),
-    };
-
-    let def = match &effective_agent_id {
-        Some(id) => {
-            let d = registry_snapshot
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("Unknown agent: {}", id))?;
-            Arc::new(d)
+    // Enforce session-agent binding. Python-defined agents resend the full
+    // definition for every turn, while retaining the same session id so the
+    // provider conversation/prompt cache remains reusable.
+    let stored_agent_id = store
+        .get_session_agent_id(&sid)
+        .ok()
+        .flatten()
+        .map(|stored| canonical_agent_id(&stored).to_string());
+    if let (Some(inline), Some(stored)) = (inline_agent_def.as_ref(), stored_agent_id.as_ref()) {
+        if inline.id != *stored {
+            return Err(format!(
+                "Session {} belongs to agent '{}', not '{}'",
+                sid, stored, inline.id
+            )
+            .into());
         }
-        None => {
-            let d = registry_snapshot
-                .default_def()
-                .cloned()
-                .ok_or_else(|| "No agent definitions found".to_string())?;
-            Arc::new(d)
+    }
+    let effective_agent_id = inline_agent_def
+        .as_ref()
+        .map(|def| def.id.clone())
+        .or(stored_agent_id)
+        .or(requested_agent_id.clone());
+
+    let def = if let Some(inline) = inline_agent_def {
+        Arc::new(inline)
+    } else {
+        match &effective_agent_id {
+            Some(id) => {
+                let d = registry_snapshot
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("Unknown agent: {}", id))?;
+                Arc::new(d)
+            }
+            None => {
+                let d = registry_snapshot
+                    .default_def()
+                    .cloned()
+                    .ok_or_else(|| "No agent definitions found".to_string())?;
+                Arc::new(d)
+            }
         }
     };
 
@@ -934,16 +991,11 @@ pub async fn chat(
     } else if is_openai_codex {
         let mut codex_guard = codex.lock().await;
         match codex_guard.access_token().await {
-            Ok(_) => {
-                let transport = crate::commands::load_codex_model_config()
-                    .map(|config| config.transport)
-                    .unwrap_or_default();
-                LlmBackend::OpenAiCodex {
-                    auth: codex.inner().clone(),
-                    transport,
-                    base_url: config.base_url.clone(),
-                }
-            }
+            Ok(_) => LlmBackend::OpenAiCodex {
+                auth: codex.inner().clone(),
+                transport: codex_model_config.transport,
+                base_url: config.base_url.clone(),
+            },
             Err(e) => {
                 return Err(format!("OpenAI Codex token failed (please re-login): {}", e).into());
             }
@@ -979,8 +1031,29 @@ pub async fn chat(
             selected_model
         ).into());
     };
+
+    if let Some(title_prompt) = prepared_title_prompt {
+        let expected_title = store
+            .get_session_title(&sid)?
+            .unwrap_or_else(|| title_prompt.chars().take(20).collect());
+        crate::session::title::spawn_codex_session_title_generation(
+            app_handle.clone(),
+            store.inner().clone(),
+            codex.inner().clone(),
+            codex_model_config.transport,
+            config.base_url.clone(),
+            sid.clone(),
+            expected_title,
+            crate::session::title::SessionTitleGenerationRequest::codex_default(title_prompt),
+            config.debug_enabled(),
+        );
+    }
+
     let reg = registry_snapshot;
-    let tools = tool_registry.inner().clone();
+    let tools = match sdk_agent.as_ref() {
+        Some(spec) => crate::sdk::tool_registry_for_agent(tool_registry.inner().as_ref(), spec)?,
+        None => tool_registry.inner().clone(),
+    };
     let raw = raw_store.inner().clone();
 
     let akd = app_knowledge_dir.0.clone();
@@ -989,6 +1062,7 @@ pub async fn chat(
         .map_err(|error| AppError::new("chat.invalid_knowledge_mode", error).operation("chat"))?;
     let um = Some(undo_manager.inner().clone());
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let idle_cancel_rx = cancel_rx.clone();
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let mut instance = AgentInstance::new(
         def,
@@ -1000,8 +1074,8 @@ pub async fn chat(
         cwd,
         raw,
         ws_id,
-        selected_model,
-        effort,
+        selected_model.clone(),
+        effort.clone(),
         akd,
         aad,
         knowledge_access_mode,
@@ -1010,6 +1084,7 @@ pub async fn chat(
         cancel_rx,
     );
     instance.set_codex_fast_mode(fast_mode.unwrap_or(false));
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
     let knowledge_focus = match (knowledge_doc_type, knowledge_doc_path) {
         (Some(doc_type), Some(path)) if !path.trim().is_empty() => {
             Some(crate::agent::instance::KnowledgeFocusDoc {
@@ -1042,6 +1117,24 @@ pub async fn chat(
                 .operation("chat")
         }
     })?;
+    if let Err(error) = store.set_session_last_model_id(&sid, &selected_model) {
+        let _ = store.update_run_status(&run_id, "error", Some(&error));
+        return Err(AppError::new(
+            "session.model_persist_failed",
+            "Failed to save the session model.",
+        )
+        .detail(error)
+        .operation("chat"));
+    }
+    if let Err(error) = store.set_session_last_effort(&sid, effort.as_deref()) {
+        let _ = store.update_run_status(&run_id, "error", Some(&error));
+        return Err(AppError::new(
+            "session.effort_persist_failed",
+            "Failed to save the session effort.",
+        )
+        .detail(error)
+        .operation("chat"));
+    }
     let store = store.inner().clone();
     let sid_clone = sid.clone();
     let tasks = active_tasks.inner().clone();
@@ -1069,6 +1162,8 @@ pub async fn chat(
         let mut next_mode = effective_mode;
         let mut next_user_intent = user_intent_for_task;
         let mut accepted_pending_input_id: Option<String> = None;
+        let mut next_internal_system_reminder: Option<String> = None;
+        let mut idle_cancel_rx = idle_cancel_rx;
 
         loop {
             let task_result = AssertUnwindSafe(instance.run_with_run_id(
@@ -1089,6 +1184,7 @@ pub async fn chat(
                 next_user_intent.take(),
                 current_run_id.clone(),
                 accepted_pending_input_id.take(),
+                next_internal_system_reminder.take(),
             ))
             .catch_unwind()
             .await;
@@ -1118,29 +1214,60 @@ pub async fn chat(
                 }
             }
 
-            let follow_up = {
-                let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = handle.state();
-                let claimed = match queue_state.lock() {
-                    Ok(mut queue) => queue.claim_after_run(&sid_clone, &current_run_id),
-                    Err(error) => {
-                        eprintln!(
-                            "[Locus] failed to lock pending input queue for session {} run {}: {}",
-                            sid_clone, current_run_id, error
-                        );
-                        None
-                    }
+            let mut async_reminder: Option<String> = None;
+            let follow_up = loop {
+                let claimed = {
+                    let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                        handle.state();
+                    let claimed = match queue_state.lock() {
+                        Ok(mut queue) => queue.claim_after_run(&sid_clone, &current_run_id),
+                        Err(error) => {
+                            eprintln!(
+                                "[Locus] failed to lock pending input queue for session {} run {}: {}",
+                                sid_clone, current_run_id, error
+                            );
+                            None
+                        }
+                    };
+                    claimed
                 };
-                claimed
+                if claimed.is_some() {
+                    break claimed;
+                }
+
+                let async_tasks: tauri::State<'_, Arc<crate::async_tasks::AsyncTaskManager>> =
+                    handle.state();
+                let (notifications, has_pending_notifications) =
+                    async_tasks.take_notifications_and_pending(&sid_clone);
+                if !notifications.is_empty() {
+                    async_reminder = Some(notifications.join("\n\n"));
+                    break None;
+                }
+                if !has_pending_notifications || *idle_cancel_rx.borrow() {
+                    break None;
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                    _ = idle_cancel_rx.changed() => {}
+                }
             };
-            let Some(follow_up) = follow_up else {
+            if follow_up.is_none() && async_reminder.is_none() {
                 break;
-            };
+            }
 
             let next_run_id = generate_chat_run_id(&sid_clone);
             if let Err(error) = store_for_task.try_start_run(&sid_clone, &next_run_id) {
-                let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = handle.state();
-                if let Ok(mut queue) = queue_state.lock() {
-                    queue.restore_claimed(vec![follow_up]);
+                if let Some(follow_up) = follow_up {
+                    let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                        handle.state();
+                    if let Ok(mut queue) = queue_state.lock() {
+                        queue.restore_claimed(vec![follow_up]);
+                    };
+                } else if let Some(reminder) = async_reminder {
+                    let async_tasks: tauri::State<'_, Arc<crate::async_tasks::AsyncTaskManager>> =
+                        handle.state();
+                    async_tasks.enqueue_notification(&sid_clone, reminder);
                 }
                 eprintln!(
                     "[Locus] failed to start queued follow-up for session {} after run {}: {}",
@@ -1156,10 +1283,18 @@ pub async fn chat(
                         task.run_id = next_run_id.clone();
                     }
                     _ => {
-                        let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
-                            handle.state();
-                        if let Ok(mut queue) = queue_state.lock() {
-                            queue.restore_claimed(vec![follow_up]);
+                        if let Some(follow_up) = follow_up {
+                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                                handle.state();
+                            if let Ok(mut queue) = queue_state.lock() {
+                                queue.restore_claimed(vec![follow_up]);
+                            };
+                        } else if let Some(reminder) = async_reminder {
+                            let async_tasks: tauri::State<
+                                '_,
+                                Arc<crate::async_tasks::AsyncTaskManager>,
+                            > = handle.state();
+                            async_tasks.enqueue_notification(&sid_clone, reminder);
                         }
                         if let Err(error) = store_for_task.update_run_status(
                             &next_run_id,
@@ -1176,21 +1311,30 @@ pub async fn chat(
                 }
             }
 
-            accepted_pending_input_id = Some(follow_up.id);
-            next_text = follow_up.text;
-            next_images = follow_up.images.unwrap_or_default();
-            next_asset_refs = follow_up.asset_refs.unwrap_or_default();
-            next_mode = follow_up
-                .mode
-                .clone()
-                .or_else(|| {
-                    follow_up
-                        .user_intent
-                        .as_ref()
-                        .map(|intent| intent.mode.clone())
-                })
-                .unwrap_or_else(|| "build".to_string());
-            next_user_intent = follow_up.user_intent;
+            if let Some(follow_up) = follow_up {
+                accepted_pending_input_id = Some(follow_up.id);
+                next_text = follow_up.text;
+                next_images = follow_up.images.unwrap_or_default();
+                next_asset_refs = follow_up.asset_refs.unwrap_or_default();
+                next_mode = follow_up
+                    .mode
+                    .clone()
+                    .or_else(|| {
+                        follow_up
+                            .user_intent
+                            .as_ref()
+                            .map(|intent| intent.mode.clone())
+                    })
+                    .unwrap_or_else(|| "build".to_string());
+                next_user_intent = follow_up.user_intent;
+            } else {
+                next_text.clear();
+                next_images.clear();
+                next_asset_refs.clear();
+                next_mode = "build".to_string();
+                next_user_intent = None;
+                next_internal_system_reminder = async_reminder;
+            }
             current_run_id = next_run_id;
         }
         let removed = {
@@ -1534,6 +1678,41 @@ pub async fn load_session(
 }
 
 #[tauri::command]
+pub async fn get_compacted_context_output(
+    session_id: String,
+    message_id: String,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<CompactedContextOutput, AppError> {
+    let session_id = session_id.trim();
+    let message_id = message_id.trim();
+    if session_id.is_empty() || message_id.is_empty() {
+        return Err(AppError::new(
+            "session.compacted_context.invalid_target",
+            "A session and compacted message are required.",
+        )
+        .operation("getCompactedContextOutput"));
+    }
+
+    store
+        .get_compacted_context_output(session_id, message_id)
+        .map_err(|error| {
+            AppError::new(
+                "session.compacted_context.read_failed",
+                "Failed to read the compacted context.",
+            )
+            .detail(error)
+            .operation("getCompactedContextOutput")
+        })?
+        .ok_or_else(|| {
+            AppError::new(
+                "session.compacted_context.not_found",
+                "The compacted context is no longer available.",
+            )
+            .operation("getCompactedContextOutput")
+        })
+}
+
+#[tauri::command]
 pub async fn undo_latest_conversation_turn(
     session_id: String,
     app_handle: AppHandle,
@@ -1733,6 +1912,17 @@ pub async fn get_session_usage(
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<TokenUsage, AppError> {
     store.get_token_usage(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_model_usage_stats(
+    days: Option<u32>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<crate::commands::ModelUsageReport, AppError> {
+    if days.is_some_and(|value| value == 0 || value > 3650) {
+        return Err("Usage statistics range must be between 1 and 3650 days".into());
+    }
+    store.get_model_usage_report(days).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -2602,6 +2792,8 @@ migration is written as `empty`.\n\n",
         "sessionId": detail.id,
         "title": export_optional_text(Some(&detail.title)),
         "agentId": export_optional_text(detail.agent_id.as_deref()),
+        "lastModelId": export_optional_text(detail.last_model_id.as_deref()),
+        "lastEffort": export_optional_text(detail.last_effort.as_deref()),
         "sessionType": export_optional_text(Some(&detail.session_type)),
         "parentSessionId": export_optional_text(detail.parent_session_id.as_deref()),
         "latestCompletedRunId": export_optional_text(detail.latest_completed_run_id.as_deref()),
@@ -3374,6 +3566,8 @@ mod tests {
             id: "session-1".to_string(),
             title: "Migrated Session".to_string(),
             agent_id: None,
+            last_model_id: None,
+            last_effort: None,
             session_type: "chat".to_string(),
             parent_session_id: None,
             latest_completed_run_id: None,
@@ -3407,6 +3601,8 @@ mod tests {
 
         assert!(markdown.contains("session-store-fallback"));
         assert!(markdown.contains("\"agentId\": \"empty\""));
+        assert!(markdown.contains("\"lastModelId\": \"empty\""));
+        assert!(markdown.contains("\"lastEffort\": \"empty\""));
         assert!(markdown.contains("\"parentSessionId\": \"empty\""));
         assert!(markdown.contains("\"latestCompletedRunId\": \"empty\""));
         assert!(markdown.contains("## Pending Inputs"));
@@ -3431,6 +3627,8 @@ mod tests {
             id: "session-1".to_string(),
             title: "Migrated Session".to_string(),
             agent_id: None,
+            last_model_id: None,
+            last_effort: None,
             session_type: "chat".to_string(),
             parent_session_id: None,
             latest_completed_run_id: None,
@@ -3486,6 +3684,8 @@ mod tests {
             id: "session-2".to_string(),
             title: "Session With Agent".to_string(),
             agent_id: Some("dev".to_string()),
+            last_model_id: Some("openai/gpt-5.6-sol".to_string()),
+            last_effort: Some("high".to_string()),
             session_type: "chat".to_string(),
             parent_session_id: None,
             latest_completed_run_id: Some("run-2".to_string()),
@@ -3508,6 +3708,8 @@ mod tests {
         assert!(markdown.contains("## System Prompt"));
         assert!(markdown.contains("You are a helpful assistant."));
         assert!(markdown.contains("current agent definition"));
+        assert!(markdown.contains("\"lastModelId\": \"openai/gpt-5.6-sol\""));
+        assert!(markdown.contains("\"lastEffort\": \"high\""));
     }
 
     #[test]
@@ -3594,6 +3796,8 @@ mod tests {
         assert!(markdown.contains("session-store-fallback"));
         assert!(markdown.contains("历史消息"));
         assert!(markdown.contains("\"latestCompletedRunId\": \"empty\""));
+        assert!(markdown.contains("\"lastModelId\": \"empty\""));
+        assert!(markdown.contains("\"lastEffort\": \"empty\""));
         assert!(markdown.contains("\"promptPrefix\": \"empty\""));
         assert!(markdown.contains("\"promptSuffix\": \"empty\""));
         assert!(markdown.contains("\"contextTokens\": \"empty\""));

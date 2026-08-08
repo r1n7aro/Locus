@@ -5,16 +5,7 @@ import { estimateTextTokens } from "../../utils/tokenEstimate";
 export { estimateTextTokens };
 
 const KNOWLEDGE_TOOL_NAMES = new Set([
-  "knowledge_list",
   "knowledge_query",
-  "knowledge_read",
-  "knowledge_create",
-  "knowledge_delete",
-  "knowledge_move",
-  "knowledge_edit",
-  "skill_create",
-  "skill_reload",
-  "skill_list",
 ]);
 
 function asRecord(value: unknown): Record<string, unknown> | null {

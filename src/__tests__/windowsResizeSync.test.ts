@@ -18,6 +18,7 @@ describe("native Windows resize sync", () => {
 
     expect(lib).toContain("mod windows_resize_sync;");
     expect(lib).toContain("windows_resize_sync::install_for_main_window(app)");
+    expect(lib).toContain("windows_resize_sync::sync_after_page_load(webview)");
     expect(lib).toContain("mod windows_window_frame;");
     expect(lib).toContain("windows_window_frame::restore_main_window_frame(app)");
     expect(cargo).toContain('webview2-com = "0.38.2"');
@@ -33,6 +34,15 @@ describe("native Windows resize sync", () => {
     expect(frame).toContain("DWMWCP_ROUND");
     expect(sync).toContain("WM_WINDOWPOSCHANGED");
     expect(sync).toContain("WM_WINDOWPOSCHANGING");
+    expect(sync).toContain("let webview = window.as_ref();");
+    expect(sync).toContain("fn apply_webview_client_bounds(");
+    expect(sync).toContain(".set_bounds(bounds)");
+    expect(sync).toContain("position: PhysicalPosition::new(0, 0).into()");
+    expect(sync).toContain("size: client_size.into()");
+    expect(sync).toContain("platform_webview.controller().SetBounds(native_bounds)");
+    expect(sync).toContain(".set_auto_resize(true)");
+    expect(sync).toContain("pub fn sync_after_page_load(webview: &tauri::Webview)");
+    expect(sync).toContain('apply_webview_client_bounds(webview, client_size, "page load")');
     expect(sync).not.toContain("WM_SIZING");
     expect(sync).toContain('NATIVE_CLIENT_SIZE_EVENT: &str = "locus-native-window-client-size"');
     expect(sync).toContain("struct NativeWindowClientSize");
@@ -70,6 +80,10 @@ describe("native Windows resize sync", () => {
     expect(sync).toContain("if state.live_resize");
     expect(sync).toContain("notify_parent_position_changed(state)");
     expect(sync).toContain("TAURI_DRAG_RESIZE_BORDERS");
+    expect(sync).toContain("Chrome_RenderWidgetHostHWND");
+    expect(sync).toContain("render_widget_hwnd");
+    expect(sync).toContain("find_render_widget_hwnd");
+    expect(sync).toContain("find_render_widget_proc");
     expect(sync).toContain("EnumChildWindows");
     expect(sync).toContain("state.controller.SetBounds(bounds)");
     expect(sync).toContain("SetWindowPos(");

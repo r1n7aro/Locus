@@ -9,7 +9,8 @@ export type IntentCommandType =
   | "clear"
   | "fork"
   | "undo"
-  | "unity-console";
+  | "unity-console"
+  | "unity-console-error";
 
 export interface ComposerIntentState {
   mode: IntentMode;

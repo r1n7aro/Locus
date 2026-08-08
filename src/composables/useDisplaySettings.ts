@@ -9,6 +9,7 @@ export type DiffReviewTarget = "inline" | "window";
 export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
 export type PlanApprovalTarget = "card" | "window";
+export type MemoryFileOpenTarget = "window" | "knowledge";
 export type AssetRefClickAction =
   | "unitySelect"
   | "fileBrowser"
@@ -46,12 +47,16 @@ export interface DisplaySettings {
   gitDiffReviewTarget: DiffReviewTarget;
   /** Default surface for the exit_plan_mode approval (inline card or standalone window) */
   planApprovalTarget: PlanApprovalTarget;
+  /** Default target when opening a Memory document reference */
+  memoryFileOpenTarget: MemoryFileOpenTarget;
   /** Default action when clicking a Unity asset reference in chat messages */
   assetRefClickAction: AssetRefClickAction;
   /** Click action override for chat running inside the Unity embed window */
   unityEmbedAssetRefClickAction: AssetRefClickAction;
   /** Right-align user messages in the session transcript */
   rightAlignUserMessages: boolean;
+  /** Show the user-turn navigation rail when the transcript has enough left gutter */
+  showTurnNavigationRail: boolean;
   /** Collapse completed tool call batches in chat transcript */
   compactToolCalls: boolean;
   /** Hide completed thinking blocks in chat transcript */
@@ -125,11 +130,13 @@ const defaults: DisplaySettings = {
   chatDiffReviewTarget: "window",
   gitDiffReviewTarget: "window",
   planApprovalTarget: "card",
+  memoryFileOpenTarget: "knowledge",
   assetRefClickAction: "locusInspectorAuto",
   // Inside the Unity embed window the editor's own Inspector is one click
   // away, so asset/GameObject refs open there by default.
   unityEmbedAssetRefClickAction: "unityInspector",
   rightAlignUserMessages: true,
+  showTurnNavigationRail: true,
   compactToolCalls: true,
   hideThinkingBlocks: true,
   showViewsInSessionPanel: true,

@@ -4,3 +4,4 @@ pub mod models;
 pub mod pending_inputs;
 pub mod runtime;
 pub mod store;
+pub mod title;

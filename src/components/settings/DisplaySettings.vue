@@ -2,7 +2,14 @@
 import { computed, ref, onMounted } from "vue";
 import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
-import { useDisplaySettings, type AssetRefClickAction, type DiffReviewTarget, type FontSlot, type PlanApprovalTarget } from "../../composables/useDisplaySettings";
+import {
+  useDisplaySettings,
+  type AssetRefClickAction,
+  type DiffReviewTarget,
+  type FontSlot,
+  type MemoryFileOpenTarget,
+  type PlanApprovalTarget,
+} from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
 import {
@@ -47,6 +54,11 @@ const diffReviewTargetOptions = computed(() => [
 const planApprovalTargetOptions = computed(() => [
   { value: "card", label: t("chat.plan.approvalTarget.card") },
   { value: "window", label: t("chat.plan.approvalTarget.window") },
+]);
+
+const memoryFileOpenTargetOptions = computed(() => [
+  { value: "window", label: t("settings.display.memoryFileOpenWindow") },
+  { value: "knowledge", label: t("settings.display.memoryFileOpenKnowledge") },
 ]);
 
 const assetRefClickActionOptions = computed(() => [
@@ -294,6 +306,15 @@ async function updateViewWindowsAboveMain(value: boolean) {
 
     <div class="toggle-row">
       <BaseSwitch
+        :model-value="display.showTurnNavigationRail"
+        :aria-label="t('settings.display.showTurnNavigationRail')"
+        @update:model-value="setDisplay('showTurnNavigationRail', $event)"
+      />
+      <span>{{ t("settings.display.showTurnNavigationRail") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
         :model-value="display.compactToolCalls"
         :aria-label="t('settings.display.compactToolCalls')"
         @update:model-value="setDisplay('compactToolCalls', $event)"
@@ -386,6 +407,23 @@ async function updateViewWindowsAboveMain(value: boolean) {
         :aria-label="t('chat.plan.approvalTargetLabel')"
         size="sm"
         @update:model-value="setDisplay('planApprovalTarget', $event as PlanApprovalTarget)"
+      />
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.memoryFileOpenTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.memoryFileOpenDesc") }}</p>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.memoryFileOpenTarget") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.memoryFileOpenTarget"
+        :options="memoryFileOpenTargetOptions"
+        :aria-label="t('settings.display.memoryFileOpenTarget')"
+        size="sm"
+        @update:model-value="setDisplay('memoryFileOpenTarget', $event as MemoryFileOpenTarget)"
       />
     </div>
   </div>

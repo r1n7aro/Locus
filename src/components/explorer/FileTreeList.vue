@@ -1,12 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import {
-  createAnimationFrameResizeObserver,
-  type ResizeObserverHandle,
-} from "../../composables/resizeObserver";
 
 interface FileTreeListItem {
   key: string;
+  [field: string]: any;
 }
 
 const props = withDefaults(defineProps<{
@@ -26,13 +23,20 @@ const scrollRef = ref<HTMLElement | null>(null);
 const scrollTop = ref(0);
 const viewportHeight = ref(0);
 
-let resizeObserver: ResizeObserverHandle | null = null;
+let resizeObserver: ResizeObserver | null = null;
 let scrollFrame = 0;
 
 function updateViewportMetrics() {
   const element = scrollRef.value;
-  scrollTop.value = element?.scrollTop ?? 0;
-  viewportHeight.value = element?.clientHeight ?? 0;
+  const nextScrollTop = element?.scrollTop ?? 0;
+  const nextViewportHeight = element?.clientHeight ?? 0;
+  if (scrollTop.value !== nextScrollTop) scrollTop.value = nextScrollTop;
+  // Tabs are kept mounted with display:none. Preserve the last usable height
+  // while hidden so the virtual window does not collapse to 17 rows and then
+  // repopulate on the first visible frame.
+  if (nextViewportHeight > 0 || viewportHeight.value === 0) {
+    if (viewportHeight.value !== nextViewportHeight) viewportHeight.value = nextViewportHeight;
+  }
 }
 
 function scheduleViewportMetrics() {
@@ -56,7 +60,13 @@ const virtualWindow = computed(() => {
     };
   }
 
-  const visibleCount = Math.max(1, Math.ceil(viewportHeight.value / rowHeight));
+  const fallbackViewportHeight = typeof window === "undefined"
+    ? rowHeight * 16
+    : Math.max(rowHeight, window.innerHeight);
+  const effectiveViewportHeight = viewportHeight.value > 0
+    ? viewportHeight.value
+    : fallbackViewportHeight;
+  const visibleCount = Math.max(1, Math.ceil(effectiveViewportHeight / rowHeight));
   const start = Math.max(0, Math.floor(scrollTop.value / rowHeight) - props.overscan);
   const end = Math.min(total, start + visibleCount + props.overscan * 2);
 
@@ -117,7 +127,9 @@ defineExpose({ scrollToIndex });
 onMounted(() => {
   updateViewportMetrics();
   if (scrollRef.value && typeof ResizeObserver !== "undefined") {
-    resizeObserver = createAnimationFrameResizeObserver(updateViewportMetrics);
+    // ResizeObserver runs before paint. Updating directly here lets a hidden
+    // tab restore its virtual window in the same frame it becomes visible.
+    resizeObserver = new ResizeObserver(updateViewportMetrics);
     resizeObserver?.observe(scrollRef.value);
   }
 });

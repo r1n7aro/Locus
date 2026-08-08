@@ -18,11 +18,11 @@ import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import ChatTranscript from "./chat/ChatTranscript.vue";
+import ChatTurnNavigationRail from "./chat/ChatTurnNavigationRail.vue";
 import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
-import SheetCard from "./chat/SheetCard.vue";
 import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
@@ -33,6 +33,7 @@ import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
+import { openContextCompactionWindow } from "../services/contextCompactionWindow";
 import type { LocusAssetInspectorWindowPayload } from "../services/locusAssetInspectorWindow";
 import { openLocusAssetInspector } from "../composables/useLocusAssetInspectorPanel";
 import { normalizeAppError } from "../services/errors";
@@ -84,6 +85,7 @@ import {
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import {
   buildChatMessageClipboardPayload,
@@ -108,6 +110,10 @@ const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
 const { state: displaySettings } = useDisplaySettings();
+const {
+  openDocument: openKnowledgeDocument,
+  openInKnowledge: openKnowledgeDocumentInKnowledge,
+} = useKnowledgeDocumentOpen();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
 const planModeActive = computed(() => chatStore.activeSessionPlanMode);
@@ -236,7 +242,13 @@ const props = defineProps<{
   layoutMode?: ChatLayoutMode;
   defaultSessionPanelCollapsed?: boolean;
   sessionPanelStorageScope?: string;
+  showSessionNavigation?: boolean;
+  contentStartInset?: number;
 }>();
+
+const chatContentStyle = computed(() => ({
+  paddingLeft: `${Math.max(0, props.contentStartInset ?? 0)}px`,
+}));
 
 function hasRunningUnityRecompile(calls: ToolCallDisplay[] | undefined): boolean {
   return !!calls?.some((call) =>
@@ -713,11 +725,14 @@ function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
 }
 
 function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
-  uiStore.stageKnowledgeSelection({
-    dashboard: docType,
-    path,
+  void openKnowledgeDocument(docType, path).catch((error) => {
+    const err = normalizeAppError(error);
+    notificationStore.addNotice("warning", t("chat.knowledgeRef.openFailed", err.message), {
+      code: err.code,
+      operation: "knowledgeRef",
+      replaceOperation: true,
+    });
   });
-  uiStore.setTab("knowledge");
 }
 
 function handleUnityAssetInspectorClick(filePath: string) {
@@ -956,6 +971,20 @@ async function openInlineDiffInWindow() {
   }
 }
 
+async function openCompactedContext(messageId: string) {
+  const sessionId = props.activeSessionId?.trim();
+  if (!sessionId || !messageId.trim()) return;
+  try {
+    await openContextCompactionWindow({ sessionId, messageId });
+  } catch (cause) {
+    const err = normalizeAppError(cause);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openContextCompactionWindow",
+    });
+  }
+}
+
 async function doAssetRefShowInFolder() {
   const target = assetRefCtxMenu.value?.target;
   if (!target) return;
@@ -980,11 +1009,7 @@ function doAssetRefOpenInKnowledge() {
   const target = assetRefCtxMenu.value?.target;
   if (!target || target.kind !== "knowledge") return;
   closeAssetRefContextMenu();
-  uiStore.stageKnowledgeSelection({
-    dashboard: target.docType,
-    path: target.path,
-  });
-  uiStore.setTab("knowledge");
+  openKnowledgeDocumentInKnowledge(target.docType, target.path);
 }
 
 async function doAssetRefSelectInUnity() {
@@ -1132,6 +1157,7 @@ const inputText = ref("");
 const composerDrafts = ref(new Map<string, string>());
 const composerPanelRef = ref<InstanceType<typeof RichChatInput> | null>(null);
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
+const transcriptScrollElement = computed(() => transcriptRef.value?.getScrollElement() ?? null);
 
 function draftSessionKey(sessionId: string | null) {
   return sessionId ?? NEW_CHAT_DRAFT_KEY;
@@ -2432,9 +2458,15 @@ const resolvedLayoutMode = computed<ResolvedChatLayoutMode>(() => {
 });
 const isVerticalLayout = computed(() => resolvedLayoutMode.value === "vertical");
 const showSessionPanel = computed(() =>
-  !showInlineDiff.value && !isVerticalLayout.value && !sessionPanelCollapsed.value,
+  props.showSessionNavigation !== false
+  && !showInlineDiff.value
+  && !isVerticalLayout.value
+  && !sessionPanelCollapsed.value,
 );
-const showSessionCompactPicker = computed(() => isVerticalLayout.value || sessionPanelCollapsed.value);
+const showSessionCompactPicker = computed(() =>
+  props.showSessionNavigation !== false
+  && (isVerticalLayout.value || sessionPanelCollapsed.value),
+);
 
 watch(
   resolvedLayoutMode,
@@ -2714,6 +2746,7 @@ onUnmounted(() => {
     </div>
 
     <SessionPanel
+      v-if="showSessionNavigation !== false"
       v-show="showSessionPanel"
       :sessions="sessions"
       :active-session-id="activeSessionId"
@@ -2730,12 +2763,18 @@ onUnmounted(() => {
       @toggle-panel-collapsed="setSessionPanelCollapsed(true)"
     />
 
-    <div v-show="showSessionPanel" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
+    <div
+      v-if="showSessionNavigation !== false"
+      v-show="showSessionPanel"
+      class="session-divider"
+      @mousedown="onSessionSplitterMouseDown"
+    ></div>
 
     <div
       v-show="!showInlineDiff"
       class="chat-view"
       :class="{ 'is-vertical-layout': isVerticalLayout }"
+      :style="chatContentStyle"
     >
       <SessionCompactPicker
         v-if="showSessionCompactPicker"
@@ -2776,6 +2815,8 @@ onUnmounted(() => {
           :waiting-label="t('chat.transcript.waiting')"
           :compacting-label="t('chat.transcript.compacting')"
           :compacted-label="t('chat.transcript.compacted')"
+          :compacted-context-open-label="t('chat.transcript.openCompactedContext')"
+          :enable-compacted-context-open="!!activeSessionId"
           :thinking-active-label="t('chat.transcript.thinking')"
           :thought-duration-label="t('chat.transcript.thoughtDuration', '{0}')"
           :thought-moment-label="t('chat.transcript.thoughtMoment')"
@@ -2788,6 +2829,7 @@ onUnmounted(() => {
           @content-contextmenu="handleContentContextMenu"
           @open-thinking="emit('openThinking', $event)"
           @open-image="openLightbox"
+          @open-compacted-context="openCompactedContext"
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
           @ignore-knowledge-proposal="chatStore.ignoreKnowledgeProposal"
           @tool-handoff-quiet-change="handleToolHandoffQuietChange"
@@ -2795,6 +2837,12 @@ onUnmounted(() => {
           @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
         >
         </ChatTranscript>
+        <ChatTurnNavigationRail
+          v-if="displaySettings.showTurnNavigationRail"
+          :messages="messages"
+          :scroll-element="transcriptScrollElement"
+          @navigate="markMessagesUserScrollIntent"
+        />
         <div v-if="showWelcomeState" class="chat-empty-overlay">
           <div class="empty-state">
             <div class="empty-icon">L</div>
@@ -2835,13 +2883,8 @@ onUnmounted(() => {
         </BaseButton>
       </div>
 
-      <SheetCard
-        v-if="pendingQuestion && pendingQuestion.sheet && !isViewingSubagent"
-        :question="pendingQuestion"
-        @answer="handleQuestionAnswer"
-      />
       <AskUserCard
-        v-else-if="pendingQuestion && !isViewingSubagent"
+        v-if="pendingQuestion && !isViewingSubagent"
         :question="pendingQuestion"
         @answer="handleQuestionAnswer"
       />
@@ -2885,122 +2928,124 @@ onUnmounted(() => {
         'is-controls-switching': inputControlsSwitching,
       }"
     >
-      <div class="input-controls-toggle-zone">
-        <button
-          class="input-controls-toggle ui-select-none"
-          :class="{ 'is-collapsed': inputControlsCollapsed }"
-          type="button"
-          :title="inputControlsToggleTitle"
-          :aria-label="inputControlsToggleTitle"
-          :aria-pressed="inputControlsCollapsed"
-          @click="toggleInputControlsCollapsed"
-        >
-          <svg
-            v-if="inputControlsCollapsed"
-            class="input-controls-toggle-icon"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M4 10l4-4 4 4" />
-          </svg>
-          <svg
-            v-else
-            class="input-controls-toggle-icon"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M4 6l4 4 4-4" />
-          </svg>
-        </button>
-      </div>
-      <div v-if="!inputControlsCollapsed" class="input-backdrop-row">
-        <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
-          <ChatStatusIndicators
-            :unity-connected="unityConnected"
-            :unity-plugin-status="unityPluginStatus"
-            :unity-plugin-installing="unityPluginInstalling"
-            :unity-launching="unityLaunching"
-            :unity-launch-state="unityLaunchState"
-            :unity-connection-status="unityConnectionStatus"
-            :unity-recompiling="unityRecompileActive"
-            :working-dir="workingDir"
-            :is-unity-project="isUnityProject"
-            :scan-phase="scanPhase"
-            :last-scan-stats="lastScanStats"
-            :knowledge-access-mode="knowledgeAccessMode"
-            :selected-agent-id="selectedAgentId"
-            @start-scan="emit('startScan')"
-            @install-plugin="emit('installPlugin')"
-            @launch-unity-project="emit('launchUnityProject')"
-            @update-knowledge-access-mode="setKnowledgeAccessMode"
-          />
-        </div>
-        <div class="input-backdrop-action">
+      <div class="chat-input-frame">
+        <div class="input-controls-toggle-zone">
           <button
-            v-if="!isViewingSubagent && hasPanelToggleRow"
-            class="changes-toggle-btn ui-select-none"
-            :class="{ 'is-active': chatChangesStore.currentPanelVisible }"
+            class="input-controls-toggle ui-select-none"
+            :class="{ 'is-collapsed': inputControlsCollapsed }"
             type="button"
-            :disabled="isStreaming"
-            :aria-pressed="chatChangesStore.currentPanelVisible"
-            :aria-label="t('chat.changes.toggle')"
-            @click="chatChangesStore.togglePanel()"
+            :title="inputControlsToggleTitle"
+            :aria-label="inputControlsToggleTitle"
+            :aria-pressed="inputControlsCollapsed"
+            @click="toggleInputControlsCollapsed"
           >
-            <LucideIcon :icon="FileDiff" :size="14" />
-            <span class="changes-toggle-label">{{ t('chat.changes.toggle') }}</span>
+            <svg
+              v-if="inputControlsCollapsed"
+              class="input-controls-toggle-icon"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M4 10l4-4 4 4" />
+            </svg>
+            <svg
+              v-else
+              class="input-controls-toggle-icon"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M4 6l4 4 4-4" />
+            </svg>
           </button>
         </div>
+        <div v-if="!inputControlsCollapsed" class="input-backdrop-row">
+          <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
+            <ChatStatusIndicators
+              :unity-connected="unityConnected"
+              :unity-plugin-status="unityPluginStatus"
+              :unity-plugin-installing="unityPluginInstalling"
+              :unity-launching="unityLaunching"
+              :unity-launch-state="unityLaunchState"
+              :unity-connection-status="unityConnectionStatus"
+              :unity-recompiling="unityRecompileActive"
+              :working-dir="workingDir"
+              :is-unity-project="isUnityProject"
+              :scan-phase="scanPhase"
+              :last-scan-stats="lastScanStats"
+              :knowledge-access-mode="knowledgeAccessMode"
+              :selected-agent-id="selectedAgentId"
+              @start-scan="emit('startScan')"
+              @install-plugin="emit('installPlugin')"
+              @launch-unity-project="emit('launchUnityProject')"
+              @update-knowledge-access-mode="setKnowledgeAccessMode"
+            />
+          </div>
+          <div class="input-backdrop-action">
+            <button
+              v-if="!isViewingSubagent && hasPanelToggleRow"
+              class="changes-toggle-btn ui-select-none"
+              :class="{ 'is-active': chatChangesStore.currentPanelVisible }"
+              type="button"
+              :disabled="isStreaming"
+              :aria-pressed="chatChangesStore.currentPanelVisible"
+              :aria-label="t('chat.changes.toggle')"
+              @click="chatChangesStore.togglePanel()"
+            >
+              <LucideIcon :icon="FileDiff" :size="14" />
+              <span class="changes-toggle-label">{{ t('chat.changes.toggle') }}</span>
+            </button>
+          </div>
+        </div>
+        <RichChatInput
+          ref="composerPanelRef"
+          v-model="inputText"
+          :selected-agent-id="selectedAgentId"
+          :skills="skills"
+          :placeholder="chatInputPlaceholder"
+          :is-streaming="isStreaming"
+          :cancelling="isCancelling"
+          :send-label="isStreaming ? runningSendLabel : t('common.send')"
+          :cancel-label="t('common.cancel')"
+          :compact="inputControlsCollapsed"
+          :asset-ref-sync-key="composerAssetRefSyncKey"
+          :message-history="messages"
+          @send="handleComposerSend"
+          @compact="emit('compact')"
+          @fork="emit('fork')"
+          @undo="openUndoChooser"
+          @clear="handleNewChatRequest"
+          @cancel="emit('cancel')"
+        >
+          <template v-if="!inputControlsCollapsed" #footer-start>
+            <ModelEffortSelector
+              align="start"
+              :models="models"
+              :selected-id="selectedModelId"
+              :effort="effort"
+              :efforts="effortLevels"
+              :effort-supported="effortSupported"
+              :fast-mode-enabled="fastModeEnabled"
+              :fast-mode-available="fastModeAvailable"
+              :disabled="isStreaming"
+              @select-model="emit('selectModel', $event)"
+              @select-effort="emit('selectEffort', $event)"
+              @select-fast-mode="emit('selectFastMode', $event)"
+            />
+            <TokenUsageBar
+              :token-usage="tokenUsage"
+            />
+          </template>
+        </RichChatInput>
       </div>
-      <RichChatInput
-        ref="composerPanelRef"
-        v-model="inputText"
-        :selected-agent-id="selectedAgentId"
-        :skills="skills"
-        :placeholder="chatInputPlaceholder"
-        :is-streaming="isStreaming"
-        :cancelling="isCancelling"
-        :send-label="isStreaming ? runningSendLabel : t('common.send')"
-        :cancel-label="t('common.cancel')"
-        :compact="inputControlsCollapsed"
-        :asset-ref-sync-key="composerAssetRefSyncKey"
-        :message-history="messages"
-        @send="handleComposerSend"
-        @compact="emit('compact')"
-        @fork="emit('fork')"
-        @undo="openUndoChooser"
-        @clear="handleNewChatRequest"
-        @cancel="emit('cancel')"
-      >
-        <template v-if="!inputControlsCollapsed" #footer-start>
-          <ModelEffortSelector
-            align="start"
-            :models="models"
-            :selected-id="selectedModelId"
-            :effort="effort"
-            :efforts="effortLevels"
-            :effort-supported="effortSupported"
-            :fast-mode-enabled="fastModeEnabled"
-            :fast-mode-available="fastModeAvailable"
-            :disabled="isStreaming"
-            @select-model="emit('selectModel', $event)"
-            @select-effort="emit('selectEffort', $event)"
-            @select-fast-mode="emit('selectFastMode', $event)"
-          />
-          <TokenUsageBar
-            :token-usage="tokenUsage"
-          />
-        </template>
-      </RichChatInput>
     </div>
     </div><!-- /chat-view -->
 
@@ -3491,6 +3536,7 @@ onUnmounted(() => {
 }
 
 .chat-view {
+  --chat-workspace-content-max-width: 980px;
   z-index: 2;
   flex: 1 1 0;
   display: flex;
@@ -3567,12 +3613,23 @@ onUnmounted(() => {
   width: 100%;
   min-width: 0;
   padding: 12px 24px 18px;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-color);
+  border-top: 0;
+  background: transparent;
 }
 
 .input-area.is-controls-collapsed {
   padding-bottom: 14px;
+}
+
+.chat-input-frame {
+  position: relative;
+  width: min(100%, var(--chat-workspace-content-max-width));
+  min-width: 0;
+  margin: 0 auto;
+}
+
+.chat-input-frame :deep(.chat-composer:not(.is-compact):not(.has-top-extension)) {
+  min-height: 104px;
 }
 
 .input-backdrop-row {
@@ -3681,7 +3738,9 @@ onUnmounted(() => {
 }
 
 .chat-pending-stack {
+  width: min(100%, var(--chat-workspace-content-max-width));
   min-width: 0;
+  margin-inline: auto;
 }
 
 .chat-view.is-vertical-layout :deep(.chat-transcript-scroll.is-session) {

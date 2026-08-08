@@ -193,7 +193,9 @@ fn build_sub_window(
             sized
         }
         // Pool windows park off-screen until a claim positions them.
-        None => builder.inner_size(920.0, 720.0).position(-32000.0, -32000.0),
+        None => builder
+            .inner_size(920.0, 720.0)
+            .position(-32000.0, -32000.0),
     };
     if let Some(main_window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
         builder = builder
@@ -371,7 +373,9 @@ fn open_sub_window_inner(
     let url = format!("{}{}", SUB_WINDOW_ROUTE_PREFIX, request.query);
     build_sub_window(app_handle, &label, &url, Some(&request))?;
     if let Ok(mut state) = sub_window_pool_state().lock() {
-        state.claimed_queries.insert(kind.clone(), request.query.clone());
+        state
+            .claimed_queries
+            .insert(kind.clone(), request.query.clone());
         state.claimed.insert(kind, label.clone());
     }
     if let Err(error) = ensure_sub_window_pool_window(app_handle) {
@@ -447,10 +451,7 @@ pub async fn sub_window_pool_prepare(
 }
 
 #[tauri::command]
-pub async fn sub_window_pool_ready(
-    label: String,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
+pub async fn sub_window_pool_ready(label: String, app_handle: AppHandle) -> Result<(), AppError> {
     mark_sub_window_pool_ready(&app_handle, &label).map_err(Into::into)
 }
 

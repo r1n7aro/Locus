@@ -13,7 +13,7 @@ use super::models::{
     SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use super::runtime::SessionRuntimeRegistry;
-use crate::commands::TokenUsage;
+use crate::commands::{ModelUsageGroup, ModelUsageMetrics, ModelUsageReport, TokenUsage};
 use crate::compact;
 
 #[derive(Clone)]
@@ -22,6 +22,36 @@ pub struct SessionStore {
     tool_results_root: PathBuf,
     event_writer: Arc<SessionEventWriter>,
     runtime: Arc<SessionRuntimeRegistry>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactedContextMessageOutput {
+    pub id: String,
+    pub role: MessageRole,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<super::models::ImageData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_refs: Option<Vec<super::models::AssetRefData>>,
+    pub prompt_prefix_placeholder: bool,
+    pub prompt_suffix_placeholder: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactedContextOutput {
+    pub message_id: String,
+    /// complete: captured at compaction time; reconstructed: latest legacy
+    /// handoff recovered from current prompt flags; partial: only the handoff
+    /// itself remains provable.
+    pub snapshot_status: String,
+    /// readable for prompt-based/local compaction; codexEncrypted when the
+    /// actual Codex handoff is an opaque server compaction item.
+    pub compaction_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_content_chars: Option<usize>,
+    pub messages: Vec<CompactedContextMessageOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +340,25 @@ struct MessageMetadata {
     thinking_order: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     render_parts: Option<Vec<AssistantRenderPart>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compacted_context: Option<CompactedContextSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactedContextSnapshot {
+    version: u32,
+    /// None marks handoffs created before exact snapshots were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entries: Option<Vec<CompactedContextSnapshotEntry>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactedContextSnapshotEntry {
+    message_id: String,
+    prompt_prefix_placeholder: bool,
+    prompt_suffix_placeholder: bool,
 }
 
 fn message_metadata_json(
@@ -328,6 +377,7 @@ fn message_metadata_json(
         content_order,
         thinking_order,
         render_parts: render_parts.map(|value| value.to_vec()),
+        compacted_context: None,
     };
     if metadata.knowledge_proposal.is_none()
         && metadata.response_id.is_none()
@@ -336,6 +386,7 @@ fn message_metadata_json(
         && metadata.content_order.is_none()
         && metadata.thinking_order.is_none()
         && metadata.render_parts.is_none()
+        && metadata.compacted_context.is_none()
     {
         return Ok(None);
     }
@@ -509,7 +560,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 20;
+    const SCHEMA_VERSION: i32 = 24;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::new_with_tool_results_root(data_dir, data_dir.join("temp").join("tool-results"))
@@ -748,7 +799,40 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 20, "add a new migration block above");
+        if current < 21 {
+            Self::migrate(
+                conn,
+                21,
+                "mark legacy compacted-context snapshots",
+                Self::migrate_compacted_context_snapshots,
+            )?;
+        }
+
+        if current < 22 {
+            Self::migrate(conn, 22, "persist the latest session model", |conn| {
+                if !Self::table_has_column(conn, "sessions", "last_model_id")? {
+                    conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_model_id TEXT;")?;
+                }
+                Ok(())
+            })?;
+        }
+
+        if current < 23 {
+            Self::migrate(conn, 23, "persist the latest session effort", |conn| {
+                if !Self::table_has_column(conn, "sessions", "last_effort")? {
+                    conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_effort TEXT;")?;
+                }
+                Ok(())
+            })?;
+        }
+
+        if current < 24 {
+            Self::migrate(conn, 24, "add model usage events", |conn| {
+                Self::create_model_usage_schema(conn)
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 24, "add a new migration block above");
         Ok(())
     }
 
@@ -761,6 +845,8 @@ impl SessionStore {
                 workspace_id TEXT,
                 session_type TEXT NOT NULL DEFAULT 'chat',
                 agent_id TEXT,
+                last_model_id TEXT,
+                last_effort TEXT,
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
                 latest_todo_run_id TEXT,
@@ -815,6 +901,29 @@ impl SessionStore {
             CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);",
         )
         .and_then(|_| Self::create_session_sync_schema(conn))
+        .and_then(|_| Self::create_model_usage_schema(conn))
+    }
+
+    fn create_model_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS model_usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                request_kind TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_usage_events_created
+                ON model_usage_events(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_model_usage_events_model_created
+                ON model_usage_events(model_id, created_at DESC);",
+        )
     }
 
     fn create_session_sync_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -954,6 +1063,45 @@ impl SessionStore {
             }
         }
 
+        Ok(())
+    }
+
+    fn migrate_compacted_context_snapshots(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT id, metadata_json FROM messages
+             WHERE role = 'assistant' AND substr(content, 1, ?1) = ?2",
+        )?;
+        let marker_len = CONTEXT_HANDOFF_MARKER.len() as i64;
+        let rows = stmt
+            .query_map(params![marker_len, CONTEXT_HANDOFF_MARKER], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for (message_id, metadata_json) in rows {
+            let mut metadata: MessageMetadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                })?
+                .unwrap_or_default();
+            if metadata.compacted_context.is_some() {
+                continue;
+            }
+            metadata.compacted_context = Some(CompactedContextSnapshot {
+                version: 1,
+                entries: None,
+            });
+            let serialized = serde_json::to_string(&metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            conn.execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2",
+                params![serialized, message_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -1252,11 +1400,13 @@ impl SessionStore {
                 workspace_id,
                 session_type,
                 agent_id,
+                last_model_id,
+                last_effort,
                 latest_completed_run_id,
                 latest_todo_run_id,
             ) = conn
                 .query_row(
-                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, latest_completed_run_id, latest_todo_run_id
+                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, latest_completed_run_id, latest_todo_run_id
                      FROM sessions WHERE id = ?1",
                     params![source_id],
                     |row| {
@@ -1268,6 +1418,8 @@ impl SessionStore {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -1312,19 +1464,23 @@ impl SessionStore {
                     workspace_id,
                     session_type,
                     agent_id,
+                    last_model_id,
+                    last_effort,
                     archived_at,
                     latest_completed_run_id,
                     latest_todo_run_id,
                     created_at,
                     updated_at
                  )
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?8)",
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
                 params![
                     new_id,
                     resolved_title,
                     workspace_id,
                     session_type,
                     agent_id,
+                    last_model_id,
+                    last_effort,
                     if cutoff_rowid.is_some() {
                         Option::<String>::None
                     } else {
@@ -1626,6 +1782,29 @@ impl SessionStore {
         .map_err(|e| format!("Failed to query active session run: {}", e))
     }
 
+    pub fn run_by_id(&self, run_id: &str) -> Result<Option<SessionRunSummary>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT run_id, session_id, status, started_at, updated_at, finished_at, error_message
+             FROM session_runs
+             WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(SessionRunSummary {
+                    run_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    finished_at: row.get(5)?,
+                    error_message: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query session run: {}", e))
+    }
+
     pub fn active_descendant_runs(
         &self,
         root_session_id: &str,
@@ -1867,6 +2046,59 @@ impl SessionStore {
         Ok(events)
     }
 
+    pub fn list_run_events(
+        &self,
+        run_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<SessionEventRecord>, String> {
+        let after_seq = after_seq.unwrap_or(0);
+        let limit = i64::from(limit.unwrap_or(500).clamp(1, 2_000));
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, run_id, seq, event_type, payload_json, created_at
+                 FROM session_events
+                 WHERE run_id = ?1 AND seq > ?2
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("Failed to prepare run event query: {}", e))?;
+        let rows = stmt
+            .query_map(params![run_id, after_seq, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query run events: {}", e))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (session_id, run_id, seq, event_type, payload_json, created_at) =
+                row.map_err(|e| format!("Failed to read run event row: {}", e))?;
+            let payload = serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|e| {
+                format!(
+                    "Failed to parse run event payload for run {} seq {}: {}",
+                    run_id, seq, e
+                )
+            })?;
+            events.push(SessionEventRecord {
+                session_id,
+                run_id,
+                seq,
+                event_type,
+                payload,
+                created_at,
+            });
+        }
+        Ok(events)
+    }
+
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<SessionSummary>, String> {
         self.list_sessions_by_archive_state(workspace_id, false)
     }
@@ -2009,6 +2241,8 @@ impl SessionStore {
         let (
             title,
             agent_id,
+            last_model_id,
+            last_effort,
             session_type,
             parent_session_id,
             latest_completed_run_id,
@@ -2016,17 +2250,19 @@ impl SessionStore {
             updated_at,
         ) = conn
             .query_row(
-                "SELECT title, agent_id, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT title, agent_id, last_model_id, last_effort, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -2040,6 +2276,8 @@ impl SessionStore {
             id: id.to_string(),
             title,
             agent_id,
+            last_model_id,
+            last_effort,
             session_type,
             parent_session_id,
             latest_completed_run_id,
@@ -2049,6 +2287,49 @@ impl SessionStore {
             pending_inputs: Vec::new(),
             runtime: None,
         })
+    }
+
+    pub fn set_session_last_model_id(
+        &self,
+        session_id: &str,
+        model_id: &str,
+    ) -> Result<(), String> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return Err("Session model id cannot be empty".to_string());
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET last_model_id = ?1 WHERE id = ?2",
+                params![model_id, session_id],
+            )
+            .map_err(|e| format!("Failed to update session model: {}", e))?;
+        if updated == 0 {
+            return Err(format!("Session not found: {}", session_id));
+        }
+        Ok(())
+    }
+
+    pub fn set_session_last_effort(
+        &self,
+        session_id: &str,
+        effort: Option<&str>,
+    ) -> Result<(), String> {
+        let effort = effort
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET last_effort = ?1 WHERE id = ?2",
+                params![effort, session_id],
+            )
+            .map_err(|e| format!("Failed to update session effort: {}", e))?;
+        if updated == 0 {
+            return Err(format!("Session not found: {}", session_id));
+        }
+        Ok(())
     }
 
     pub fn set_latest_completed_run_id(
@@ -2110,6 +2391,25 @@ impl SessionStore {
         )
         .map_err(|e| format!("Failed to rename session: {}", e))?;
         Ok(())
+    }
+
+    pub fn rename_session_if_title_matches(
+        &self,
+        id: &str,
+        expected_title: &str,
+        title: &str,
+    ) -> Result<bool, String> {
+        if title == expected_title {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2 AND title = ?3",
+                params![title, id, expected_title],
+            )
+            .map_err(|e| format!("Failed to conditionally rename session: {}", e))?;
+        Ok(updated > 0)
     }
 
     pub fn archive_session(&self, id: &str) -> Result<(), String> {
@@ -3227,6 +3527,156 @@ impl SessionStore {
         self.get_messages_with_conn_filtered(&conn, session_id, true)
     }
 
+    /// Rebuild the post-compaction prompt slice behind a visible handoff
+    /// marker. System instructions stay represented by frontend placeholders;
+    /// message bodies, retained images, and asset references are returned in
+    /// their exact captured order.
+    pub fn get_compacted_context_output(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<CompactedContextOutput>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT role, content, metadata_json, include_in_prompt, rowid
+                 FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query compacted context output: {}", e))?;
+
+        let Some((role, handoff_content, metadata_json, include_in_prompt, handoff_rowid)) = row
+        else {
+            return Ok(None);
+        };
+        if role != MessageRole::Assistant.as_str()
+            || !handoff_content.starts_with(CONTEXT_HANDOFF_MARKER)
+        {
+            return Ok(None);
+        }
+
+        let metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse compacted context metadata: {}", e))?
+            .unwrap_or_default();
+
+        let (mut snapshot_status, entries) = match metadata
+            .compacted_context
+            .as_ref()
+            .and_then(|snapshot| snapshot.entries.clone())
+        {
+            Some(entries) => ("complete".to_string(), entries),
+            None if include_in_prompt != 0 => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, prompt_prefix, prompt_suffix
+                         FROM messages
+                         WHERE session_id = ?1
+                           AND include_in_prompt = 1
+                           AND rowid <= ?2
+                         ORDER BY created_at ASC, rowid ASC",
+                    )
+                    .map_err(|e| {
+                        format!("Failed to prepare legacy compacted context query: {}", e)
+                    })?;
+                let rows = stmt
+                    .query_map(params![session_id, handoff_rowid], |row| {
+                        let prompt_prefix = row.get::<_, Option<String>>(1)?;
+                        let prompt_suffix = row.get::<_, Option<String>>(2)?;
+                        Ok(CompactedContextSnapshotEntry {
+                            message_id: row.get(0)?,
+                            prompt_prefix_placeholder: prompt_prefix
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty()),
+                            prompt_suffix_placeholder: prompt_suffix
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty()),
+                        })
+                    })
+                    .map_err(|e| format!("Failed to query legacy compacted context: {}", e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Failed to read legacy compacted context: {}", e))?;
+                ("reconstructed".to_string(), rows)
+            }
+            None => (
+                "partial".to_string(),
+                vec![CompactedContextSnapshotEntry {
+                    message_id: message_id.to_string(),
+                    prompt_prefix_placeholder: false,
+                    prompt_suffix_placeholder: false,
+                }],
+            ),
+        };
+
+        let mut messages_by_id = Self::get_messages_with_conn_filtered_static(
+            &conn,
+            session_id,
+            false,
+        )?
+        .into_iter()
+        .map(|message| (message.id.clone(), message))
+        .collect::<HashMap<_, _>>();
+        if let Some(handoff) = messages_by_id.get_mut(message_id) {
+            handoff.content = handoff_content;
+        }
+
+        let expected_message_count = entries.len();
+        let mut messages = Vec::with_capacity(expected_message_count);
+        for entry in entries {
+            let Some(mut message) = messages_by_id.remove(&entry.message_id) else {
+                snapshot_status = "partial".to_string();
+                continue;
+            };
+            message.prompt_prefix = None;
+            message.prompt_suffix = None;
+            messages.push(CompactedContextMessageOutput {
+                id: message.id,
+                role: message.role,
+                content: message.content,
+                images: message.images,
+                asset_refs: message.asset_refs,
+                prompt_prefix_placeholder: entry.prompt_prefix_placeholder,
+                prompt_suffix_placeholder: entry.prompt_suffix_placeholder,
+            });
+        }
+        if messages.len() != expected_message_count {
+            snapshot_status = "partial".to_string();
+        }
+
+        let encrypted_content_chars = metadata
+            .response_request
+            .as_ref()
+            .and_then(|value| value.get("codex_compaction"))
+            .and_then(|value| value.get("encrypted_content"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::len);
+
+        Ok(Some(CompactedContextOutput {
+            message_id: message_id.to_string(),
+            snapshot_status,
+            compaction_kind: if encrypted_content_chars.is_some() {
+                "codexEncrypted".to_string()
+            } else {
+                "readable".to_string()
+            },
+            encrypted_content_chars,
+            messages,
+        }))
+    }
+
     pub fn get_response_request_metadata(
         &self,
         session_id: &str,
@@ -3311,6 +3761,155 @@ impl SessionStore {
         context_limit: Option<u32>,
     ) -> Result<TokenUsage, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::record_token_usage_with_conn(
+            &conn,
+            session_id,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cost_usd,
+            priced_rounds,
+            context_tokens,
+            context_limit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_model_usage(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        provider: &str,
+        request_kind: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        cost_usd: f64,
+        priced_rounds: u64,
+        context_tokens: Option<u32>,
+        context_limit: Option<u32>,
+    ) -> Result<TokenUsage, String> {
+        let model_id = model_id.trim();
+        let provider = provider.trim();
+        let request_kind = request_kind.trim();
+        if model_id.is_empty() || provider.is_empty() || request_kind.is_empty() {
+            return Err("Model usage metadata must not be empty".to_string());
+        }
+
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin model usage transaction: {}", e))?;
+        let usage = Self::record_token_usage_with_conn(
+            &tx,
+            session_id,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cost_usd,
+            priced_rounds,
+            context_tokens,
+            context_limit,
+        )?;
+        tx.execute(
+            "INSERT INTO model_usage_events (
+                session_id,
+                model_id,
+                provider,
+                request_kind,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost_usd,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                model_id,
+                provider,
+                request_kind,
+                input_tokens as i64,
+                output_tokens as i64,
+                cache_read_tokens as i64,
+                cache_write_tokens as i64,
+                cost_usd,
+                Self::now_ts(),
+            ],
+        )
+        .map_err(|e| format!("Failed to record model usage event: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit model usage transaction: {}", e))?;
+        Ok(usage)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_model_usage_event(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        provider: &str,
+        request_kind: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        cost_usd: f64,
+    ) -> Result<(), String> {
+        let model_id = model_id.trim();
+        let provider = provider.trim();
+        let request_kind = request_kind.trim();
+        if model_id.is_empty() || provider.is_empty() || request_kind.is_empty() {
+            return Err("Model usage metadata must not be empty".to_string());
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO model_usage_events (
+                session_id,
+                model_id,
+                provider,
+                request_kind,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost_usd,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                model_id,
+                provider,
+                request_kind,
+                input_tokens as i64,
+                output_tokens as i64,
+                cache_read_tokens as i64,
+                cache_write_tokens as i64,
+                cost_usd,
+                Self::now_ts(),
+            ],
+        )
+        .map_err(|e| format!("Failed to record model usage event: {}", e))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_token_usage_with_conn(
+        conn: &Connection,
+        session_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        cost_usd: f64,
+        priced_rounds: u64,
+        context_tokens: Option<u32>,
+        context_limit: Option<u32>,
+    ) -> Result<TokenUsage, String> {
         conn.execute(
             "INSERT INTO token_usage (
                 session_id,
@@ -3393,6 +3992,98 @@ impl SessionStore {
             priced_rounds: priced_rounds as u64,
             context_tokens: last_context_tokens as u32,
             context_limit: last_context_limit as u32,
+        })
+    }
+
+    pub fn get_model_usage_report(&self, days: Option<u32>) -> Result<ModelUsageReport, String> {
+        let since = days.map(|days| {
+            Self::now_ts().saturating_sub(i64::from(days).saturating_mul(24 * 60 * 60))
+        });
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let usage = conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COUNT(DISTINCT session_id),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+                 FROM model_usage_events
+                 WHERE (?1 IS NULL OR created_at >= ?1)",
+                params![since],
+                Self::read_model_usage_metrics,
+            )
+            .map_err(|e| format!("Failed to read model usage totals: {}", e))?;
+
+        let (recorded_from, recorded_to) = conn
+            .query_row(
+                "SELECT MIN(created_at), MAX(created_at)
+                 FROM model_usage_events
+                 WHERE (?1 IS NULL OR created_at >= ?1)",
+                params![since],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(|e| format!("Failed to read model usage range: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    model_id,
+                    provider,
+                    COUNT(*),
+                    COUNT(DISTINCT session_id),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+                 FROM model_usage_events
+                 WHERE (?1 IS NULL OR created_at >= ?1)
+                 GROUP BY model_id, provider
+                 ORDER BY
+                    SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) DESC,
+                    model_id ASC",
+            )
+            .map_err(|e| format!("Failed to prepare model usage query: {}", e))?;
+        let by_model = stmt
+            .query_map(params![since], |row| {
+                Ok(ModelUsageGroup {
+                    model_id: row.get(0)?,
+                    provider: row.get(1)?,
+                    usage: ModelUsageMetrics {
+                        request_count: row.get::<_, i64>(2)? as u64,
+                        session_count: row.get::<_, i64>(3)? as u64,
+                        input_tokens: row.get::<_, i64>(4)? as u64,
+                        output_tokens: row.get::<_, i64>(5)? as u64,
+                        cache_read_tokens: row.get::<_, i64>(6)? as u64,
+                        cache_write_tokens: row.get::<_, i64>(7)? as u64,
+                        cost_usd: row.get(8)?,
+                    },
+                })
+            })
+            .map_err(|e| format!("Failed to query model usage: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read model usage row: {}", e))?;
+
+        Ok(ModelUsageReport {
+            usage,
+            by_model,
+            recorded_from,
+            recorded_to,
+        })
+    }
+
+    fn read_model_usage_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelUsageMetrics> {
+        Ok(ModelUsageMetrics {
+            request_count: row.get::<_, i64>(0)? as u64,
+            session_count: row.get::<_, i64>(1)? as u64,
+            input_tokens: row.get::<_, i64>(2)? as u64,
+            output_tokens: row.get::<_, i64>(3)? as u64,
+            cache_read_tokens: row.get::<_, i64>(4)? as u64,
+            cache_write_tokens: row.get::<_, i64>(5)? as u64,
+            cost_usd: row.get(6)?,
         })
     }
 
@@ -3542,6 +4233,74 @@ impl SessionStore {
     /// `retained_user_budget_tokens` comes from
     /// `compact::compact_user_message_token_budget(context_limit)` so the
     /// verbatim retention scales with the caller's context window.
+    fn persist_compacted_context_snapshot(
+        conn: &Connection,
+        session_id: &str,
+        summary_message_id: &str,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, prompt_prefix, prompt_suffix
+                 FROM messages
+                 WHERE session_id = ?1 AND include_in_prompt = 1
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare compacted context snapshot: {}", e))?;
+        let entries = stmt
+            .query_map(params![session_id], |row| {
+                let prompt_prefix = row.get::<_, Option<String>>(1)?;
+                let prompt_suffix = row.get::<_, Option<String>>(2)?;
+                Ok(CompactedContextSnapshotEntry {
+                    message_id: row.get(0)?,
+                    prompt_prefix_placeholder: prompt_prefix
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()),
+                    prompt_suffix_placeholder: prompt_suffix
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty()),
+                })
+            })
+            .map_err(|e| format!("Failed to query compacted context snapshot: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read compacted context snapshot: {}", e))?;
+        drop(stmt);
+
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![session_id, summary_message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load compacted context metadata: {}", e))?
+            .flatten();
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse compacted context metadata: {}", e))?
+            .unwrap_or_default();
+        metadata.compacted_context = Some(CompactedContextSnapshot {
+            version: 1,
+            entries: Some(entries),
+        });
+        let serialized = serde_json::to_string(&metadata)
+            .map_err(|e| format!("Failed to serialize compacted context snapshot: {}", e))?;
+        let updated = conn
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE session_id = ?2 AND id = ?3",
+                params![serialized, session_id, summary_message_id],
+            )
+            .map_err(|e| format!("Failed to persist compacted context snapshot: {}", e))?;
+        if updated == 0 {
+            return Err(format!(
+                "Compacted context handoff '{}' was not found in session '{}'",
+                summary_message_id, session_id
+            ));
+        }
+        Ok(())
+    }
+
     pub fn compact_messages(
         &self,
         session_id: &str,
@@ -3685,6 +4444,13 @@ impl SessionStore {
                 })?;
             }
         }
+
+        Self::persist_compacted_context_snapshot(&conn, session_id, &summary_msg.id).map_err(
+            |error| {
+                let _ = conn.execute("ROLLBACK", []);
+                error
+            },
+        )?;
 
         conn.execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit compact transaction: {}", e))?;
@@ -4278,6 +5044,8 @@ mod tests {
         assert!(
             SessionStore::table_has_column(&conn, "sessions", "latest_completed_run_id").unwrap()
         );
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_model_id").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_effort").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "metadata_json").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
@@ -4291,6 +5059,162 @@ mod tests {
         );
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
+        assert!(table_exists(&conn, "model_usage_events"));
+    }
+
+    #[test]
+    fn v21_database_migrates_session_model_as_empty_and_can_persist_it() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v21 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "ALTER TABLE sessions DROP COLUMN last_model_id;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-1', 'Migrated model', 'chat', 100, 100);
+             PRAGMA user_version = 21;",
+        )
+        .expect("create v21 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v21 store");
+        let detail = store
+            .load_session("session-1")
+            .expect("load migrated session");
+        assert_eq!(detail.last_model_id, None);
+
+        store
+            .set_session_last_model_id("session-1", "openai/gpt-5.6-sol")
+            .expect("persist session model");
+        let detail = store
+            .load_session("session-1")
+            .expect("reload session model");
+        assert_eq!(detail.last_model_id.as_deref(), Some("openai/gpt-5.6-sol"));
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_model_id").unwrap());
+    }
+
+    #[test]
+    fn v22_database_migrates_session_effort_as_empty_and_can_persist_it() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v22 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "ALTER TABLE sessions DROP COLUMN last_effort;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-1', 'Migrated effort', 'chat', 100, 100);
+             PRAGMA user_version = 22;",
+        )
+        .expect("create v22 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v22 store");
+        let detail = store
+            .load_session("session-1")
+            .expect("load migrated session");
+        assert_eq!(detail.last_effort, None);
+
+        store
+            .set_session_last_effort("session-1", Some("xhigh"))
+            .expect("persist session effort");
+        let detail = store
+            .load_session("session-1")
+            .expect("reload session effort");
+        assert_eq!(detail.last_effort.as_deref(), Some("xhigh"));
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_effort").unwrap());
+    }
+
+    #[test]
+    fn v23_database_migrates_model_usage_schema_without_changing_sessions() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v23 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "DROP TABLE model_usage_events;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-1', 'Existing session', 'chat', 100, 100);
+             PRAGMA user_version = 23;",
+        )
+        .expect("create v23 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v23 store");
+        let detail = store
+            .load_session("session-1")
+            .expect("load migrated session");
+        assert_eq!(detail.title, "Existing session");
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(table_exists(&conn, "model_usage_events"));
+    }
+
+    #[test]
+    fn v20_database_marks_legacy_compactions_and_keeps_them_readable() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v20 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute(
+            "INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-1', 'Legacy compact', 'chat', 100, 100)",
+            [],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('handoff-1', 'session-1', 'assistant', ?1, 100)",
+            params!["## Context Handoff\n\n### Earlier Conversation Summary\n\nLegacy summary"],
+        )
+        .expect("insert legacy handoff");
+        conn.pragma_update(None, "user_version", 20)
+            .expect("set v20");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v20 store");
+        let detail = store.load_session("session-1").expect("load migrated session");
+        assert_eq!(detail.messages[0].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+
+        let output = store
+            .get_compacted_context_output("session-1", "handoff-1")
+            .expect("read legacy compact")
+            .expect("legacy compact exists");
+        assert_eq!(output.snapshot_status, "reconstructed");
+        assert_eq!(output.messages.len(), 1);
+        assert!(output.messages[0].content.contains("Legacy summary"));
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE id = 'handoff-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).expect("parse migrated metadata");
+        assert_eq!(metadata["compactedContext"]["version"].as_u64(), Some(1));
+        assert!(metadata["compactedContext"].get("entries").is_none());
     }
 
     #[test]
@@ -4407,6 +5331,94 @@ mod tests {
         let reloaded = store.get_token_usage(&session_id).expect("read usage");
         assert_eq!(reloaded.context_tokens, 135);
         assert_eq!(reloaded.context_limit, 1000);
+    }
+
+    #[test]
+    fn model_usage_report_counts_calls_without_counting_parent_rollups() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent_id = store
+            .create_session("Parent", None, None, "chat", None)
+            .expect("create parent");
+        let child_id = store
+            .create_session("Child", Some(&parent_id), None, "chat", None)
+            .expect("create child");
+
+        store
+            .record_model_usage(
+                &parent_id,
+                "openai/gpt-test",
+                "OpenAI Codex",
+                "completion",
+                100,
+                20,
+                10,
+                0,
+                0.0,
+                0,
+                Some(130),
+                Some(4096),
+            )
+            .expect("record parent call");
+        let child_usage = store
+            .record_model_usage(
+                &child_id,
+                "anthropic/claude-test",
+                "Anthropic",
+                "completion",
+                50,
+                10,
+                5,
+                2,
+                0.25,
+                1,
+                Some(67),
+                Some(4096),
+            )
+            .expect("record child call");
+        store
+            .record_token_usage(
+                &parent_id,
+                child_usage.total_input_tokens,
+                child_usage.total_output_tokens,
+                child_usage.total_cache_read_tokens,
+                child_usage.total_cache_write_tokens,
+                child_usage.total_cost_usd,
+                child_usage.priced_rounds,
+                None,
+                None,
+            )
+            .expect("merge child usage into parent");
+        store
+            .record_model_usage_event(
+                &parent_id,
+                "openai/gpt-title",
+                "OpenAI Codex",
+                "session_title",
+                3,
+                1,
+                0,
+                0,
+                0.0,
+            )
+            .expect("record standalone title call");
+
+        let report = store
+            .get_model_usage_report(Some(30))
+            .expect("read usage report");
+        assert_eq!(report.usage.request_count, 3);
+        assert_eq!(report.usage.session_count, 2);
+        assert_eq!(report.usage.input_tokens, 153);
+        assert_eq!(report.usage.output_tokens, 31);
+        assert_eq!(report.usage.cache_read_tokens, 15);
+        assert_eq!(report.usage.cache_write_tokens, 2);
+        assert_eq!(report.by_model.len(), 3);
+
+        let parent_usage = store
+            .get_token_usage(&parent_id)
+            .expect("read parent usage");
+        assert_eq!(parent_usage.total_input_tokens, 150);
+        assert_eq!(parent_usage.total_output_tokens, 30);
     }
 
     #[test]
@@ -5208,6 +6220,29 @@ mod tests {
     }
 
     #[test]
+    fn generated_title_only_replaces_the_expected_fallback() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Fallback title", None, None, "chat", None)
+            .expect("create session");
+
+        assert!(store
+            .rename_session_if_title_matches(&session_id, "Fallback title", "Generated title")
+            .expect("replace fallback"));
+        assert!(!store
+            .rename_session_if_title_matches(&session_id, "Fallback title", "Late title")
+            .expect("reject stale fallback"));
+        assert_eq!(
+            store
+                .get_session_title(&session_id)
+                .expect("load title")
+                .as_deref(),
+            Some("Generated title")
+        );
+    }
+
+    #[test]
     fn v12_database_is_migrated_forward_with_latest_todo_run_id() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("locus.db");
@@ -5996,26 +7031,15 @@ mod tests {
             }
         }
 
-        let summary_msg = ChatMessage {
-            id: "handoff-1".to_string(),
-            role: MessageRole::Assistant,
-            content: "## Context Handoff\n\n交接摘要".to_string(),
-            created_at: 101,
-            prompt_prefix: None,
-            prompt_suffix: None,
-            response_id: None,
-            content_order: None,
-            thinking_order: None,
-            tool_calls: None,
-            tool_call_id: None,
-            images: None,
-            asset_refs: None,
-            thinking_content: None,
-            thinking_duration: None,
-            thinking_signature: None,
-            knowledge_proposal: None,
-            render_parts: None,
-        };
+        let mut summary_msg = compact::build_post_compact_message(
+            "1. Primary Request and Intent\n继续完成压缩上下文查看功能。",
+            "",
+            102,
+            true,
+            None,
+        );
+        summary_msg.id = "handoff-1".to_string();
+        summary_msg.created_at = 101;
 
         let (count_before, count_after) = store
             .compact_messages(
@@ -6052,6 +7076,30 @@ mod tests {
             ]
         );
         assert_eq!(all_messages[4].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+        let compacted_context = store
+            .get_compacted_context_output(&session_id, "handoff-1")
+            .expect("load compact output")
+            .expect("compacted context exists");
+        assert_eq!(compacted_context.snapshot_status, "complete");
+        assert_eq!(compacted_context.compaction_kind, "readable");
+        assert_eq!(
+            compacted_context
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![old_user_id, "handoff-1", latest_user_id]
+        );
+        assert!(compacted_context.messages[0].prompt_prefix_placeholder);
+        assert!(compacted_context.messages[1]
+            .content
+            .contains("继续完成压缩上下文查看功能"));
+        assert_eq!(
+            store
+                .get_compacted_context_output(&session_id, old_assistant_id)
+                .expect("reject regular assistant message"),
+            None
+        );
         assert_eq!(prompt_messages.len(), 3);
         assert_eq!(prompt_messages[0].id, old_user_id);
         assert_eq!(prompt_messages[1].id, "handoff-1");

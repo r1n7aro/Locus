@@ -16,6 +16,8 @@ import { filterVisibleModels } from "../config/providerVisibility";
 import { modelSupportsFastMode } from "../utils/modelDisplay";
 
 const CLAUDE_CONTEXT_1M = 1_000_000;
+const CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW = 258_400;
+const CODEX_EXTENDED_EFFECTIVE_CONTEXT_WINDOW = 353_400;
 const CLAUDE_STANDARD_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "max"];
 const CLAUDE_XHIGH_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
 
@@ -214,6 +216,22 @@ function normalizeCodexTransport(config?: Partial<CodexModelConfig> | null): Cod
   return config?.transport === "http" ? "http" : "websocket";
 }
 
+function isGpt56CodexModel(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase().replace(/^openai\//, "");
+  return normalized === "gpt-5.6" || normalized.startsWith("gpt-5.6-");
+}
+
+function applyCodexContextMode(model: ModelOption, extendedContext: boolean): ModelOption {
+  if (!isGpt56CodexModel(model.id)) return model;
+  const contextWindow = extendedContext
+    ? CODEX_EXTENDED_EFFECTIVE_CONTEXT_WINDOW
+    : Math.min(
+        model.contextWindow ?? CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
+        CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
+      );
+  return contextWindow === model.contextWindow ? model : { ...model, contextWindow };
+}
+
 function formatCodexModelName(id: string, fallbackName?: string): string {
   const slug = id.startsWith("openai/") ? id.slice("openai/".length) : id;
   const parts = slug
@@ -276,6 +294,7 @@ export const useModelStore = defineStore("model", () => {
   const customProviders = ref<CustomProvider[]>([]);
   const codexRemoteModels = ref<ModelOption[]>([]);
   const codexTransport = ref<CodexTransportMode>("websocket");
+  const codexExtendedContext = ref(false);
   const codexFastMode = ref(false);
   const selectedModelId = ref("");
   const lastModelId = ref("");
@@ -287,9 +306,10 @@ export const useModelStore = defineStore("model", () => {
 
   // -- Getters --
 
-  const codexModels = computed<ModelOption[]>(() =>
-    codexRemoteModels.value.length > 0 ? codexRemoteModels.value : codexFallbackModels
-  );
+  const codexModels = computed<ModelOption[]>(() => {
+    const models = codexRemoteModels.value.length > 0 ? codexRemoteModels.value : codexFallbackModels;
+    return models.map((model) => applyCodexContextMode(model, codexExtendedContext.value));
+  });
 
   const allModels = computed<ModelOption[]>(() => {
     const customs: ModelOption[] = customProviders.value.flatMap((provider) =>
@@ -475,9 +495,12 @@ export const useModelStore = defineStore("model", () => {
 
   async function loadCodexModelConfig() {
     try {
-      codexTransport.value = normalizeCodexTransport(await modelService.getCodexModelConfig());
+      const config = await modelService.getCodexModelConfig();
+      codexTransport.value = normalizeCodexTransport(config);
+      codexExtendedContext.value = config?.extendedContext === true;
     } catch {
       codexTransport.value = "websocket";
+      codexExtendedContext.value = false;
     }
   }
 
@@ -519,6 +542,12 @@ export const useModelStore = defineStore("model", () => {
     rememberLastModel(id);
   }
 
+  function applySessionModel(id: string | null | undefined) {
+    const normalized = id?.trim();
+    if (!normalized || !availableModels.value.some((model) => model.id === normalized)) return;
+    selectedModelId.value = normalized;
+  }
+
   function selectEffort(level: EffortLevel) {
     if (!isEffortLevel(level)) return;
     hasUserDefaultEffort.value = true;
@@ -555,12 +584,14 @@ export const useModelStore = defineStore("model", () => {
 
   function applyCodexModelConfig(config?: Partial<CodexModelConfig> | null) {
     codexTransport.value = normalizeCodexTransport(config);
+    codexExtendedContext.value = config?.extendedContext === true;
   }
 
   return {
     customProviders,
     codexRemoteModels,
     codexTransport,
+    codexExtendedContext,
     codexFastMode,
     selectedModelId,
     lastModelId,
@@ -587,6 +618,7 @@ export const useModelStore = defineStore("model", () => {
     loadCodexAvailableModels,
     resolveSelectedModel,
     selectModel,
+    applySessionModel,
     selectEffort,
     selectCodexFastMode,
     codexFastModeForModel,

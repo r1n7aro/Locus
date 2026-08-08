@@ -35,12 +35,16 @@ const props = withDefaults(
     hideTextDisplayControls?: boolean;
     /** Preferred initial tab when a fresh payload is mounted */
     initialTab?: "semantic" | "text";
+    /** Optional contextual action rendered beside the text display controls */
+    textToolbarActionLabel?: string;
+    textToolbarActionTitle?: string;
   }>(),
   { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideSemanticSummary: false, hideTextDisplayControls: false },
 );
 
 const emit = defineEmits<{
   lfsPulled: [];
+  textToolbarAction: [];
 }>();
 
 const lfsPulling = ref(false);
@@ -803,6 +807,15 @@ onUnmounted(() => {
         <span class="summary-spacer"></span>
         <button class="summary-toggle-btn" :class="{ active: textDisplayMode === 'side-by-side' }" @click="toggleTextDisplayMode">
           {{ t('diff.mode.sideBySide') }}
+        </button>
+        <button
+          v-if="textToolbarActionLabel"
+          type="button"
+          class="summary-toggle-btn"
+          :title="textToolbarActionTitle || textToolbarActionLabel"
+          @click.stop="emit('textToolbarAction')"
+        >
+          {{ textToolbarActionLabel }}
         </button>
       </div>
       <div

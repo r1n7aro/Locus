@@ -4,6 +4,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { saveRawContext as saveCtx } from "../services/session";
+import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type { EffortLevel, SaveRawContextRequest } from "../types";
 import { useAgentStore } from "../stores/agent";
 import { useChatStore } from "../stores/chat";
@@ -20,6 +21,7 @@ import {
 import ChatView from "./ChatView.vue";
 import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
+import { resolveChatContentBalanceInset } from "./chat/chatSidebarBalance";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -29,11 +31,15 @@ const props = withDefaults(defineProps<{
   layoutMode?: ChatLayoutMode;
   defaultSessionPanelCollapsed?: boolean;
   sessionPanelStorageScope?: string;
+  showSessionNavigation?: boolean;
+  persistSessionSelection?: boolean;
 }>(), {
   active: true,
   layoutMode: "auto",
   defaultSessionPanelCollapsed: false,
   sessionPanelStorageScope: "",
+  showSessionNavigation: true,
+  persistSessionSelection: true,
 });
 
 const agentStore = useAgentStore();
@@ -47,6 +53,7 @@ const { skillItems } = useSkills();
 
 const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
+const assistantSidebarBalanceWidth = ref(0);
 const isVerticalLayout = computed(() => props.layoutMode === "vertical");
 const showAssistantSidebar = computed(() =>
   props.active && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible),
@@ -78,12 +85,91 @@ const assistantSidebarMaxSideWidth = computed(() => {
   );
 });
 let workspaceResizeObserver: ResizeObserverHandle | null = null;
+let assistantSidebarResizeObserver: ResizeObserver | null = null;
+let assistantSidebarShell: HTMLElement | null = null;
+
+function syncAssistantSidebarContentBalance(shell = assistantSidebarShell) {
+  if (isVerticalLayout.value || !shell || !workspaceRef.value) {
+    assistantSidebarBalanceWidth.value = 0;
+    return;
+  }
+  const chatSurface = workspaceRef.value.querySelector<HTMLElement>(".chat-view");
+  if (!chatSurface) {
+    assistantSidebarBalanceWidth.value = 0;
+    return;
+  }
+  assistantSidebarBalanceWidth.value = resolveChatContentBalanceInset(
+    chatSurface.clientWidth,
+    shell.getBoundingClientRect().width,
+  );
+}
+
+function disconnectAssistantSidebarResizeObserver() {
+  assistantSidebarResizeObserver?.disconnect();
+  assistantSidebarResizeObserver = null;
+  assistantSidebarShell = null;
+  assistantSidebarBalanceWidth.value = 0;
+}
+
+function connectAssistantSidebarResizeObserver(shell: HTMLElement) {
+  disconnectAssistantSidebarResizeObserver();
+  assistantSidebarShell = shell;
+  syncAssistantSidebarContentBalance(shell);
+  if (typeof ResizeObserver === "undefined") return;
+  assistantSidebarResizeObserver = new ResizeObserver(() => {
+    syncAssistantSidebarContentBalance(shell);
+  });
+  assistantSidebarResizeObserver.observe(shell);
+  const chatSurface = workspaceRef.value?.querySelector<HTMLElement>(".chat-view");
+  if (chatSurface) {
+    assistantSidebarResizeObserver.observe(chatSurface);
+  }
+}
 
 function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
+
+function selectWorkspaceSession(sessionId: string) {
+  void chatStore.selectSession(sessionId, {
+    persist: props.persistSessionSelection,
+  });
+}
+
+function createWorkspaceSession() {
+  chatStore.newChat({
+    persistSelection: props.persistSessionSelection,
+  });
+}
+
+function publishSessionExecutionState() {
+  const sessionId = chatStore.activeSessionId;
+  if (!sessionId) return;
+  chatStore.applyActiveSessionExecutionState(
+    sessionId,
+    modelStore.selectedModelId,
+    modelStore.effort,
+  );
+  void broadcastSessionExecutionState({
+    sessionId,
+    modelId: modelStore.selectedModelId,
+    effort: modelStore.effort,
+  });
+}
+
+async function selectWorkspaceModel(modelId: string) {
+  modelStore.selectModel(modelId);
+  await nextTick();
+  publishSessionExecutionState();
+}
+
+function selectWorkspaceEffort(effort: EffortLevel) {
+  modelStore.selectEffort(effort);
+  publishSessionExecutionState();
+}
 
 function beforeEnterSidebarPanel(element: Element) {
   const shell = element as HTMLElement;
   const isBottomLayout = shell.classList.contains("layout-bottom");
+  connectAssistantSidebarResizeObserver(shell);
   shell.dataset.enterAxis = isBottomLayout ? "vertical" : "horizontal";
   shell.style.pointerEvents = "none";
   shell.style.overflow = "hidden";
@@ -95,12 +181,14 @@ function beforeEnterSidebarPanel(element: Element) {
     shell.style.height = "0px";
     shell.style.minHeight = "0px";
     shell.style.maxHeight = "0px";
+    syncAssistantSidebarContentBalance(shell);
     return;
   }
 
   shell.style.width = "0px";
   shell.style.minWidth = "0px";
   shell.style.maxWidth = "0px";
+  syncAssistantSidebarContentBalance(shell);
 }
 
 function enterSidebarPanel(element: Element, done: () => void) {
@@ -281,6 +369,7 @@ function afterLeaveSidebarPanel(element: Element) {
   const shell = element as HTMLElement;
   delete shell.dataset.exitAxis;
   shell.removeAttribute("style");
+  disconnectAssistantSidebarResizeObserver();
 }
 
 function setWorkspaceWidth(width: number) {
@@ -296,6 +385,7 @@ function updateWorkspaceWidth() {
 function handleWorkspaceResize(entries: ResizeObserverEntry[]) {
   const width = entries[0]?.contentRect.width ?? workspaceRef.value?.clientWidth ?? 0;
   setWorkspaceWidth(width);
+  syncAssistantSidebarContentBalance();
 }
 
 function disconnectWorkspaceResizeObserver() {
@@ -346,6 +436,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disconnectWorkspaceResizeObserver();
+  disconnectAssistantSidebarResizeObserver();
 });
 </script>
 
@@ -363,6 +454,8 @@ onUnmounted(() => {
       :layout-mode="layoutMode"
       :default-session-panel-collapsed="defaultSessionPanelCollapsed"
       :session-panel-storage-scope="sessionPanelStorageScope"
+      :show-session-navigation="showSessionNavigation"
+      :content-start-inset="assistantSidebarBalanceWidth"
       :messages="chatStore.messages"
       streaming-text=""
       :typed-text-stream="chatStore.typedStream"
@@ -412,16 +505,16 @@ onUnmounted(() => {
       @fork="chatStore.forkSession"
       @cancel="chatStore.cancelChat"
       @select-agent="(id: string) => agentStore.selectAgent(id)"
-      @select-model="(id: string) => modelStore.selectModel(id)"
-      @select-effort="(level: EffortLevel) => modelStore.selectEffort(level)"
+      @select-model="selectWorkspaceModel"
+      @select-effort="selectWorkspaceEffort"
       @select-fast-mode="(enabled: boolean) => modelStore.selectCodexFastMode(enabled)"
       @save-raw-context="saveRawContext"
       @answer-question="chatStore.answerQuestion"
       @answer-tool-confirm="chatStore.answerToolConfirm"
       @answer-all-tool-confirms="chatStore.answerAllToolConfirms"
       @open-thinking="chatStore.openThinkingPanel"
-      @select-session="chatStore.selectSession"
-      @new-chat="chatStore.newChat"
+      @select-session="selectWorkspaceSession"
+      @new-chat="createWorkspaceSession"
       @rename-session="chatStore.renameSession"
       @archive-session="chatStore.archiveSession"
       @delete-session="chatStore.deleteSession"

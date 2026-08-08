@@ -80,6 +80,17 @@ describe("RichChatInput command popup layout", () => {
     expect(tabAutocompleteStart).toBeGreaterThan(tabStart);
   });
 
+  it("keeps intent commands available while a session is running", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(richInput).toMatch(
+      /const allowActionCommands = computed\(\(\) =>\s*!props\.isStreaming\s*&& !!activeOperator\.value/,
+    );
+    expect(richInput).not.toMatch(
+      /function syncOperatorState\(\) \{[\s\S]*?if \(props\.isStreaming\) \{[\s\S]*?showCommandPopup\.value = false;/,
+    );
+  });
+
   it("registers fork as an executable action command", () => {
     const richInput = read("src/components/chat/RichChatInput.vue");
     const commandRegistry = read("src/composables/useCommandRegistry.ts");

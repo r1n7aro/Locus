@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 const AUTO_COMPACT_THRESHOLD: f64 = 0.9;
 const AUTO_COMPACT_BUFFER_MIN_TOKENS: u32 = 4_000;
 const AUTO_COMPACT_BUFFER_MAX_TOKENS: u32 = 24_000;
+const CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u32 = 95;
+const CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT: u32 = 90;
 
 // The byte heuristic in `estimate_text_tokens` undercounts CJK and dense JSON
 // by 15-35%, so real usage feedback may only raise the estimate, never lower it.
@@ -32,6 +34,8 @@ const SUMMARY_CLOSE: &str = "</summary>";
 /// `SessionStore` (handoff detection/redaction) and used here to give handoff
 /// messages their own truncation budget inside a follow-up compact request.
 pub const CONTEXT_HANDOFF_MARKER: &str = "## Context Handoff";
+const CONTEXT_HANDOFF_SUMMARY_HEADING: &str = "### Earlier Conversation Summary";
+const RESTORED_FILE_CONTEXT_HEADING: &str = "### Restored File Context";
 
 const POST_COMPACT_MAX_FILES_TO_RESTORE: usize = 5;
 // Post-compact file restoration scales with the context window: small custom
@@ -247,19 +251,31 @@ pub fn should_auto_compact(total_input_tokens: u32, context_limit: u32) -> bool 
     total_input_tokens.saturating_add(auto_compact_buffer(context_limit)) >= threshold
 }
 
-pub fn should_codex_auto_compact(total_input_tokens: u32, context_limit: u32) -> bool {
-    if context_limit == 0 {
+/// Derives codex-rs's default threshold from the effective input window Locus
+/// uses elsewhere: raw window × 90%, while the effective window is raw × 95%.
+pub fn codex_auto_compact_token_limit(effective_context_window: u32) -> u32 {
+    (u64::from(effective_context_window)
+        .saturating_mul(u64::from(CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT))
+        / u64::from(CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT))
+    .min(u64::from(u32::MAX)) as u32
+}
+
+pub fn should_codex_auto_compact(total_input_tokens: u32, auto_compact_limit: u32) -> bool {
+    if auto_compact_limit == 0 {
         return false;
     }
-    let auto_compact_limit = context_limit.saturating_mul(9) / 10;
     total_input_tokens >= auto_compact_limit
 }
 
-pub fn should_codex_block_normal_send(total_input_tokens: u32, context_limit: u32) -> bool {
-    if context_limit == 0 {
+pub fn should_codex_block_normal_send(
+    total_input_tokens: u32,
+    effective_context_window: u32,
+    auto_compact_limit: u32,
+) -> bool {
+    if effective_context_window == 0 || auto_compact_limit == 0 {
         return false;
     }
-    total_input_tokens >= context_limit.saturating_sub(24_000)
+    total_input_tokens >= auto_compact_limit.min(effective_context_window)
 }
 
 pub const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
@@ -586,8 +602,10 @@ fn truncate_to_token_budget(content: &str, max_tokens: u32) -> (String, bool) {
 fn sanitize_tool_call_for_compact(tool_call: &ToolCallInfo) -> (ToolCallInfo, bool) {
     let mut sanitized = tool_call.clone();
     let mut truncated = false;
-    let (arguments, arguments_truncated) =
-        truncate_to_token_budget(&sanitized.arguments, COMPACT_REQUEST_MAX_TOOL_ARGUMENT_TOKENS);
+    let (arguments, arguments_truncated) = truncate_to_token_budget(
+        &sanitized.arguments,
+        COMPACT_REQUEST_MAX_TOOL_ARGUMENT_TOKENS,
+    );
     sanitized.arguments = arguments;
     truncated |= arguments_truncated;
     sanitized.recorded_output = None;
@@ -775,10 +793,7 @@ fn flatten_tool_interactions_for_compact(messages: &mut [ChatMessage]) {
                         tool_call.name, tool_call.arguments
                     ));
                     if let Some(output) = tool_call.server_tool_output.as_deref() {
-                        rendered.push_str(&format!(
-                            "\n[{} output]\n{}",
-                            tool_call.name, output
-                        ));
+                        rendered.push_str(&format!("\n[{} output]\n{}", tool_call.name, output));
                     }
                 }
                 message.content = format!("{}{}", message.content.trim_end(), rendered)
@@ -1569,10 +1584,7 @@ fn read_current_unity_yaml_excerpt(
             }
             _ => unreachable!(),
         };
-        return Some(truncate_for_token_budget(
-            &output,
-            max_tokens_per_file,
-        ));
+        return Some(truncate_for_token_budget(&output, max_tokens_per_file));
     }
 
     if is_hierarchical && request.object_path.is_none() {
@@ -1623,10 +1635,14 @@ fn read_current_unity_yaml_excerpt(
                 {
                     let guid_resolver =
                         |_guid: &crate::asset_db::types::Guid| -> Option<String> { None };
+                    let object_resolver = |_guid: &crate::asset_db::types::Guid,
+                                           _file_id: i64|
+                     -> Option<String> { None };
                     let stripped = crate::unity_yaml::extract_stripped_mappings(&docs, &lines);
                     let detail = crate::unity_yaml::format_prefab_instance_detail(
                         prefab_instance,
                         &guid_resolver,
+                        &object_resolver,
                         None,
                         &stripped,
                     );
@@ -1655,11 +1671,14 @@ fn read_current_unity_yaml_excerpt(
         )
     };
 
-    let guid_resolver = |_hex: &str| -> Option<String> { None };
+    let external_resolver = |_hex: &str, _file_id: Option<i64>| -> Option<String> { None };
     let mut output = output_header;
     for idx in doc_ranges {
         let doc = &docs[idx];
-        output.push_str(&format!("\n--- {} ---\n", doc.type_name));
+        output.push_str(&format!(
+            "\n--- {} ---\n",
+            crate::unity_yaml::format_doc_display_label(doc)
+        ));
         output.push_str(&crate::unity_yaml::format_doc_state_lines(doc));
         let content_start = (doc.line_start + 2).min(doc.line_end);
         let skipped_fields = if doc.m_enabled.is_some() {
@@ -1671,7 +1690,7 @@ fn read_current_unity_yaml_excerpt(
             &lines,
             content_start,
             doc.line_end,
-            &guid_resolver,
+            &external_resolver,
             &internal_resolver,
             skipped_fields,
         );
@@ -1908,6 +1927,32 @@ fn build_handoff_content(
     )
 }
 
+/// Extract the user-readable compact output from a persisted handoff message.
+/// The surrounding handoff instructions, transcript reference, and restored
+/// file context are implementation context and stay out of the standalone
+/// summary viewer.
+pub fn extract_post_compact_summary(content: &str) -> Option<String> {
+    let handoff = content.strip_prefix(CONTEXT_HANDOFF_MARKER)?;
+    let (_, summary_and_restored_files) = handoff.split_once(CONTEXT_HANDOFF_SUMMARY_HEADING)?;
+
+    let summary = summary_and_restored_files
+        .rfind(RESTORED_FILE_CONTEXT_HEADING)
+        .and_then(|index| {
+            let restored_section = &summary_and_restored_files[index..];
+            restored_section
+                .contains("The snippets below were auto-restored because")
+                .then_some(&summary_and_restored_files[..index])
+        })
+        .unwrap_or(summary_and_restored_files)
+        .trim();
+
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.to_string())
+    }
+}
+
 /// `has_retained_user_messages` should reflect what actually survives in the
 /// prompt after `SessionStore::compact_messages` (the recent-user-message
 /// retention set), not the summary boundary position.
@@ -2013,7 +2058,9 @@ pub fn export_compact_transcript(
         return None;
     }
 
-    let root = crate::commands::app_temp_dir().ok()?.join("compact-transcripts");
+    let root = crate::commands::app_temp_dir()
+        .ok()?
+        .join("compact-transcripts");
     std::fs::create_dir_all(&root).ok()?;
     let path = root.join(format!("{}.md", safe_session));
     let existing_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -2154,10 +2201,12 @@ mod tests {
             latest_segment_omitted: false,
         };
         let msg = build_post_compact_message("总结", "", 100, false, Some(&export));
-        assert!(msg.content.contains("No verbatim messages follow this handoff"));
         assert!(msg
             .content
-            .contains("read the full pre-compact transcript at: C:/temp/compact-transcripts/session.md"));
+            .contains("No verbatim messages follow this handoff"));
+        assert!(msg.content.contains(
+            "read the full pre-compact transcript at: C:/temp/compact-transcripts/session.md"
+        ));
 
         // Once the transcript file is capped, the handoff must not advertise
         // it as the full transcript for this round.
@@ -2168,7 +2217,42 @@ mod tests {
         let msg = build_post_compact_message("总结", "", 100, false, Some(&capped));
         assert!(!msg.content.contains("full pre-compact transcript"));
         assert!(msg.content.contains("EARLIER compaction rounds"));
-        assert!(msg.content.contains("the segment for this round was omitted"));
+        assert!(msg
+            .content
+            .contains("the segment for this round was omitted"));
+    }
+
+    #[test]
+    fn extract_post_compact_summary_returns_only_the_compact_output() {
+        let restored_files = "### Restored File Context\n\nThe snippets below were auto-restored because these files or Unity assets were inspected before compaction.\n\n#### src/main.rs\nsource\n\nfn main() {}";
+        let message = build_post_compact_message(
+            "1. Primary Request and Intent\nKeep working on the editor.\n\n2. Current Work\nImplement the viewer.",
+            restored_files,
+            100,
+            true,
+            None,
+        );
+
+        let output =
+            extract_post_compact_summary(&message.content).expect("extract compact output");
+
+        assert!(output.starts_with("1. Primary Request and Intent"));
+        assert!(output.ends_with("Implement the viewer."));
+        assert!(!output.contains("Context Handoff"));
+        assert!(!output.contains("Restored File Context"));
+        assert!(!output.contains("auto-restored"));
+    }
+
+    #[test]
+    fn extract_post_compact_summary_rejects_regular_messages() {
+        assert_eq!(
+            extract_post_compact_summary("ordinary assistant reply"),
+            None
+        );
+        assert_eq!(
+            extract_post_compact_summary("## Context Handoff\n\nmissing summary heading"),
+            None
+        );
     }
 
     #[test]
@@ -2399,11 +2483,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_auto_compact_uses_ninety_percent_context_limit() {
-        assert!(!should_codex_auto_compact(180_000, 258_400));
-        assert!(!should_codex_auto_compact(232_559, 258_400));
-        assert!(should_codex_auto_compact(232_560, 258_400));
-        assert!(should_codex_block_normal_send(235_000, 258_400));
+    fn codex_auto_compact_uses_ninety_percent_of_the_raw_window() {
+        let standard_limit = codex_auto_compact_token_limit(258_400);
+        assert_eq!(standard_limit, 244_800);
+        assert!(!should_codex_auto_compact(244_799, standard_limit));
+        assert!(should_codex_auto_compact(244_800, standard_limit));
+        assert!(should_codex_block_normal_send(
+            244_800,
+            258_400,
+            standard_limit,
+        ));
+
+        let extended_limit = codex_auto_compact_token_limit(353_400);
+        assert_eq!(extended_limit, 334_800);
+        assert!(!should_codex_auto_compact(334_799, extended_limit));
+        assert!(should_codex_auto_compact(334_800, extended_limit));
     }
 
     #[test]
@@ -2453,7 +2547,10 @@ mod tests {
 
         let estimated = estimate_request_tokens(&["system"], &messages, &tools);
         assert!(estimated < 60_000);
-        assert!(!should_codex_auto_compact(estimated, 258_400));
+        assert!(!should_codex_auto_compact(
+            estimated,
+            codex_auto_compact_token_limit(258_400),
+        ));
     }
 
     #[test]
@@ -2527,7 +2624,10 @@ mod tests {
         let estimated = estimate_request_tokens(&["system"], &with_nested, &[]);
 
         assert_eq!(estimated, baseline);
-        assert!(!should_codex_auto_compact(estimated, 258_400));
+        assert!(!should_codex_auto_compact(
+            estimated,
+            codex_auto_compact_token_limit(258_400),
+        ));
     }
 
     #[test]
@@ -2726,7 +2826,14 @@ mod tests {
                 None,
                 Some("tc-1"),
             ),
-            make_message("assistant-2", MessageRole::Assistant, "done", 103, None, None),
+            make_message(
+                "assistant-2",
+                MessageRole::Assistant,
+                "done",
+                103,
+                None,
+                None,
+            ),
         ];
 
         let plan = build_compact_request_with_budget(&messages, &["system"], 258_400)
@@ -2853,7 +2960,9 @@ mod tests {
     #[test]
     fn transcript_capacity_gate_uses_size_cap() {
         assert!(!transcript_capacity_reached(0));
-        assert!(!transcript_capacity_reached(COMPACT_TRANSCRIPT_MAX_BYTES - 1));
+        assert!(!transcript_capacity_reached(
+            COMPACT_TRANSCRIPT_MAX_BYTES - 1
+        ));
         assert!(transcript_capacity_reached(COMPACT_TRANSCRIPT_MAX_BYTES));
     }
 
@@ -2864,10 +2973,7 @@ mod tests {
         assert!(was_truncated);
         // Byte-based cut keeps ~1333 chars; the old char-based cut would have
         // kept the full 4k chars (12k bytes ≈ 3k estimated tokens).
-        let kept_chars = truncated
-            .chars()
-            .take_while(|ch| *ch == '工')
-            .count();
+        let kept_chars = truncated.chars().take_while(|ch| *ch == '工').count();
         assert!(kept_chars <= 1_334, "kept {} chars", kept_chars);
         assert!(estimate_text_tokens(truncated.as_str()) <= 1_100);
     }
@@ -3238,12 +3344,11 @@ mod tests {
             ),
         ];
 
-        let section =
-            build_post_compact_restored_files_section(
-                &messages,
-                &temp_root.display().to_string(),
-                0,
-            );
+        let section = build_post_compact_restored_files_section(
+            &messages,
+            &temp_root.display().to_string(),
+            0,
+        );
 
         assert!(section.contains("Restored File Context"));
         assert!(section.contains("src/main.ts"));
@@ -3295,12 +3400,11 @@ mod tests {
             ),
         ];
 
-        let section =
-            build_post_compact_restored_files_section(
-                &messages,
-                &temp_root.display().to_string(),
-                0,
-            );
+        let section = build_post_compact_restored_files_section(
+            &messages,
+            &temp_root.display().to_string(),
+            0,
+        );
 
         assert!(section.contains("src/main.ts"));
         assert!(section.contains("line two"));
@@ -3347,12 +3451,11 @@ mod tests {
             ),
         ];
 
-        let section =
-            build_post_compact_restored_files_section(
-                &messages,
-                &temp_root.display().to_string(),
-                0,
-            );
+        let section = build_post_compact_restored_files_section(
+            &messages,
+            &temp_root.display().to_string(),
+            0,
+        );
 
         assert!(section.contains("Assets/Data/Test.asset"));
         assert!(section.contains("exact `unity_yaml_read` result"));
@@ -3411,12 +3514,11 @@ mod tests {
             ),
         ];
 
-        let section =
-            build_post_compact_restored_files_section(
-                &messages,
-                &temp_root.display().to_string(),
-                0,
-            );
+        let section = build_post_compact_restored_files_section(
+            &messages,
+            &temp_root.display().to_string(),
+            0,
+        );
 
         assert!(section.contains("PersistedAsset"));
 

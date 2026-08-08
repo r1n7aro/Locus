@@ -5,6 +5,7 @@ import type {
   SessionEventRecord,
   SessionRunSummary,
   TokenUsage,
+  ModelUsageReport,
   TodoSnapshot,
   ImageAttachment,
   AssetRefAttachment,
@@ -12,6 +13,7 @@ import type {
   KnowledgeAccessMode,
   KnowledgeDocumentType,
   PendingSessionInput,
+  CompactedContextOutput,
 } from "../types";
 
 export interface ChatParams {
@@ -153,6 +155,16 @@ export function loadSession(sessionId: string): Promise<SessionDetail> {
   return ipcInvoke<SessionDetail>("load_session", { sessionId });
 }
 
+export function getCompactedContextOutput(
+  sessionId: string,
+  messageId: string,
+): Promise<CompactedContextOutput> {
+  return ipcInvoke<CompactedContextOutput>("get_compacted_context_output", {
+    sessionId,
+    messageId,
+  });
+}
+
 export function renameSession(sessionId: string, title: string): Promise<void> {
   return ipcInvoke("rename_session", { sessionId, title });
 }
@@ -182,6 +194,10 @@ export function rollbackSessionToMessage(
 
 export function getSessionUsage(sessionId: string): Promise<TokenUsage> {
   return ipcInvoke<TokenUsage>("get_session_usage", { sessionId });
+}
+
+export function getModelUsageStats(days?: number | null): Promise<ModelUsageReport> {
+  return ipcInvoke<ModelUsageReport>("get_model_usage_stats", { days: days ?? null });
 }
 
 export function getSessionActiveRun(sessionId: string): Promise<SessionRunSummary | null> {

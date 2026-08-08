@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use tauri::Emitter;
 use tauri::Manager;
+use tauri::{PhysicalPosition, Rect};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
 use windows::core::BOOL;
 use windows::Win32::{
@@ -21,6 +22,7 @@ use windows::Win32::{
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const RESIZE_BORDERS_CLASS_NAME: &str = "TAURI_DRAG_RESIZE_BORDERS";
+const RENDER_WIDGET_CLASS_NAME: &str = "Chrome_RenderWidgetHostHWND";
 const NATIVE_CLIENT_SIZE_EVENT: &str = "locus-native-window-client-size";
 const SUBCLASS_ID: usize = 0x4c6f63757352537a;
 const CHILD_SUBCLASS_ID: usize = 0x4c6f63757352537b;
@@ -41,6 +43,7 @@ struct ResizeSyncState {
     parent_hwnd: HWND,
     webview_hwnd: HWND,
     resize_borders_hwnd: HWND,
+    render_widget_hwnd: HWND,
     last_x: i32,
     last_y: i32,
     last_width: i32,
@@ -62,6 +65,71 @@ struct WindowClientMetrics {
     frame_height: i32,
 }
 
+fn apply_webview_client_bounds(
+    webview: &tauri::Webview,
+    client_size: tauri::PhysicalSize<u32>,
+    phase: &'static str,
+) -> Result<(), String> {
+    let parent_hwnd_value = webview
+        .window()
+        .hwnd()
+        .map_err(|error| format!("failed to read main window handle during {phase}: {error}"))?
+        .0 as isize;
+    let bounds = Rect {
+        position: PhysicalPosition::new(0, 0).into(),
+        size: client_size.into(),
+    };
+    webview
+        .set_bounds(bounds)
+        .map_err(|error| format!("failed to queue main webview bounds during {phase}: {error}"))?;
+
+    // WebviewWindow is built without explicit stable-api webview bounds, so
+    // its native controller may still be at WebView2's 800x600 default even
+    // after the dispatcher accepted set_bounds. Apply the same rectangle to
+    // the controller before calculating auto-resize ratios.
+    let native_bounds = RECT {
+        left: 0,
+        top: 0,
+        right: client_size.width as i32,
+        bottom: client_size.height as i32,
+    };
+    webview
+        .with_webview(move |platform_webview| {
+            if let Err(error) = unsafe { platform_webview.controller().SetBounds(native_bounds) } {
+                eprintln!(
+                    "[Locus] warning: failed to apply native WebView2 bounds during {phase}: {error}"
+                );
+            }
+            let parent_hwnd = HWND(parent_hwnd_value as *mut std::ffi::c_void);
+            let render_widget_hwnd = unsafe { find_render_widget_hwnd(parent_hwnd) };
+            unsafe {
+                sync_child_window(
+                    render_widget_hwnd,
+                    0,
+                    0,
+                    native_bounds.right,
+                    native_bounds.bottom,
+                );
+            }
+        })
+        .map_err(|error| format!("failed to access WebView2 during {phase}: {error}"))?;
+
+    webview
+        .set_auto_resize(true)
+        .map_err(|error| format!("failed to enable main webview auto-resize during {phase}: {error}"))
+}
+
+pub fn sync_after_page_load(webview: &tauri::Webview) -> Result<(), String> {
+    if webview.label() != MAIN_WINDOW_LABEL {
+        return Ok(());
+    }
+    let client_size = webview
+        .window()
+        .inner_size()
+        .map_err(|error| format!("failed to read main window client size after page load: {error}"))?;
+    apply_webview_client_bounds(webview, client_size, "page load")
+}
+
 pub fn install_for_main_window(app: &tauri::App) -> Result<(), String> {
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Ok(());
@@ -73,6 +141,21 @@ pub fn install_for_main_window(app: &tauri::App) -> Result<(), String> {
             "main webview window '{MAIN_WINDOW_LABEL}' was not found"
         ));
     };
+
+    // WebviewWindowBuilder::from_config creates the native window with its
+    // configured size, while Tauri's stable webview builder starts without
+    // explicit bounds or auto-resize. That leaves WebView2 at its 800x600
+    // default until some other code happens to resize it. Seed Tauri's own
+    // webview layout state before installing the native live-resize shim so
+    // startup, maximize/restore, and edge resizing all share the same bounds.
+    let initial_size = window
+        .inner_size()
+        .map_err(|error| format!("failed to read main window client size: {error}"))?;
+    let webview = window.as_ref();
+    apply_webview_client_bounds(webview, initial_size, "startup").map_err(|error| {
+        INSTALLED.store(false, Ordering::Release);
+        error
+    })?;
 
     let parent_hwnd = window
         .hwnd()
@@ -107,6 +190,7 @@ unsafe fn install_subclass(
         parent_hwnd,
         webview_hwnd,
         resize_borders_hwnd: unsafe { find_resize_borders_hwnd(parent_hwnd) },
+        render_widget_hwnd: unsafe { find_render_widget_hwnd(parent_hwnd) },
         last_x: 0,
         last_y: 0,
         last_width: 0,
@@ -247,6 +331,9 @@ unsafe extern "system" fn child_sync_subclass_proc(
             }
             if state.resize_borders_hwnd.0 == hwnd.0 {
                 state.resize_borders_hwnd = HWND::default();
+            }
+            if state.render_widget_hwnd.0 == hwnd.0 {
+                state.render_widget_hwnd = HWND::default();
             }
             return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
@@ -515,6 +602,13 @@ unsafe fn sync_webview_bounds_at(
         sync_child_window(state.resize_borders_hwnd, x, y, width, height);
     }
 
+    if state.render_widget_hwnd.0.is_null() {
+        state.render_widget_hwnd = unsafe { find_render_widget_hwnd(state.parent_hwnd) };
+    }
+    unsafe {
+        sync_child_window(state.render_widget_hwnd, x, y, width, height);
+    }
+
     if state.live_resize {
         unsafe {
             notify_parent_position_changed(state);
@@ -535,6 +629,13 @@ unsafe fn ensure_child_subclasses(state: &mut ResizeSyncState) {
     }
     unsafe {
         install_child_subclass(state.resize_borders_hwnd, state);
+    }
+
+    if state.render_widget_hwnd.0.is_null() {
+        state.render_widget_hwnd = unsafe { find_render_widget_hwnd(state.parent_hwnd) };
+    }
+    unsafe {
+        install_child_subclass(state.render_widget_hwnd, state);
     }
 }
 
@@ -557,6 +658,7 @@ unsafe fn remove_child_subclasses(state: &ResizeSyncState) {
     unsafe {
         remove_child_subclass(state.webview_hwnd);
         remove_child_subclass(state.resize_borders_hwnd);
+        remove_child_subclass(state.render_widget_hwnd);
     }
 }
 
@@ -693,6 +795,37 @@ unsafe fn find_resize_borders_hwnd(parent_hwnd: HWND) -> HWND {
         )
     };
     found
+}
+
+unsafe fn find_render_widget_hwnd(parent_hwnd: HWND) -> HWND {
+    let mut found = HWND::default();
+    let found_ptr = &mut found as *mut HWND;
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(parent_hwnd),
+            Some(find_render_widget_proc),
+            LPARAM(found_ptr as isize),
+        )
+    };
+    found
+}
+
+unsafe extern "system" fn find_render_widget_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let mut class_name = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    if len > 0 {
+        let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+        if class_name == RENDER_WIDGET_CLASS_NAME {
+            let found = lparam.0 as *mut HWND;
+            if !found.is_null() {
+                unsafe {
+                    *found = hwnd;
+                }
+            }
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
 }
 
 unsafe extern "system" fn find_resize_borders_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
