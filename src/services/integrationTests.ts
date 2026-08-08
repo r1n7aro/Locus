@@ -7,6 +7,7 @@ export type UnityIntegrationSuite =
   | "type-index"
   | "state-probe"
   | "native-bridge"
+  | "unity-test"
   | "hot-reload"
   | "execute";
 

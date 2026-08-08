@@ -3358,7 +3358,13 @@ mod tests {
         let (added_docs, added_lines, added_index) = parse(component_added);
 
         assert!(scene_target_docs_identical(
-            100, &old_docs, &same_docs, &old_lines, &same_lines, &old_index, &same_index,
+            100,
+            &old_docs,
+            &same_docs,
+            &old_lines,
+            &same_lines,
+            &old_index,
+            &same_index,
         ));
         assert!(!scene_target_docs_identical(
             100,

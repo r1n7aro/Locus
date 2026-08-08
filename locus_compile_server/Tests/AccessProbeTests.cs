@@ -85,6 +85,10 @@ namespace Locus
         internal int _intInst = 11;
         private static int _privStatic = 13;
         internal static int _intStatic = 17;
+        private int PrivProperty { get; set; } = 23;
+        internal int IntProperty { get; set; } = 29;
+        private event global::System.Action PrivEvent;
+        internal event global::System.Action IntEvent;
 
         private LocusAccessProbeTarget(int seed) { _privInst = seed; }
         internal LocusAccessProbeTarget() { }
@@ -93,10 +97,22 @@ namespace Locus
         internal int IntMethod(int x) { return x * 3 + 1; }
         private static int PrivStatic(int x) { return x * 5 + 1; }
         internal static int IntStatic(int x) { return x * 7 + 1; }
+        private T PrivGeneric<T>(T value) { return value; }
+        internal T IntGeneric<T>(T value) { return value; }
+        private void PrivRef(ref int value) { value += 5; }
+        internal void IntRef(ref int value) { value += 7; }
 
         public static LocusAccessProbeTarget New() { return new LocusAccessProbeTarget(); }
 
         public int ReadPrivInst() { return _privInst; }
+        public int ReadIntInst() { return _intInst; }
+        public static int ReadPrivStatic() { return _privStatic; }
+        public static int ReadIntStatic() { return _intStatic; }
+        public int ReadPrivProperty() { return PrivProperty; }
+        public int ReadIntProperty() { return IntProperty; }
+        public int ReadPrivEventSubscribers() { return PrivEvent == null ? 0 : PrivEvent.GetInvocationList().Length; }
+        public int ReadIntEventSubscribers() { return IntEvent == null ? 0 : IntEvent.GetInvocationList().Length; }
+        public static void ResetStatics() { _privStatic = 13; _intStatic = 17; }
 
         private sealed class PrivNested { }
     }
@@ -105,10 +121,15 @@ namespace Locus
 
     private const string TargetAssemblyName = "LocusAccessProbeTargetRef";
 
-    private JsonNode CompileProbe(CompileService service, out string targetPath)
+    private JsonNode CompileProbe(
+        CompileService service,
+        out string targetPath,
+        string? mode = null)
     {
         targetPath = CompileOriginal(service, TargetAssemblyName, TargetSource);
         var request = new JsonObject { ["params"] = ParamsFor(targetPath) };
+        if (mode != null)
+            request["nonPublicAccessProbeMode"] = mode;
         return service.HandleCompileAccessProbe(request);
     }
 
@@ -123,25 +144,61 @@ namespace Locus
 
         var cells = result["cells"]!.AsArray();
         Assert.Equal(AccessProbeSource.Cells.Count, cells.Count);
-        Assert.Equal(18, cells.Count);
+        Assert.Equal(34, cells.Count);
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (JsonNode? cell in cells)
         {
             string op = cell!["op"]!.GetValue<string>();
             string visibility = cell["visibility"]!.GetValue<string>();
+            Assert.True(cell["expected"]!.GetValue<int>() > 0);
             Assert.Equal("Cell_" + op + "_" + visibility, cell["method"]!.GetValue<string>());
             Assert.True(seen.Add(op + "|" + visibility), "duplicate cell " + op + "|" + visibility);
         }
-        foreach (string op in new[] { "ldfld", "stfld", "ldsfld", "stsfld", "call", "callvirt", "newobj", "castclass", "ldtoken" })
+        foreach (string op in new[]
+        {
+            "ldfld", "stfld", "ldsfld", "stsfld", "ldflda", "ldsflda",
+            "call", "callvirt", "newobj", "ldftn", "property_get", "property_set",
+            "event_add", "generic_call", "ref_call", "castclass", "ldtoken",
+        })
         {
             Assert.Contains(op + "|private", seen);
             Assert.Contains(op + "|internal", seen);
         }
     }
 
+    [Theory]
+    [InlineData(CompileService.AccessProbeCompilerOnly, false)]
+    [InlineData(CompileService.AccessProbeIgnoresAccessChecksTo, false)]
+    [InlineData(CompileService.AccessProbeSkipVerification, true)]
+    [InlineData(CompileService.AccessProbeCombined, true)]
+    public void Every_runtime_policy_compiles_and_skip_modes_emit_decl_security(
+        string mode,
+        bool expectsDeclSecurity)
+    {
+        var service = new CompileService();
+        JsonNode result = CompileProbe(service, out _, mode);
+
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.Equal(mode, result["nonPublicAccessProbeMode"]!.GetValue<string>());
+        Assert.Equal(
+            expectsDeclSecurity,
+            result["skipVerificationDeclSecurity"]!.GetValue<bool>());
+    }
+
     [Fact]
-    public void Every_cell_jits_on_coreclr()
+    public void Unknown_runtime_policy_fails_validation()
+    {
+        var service = new CompileService();
+        JsonNode result = CompileProbe(service, out _, "unknown-policy");
+
+        Assert.False(result["success"]!.GetValue<bool>());
+        Assert.Equal("validation", result["errorStage"]!.GetValue<string>());
+        Assert.Contains("unknown nonPublicAccessProbeMode", result["error"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Every_cell_jits_executes_and_returns_expected_value_on_coreclr()
     {
         var service = new CompileService();
         JsonNode result = CompileProbe(service, out string targetPath);
@@ -165,9 +222,14 @@ namespace Locus
                 MethodInfo? method = probeType.GetMethod(methodName, BindingFlags.Public | BindingFlags.Static);
                 Assert.True(method != null, "probe method missing: " + methodName);
 
-                // CoreCLR honors IgnoresAccessChecksTo: every cell must JIT.
-                Exception? failure = Record.Exception(() => RuntimeHelpers.PrepareMethod(method!.MethodHandle));
-                Assert.True(failure == null, methodName + " failed to JIT: " + failure);
+                int expected = cell["expected"]!.GetValue<int>();
+                Exception? failure = Record.Exception(() =>
+                {
+                    RuntimeHelpers.PrepareMethod(method!.MethodHandle);
+                    object? resultValue = method.Invoke(null, null);
+                    Assert.Equal(expected, Convert.ToInt32(resultValue));
+                });
+                Assert.True(failure == null, methodName + " failed to execute: " + failure);
             }
         }
         finally

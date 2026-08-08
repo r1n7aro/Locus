@@ -30,6 +30,21 @@ describe("rankSearchResults", () => {
 });
 
 describe("useCommandRegistry", () => {
+  it("registers /console-error as an executable action command", () => {
+    const skills = ref<SkillManifest[]>([]);
+    const agentId = ref("dev");
+    const { filteredCommands, findExactAvailableCommand } = useCommandRegistry(skills, agentId);
+
+    expect(findExactAvailableCommand("/console-error")).toMatchObject({
+      name: "/console-error",
+      commandKind: "action",
+      commandType: "unity-console-error",
+    });
+    expect(
+      filteredCommands("/console-error", { includeActions: true })[0]?.name,
+    ).toBe("/console-error");
+  });
+
   it("finds skill commands even when the query only matches a later segment", () => {
     const skills = ref<SkillManifest[]>([
       {

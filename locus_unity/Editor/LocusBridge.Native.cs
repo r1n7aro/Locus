@@ -94,6 +94,9 @@ namespace Locus
             byte[] eventType, int typeLen, byte[] payload, int payloadLen);
 
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int locus_has_connected_client();
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern int locus_set_background_active(int active);
 
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
@@ -370,6 +373,21 @@ namespace Locus
             catch (Exception ex)
             {
                 Debug.LogWarning("[Locus] Native emit_event failed: " + ex.Message);
+            }
+        }
+
+        internal static bool HasConnectedDesktopClient()
+        {
+            if (!_nativeBridgeActive)
+                return false;
+            try
+            {
+                return locus_has_connected_client() != 0;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] Native client-state query failed: " + ex.Message);
+                return false;
             }
         }
 

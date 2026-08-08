@@ -4,7 +4,8 @@
 //! Unity checkout has none until an IDE package inside the editor writes
 //! them. Two generation channels, tried by `discover_project_target`:
 //!
-//! 1. A connected editor (Locus bridge) runs [`editor_sync_snippet`].
+//! 1. A connected editor asks the Locus Unity plugin to sync directly, with
+//!    [`editor_sync_snippet`] retained as a compatibility fallback.
 //! 2. No editor running: a one-shot headless `-batchmode` editor run.
 //!    The `-executeMethod` entry point is carried by a temporary embedded
 //!    package written into `Packages/` and removed afterwards; the project

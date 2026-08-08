@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{
+    AtomicBool as GlobalAtomicBool, AtomicU64, Ordering as GlobalAtomicOrdering,
+};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -27,8 +30,40 @@ const TARGET_KIND_VIEW: &str = "view";
 const TARGET_KIND_SESSION: &str = "session";
 const CLOSE_REASON_DOMAIN_RELOAD: &str = "domainReload";
 const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
+const UNITY_EMBED_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
 const ASSET_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(35);
+
+static UNITY_EMBED_QUIESCED: GlobalAtomicBool = GlobalAtomicBool::new(false);
+static UNITY_EMBED_CONTROL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct UnityEmbedQuiesceGuard {
+    active: bool,
+}
+
+impl Drop for UnityEmbedQuiesceGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        // Advance the epoch before accepting new messages. Messages received
+        // while Unity was closing retain the previous epoch and stay ignored
+        // even if their main-thread dispatch runs after this guard is dropped.
+        UNITY_EMBED_CONTROL_EPOCH.fetch_add(1, GlobalAtomicOrdering::SeqCst);
+        UNITY_EMBED_QUIESCED.store(false, GlobalAtomicOrdering::SeqCst);
+        self.active = false;
+        eprintln!("[Locus] Unity embed control resumed after editor shutdown");
+    }
+}
+
+fn unity_embed_is_quiesced() -> bool {
+    UNITY_EMBED_QUIESCED.load(GlobalAtomicOrdering::SeqCst)
+}
+
+fn unity_embed_control_epoch() -> u64 {
+    UNITY_EMBED_CONTROL_EPOCH.load(GlobalAtomicOrdering::SeqCst)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +315,25 @@ struct UnityEmbedAppliedState {
     height: i32,
     parent_hwnd: i64,
     visible: bool,
+    mount_mode: UnityEmbedMountMode,
+    last_mount_attempt: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum UnityEmbedMountMode {
+    #[default]
+    Unknown,
+    Child,
+    PopupIntentional,
+    PopupRecoverable,
+    DeferredParent,
+    TauriFallback,
+}
+
+impl UnityEmbedMountMode {
+    fn needs_child_retry(self) -> bool {
+        matches!(self, Self::PopupRecoverable | Self::DeferredParent)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -639,12 +693,18 @@ fn needs_geometry_apply(label: &str, msg: &UnityEmbedControlMessage) -> bool {
         let Some(state) = states.get(label) else {
             return true;
         };
+        let retry_due = state.mount_mode.needs_child_retry()
+            && state
+                .last_mount_attempt
+                .map(|attempt| attempt.elapsed() >= Duration::from_millis(500))
+                .unwrap_or(true);
         return !state.has_window
             || state.x != msg.x
             || state.y != msg.y
             || state.width != msg.width
             || state.height != msg.height
-            || state.parent_hwnd != msg.parent_hwnd;
+            || state.parent_hwnd != msg.parent_hwnd
+            || retry_due;
     }
 
     true
@@ -661,7 +721,11 @@ fn needs_visibility_apply(label: &str, visible: bool) -> bool {
     true
 }
 
-fn record_applied_geometry(label: &str, msg: &UnityEmbedControlMessage) {
+fn record_applied_geometry(
+    label: &str,
+    msg: &UnityEmbedControlMessage,
+    mount_mode: UnityEmbedMountMode,
+) {
     if let Ok(mut states) = applied_states().lock() {
         let state = states.entry(label.to_string()).or_default();
         state.has_window = true;
@@ -670,6 +734,17 @@ fn record_applied_geometry(label: &str, msg: &UnityEmbedControlMessage) {
         state.width = msg.width;
         state.height = msg.height;
         state.parent_hwnd = msg.parent_hwnd;
+        state.mount_mode = mount_mode;
+        state.last_mount_attempt = Some(Instant::now());
+    }
+}
+
+fn record_applied_mount_mode(label: &str, mount_mode: UnityEmbedMountMode) {
+    if let Ok(mut states) = applied_states().lock() {
+        if let Some(state) = states.get_mut(label) {
+            state.mount_mode = mount_mode;
+            state.last_mount_attempt = Some(Instant::now());
+        }
     }
 }
 
@@ -716,6 +791,16 @@ fn record_all_embed_windows_destroyed() {
         windows_impl::remove_mouse_activate_hook();
         windows_impl::reset_mouse_activation_suppressed();
     }
+}
+
+fn record_all_embed_windows_quiesced() {
+    if let Ok(mut states) = applied_states().lock() {
+        states.clear();
+    }
+    if let Ok(mut revisions) = control_revisions().lock() {
+        revisions.clear();
+    }
+    record_mount_result(false, None);
 }
 
 fn should_show_window_now(window: &tauri::WebviewWindow, msg: &UnityEmbedControlMessage) -> bool {
@@ -1839,7 +1924,13 @@ pub(crate) async fn open_unity_embed_frontend_window_for_request(
 pub async fn unity_embed_open_frontend_window(
     request: UnityEmbedOpenFrontendWindowRequest,
     workspace: State<'_, Arc<Workspace>>,
+    config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<UnityEmbedOpenFrontendWindowResult, AppError> {
+    if !config.unity_embed_enabled() {
+        return Err(AppError::from(
+            "Unity embedded windows are disabled in settings".to_string(),
+        ));
+    }
     let working_dir = workspace.path.read().await.clone();
     open_unity_embed_frontend_window_for_request(&working_dir, request)
         .await
@@ -1859,6 +1950,46 @@ pub async fn unity_embed_status(app_handle: AppHandle) -> Result<UnityEmbedStatu
         window_label: WINDOW_LABEL.to_string(),
         control: control_snapshot(),
     })
+}
+
+#[tauri::command]
+pub fn get_unity_embed_enabled(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.unity_embed_enabled())
+}
+
+#[tauri::command]
+pub async fn set_unity_embed_enabled(
+    app_handle: AppHandle,
+    value: bool,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<bool, AppError> {
+    config
+        .set_unity_embed_enabled(value)
+        .map_err(AppError::from)?;
+
+    let project_path = workspace.path.read().await.clone();
+    if !project_path.trim().is_empty() && crate::unity_bridge::is_unity_project(&project_path) {
+        crate::unity_bridge::sync_unity_embed_enabled_marker(&project_path, value)
+            .map_err(AppError::from)?;
+    }
+
+    if !value {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let app_for_main = app_handle.clone();
+        app_handle
+            .run_on_main_thread(move || {
+                destroy_unity_embed_control_window_on_main(&app_for_main);
+                let _ = tx.send(());
+            })
+            .map_err(|error| format!("Failed to disable Unity embed windows: {error}"))?;
+        rx.await
+            .map_err(|_| "Unity embed disable dispatch was cancelled".to_string())?;
+    }
+
+    Ok(value)
 }
 
 #[tauri::command]
@@ -2033,6 +2164,93 @@ pub(crate) fn reset_unity_embed_control_window(app_handle: &AppHandle) {
     }
 }
 
+/// Preserve the Unity-embedded WebViews while their cross-process parent HWND
+/// is about to disappear. The barrier runs on the GUI thread, detaches and
+/// hides every embed window, and rejects stale overlay messages until the
+/// returned guard is dropped. A later Unity open/update message remounts the
+/// existing WebView into the new editor window.
+pub(crate) async fn quiesce_unity_embed_control_windows(
+    app_handle: &AppHandle,
+) -> Result<UnityEmbedQuiesceGuard, String> {
+    UNITY_EMBED_QUIESCED
+        .compare_exchange(
+            false,
+            true,
+            GlobalAtomicOrdering::SeqCst,
+            GlobalAtomicOrdering::SeqCst,
+        )
+        .map_err(|_| "Unity embed shutdown is already in progress".to_string())?;
+    let guard = UnityEmbedQuiesceGuard { active: true };
+    let quiesce_epoch = UNITY_EMBED_CONTROL_EPOCH
+        .fetch_add(1, GlobalAtomicOrdering::SeqCst)
+        .wrapping_add(1);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let app_for_main = app_handle.clone();
+    app_handle
+        .run_on_main_thread(move || {
+            let result =
+                if !unity_embed_is_quiesced() || unity_embed_control_epoch() != quiesce_epoch {
+                    Err("Unity embed shutdown barrier was cancelled".to_string())
+                } else {
+                    quiesce_unity_embed_control_windows_on_main(&app_for_main)
+                };
+            let _ = tx.send(result);
+        })
+        .map_err(|error| format!("Failed to dispatch Unity embed shutdown barrier: {error}"))?;
+
+    let result = tokio::time::timeout(UNITY_EMBED_QUIESCE_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Unity embed shutdown barrier timed out".to_string())?
+        .map_err(|_| "Unity embed shutdown barrier was cancelled".to_string())?;
+    result?;
+    Ok(guard)
+}
+
+fn quiesce_unity_embed_control_windows_on_main(app_handle: &AppHandle) -> Result<(), String> {
+    cancel_all_transient_close_destroys(app_handle);
+    let labels = unity_embed_window_labels(app_handle);
+    let window_count = labels.len();
+    let mut errors = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    windows_impl::prepare_for_editor_shutdown();
+
+    for label in labels {
+        let Some(window) = app_handle.get_webview_window(&label) else {
+            continue;
+        };
+
+        #[cfg(target_os = "windows")]
+        if let Err(error) = windows_impl::quiesce_owned_overlay(&window) {
+            errors.push(format!("{label}: {error}"));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        if let Err(error) = window.hide() {
+            errors.push(format!(
+                "{label}: failed to hide Unity embed window: {error}"
+            ));
+        }
+    }
+
+    // Force the first message from the relaunched editor to reapply geometry,
+    // parentage, and visibility to the preserved WebView windows.
+    record_all_embed_windows_quiesced();
+
+    if errors.is_empty() {
+        eprintln!(
+            "[Locus] Unity embed windows quiesced before editor shutdown: count={window_count}"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to quiesce Unity embed windows before editor shutdown: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
 pub(crate) fn destroy_unity_embed_control_window_on_main(app_handle: &AppHandle) {
     cancel_all_transient_close_destroys(app_handle);
     for label in unity_embed_window_labels(app_handle) {
@@ -2115,7 +2333,24 @@ fn ensure_embed_window(
 fn apply_control_message_on_main(
     app_handle: &AppHandle,
     msg: UnityEmbedControlMessage,
+    expected_epoch: u64,
+    received_while_quiesced: bool,
 ) -> Result<(), String> {
+    if received_while_quiesced
+        || unity_embed_is_quiesced()
+        || unity_embed_control_epoch() != expected_epoch
+    {
+        return Ok(());
+    }
+
+    let embed_enabled = app_handle
+        .try_state::<Arc<crate::config::AppConfig>>()
+        .map(|config| config.unity_embed_enabled())
+        .unwrap_or(true);
+    if !embed_enabled {
+        return Ok(());
+    }
+
     let label = unity_embed_window_label_for_msg(&msg);
     // While the managed domain is reloading, the native overlay client keeps
     // the pipe alive and sends this marker. Retain the overlay exactly as-is
@@ -2140,8 +2375,8 @@ fn apply_control_message_on_main(
             let desired_visible = should_show_window_now(&window, &msg);
             let apply_visibility = created || needs_visibility_apply(&label, desired_visible);
             if apply_geometry {
-                apply_window_geometry(&window, &msg)?;
-                record_applied_geometry(&label, &msg);
+                let mount_mode = apply_window_geometry(&window, &msg)?;
+                record_applied_geometry(&label, &msg, mount_mode);
             }
 
             if apply_visibility {
@@ -2214,11 +2449,18 @@ async fn apply_control_message(
     app_handle: AppHandle,
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
+    let received_while_quiesced = unity_embed_is_quiesced();
+    let expected_epoch = unity_embed_control_epoch();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let app_for_main = app_handle.clone();
     app_handle
         .run_on_main_thread(move || {
-            let result = apply_control_message_on_main(&app_for_main, msg);
+            let result = apply_control_message_on_main(
+                &app_for_main,
+                msg,
+                expected_epoch,
+                received_while_quiesced,
+            );
             let _ = tx.send(result);
         })
         .map_err(|error| format!("Failed to dispatch Unity embed control: {error}"))?;
@@ -2230,26 +2472,54 @@ async fn apply_control_message(
 fn apply_window_geometry(
     window: &tauri::WebviewWindow,
     msg: &UnityEmbedControlMessage,
-) -> Result<(), String> {
+) -> Result<UnityEmbedMountMode, String> {
     #[cfg(target_os = "windows")]
     if msg.parent_hwnd > 0 {
-        if let Err(error) = windows_impl::position_owned_overlay(window, msg) {
-            eprintln!("[Locus] Unity embed Win32 overlay failed, using Tauri fallback: {error}");
-            record_mount_result(false, Some(error.clone()));
-            windows_impl::disable_popup_sync_for_window(window);
-            return apply_overlay_geometry(window, msg);
+        match windows_impl::position_owned_overlay(window, msg) {
+            Ok(outcome) => {
+                let mount_mode = match outcome {
+                    windows_impl::OverlayMountOutcome::Child => UnityEmbedMountMode::Child,
+                    windows_impl::OverlayMountOutcome::PopupIntentional => {
+                        UnityEmbedMountMode::PopupIntentional
+                    }
+                    windows_impl::OverlayMountOutcome::PopupRecoverable => {
+                        UnityEmbedMountMode::PopupRecoverable
+                    }
+                    windows_impl::OverlayMountOutcome::DeferredParent => {
+                        UnityEmbedMountMode::DeferredParent
+                    }
+                };
+                record_mount_result(
+                    matches!(
+                        mount_mode,
+                        UnityEmbedMountMode::Child
+                            | UnityEmbedMountMode::PopupIntentional
+                            | UnityEmbedMountMode::PopupRecoverable
+                    ),
+                    None,
+                );
+                return Ok(mount_mode);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Locus] Unity embed Win32 overlay failed, using Tauri fallback: {error}"
+                );
+                record_mount_result(false, Some(error.clone()));
+                windows_impl::disable_popup_sync_for_window(window);
+                apply_overlay_geometry(window, msg)?;
+                return Ok(UnityEmbedMountMode::TauriFallback);
+            }
         }
-        record_mount_result(true, None);
-        return Ok(());
     }
 
     record_mount_result(false, Some("Unity parent HWND is missing".to_string()));
     #[cfg(target_os = "windows")]
     {
         windows_impl::disable_popup_sync_for_window(window);
-        windows_impl::set_activation_guard_enabled(Some(window), true)?;
+        windows_impl::set_activation_guard_enabled(Some(window), msg.visible)?;
     }
-    apply_overlay_geometry(window, msg)
+    apply_overlay_geometry(window, msg)?;
+    Ok(UnityEmbedMountMode::TauriFallback)
 }
 
 fn apply_embed_window_visibility(
@@ -2294,7 +2564,7 @@ mod windows_impl {
     use super::*;
     use std::path::Path;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     };
     use std::time::{Duration, Instant};
@@ -2302,6 +2572,7 @@ mod windows_impl {
     use tokio::{
         io::{AsyncBufReadExt, BufReader},
         net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+        sync::Notify,
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
     use windows::core::{
@@ -2334,9 +2605,10 @@ mod windows_impl {
                 CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
             },
             SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
-            Threading::{AttachThreadInput, GetCurrentThreadId},
+            Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId},
         },
         UI::{
+            Accessibility::SetWinEventHook,
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetFocus, ReleaseCapture, SetActiveWindow,
                 SetFocus as SetKeyboardFocus,
@@ -2352,20 +2624,27 @@ mod windows_impl {
                 GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
                 GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
                 SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-                UpdateLayeredWindow, WindowFromPoint, GA_ROOT, GUITHREADINFO, GWLP_HWNDPARENT,
-                GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP, MA_NOACTIVATE,
-                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-                SW_HIDE, SW_SHOWNOACTIVATE, ULW_COLORKEY, WM_MOUSEACTIVATE, WM_NCDESTROY,
-                WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-                WS_SYSMENU, WS_THICKFRAME,
+                UpdateLayeredWindow, WindowFromPoint, CHILDID_SELF, EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GA_ROOT, GUITHREADINFO,
+                GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_TOP,
+                MA_NOACTIVATE, OBJID_WINDOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_COLORKEY,
+                WINEVENT_OUTOFCONTEXT, WM_MOUSEACTIVATE, WM_NCDESTROY, WS_CAPTION, WS_CHILD,
+                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+                WS_THICKFRAME,
             },
         },
     };
 
-    const POPUP_SYNC_ACTIVE_INTERVAL_MS: u64 = 16;
-    const POPUP_SYNC_IDLE_INTERVAL_MS: u64 = 120;
+    const POPUP_SYNC_COALESCE_INTERVAL_MS: u64 = 16;
+    const POPUP_SYNC_SAFETY_INTERVAL_MS: u64 = 10_000;
+    const POPUP_SYNC_HOOK_FALLBACK_INTERVAL_MS: u64 = 120;
+    const CHILD_MOUNT_RETRY_INTERVAL_MS: u64 = 250;
     const MOUSE_HOOK_SYNC_INTERVAL_MS: u64 = 250;
+    const MOUSE_HOOK_SAFETY_INTERVAL_MS: u64 = 30_000;
     const REFERENCE_DRAG_PREVIEW_INTERVAL_MS: u64 = 16;
     const REFERENCE_DRAG_PREVIEW_TIMEOUT: Duration = Duration::from_secs(120);
     // Drag previews only make sense while a button is held; if the owner of a
@@ -3240,20 +3519,32 @@ mod windows_impl {
         path.replace('/', "\\")
     }
 
-    #[derive(Debug, Clone, Copy, Default)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum PopupSyncMode {
+        #[default]
+        Intentional,
+        Recoverable,
+        DeferredParent,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct PopupSyncSnapshot {
+        label: String,
         parent_hwnd: i64,
         child_hwnd: i64,
         offset_x: i32,
         offset_y: i32,
         width: i32,
         height: i32,
+        visible: bool,
+        mode: PopupSyncMode,
     }
 
-    #[derive(Debug, Clone, Copy, Default)]
+    #[derive(Debug, Clone)]
     struct PopupSyncEntry {
         visible: bool,
         snapshot: PopupSyncSnapshot,
+        last_child_retry_at: Option<Instant>,
     }
 
     #[derive(Debug, Default)]
@@ -3261,27 +3552,50 @@ mod windows_impl {
         entries: HashMap<i64, PopupSyncEntry>,
     }
 
-    #[derive(Debug)]
-    struct MouseActivationState {
+    #[derive(Debug, Clone, Copy)]
+    struct MouseActivationEntry {
         suppressed: bool,
         guard_enabled: bool,
     }
 
-    #[derive(Debug, Default)]
-    struct MouseActivateHookState {
-        hwnds: Vec<i64>,
-        installed: bool,
-        block_count: u64,
-    }
-
-    impl Default for MouseActivationState {
+    impl Default for MouseActivationEntry {
         fn default() -> Self {
             Self {
                 suppressed: true,
-                guard_enabled: true,
+                guard_enabled: false,
             }
         }
     }
+
+    #[derive(Debug, Default)]
+    struct MouseActivationState {
+        entries: HashMap<i64, MouseActivationEntry>,
+    }
+
+    #[derive(Debug, Default)]
+    struct MouseActivateHookState {
+        entries: HashMap<i64, MouseActivateHookEntry>,
+    }
+
+    #[derive(Debug, Default)]
+    struct MouseActivateHookEntry {
+        hwnds: HashSet<i64>,
+        block_count: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum OverlayMountOutcome {
+        Child,
+        PopupIntentional,
+        PopupRecoverable,
+        DeferredParent,
+    }
+
+    static POPUP_SYNC_ENTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static POPUP_SYNC_VISIBLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static POPUP_WIN_EVENT_HOOKS_READY: AtomicBool = AtomicBool::new(false);
+    static MOUSE_HOOK_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static MOUSE_WIN_EVENT_HOOK_READY: AtomicBool = AtomicBool::new(false);
 
     #[derive(Default)]
     struct ControlServerState {
@@ -3309,11 +3623,151 @@ mod windows_impl {
         STATE.get_or_init(|| Mutex::new(MouseActivateHookState::default()))
     }
 
+    fn popup_sync_notify() -> &'static Notify {
+        static NOTIFY: OnceLock<Notify> = OnceLock::new();
+        NOTIFY.get_or_init(Notify::new)
+    }
+
+    fn mouse_hook_sync_notify() -> &'static Notify {
+        static NOTIFY: OnceLock<Notify> = OnceLock::new();
+        NOTIFY.get_or_init(Notify::new)
+    }
+
+    fn refresh_popup_sync_activity_counts(state: &PopupSyncState) {
+        POPUP_SYNC_ENTRY_COUNT.store(state.entries.len(), Ordering::Release);
+        POPUP_SYNC_VISIBLE_COUNT.store(
+            state.entries.values().filter(|entry| entry.visible).count(),
+            Ordering::Release,
+        );
+    }
+
+    fn refresh_mouse_hook_root_count(state: &MouseActivateHookState) {
+        MOUSE_HOOK_ROOT_COUNT.store(state.entries.len(), Ordering::Release);
+    }
+
+    fn notify_popup_sync() {
+        popup_sync_notify().notify_one();
+    }
+
+    fn notify_mouse_hook_sync() {
+        mouse_hook_sync_notify().notify_one();
+    }
+
+    unsafe extern "system" fn popup_win_event_proc(
+        _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+        event: u32,
+        _hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        _event_thread: u32,
+        _event_time: u32,
+    ) {
+        if POPUP_SYNC_VISIBLE_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if event >= EVENT_OBJECT_CREATE
+            && (id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32)
+        {
+            return;
+        }
+        if matches!(
+            event,
+            EVENT_SYSTEM_FOREGROUND
+                | EVENT_SYSTEM_MINIMIZESTART
+                | EVENT_SYSTEM_MINIMIZEEND
+                | EVENT_OBJECT_DESTROY
+                | EVENT_OBJECT_SHOW
+                | EVENT_OBJECT_HIDE
+                | EVENT_OBJECT_REORDER
+                | EVENT_OBJECT_LOCATIONCHANGE
+        ) {
+            notify_popup_sync();
+        }
+    }
+
+    unsafe extern "system" fn mouse_hook_win_event_proc(
+        _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+        event: u32,
+        _hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        _event_thread: u32,
+        _event_time: u32,
+    ) {
+        if MOUSE_HOOK_ROOT_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 {
+            return;
+        }
+        if matches!(event, EVENT_OBJECT_CREATE | EVENT_OBJECT_DESTROY) {
+            notify_mouse_hook_sync();
+        }
+    }
+
+    fn install_win_event_hooks() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        if INSTALLED.set(()).is_err() {
+            return;
+        }
+
+        unsafe {
+            let flags = WINEVENT_OUTOFCONTEXT;
+            let system_hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MINIMIZEEND,
+                None,
+                Some(popup_win_event_proc),
+                0,
+                0,
+                flags,
+            );
+            let object_hook = SetWinEventHook(
+                EVENT_OBJECT_DESTROY,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(popup_win_event_proc),
+                0,
+                0,
+                flags,
+            );
+            POPUP_WIN_EVENT_HOOKS_READY.store(
+                !system_hook.0.is_null() && !object_hook.0.is_null(),
+                Ordering::Release,
+            );
+
+            let mouse_hook = SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_DESTROY,
+                None,
+                Some(mouse_hook_win_event_proc),
+                GetCurrentProcessId(),
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            MOUSE_WIN_EVENT_HOOK_READY.store(!mouse_hook.0.is_null(), Ordering::Release);
+
+            if !POPUP_WIN_EVENT_HOOKS_READY.load(Ordering::Acquire) {
+                eprintln!(
+                    "[Locus] Unity embed WinEvent popup sync unavailable; using timer fallback"
+                );
+            }
+            if !MOUSE_WIN_EVENT_HOOK_READY.load(Ordering::Acquire) {
+                eprintln!("[Locus] Unity embed WinEvent mouse-hook sync unavailable");
+            }
+        }
+    }
+
     pub(super) fn start(app_handle: AppHandle) {
+        let _ = app_handle.run_on_main_thread(move || {
+            install_win_event_hooks();
+        });
+
         static POPUP_SYNC_STARTED: OnceLock<()> = OnceLock::new();
         if POPUP_SYNC_STARTED.set(()).is_ok() {
+            let app_for_popup_sync = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                popup_sync_loop().await;
+                popup_sync_loop(app_for_popup_sync).await;
             });
         }
 
@@ -3380,16 +3834,24 @@ mod windows_impl {
         window: Option<&tauri::WebviewWindow>,
         suppressed: bool,
     ) -> Result<(), String> {
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+        let root_hwnd = hwnd.0 as isize as i64;
         let guard_enabled = mouse_activation_state()
             .lock()
             .map(|mut state| {
-                state.suppressed = suppressed;
-                state.guard_enabled
+                let entry = state.entries.entry(root_hwnd).or_default();
+                entry.suppressed = suppressed;
+                entry.guard_enabled
             })
-            .unwrap_or(true);
+            .unwrap_or(false);
 
-        if let Some(window) = window {
-            apply_mouse_activation_style(window, guard_enabled && suppressed)?;
+        unsafe {
+            apply_mouse_activation_style_to_hwnd(hwnd, guard_enabled && suppressed)?;
         }
 
         Ok(())
@@ -3399,18 +3861,35 @@ mod windows_impl {
         window: Option<&tauri::WebviewWindow>,
         enabled: bool,
     ) -> Result<(), String> {
-        if let Ok(mut state) = mouse_activation_state().lock() {
-            state.guard_enabled = enabled;
+        let Some(window) = window else {
+            return Ok(());
+        };
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+        let root_hwnd = hwnd.0 as isize as i64;
+        let (suppressed, changed) = mouse_activation_state()
+            .lock()
+            .map(|mut state| {
+                let entry = state.entries.entry(root_hwnd).or_default();
+                let changed = entry.guard_enabled != enabled;
+                entry.guard_enabled = enabled;
+                (entry.suppressed, changed)
+            })
+            .unwrap_or((true, true));
+
+        if !changed {
+            return Ok(());
         }
 
-        if let Some(window) = window {
-            if enabled {
-                sync_mouse_activation_style(window)?;
-                ensure_mouse_activate_hook(window)?;
-            } else {
-                apply_mouse_activation_style(window, false)?;
-                remove_mouse_activate_hook();
-            }
+        unsafe {
+            apply_mouse_activation_style_to_hwnd(hwnd, enabled && suppressed)?;
+        }
+        if enabled {
+            ensure_mouse_activate_hook_for_hwnd(hwnd)?;
+            notify_mouse_hook_sync();
+        } else {
+            remove_mouse_activate_hook_for_root(root_hwnd);
         }
 
         Ok(())
@@ -3418,8 +3897,7 @@ mod windows_impl {
 
     pub(super) fn reset_mouse_activation_suppressed() {
         if let Ok(mut state) = mouse_activation_state().lock() {
-            state.suppressed = true;
-            state.guard_enabled = true;
+            state.entries.clear();
         }
     }
 
@@ -3431,7 +3909,7 @@ mod windows_impl {
         let hwnd = window
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
-        if is_activation_guard_enabled() {
+        if is_activation_guard_enabled_for_root(hwnd.0 as isize as i64) {
             set_mouse_activation_suppressed(Some(window), false)?;
             ensure_mouse_activate_hook(window)?;
         }
@@ -3442,11 +3920,13 @@ mod windows_impl {
         Ok(())
     }
 
-    fn is_activation_guard_enabled() -> bool {
+    fn is_activation_guard_enabled_for_root(root_hwnd: i64) -> bool {
         mouse_activation_state()
             .lock()
-            .map(|state| state.guard_enabled)
-            .unwrap_or(true)
+            .ok()
+            .and_then(|state| state.entries.get(&root_hwnd).copied())
+            .map(|entry| entry.guard_enabled)
+            .unwrap_or(false)
     }
 
     pub(super) fn set_window_visible_no_activate(
@@ -3466,23 +3946,59 @@ mod windows_impl {
         let hwnd = window
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+        ensure_mouse_activate_hook_for_hwnd(hwnd)
+    }
+
+    fn ensure_mouse_activate_hook_for_hwnd(hwnd: HWND) -> Result<(), String> {
         let mut hwnds = vec![hwnd];
         unsafe {
             collect_descendant_windows(hwnd, &mut hwnds);
         }
+        let root_hwnd = hwnd.0 as isize as i64;
+        let current_hwnds = hwnds
+            .into_iter()
+            .map(|target| target.0 as isize as i64)
+            .collect::<HashSet<_>>();
+        let (previous_hwnds, block_count) = mouse_activate_hook_state()
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .entries
+                    .get(&root_hwnd)
+                    .map(|entry| (entry.hwnds.clone(), entry.block_count))
+            })
+            .unwrap_or_default();
 
-        let mut installed_hwnds = Vec::with_capacity(hwnds.len());
-        for hwnd in hwnds {
+        let mut installed_hwnds = previous_hwnds
+            .intersection(&current_hwnds)
+            .copied()
+            .collect::<HashSet<_>>();
+        for target_hwnd in current_hwnds.difference(&previous_hwnds).copied() {
+            let target = HWND(target_hwnd as isize as *mut std::ffi::c_void);
             unsafe {
                 let ok = SetWindowSubclass(
-                    hwnd,
+                    target,
                     Some(unity_embed_mouse_activate_proc),
                     MOUSE_ACTIVATE_SUBCLASS_ID,
-                    0,
+                    root_hwnd as usize,
                 )
                 .as_bool();
                 if ok {
-                    installed_hwnds.push(hwnd.0 as isize as i64);
+                    installed_hwnds.insert(target_hwnd);
+                }
+            }
+        }
+
+        for stale_hwnd in previous_hwnds.difference(&current_hwnds).copied() {
+            let stale = HWND(stale_hwnd as isize as *mut std::ffi::c_void);
+            unsafe {
+                if IsWindow(Some(stale)).as_bool() {
+                    let _ = RemoveWindowSubclass(
+                        stale,
+                        Some(unity_embed_mouse_activate_proc),
+                        MOUSE_ACTIVATE_SUBCLASS_ID,
+                    );
                 }
             }
         }
@@ -3492,23 +4008,14 @@ mod windows_impl {
         }
 
         if let Ok(mut state) = mouse_activate_hook_state().lock() {
-            for stale_hwnd in state.hwnds.iter().copied() {
-                if installed_hwnds.contains(&stale_hwnd) {
-                    continue;
-                }
-                let hwnd = HWND(stale_hwnd as isize as *mut std::ffi::c_void);
-                unsafe {
-                    if IsWindow(Some(hwnd)).as_bool() {
-                        let _ = RemoveWindowSubclass(
-                            hwnd,
-                            Some(unity_embed_mouse_activate_proc),
-                            MOUSE_ACTIVATE_SUBCLASS_ID,
-                        );
-                    }
-                }
-            }
-            state.hwnds = installed_hwnds;
-            state.installed = true;
+            state.entries.insert(
+                root_hwnd,
+                MouseActivateHookEntry {
+                    hwnds: installed_hwnds,
+                    block_count,
+                },
+            );
+            refresh_mouse_hook_root_count(&state);
         }
 
         Ok(())
@@ -3531,13 +4038,37 @@ mod windows_impl {
     }
 
     pub(super) fn remove_mouse_activate_hook() {
-        let hwnds = mouse_activate_hook_state()
+        let entries = mouse_activate_hook_state()
             .lock()
             .ok()
-            .map(|state| state.hwnds.clone())
+            .map(|mut state| {
+                let entries = std::mem::take(&mut state.entries);
+                refresh_mouse_hook_root_count(&state);
+                entries
+            })
             .unwrap_or_default();
-        for hwnd in hwnds {
-            let hwnd = HWND(hwnd as isize as *mut std::ffi::c_void);
+        for entry in entries.into_values() {
+            remove_mouse_activate_subclasses(entry.hwnds);
+        }
+    }
+
+    fn remove_mouse_activate_hook_for_root(root_hwnd: i64) {
+        let entry = mouse_activate_hook_state()
+            .lock()
+            .ok()
+            .and_then(|mut state| {
+                let entry = state.entries.remove(&root_hwnd);
+                refresh_mouse_hook_root_count(&state);
+                entry
+            });
+        if let Some(entry) = entry {
+            remove_mouse_activate_subclasses(entry.hwnds);
+        }
+    }
+
+    fn remove_mouse_activate_subclasses(hwnds: HashSet<i64>) {
+        for hwnd_value in hwnds {
+            let hwnd = HWND(hwnd_value as isize as *mut std::ffi::c_void);
             unsafe {
                 if IsWindow(Some(hwnd)).as_bool() {
                     let _ = RemoveWindowSubclass(
@@ -3548,10 +4079,33 @@ mod windows_impl {
                 }
             }
         }
+    }
 
-        if let Ok(mut state) = mouse_activate_hook_state().lock() {
-            state.hwnds.clear();
-            state.installed = false;
+    fn reconcile_mouse_activate_hooks() {
+        let roots = mouse_activation_state()
+            .lock()
+            .map(|state| {
+                state
+                    .entries
+                    .iter()
+                    .filter_map(|(root, entry)| entry.guard_enabled.then_some(*root))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for root in roots {
+            let hwnd = HWND(root as isize as *mut std::ffi::c_void);
+            unsafe {
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    remove_mouse_activate_hook_for_root(root);
+                    if let Ok(mut state) = mouse_activation_state().lock() {
+                        state.entries.remove(&root);
+                    }
+                    continue;
+                }
+            }
+            if let Err(error) = ensure_mouse_activate_hook_for_hwnd(hwnd) {
+                eprintln!("[Locus] failed to sync Unity embed mouse hook: {error}");
+            }
         }
     }
 
@@ -3561,16 +4115,21 @@ mod windows_impl {
         wparam: WPARAM,
         lparam: LPARAM,
         _uid_subclass: usize,
-        _ref_data: usize,
+        ref_data: usize,
     ) -> LRESULT {
+        let root_hwnd = ref_data as i64;
         if msg == WM_MOUSEACTIVATE {
             let should_suppress = mouse_activation_state()
                 .lock()
-                .map(|state| state.guard_enabled && state.suppressed)
-                .unwrap_or(true);
+                .ok()
+                .and_then(|state| state.entries.get(&root_hwnd).copied())
+                .map(|entry| entry.guard_enabled && entry.suppressed)
+                .unwrap_or(false);
             if should_suppress {
                 if let Ok(mut state) = mouse_activate_hook_state().lock() {
-                    state.block_count = state.block_count.saturating_add(1);
+                    if let Some(entry) = state.entries.get_mut(&root_hwnd) {
+                        entry.block_count = entry.block_count.saturating_add(1);
+                    }
                 }
                 return LRESULT(MA_NOACTIVATE as isize);
             }
@@ -3579,8 +4138,18 @@ mod windows_impl {
         if msg == WM_NCDESTROY {
             if let Ok(mut state) = mouse_activate_hook_state().lock() {
                 let hwnd_value = hwnd.0 as isize as i64;
-                state.hwnds.retain(|hooked_hwnd| *hooked_hwnd != hwnd_value);
-                state.installed = !state.hwnds.is_empty();
+                let remove_root = state
+                    .entries
+                    .get_mut(&root_hwnd)
+                    .map(|entry| {
+                        entry.hwnds.remove(&hwnd_value);
+                        entry.hwnds.is_empty()
+                    })
+                    .unwrap_or(false);
+                if remove_root {
+                    state.entries.remove(&root_hwnd);
+                }
+                refresh_mouse_hook_root_count(&state);
             }
         }
 
@@ -3864,17 +4433,31 @@ mod windows_impl {
         };
         let (overlay_input_focused, input_focus) =
             unsafe { overlay_input_focus_state(overlay, foreground, parent) };
+        let overlay_root_hwnd = overlay
+            .map(|hwnd| hwnd.0 as isize as i64)
+            .unwrap_or_default();
         let (mouse_activation_suppressed, activation_guard_enabled) = mouse_activation_state()
             .lock()
-            .map(|state| (state.suppressed, state.guard_enabled))
-            .unwrap_or((true, true));
+            .ok()
+            .and_then(|state| state.entries.get(&overlay_root_hwnd).copied())
+            .map(|entry| (entry.suppressed, entry.guard_enabled))
+            .unwrap_or((true, false));
         let (
             mouse_activate_hook_installed,
             mouse_activate_hooked_hwnd_count,
             mouse_activate_block_count,
         ) = mouse_activate_hook_state()
             .lock()
-            .map(|state| (state.installed, state.hwnds.len(), state.block_count))
+            .ok()
+            .and_then(|state| {
+                state.entries.get(&overlay_root_hwnd).map(|entry| {
+                    (
+                        !entry.hwnds.is_empty(),
+                        entry.hwnds.len(),
+                        entry.block_count,
+                    )
+                })
+            })
             .unwrap_or_default();
         let foreground_hwnd = foreground.0 as isize as i64;
 
@@ -3915,14 +4498,6 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn sync_mouse_activation_style(window: &tauri::WebviewWindow) -> Result<(), String> {
-        let suppressed = mouse_activation_state()
-            .lock()
-            .map(|state| state.guard_enabled && state.suppressed)
-            .unwrap_or(true);
-        apply_mouse_activation_style(window, suppressed)
-    }
-
     pub(super) fn set_drag_passthrough(
         window: Option<&tauri::WebviewWindow>,
         active: bool,
@@ -3945,16 +4520,6 @@ mod windows_impl {
             }
         }
         Ok(())
-    }
-
-    fn apply_mouse_activation_style(
-        window: &tauri::WebviewWindow,
-        suppressed: bool,
-    ) -> Result<(), String> {
-        let hwnd = window
-            .hwnd()
-            .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
-        unsafe { apply_mouse_activation_style_to_hwnd(hwnd, suppressed) }
     }
 
     unsafe fn apply_mouse_activation_style_to_hwnd(
@@ -4116,51 +4681,55 @@ mod windows_impl {
         Ok(())
     }
 
-    async fn popup_sync_loop() {
+    async fn popup_sync_loop(app_handle: AppHandle) {
         loop {
-            let active = sync_popup_overlay_position();
-            let delay = if active {
-                POPUP_SYNC_ACTIVE_INTERVAL_MS
+            if POPUP_SYNC_VISIBLE_COUNT.load(Ordering::Acquire) == 0 {
+                popup_sync_notify().notified().await;
             } else {
-                POPUP_SYNC_IDLE_INTERVAL_MS
-            };
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+                let delay = if POPUP_WIN_EVENT_HOOKS_READY.load(Ordering::Acquire) {
+                    POPUP_SYNC_SAFETY_INTERVAL_MS
+                } else {
+                    POPUP_SYNC_HOOK_FALLBACK_INTERVAL_MS
+                };
+                tokio::select! {
+                    _ = popup_sync_notify().notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                }
+            }
+
+            if POPUP_SYNC_VISIBLE_COUNT.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(POPUP_SYNC_COALESCE_INTERVAL_MS)).await;
+            retry_recoverable_child_mounts(app_handle.clone()).await;
+            sync_popup_overlay_position();
         }
     }
 
     async fn mouse_hook_sync_loop(app_handle: AppHandle) {
         loop {
+            if MOUSE_HOOK_ROOT_COUNT.load(Ordering::Acquire) == 0 {
+                mouse_hook_sync_notify().notified().await;
+            } else {
+                let delay = if MOUSE_WIN_EVENT_HOOK_READY.load(Ordering::Acquire) {
+                    MOUSE_HOOK_SAFETY_INTERVAL_MS
+                } else {
+                    MOUSE_HOOK_SYNC_INTERVAL_MS
+                };
+                tokio::select! {
+                    _ = mouse_hook_sync_notify().notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                }
+            }
+
+            if MOUSE_HOOK_ROOT_COUNT.load(Ordering::Acquire) == 0 {
+                continue;
+            }
             let app_for_main = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
-                let windows = app_for_main.webview_windows();
-                let mut synced_any = false;
-                for (label, window) in windows {
-                    if !is_unity_embed_window_label(&label) {
-                        continue;
-                    }
-                    synced_any = true;
-                    if is_activation_guard_enabled() {
-                        if let Err(error) = sync_mouse_activation_style(&window) {
-                            eprintln!(
-                                "[Locus] failed to sync Unity embed activation style: {error}"
-                            );
-                        }
-                        if let Err(error) = ensure_mouse_activate_hook(&window) {
-                            eprintln!("[Locus] failed to sync Unity embed mouse hook: {error}");
-                        }
-                    } else {
-                        if let Err(error) = apply_mouse_activation_style(&window, false) {
-                            eprintln!(
-                                "[Locus] failed to clear Unity embed activation style: {error}"
-                            );
-                        }
-                    }
-                }
-                if !synced_any || !is_activation_guard_enabled() {
-                    remove_mouse_activate_hook();
-                }
+                let _ = app_for_main;
+                reconcile_mouse_activate_hooks();
             });
-            tokio::time::sleep(Duration::from_millis(MOUSE_HOOK_SYNC_INTERVAL_MS)).await;
         }
     }
 
@@ -4175,7 +4744,7 @@ mod windows_impl {
                         if !entry.visible {
                             return None;
                         }
-                        let snapshot = entry.snapshot;
+                        let mut snapshot = entry.snapshot.clone();
                         if snapshot.parent_hwnd <= 0
                             || snapshot.child_hwnd <= 0
                             || snapshot.width <= 0
@@ -4183,6 +4752,7 @@ mod windows_impl {
                         {
                             return None;
                         }
+                        snapshot.visible = entry.visible;
                         Some(snapshot)
                     })
                     .collect()
@@ -4190,13 +4760,115 @@ mod windows_impl {
             .unwrap_or_default()
     }
 
-    fn sync_popup_overlay_position() -> bool {
-        let snapshots = popup_sync_snapshots();
+    fn claim_recoverable_child_mounts() -> Vec<PopupSyncSnapshot> {
+        let now = Instant::now();
+        popup_sync_state()
+            .lock()
+            .map(|mut state| {
+                state
+                    .entries
+                    .values_mut()
+                    .filter_map(|entry| {
+                        if !entry.visible || entry.snapshot.mode == PopupSyncMode::Intentional {
+                            return None;
+                        }
+                        if entry
+                            .last_child_retry_at
+                            .map(|attempt| {
+                                now.duration_since(attempt)
+                                    < Duration::from_millis(CHILD_MOUNT_RETRY_INTERVAL_MS)
+                            })
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        entry.last_child_retry_at = Some(now);
+                        let mut snapshot = entry.snapshot.clone();
+                        snapshot.visible = entry.visible;
+                        Some(snapshot)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn retry_recoverable_child_mounts(app_handle: AppHandle) {
+        let snapshots = claim_recoverable_child_mounts();
         if snapshots.is_empty() {
-            return false;
+            return;
         }
 
-        let mut active = false;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let app_for_main = app_handle.clone();
+        if app_handle
+            .run_on_main_thread(move || {
+                for snapshot in snapshots {
+                    retry_recoverable_child_mount_on_main(&app_for_main, snapshot);
+                }
+                let _ = tx.send(());
+            })
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+
+    fn retry_recoverable_child_mount_on_main(app_handle: &AppHandle, snapshot: PopupSyncSnapshot) {
+        let still_pending = popup_sync_state()
+            .lock()
+            .map(|state| {
+                state
+                    .entries
+                    .get(&snapshot.child_hwnd)
+                    .map(|entry| entry.snapshot == snapshot && entry.visible == snapshot.visible)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !still_pending {
+            return;
+        }
+
+        let parent = HWND(snapshot.parent_hwnd as isize as *mut std::ffi::c_void);
+        let child = HWND(snapshot.child_hwnd as isize as *mut std::ffi::c_void);
+        unsafe {
+            if !is_overlay_parent_visible_at(parent) || !IsWindow(Some(child)).as_bool() {
+                return;
+            }
+            let mut parent_rect = RECT::default();
+            if GetWindowRect(parent, &mut parent_rect).is_err() {
+                return;
+            }
+            let x = parent_rect.left + snapshot.offset_x;
+            let y = parent_rect.top + snapshot.offset_y;
+            if let Err(error) =
+                mount_child_overlay_hwnd(child, parent, x, y, snapshot.width, snapshot.height)
+            {
+                if snapshot.mode == PopupSyncMode::DeferredParent {
+                    eprintln!("[Locus] Unity embed deferred child mount retry failed: {error}");
+                }
+                return;
+            }
+        }
+
+        if let Some(window) = app_handle.get_webview_window(&snapshot.label) {
+            if let Err(error) = set_activation_guard_enabled(Some(&window), false) {
+                eprintln!(
+                    "[Locus] failed to clear recovered Unity embed activation guard: {error}"
+                );
+            }
+            let _ = set_window_visible_no_activate(&window, snapshot.visible);
+        }
+        remove_popup_sync_entry(snapshot.child_hwnd);
+        record_applied_mount_mode(&snapshot.label, UnityEmbedMountMode::Child);
+        record_mount_result(true, None);
+        eprintln!("[Locus] Unity embed popup fallback recovered to child mount");
+    }
+
+    fn sync_popup_overlay_position() {
+        let snapshots = popup_sync_snapshots();
+        if snapshots.is_empty() {
+            return;
+        }
 
         for snapshot in snapshots {
             let parent = HWND(snapshot.parent_hwnd as isize as *mut std::ffi::c_void);
@@ -4210,7 +4882,6 @@ mod windows_impl {
 
                 let mut parent_rect = RECT::default();
                 if GetWindowRect(parent, &mut parent_rect).is_err() {
-                    active = true;
                     continue;
                 }
 
@@ -4226,6 +4897,7 @@ mod windows_impl {
                     bottom: y + height,
                 };
                 let should_show = is_overlay_parent_visible_at(parent);
+                let should_show = should_show && snapshot.mode != PopupSyncMode::DeferredParent;
                 sync_overlay_visibility(child, should_show);
                 if !should_show {
                     continue;
@@ -4254,20 +4926,14 @@ mod windows_impl {
                         SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                     );
                 }
-
-                active = true;
-                if !child_matches {
-                    continue;
-                }
             }
         }
-
-        active
     }
 
     pub(super) fn disable_popup_sync() {
         if let Ok(mut state) = popup_sync_state().lock() {
             *state = PopupSyncState::default();
+            refresh_popup_sync_activity_counts(&state);
         }
     }
 
@@ -4275,21 +4941,118 @@ mod windows_impl {
         remove_popup_sync_for_window(window);
     }
 
+    pub(super) fn prepare_for_editor_shutdown() {
+        stop_reference_drag_preview();
+        disable_popup_sync();
+        if let Ok(mut state) = mouse_activation_state().lock() {
+            state.entries.clear();
+        }
+        remove_mouse_activate_hook();
+    }
+
+    pub(super) fn quiesce_owned_overlay(window: &tauri::WebviewWindow) -> Result<(), String> {
+        remove_popup_sync_for_window(window);
+        set_activation_guard_enabled(Some(window), false)?;
+        set_drag_passthrough(Some(window), false)?;
+
+        let child = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read Unity embed window handle: {error}"))?;
+        unsafe {
+            if !IsWindow(Some(child)).as_bool() {
+                return Err("Unity embed window handle is no longer valid".to_string());
+            }
+
+            // Hide before changing parentage so the borderless WebView never
+            // flashes as a desktop popup between Unity instances.
+            let _ = ShowWindow(child, SW_HIDE);
+
+            let current_style = GetWindowLongPtrW(child, GWL_STYLE) as u32;
+            if (current_style & WS_CHILD.0) != 0 {
+                SetParent(child, None).map_err(|error| {
+                    format!("SetParent detach failed for Unity embed window: {error}")
+                })?;
+            }
+
+            let frame_style_mask = WS_CHILD.0
+                | WS_CAPTION.0
+                | WS_THICKFRAME.0
+                | WS_MINIMIZEBOX.0
+                | WS_MAXIMIZEBOX.0
+                | WS_SYSMENU.0;
+            let detached_style = (current_style & !frame_style_mask) | WS_POPUP.0;
+            if detached_style != current_style {
+                SetWindowLongPtrW(child, GWL_STYLE, detached_style as isize);
+            }
+
+            // Popup fallback windows can be owned by Unity even when they are
+            // not WS_CHILD. Clear that owner before the editor HWND is killed.
+            if GetWindowLongPtrW(child, GWLP_HWNDPARENT) != 0 {
+                SetWindowLongPtrW(child, GWLP_HWNDPARENT, 0);
+            }
+
+            SetWindowPos(
+                child,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
+            )
+            .map_err(|error| {
+                format!("SetWindowPos failed for detached Unity embed window: {error}")
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub(super) fn set_popup_sync_visible(window: &tauri::WebviewWindow, visible: bool) {
-        let child_hwnd = match window.hwnd() {
-            Ok(hwnd) => hwnd.0 as isize as i64,
+        let child = match window.hwnd() {
+            Ok(hwnd) => hwnd,
             Err(_) => return,
         };
+        let child_hwnd = child.0 as isize as i64;
+        let mut guard_enabled = None;
+        let mut changed = false;
         if let Ok(mut state) = popup_sync_state().lock() {
             if let Some(entry) = state.entries.get_mut(&child_hwnd) {
+                changed = entry.visible != visible;
                 entry.visible = visible;
+                entry.snapshot.visible = visible;
+                if visible && changed {
+                    entry.last_child_retry_at = None;
+                }
+                if changed {
+                    guard_enabled = Some(
+                        visible
+                            && matches!(
+                                entry.snapshot.mode,
+                                PopupSyncMode::Intentional | PopupSyncMode::Recoverable
+                            ),
+                    );
+                }
             }
+            refresh_popup_sync_activity_counts(&state);
+        }
+        if guard_enabled.is_none() && unsafe { !has_child_style(child) } {
+            guard_enabled = Some(visible);
+        }
+        if let Some(enabled) = guard_enabled {
+            if let Err(error) = set_activation_guard_enabled(Some(window), enabled) {
+                eprintln!("[Locus] failed to update Unity embed activation guard: {error}");
+            }
+        }
+        if changed {
+            notify_popup_sync();
         }
     }
 
     fn remove_popup_sync_entry(child_hwnd: i64) {
         if let Ok(mut state) = popup_sync_state().lock() {
             state.entries.remove(&child_hwnd);
+            refresh_popup_sync_activity_counts(&state);
         }
     }
 
@@ -4308,6 +5071,7 @@ mod windows_impl {
     }
 
     fn update_popup_sync(
+        label: &str,
         parent_hwnd: i64,
         child_hwnd: i64,
         x: i32,
@@ -4315,6 +5079,7 @@ mod windows_impl {
         width: i32,
         height: i32,
         visible: bool,
+        mode: PopupSyncMode,
     ) -> Result<(), String> {
         let parent = HWND(parent_hwnd as isize as *mut std::ffi::c_void);
         unsafe {
@@ -4322,21 +5087,44 @@ mod windows_impl {
             GetWindowRect(parent, &mut parent_rect)
                 .map_err(|error| format!("GetWindowRect failed for Unity parent HWND: {error}"))?;
 
+            let snapshot = PopupSyncSnapshot {
+                label: label.to_string(),
+                parent_hwnd,
+                child_hwnd,
+                offset_x: x - parent_rect.left,
+                offset_y: y - parent_rect.top,
+                width,
+                height,
+                visible,
+                mode,
+            };
+            let mut changed = false;
             if let Ok(mut state) = popup_sync_state().lock() {
-                state.entries.insert(
-                    child_hwnd,
-                    PopupSyncEntry {
-                        visible,
-                        snapshot: PopupSyncSnapshot {
-                            parent_hwnd,
+                match state.entries.get_mut(&child_hwnd) {
+                    Some(entry) => {
+                        changed = entry.visible != visible || entry.snapshot != snapshot;
+                        entry.visible = visible;
+                        entry.snapshot = snapshot;
+                        if changed {
+                            entry.last_child_retry_at = None;
+                        }
+                    }
+                    None => {
+                        changed = true;
+                        state.entries.insert(
                             child_hwnd,
-                            offset_x: x - parent_rect.left,
-                            offset_y: y - parent_rect.top,
-                            width,
-                            height,
-                        },
-                    },
-                );
+                            PopupSyncEntry {
+                                visible,
+                                snapshot,
+                                last_child_retry_at: None,
+                            },
+                        );
+                    }
+                }
+                refresh_popup_sync_activity_counts(&state);
+            }
+            if changed {
+                notify_popup_sync();
             }
         }
 
@@ -4359,18 +5147,17 @@ mod windows_impl {
     }
 
     fn overlay_insert_after(parent: HWND, child: HWND, target_rect: RECT) -> HWND {
-        // Follow the current desktop z-order without moving Unity popup windows.
-        // When several Unity floating windows overlap Locus, changing their
-        // order here creates a 16ms reorder loop. Anchoring Locus below the
-        // lowest current blocker keeps Unity's own order stable.
-        find_intersecting_window_above_parent(parent, child, target_rect).unwrap_or(HWND_TOP)
+        overlay_z_order_decision(parent, child, target_rect).insert_after
     }
 
     unsafe fn sync_popup_overlay_z_order(parent: HWND, child: HWND, target_rect: RECT) {
-        let insert_after = overlay_insert_after(parent, child, target_rect);
+        let decision = overlay_z_order_decision(parent, child, target_rect);
+        if decision.positioned {
+            return;
+        }
         let _ = SetWindowPos(
             child,
-            Some(insert_after),
+            Some(decision.insert_after),
             0,
             0,
             0,
@@ -4379,20 +5166,40 @@ mod windows_impl {
         );
     }
 
-    fn find_intersecting_window_above_parent(
+    struct OverlayZOrderDecision {
+        insert_after: HWND,
+        positioned: bool,
+    }
+
+    fn overlay_z_order_decision(
         parent: HWND,
         child: HWND,
         target_rect: RECT,
-    ) -> Option<HWND> {
+    ) -> OverlayZOrderDecision {
         let mut blocker = None;
-        let mut hwnd = unsafe { GetTopWindow(None).ok()? };
+        let mut child_seen = false;
+        let mut child_below_all_blockers = true;
+        let Some(mut hwnd) = (unsafe { GetTopWindow(None).ok() }) else {
+            return OverlayZOrderDecision {
+                insert_after: HWND_TOP,
+                positioned: false,
+            };
+        };
         for _ in 0..Z_ORDER_SCAN_LIMIT {
             if hwnd == parent {
-                return blocker;
+                return OverlayZOrderDecision {
+                    insert_after: blocker.unwrap_or(HWND_TOP),
+                    positioned: child_seen && child_below_all_blockers,
+                };
             }
 
-            if hwnd != child && unsafe { is_visible_intersecting_window(hwnd, target_rect) } {
+            if hwnd == child {
+                child_seen = true;
+            } else if unsafe { is_visible_intersecting_window(hwnd, target_rect) } {
                 blocker = Some(hwnd);
+                if child_seen {
+                    child_below_all_blockers = false;
+                }
             }
 
             match unsafe { GetWindow(hwnd, GW_HWNDNEXT) } {
@@ -4401,38 +5208,84 @@ mod windows_impl {
             }
         }
 
-        None
+        OverlayZOrderDecision {
+            insert_after: blocker.unwrap_or(HWND_TOP),
+            positioned: false,
+        }
     }
 
     pub(super) fn position_owned_overlay(
         window: &tauri::WebviewWindow,
         msg: &UnityEmbedControlMessage,
-    ) -> Result<(), String> {
+    ) -> Result<OverlayMountOutcome, String> {
         if !USE_CHILD_EMBED_OVERLAY {
-            set_activation_guard_enabled(Some(window), true)?;
-            return position_popup_overlay(window, msg);
+            set_activation_guard_enabled(Some(window), msg.visible)?;
+            position_popup_overlay(window, msg, PopupSyncMode::Intentional)?;
+            return Ok(OverlayMountOutcome::PopupIntentional);
         }
 
         if let Some(stable_owner) = transient_unity_embed_parent_owner(msg) {
-            set_activation_guard_enabled(Some(window), true)?;
-            return position_transient_parent_overlay(window, msg, stable_owner);
+            set_activation_guard_enabled(Some(window), msg.visible)?;
+            position_transient_parent_overlay(window, msg, stable_owner)?;
+            return Ok(OverlayMountOutcome::PopupIntentional);
+        }
+
+        let parent = HWND(msg.parent_hwnd as isize as *mut std::ffi::c_void);
+        if unsafe { !is_overlay_parent_visible_at(parent) } {
+            position_deferred_parent_overlay(window, msg)?;
+            return Ok(OverlayMountOutcome::DeferredParent);
         }
 
         match position_child_overlay(window, msg) {
             Ok(()) => {
                 remove_popup_sync_for_window(window);
-                Ok(())
+                Ok(OverlayMountOutcome::Child)
             }
             Err(child_error) => {
                 eprintln!(
                     "[Locus] Unity embed child mount failed, using popup fallback: {child_error}"
                 );
-                set_activation_guard_enabled(Some(window), true)?;
-                position_popup_overlay(window, msg).map_err(|popup_error| {
-                    format!("{child_error}; popup fallback failed: {popup_error}")
-                })
+                set_activation_guard_enabled(Some(window), msg.visible)?;
+                position_popup_overlay(window, msg, PopupSyncMode::Recoverable).map_err(
+                    |popup_error| format!("{child_error}; popup fallback failed: {popup_error}"),
+                )?;
+                Ok(OverlayMountOutcome::PopupRecoverable)
             }
         }
+    }
+
+    fn position_deferred_parent_overlay(
+        window: &tauri::WebviewWindow,
+        msg: &UnityEmbedControlMessage,
+    ) -> Result<(), String> {
+        let child = window
+            .hwnd()
+            .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
+        let child_hwnd = child.0 as isize as i64;
+        record_child_hwnd(child_hwnd);
+        set_activation_guard_enabled(Some(window), false)?;
+        unsafe {
+            sync_overlay_visibility(child, false);
+        }
+
+        let parent = HWND(msg.parent_hwnd as isize as *mut std::ffi::c_void);
+        if unsafe { IsWindow(Some(parent)).as_bool() } {
+            let (x, y, width, height) = normalized_rect(msg);
+            update_popup_sync(
+                &unity_embed_window_label_for_msg(msg),
+                msg.parent_hwnd,
+                child_hwnd,
+                x,
+                y,
+                width as i32,
+                height as i32,
+                msg.visible,
+                PopupSyncMode::DeferredParent,
+            )?;
+        } else {
+            remove_popup_sync_entry(child_hwnd);
+        }
+        Ok(())
     }
 
     fn position_child_overlay(
@@ -4450,74 +5303,85 @@ mod windows_impl {
         let height_i32 = height as i32;
 
         unsafe {
-            if !is_overlay_parent_visible_at(parent) {
-                return Err("Unity parent HWND is not visible".to_string());
-            }
-
-            let style = GetWindowLongPtrW(child, GWL_STYLE);
-            let current_style = style as u32;
-            let frame_style_mask = WS_POPUP.0
-                | WS_CAPTION.0
-                | WS_THICKFRAME.0
-                | WS_MINIMIZEBOX.0
-                | WS_MAXIMIZEBOX.0
-                | WS_SYSMENU.0;
-            let next_style = (current_style & !frame_style_mask) | WS_CHILD.0;
-            let reparent_from_popup = (current_style & WS_CHILD.0) == 0;
-            let needs_style_update = next_style != current_style;
-            let current_parent = GetParent(child).unwrap_or(HWND(std::ptr::null_mut()));
-            let needs_parent_update = current_parent != parent || reparent_from_popup;
-
-            if needs_style_update {
-                SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
-            }
-
-            if needs_parent_update {
-                SetParent(child, Some(parent)).map_err(|error| {
-                    format!("SetParent failed for Unity embed child window: {error}")
-                })?;
-            }
-
-            let mut top_left = POINT { x, y };
-            if !ScreenToClient(parent, &mut top_left).as_bool() {
-                return Err("ScreenToClient failed for Unity embed child window".to_string());
-            }
-
-            let flags = if needs_style_update || needs_parent_update {
-                SWP_NOACTIVATE | SWP_FRAMECHANGED
-            } else {
-                SWP_NOACTIVATE
-            };
-            let child_matches = if needs_style_update || needs_parent_update {
-                false
-            } else {
-                let mut parent_origin = POINT { x: 0, y: 0 };
-                let mut child_rect = RECT::default();
-                ClientToScreen(parent, &mut parent_origin).as_bool()
-                    && GetWindowRect(child, &mut child_rect).is_ok()
-                    && child_rect.left == parent_origin.x + top_left.x
-                    && child_rect.top == parent_origin.y + top_left.y
-                    && child_rect.right == parent_origin.x + top_left.x + width_i32
-                    && child_rect.bottom == parent_origin.y + top_left.y + height_i32
-            };
-
-            if !child_matches {
-                SetWindowPos(
-                    child,
-                    Some(HWND_TOP),
-                    top_left.x,
-                    top_left.y,
-                    width_i32,
-                    height_i32,
-                    flags,
-                )
-                .map_err(|error| {
-                    format!("SetWindowPos failed for Unity embed child window: {error}")
-                })?;
-            }
+            mount_child_overlay_hwnd(child, parent, x, y, width_i32, height_i32)?;
         }
 
         set_activation_guard_enabled(Some(window), false)?;
+        Ok(())
+    }
+
+    unsafe fn mount_child_overlay_hwnd(
+        child: HWND,
+        parent: HWND,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        if !is_overlay_parent_visible_at(parent) {
+            return Err("Unity parent HWND is not visible".to_string());
+        }
+
+        let style = GetWindowLongPtrW(child, GWL_STYLE);
+        let current_style = style as u32;
+        let frame_style_mask = WS_POPUP.0
+            | WS_CAPTION.0
+            | WS_THICKFRAME.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0
+            | WS_SYSMENU.0;
+        let next_style = (current_style & !frame_style_mask) | WS_CHILD.0;
+        let reparent_from_popup = (current_style & WS_CHILD.0) == 0;
+        let needs_style_update = next_style != current_style;
+        let current_parent = GetParent(child).unwrap_or(HWND(std::ptr::null_mut()));
+        let needs_parent_update = current_parent != parent || reparent_from_popup;
+
+        if needs_style_update {
+            SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
+        }
+        if needs_parent_update {
+            SetParent(child, Some(parent)).map_err(|error| {
+                format!("SetParent failed for Unity embed child window: {error}")
+            })?;
+        }
+
+        let mut top_left = POINT { x, y };
+        if !ScreenToClient(parent, &mut top_left).as_bool() {
+            return Err("ScreenToClient failed for Unity embed child window".to_string());
+        }
+
+        let flags = if needs_style_update || needs_parent_update {
+            SWP_NOACTIVATE | SWP_FRAMECHANGED
+        } else {
+            SWP_NOACTIVATE
+        };
+        let child_matches = if needs_style_update || needs_parent_update {
+            false
+        } else {
+            let mut parent_origin = POINT { x: 0, y: 0 };
+            let mut child_rect = RECT::default();
+            ClientToScreen(parent, &mut parent_origin).as_bool()
+                && GetWindowRect(child, &mut child_rect).is_ok()
+                && child_rect.left == parent_origin.x + top_left.x
+                && child_rect.top == parent_origin.y + top_left.y
+                && child_rect.right == parent_origin.x + top_left.x + width
+                && child_rect.bottom == parent_origin.y + top_left.y + height
+        };
+
+        if !child_matches {
+            SetWindowPos(
+                child,
+                Some(HWND_TOP),
+                top_left.x,
+                top_left.y,
+                width,
+                height,
+                flags,
+            )
+            .map_err(|error| {
+                format!("SetWindowPos failed for Unity embed child window: {error}")
+            })?;
+        }
         Ok(())
     }
 
@@ -4562,20 +5426,27 @@ mod windows_impl {
         msg: &UnityEmbedControlMessage,
         stable_owner: HWND,
     ) -> Result<(), String> {
-        position_popup_overlay_with_owner(window, msg, Some(stable_owner))
+        position_popup_overlay_with_owner(
+            window,
+            msg,
+            Some(stable_owner),
+            PopupSyncMode::Intentional,
+        )
     }
 
     fn position_popup_overlay(
         window: &tauri::WebviewWindow,
         msg: &UnityEmbedControlMessage,
+        mode: PopupSyncMode,
     ) -> Result<(), String> {
-        position_popup_overlay_with_owner(window, msg, None)
+        position_popup_overlay_with_owner(window, msg, None, mode)
     }
 
     fn position_popup_overlay_with_owner(
         window: &tauri::WebviewWindow,
         msg: &UnityEmbedControlMessage,
         owner_override: Option<HWND>,
+        mode: PopupSyncMode,
     ) -> Result<(), String> {
         let child = window
             .hwnd()
@@ -4658,6 +5529,7 @@ mod windows_impl {
         }
 
         update_popup_sync(
+            &unity_embed_window_label_for_msg(msg),
             parent_hwnd,
             child_hwnd,
             x,
@@ -4665,6 +5537,7 @@ mod windows_impl {
             width_i32,
             height_i32,
             msg.visible,
+            mode,
         )?;
 
         Ok(())

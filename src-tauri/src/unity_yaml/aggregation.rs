@@ -340,6 +340,7 @@ pub fn format_prefab_file_summary(
 pub fn format_prefab_instance_detail(
     ir: &PrefabInstanceIR,
     guid_resolver: &dyn Fn(&Guid) -> Option<String>,
+    object_resolver: &dyn Fn(&Guid, i64) -> Option<String>,
     source_ctx: Option<&SourcePrefabContext>,
     stripped_mappings: &[crate::asset_db::types::StrippedMapping],
 ) -> String {
@@ -415,7 +416,7 @@ pub fn format_prefab_instance_detail(
             .unwrap_or_else(|| format!("target #{}", idx + 1));
         out.push_str(&format!("\n--- {} ---\n", label));
 
-        let formatted = merge_override_vector_components(ovs, guid_resolver);
+        let formatted = merge_override_vector_components(ovs, guid_resolver, object_resolver);
         out.push_str(&formatted);
     }
 
@@ -516,6 +517,7 @@ fn format_annotated_hierarchy(
 fn merge_override_vector_components(
     ovs: &[&PropertyOverride],
     guid_resolver: &dyn Fn(&Guid) -> Option<String>,
+    object_resolver: &dyn Fn(&Guid, i64) -> Option<String>,
 ) -> String {
     let mut out = String::new();
     let mut i = 0;
@@ -578,7 +580,9 @@ fn merge_override_vector_components(
         let formatted_val = round_decimal_str(val);
         if let Some(ref obj) = ov.object_ref {
             if obj.guid != [0u8; 16] {
-                let obj_path = guid_resolver(&obj.guid).unwrap_or_else(|| guid_to_hex(&obj.guid));
+                let obj_path = object_resolver(&obj.guid, obj.source_file_id)
+                    .or_else(|| guid_resolver(&obj.guid))
+                    .unwrap_or_else(|| guid_to_hex(&obj.guid));
                 out.push_str(&format!(
                     "  {} = {} → {{{}}}\n",
                     ov.property_path, formatted_val, obj_path

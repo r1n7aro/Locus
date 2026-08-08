@@ -1,4 +1,7 @@
 using System.Text;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace Locus.CompileServer.Tests;
 
@@ -70,11 +73,46 @@ internal static class UnityReferenceImpl
 
     // ── ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs ────────────
 
+    public static bool RequiresAsyncWrapper(
+        string bodyCode,
+        CSharpParseOptions parseOptions)
+    {
+        if (string.IsNullOrWhiteSpace(bodyCode))
+            return false;
+
+        StatementSyntax body = SyntaxFactory.ParseStatement(
+            "{\n" + bodyCode + "\n}",
+            options: parseOptions,
+            consumeFullText: true);
+        return ContainsTopLevelAwait(body);
+    }
+
+    private static bool ContainsTopLevelAwait(SyntaxNode node)
+    {
+        if (node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax)
+            return false;
+
+        foreach (SyntaxToken token in node.ChildTokens())
+        {
+            if (token.IsKind(SyntaxKind.AwaitKeyword))
+                return true;
+        }
+
+        foreach (SyntaxNode child in node.ChildNodes())
+        {
+            if (ContainsTopLevelAwait(child))
+                return true;
+        }
+
+        return false;
+    }
+
     public static string BuildAsyncSnippetSource(
         string hostTypeName,
         string leadingUsings,
         string bodyCode,
-        bool expressionMode)
+        bool expressionMode,
+        bool useAsyncWrapper)
     {
         var sb = new StringBuilder(4096);
 
@@ -102,7 +140,21 @@ internal static class UnityReferenceImpl
         sb.AppendLine("{");
         sb.Append("    public static class ").Append(hostTypeName).AppendLine();
         sb.AppendLine("    {");
-        sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+
+        if (useAsyncWrapper)
+        {
+            sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+        }
+        else
+        {
+            sb.AppendLine("        public static global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            return global::System.Threading.Tasks.Task.FromResult<object>(ExecuteSync(globals, ctx, cancellationToken));");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        private static object ExecuteSync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+        }
+
         sb.AppendLine("        {");
         sb.AppendLine("            var print = new global::System.Action<object>(globals.print);");
         sb.AppendLine("            var printJson = new global::System.Action<object>(globals.printJson);");

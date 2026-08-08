@@ -721,6 +721,15 @@ pub async fn set_working_dir(
                 error
             );
         }
+        if let Err(error) = crate::unity_bridge::sync_unity_embed_enabled_marker(
+            &canonical,
+            config.unity_embed_enabled(),
+        ) {
+            eprintln!(
+                "[Locus] warning: failed to sync Unity embed marker for workspace: {}",
+                error
+            );
+        }
         switch_timer.mark("unity_monitor_start_begin");
         crate::unity_bridge::start_unity_monitor(
             app_handle.clone(),
@@ -879,15 +888,11 @@ pub async fn save_last_effort(effort: String, _app_handle: AppHandle) -> Result<
 #[tauri::command]
 pub async fn get_codex_fast_mode(_app_handle: AppHandle) -> Result<bool, AppError> {
     let path = persistent_config_dir()?.join("codex_fast_mode.txt");
-    Ok(read_nonempty_string(&path)
-        .is_some_and(|value| value.eq_ignore_ascii_case("true")))
+    Ok(read_nonempty_string(&path).is_some_and(|value| value.eq_ignore_ascii_case("true")))
 }
 
 #[tauri::command]
-pub async fn save_codex_fast_mode(
-    enabled: bool,
-    _app_handle: AppHandle,
-) -> Result<(), AppError> {
+pub async fn save_codex_fast_mode(enabled: bool, _app_handle: AppHandle) -> Result<(), AppError> {
     let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {e}"))?;
     std::fs::write(dir.join("codex_fast_mode.txt"), enabled.to_string())
         .map_err(|e| format!("Failed to save Codex Fast mode: {e}"))?;
@@ -938,6 +943,13 @@ impl Default for CodexTransportMode {
 pub struct CodexModelConfig {
     #[serde(default)]
     pub transport: CodexTransportMode,
+    /// Opt in to the larger GPT-5.6 context window advertised by Codex.
+    /// Existing config files omit this field and remain on the standard window.
+    #[serde(default)]
+    pub extended_context: bool,
+    /// Generate a concise title for new chat sessions with Codex OAuth.
+    #[serde(default)]
+    pub generate_session_titles: bool,
 }
 
 fn codex_model_config_path() -> Result<std::path::PathBuf, String> {
@@ -1415,7 +1427,13 @@ fn sanitize_id_segment(value: &str, fallback: &str) -> String {
     let cleaned: String = value
         .trim()
         .chars()
-        .map(|c| if c == '/' || c.is_whitespace() { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         fallback.to_string()
@@ -1815,6 +1833,38 @@ pub async fn set_file_tool_workspace_boundary(
         .set_file_tool_workspace_boundary_enabled(value)
         .map_err(AppError::from)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_unity_test_tools_workspace_status(
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<crate::workspace::UnityTestToolsWorkspaceStatus, AppError> {
+    let working_dir = workspace.path.read().await.trim().to_string();
+    if working_dir.is_empty() {
+        return Err(AppError::from(
+            "Unity Test tools require an active workspace".to_string(),
+        ));
+    }
+    Ok(crate::workspace::unity_test_tools_workspace_status(
+        &working_dir,
+    ))
+}
+
+#[tauri::command]
+pub async fn set_unity_test_tools_workspace_enabled(
+    value: bool,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<crate::workspace::UnityTestToolsWorkspaceStatus, AppError> {
+    let working_dir = workspace.path.read().await.trim().to_string();
+    if working_dir.is_empty() {
+        return Err(AppError::from(
+            "Unity Test tools require an active workspace".to_string(),
+        ));
+    }
+    crate::workspace::set_unity_test_tools_enabled(&working_dir, value).map_err(AppError::from)?;
+    Ok(crate::workspace::unity_test_tools_workspace_status(
+        &working_dir,
+    ))
 }
 
 #[tauri::command]
@@ -2734,11 +2784,18 @@ pub async fn install_unity_plugin(
             .to_string()
             .into());
     }
-    let hash = crate::unity_bridge::install_or_update_plugin_with_force_close(
+
+    // The Unity-hosted Locus window is a cross-process WS_CHILD. Detach it on
+    // the GUI thread before terminating Unity so WebView2 keeps a valid host
+    // HWND throughout the plugin replacement and editor restart.
+    let unity_embed_quiesce = super::quiesce_unity_embed_control_windows(&app_handle).await?;
+    let install_result = crate::unity_bridge::install_or_update_plugin_with_force_close(
         &cwd,
         force_close_unity.unwrap_or(false),
     )
-    .await?;
+    .await;
+    drop(unity_embed_quiesce);
+    let hash = install_result?;
     crate::unity_bridge::emit_plugin_status(&app_handle, &cwd);
     Ok(hash)
 }
@@ -3024,7 +3081,8 @@ mod tests {
         normalize_tool_permission_mode_request, normalize_workspace_sub_path,
         resolve_workspace_dir_target, rewrite_legacy_custom_model_ref,
         search_workspace_entries_in_dir, valid_custom_model_refs, workspace_entry_stat_for_path,
-        workspace_search_score, ApiFormat, CustomEndpoint, CustomProvider, CustomProviderModel,
+        workspace_search_score, ApiFormat, CodexModelConfig, CodexTransportMode, CustomEndpoint,
+        CustomProvider, CustomProviderModel,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -3047,6 +3105,16 @@ mod tests {
                 false
             }
         }
+    }
+
+    #[test]
+    fn legacy_codex_model_config_keeps_opt_in_features_disabled() {
+        let config: CodexModelConfig =
+            serde_json::from_str(r#"{"transport":"websocket"}"#).expect("codex config");
+
+        assert_eq!(config.transport, CodexTransportMode::Websocket);
+        assert!(!config.extended_context);
+        assert!(!config.generate_session_titles);
     }
 
     #[test]
@@ -3487,7 +3555,10 @@ mod tests {
             rewrite_legacy_custom_model_ref("custom/ep-1/reasoner", &providers),
             None
         );
-        assert_eq!(rewrite_legacy_custom_model_ref("custom/ghost", &providers), None);
+        assert_eq!(
+            rewrite_legacy_custom_model_ref("custom/ghost", &providers),
+            None
+        );
         assert_eq!(
             rewrite_legacy_custom_model_ref("openrouter/claude-fable-5", &providers),
             None
@@ -3503,6 +3574,9 @@ mod tests {
         assert!(!is_stale_custom_model_ref("custom/ep-1/chat", &valid));
         assert!(is_stale_custom_model_ref("custom/ep-1/ghost", &valid));
         assert!(is_stale_custom_model_ref("custom/ghost", &valid));
-        assert!(!is_stale_custom_model_ref("openrouter/claude-fable-5", &valid));
+        assert!(!is_stale_custom_model_ref(
+            "openrouter/claude-fable-5",
+            &valid
+        ));
     }
 }

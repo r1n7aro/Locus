@@ -1,6 +1,172 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{make_exec, ToolDef, ToolResult};
+
+// ─── unity_test_list / unity_test_run ──────────────────────────────────────
+
+pub(super) fn unity_test_list() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_TEST_LIST);
+    ToolDef {
+        name: "unity_test_list".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path,
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_test_list' requires a selected Unity project working directory."
+                                .to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+                match crate::unity_bridge::unity_test_list(&project_path, &args).await {
+                    Ok(output) => ToolResult {
+                        output,
+                        is_error: false,
+                    },
+                    Err(output) => ToolResult {
+                        output,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn unity_test_run() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_TEST_RUN);
+    ToolDef {
+        name: "unity_test_run".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        // Test code is arbitrary project code and may modify assets or scenes.
+        mutates_workspace: true,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path,
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_test_run' requires a selected Unity project working directory."
+                                .to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(600_000)
+                    .clamp(1_000, 3_600_000);
+                match crate::unity_bridge::unity_test_run_controlled(
+                    &project_path,
+                    &args,
+                    Duration::from_millis(timeout_ms),
+                    ctx.cancel_rx,
+                    ctx.progress,
+                )
+                .await
+                {
+                    Ok(snapshot) => {
+                        let is_error = snapshot.status != "passed";
+                        ToolResult {
+                            output: serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| {
+                                format!("Unity Test run {} {}", snapshot.run_id, snapshot.status)
+                            }),
+                            is_error,
+                        }
+                    }
+                    Err(output) => ToolResult {
+                        output,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+// ─── unity_set_play_mode ───────────────────────────────────────────────────
+
+pub(super) fn unity_set_play_mode() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_SET_PLAY_MODE);
+    ToolDef {
+        name: "unity_set_play_mode".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        // Changes transient Editor state without modifying tracked project files.
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let mode = match args
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(mode) => mode,
+                    None => {
+                        return ToolResult {
+                            output: "Missing required parameter: mode".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+                let requested_status = match crate::unity_bridge::play_mode_target_status(mode) {
+                    Ok(status) => status,
+                    Err(output) => {
+                        return ToolResult {
+                            output,
+                            is_error: true,
+                        };
+                    }
+                };
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_set_play_mode' requires a selected Unity project working directory.".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+
+                let (connected, current_status, _scene) =
+                    crate::unity_bridge::query_unity_status(&project_path).await;
+                if !connected {
+                    return ToolResult {
+                        output: "Unity Editor not connected".to_string(),
+                        is_error: true,
+                    };
+                }
+                if current_status == requested_status {
+                    return ToolResult {
+                        output: crate::unity_bridge::format_play_mode_tool_result(mode, false),
+                        is_error: false,
+                    };
+                }
+
+                match crate::unity_bridge::set_editor_status(&project_path, requested_status).await
+                {
+                    Ok(()) => ToolResult {
+                        output: crate::unity_bridge::format_play_mode_tool_result(mode, true),
+                        is_error: false,
+                    },
+                    Err(error) => ToolResult {
+                        output: format!("Failed to change Unity Editor mode: {error}"),
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
 
 // ─── unity_execute ───────────────────────────────────────────────────────────
 
@@ -8,7 +174,10 @@ pub(super) fn unity_execute() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_EXECUTE);
     ToolDef {
         name: "unity_execute".to_string(),
-        description: prompt.description,
+        description: format!(
+            "Use `unity_set_play_mode` whenever the task only needs to start, resume, or stop Play Mode. Reserve `unity_execute` for C# operations that inspect or change Unity objects, assets, scenes, or editor data.\n\n{}",
+            prompt.description
+        ),
         parameters: prompt.parameters,
         mutates_workspace: true,
         execute: make_exec(|args, ctx| {
@@ -22,6 +191,16 @@ pub(super) fn unity_execute() -> ToolDef {
                         };
                     }
                 };
+                let enable_non_public_access =
+                    match crate::csharp_compile::resolve_tool_non_public_access(&args) {
+                        Ok(value) => value,
+                        Err(output) => {
+                            return ToolResult {
+                                output,
+                                is_error: true,
+                            };
+                        }
+                    };
 
                 let requested_status = match args
                     .get("request_editor_status")
@@ -79,7 +258,13 @@ pub(super) fn unity_execute() -> ToolDef {
                     };
                 }
 
-                match crate::unity_bridge::unity_execute_code(&project_path, &code).await {
+                match crate::unity_bridge::unity_execute_code_with_non_public_access(
+                    &project_path,
+                    &code,
+                    enable_non_public_access,
+                )
+                .await
+                {
                     Ok(output) => {
                         let trimmed = output.trim();
                         ToolResult {
@@ -121,6 +306,16 @@ pub(super) fn unity_run_states() -> ToolDef {
                         };
                     }
                 };
+                let enable_non_public_access =
+                    match crate::csharp_compile::resolve_tool_non_public_access(&args) {
+                        Ok(value) => value,
+                        Err(output) => {
+                            return ToolResult {
+                                output,
+                                is_error: true,
+                            };
+                        }
+                    };
 
                 let requested_status = match args
                     .get("request_editor_status")
@@ -146,8 +341,12 @@ pub(super) fn unity_run_states() -> ToolDef {
                     };
                 }
 
-                if let Err(error) =
-                    crate::unity_bridge::compile_run_states(&project_path, &args).await
+                if let Err(error) = crate::unity_bridge::compile_run_states_with_non_public_access(
+                    &project_path,
+                    &args,
+                    enable_non_public_access,
+                )
+                .await
                 {
                     return ToolResult {
                         output: error,
@@ -174,7 +373,13 @@ pub(super) fn unity_run_states() -> ToolDef {
                     };
                 }
 
-                match crate::unity_bridge::unity_run_states(&project_path, &args).await {
+                match crate::unity_bridge::unity_run_states_with_non_public_access(
+                    &project_path,
+                    &args,
+                    enable_non_public_access,
+                )
+                .await
+                {
                     Ok(output) => ToolResult {
                         output: output.trim().to_string(),
                         is_error: false,
@@ -252,6 +457,85 @@ pub(super) fn unity_capture_viewport() -> ToolDef {
                 ToolResult {
                     output: "Error: unity_capture_viewport must be executed through the agent loop or the MCP server (its result carries images that ToolResult cannot).".to_string(),
                     is_error: true,
+                }
+            })
+        }),
+    }
+}
+
+// ─── unity_get_console_log ──────────────────────────────────────────────────
+
+pub(super) fn unity_get_console_log() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_GET_CONSOLE_LOG);
+    ToolDef {
+        name: "unity_get_console_log".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let project_path = match ctx.working_dir {
+                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+                    _ => {
+                        return ToolResult {
+                            output: "Tool 'unity_get_console_log' requires a selected Unity project working directory.".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+                let request = match serde_json::to_string(&args) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!("Failed to serialize Console log request: {error}"),
+                            is_error: true,
+                        };
+                    }
+                };
+                let response = match crate::unity_bridge::send_message(
+                    &project_path,
+                    "unity_get_console_log",
+                    &request,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return ToolResult {
+                            output: error,
+                            is_error: true,
+                        };
+                    }
+                };
+                if !response.ok {
+                    return ToolResult {
+                        output: response
+                            .error
+                            .unwrap_or_else(|| "Failed to read Unity Console".to_string()),
+                        is_error: true,
+                    };
+                }
+
+                let output = match serde_json::from_str::<serde_json::Value>(
+                    response.message.as_deref().unwrap_or_default(),
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!("Failed to parse Unity Console response: {error}"),
+                            is_error: true,
+                        };
+                    }
+                };
+                match serde_json::to_string_pretty(&output) {
+                    Ok(output) => ToolResult {
+                        output,
+                        is_error: false,
+                    },
+                    Err(error) => ToolResult {
+                        output: format!("Failed to serialize Unity Console logs: {error}"),
+                        is_error: true,
+                    },
                 }
             })
         }),

@@ -12,6 +12,7 @@ const props = withDefaults(defineProps<{
   payload: AssetPreviewPayload | null;
   loading: boolean;
   error: string;
+  focusLine?: number | null;
   selectedName: string;
   selectedPath: string;
   activeTargetId: string | null;
@@ -21,6 +22,7 @@ const props = withDefaults(defineProps<{
   showClose?: boolean;
 }>(), {
   showClose: true,
+  focusLine: null,
 });
 
 const emit = defineEmits<{
@@ -123,6 +125,8 @@ async function onTreeSelect(targetId: string) {
           :snippet="payload.snippet"
           :truncated="payload.truncated"
           :total-lines="payload.totalLines"
+          :start-line="payload.startLine ?? 1"
+          :focus-line="focusLine"
           :language="payload.language"
         />
 

@@ -1,4 +1,7 @@
 using System.Text;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace Locus.CompileServer;
 
@@ -17,6 +20,43 @@ public static class UnitySnippetSource
     public const string HostTypeName = "__LocusAsyncSnippetHost";
     public const string FullHostTypeName = "Locus.RuntimeSnippets.__LocusAsyncSnippetHost";
     public const string SourcePath = "LocusRuntimeAsyncSnippet.cs";
+
+    /// <summary>
+    /// Detect await syntax that belongs to the generated snippet method itself.
+    /// Await inside a local function or lambda has its own async context and
+    /// therefore does not require the outer snippet body to be async.
+    /// </summary>
+    public static bool RequiresAsyncWrapper(string bodyCode, CSharpParseOptions parseOptions)
+    {
+        if (string.IsNullOrWhiteSpace(bodyCode))
+            return false;
+
+        StatementSyntax body = SyntaxFactory.ParseStatement(
+            "{\n" + bodyCode + "\n}",
+            options: parseOptions,
+            consumeFullText: true);
+        return ContainsTopLevelAwait(body);
+    }
+
+    private static bool ContainsTopLevelAwait(SyntaxNode node)
+    {
+        if (node is AnonymousFunctionExpressionSyntax or LocalFunctionStatementSyntax)
+            return false;
+
+        foreach (SyntaxToken token in node.ChildTokens())
+        {
+            if (token.IsKind(SyntaxKind.AwaitKeyword))
+                return true;
+        }
+
+        foreach (SyntaxNode child in node.ChildNodes())
+        {
+            if (ContainsTopLevelAwait(child))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <summary>Port of LocusBridge.ExecuteCode.cs SplitLeadingUsings.</summary>
     public static void SplitLeadingUsings(string? code, out string leadingUsings, out string bodyCode)
@@ -75,7 +115,8 @@ public static class UnitySnippetSource
         string hostTypeName,
         string leadingUsings,
         string bodyCode,
-        bool expressionMode)
+        bool expressionMode,
+        bool useAsyncWrapper)
     {
         var sb = new StringBuilder(4096);
 
@@ -103,7 +144,21 @@ public static class UnitySnippetSource
         sb.AppendLine("{");
         sb.Append("    public static class ").Append(hostTypeName).AppendLine();
         sb.AppendLine("    {");
-        sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+
+        if (useAsyncWrapper)
+        {
+            sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+        }
+        else
+        {
+            sb.AppendLine("        public static global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            return global::System.Threading.Tasks.Task.FromResult<object>(ExecuteSync(globals, ctx, cancellationToken));");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+            sb.AppendLine("        private static object ExecuteSync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+        }
+
         sb.AppendLine("        {");
         sb.AppendLine("            var print = new global::System.Action<object>(globals.print);");
         sb.AppendLine("            var printJson = new global::System.Action<object>(globals.printJson);");

@@ -1346,6 +1346,13 @@ impl AssetDb {
     ) -> Result<HashMap<types::Guid, String>, String> {
         db::batch_resolve_paths(&self.conn, guids)
     }
+
+    pub fn batch_resolve_asset_objects(
+        &self,
+        object_refs: &[(types::Guid, i64)],
+    ) -> Result<HashMap<(types::Guid, i64), types::AssetObjectIdentity>, String> {
+        db::batch_resolve_asset_objects(&self.conn, object_refs)
+    }
 }
 
 fn build_duplicate_guid_overview(

@@ -1383,6 +1383,42 @@ namespace Locus
                     case "ping":
                         return OkResponse(reqId, "pong");
 
+                    case "configure_locus_external_editor":
+                    {
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(
+                                    reqId,
+                                    LocusExternalCodeEditor.ConfigureFromJson(msg.message)));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
+                    case "sync_project_files":
+                    {
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(reqId, LocusProjectFiles.SyncAll()));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
                     case "bridge_capabilities":
                         return OkResponse(reqId, "managed_executor_v1,status_cached,set_editor_status_async");
 
@@ -1397,6 +1433,24 @@ namespace Locus
                             try
                             {
                                 tcs.SetResult(OkResponse(reqId, BuildConsoleTextPayloadJson()));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
+                    case "unity_get_console_log":
+                    {
+                        string requestJson = msg.message ?? "";
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(OkResponse(reqId, BuildConsoleLogPayloadJson(requestJson)));
                             }
                             catch (Exception ex)
                             {
@@ -1883,7 +1937,10 @@ namespace Locus
                     }
 
                     default:
-                        return ErrorResponse(reqId, "unknown message type: " + (msg.type ?? ""));
+                        return await HandleExtensionMessageAsync(
+                            reqId,
+                            msg.type,
+                            msg.message).ConfigureAwait(false);
                 }
             }
             catch (Exception ex)

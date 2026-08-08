@@ -17,8 +17,9 @@ namespace Locus
     // vary with the Mono build, so they are MEASURED here per editor, never
     // assumed. The sidecar compiles a probe assembly (AccessProbeSource.cs)
     // whose methods each touch one non-public member of
-    // LocusAccessProbeTarget; this side loads it, force-JITs every cell,
-    // runs the primitives, and returns the matrix. The desktop coordinator
+    // LocusAccessProbeTarget; this side loads it, force-JITs and invokes every
+    // cell, validates the returned value, runs the primitives, and returns the
+    // matrix. The desktop coordinator
     // caches it per domain generation and feeds it back into
     // compile/hotPatch as runtimeCaps.
 
@@ -34,24 +35,113 @@ namespace Locus
         internal int _intInst = 11;
         private static int _privStatic = 13;
         internal static int _intStatic = 17;
+        private int PrivProperty { get; set; } = 23;
+        internal int IntProperty { get; set; } = 29;
+        private event Action PrivEvent;
+        internal event Action IntEvent;
 
         private LocusAccessProbeTarget(int seed) { _privInst = seed; }
         internal LocusAccessProbeTarget() { }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
         private int PrivMethod(int x) { return x * 2 + 1; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
         internal int IntMethod(int x) { return x * 3 + 1; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
         private static int PrivStatic(int x) { return x * 5 + 1; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
         internal static int IntStatic(int x) { return x * 7 + 1; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private T PrivGeneric<T>(T value) { return value; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal T IntGeneric<T>(T value) { return value; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void PrivRef(ref int value) { value += 5; }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void IntRef(ref int value) { value += 7; }
 
         public static LocusAccessProbeTarget New() { return new LocusAccessProbeTarget(); }
 
         /// <summary>Verification accessor: lets the byref primitive assert
         /// that a write through the emitted reference actually landed.</summary>
         public int ReadPrivInst() { return _privInst; }
+        public int ReadIntInst() { return _intInst; }
+        public static int ReadPrivStatic() { return _privStatic; }
+        public static int ReadIntStatic() { return _intStatic; }
+        public int ReadPrivProperty() { return PrivProperty; }
+        public int ReadIntProperty() { return IntProperty; }
+        public int ReadPrivEventSubscribers() { return PrivEvent == null ? 0 : PrivEvent.GetInvocationList().Length; }
+        public int ReadIntEventSubscribers() { return IntEvent == null ? 0 : IntEvent.GetInvocationList().Length; }
+        public static void ResetStatics() { _privStatic = 13; _intStatic = 17; }
 
         /// <summary>The castclass/ldtoken × private cells target this type
         /// (type-level checks, distinct from member-level ones).</summary>
         private sealed class PrivNested { }
+    }
+
+    /// <summary>
+    /// Public declaring type used by the execute/run-states integration probe.
+    /// Keeping the container public isolates member visibility from containing-
+    /// type visibility, while the nested types cover private/internal type tokens.
+    /// Probe methods are explicitly non-inline so Debug/Release differences cannot
+    /// turn an access-check failure into a false green result.
+    /// </summary>
+    public sealed class LocusExecuteAccessProbeTarget
+    {
+        private int _privInst = 7;
+        internal int _intInst = 11;
+        private static int _privStatic = 13;
+        internal static int _intStatic = 17;
+        private int PrivProperty { get; set; } = 23;
+        internal int IntProperty { get; set; } = 29;
+        private event Action PrivEvent;
+        internal event Action IntEvent;
+
+        private LocusExecuteAccessProbeTarget(int seed) { _privInst = seed; }
+        internal LocusExecuteAccessProbeTarget() { }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private int PrivMethod(int x) { return x * 2 + 1; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal int IntMethod(int x) { return x * 3 + 1; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static int PrivStatic(int x) { return x * 5 + 1; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal static int IntStatic(int x) { return x * 7 + 1; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private T PrivGeneric<T>(T value) { return value; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal T IntGeneric<T>(T value) { return value; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void PrivRef(ref int value) { value += 5; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void IntRef(ref int value) { value += 7; }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static LocusExecuteAccessProbeTarget New()
+        {
+            return new LocusExecuteAccessProbeTarget();
+        }
+
+        public int ReadPrivInst() { return _privInst; }
+        public int ReadIntInst() { return _intInst; }
+        public static int ReadPrivStatic() { return _privStatic; }
+        public static int ReadIntStatic() { return _intStatic; }
+        public int ReadPrivProperty() { return PrivProperty; }
+        public int ReadIntProperty() { return IntProperty; }
+        public int ReadPrivEventSubscribers() { return PrivEvent == null ? 0 : PrivEvent.GetInvocationList().Length; }
+        public int ReadIntEventSubscribers() { return IntEvent == null ? 0 : IntEvent.GetInvocationList().Length; }
+        public static void ResetStatics() { _privStatic = 13; _intStatic = 17; }
+
+        private sealed class PrivNested { }
+        internal sealed class IntNested { }
     }
 #pragma warning restore 0414
 
@@ -65,6 +155,7 @@ namespace Locus
             public string method;
             public string op;
             public string visibility;
+            public int expected;
         }
 
         [Serializable]
@@ -80,6 +171,8 @@ namespace Locus
             public string op;
             public string visibility;
             public bool ok;
+            public int expected;
+            public int actual;
             public string error;
         }
 
@@ -192,6 +285,8 @@ namespace Locus
                     op = cell.op ?? "",
                     visibility = cell.visibility ?? "",
                     ok = false,
+                    expected = cell.expected,
+                    actual = 0,
                     error = "",
                 };
                 if (probeType == null)
@@ -212,7 +307,17 @@ namespace Locus
                         else
                         {
                             RuntimeHelpers.PrepareMethod(method.MethodHandle);
-                            result.ok = true;
+                            object value = method.Invoke(null, null);
+                            result.actual = Convert.ToInt32(value);
+                            if (result.actual == result.expected)
+                            {
+                                result.ok = true;
+                            }
+                            else
+                            {
+                                result.error = "expected " + result.expected +
+                                    ", got " + result.actual;
+                            }
                         }
                     }
                     catch (Exception ex)

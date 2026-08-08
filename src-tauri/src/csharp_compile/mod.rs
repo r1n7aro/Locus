@@ -24,6 +24,10 @@ use tauri::Emitter;
 pub const STATUS_EVENT: &str = "csharp-compile-status";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// Master gate for direct private/internal access in generated unity_execute /
+// unity_run_states assemblies. The persisted setting initializes this to true;
+// each tool call may further disable it through enable_non_public_access=false.
+static NON_PUBLIC_ACCESS_ENABLED: AtomicBool = AtomicBool::new(true);
 // Graceful fallback to the in-Unity Roslyn compile when the sidecar is on but
 // a compile is unavailable (sidecar down / transport error). Default true
 // (keeps current behavior). Set false for pure-sidecar / A-B: an unavailable
@@ -66,14 +70,44 @@ pub(crate) fn emit_status_in_background() {
     });
 }
 
-/// Called once from app setup with the persisted flag.
-pub fn initialize(enabled: bool, app_handle: tauri::AppHandle) {
+/// Called once from app setup with the persisted flags.
+pub fn initialize(enabled: bool, non_public_access_enabled: bool, app_handle: tauri::AppHandle) {
     ENABLED.store(enabled, Ordering::Relaxed);
+    NON_PUBLIC_ACCESS_ENABLED.store(non_public_access_enabled, Ordering::Relaxed);
     let _ = APP_HANDLE.set(app_handle);
 }
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn non_public_access_enabled() -> bool {
+    NON_PUBLIC_ACCESS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_non_public_access_enabled(value: bool) {
+    NON_PUBLIC_ACCESS_ENABLED.store(value, Ordering::Relaxed);
+    emit_status_in_background();
+}
+
+/// Resolve the tool-level switch under the persisted master gate. Omitting the
+/// parameter means true, matching the JSON schema. A global-off setting always
+/// wins, so tool calls cannot silently bypass the user's preference.
+pub fn resolve_tool_non_public_access(args: &Value) -> Result<bool, String> {
+    resolve_tool_non_public_access_with_global(args, non_public_access_enabled())
+}
+
+fn resolve_tool_non_public_access_with_global(
+    args: &Value,
+    global_enabled: bool,
+) -> Result<bool, String> {
+    let requested = match args.get("enable_non_public_access") {
+        None => true,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            "enable_non_public_access must be a boolean when provided".to_string()
+        })?,
+    };
+    Ok(global_enabled && requested)
 }
 
 pub fn in_process_fallback_enabled() -> bool {
@@ -126,6 +160,7 @@ pub fn note_fallback(reason: &str) {
 #[serde(rename_all = "camelCase")]
 pub struct CsharpCompileStatusPayload {
     pub enabled: bool,
+    pub non_public_access_enabled: bool,
     pub platform_supported: bool,
     /// Published sidecar binaries present on disk.
     pub server_available: bool,
@@ -156,6 +191,7 @@ pub async fn status() -> CsharpCompileStatusPayload {
     let hot_unapplied_changes = crate::unity_hotreload::coordinator::unapplied_change_count().await;
     CsharpCompileStatusPayload {
         enabled: is_enabled(),
+        non_public_access_enabled: non_public_access_enabled(),
         platform_supported: crate::dotnet_runtime::is_platform_supported(),
         server_available: manager::server_dll_available(),
         running: running.is_some(),
@@ -240,6 +276,39 @@ pub struct CompileParams {
     pub allow_unsafe: bool,
 }
 
+/// Compiler/runtime policy for direct private/internal IL. Production uses
+/// SkipVerification; the integration matrix also exercises the other variants
+/// to identify Mono behavior changes across Unity versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum NonPublicAccessProbeMode {
+    CompilerOnly,
+    IgnoresAccessChecksTo,
+    SkipVerification,
+    Combined,
+}
+
+impl NonPublicAccessProbeMode {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::CompilerOnly,
+        Self::IgnoresAccessChecksTo,
+        Self::SkipVerification,
+        Self::Combined,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompilerOnly => "compiler_only",
+            Self::IgnoresAccessChecksTo => "ignores_access_checks_to",
+            Self::SkipVerification => "skip_verification",
+            Self::Combined => "combined",
+        }
+    }
+
+    pub(crate) const fn emits_skip_verification(self) -> bool {
+        matches!(self, Self::SkipVerification | Self::Combined)
+    }
+}
+
 /// A successfully emitted assembly, ready to ship to Unity.
 #[derive(Debug, Clone)]
 pub struct CompiledAssembly {
@@ -273,13 +342,36 @@ pub async fn compile_snippet(
     reference_session_images: bool,
     register_image: bool,
 ) -> Result<CompileOutcome, String> {
-    let request = json!({
+    compile_snippet_with_access_probe(
+        compile_params,
+        code,
+        reference_session_images,
+        register_image,
+        None,
+    )
+    .await
+}
+
+/// Compile with an explicit private/internal policy. Production tool calls use
+/// SkipVerification; the Unity integration suite selects every policy variant
+/// to measure Unity Mono's JIT behavior.
+pub(crate) async fn compile_snippet_with_access_probe(
+    compile_params: &CompileParams,
+    code: &str,
+    reference_session_images: bool,
+    register_image: bool,
+    non_public_access_probe_mode: Option<NonPublicAccessProbeMode>,
+) -> Result<CompileOutcome, String> {
+    let mut request = json!({
         "code": code,
         "params": compile_params,
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
         "returnAssemblyPath": true,
     });
+    if let Some(mode) = non_public_access_probe_mode {
+        request["nonPublicAccessProbeMode"] = json!(mode.as_str());
+    }
     let outcome = request_compile("compile/snippet", request).await;
     record_outcome(&outcome);
     outcome
@@ -294,13 +386,35 @@ pub async fn compile_run_states(
     reference_session_images: bool,
     register_image: bool,
 ) -> Result<CompileOutcome, String> {
-    let request = json!({
+    compile_run_states_with_access_probe(
+        compile_params,
+        run_states_request,
+        reference_session_images,
+        register_image,
+        None,
+    )
+    .await
+}
+
+/// Explicit-access counterpart of [`compile_snippet_with_access_probe`] for
+/// the generated unity_run_states host and handler lambdas.
+pub(crate) async fn compile_run_states_with_access_probe(
+    compile_params: &CompileParams,
+    run_states_request: &Value,
+    reference_session_images: bool,
+    register_image: bool,
+    non_public_access_probe_mode: Option<NonPublicAccessProbeMode>,
+) -> Result<CompileOutcome, String> {
+    let mut request = json!({
         "request": run_states_request,
         "params": compile_params,
         "referenceSessionImages": reference_session_images,
         "registerImage": register_image,
         "returnAssemblyPath": true,
     });
+    if let Some(mode) = non_public_access_probe_mode {
+        request["nonPublicAccessProbeMode"] = json!(mode.as_str());
+    }
     let outcome = request_compile("compile/runStates", request).await;
     record_outcome(&outcome);
     outcome
@@ -767,20 +881,41 @@ pub async fn register_session_image(
     }
 }
 
-/// C0: compile the fixed access-probe source against the project's
-/// reference set (`compile/accessProbe`). Returns the probe assembly
-/// (base64) plus the cell manifest `[{method, op, visibility}]` the Unity
-/// side force-JITs. Compile failures (e.g. an old plugin whose Locus.Editor
-/// lacks LocusAccessProbeTarget) come back as `Err` like transport failures:
-/// the caller falls back to conservative caps either way.
-pub async fn compile_access_probe(
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledAccessProbe {
+    pub assembly_b64: String,
+    pub cells: Vec<Value>,
+    pub mode: NonPublicAccessProbeMode,
+    pub skip_verification_decl_security: bool,
+}
+
+/// C0 production default: preserve the historical
+/// IgnoresAccessChecksTo-only capability measurement.
+pub(crate) async fn compile_access_probe(
     compile_params: &CompileParams,
-) -> Result<(String, Vec<Value>), String> {
+) -> Result<CompiledAccessProbe, String> {
+    compile_access_probe_with_mode(
+        compile_params,
+        NonPublicAccessProbeMode::IgnoresAccessChecksTo,
+    )
+    .await
+}
+
+/// Compile one complete access matrix under an explicitly selected runtime
+/// policy. The server validates SkipVerification's DeclSecurity encoding
+/// before returning success.
+pub(crate) async fn compile_access_probe_with_mode(
+    compile_params: &CompileParams,
+    mode: NonPublicAccessProbeMode,
+) -> Result<CompiledAccessProbe, String> {
     let client = manager::ensure_client().await?;
     let value = client
         .request_with_timeout(
             "compile/accessProbe",
-            json!({ "params": compile_params }),
+            json!({
+                "params": compile_params,
+                "nonPublicAccessProbeMode": mode.as_str(),
+            }),
             client::COMPILE_REQUEST_TIMEOUT,
         )
         .await?;
@@ -810,7 +945,37 @@ pub async fn compile_access_probe(
     if cells.is_empty() {
         return Err("malformed compile/accessProbe response (missing cells)".to_string());
     }
-    Ok((assembly_b64, cells))
+    let returned_mode = value
+        .get("nonPublicAccessProbeMode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if returned_mode != mode.as_str() {
+        return Err(format!(
+            "compile/accessProbe mode mismatch: requested {}, received {}",
+            mode.as_str(),
+            if returned_mode.is_empty() {
+                "<missing>"
+            } else {
+                returned_mode
+            }
+        ));
+    }
+    let skip_verification_decl_security = value
+        .get("skipVerificationDeclSecurity")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if mode.emits_skip_verification() && !skip_verification_decl_security {
+        return Err(
+            "compile/accessProbe did not confirm SkipVerification DeclSecurity metadata"
+                .to_string(),
+        );
+    }
+    Ok(CompiledAccessProbe {
+        assembly_b64,
+        cells,
+        mode,
+        skip_verification_decl_security,
+    })
 }
 
 fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
@@ -1078,6 +1243,27 @@ fn parse_compile_result(value: Value) -> Result<CompileOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_non_public_access_defaults_on_and_respects_both_gates() {
+        assert!(resolve_tool_non_public_access_with_global(&json!({}), true).unwrap());
+        assert!(!resolve_tool_non_public_access_with_global(&json!({}), false).unwrap());
+        assert!(!resolve_tool_non_public_access_with_global(
+            &json!({ "enable_non_public_access": false }),
+            true,
+        )
+        .unwrap());
+        assert!(!resolve_tool_non_public_access_with_global(
+            &json!({ "enable_non_public_access": true }),
+            false,
+        )
+        .unwrap());
+        assert!(resolve_tool_non_public_access_with_global(
+            &json!({ "enable_non_public_access": "true" }),
+            true,
+        )
+        .is_err());
+    }
 
     #[test]
     fn parse_compile_result_success() {

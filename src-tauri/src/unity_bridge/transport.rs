@@ -18,7 +18,7 @@ mod windows_impl {
             OnceLock,
         },
     };
-    use tauri::{AppHandle, Emitter};
+    use tauri::{AppHandle, Emitter, Manager};
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
         net::windows::named_pipe::{ClientOptions, NamedPipeClient},
@@ -99,6 +99,8 @@ mod windows_impl {
 
     static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<UnityPipeConnection>>>> =
         OnceLock::new();
+    static CONNECTION_ATTEMPT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+        OnceLock::new();
     static ACTIVE_CONNECTIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     static EVENT_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -110,6 +112,18 @@ mod windows_impl {
 
     fn connections() -> &'static Mutex<HashMap<String, Arc<UnityPipeConnection>>> {
         CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn connection_attempt_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+        CONNECTION_ATTEMPT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    async fn connection_attempt_lock(pipe_name: &str) -> Arc<Mutex<()>> {
+        let mut locks = connection_attempt_locks().lock().await;
+        locks
+            .entry(pipe_name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     fn active_connections() -> &'static Mutex<HashMap<String, String>> {
@@ -255,7 +269,19 @@ mod windows_impl {
         }
 
         if let Some(app_handle) = EVENT_APP_HANDLE.get() {
-            let _ = app_handle.emit(event_name, unsolicited_payload(env));
+            let payload = unsolicited_payload(env);
+            if event_name == "locus-open-script" {
+                let request: Result<crate::unity_bridge::ExternalScriptOpenRequest, _> =
+                    serde_json::from_value(payload.clone());
+                if let Ok(request) = request {
+                    let pending = app_handle
+                        .try_state::<crate::unity_bridge::PendingExternalScriptOpenRequest>();
+                    if let Some(pending) = pending {
+                        pending.stage(request);
+                    }
+                }
+            }
+            let _ = app_handle.emit(event_name, payload);
             return;
         }
 
@@ -349,6 +375,14 @@ mod windows_impl {
         pipe_name: String,
         max_retries: u32,
     ) -> Result<Arc<UnityPipeConnection>, String> {
+        // Opening a Windows named-pipe client is not idempotent while the
+        // broker serves a single instance. Without this per-pipe single-flight,
+        // concurrent first requests can all observe an empty cache; one opens
+        // the broker connection while the others receive ERROR_PIPE_BUSY and
+        // incorrectly report the editor as disconnected. Recheck the cache
+        // after acquiring the attempt lock so every waiter reuses the winner.
+        let attempt_lock = connection_attempt_lock(&pipe_name).await;
+        let _attempt_guard = attempt_lock.lock().await;
         {
             let map = connections().lock().await;
             if let Some(conn) = map.get(&pipe_name) {
@@ -693,6 +727,46 @@ mod windows_impl {
 
     pub async fn disconnect(project_path: &str) {
         disconnect_with_reason(project_path, "disconnected for recompile").await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        #[tokio::test]
+        async fn concurrent_first_connect_is_single_flight() {
+            let unique = format!(
+                "{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let pipe_name = format!(r"\\.\pipe\locus_transport_singleflight_{unique}");
+            let project_key = format!("singleflight-project-{unique}");
+            let server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+                .expect("create test pipe");
+            let server_task = tokio::spawn(async move {
+                server.connect().await.expect("accept test pipe client");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+
+            let (first, second) = tokio::join!(
+                connect_pipe(project_key.clone(), pipe_name.clone(), 1),
+                connect_pipe(project_key, pipe_name.clone(), 1),
+            );
+            let first = first.expect("first connection");
+            let second = second.expect("second connection should reuse the first");
+            assert!(Arc::ptr_eq(&first, &second));
+
+            remove_connection_if_same(&pipe_name, &first).await;
+            close_connection(&first, "test complete".to_string()).await;
+            server_task.abort();
+        }
     }
 }
 

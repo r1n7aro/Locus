@@ -66,6 +66,14 @@ export function unitySidecarCompilerSetEnabled(value: boolean): Promise<CsharpCo
   );
 }
 
+export function unityNonPublicAccessSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+  return ipcInvoke<CsharpCompileStatus>(
+    "unity_non_public_access_set_enabled",
+    { value },
+    { operation: "unityNonPublicAccessSetEnabled", notify: false, throwOnError: true },
+  );
+}
+
 export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
   return ipcInvoke<CsharpCompileStatus>(
     "unity_hot_reload_set_enabled",

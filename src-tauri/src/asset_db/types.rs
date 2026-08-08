@@ -239,6 +239,18 @@ pub struct AssetObject {
     pub sort_index: i64,
 }
 
+/// Human-facing identity for one addressable Unity object inside an asset.
+/// The `(asset_guid, file_id)` pair remains the canonical lookup key; this
+/// payload carries the fields needed by readers to distinguish subassets from
+/// their container asset without exposing database rows to higher layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetObjectIdentity {
+    pub path: String,
+    pub name: String,
+    pub type_name: String,
+    pub is_sub_asset: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefEdge {
     pub src_guid: Guid,

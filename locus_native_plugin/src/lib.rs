@@ -1290,6 +1290,13 @@ mod imp {
         }
     }
 
+    pub fn connected() -> bool {
+        BROKER
+            .get()
+            .map(|broker| broker.connected.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     /// Copy the next queued request line into `buf`. Returns the byte length
     /// written, `0` when the queue is empty, or `-1` when `buf` is too small
     /// (the request is left queued and `*out_required` is set to the size the
@@ -2194,6 +2201,25 @@ pub unsafe extern "C" fn locus_emit_event(
     #[cfg(not(windows))]
     {
         let _ = (event_type, type_len, payload, payload_len);
+    }
+}
+
+/// Return whether a Locus desktop client is currently connected to this
+/// project's native broker. Unity uses this to choose between sending an
+/// in-process open-script event and launching Locus with startup arguments.
+#[no_mangle]
+pub extern "C" fn locus_has_connected_client() -> c_int {
+    #[cfg(windows)]
+    {
+        if imp::connected() {
+            1
+        } else {
+            0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        0
     }
 }
 

@@ -99,11 +99,10 @@ pub async fn append_frontend_logs(
 #[tauri::command]
 pub async fn reveal_log_file(logs: State<'_, Arc<AppLogStore>>) -> Result<String, AppError> {
     let Some(sink) = logs.file_sink() else {
-        return Err(AppError::new(
-            "log.file.disabled",
-            "Persistent file logging is not active",
-        )
-        .operation("revealLogFile"));
+        return Err(
+            AppError::new("log.file.disabled", "Persistent file logging is not active")
+                .operation("revealLogFile"),
+        );
     };
     sink.flush_blocking(std::time::Duration::from_millis(500));
     let path = sink.log_path().to_path_buf();
@@ -181,8 +180,14 @@ mod tests {
 
     #[test]
     fn sanitize_keeps_known_levels_and_defaults_unknown_to_info() {
-        assert_eq!(sanitize_frontend_log_line(&line("WARN", "m", "x")).level, "warn");
-        assert_eq!(sanitize_frontend_log_line(&line("verbose", "m", "x")).level, "info");
+        assert_eq!(
+            sanitize_frontend_log_line(&line("WARN", "m", "x")).level,
+            "warn"
+        );
+        assert_eq!(
+            sanitize_frontend_log_line(&line("verbose", "m", "x")).level,
+            "info"
+        );
     }
 
     #[test]

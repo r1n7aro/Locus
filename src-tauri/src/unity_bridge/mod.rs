@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,68 @@ pub async fn run_native_bridge_selftest(
     native_selftest::run(app, project).await
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalScriptOpenRequest {
+    pub project_path: String,
+    pub asset_path: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Clone, Default)]
+pub struct PendingExternalScriptOpenRequest(Arc<StdMutex<Option<ExternalScriptOpenRequest>>>);
+
+impl PendingExternalScriptOpenRequest {
+    pub fn new(request: Option<ExternalScriptOpenRequest>) -> Self {
+        Self(Arc::new(StdMutex::new(request)))
+    }
+
+    pub fn take(&self) -> Option<ExternalScriptOpenRequest> {
+        self.0.lock().ok()?.take()
+    }
+
+    pub fn stage(&self, request: ExternalScriptOpenRequest) {
+        if let Ok(mut pending) = self.0.lock() {
+            *pending = Some(request);
+        }
+    }
+}
+
+fn command_line_option(args: &[String], name: &str) -> Option<String> {
+    let inline_prefix = format!("{name}=");
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix(&inline_prefix) {
+            return Some(value.to_string());
+        }
+        if arg == name {
+            return args.get(index + 1).cloned();
+        }
+    }
+    None
+}
+
+pub fn external_script_open_request_from_env_args() -> Option<ExternalScriptOpenRequest> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let project_path = command_line_option(&args, "--locus-project")?;
+    let asset_path = command_line_option(&args, "--locus-open-script")?;
+    if project_path.trim().is_empty() {
+        return None;
+    }
+    let parse_position = |name: &str| {
+        command_line_option(&args, name)
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+    Some(ExternalScriptOpenRequest {
+        project_path,
+        asset_path,
+        line: parse_position("--locus-line"),
+        column: parse_position("--locus-column"),
+    })
+}
+
 // ── Native broker bridge ─────────────────────────────────────────────
 //
 // When enabled, the Tauri↔Unity command channel is served by the native
@@ -105,6 +167,7 @@ pub async fn run_native_bridge_selftest(
 // the native broker is the required Unity command transport.
 
 static NATIVE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static EXTERNAL_EDITOR_DEFAULT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn initialize_native_bridge(enabled: bool) {
     NATIVE_BRIDGE_ENABLED.store(enabled, Ordering::Relaxed);
@@ -116,6 +179,18 @@ pub fn set_native_bridge_enabled(value: bool) {
 
 pub fn native_bridge_enabled() -> bool {
     NATIVE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn initialize_external_editor_default(enabled: bool) {
+    EXTERNAL_EDITOR_DEFAULT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_external_editor_default(enabled: bool) {
+    EXTERNAL_EDITOR_DEFAULT_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn external_editor_default_enabled() -> bool {
+    EXTERNAL_EDITOR_DEFAULT_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Broker status as published by the native plugin's shared-memory state
@@ -571,6 +646,49 @@ fn background_hook_marker_path(project_path: &str) -> PathBuf {
         .join("BackgroundHook.enabled")
 }
 
+/// Reconcile the marker read by the Unity editor window before it performs
+/// HWND discovery or sends overlay control messages. Absence keeps the default
+/// enabled behavior for existing projects and older Locus installations.
+pub fn sync_unity_embed_enabled_marker(project_path: &str, enabled: bool) -> Result<(), String> {
+    let path = unity_embed_disabled_marker_path(project_path);
+    if enabled {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Failed to remove Unity embed marker '{}': {}",
+                    path.display(),
+                    error
+                )
+            })?;
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create Unity embed marker dir '{}': {}",
+                    parent.display(),
+                    error
+                )
+            })?;
+        }
+        std::fs::write(&path, "disabled\n").map_err(|error| {
+            format!(
+                "Failed to write Unity embed marker '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn unity_embed_disabled_marker_path(project_path: &str) -> PathBuf {
+    Path::new(strip_extended_path_prefix(project_path))
+        .join("Library")
+        .join("Locus")
+        .join("UnityEmbed.disabled")
+}
+
 fn native_background_hook_markers_present(project_path: &str) -> bool {
     native_bridge_marker_path(project_path).is_file()
         && background_hook_marker_path(project_path).is_file()
@@ -650,6 +768,69 @@ pub(crate) async fn send_message_with_transient_retry(
     }
 }
 
+pub async fn configure_locus_external_editor(
+    project_path: &str,
+    set_default: bool,
+) -> Result<String, String> {
+    let executable_path = std::env::current_exe()
+        .map_err(|error| format!("Failed to resolve the Locus executable: {error}"))?;
+    let payload = serde_json::json!({
+        "executablePath": executable_path.to_string_lossy(),
+        "setDefault": set_default,
+    })
+    .to_string();
+    let response = send_message_with_transient_retry(
+        project_path,
+        "configure_locus_external_editor",
+        &payload,
+        Duration::from_secs(30),
+        "configure Locus external editor",
+    )
+    .await?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "Unity rejected the external editor configuration".to_string()));
+    }
+    Ok(response.message.unwrap_or_default())
+}
+
+pub async fn sync_project_files(project_path: &str) -> Result<String, String> {
+    let response = send_message_with_transient_retry(
+        project_path,
+        "sync_project_files",
+        "",
+        Duration::from_secs(120),
+        "sync Unity project files",
+    )
+    .await?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "Unity project-file sync failed".to_string()));
+    }
+    Ok(response.message.unwrap_or_default())
+}
+
+fn unity_project_files_present(project_path: &str) -> bool {
+    std::fs::read_dir(project_path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| {
+                    extension.eq_ignore_ascii_case("sln")
+                        || extension.eq_ignore_ascii_case("csproj")
+                })
+                .unwrap_or(false)
+        })
+}
+
 async fn send_message_without_timeout_with_transient_retry(
     project_path: &str,
     msg_type: &str,
@@ -677,6 +858,7 @@ pub const UNITY_EDITOR_STATUS_PLAYING: &str = "playing";
 pub const UNITY_EDITOR_STATUS_PLAYING_PAUSED: &str = "playing_paused";
 pub const UNITY_EDITOR_STATUS_SCHEMA: &str = "disconnected | editing | playing | playing_paused";
 const UNITY_STATUS_POLL_TIMEOUT: Duration = Duration::from_millis(800);
+const UNITY_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const UNITY_PROCESS_STATUS_TIMEOUT: Duration = Duration::from_millis(1_000);
 const UNITY_CONNECTION_STATUS_STALE_MS: u64 = 10_000;
 
@@ -691,6 +873,42 @@ pub struct PipeResponse {
     pub process_id: Option<u32>,
     #[serde(default, rename = "processPath")]
     pub process_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnityTestRunSnapshot {
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub unity_run_guid: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub current_test: String,
+    #[serde(default)]
+    pub started_at_ticks: i64,
+    #[serde(default)]
+    pub finished_at_ticks: i64,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub total: i32,
+    #[serde(default)]
+    pub passed: i32,
+    #[serde(default)]
+    pub failed: i32,
+    #[serde(default)]
+    pub skipped: i32,
+    #[serde(default)]
+    pub inconclusive: i32,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub failures: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub results: Vec<serde_json::Value>,
 }
 
 pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
@@ -957,7 +1175,10 @@ fn push_editor_install_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) 
         // contains one flavor's exe, so the other flavor's candidate is silently
         // skipped by the `is_file()` check in `resolve_unity_editor_executable`.
         for flavor in EditorFlavor::ALL {
-            push_unique_path(paths, root.join("Editor").join(flavor.editor_exe_file_name()));
+            push_unique_path(
+                paths,
+                root.join("Editor").join(flavor.editor_exe_file_name()),
+            );
             push_unique_path(paths, root.join(flavor.editor_exe_file_name()));
         }
     }
@@ -1411,6 +1632,27 @@ pub fn is_play_mode_status(status: &str) -> bool {
     )
 }
 
+pub fn play_mode_target_status(mode: &str) -> Result<&'static str, String> {
+    match mode.trim() {
+        "play" => Ok(UNITY_EDITOR_STATUS_PLAYING),
+        "edit" => Ok(UNITY_EDITOR_STATUS_EDITING),
+        value => Err(format!(
+            "Invalid mode: '{}'. Allowed values: play, edit.",
+            value
+        )),
+    }
+}
+
+pub fn format_play_mode_tool_result(mode: &str, changed: bool) -> String {
+    match (mode.trim(), changed) {
+        ("play", true) => "Unity Editor entered Play Mode (playing).".to_string(),
+        ("play", false) => "Unity Editor is already in Play Mode (playing).".to_string(),
+        ("edit", true) => "Unity Editor returned to Edit Mode (editing).".to_string(),
+        ("edit", false) => "Unity Editor is already in Edit Mode (editing).".to_string(),
+        (value, _) => format!("Unity Editor mode request completed: {value}."),
+    }
+}
+
 fn requested_run_states_editor_status(request: &serde_json::Value) -> Result<&str, String> {
     let requested_status = request
         .get("request_editor_status")
@@ -1509,6 +1751,7 @@ fn cached_running_connection_status_for_transient_failure(
     project_path: &str,
     checked_at_ms: u64,
     error: impl Into<String>,
+    preserve_connected: bool,
 ) -> Option<UnityConnectionStatus> {
     let error = error.into();
     let mut status = unity_connection_status_cache()
@@ -1534,7 +1777,7 @@ fn cached_running_connection_status_for_transient_failure(
     ) {
         status.editor_status = fallback_status;
     }
-    status.connected = false;
+    status.connected = preserve_connected && status.connected;
     status.control_channel_state = if error.contains("busy") {
         "busy".to_string()
     } else if error.contains("timed out") {
@@ -1769,7 +2012,10 @@ async fn query_process_info_for_connection_status_bounded(
     }
 }
 
-async fn query_unity_status_response_with_timeout(
+/// Opportunistic status probe for observers and progress polling. `Ok(None)`
+/// means another request currently owns the pipe writer; callers must preserve
+/// that distinction instead of treating it as a disconnected editor.
+async fn try_query_unity_status_response_with_timeout(
     project_path: &str,
     timeout: Duration,
 ) -> Result<Option<(PipeResponse, u64)>, String> {
@@ -1780,11 +2026,26 @@ async fn query_unity_status_response_with_timeout(
     Ok(response.map(|resp| (resp, latency_ms)))
 }
 
+/// Authoritative status request for command preconditions. This path waits for
+/// the short-lived pipe writer lock, so concurrent requests cannot turn local
+/// writer contention into a false disconnected result.
+async fn query_unity_status_response_waiting_with_timeout(
+    project_path: &str,
+    timeout: Duration,
+) -> Result<(PipeResponse, u64), String> {
+    let started_at = std::time::Instant::now();
+    let response = send_message_with_timeout(project_path, "status", "", timeout).await?;
+    let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok((response, latency_ms))
+}
+
 pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
     let pipe_name = get_native_pipe_name(project_path);
     let checked_at_ms = unix_now_ms();
 
-    match query_unity_status_response_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await {
+    match try_query_unity_status_response_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT)
+        .await
+    {
         Ok(Some((resp, latency_ms))) if resp.ok => {
             let process_hint = process_hint_from_response(&resp, project_path, checked_at_ms);
             let message = resp.message.unwrap_or_default();
@@ -1866,14 +2127,25 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 project_path,
                 checked_at_ms,
                 error.clone(),
+                true,
             ) {
                 return status;
             }
+            let native_editor_state = query_native_broker_status(project_path)
+                .await
+                .filter(|status| status.native_alive)
+                .map(|status| parse_unity_status_message(&status.editor_status));
+            let (editor_status, scene_path) = native_editor_state
+                .unwrap_or((UNITY_EDITOR_STATUS_DISCONNECTED, None));
             let mut status = UnityConnectionStatus {
-                connected: false,
-                editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
+                // `Ok(None)` is returned only after get_or_connect succeeded and
+                // the existing connection's writer lock was observed busy. It
+                // therefore proves a live local connection, even when this is
+                // the first poll and no ready status has been cached yet.
+                connected: true,
+                editor_status: editor_status.to_string(),
                 control_channel_state: "busy".to_string(),
-                scene_path: None,
+                scene_path,
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
                 editor_process_path: None,
@@ -1892,7 +2164,9 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
             apply_unity_process_info(&mut status, process_info);
             apply_observed_editor_status_fallback(project_path, &mut status);
             sync_background_hook_for_status(&mut status, project_path).await;
-            cache_unity_connection_status(project_path, &status);
+            // Keep the cache anchored to the last authoritative ready/error
+            // sample. Caching a busy observation would let repeated contention
+            // extend the freshness window indefinitely.
             status
         }
         Err(error) => {
@@ -1900,6 +2174,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 project_path,
                 checked_at_ms,
                 error.clone(),
+                false,
             ) {
                 return status;
             }
@@ -2199,7 +2474,7 @@ pub async fn open_frontend_window(project_path: &str, payload: &str) -> Result<(
 
 /// Canonical status values: "disconnected" | "editing" | "playing" | "playing_paused"
 pub async fn query_unity_status(project_path: &str) -> (bool, &'static str, Option<String>) {
-    query_unity_status_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await
+    query_unity_status_with_timeout(project_path, UNITY_STATUS_REQUEST_TIMEOUT).await
 }
 
 /// Like `query_unity_status` but with an explicit (short) timeout, so a wedged
@@ -2210,8 +2485,8 @@ pub async fn query_unity_status_with_timeout(
     project_path: &str,
     timeout: Duration,
 ) -> (bool, &'static str, Option<String>) {
-    match query_unity_status_response_with_timeout(project_path, timeout).await {
-        Ok(Some((resp, _))) if resp.ok => {
+    match query_unity_status_response_waiting_with_timeout(project_path, timeout).await {
+        Ok((resp, _)) if resp.ok => {
             let msg = resp.message.unwrap_or_default();
             let (status, scene_part) = parse_unity_status_message(&msg);
             state_probe::note_pipe_editor_status(
@@ -2495,13 +2770,19 @@ async fn sidecar_compile_for_run_states(
     project_path: &str,
     prepared_request: &serde_json::Value,
     cache_mode: RunStatesCompileCacheMode,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
         Err(reason) => return sidecar_unavailable(reason),
     };
 
-    let cache_key = run_states_compile_cache_key(project_path, &params, prepared_request);
+    let cache_key = run_states_compile_cache_key(
+        project_path,
+        &params,
+        prepared_request,
+        non_public_access_probe_mode,
+    );
     if cache_mode == RunStatesCompileCacheMode::Consume {
         if let Some(key) = cache_key.as_deref() {
             if let Some(cached) = take_cached_run_states_compile(key) {
@@ -2512,7 +2793,15 @@ async fn sidecar_compile_for_run_states(
         }
     }
 
-    match crate::csharp_compile::compile_run_states(&params, prepared_request, false, false).await {
+    match crate::csharp_compile::compile_run_states_with_access_probe(
+        &params,
+        prepared_request,
+        false,
+        false,
+        non_public_access_probe_mode,
+    )
+    .await
+    {
         Ok(Ok(assembly)) => {
             let assembly_b64 = assembly.assembly_b64;
             let assembly_path = assembly.assembly_path;
@@ -2570,6 +2859,43 @@ pub async fn unity_run_states(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
+    unity_run_states_with_mode(project_path, request, None, false).await
+}
+
+/// Tool-facing path. `enable_non_public_access` selects the production
+/// SkipVerification policy while retaining graceful legacy fallback when the
+/// compile server or a loaded-assembly plugin handler is unavailable.
+pub async fn unity_run_states_with_non_public_access(
+    project_path: &str,
+    request: &serde_json::Value,
+    enable_non_public_access: bool,
+) -> Result<String, String> {
+    unity_run_states_with_mode(
+        project_path,
+        request,
+        production_non_public_access_mode(enable_non_public_access),
+        false,
+    )
+    .await
+}
+
+/// Integration-test-only path: compile direct private/internal references in
+/// the generated host and let Unity's normal run_states_loaded path perform
+/// the runtime JIT check. This path never falls back to in-Unity compilation.
+pub(crate) async fn unity_run_states_with_access_probe(
+    project_path: &str,
+    request: &serde_json::Value,
+    mode: crate::csharp_compile::NonPublicAccessProbeMode,
+) -> Result<String, String> {
+    unity_run_states_with_mode(project_path, request, Some(mode), true).await
+}
+
+async fn unity_run_states_with_mode(
+    project_path: &str,
+    request: &serde_json::Value,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
+    require_sidecar: bool,
+) -> Result<String, String> {
     requested_run_states_editor_status(request)?;
 
     let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
@@ -2582,6 +2908,7 @@ pub async fn unity_run_states(
             project_path,
             &prepared.request,
             RunStatesCompileCacheMode::Consume,
+            non_public_access_probe_mode,
         )
         .await
         {
@@ -2596,9 +2923,16 @@ pub async fn unity_run_states(
                 ));
             }
             SidecarCompileAttempt::Unavailable(reason) => {
+                if require_sidecar {
+                    return Err(format!(
+                        "non-public access probe requires the sidecar compiler: {reason}"
+                    ));
+                }
                 crate::csharp_compile::note_fallback(&reason);
             }
         }
+    } else if require_sidecar {
+        return Err("non-public access probe requires the sidecar compiler".to_string());
     }
 
     eprintln!(
@@ -2608,6 +2942,12 @@ pub async fn unity_run_states(
     );
     let mut resp = send_message_without_timeout(project_path, msg_type, &payload).await?;
     if msg_type == "run_states_loaded" && unity_plugin_lacks_message(&resp) {
+        if require_sidecar {
+            return Err(
+                "non-public access probe requires a Unity plugin with run_states_loaded support"
+                    .to_string(),
+            );
+        }
         crate::csharp_compile::note_fallback(
             "Unity plugin lacks run_states_loaded; update the Locus Unity plugin",
         );
@@ -2646,6 +2986,29 @@ pub async fn compile_run_states(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
+    compile_run_states_with_mode(project_path, request, None, false).await
+}
+
+pub async fn compile_run_states_with_non_public_access(
+    project_path: &str,
+    request: &serde_json::Value,
+    enable_non_public_access: bool,
+) -> Result<String, String> {
+    compile_run_states_with_mode(
+        project_path,
+        request,
+        production_non_public_access_mode(enable_non_public_access),
+        false,
+    )
+    .await
+}
+
+async fn compile_run_states_with_mode(
+    project_path: &str,
+    request: &serde_json::Value,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
+    require_sidecar: bool,
+) -> Result<String, String> {
     requested_run_states_editor_status(request)?;
 
     let prepared = prepare_unity_run_states_request_for_send(project_path, request).await;
@@ -2659,6 +3022,7 @@ pub async fn compile_run_states(
             project_path,
             &prepared.request,
             RunStatesCompileCacheMode::Store,
+            non_public_access_probe_mode,
         )
         .await
         {
@@ -2672,9 +3036,16 @@ pub async fn compile_run_states(
                 ));
             }
             SidecarCompileAttempt::Unavailable(reason) => {
+                if require_sidecar {
+                    return Err(format!(
+                        "non-public access probe requires the sidecar compiler: {reason}"
+                    ));
+                }
                 crate::csharp_compile::note_fallback(&reason);
             }
         }
+    } else if require_sidecar {
+        return Err("non-public access probe requires the sidecar compiler".to_string());
     }
 
     let payload = serde_json::to_string(&prepared.request).map_err(|error| {
@@ -2974,6 +3345,251 @@ async fn send_view_binding_message(
         Err(resp
             .error
             .unwrap_or_else(|| format!("{} failed", message_type)))
+    }
+}
+
+fn require_unity_test_tools_available(project_path: &str) -> Result<(), String> {
+    let status = crate::workspace::unity_test_tools_workspace_status(project_path);
+    if !status.enabled {
+        return Err(
+            "Unity Test tools are disabled for this workspace. Enable them in Settings > Unity Connection."
+                .to_string(),
+        );
+    }
+    if !status.package_installed {
+        return Err(
+            "The Unity Test Framework package (com.unity.test-framework) is not installed in this project."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+async fn require_unity_test_sources_converged(project_path: &str) -> Result<(), String> {
+    if crate::workspace::unity_test_sources_pending(project_path)
+        || crate::unity_hotreload::coordinator::has_pending_state(project_path).await
+    {
+        return Err(
+            "Unity Test discovery is waiting for C# convergence. Call unity_recompile first; newly added test files, methods, attributes, and hot-applied test changes become discoverable after compilation and domain reload complete."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_unity_test_start_status(project_path: &str) -> Result<(), String> {
+    let (connected, status, _) = query_unity_status(project_path).await;
+    if !connected {
+        return Err("Unity Editor not connected".to_string());
+    }
+    if status == UNITY_EDITOR_STATUS_EDITING {
+        return Ok(());
+    }
+    if is_play_mode_status(status) {
+        exit_play_mode(project_path).await?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (connected, current, _) = query_unity_status(project_path).await;
+            if connected && current == UNITY_EDITOR_STATUS_EDITING {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "Unity Editor did not return to Edit Mode before running tests".to_string(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    Err(format!(
+        "Unity Editor status is '{status}'. Unity Test runs start from Edit Mode."
+    ))
+}
+
+pub async fn unity_test_list(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    require_unity_test_tools_available(project_path)?;
+    require_unity_test_sources_converged(project_path).await?;
+    ensure_unity_test_start_status(project_path).await?;
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize Unity Test list request: {error}"))?;
+    let response = send_message_without_timeout_with_transient_retry(
+        project_path,
+        "unity_test_list",
+        &payload,
+    )
+    .await?;
+    if !response.ok {
+        return Err(response.error.unwrap_or_else(|| {
+            "Unity Test listing failed. Update the Locus Unity plugin and recompile the project."
+                .to_string()
+        }));
+    }
+    let message = response.message.unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&message)
+        .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
+    serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Failed to format Unity Test list: {error}"))
+}
+
+pub async fn unity_test_run(
+    project_path: &str,
+    request: &serde_json::Value,
+    timeout: Duration,
+) -> Result<UnityTestRunSnapshot, String> {
+    unity_test_run_controlled(project_path, request, timeout, None, None).await
+}
+
+pub async fn unity_test_run_controlled(
+    project_path: &str,
+    request: &serde_json::Value,
+    timeout: Duration,
+    mut cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    progress: Option<crate::async_tasks::TaskProgressReporter>,
+) -> Result<UnityTestRunSnapshot, String> {
+    require_unity_test_tools_available(project_path)?;
+    require_unity_test_sources_converged(project_path).await?;
+    ensure_unity_test_start_status(project_path).await?;
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize Unity Test run request: {error}"))?;
+    let start = send_message_with_transient_retry(
+        project_path,
+        "unity_test_start",
+        &payload,
+        Duration::from_secs(30),
+        "start Unity Test run",
+    )
+    .await?;
+    if !start.ok {
+        return Err(start.error.unwrap_or_else(|| {
+            "Unity Test run could not start. Update the Locus Unity plugin and recompile the project."
+                .to_string()
+        }));
+    }
+
+    let mut snapshot: UnityTestRunSnapshot =
+        serde_json::from_str(start.message.as_deref().unwrap_or_default())
+            .map_err(|error| format!("Unity Test start returned invalid JSON: {error}"))?;
+    if snapshot.run_id.trim().is_empty() {
+        return Err("Unity Test start did not return a run id".to_string());
+    }
+
+    let started = Instant::now();
+    let status_payload = serde_json::json!({ "run_id": snapshot.run_id.clone() }).to_string();
+    loop {
+        match snapshot.status.as_str() {
+            "passed" | "failed" | "error" | "cancelled" => return Ok(snapshot),
+            _ => {}
+        }
+        if let Some(report) = progress.as_ref() {
+            report(format!(
+                "Unity tests: status={}, completed={}/{}, current={}",
+                snapshot.status,
+                snapshot.passed + snapshot.failed + snapshot.skipped + snapshot.inconclusive,
+                snapshot.total,
+                if snapshot.current_test.is_empty() {
+                    "waiting"
+                } else {
+                    snapshot.current_test.as_str()
+                }
+            ));
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "Unity Test run {} timed out after {}s (current test: {})",
+                snapshot.run_id,
+                timeout.as_secs(),
+                if snapshot.current_test.is_empty() {
+                    "unknown"
+                } else {
+                    snapshot.current_test.as_str()
+                }
+            ));
+        }
+
+        let sleep = tokio::time::sleep(Duration::from_millis(250));
+        if let Some(ref mut cancel_rx) = cancel_rx {
+            tokio::select! {
+                _ = sleep => {}
+                _ = cancel_rx.changed() => {
+                    let cancel_response = send_message_with_timeout(
+                        project_path,
+                        "unity_test_cancel",
+                        &status_payload,
+                        Duration::from_secs(5),
+                    ).await;
+                    if let Ok(response) = cancel_response {
+                        if let Some(message) = response.message.as_deref() {
+                            if let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(message) {
+                                if !cancelled.error.is_empty() {
+                                    return Err(format!(
+                                        "Unity Test cancellation unavailable: {}",
+                                        cancelled.error
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    for _ in 0..120 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let Ok(response) = send_message_with_timeout(
+                            project_path,
+                            "unity_test_status",
+                            &status_payload,
+                            Duration::from_secs(5),
+                        ).await else {
+                            continue;
+                        };
+                        let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(
+                            response.message.as_deref().unwrap_or_default(),
+                        ) else {
+                            continue;
+                        };
+                        if matches!(cancelled.status.as_str(), "cancelled" | "error" | "passed" | "failed") {
+                            return Err(format!("Unity Test run {} cancelled", snapshot.run_id));
+                        }
+                    }
+                    return Err(format!(
+                        "Unity Test cancellation failed: run {} did not stop within 30s",
+                        snapshot.run_id
+                    ));
+                }
+            }
+        } else {
+            sleep.await;
+        }
+        let response = match send_message_with_timeout(
+            project_path,
+            "unity_test_status",
+            &status_payload,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                // Play Mode transitions and tests that explicitly reload the
+                // domain briefly drop the managed executor. The persisted run
+                // state is available again after the bridge reconnects.
+                continue;
+            }
+        };
+        if pipe_response_transient_broker_error(&response) {
+            continue;
+        }
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Unity Test status query failed".to_string()));
+        }
+        snapshot = serde_json::from_str(response.message.as_deref().unwrap_or_default())
+            .map_err(|error| format!("Unity Test status returned invalid JSON: {error}"))?;
     }
 }
 
@@ -3501,6 +4117,12 @@ enum SidecarCompileAttempt {
     Unavailable(String),
 }
 
+fn production_non_public_access_mode(
+    enabled: bool,
+) -> Option<crate::csharp_compile::NonPublicAccessProbeMode> {
+    enabled.then_some(crate::csharp_compile::NonPublicAccessProbeMode::SkipVerification)
+}
+
 #[derive(Clone)]
 struct CachedRunStatesAssembly {
     payload: String,
@@ -3535,13 +4157,17 @@ fn run_states_compile_cache_key(
     project_path: &str,
     params: &crate::csharp_compile::CompileParams,
     prepared_request: &serde_json::Value,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
 ) -> Option<String> {
     let request_bytes = serde_json::to_vec(prepared_request).ok()?;
     Some(format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\nnon-public-access={}\n{}",
         project_runtime_key(project_path),
         params.fingerprint,
         params.domain_generation,
+        non_public_access_probe_mode
+            .map(crate::csharp_compile::NonPublicAccessProbeMode::as_str)
+            .unwrap_or("none"),
         sha256_hex(&request_bytes)
     ))
 }
@@ -3624,6 +4250,7 @@ fn sidecar_unavailable(reason: String) -> SidecarCompileAttempt {
 async fn sidecar_compile_for_execute(
     project_path: &str,
     prepared_code: &str,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
@@ -3631,7 +4258,15 @@ async fn sidecar_compile_for_execute(
     };
 
     let compile_started = std::time::Instant::now();
-    match crate::csharp_compile::compile_snippet(&params, prepared_code, false, false).await {
+    match crate::csharp_compile::compile_snippet_with_access_probe(
+        &params,
+        prepared_code,
+        false,
+        false,
+        non_public_access_probe_mode,
+    )
+    .await
+    {
         Ok(Ok(assembly)) => {
             let assembly_b64 = assembly.assembly_b64;
             let assembly_path = assembly.assembly_path;
@@ -3686,6 +4321,49 @@ async fn prepare_unity_run_states_request_for_send(
 pub async fn unity_execute_code_with_progress<F>(
     project_path: &str,
     code: &str,
+    on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    unity_execute_code_with_progress_mode(project_path, code, None, false, on_progress).await
+}
+
+pub async fn unity_execute_code_with_progress_non_public_access<F>(
+    project_path: &str,
+    code: &str,
+    enable_non_public_access: bool,
+    on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    unity_execute_code_with_progress_mode(
+        project_path,
+        code,
+        production_non_public_access_mode(enable_non_public_access),
+        false,
+        on_progress,
+    )
+    .await
+}
+
+/// Integration-test-only direct-access probe. The sidecar suppresses
+/// compile-time accessibility and the standard execute_loaded pipeline then
+/// measures whether Unity Mono can JIT and execute the emitted operation.
+pub(crate) async fn unity_execute_code_with_access_probe(
+    project_path: &str,
+    code: &str,
+    mode: crate::csharp_compile::NonPublicAccessProbeMode,
+) -> Result<String, String> {
+    unity_execute_code_with_progress_mode(project_path, code, Some(mode), true, |_| {}).await
+}
+
+async fn unity_execute_code_with_progress_mode<F>(
+    project_path: &str,
+    code: &str,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
+    require_sidecar: bool,
     mut on_progress: F,
 ) -> Result<String, String>
 where
@@ -3720,7 +4398,13 @@ where
             rust_progress_revision,
         ));
         rust_progress_revision += 1;
-        match sidecar_compile_for_execute(project_path, &prepared.code).await {
+        match sidecar_compile_for_execute(
+            project_path,
+            &prepared.code,
+            non_public_access_probe_mode,
+        )
+        .await
+        {
             SidecarCompileAttempt::Compiled { payload } => {
                 on_progress(rust_unity_execute_progress(
                     "Compile server returned snippet assembly",
@@ -3737,9 +4421,16 @@ where
                 ));
             }
             SidecarCompileAttempt::Unavailable(reason) => {
+                if require_sidecar {
+                    return Err(format!(
+                        "non-public access probe requires the sidecar compiler: {reason}"
+                    ));
+                }
                 crate::csharp_compile::note_fallback(&reason);
             }
         }
+    } else if require_sidecar {
+        return Err("non-public access probe requires the sidecar compiler".to_string());
     }
 
     let mut send_attempt = 1u32;
@@ -3866,6 +4557,12 @@ where
             Ok(resp)
                 if execute_msg_type == "execute_loaded" && unity_plugin_lacks_message(&resp) =>
             {
+                if require_sidecar {
+                    return Err(
+                        "non-public access probe requires a Unity plugin with execute_loaded support"
+                            .to_string(),
+                    );
+                }
                 crate::csharp_compile::note_fallback(
                     "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
                 );
@@ -3936,6 +4633,49 @@ where
 pub async fn unity_execute_code_with_progress_cancellable<F>(
     project_path: &str,
     code: &str,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    unity_execute_code_with_progress_cancellable_mode(
+        project_path,
+        code,
+        None,
+        false,
+        cancel_rx,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn unity_execute_code_with_progress_cancellable_non_public_access<F>(
+    project_path: &str,
+    code: &str,
+    enable_non_public_access: bool,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    on_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    unity_execute_code_with_progress_cancellable_mode(
+        project_path,
+        code,
+        production_non_public_access_mode(enable_non_public_access),
+        false,
+        cancel_rx,
+        on_progress,
+    )
+    .await
+}
+
+async fn unity_execute_code_with_progress_cancellable_mode<F>(
+    project_path: &str,
+    code: &str,
+    non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
+    require_sidecar: bool,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     mut on_progress: F,
 ) -> Result<String, String>
@@ -3982,7 +4722,11 @@ where
         ));
         rust_progress_revision += 1;
         let attempt = tokio::select! {
-            attempt = sidecar_compile_for_execute(project_path, &prepared.code) => attempt,
+            attempt = sidecar_compile_for_execute(
+                project_path,
+                &prepared.code,
+                non_public_access_probe_mode,
+            ) => attempt,
             _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
         };
         match attempt {
@@ -4002,9 +4746,16 @@ where
                 ));
             }
             SidecarCompileAttempt::Unavailable(reason) => {
+                if require_sidecar {
+                    return Err(format!(
+                        "non-public access probe requires the sidecar compiler: {reason}"
+                    ));
+                }
                 crate::csharp_compile::note_fallback(&reason);
             }
         }
+    } else if require_sidecar {
+        return Err("non-public access probe requires the sidecar compiler".to_string());
     }
 
     let mut send_attempt = 1u32;
@@ -4183,6 +4934,12 @@ where
             Ok(resp)
                 if execute_msg_type == "execute_loaded" && unity_plugin_lacks_message(&resp) =>
             {
+                if require_sidecar {
+                    return Err(
+                        "non-public access probe requires a Unity plugin with execute_loaded support"
+                            .to_string(),
+                    );
+                }
                 crate::csharp_compile::note_fallback(
                     "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
                 );
@@ -4289,6 +5046,20 @@ pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String
     unity_execute_code_with_progress(project_path, code, |_| {}).await
 }
 
+pub async fn unity_execute_code_with_non_public_access(
+    project_path: &str,
+    code: &str,
+    enable_non_public_access: bool,
+) -> Result<String, String> {
+    unity_execute_code_with_progress_non_public_access(
+        project_path,
+        code,
+        enable_non_public_access,
+        |_| {},
+    )
+    .await
+}
+
 async fn wait_for_unity_bridge_ready_after_recompile(project_path: &str) -> Result<(), String> {
     wait_for_unity_bridge_ready(project_path, Duration::from_secs(30), "after recompile").await
 }
@@ -4379,11 +5150,14 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     // away deleted ones) before compiling. Without this, files created or
     // deleted during a hot-reload session would be missing from (or stale
     // in) the converged assembly. Older plugins ignore the message body.
-    let tracked_dirty_paths = relative_asset_paths(
-        project_path,
-        &crate::unity_hotreload::coordinator::pending_paths(project_path).await,
-    )
-    .join("\n");
+    let (unity_test_pending_seq, unity_test_pending_paths) =
+        crate::workspace::unity_test_pending_source_snapshot(project_path);
+    let mut tracked_dirty_sources =
+        crate::unity_hotreload::coordinator::pending_paths(project_path).await;
+    tracked_dirty_sources.extend(unity_test_pending_paths);
+    tracked_dirty_sources.sort();
+    tracked_dirty_sources.dedup();
+    let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources).join("\n");
 
     let resp = match send_message(project_path, "request_recompile", &tracked_dirty_paths).await {
         Ok(resp) => resp,
@@ -4429,6 +5203,10 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                     {
                         return finish(Err(error));
                     }
+                    crate::workspace::clear_unity_test_pending_sources_through(
+                        project_path,
+                        unity_test_pending_seq,
+                    );
                     if let Err(error) = refresh_unity_type_index_after_recompile(project_path).await
                     {
                         eprintln!(
@@ -4463,6 +5241,10 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                             {
                                 return finish(Err(error));
                             }
+                            crate::workspace::clear_unity_test_pending_sources_through(
+                                project_path,
+                                unity_test_pending_seq,
+                            );
                             if let Err(error) =
                                 refresh_unity_type_index_after_recompile(project_path).await
                             {
@@ -4726,6 +5508,32 @@ pub async fn start_unity_monitor(
                 let just_connected = last_status != Some(true);
                 if just_connected {
                     eprintln!("[Locus] Unity Editor connected! (pipe: {})", pipe_name);
+                    let editor_project = project_path.clone();
+                    tokio::spawn(async move {
+                        let set_default = external_editor_default_enabled();
+                        match configure_locus_external_editor(&editor_project, set_default).await {
+                            Ok(status) => {
+                                eprintln!("[Locus] Unity external editor registration: {}", status)
+                            }
+                            Err(error) => eprintln!(
+                                "[Locus] Unity external editor registration skipped: {}",
+                                error
+                            ),
+                        }
+                        if !unity_project_files_present(&editor_project) {
+                            match sync_project_files(&editor_project).await {
+                                Ok(report) => eprintln!(
+                                    "[Locus] generated Unity project files on connect: {}",
+                                    report.replace('\n', " | ")
+                                ),
+                                Err(error) => eprintln!(
+                                    "[Locus] Unity project-file generation on connect failed: {}",
+                                    error
+                                ),
+                            }
+                            crate::csharp_lsp::warm_up_in_background(editor_project);
+                        }
+                    });
                     // Pre-start the compile-server sidecar (and JIT-warm
                     // Roslyn) so the first unity_execute does not pay the
                     // cold-start cost. No-op while the feature is off.
@@ -4917,9 +5725,10 @@ mod tests {
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
         is_transient_broker_error, native_background_hook_markers_present,
         parse_unity_hub_editor_locations, pipe_response_transient_broker_error,
-        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
-        rewrite_run_states_output_for_size, PipeResponse, UnityBackgroundHookState,
-        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
+        play_mode_target_status, read_project_unity_version, relative_asset_paths,
+        requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
+        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
+        UnityEditorProcessState, UNITY_EDITOR_STATUS_EDITING, UNITY_EDITOR_STATUS_PLAYING,
     };
     use serde_json::json;
 
@@ -4998,10 +5807,11 @@ mod tests {
             &project_path,
             1_500,
             "writer busy",
+            true,
         )
         .expect("recent running status should be reused");
 
-        assert!(!cached.connected);
+        assert!(cached.connected);
         assert_eq!(cached.control_channel_state, "busy");
         assert_eq!(cached.editor_status, super::UNITY_EDITOR_STATUS_PLAYING);
         assert_eq!(cached.checked_at_ms, 1_500);
@@ -5011,8 +5821,19 @@ mod tests {
             &project_path,
             20_000,
             "stale",
+            true,
         )
         .is_none());
+
+        let disconnected = cached_running_connection_status_for_transient_failure(
+            &project_path,
+            1_500,
+            "pipe closed",
+            false,
+        )
+        .expect("recent process metadata should remain available");
+        assert!(!disconnected.connected);
+        assert_eq!(disconnected.control_channel_state, "error");
     }
 
     #[test]
@@ -5030,6 +5851,29 @@ mod tests {
 
         super::sync_background_hook_marker(&project_path, false).expect("remove hook marker");
         assert!(!native_background_hook_markers_present(&project_path));
+    }
+
+    #[test]
+    fn unity_embed_disabled_marker_preserves_default_enabled_behavior() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_path = temp.path().to_string_lossy().to_string();
+        let marker = temp
+            .path()
+            .join("Library")
+            .join("Locus")
+            .join("UnityEmbed.disabled");
+
+        super::sync_unity_embed_enabled_marker(&project_path, true)
+            .expect("keep embed enabled");
+        assert!(!marker.exists());
+
+        super::sync_unity_embed_enabled_marker(&project_path, false)
+            .expect("disable embed");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "disabled\n");
+
+        super::sync_unity_embed_enabled_marker(&project_path, true)
+            .expect("enable embed");
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -5070,6 +5914,21 @@ mod tests {
             requested_run_states_editor_status(&request).unwrap(),
             "playing_paused"
         );
+    }
+
+    #[test]
+    fn play_mode_tool_modes_map_to_canonical_editor_statuses() {
+        assert_eq!(
+            play_mode_target_status("play").unwrap(),
+            UNITY_EDITOR_STATUS_PLAYING
+        );
+        assert_eq!(
+            play_mode_target_status(" edit ").unwrap(),
+            UNITY_EDITOR_STATUS_EDITING
+        );
+        assert!(play_mode_target_status("pause")
+            .unwrap_err()
+            .contains("Allowed values: play, edit"));
     }
 
     #[test]
@@ -5170,7 +6029,9 @@ mod tests {
         // Editor installed on a non-default drive is still resolved.
         assert_eq!(
             parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2021.3.45f1"),
-            vec![PathBuf::from(r"F:\UnityEditor\2021.3.45f1\Editor\Unity.exe")]
+            vec![PathBuf::from(
+                r"F:\UnityEditor\2021.3.45f1\Editor\Unity.exe"
+            )]
         );
         // ProjectVersion.txt parsing may leave surrounding whitespace.
         assert_eq!(
@@ -5186,7 +6047,9 @@ mod tests {
 
     #[test]
     fn unity_hub_locations_ignore_unknown_versions_and_invalid_cache() {
-        assert!(parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2019.4.0f1").is_empty());
+        assert!(
+            parse_unity_hub_editor_locations(UNITY_HUB_EDITORS_SAMPLE, "2019.4.0f1").is_empty()
+        );
         assert!(parse_unity_hub_editor_locations("not json", "2022.3.2f1").is_empty());
         assert!(parse_unity_hub_editor_locations("{}", "2022.3.2f1").is_empty());
         assert!(parse_unity_hub_editor_locations(r#"{"data":[]}"#, "2022.3.2f1").is_empty());

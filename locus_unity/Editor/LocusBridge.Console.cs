@@ -12,6 +12,7 @@ namespace Locus
     {
         private const int MaxConsoleEntriesToSend = 200;
         private const int MaxConsoleCharsToSend = 60000;
+        private const int DefaultConsoleLogLimit = 50;
 
         [Serializable]
         private sealed class UnityConsoleTextPayload
@@ -29,6 +30,37 @@ namespace Locus
             public string text;
             public string source;
             public string level;
+            public int count;
+        }
+
+        [Serializable]
+        public sealed class ConsoleLogEntry
+        {
+            public string level;
+            public string message;
+            public int count;
+        }
+
+        [Serializable]
+        public sealed class ConsoleLogResult
+        {
+            public ConsoleLogEntry[] entries;
+            public int matchedCount;
+            public int uniqueCount;
+            public bool truncated;
+        }
+
+        [Serializable]
+        private sealed class ConsoleLogRequest
+        {
+            public string level;
+            public int limit = DefaultConsoleLogLimit;
+        }
+
+        private sealed class ConsoleLogGroup
+        {
+            public ConsoleLogEntry entry;
+            public int lastIndex;
         }
 
         private static string BuildConsoleTextPayloadJson()
@@ -41,6 +73,113 @@ namespace Locus
                 title = "Unity Console",
                 source = "unity-console"
             });
+        }
+
+        private static string BuildConsoleLogPayloadJson(string requestJson)
+        {
+            ConsoleLogRequest request = string.IsNullOrWhiteSpace(requestJson)
+                ? new ConsoleLogRequest()
+                : JsonUtility.FromJson<ConsoleLogRequest>(requestJson);
+            if (request == null)
+                request = new ConsoleLogRequest();
+            return JsonUtility.ToJson(BuildConsoleLogResult(request.level, request.limit));
+        }
+
+        private static ConsoleLogResult BuildConsoleLogResult(string level, int limit)
+        {
+            string levelFilter = NormalizeConsoleLogFilter(level);
+            int normalizedLimit = limit <= 0
+                ? DefaultConsoleLogLimit
+                : Math.Min(MaxConsoleEntriesToSend, limit);
+            ConsoleTextEntry[] sourceEntries = BuildConsoleTextEntries();
+            Dictionary<string, ConsoleLogGroup> groupsByKey =
+                new Dictionary<string, ConsoleLogGroup>(StringComparer.Ordinal);
+            int matchedCount = 0;
+
+            for (int i = 0; i < sourceEntries.Length; i++)
+            {
+                ConsoleTextEntry sourceEntry = sourceEntries[i];
+                if (sourceEntry == null)
+                    continue;
+
+                string normalizedLevel = NormalizeConsoleLogLevel(sourceEntry.level);
+                if (levelFilter != null && !string.Equals(levelFilter, normalizedLevel, StringComparison.Ordinal))
+                    continue;
+
+                string message = (sourceEntry.text ?? "")
+                    .Replace("\r\n", "\n")
+                    .Replace('\r', '\n')
+                    .Trim();
+                if (message.Length == 0)
+                    continue;
+
+                int occurrences = Math.Max(1, sourceEntry.count);
+                matchedCount += occurrences;
+                string key = normalizedLevel + "\0" + message;
+                ConsoleLogGroup group;
+                if (groupsByKey.TryGetValue(key, out group))
+                {
+                    group.entry.count += occurrences;
+                    group.lastIndex = i;
+                    continue;
+                }
+
+                groupsByKey.Add(key, new ConsoleLogGroup
+                {
+                    entry = new ConsoleLogEntry
+                    {
+                        level = normalizedLevel,
+                        message = message,
+                        count = occurrences
+                    },
+                    lastIndex = i
+                });
+            }
+
+            List<ConsoleLogGroup> groups = new List<ConsoleLogGroup>(groupsByKey.Values);
+            groups.Sort(delegate(ConsoleLogGroup left, ConsoleLogGroup right)
+            {
+                return left.lastIndex.CompareTo(right.lastIndex);
+            });
+            int uniqueCount = groups.Count;
+            int startIndex = Math.Max(0, uniqueCount - normalizedLimit);
+            List<ConsoleLogEntry> entries = new List<ConsoleLogEntry>(uniqueCount - startIndex);
+            for (int i = startIndex; i < uniqueCount; i++)
+                entries.Add(groups[i].entry);
+
+            return new ConsoleLogResult
+            {
+                entries = entries.ToArray(),
+                matchedCount = matchedCount,
+                uniqueCount = uniqueCount,
+                truncated = uniqueCount > normalizedLimit
+            };
+        }
+
+        private static string NormalizeConsoleLogFilter(string level)
+        {
+            if (string.IsNullOrWhiteSpace(level))
+                return null;
+
+            string normalized = level.Trim().ToLowerInvariant();
+            if (normalized == "error" || normalized == "warn" || normalized == "info")
+                return normalized;
+            throw new ArgumentException(
+                "Invalid Console log level '" + level + "'. Allowed values: error, warn, info.",
+                "level");
+        }
+
+        private static string NormalizeConsoleLogLevel(string level)
+        {
+            string normalized = (level ?? "").Trim().ToLowerInvariant();
+            if (normalized.Contains("error")
+                || normalized.Contains("assert")
+                || normalized.Contains("exception")
+                || normalized.Contains("fatal"))
+                return "error";
+            if (normalized.Contains("warn"))
+                return "warn";
+            return "info";
         }
 
         private static ConsoleTextEntry[] BuildConsoleTextEntries()
@@ -95,19 +234,21 @@ namespace Locus
                 MethodInfo startGettingEntries = FindStaticMethod(logEntriesType, "StartGettingEntries", 0);
                 MethodInfo endGettingEntries = FindStaticMethod(logEntriesType, "EndGettingEntries", 0);
                 MethodInfo getEntryInternal = FindStaticMethod(logEntriesType, "GetEntryInternal", 2);
+                MethodInfo getEntryCount = FindStaticMethod(logEntriesType, "GetEntryCount", 1);
                 if (logEntryType != null && getEntryInternal != null)
                 {
                     return BuildConsoleTextFromLogEntryObjects(
                         count,
                         logEntryType,
                         getEntryInternal,
+                        getEntryCount,
                         startGettingEntries,
                         endGettingEntries);
                 }
 
                 MethodInfo getLinesAndMode = FindStaticMethod(logEntriesType, "GetLinesAndModeFromEntryInternal", 4);
                 if (getLinesAndMode != null)
-                    return BuildConsoleTextFromLinesAndMode(count, getLinesAndMode);
+                    return BuildConsoleTextFromLinesAndMode(count, getLinesAndMode, getEntryCount);
             }
             catch
             {
@@ -120,6 +261,7 @@ namespace Locus
             int count,
             Type logEntryType,
             MethodInfo getEntryInternal,
+            MethodInfo getEntryCount,
             MethodInfo startGettingEntries,
             MethodInfo endGettingEntries)
         {
@@ -141,7 +283,12 @@ namespace Locus
                     string condition = ReadStringMember(logEntry, "message", "condition");
                     string stackTrace = ReadStringMember(logEntry, "stacktrace", "stackTrace");
                     int mode = ReadIntMember(logEntry, "mode");
-                    AddConsoleEntry(entries, LogModeLabel(mode), condition, stackTrace);
+                    AddConsoleEntry(
+                        entries,
+                        LogModeLabel(mode),
+                        condition,
+                        stackTrace,
+                        ReadConsoleEntryCount(getEntryCount, i));
                     TrimConsoleEntries(entries);
                 }
             }
@@ -154,7 +301,10 @@ namespace Locus
             return entries.ToArray();
         }
 
-        private static ConsoleTextEntry[] BuildConsoleTextFromLinesAndMode(int count, MethodInfo getLinesAndMode)
+        private static ConsoleTextEntry[] BuildConsoleTextFromLinesAndMode(
+            int count,
+            MethodInfo getLinesAndMode,
+            MethodInfo getEntryCount)
         {
             List<ConsoleTextEntry> entries = new List<ConsoleTextEntry>();
             int startIndex = Math.Max(0, count - MaxConsoleEntriesToSend);
@@ -164,7 +314,12 @@ namespace Locus
                 int mode;
                 if (!TryGetLinesAndMode(getLinesAndMode, i, out lines, out mode))
                     continue;
-                AddConsoleEntry(entries, LogModeLabel(mode), lines, "");
+                AddConsoleEntry(
+                    entries,
+                    LogModeLabel(mode),
+                    lines,
+                    "",
+                    ReadConsoleEntryCount(getEntryCount, i));
                 TrimConsoleEntries(entries);
             }
             return entries.ToArray();
@@ -222,6 +377,20 @@ namespace Locus
             if (textIndex >= 0)
                 lines = Convert.ToString(args[textIndex]) ?? "";
             return !string.IsNullOrWhiteSpace(lines);
+        }
+
+        private static int ReadConsoleEntryCount(MethodInfo getEntryCount, int row)
+        {
+            if (getEntryCount == null)
+                return 1;
+            try
+            {
+                return Math.Max(1, Convert.ToInt32(getEntryCount.Invoke(null, new object[] { row })));
+            }
+            catch
+            {
+                return 1;
+            }
         }
 
         private static MethodInfo FindStaticMethod(Type type, string name, int parameterCount)
@@ -290,7 +459,12 @@ namespace Locus
             }
         }
 
-        private static void AddConsoleEntry(List<ConsoleTextEntry> entries, string type, string condition, string stackTrace)
+        private static void AddConsoleEntry(
+            List<ConsoleTextEntry> entries,
+            string type,
+            string condition,
+            string stackTrace,
+            int count)
         {
             condition = (condition ?? "").TrimEnd();
             stackTrace = (stackTrace ?? "").TrimEnd();
@@ -309,7 +483,8 @@ namespace Locus
                 title = ConsoleEntryTitle(level, condition),
                 text = sb.ToString().TrimEnd(),
                 source = "unity-console",
-                level = level
+                level = level,
+                count = Math.Max(1, count)
             });
         }
 

@@ -1199,6 +1199,7 @@ const hotReloadModeOptions = computed<SegmentedOption[]>(() => [
 function createUnavailableHotReloadStatus(error: string): CsharpCompileStatus {
   return {
     enabled: false,
+    nonPublicAccessEnabled: false,
     platformSupported: false,
     serverAvailable: false,
     running: false,

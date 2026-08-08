@@ -10,6 +10,7 @@ import {
   subscribeUnitySidecarCompilerStatus,
   unityHotReloadSelfTestRun,
   unityHotReloadSetEnabled,
+  unityNonPublicAccessSetEnabled,
   unitySidecarCompilerGetStatus,
   unitySidecarCompilerSetEnabled,
 } from "../../services/csharpLsp";
@@ -91,6 +92,29 @@ async function toggleSidecarEnabled() {
     await refreshSidecarStatus();
   } finally {
     sidecarBusy.value = false;
+  }
+}
+
+const nonPublicAccessEnabled = computed(
+  () => sidecarStatus.value?.nonPublicAccessEnabled ?? true,
+);
+const nonPublicAccessBusy = ref(false);
+
+async function toggleNonPublicAccessEnabled() {
+  if (!sidecarReady.value || nonPublicAccessBusy.value) return;
+  nonPublicAccessBusy.value = true;
+  try {
+    sidecarStatus.value = await unityNonPublicAccessSetEnabled(!nonPublicAccessEnabled.value);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnityNonPublicAccess",
+      replaceOperation: true,
+    });
+    await refreshSidecarStatus();
+  } finally {
+    nonPublicAccessBusy.value = false;
   }
 }
 
@@ -247,6 +271,25 @@ onUnmounted(() => {
             "
             :aria-label="t('settings.codeAnalysis.sidecarLabel')"
             @update:model-value="toggleSidecarEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+      <div class="tool-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.codeAnalysis.nonPublicAccessLabel") }}</span>
+          <span class="tool-desc">{{ t("settings.codeAnalysis.nonPublicAccessDesc") }}</span>
+          <span v-if="!sidecarEnabled" class="tool-desc tool-dep">
+            {{ t("settings.codeAnalysis.nonPublicAccessDepSidecar") }}
+          </span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="sidecarReady"
+            :model-value="nonPublicAccessEnabled"
+            :disabled="nonPublicAccessBusy || !sidecarEnabled"
+            :aria-label="t('settings.codeAnalysis.nonPublicAccessLabel')"
+            @update:model-value="toggleNonPublicAccessEnabled"
           />
           <span v-else class="switch-placeholder" aria-hidden="true" />
         </div>

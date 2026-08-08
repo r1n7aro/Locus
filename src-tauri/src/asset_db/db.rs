@@ -1645,6 +1645,81 @@ pub fn batch_resolve_paths(
     Ok(map)
 }
 
+/// Resolve exact Unity object identities by their serialized `(GUID, fileID)`
+/// pair. Imported objects such as AnimationClips, Meshes, and Sprites share
+/// their container asset's GUID, so a GUID-only path lookup cannot identify
+/// the referenced object.
+pub fn batch_resolve_asset_objects(
+    conn: &Connection,
+    object_refs: &[(Guid, i64)],
+) -> Result<std::collections::HashMap<(Guid, i64), AssetObjectIdentity>, String> {
+    use std::collections::HashMap;
+
+    if object_refs.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Keep each statement below SQLite's common 999-variable limit: every
+    // object consumes one GUID parameter and one fileID parameter.
+    const BATCH_SIZE: usize = 400;
+    let mut map = HashMap::with_capacity(object_refs.len());
+
+    for chunk in object_refs.chunks(BATCH_SIZE) {
+        let predicates = chunk
+            .iter()
+            .map(|_| "(asset_guid = ? AND file_id = ?)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT asset_guid, file_id, path, name, type_name, is_sub_asset
+             FROM asset_objects
+             WHERE {}",
+            predicates
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare asset object batch resolve: {}", e))?;
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(chunk.len() * 2);
+        for (guid, file_id) in chunk {
+            params_vec.push(Box::new(guid.to_vec()));
+            params_vec.push(Box::new(*file_id));
+        }
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|value| value.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let guid_blob: Vec<u8> = row.get(0)?;
+                let file_id: i64 = row.get(1)?;
+                let path: String = row.get(2)?;
+                let name: String = row.get(3)?;
+                let type_name: String = row.get(4)?;
+                let is_sub_asset: i32 = row.get(5)?;
+                Ok((
+                    blob_to_guid(&guid_blob),
+                    file_id,
+                    AssetObjectIdentity {
+                        path,
+                        name,
+                        type_name,
+                        is_sub_asset: is_sub_asset != 0,
+                    },
+                ))
+            })
+            .map_err(|e| format!("Failed to batch resolve asset objects: {}", e))?;
+
+        for row in rows {
+            let (guid, file_id, identity) =
+                row.map_err(|e| format!("Failed to read asset object row: {}", e))?;
+            map.insert((guid, file_id), identity);
+        }
+    }
+
+    Ok(map)
+}
+
 pub fn resolve_path_and_kind_by_guid(
     conn: &Connection,
     guid: &Guid,
@@ -3081,8 +3156,11 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
         asset_fts::delete_by_asset_guid(&tx, g)?;
         tx.execute("DELETE FROM edges WHERE src_guid = ?1", params![g])
             .map_err(|e| format!("Failed to delete outgoing edges: {}", e))?;
-        tx.execute("DELETE FROM member_bindings WHERE src_guid = ?1", params![g])
-            .map_err(|e| format!("Failed to delete member bindings: {}", e))?;
+        tx.execute(
+            "DELETE FROM member_bindings WHERE src_guid = ?1",
+            params![g],
+        )
+        .map_err(|e| format!("Failed to delete member bindings: {}", e))?;
         tx.execute(
             "DELETE FROM asset_object_type_terms
              WHERE object_key IN (
@@ -3739,6 +3817,52 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id, Some(11400000));
         assert_eq!(rows[0].name, "Cure Event");
+    }
+
+    #[test]
+    fn batch_resolve_asset_objects_distinguishes_shared_guid_subassets() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let asset = test_asset("Assets/Models/Hero.fbx", AssetKind::Model, "");
+        seed_assets(&mut conn, &[asset.clone()]);
+        let idle = test_sub_object(&asset, 7_400_000, "Idle", "AnimationClip", "animationclip");
+        let dash = test_sub_object(
+            &asset,
+            7_400_001,
+            "Light_DashAttack.1",
+            "AnimationClip",
+            "animationclip",
+        );
+        let tx = conn.transaction().unwrap();
+        batch_insert_asset_objects(&tx, &[idle, dash]).unwrap();
+        tx.commit().unwrap();
+
+        let resolved = batch_resolve_asset_objects(
+            &conn,
+            &[
+                (asset.guid, 7_400_000),
+                (asset.guid, 7_400_001),
+                (asset.guid, 7_499_999),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved.get(&(asset.guid, 7_400_000)),
+            Some(&AssetObjectIdentity {
+                path: "Assets/Models/Hero.fbx".to_string(),
+                name: "Idle".to_string(),
+                type_name: "AnimationClip".to_string(),
+                is_sub_asset: true,
+            })
+        );
+        assert_eq!(
+            resolved
+                .get(&(asset.guid, 7_400_001))
+                .map(|identity| identity.name.as_str()),
+            Some("Light_DashAttack.1")
+        );
+        assert!(!resolved.contains_key(&(asset.guid, 7_499_999)));
     }
 
     #[test]

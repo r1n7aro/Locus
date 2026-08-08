@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::Path,
     sync::{
@@ -51,6 +52,7 @@ pub enum CliDriverSuite {
     HotReload,
     HotReloadRelease,
     Execute,
+    UnityTest,
 }
 
 impl CliDriverSuite {
@@ -64,6 +66,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::Execute => "execute",
+            CliDriverSuite::UnityTest => "unity-test",
         }
     }
 
@@ -78,6 +81,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
+            CliDriverSuite::UnityTest => None,
         }
     }
 }
@@ -523,9 +527,12 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
+        "unity-test" | "unity_test" | "test-framework" | "test_framework" => {
+            CliDriverSuite::UnityTest
+        }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, or all.",
+            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, unity-test, or all.",
             value
         ))
         }
@@ -798,7 +805,28 @@ async fn run_driver(
                     Ok(())
                 };
                 match edit_mode_result {
-                    Ok(()) => run_execute_suite(&project, *suite, &config, &sink, &cancel_rx).await,
+                    Ok(()) => {
+                        run_execute_suite(&project, *suite, &config, &sink, &mut cancel_rx).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            CliDriverSuite::UnityTest => {
+                let edit_mode_result = if config.force_edit_mode {
+                    ensure_edit_mode(
+                        &project,
+                        *suite,
+                        config.connect_timeout,
+                        config.poll_interval,
+                        &sink,
+                        &mut cancel_rx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => run_unity_test_suite(&project, *suite, &config, &sink).await,
                     Err(error) => Err(error),
                 }
             }
@@ -830,6 +858,106 @@ async fn run_driver(
 
     sink.emit("finished", json!({ "ok": true }));
     Ok(())
+}
+
+async fn run_unity_test_suite(
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({ "suite": suite.as_str(), "project": project }),
+    );
+
+    let workspace_status = crate::workspace::unity_test_tools_workspace_status(project);
+    if !workspace_status.enabled {
+        return Err(
+            "Unity Test tools are disabled in this workspace's Locus/config.json".to_string(),
+        );
+    }
+    if !workspace_status.package_installed {
+        return Err("com.unity.test-framework is not installed in this project".to_string());
+    }
+
+    let recompile = unity_bridge::recompile_and_wait(project).await?;
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!("PASS  unity-test convergence: {recompile}"),
+            "passed": 1,
+            "failed": 0,
+        }),
+    );
+
+    let list_request = json!({ "mode": "edit", "max_results": 50 });
+    let list_text = unity_bridge::unity_test_list(project, &list_request).await?;
+    let list: Value = serde_json::from_str(&list_text)
+        .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
+    let matched = list
+        .get("matched")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if matched == 0 {
+        return Err("Unity Test Framework discovered no Edit Mode tests".to_string());
+    }
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!("PASS  unity-test list: discovered {matched} Edit Mode test(s)"),
+            "passed": 2,
+            "failed": 0,
+        }),
+    );
+
+    let run_request = json!({ "mode": "edit", "result_detail": "failures" });
+    let result = unity_bridge::unity_test_run(project, &run_request, config.suite_timeout).await?;
+    let failed = u64::from(result.status != "passed");
+    let passed_checks = if failed == 0 { 3 } else { 2 };
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!(
+                "{} unity-test run: {} passed, {} failed, {} skipped, {} inconclusive",
+                if failed == 0 { "PASS " } else { "FAIL " },
+                result.passed,
+                result.failed,
+                result.skipped,
+                result.inconclusive,
+            ),
+            "passed": passed_checks,
+            "failed": failed,
+        }),
+    );
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": passed_checks,
+            "failed": failed,
+            "tests": {
+                "total": result.total,
+                "passed": result.passed,
+                "failed": result.failed,
+                "skipped": result.skipped,
+                "inconclusive": result.inconclusive,
+            },
+            "failures": result.failures,
+        }),
+    );
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unity Test Framework run failed ({} failed test(s))",
+            result.failed
+        ))
+    }
 }
 
 fn prepare_suite_environment(
@@ -1554,6 +1682,309 @@ fn format_suite_failures(suite_failures: &[String]) -> String {
     )
 }
 
+/// One direct-IL operation from the same operation × visibility matrix used by
+/// the hot-reload access probe. The target type is public, so member visibility
+/// and nested-type visibility are measured without an internal container type
+/// contaminating every cell.
+struct NonPublicWrapperProbeCell {
+    op: &'static str,
+    visibility: &'static str,
+    body: &'static str,
+    expected: &'static str,
+}
+
+const NON_PUBLIC_WRAPPER_PROBE_TARGET: &str = "global::Locus.LocusExecuteAccessProbeTarget";
+
+const NON_PUBLIC_WRAPPER_PROBE_CELLS: &[NonPublicWrapperProbeCell] = &[
+    NonPublicWrapperProbeCell {
+        op: "ldfld",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t._privInst);"#,
+        expected: "7",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldfld",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t._intInst);"#,
+        expected: "11",
+    },
+    NonPublicWrapperProbeCell {
+        op: "stfld",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); t._privInst = 42; print("__MARKER__:" + t.ReadPrivInst());"#,
+        expected: "42",
+    },
+    NonPublicWrapperProbeCell {
+        op: "stfld",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); t._intInst = 43; print("__MARKER__:" + t.ReadIntInst());"#,
+        expected: "43",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldsfld",
+        visibility: "private",
+        body: r#"__TARGET__.ResetStatics(); print("__MARKER__:" + __TARGET__._privStatic);"#,
+        expected: "13",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldsfld",
+        visibility: "internal",
+        body: r#"__TARGET__.ResetStatics(); print("__MARKER__:" + __TARGET__._intStatic);"#,
+        expected: "17",
+    },
+    NonPublicWrapperProbeCell {
+        op: "stsfld",
+        visibility: "private",
+        body: r#"__TARGET__.ResetStatics(); __TARGET__._privStatic = 47; print("__MARKER__:" + __TARGET__.ReadPrivStatic());"#,
+        expected: "47",
+    },
+    NonPublicWrapperProbeCell {
+        op: "stsfld",
+        visibility: "internal",
+        body: r#"__TARGET__.ResetStatics(); __TARGET__._intStatic = 53; print("__MARKER__:" + __TARGET__.ReadIntStatic());"#,
+        expected: "53",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldflda",
+        visibility: "private",
+        body: r#"int __LocusProbeLdfldaPrivate() { var t = __TARGET__.New(); ref int slot = ref t._privInst; slot = 59; return t.ReadPrivInst(); } print("__MARKER__:" + __LocusProbeLdfldaPrivate());"#,
+        expected: "59",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldflda",
+        visibility: "internal",
+        body: r#"int __LocusProbeLdfldaInternal() { var t = __TARGET__.New(); ref int slot = ref t._intInst; slot = 61; return t.ReadIntInst(); } print("__MARKER__:" + __LocusProbeLdfldaInternal());"#,
+        expected: "61",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldsflda",
+        visibility: "private",
+        body: r#"int __LocusProbeLdsfldaPrivate() { __TARGET__.ResetStatics(); ref int slot = ref __TARGET__._privStatic; slot = 67; return __TARGET__.ReadPrivStatic(); } print("__MARKER__:" + __LocusProbeLdsfldaPrivate());"#,
+        expected: "67",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldsflda",
+        visibility: "internal",
+        body: r#"int __LocusProbeLdsfldaInternal() { __TARGET__.ResetStatics(); ref int slot = ref __TARGET__._intStatic; slot = 71; return __TARGET__.ReadIntStatic(); } print("__MARKER__:" + __LocusProbeLdsfldaInternal());"#,
+        expected: "71",
+    },
+    NonPublicWrapperProbeCell {
+        op: "call",
+        visibility: "private",
+        body: r#"print("__MARKER__:" + __TARGET__.PrivStatic(3));"#,
+        expected: "16",
+    },
+    NonPublicWrapperProbeCell {
+        op: "call",
+        visibility: "internal",
+        body: r#"print("__MARKER__:" + __TARGET__.IntStatic(3));"#,
+        expected: "22",
+    },
+    NonPublicWrapperProbeCell {
+        op: "callvirt",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.PrivMethod(3));"#,
+        expected: "7",
+    },
+    NonPublicWrapperProbeCell {
+        op: "callvirt",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.IntMethod(3));"#,
+        expected: "10",
+    },
+    NonPublicWrapperProbeCell {
+        op: "newobj",
+        visibility: "private",
+        body: r#"var t = new __TARGET__(9); print("__MARKER__:" + t.ReadPrivInst());"#,
+        expected: "9",
+    },
+    NonPublicWrapperProbeCell {
+        op: "newobj",
+        visibility: "internal",
+        body: r#"var t = new __TARGET__(); print("__MARKER__:" + t.ReadPrivInst());"#,
+        expected: "7",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldftn",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); System.Func<int, int> f = t.PrivMethod; print("__MARKER__:" + f(5));"#,
+        expected: "11",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldftn",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); System.Func<int, int> f = t.IntMethod; print("__MARKER__:" + f(5));"#,
+        expected: "16",
+    },
+    NonPublicWrapperProbeCell {
+        op: "property_get",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.PrivProperty);"#,
+        expected: "23",
+    },
+    NonPublicWrapperProbeCell {
+        op: "property_get",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.IntProperty);"#,
+        expected: "29",
+    },
+    NonPublicWrapperProbeCell {
+        op: "property_set",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); t.PrivProperty = 31; print("__MARKER__:" + t.ReadPrivProperty());"#,
+        expected: "31",
+    },
+    NonPublicWrapperProbeCell {
+        op: "property_set",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); t.IntProperty = 37; print("__MARKER__:" + t.ReadIntProperty());"#,
+        expected: "37",
+    },
+    NonPublicWrapperProbeCell {
+        op: "event_add",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); System.Action h = delegate { }; t.PrivEvent += h; print("__MARKER__:" + t.ReadPrivEventSubscribers());"#,
+        expected: "1",
+    },
+    NonPublicWrapperProbeCell {
+        op: "event_add",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); System.Action h = delegate { }; t.IntEvent += h; print("__MARKER__:" + t.ReadIntEventSubscribers());"#,
+        expected: "1",
+    },
+    NonPublicWrapperProbeCell {
+        op: "generic_call",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.PrivGeneric<int>(41));"#,
+        expected: "41",
+    },
+    NonPublicWrapperProbeCell {
+        op: "generic_call",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); print("__MARKER__:" + t.IntGeneric<int>(43));"#,
+        expected: "43",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ref_call",
+        visibility: "private",
+        body: r#"var t = __TARGET__.New(); int value = 7; t.PrivRef(ref value); print("__MARKER__:" + value);"#,
+        expected: "12",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ref_call",
+        visibility: "internal",
+        body: r#"var t = __TARGET__.New(); int value = 7; t.IntRef(ref value); print("__MARKER__:" + value);"#,
+        expected: "14",
+    },
+    NonPublicWrapperProbeCell {
+        op: "castclass",
+        visibility: "private",
+        body: r#"object value = null; var typed = (__TARGET__.PrivNested)value; print("__MARKER__:" + (typed == null));"#,
+        expected: "True",
+    },
+    NonPublicWrapperProbeCell {
+        op: "castclass",
+        visibility: "internal",
+        body: r#"object value = null; var typed = (__TARGET__.IntNested)value; print("__MARKER__:" + (typed == null));"#,
+        expected: "True",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldtoken",
+        visibility: "private",
+        body: r#"print("__MARKER__:" + typeof(__TARGET__.PrivNested).Name);"#,
+        expected: "PrivNested",
+    },
+    NonPublicWrapperProbeCell {
+        op: "ldtoken",
+        visibility: "internal",
+        body: r#"print("__MARKER__:" + typeof(__TARGET__.IntNested).Name);"#,
+        expected: "IntNested",
+    },
+];
+
+#[derive(Default)]
+struct NonPublicWrapperProbeSummary {
+    direct: u32,
+    blocked: u32,
+    infrastructure_failed: u32,
+    cells: BTreeMap<String, bool>,
+}
+
+impl NonPublicWrapperProbeSummary {
+    fn complete_direct(&self, expected_cells: usize) -> bool {
+        self.infrastructure_failed == 0
+            && self.blocked == 0
+            && self.direct as usize == expected_cells
+    }
+}
+
+fn non_public_probe_key(cell: &NonPublicWrapperProbeCell) -> String {
+    format!("{}_{}", cell.op, cell.visibility)
+}
+
+fn non_public_probe_code(cell: &NonPublicWrapperProbeCell, marker: &str) -> String {
+    cell.body
+        .replace("__TARGET__", NON_PUBLIC_WRAPPER_PROBE_TARGET)
+        .replace("__MARKER__", marker)
+}
+
+fn non_public_probe_expected_marker(
+    marker_prefix: &str,
+    cell: &NonPublicWrapperProbeCell,
+) -> String {
+    format!("{marker_prefix}:{}", cell.expected)
+}
+
+fn non_public_probe_compile_control_rejected(error: &str) -> bool {
+    error.contains("_privInst")
+        && ["CS0122", "CS1061", "CS0117", "CS1729"]
+            .iter()
+            .any(|code| error.contains(code))
+}
+
+fn non_public_probe_compile_failed(error: &str) -> bool {
+    error.contains("compilation failed:")
+        || error.contains("CS0122")
+        || error.contains("CS0050")
+        || error.contains("CS0051")
+        || error.contains("skip_verification")
+        || error.contains("DeclSecurity")
+        || error.contains("mode mismatch")
+        || error.contains("requires the sidecar compiler")
+        || error.contains("requires a Unity plugin with")
+}
+
+async fn query_effective_unity_inlining(project: &str) -> Result<(bool, String), String> {
+    let resp = unity_bridge::send_message_with_timeout(
+        project,
+        "hot_reload_inlining_active",
+        "",
+        Duration::from_secs(15),
+    )
+    .await?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "inlining probe failed".to_string()));
+    }
+    let message = resp.message.unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(&message)
+        .map_err(|error| format!("inlining probe response parse failed: {error}"))?;
+    let active = parsed
+        .get("inlining_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let setting = parsed
+        .get("code_optimization")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let detail = parsed
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Ok((active, format!("setting={setting} {detail}")))
+}
+
 /// Per-check accumulator for the execute suite. Mirrors the self-test `pass`/
 /// `fail`/`log` shape so failing lines are streamed as `suite_event`s (buffered
 /// by the UI and surfaced only when the suite fails) and totals land in
@@ -1819,7 +2250,11 @@ print("E7:done");"#;
     async fn check_legacy_compile(&mut self, project: &str) {
         let was_enabled = crate::csharp_compile::is_enabled();
         crate::csharp_compile::set_enabled(false).await;
-        let result = execute_capture(project, r#"print("E12:" + (21 + 21));"#).await;
+        let result = execute_capture(
+            project,
+            r#"var values = new[] { 41 }; ref int value = ref values[0]; value++; print("E12:" + value);"#,
+        )
+        .await;
         if was_enabled {
             crate::csharp_compile::set_enabled(true).await;
         }
@@ -1871,6 +2306,636 @@ print("E7:done");"#;
                 format!("run-states error: {}", clip(&error, 200)),
             ),
         }
+    }
+
+    fn record_non_public_wrapper_probe(
+        &mut self,
+        surface: &str,
+        key: &str,
+        marker: &str,
+        result: Result<String, String>,
+        summary: &mut NonPublicWrapperProbeSummary,
+    ) {
+        match result {
+            Ok(output) if output.contains(marker) => {
+                summary.direct += 1;
+                summary.cells.insert(key.to_string(), true);
+                self.line(format!(
+                    "PROBE {surface} {key}: DIRECT ({})",
+                    clip(&output, 120)
+                ));
+            }
+            Ok(output) => {
+                summary.infrastructure_failed += 1;
+                summary.cells.insert(key.to_string(), false);
+                self.line(format!(
+                    "FAIL  {surface} {key}: wrapper completed without marker '{}' ({})",
+                    marker,
+                    clip(&output, 180)
+                ));
+            }
+            Err(error) if non_public_probe_compile_failed(&error) => {
+                summary.infrastructure_failed += 1;
+                summary.cells.insert(key.to_string(), false);
+                self.line(format!(
+                    "FAIL  {surface} {key}: probe compilation/infrastructure failed ({})",
+                    clip(&error, 220)
+                ));
+            }
+            Err(error) => {
+                summary.blocked += 1;
+                summary.cells.insert(key.to_string(), false);
+                self.line(format!(
+                    "PROBE {surface} {key}: BLOCKED ({})",
+                    clip(&error, 180)
+                ));
+            }
+        }
+    }
+
+    async fn check_non_public_compile_controls(&mut self, project: &str) {
+        let execute_control = format!(
+            "var t = {target}.New(); print(t._privInst);",
+            target = NON_PUBLIC_WRAPPER_PROBE_TARGET
+        );
+        match execute_capture(project, &execute_control).await {
+            Err(error) if non_public_probe_compile_control_rejected(&error) => self.pass(
+                "E13 execute access control",
+                format!(
+                    "normal unity_execute compilation rejected direct private access ({})",
+                    clip(&error, 100)
+                ),
+            ),
+            Err(error) => self.fail(
+                "E13 execute access control",
+                format!("unexpected rejection shape: '{}'", clip(&error, 180)),
+            ),
+            Ok(output) => self.fail(
+                "E13 execute access control",
+                format!(
+                    "normal compilation unexpectedly executed: '{}'",
+                    clip(&output, 140)
+                ),
+            ),
+        }
+
+        let run_states_control = json!({
+            "request_editor_status": "editing",
+            "initial_state": "probe",
+            "states": [{
+                "name": "probe",
+                "update": format!(
+                    "var t = {target}.New(); print(t._privInst); ctx.Done(\"control\");",
+                    target = NON_PUBLIC_WRAPPER_PROBE_TARGET
+                ),
+            }],
+        });
+        match unity_bridge::unity_run_states(project, &run_states_control).await {
+            Err(error) if non_public_probe_compile_control_rejected(&error) => self.pass(
+                "E13 run-states access control",
+                format!(
+                    "normal unity_run_states compilation rejected direct private access ({})",
+                    clip(&error, 100)
+                ),
+            ),
+            Err(error) => self.fail(
+                "E13 run-states access control",
+                format!("unexpected rejection shape: '{}'", clip(&error, 180)),
+            ),
+            Ok(output) => self.fail(
+                "E13 run-states access control",
+                format!(
+                    "normal compilation unexpectedly executed: '{}'",
+                    clip(&output, 140)
+                ),
+            ),
+        }
+    }
+
+    async fn report_low_level_non_public_probe(
+        &mut self,
+        project: &str,
+        mode: crate::csharp_compile::NonPublicAccessProbeMode,
+        config: &CliDriverConfig,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<BTreeMap<String, bool>, String> {
+        let check_name = format!("E14 low-level {}", mode.as_str());
+        let mut attempt = 0u32;
+        let value = loop {
+            attempt += 1;
+            match crate::unity_hotreload::coordinator::access_probe_run_with_mode(project, mode)
+                .await
+            {
+                Ok(value) => break value,
+                Err(error) if unity_reload_boundary_error(&error) && attempt < 4 => {
+                    self.line(format!(
+                        "PROBE low-level [{}] attempt {} crossed a domain reload; waiting and retrying",
+                        mode.as_str(),
+                        attempt
+                    ));
+                    wait_for_semantic_ready(
+                        project,
+                        self.suite,
+                        "access-probe reload recovery",
+                        SemanticReadyRequirement::UnityApi,
+                        recompile_wait(config),
+                        config.poll_interval,
+                        self.sink,
+                        cancel_rx,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    self.fail(
+                        &check_name,
+                        format!(
+                            "probe failed after {attempt} attempt(s): {}",
+                            clip(&error, 220)
+                        ),
+                    );
+                    return Ok(BTreeMap::new());
+                }
+            }
+        };
+
+        if mode.emits_skip_verification()
+            && value
+                .get("skipVerificationDeclSecurity")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            self.fail(
+                &check_name,
+                "compile server did not confirm SkipVerification DeclSecurity metadata",
+            );
+            return Ok(BTreeMap::new());
+        }
+
+        let cells = value
+            .get("caps")
+            .and_then(|caps| caps.get("cells"))
+            .and_then(serde_json::Value::as_object);
+        let raw_cells = value
+            .get("matrix")
+            .and_then(|matrix| matrix.get("cells"))
+            .and_then(serde_json::Value::as_array);
+        let mut measured = BTreeMap::new();
+        if let Some(capability_cells) = cells {
+            for (key, capability) in capability_cells {
+                let direct = capability.as_bool().unwrap_or(false);
+                measured.insert(key.clone(), direct);
+                let raw = raw_cells.and_then(|cells| {
+                    cells.iter().find(|cell| {
+                        let op = cell
+                            .get("op")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let visibility = cell
+                            .get("visibility")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        format!("{op}_{visibility}") == key.as_str()
+                    })
+                });
+                let detail = raw
+                    .map(|cell| {
+                        let expected = cell
+                            .get("expected")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or_default();
+                        let actual = cell
+                            .get("actual")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or_default();
+                        let error = cell
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if error.is_empty() {
+                            format!("expected={expected} actual={actual}")
+                        } else {
+                            clip(error, 130)
+                        }
+                    })
+                    .unwrap_or_else(|| "raw result missing".to_string());
+                self.line(format!(
+                    "PROBE low-level [{}] {key}: {} ({detail})",
+                    mode.as_str(),
+                    if direct { "DIRECT" } else { "BLOCKED" },
+                ));
+            }
+        }
+
+        let caps = value.get("caps");
+        let primitive = |name: &str| {
+            caps.and_then(|caps| caps.get(name))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        self.line(format!(
+            "PROBE low-level [{}] fallbacks: create_delegate={} dynamic_method={} byref_dynamic_method={}",
+            mode.as_str(),
+            primitive("createDelegateNonPublic"),
+            primitive("dynamicMethodSkipVisibility"),
+            primitive("dynamicMethodByrefReturn"),
+        ));
+
+        if measured.len() == NON_PUBLIC_WRAPPER_PROBE_CELLS.len() {
+            let direct = measured.values().filter(|value| **value).count();
+            self.pass(
+                &check_name,
+                format!(
+                    "executed {}/{} direct operation cells with return-value validation",
+                    direct,
+                    measured.len()
+                ),
+            );
+        } else {
+            self.fail(
+                &check_name,
+                format!(
+                    "expected {} cells, received {}",
+                    NON_PUBLIC_WRAPPER_PROBE_CELLS.len(),
+                    measured.len()
+                ),
+            );
+        }
+        Ok(measured)
+    }
+
+    async fn probe_unity_execute_non_public(
+        &mut self,
+        project: &str,
+        mode: crate::csharp_compile::NonPublicAccessProbeMode,
+        cancel_rx: &watch::Receiver<bool>,
+    ) -> Result<NonPublicWrapperProbeSummary, String> {
+        let mut summary = NonPublicWrapperProbeSummary::default();
+        let surface = format!("unity_execute[{}]", mode.as_str());
+        for cell in NON_PUBLIC_WRAPPER_PROBE_CELLS {
+            if run_cancelled(cancel_rx) {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+            let key = non_public_probe_key(cell);
+            let marker_prefix = format!("NP_EXEC_{}_{key}_OK", mode.as_str());
+            let expected_marker = non_public_probe_expected_marker(&marker_prefix, cell);
+            let code = non_public_probe_code(cell, &marker_prefix);
+            let result =
+                unity_bridge::unity_execute_code_with_access_probe(project, &code, mode).await;
+            self.record_non_public_wrapper_probe(
+                &surface,
+                &key,
+                &expected_marker,
+                result,
+                &mut summary,
+            );
+        }
+
+        let marker_prefix = format!("NP_EXEC_{}_POST_AWAIT_OK", mode.as_str());
+        let expected_marker = format!("{marker_prefix}:7");
+        let post_await = format!(
+            "await ctx.WaitFrames(1); var t = {target}.New(); print(\"{marker_prefix}:\" + t._privInst);",
+            target = NON_PUBLIC_WRAPPER_PROBE_TARGET
+        );
+        let result =
+            unity_bridge::unity_execute_code_with_access_probe(project, &post_await, mode).await;
+        self.record_non_public_wrapper_probe(
+            &surface,
+            "post_await_ldfld_private",
+            &expected_marker,
+            result,
+            &mut summary,
+        );
+
+        let check_name = format!("E15 unity_execute {}", mode.as_str());
+        if summary.infrastructure_failed == 0 {
+            self.pass(
+                &check_name,
+                format!(
+                    "direct={} blocked={} across {} operation and post-await cells",
+                    summary.direct,
+                    summary.blocked,
+                    NON_PUBLIC_WRAPPER_PROBE_CELLS.len()
+                ),
+            );
+        } else {
+            self.fail(
+                &check_name,
+                format!(
+                    "{} probe cell(s) failed before a runtime capability result",
+                    summary.infrastructure_failed
+                ),
+            );
+        }
+        Ok(summary)
+    }
+
+    async fn probe_unity_run_states_non_public(
+        &mut self,
+        project: &str,
+        mode: crate::csharp_compile::NonPublicAccessProbeMode,
+        cancel_rx: &watch::Receiver<bool>,
+    ) -> Result<NonPublicWrapperProbeSummary, String> {
+        let mut summary = NonPublicWrapperProbeSummary::default();
+        let surface = format!("unity_run_states[{}]", mode.as_str());
+        for cell in NON_PUBLIC_WRAPPER_PROBE_CELLS {
+            if run_cancelled(cancel_rx) {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+            let key = non_public_probe_key(cell);
+            let marker_prefix = format!("NP_RUN_{}_{key}_OK", mode.as_str());
+            let expected_marker = non_public_probe_expected_marker(&marker_prefix, cell);
+            let update = format!(
+                "{} ctx.Done(\"non-public-probe\");",
+                non_public_probe_code(cell, &marker_prefix)
+            );
+            let request = json!({
+                "request_editor_status": "editing",
+                "initial_state": "probe",
+                "states": [{ "name": "probe", "update": update }],
+            });
+            let result =
+                unity_bridge::unity_run_states_with_access_probe(project, &request, mode).await;
+            self.record_non_public_wrapper_probe(
+                &surface,
+                &key,
+                &expected_marker,
+                result,
+                &mut summary,
+            );
+        }
+
+        for visibility in ["private", "internal"] {
+            let key = format!("build_ldfld_{visibility}");
+            let marker_prefix = format!("NP_RUN_{}_{key}_OK", mode.as_str());
+            let member = if visibility == "private" {
+                "_privInst"
+            } else {
+                "_intInst"
+            };
+            let expected = if visibility == "private" { "7" } else { "11" };
+            let expected_marker = format!("{marker_prefix}:{expected}");
+            let variables = format!(
+                "var buildTarget = {target}.New(); var buildValue = buildTarget.{member};",
+                target = NON_PUBLIC_WRAPPER_PROBE_TARGET
+            );
+            let update =
+                format!("print(\"{marker_prefix}:\" + buildValue); ctx.Done(\"build-probe\");");
+            let request = json!({
+                "request_editor_status": "editing",
+                "initial_state": "probe",
+                "states": [{
+                    "name": "probe",
+                    "variables": variables,
+                    "update": update,
+                }],
+            });
+            let result =
+                unity_bridge::unity_run_states_with_access_probe(project, &request, mode).await;
+            self.record_non_public_wrapper_probe(
+                &surface,
+                &key,
+                &expected_marker,
+                result,
+                &mut summary,
+            );
+        }
+
+        let check_name = format!("E16 unity_run_states {}", mode.as_str());
+        if summary.infrastructure_failed == 0 {
+            self.pass(
+                &check_name,
+                format!(
+                    "direct={} blocked={} across Build and handler contexts",
+                    summary.direct, summary.blocked
+                ),
+            );
+        } else {
+            self.fail(
+                &check_name,
+                format!(
+                    "{} probe cell(s) failed before a runtime capability result",
+                    summary.infrastructure_failed
+                ),
+            );
+        }
+        Ok(summary)
+    }
+
+    fn report_non_public_probe_comparison(
+        &self,
+        mode: crate::csharp_compile::NonPublicAccessProbeMode,
+        low_level: &BTreeMap<String, bool>,
+        execute: &NonPublicWrapperProbeSummary,
+        run_states: &NonPublicWrapperProbeSummary,
+    ) {
+        for cell in NON_PUBLIC_WRAPPER_PROBE_CELLS {
+            let key = non_public_probe_key(cell);
+            let low = low_level.get(&key).copied();
+            let execute_value = execute.cells.get(&key).copied();
+            let run_states_value = run_states.cells.get(&key).copied();
+            if low != execute_value || execute_value != run_states_value {
+                self.line(format!(
+                    "PROBE comparison [{}] {key}: low-level={low:?} unity_execute={execute_value:?} unity_run_states={run_states_value:?}",
+                    mode.as_str()
+                ));
+            }
+        }
+    }
+
+    fn report_non_public_strategy_verdict(
+        &mut self,
+        low_level: &BTreeMap<
+            crate::csharp_compile::NonPublicAccessProbeMode,
+            BTreeMap<String, bool>,
+        >,
+        execute: &BTreeMap<
+            crate::csharp_compile::NonPublicAccessProbeMode,
+            NonPublicWrapperProbeSummary,
+        >,
+        run_states: &BTreeMap<
+            crate::csharp_compile::NonPublicAccessProbeMode,
+            NonPublicWrapperProbeSummary,
+        >,
+    ) {
+        let low_expected = NON_PUBLIC_WRAPPER_PROBE_CELLS.len();
+        let execute_expected = low_expected + 1;
+        let run_states_expected = low_expected + 2;
+        let mut selected = None;
+        let mut indeterminate = false;
+
+        for mode in crate::csharp_compile::NonPublicAccessProbeMode::ALL {
+            let low = low_level.get(&mode);
+            let execute_summary = execute.get(&mode);
+            let run_states_summary = run_states.get(&mode);
+            let low_direct = low
+                .map(|cells| cells.values().filter(|value| **value).count())
+                .unwrap_or_default();
+            let execute_direct = execute_summary
+                .map(|summary| summary.direct as usize)
+                .unwrap_or_default();
+            let run_states_direct = run_states_summary
+                .map(|summary| summary.direct as usize)
+                .unwrap_or_default();
+            let complete = low
+                .map(|cells| cells.len() == low_expected && low_direct == low_expected)
+                .unwrap_or(false)
+                && execute_summary
+                    .map(|summary| summary.complete_direct(execute_expected))
+                    .unwrap_or(false)
+                && run_states_summary
+                    .map(|summary| summary.complete_direct(run_states_expected))
+                    .unwrap_or(false);
+            let mode_indeterminate = low.map(|cells| cells.len() != low_expected).unwrap_or(true)
+                || execute_summary
+                    .map(|summary| summary.infrastructure_failed > 0)
+                    .unwrap_or(true)
+                || run_states_summary
+                    .map(|summary| summary.infrastructure_failed > 0)
+                    .unwrap_or(true);
+            indeterminate |= mode_indeterminate;
+            self.line(format!(
+                "PROBE strategy [{}]: low-level={low_direct}/{low_expected} execute={execute_direct}/{execute_expected} run_states={run_states_direct}/{run_states_expected} complete={complete} indeterminate={mode_indeterminate}",
+                mode.as_str()
+            ));
+            if selected.is_none() && complete {
+                selected = Some(mode);
+            }
+        }
+
+        match selected {
+            Some(mode) => self.pass(
+                "E17 non-public strategy verdict",
+                format!(
+                    "selected={} for direct IL across low-level, async, Build, and handler contexts",
+                    mode.as_str()
+                ),
+            ),
+            None if indeterminate => self.fail(
+                "E17 non-public strategy verdict",
+                "selected=indeterminate; at least one strategy had a compile or probe-infrastructure failure",
+            ),
+            None => self.pass(
+                "E17 non-public strategy verdict",
+                "selected=native_access_check_hook; no assembly-metadata policy covered every direct-IL cell",
+            ),
+        }
+    }
+
+    async fn check_non_public_access_probes(
+        &mut self,
+        project: &str,
+        config: &CliDriverConfig,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        let (connected, original) =
+            crate::unity_hotreload::coordinator::detect_code_optimization(project).await;
+        let Some(original) = original.filter(|_| connected) else {
+            self.fail(
+                "E13 Debug-effective precondition",
+                "could not read Unity Code Optimization before running access probes",
+            );
+            return Ok(());
+        };
+
+        let timeout = recompile_wait(config);
+        if let Err(error) = ensure_code_optimization(
+            project,
+            self.suite,
+            "debug",
+            timeout,
+            config.poll_interval,
+            self.sink,
+            cancel_rx,
+            false,
+        )
+        .await
+        {
+            if error == UNITY_INTEGRATION_TEST_CANCELLED {
+                return Err(error);
+            }
+            self.fail(
+                "E13 Debug-effective precondition",
+                format!("could not switch to Debug: {}", clip(&error, 180)),
+            );
+            return Ok(());
+        }
+
+        wait_for_semantic_ready(
+            project,
+            self.suite,
+            "access probes after Debug switch",
+            SemanticReadyRequirement::UnityApi,
+            timeout,
+            config.poll_interval,
+            self.sink,
+            cancel_rx,
+        )
+        .await?;
+
+        match query_effective_unity_inlining(project).await {
+            Ok((false, detail)) => self.pass(
+                "E13 Debug-effective precondition",
+                format!("runtime inlining canary is inactive ({detail})"),
+            ),
+            Ok((true, detail)) => self.fail(
+                "E13 Debug-effective precondition",
+                format!("runtime still reports active inlining ({detail})"),
+            ),
+            Err(error) => self.fail(
+                "E13 Debug-effective precondition",
+                format!("inlining canary failed: {}", clip(&error, 180)),
+            ),
+        }
+
+        self.check_non_public_compile_controls(project).await;
+        let mut low_by_mode = BTreeMap::new();
+        let mut execute_by_mode = BTreeMap::new();
+        let mut run_states_by_mode = BTreeMap::new();
+        for mode in crate::csharp_compile::NonPublicAccessProbeMode::ALL {
+            let low_level = self
+                .report_low_level_non_public_probe(project, mode, config, cancel_rx)
+                .await?;
+            let execute = self
+                .probe_unity_execute_non_public(project, mode, cancel_rx)
+                .await?;
+            let run_states = self
+                .probe_unity_run_states_non_public(project, mode, cancel_rx)
+                .await?;
+            self.report_non_public_probe_comparison(mode, &low_level, &execute, &run_states);
+            low_by_mode.insert(mode, low_level);
+            execute_by_mode.insert(mode, execute);
+            run_states_by_mode.insert(mode, run_states);
+        }
+        self.report_non_public_strategy_verdict(
+            &low_by_mode,
+            &execute_by_mode,
+            &run_states_by_mode,
+        );
+
+        if original == "release" {
+            match ensure_code_optimization(
+                project,
+                self.suite,
+                "release",
+                timeout,
+                config.poll_interval,
+                self.sink,
+                cancel_rx,
+                false,
+            )
+            .await
+            {
+                Ok(_) => self.line(
+                    "E13 access probe: restored Unity Code Optimization to release".to_string(),
+                ),
+                Err(error) if error == UNITY_INTEGRATION_TEST_CANCELLED => return Err(error),
+                Err(error) => self.fail(
+                    "E13 Code Optimization restore",
+                    format!("restore failed: {}", clip(&error, 180)),
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Full recompile: add a brand-new type to the project, ask Unity to
@@ -2042,7 +3107,7 @@ async fn run_execute_suite(
     suite: CliDriverSuite,
     config: &CliDriverConfig,
     sink: &DriverEventSink,
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     sink.emit(
         "suite_start",
@@ -2077,6 +3142,13 @@ async fn run_execute_suite(
         "E3:False",
     )
     .await;
+    run.check_marker(
+        project,
+        "E3R sync ref-local",
+        r#"var values = new[] { 41 }; ref int value = ref values[0]; value++; print("E3R:" + value);"#,
+        "E3R:42",
+    )
+    .await;
     if run_cancelled(cancel_rx) {
         return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
     }
@@ -2107,6 +3179,15 @@ async fn run_execute_suite(
     // Alternate compile backend and the run-states path.
     run.check_legacy_compile(project).await;
     run.check_run_states(project).await;
+    if run_cancelled(cancel_rx) {
+        return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+    }
+
+    // Compiler/JIT capability experiment for private/internal access. Force a
+    // Debug-effective editor first so inlining cannot hide access checks, then
+    // compare the low-level cells with both real generated wrapper shapes.
+    run.check_non_public_access_probes(project, config, cancel_rx)
+        .await?;
     if run_cancelled(cancel_rx) {
         return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
     }
@@ -2831,6 +3912,20 @@ mod tests {
             assert_eq!(
                 parsed.suites,
                 vec![CliDriverSuite::Execute],
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_unity_test_suite_aliases() {
+        for alias in ["unity-test", "unity_test", "test-framework"] {
+            let parsed = parse(&["--locus-unity-test", "--suite", alias])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::UnityTest],
                 "alias {alias}"
             );
         }

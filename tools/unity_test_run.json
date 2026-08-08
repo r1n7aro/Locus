@@ -1,0 +1,46 @@
+{
+  "description": "Run tests through the connected project's official Unity Test Framework and wait for the structured result. Use this instead of unity_execute reflection or invoking NUnit methods directly. It supports NUnit lifecycle, UnityTest coroutines, Edit Mode, Play Mode, skips, parameterized cases, and domain reload recovery. After writing or hot-reloading C# tests, call unity_recompile before running; the new test tree becomes runnable after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["edit", "play"],
+        "default": "edit",
+        "description": "Unity Test mode to run. Play Mode runs still start from Edit Mode and Unity Test Framework controls the transition."
+      },
+      "assemblies": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional test assembly names without .dll."
+      },
+      "tests": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional exact full test names."
+      },
+      "groups": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional Unity Test Framework group-name regular expressions."
+      },
+      "categories": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional NUnit category names."
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "default": 600000,
+        "description": "Host-side timeout in milliseconds, clamped to 1000..3600000."
+      },
+      "result_detail": {
+        "type": "string",
+        "enum": ["summary", "failures", "all"],
+        "default": "failures",
+        "description": "Result detail returned to the agent. failures includes failure messages and stack traces; all includes every leaf result."
+      }
+    },
+    "required": ["mode"]
+  }
+}

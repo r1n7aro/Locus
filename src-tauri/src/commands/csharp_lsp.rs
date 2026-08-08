@@ -47,6 +47,19 @@ pub async fn unity_sidecar_compiler_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_non_public_access_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_non_public_access_enabled(value)
+        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
+
+    crate::csharp_compile::set_non_public_access_enabled(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
 pub async fn unity_in_process_compile_fallback_get_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, AppError> {

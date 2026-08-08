@@ -1,12 +1,27 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     #[serde(rename = "workspace_id", alias = "workspaceId")]
     pub workspace_id: String,
+    #[serde(
+        default,
+        rename = "unity_test_tools_enabled",
+        alias = "unityTestToolsEnabled"
+    )]
+    pub unity_test_tools_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityTestToolsWorkspaceStatus {
+    pub enabled: bool,
+    pub package_installed: bool,
+    pub available: bool,
 }
 
 pub struct Workspace {
@@ -85,6 +100,180 @@ pub fn write_workspace_config(dir: &str, config: &WorkspaceConfig) -> Result<(),
         .map_err(|e| format!("Failed to write workspace config: {}", e))
 }
 
+fn read_json_object(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+pub fn unity_test_framework_package_installed(dir: &str) -> bool {
+    let packages = Path::new(dir).join("Packages");
+    for file_name in ["packages-lock.json", "manifest.json"] {
+        let Some(root) = read_json_object(&packages.join(file_name)) else {
+            continue;
+        };
+        if root
+            .get("dependencies")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|dependencies| dependencies.contains_key("com.unity.test-framework"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn unity_test_tools_workspace_status(dir: &str) -> UnityTestToolsWorkspaceStatus {
+    let enabled = read_workspace_config(dir)
+        .map(|config| config.unity_test_tools_enabled)
+        .unwrap_or(false);
+    let package_installed = unity_test_framework_package_installed(dir);
+    UnityTestToolsWorkspaceStatus {
+        enabled,
+        package_installed,
+        available: enabled && package_installed,
+    }
+}
+
+pub fn unity_test_tools_available(dir: &str) -> bool {
+    unity_test_tools_workspace_status(dir).available
+}
+
+#[derive(Default)]
+struct UnityTestPendingSourceState {
+    edit_seq: u64,
+    paths: BTreeMap<String, (String, u64)>,
+}
+
+fn unity_test_pending_sources() -> &'static Mutex<HashMap<String, UnityTestPendingSourceState>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, UnityTestPendingSourceState>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalized_path_key(path: &str) -> String {
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn unity_test_source_path(project_path: &str, file_path: &str) -> Option<String> {
+    let project = Path::new(project_path);
+    let absolute = if Path::new(file_path).is_absolute() {
+        Path::new(file_path).to_path_buf()
+    } else {
+        project.join(file_path)
+    };
+    let absolute_text = absolute.to_string_lossy().to_string();
+    let project_key = normalized_path_key(project_path);
+    let file_key = normalized_path_key(&absolute_text);
+    let relative = file_key.strip_prefix(&format!("{project_key}/"))?;
+    if !relative.ends_with(".cs")
+        || !(relative.starts_with("assets/") || relative.starts_with("packages/"))
+        || relative.starts_with("packages/com.farlocus.locus/")
+    {
+        return None;
+    }
+    Some(absolute_text)
+}
+
+/// Track C# files written by Locus while Unity Test tools are available.
+/// Test discovery is held until a real Unity compilation and domain reload
+/// converge those files into the Test Framework's test-list cache.
+pub fn note_unity_test_source_written(project_path: &str, file_path: &str) {
+    if !unity_test_tools_available(project_path) {
+        return;
+    }
+    let Some(absolute_path) = unity_test_source_path(project_path, file_path) else {
+        return;
+    };
+    if let Ok(mut pending) = unity_test_pending_sources().lock() {
+        let state = pending
+            .entry(normalized_path_key(project_path))
+            .or_default();
+        state.edit_seq += 1;
+        let edit_seq = state.edit_seq;
+        state.paths.insert(
+            normalized_path_key(&absolute_path),
+            (absolute_path, edit_seq),
+        );
+    }
+}
+
+pub fn unity_test_sources_pending(project_path: &str) -> bool {
+    unity_test_pending_sources()
+        .lock()
+        .ok()
+        .and_then(|pending| {
+            pending
+                .get(&normalized_path_key(project_path))
+                .map(|state| !state.paths.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Snapshot pending paths and the highest write sequence they represent.
+/// A successful recompile clears only through this sequence, preserving edits
+/// that race the compilation window for the next convergence cycle.
+pub fn unity_test_pending_source_snapshot(project_path: &str) -> (u64, Vec<String>) {
+    unity_test_pending_sources()
+        .lock()
+        .ok()
+        .and_then(|pending| {
+            pending
+                .get(&normalized_path_key(project_path))
+                .map(|state| {
+                    (
+                        state.edit_seq,
+                        state
+                            .paths
+                            .values()
+                            .map(|(path, _)| path.clone())
+                            .collect(),
+                    )
+                })
+        })
+        .unwrap_or_default()
+}
+
+pub fn clear_unity_test_pending_sources_through(project_path: &str, seq_bound: u64) {
+    if let Ok(mut pending) = unity_test_pending_sources().lock() {
+        let project_key = normalized_path_key(project_path);
+        let remove_project = if let Some(state) = pending.get_mut(&project_key) {
+            state.paths.retain(|_, (_, seq)| *seq > seq_bound);
+            state.paths.is_empty()
+        } else {
+            false
+        };
+        if remove_project {
+            pending.remove(&project_key);
+        }
+    }
+}
+
+pub fn set_unity_test_tools_enabled(dir: &str, enabled: bool) -> Result<(), String> {
+    let config_path = workspace_config_path(dir);
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|error| format!("Failed to read workspace config: {error}"))?;
+    let mut value = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| format!("Failed to parse workspace config: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Workspace config must be a JSON object".to_string())?;
+    object.insert(
+        "unity_test_tools_enabled".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Failed to serialize workspace config: {error}"))?;
+    std::fs::write(&config_path, json)
+        .map_err(|error| format!("Failed to write workspace config: {error}"))
+}
+
 fn extract_unity_yaml_scalar(content: &str, key: &str) -> Option<String> {
     let prefix = format!("{}:", key);
     content.lines().find_map(|line| {
@@ -159,6 +348,7 @@ pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
             dir,
             &WorkspaceConfig {
                 workspace_id: workspace_id.clone(),
+                unity_test_tools_enabled: false,
             },
         )?;
     }
@@ -171,8 +361,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        generated_workspace_id, load_or_create_workspace, read_workspace_config, Workspace,
-        WorkspaceConfig,
+        clear_unity_test_pending_sources_through, generated_workspace_id,
+        load_or_create_workspace, note_unity_test_source_written, read_workspace_config,
+        set_unity_test_tools_enabled, unity_test_pending_source_snapshot,
+        unity_test_sources_pending, unity_test_tools_workspace_status, Workspace, WorkspaceConfig,
     };
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
@@ -187,17 +379,21 @@ mod tests {
         let legacy_cfg: WorkspaceConfig =
             serde_json::from_str(legacy).expect("legacy workspace config should parse");
         assert_eq!(legacy_cfg.workspace_id, "legacy-id");
+        assert!(!legacy_cfg.unity_test_tools_enabled);
 
-        let camel = r#"{"workspaceId":"camel-id","memory":{"enabled":false}}"#;
+        let camel =
+            r#"{"workspaceId":"camel-id","unityTestToolsEnabled":true,"memory":{"enabled":false}}"#;
         let camel_cfg: WorkspaceConfig =
             serde_json::from_str(camel).expect("camelCase workspace config should parse");
         assert_eq!(camel_cfg.workspace_id, "camel-id");
+        assert!(camel_cfg.unity_test_tools_enabled);
     }
 
     #[test]
     fn workspace_config_serializes_workspace_id_in_snake_case() {
         let cfg = WorkspaceConfig {
             workspace_id: "stable-id".to_string(),
+            unity_test_tools_enabled: true,
         };
         let value = serde_json::to_value(&cfg).expect("workspace config should serialize");
         assert_eq!(
@@ -205,7 +401,102 @@ mod tests {
             Some("stable-id")
         );
         assert!(value.get("workspaceId").is_none());
+        assert_eq!(
+            value
+                .get("unity_test_tools_enabled")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
         assert!(value.get("memory").is_none());
+    }
+
+    #[test]
+    fn unity_test_workspace_setting_preserves_unrelated_config_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let locus_dir = dir.path().join("Locus");
+        fs::create_dir_all(&locus_dir).unwrap();
+        fs::write(
+            locus_dir.join("config.json"),
+            r#"{"workspace_id":"stable","memory":{"enabled":true}}"#,
+        )
+        .unwrap();
+
+        set_unity_test_tools_enabled(&dir.path().to_string_lossy(), true).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(locus_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["unity_test_tools_enabled"], true);
+        assert_eq!(value["memory"]["enabled"], true);
+    }
+
+    #[test]
+    fn unity_test_tools_require_both_workspace_setting_and_installed_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let locus_dir = dir.path().join("Locus");
+        let packages_dir = dir.path().join("Packages");
+        fs::create_dir_all(&locus_dir).unwrap();
+        fs::create_dir_all(&packages_dir).unwrap();
+        fs::write(
+            locus_dir.join("config.json"),
+            r#"{"workspace_id":"stable","unity_test_tools_enabled":true}"#,
+        )
+        .unwrap();
+
+        let missing = unity_test_tools_workspace_status(&dir.path().to_string_lossy());
+        assert!(missing.enabled);
+        assert!(!missing.package_installed);
+        assert!(!missing.available);
+
+        fs::write(
+            packages_dir.join("packages-lock.json"),
+            r#"{"dependencies":{"com.unity.test-framework":{"version":"1.7.0"}}}"#,
+        )
+        .unwrap();
+        let installed = unity_test_tools_workspace_status(&dir.path().to_string_lossy());
+        assert!(installed.available);
+    }
+
+    #[test]
+    fn unity_test_source_edits_wait_for_explicit_convergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let locus_dir = dir.path().join("Locus");
+        let packages_dir = dir.path().join("Packages");
+        let tests_dir = dir.path().join("Assets").join("Tests");
+        fs::create_dir_all(&locus_dir).unwrap();
+        fs::create_dir_all(&packages_dir).unwrap();
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(
+            locus_dir.join("config.json"),
+            r#"{"workspace_id":"stable","unity_test_tools_enabled":true}"#,
+        )
+        .unwrap();
+        fs::write(
+            packages_dir.join("manifest.json"),
+            r#"{"dependencies":{"com.unity.test-framework":"1.1.33"}}"#,
+        )
+        .unwrap();
+
+        let project = dir.path().to_string_lossy().to_string();
+        let source = tests_dir.join("NewTest.cs").to_string_lossy().to_string();
+        note_unity_test_source_written(&project, &source);
+
+        assert!(unity_test_sources_pending(&project));
+        let (first_seq, first_paths) = unity_test_pending_source_snapshot(&project);
+        assert_eq!(first_paths, vec![source]);
+
+        let racing_source = tests_dir
+            .join("RacingTest.cs")
+            .to_string_lossy()
+            .to_string();
+        note_unity_test_source_written(&project, &racing_source);
+        clear_unity_test_pending_sources_through(&project, first_seq);
+        let (second_seq, remaining_paths) = unity_test_pending_source_snapshot(&project);
+        assert_eq!(remaining_paths, vec![racing_source]);
+        assert!(unity_test_sources_pending(&project));
+
+        clear_unity_test_pending_sources_through(&project, second_seq);
+        assert!(!unity_test_sources_pending(&project));
     }
 
     #[test]

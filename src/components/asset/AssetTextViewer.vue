@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { t } from "../../i18n";
 import hljs from "../../hljs";
 
@@ -7,9 +7,13 @@ const props = defineProps<{
   snippet: string;
   truncated: boolean;
   totalLines: number;
+  startLine?: number;
+  focusLine?: number | null;
+  highlightLineRanges?: Array<{ startLine: number; endLine: number }>;
   language?: string;
 }>();
 
+const bodyRef = ref<HTMLElement | null>(null);
 const lines = computed(() => props.snippet.split("\n"));
 const shownLines = computed(() => lines.value.length);
 const languageClass = computed(() => (props.language ? `language-${props.language}` : null));
@@ -27,6 +31,30 @@ const highlightedLines = computed(() => {
   }
   return highlighted.split("\n");
 });
+const firstLine = computed(() => Math.max(1, props.startLine ?? 1));
+
+function sourceLine(index: number): number {
+  return firstLine.value + index;
+}
+
+function isHighlightedLine(line: number): boolean {
+  return props.highlightLineRanges?.some(
+    (range) => line >= range.startLine && line <= range.endLine,
+  ) ?? false;
+}
+
+watch(
+  () => [props.focusLine, props.startLine, props.snippet] as const,
+  async () => {
+    if (!props.focusLine) return;
+    await nextTick();
+    const target = bodyRef.value?.querySelector<HTMLElement>(
+      `[data-line-number="${Math.max(1, Math.floor(props.focusLine))}"]`,
+    );
+    target?.scrollIntoView({ block: "center" });
+  },
+  { immediate: true },
+);
 
 function escapeHtml(source: string): string {
   return source.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -35,12 +63,17 @@ function escapeHtml(source: string): string {
 
 <template>
   <div class="atv-root">
-    <div class="atv-body">
+    <div ref="bodyRef" class="atv-body">
       <pre class="atv-pre hljs" :class="languageClass"><code><span
         v-for="(line, i) in highlightedLines"
         :key="i"
         class="atv-line"
-      ><span class="atv-ln">{{ i + 1 }}</span><span class="atv-text" v-html="line || ' '"></span>
+        :class="{
+          'is-focused': sourceLine(i) === focusLine,
+          'is-highlighted': isHighlightedLine(sourceLine(i)),
+        }"
+        :data-line-number="sourceLine(i)"
+      ><span class="atv-ln">{{ sourceLine(i) }}</span><span class="atv-text" v-html="line || ' '"></span>
 </span></code></pre>
     </div>
     <div v-if="truncated" class="atv-footer">
@@ -81,6 +114,15 @@ function escapeHtml(source: string): string {
 }
 .atv-line {
   display: flex;
+}
+.atv-line.is-focused {
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+}
+.atv-line.is-highlighted {
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+.atv-line.is-highlighted.is-focused {
+  box-shadow: inset 2px 0 0 var(--accent-color);
 }
 .atv-ln {
   flex-shrink: 0;

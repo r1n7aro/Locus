@@ -1584,7 +1584,6 @@ pub fn get_components_for_go(docs: &[YamlDoc], go_file_id: i64) -> Vec<usize> {
     result
 }
 
-/// guid_resolver: guid hex string → Option<asset path>
 pub fn format_doc_state_lines(doc: &YamlDoc) -> String {
     let mut out = String::new();
     if let Some(enabled) = doc.m_enabled {
@@ -1596,18 +1595,21 @@ pub fn format_doc_state_lines(doc: &YamlDoc) -> String {
     out
 }
 
+/// `external_resolver`: `(guid hex, fileID)` → readable asset/object path.
+/// The fileID is required for importer subassets because every object inside
+/// one FBX/texture shares the same GUID.
 pub fn resolve_references_in_lines(
     lines: &[&str],
     start: usize,
     end: usize,
-    guid_resolver: &dyn Fn(&str) -> Option<String>,
+    external_resolver: &dyn Fn(&str, Option<i64>) -> Option<String>,
     internal_resolver: &dyn Fn(i64) -> Option<String>,
 ) -> String {
     resolve_references_in_lines_skipping_fields(
         lines,
         start,
         end,
-        guid_resolver,
+        external_resolver,
         internal_resolver,
         &[],
     )
@@ -1617,7 +1619,7 @@ pub fn resolve_references_in_lines_skipping_fields(
     lines: &[&str],
     start: usize,
     end: usize,
-    guid_resolver: &dyn Fn(&str) -> Option<String>,
+    external_resolver: &dyn Fn(&str, Option<i64>) -> Option<String>,
     internal_resolver: &dyn Fn(i64) -> Option<String>,
     skipped_fields: &[&str],
 ) -> String {
@@ -1639,7 +1641,7 @@ pub fn resolve_references_in_lines_skipping_fields(
                 let complete = pending_line.take().unwrap();
                 out.push_str(&resolve_line_refs(
                     &complete,
-                    guid_resolver,
+                    external_resolver,
                     internal_resolver,
                 ));
                 out.push('\n');
@@ -1668,7 +1670,11 @@ pub fn resolve_references_in_lines_skipping_fields(
                 i += 1;
                 continue;
             }
-            out.push_str(&resolve_line_refs(line, guid_resolver, internal_resolver));
+            out.push_str(&resolve_line_refs(
+                line,
+                external_resolver,
+                internal_resolver,
+            ));
         } else {
             out.push_str(&format_decimal_line(line));
         }
@@ -1809,7 +1815,7 @@ fn format_decimal_line(line: &str) -> String {
 
 fn resolve_line_refs(
     line: &str,
-    guid_resolver: &dyn Fn(&str) -> Option<String>,
+    external_resolver: &dyn Fn(&str, Option<i64>) -> Option<String>,
     internal_resolver: &dyn Fn(i64) -> Option<String>,
 ) -> String {
     let bytes = line.as_bytes();
@@ -1826,7 +1832,7 @@ fn resolve_line_refs(
             if let Some(end) = find_closing_brace(bytes, i) {
                 result.push_str(&line[last..i]);
                 let block = &line[i..=end];
-                let resolved = resolve_single_ref(block, guid_resolver, internal_resolver);
+                let resolved = resolve_single_ref(block, external_resolver, internal_resolver);
                 result.push_str(&resolved);
                 i = end + 1;
                 last = i;
@@ -1842,31 +1848,34 @@ fn resolve_line_refs(
 
 fn resolve_single_ref(
     block: &str,
-    guid_resolver: &dyn Fn(&str) -> Option<String>,
+    external_resolver: &dyn Fn(&str, Option<i64>) -> Option<String>,
     internal_resolver: &dyn Fn(i64) -> Option<String>,
 ) -> String {
     let has_guid = block.contains("guid:");
     let has_file_id = block.contains("fileID:");
+    let file_id = if has_file_id {
+        extract_value(block, "fileID:")
+            .and_then(|value| value.trim().trim_end_matches(',').parse::<i64>().ok())
+    } else {
+        None
+    };
 
     if has_guid {
         if let Some(guid_str) = extract_value(block, "guid:") {
             let guid_hex = guid_str.trim().trim_end_matches(',');
-            if let Some(path) = guid_resolver(guid_hex) {
+            if let Some(path) = external_resolver(guid_hex, file_id) {
                 return format!("{{{}}}", path);
             }
             return format!("{{guid:{}}}", guid_hex);
         }
         "{unresolved external ref}".to_string()
     } else if has_file_id {
-        if let Some(fid_str) = extract_value(block, "fileID:") {
-            let fid_str = fid_str.trim().trim_end_matches(',');
-            if let Ok(fid) = fid_str.parse::<i64>() {
-                if fid == 0 {
-                    return "{none}".to_string();
-                }
-                if let Some(desc) = internal_resolver(fid) {
-                    return format!("{{{}}}", desc);
-                }
+        if let Some(fid) = file_id {
+            if fid == 0 {
+                return "{none}".to_string();
+            }
+            if let Some(desc) = internal_resolver(fid) {
+                return format!("{{{}}}", desc);
             }
         }
         "{unresolved internal ref}".to_string()
@@ -1888,6 +1897,7 @@ pub fn build_internal_id_map(docs: &[YamlDoc]) -> HashMap<i64, String> {
     let mut map: HashMap<i64, String> = HashMap::new();
 
     for doc in docs {
+        let display_label = format_doc_display_label(doc);
         let desc = if doc.class_id == 1 {
             let path = go_paths
                 .get(&doc.file_id)
@@ -1905,24 +1915,55 @@ pub fn build_internal_id_map(docs: &[YamlDoc]) -> HashMap<i64, String> {
                 .get(&go_id)
                 .cloned()
                 .unwrap_or_else(|| go_names.get(&go_id).copied().unwrap_or("?").to_string());
-            format!("{}.{}", go_path, doc.type_name)
+            format!("{}.{}", go_path, display_label)
         } else if doc.is_stripped {
             if let Some(pi_id) = doc.prefab_instance_id {
                 let pi_path = go_paths
                     .get(&pi_id)
                     .cloned()
                     .unwrap_or_else(|| go_names.get(&pi_id).copied().unwrap_or("?").to_string());
-                format!("{}.{} (stripped)", pi_path, doc.type_name)
+                format!("{}.{} (stripped)", pi_path, display_label)
             } else {
-                format!("{} (stripped)", doc.type_name)
+                format!("{} (stripped)", display_label)
             }
         } else {
-            doc.type_name.clone()
+            display_label
         };
         map.insert(doc.file_id, desc);
     }
 
     map
+}
+
+/// Human-facing label for a serialized document. Unity stores every scripted
+/// object under the generic `MonoBehaviour` YAML key, even when the object has
+/// a useful serialized name. Keep the engine type as secondary context while
+/// promoting that semantic name for headings and internal-reference labels.
+pub fn format_doc_display_label(doc: &YamlDoc) -> String {
+    let type_name = if doc.type_name.trim().is_empty() {
+        if doc.class_id == 114 {
+            "MonoBehaviour"
+        } else {
+            "Unknown"
+        }
+    } else {
+        doc.type_name.trim()
+    };
+
+    if doc.class_id != 114 && type_name != "MonoBehaviour" {
+        return type_name.to_string();
+    }
+
+    let Some(name) = doc
+        .m_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(type_name))
+    else {
+        return type_name.to_string();
+    };
+
+    format!("{} ({})", name, type_name)
 }
 
 pub fn collect_guids_from_lines(lines: &[&str], start: usize, end: usize) -> Vec<Guid> {

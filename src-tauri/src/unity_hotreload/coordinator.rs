@@ -158,6 +158,48 @@ fn file_key(file_path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn failure_file_inputs(
+    files: &[(String, String, String)],
+    per_file_reasons: &[(String, Vec<String>)],
+) -> Vec<super::failure_log::FailureFileInput> {
+    let reasons_by_path: HashMap<String, &Vec<String>> = per_file_reasons
+        .iter()
+        .map(|(path, reasons)| (file_key(path), reasons))
+        .collect();
+    files
+        .iter()
+        .map(
+            |(path, baseline_text, edited_text)| super::failure_log::FailureFileInput {
+                path: path.clone(),
+                baseline_text: baseline_text.clone(),
+                edited_text: edited_text.clone(),
+                reasons: reasons_by_path
+                    .get(&file_key(path))
+                    .map(|reasons| (*reasons).clone())
+                    .unwrap_or_default(),
+            },
+        )
+        .collect()
+}
+
+async fn record_failure_diagnostic(
+    project_path: &str,
+    domain_generation: Option<&str>,
+    stage: &str,
+    reason: &str,
+    files: &[(String, String, String)],
+    per_file_reasons: &[(String, Vec<String>)],
+) {
+    super::failure_log::record(super::failure_log::FailureInput {
+        project_path: project_path.to_string(),
+        domain_generation: domain_generation.map(str::to_string),
+        stage: stage.to_string(),
+        reason: reason.to_string(),
+        files: failure_file_inputs(files, per_file_reasons),
+    })
+    .await;
+}
+
 // ── per-project hot-patch counters & H6 automatic convergence ────────
 //
 // These tallies and the convergence state on `ProjectState` were once
@@ -2378,13 +2420,33 @@ async fn run_access_probe(
     project_path: &str,
     params: &crate::csharp_compile::CompileParams,
 ) -> Result<(crate::csharp_compile::AccessCaps, serde_json::Value), String> {
-    let (assembly_b64, cells) = crate::csharp_compile::compile_access_probe(params).await?;
+    let compiled = crate::csharp_compile::compile_access_probe(params).await?;
+    run_compiled_access_probe(project_path, compiled).await
+}
+
+async fn run_access_probe_with_mode(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    mode: crate::csharp_compile::NonPublicAccessProbeMode,
+) -> Result<(crate::csharp_compile::AccessCaps, serde_json::Value, bool), String> {
+    let compiled = crate::csharp_compile::compile_access_probe_with_mode(params, mode).await?;
+    let decl_security = compiled.skip_verification_decl_security;
+    let (caps, matrix) = run_compiled_access_probe(project_path, compiled).await?;
+    Ok((caps, matrix, decl_security))
+}
+
+async fn run_compiled_access_probe(
+    project_path: &str,
+    compiled: crate::csharp_compile::CompiledAccessProbe,
+) -> Result<(crate::csharp_compile::AccessCaps, serde_json::Value), String> {
+    let mode = compiled.mode;
 
     // Cell descriptors pass through verbatim (the sidecar already emits the
-    // lowercase method/op/visibility keys JsonUtility expects).
+    // lowercase method/op/visibility/expected keys JsonUtility expects).
     let payload = serde_json::json!({
-        "assembly_b64": assembly_b64,
-        "cells": cells,
+        "assembly_b64": compiled.assembly_b64,
+        "cells": compiled.cells,
+        "mode": mode.as_str(),
     })
     .to_string();
 
@@ -2565,6 +2627,36 @@ pub async fn access_probe_run(project_path: &str) -> Result<serde_json::Value, S
     }))
 }
 
+/// Integration-suite A/B entry: bypasses the production cache so every
+/// runtime policy is compiled, loaded, and executed independently in the
+/// current domain. Reload-boundary retries belong to the CLI driver.
+pub(crate) async fn access_probe_run_with_mode(
+    project_path: &str,
+    mode: crate::csharp_compile::NonPublicAccessProbeMode,
+) -> Result<serde_json::Value, String> {
+    if !crate::csharp_compile::is_enabled() {
+        return Err(
+            "the sidecar compiler is disabled; enable it in Settings > Code Analysis".to_string(),
+        );
+    }
+
+    let op_lock = crate::unity_bridge::project_unity_op_lock(project_path).await;
+    let _op_guard = op_lock.lock().await;
+    let params = crate::csharp_compile::params::get_params(project_path)
+        .await
+        .map_err(|error| format!("could not get compile params from Unity: {error}"))?;
+    let (caps, matrix, skip_verification_decl_security) =
+        run_access_probe_with_mode(project_path, &params, mode).await?;
+    Ok(serde_json::json!({
+        "cached": false,
+        "domainGeneration": params.domain_generation,
+        "mode": mode.as_str(),
+        "skipVerificationDeclSecurity": skip_verification_decl_security,
+        "caps": caps,
+        "matrix": matrix,
+    }))
+}
+
 // ── hot reload orchestration ─────────────────────────────────────────
 
 /// Outcome text for the `unity_hot_reload` tool. `Err` carries agent-facing
@@ -2701,11 +2793,16 @@ pub async fn hot_reload(
         return Ok(converge_after_session_loss(project_path, &changed_keys).await);
     }
 
-    let params = crate::csharp_compile::params::get_params(project_path)
-        .await
-        .map_err(|error| {
-            format!("Could not get compile params from Unity ({error}); use unity_recompile.")
-        })?;
+    let params = match crate::csharp_compile::params::get_params(project_path).await {
+        Ok(params) => params,
+        Err(error) => {
+            let reason =
+                format!("Could not get compile params from Unity ({error}); use unity_recompile.");
+            record_failure_diagnostic(project_path, None, "compile_params", &reason, &files, &[])
+                .await;
+            return Err(reason);
+        }
+    };
 
     // The generation/serial trackers are maintained solely by
     // `observe_reload_state` (the monitor samples every poll while connected),
@@ -2742,14 +2839,36 @@ pub async fn hot_reload(
         Ok(outcome) => outcome,
         Err(error) => {
             record_patch_failure(project_path).await;
-            return Err(format!(
-                "Compile server unavailable ({error}); use unity_recompile."
-            ));
+            let reason = format!("Compile server unavailable ({error}); use unity_recompile.");
+            record_failure_diagnostic(
+                project_path,
+                Some(&params.domain_generation),
+                "compile_server",
+                &reason,
+                &files,
+                &[],
+            )
+            .await;
+            return Err(reason);
         }
     };
 
     match outcome {
         crate::csharp_compile::HotPatchOutcome::Cold { files: cold_files } => {
+            let failure_reason = cold_files
+                .iter()
+                .map(|(path, reasons)| format!("{path}: {}", reasons.join("; ")))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            record_failure_diagnostic(
+                project_path,
+                Some(&params.domain_generation),
+                "classification",
+                &failure_reason,
+                &files,
+                &cold_files,
+            )
+            .await;
             let mut lines = vec![
                 "Hot reload not applicable — these edits change structure (signatures, fields, \
                  types), which needs a real compile:"
@@ -2797,7 +2916,18 @@ pub async fn hot_reload(
             }
             Ok(summary)
         }
-        crate::csharp_compile::HotPatchOutcome::CompileError(message) => Err(message),
+        crate::csharp_compile::HotPatchOutcome::CompileError(message) => {
+            record_failure_diagnostic(
+                project_path,
+                Some(&params.domain_generation),
+                "compile",
+                &message,
+                &files,
+                &[],
+            )
+            .await;
+            Err(message)
+        }
         crate::csharp_compile::HotPatchOutcome::Compiled {
             assembly_name,
             assembly_b64,
@@ -2848,6 +2978,15 @@ pub async fn hot_reload(
                 Err(error) => {
                     queue_cold_paths(project_path, &changed_keys).await;
                     crate::csharp_compile::emit_status_in_background();
+                    record_failure_diagnostic(
+                        project_path,
+                        Some(&params.domain_generation),
+                        "unity_apply",
+                        &error,
+                        &files,
+                        &[],
+                    )
+                    .await;
                     return Err(error);
                 }
             };
@@ -3055,6 +3194,29 @@ pub async fn hot_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_file_inputs_attach_reasons_by_normalized_path() {
+        let files = vec![(
+            r"C:\Project\Assets\Replay.cs".to_string(),
+            "class Replay { int Value => 1; }".to_string(),
+            "class Replay { int Value => 2; }".to_string(),
+        )];
+        let reasons = vec![(
+            "c:/project/assets/replay.cs".to_string(),
+            vec!["patched body references non-public surface".to_string()],
+        )];
+
+        let inputs = failure_file_inputs(&files, &reasons);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].baseline_text, "class Replay { int Value => 1; }");
+        assert_eq!(inputs[0].edited_text, "class Replay { int Value => 2; }");
+        assert_eq!(
+            inputs[0].reasons,
+            vec!["patched body references non-public surface"]
+        );
+    }
 
     #[test]
     fn message_driver_gate_passes_when_supported_and_clean() {

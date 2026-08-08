@@ -1,0 +1,33 @@
+{
+    "name": "Locus.UnityTesting.Editor",
+    "rootNamespace": "",
+    "references": [
+        "Locus.Editor",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "LOCUS_HAS_UNITY_TEST_FRAMEWORK"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.test-framework",
+            "expression": "1.1.0",
+            "define": "LOCUS_HAS_UNITY_TEST_FRAMEWORK"
+        },
+        {
+            "name": "com.unity.test-framework",
+            "expression": "2.0.0",
+            "define": "LOCUS_HAS_UNITY_TEST_CANCEL"
+        }
+    ],
+    "noEngineReferences": false
+}

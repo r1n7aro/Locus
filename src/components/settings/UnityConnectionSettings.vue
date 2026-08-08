@@ -17,15 +17,145 @@ import {
   type UnityStateProbeStatus,
 } from "../../services/csharpLsp";
 import {
+  getUnityExternalEditorDefaultEnabled,
   getUnityBackgroundHookStatus,
+  setUnityExternalEditorDefaultEnabled,
   setUnityBackgroundHookEnabled,
 } from "../../services/system";
+import {
+  getUnityEmbedEnabled,
+  getUnityTestToolsWorkspaceStatus,
+  setUnityEmbedEnabled,
+  setUnityTestToolsWorkspaceEnabled,
+  type UnityTestToolsWorkspaceStatus,
+} from "../../services/unity";
 import type { UnityBackgroundHookStatus, UnityNativeBrokerStatus } from "../../types";
 import { useNotificationStore } from "../../stores/notification";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const notificationStore = useNotificationStore();
+
+const externalEditorDefaultEnabled = ref(false);
+const externalEditorDefaultReady = ref(false);
+const externalEditorDefaultBusy = ref(false);
+
+async function refreshExternalEditorDefaultEnabled() {
+  try {
+    externalEditorDefaultEnabled.value = await getUnityExternalEditorDefaultEnabled();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadUnityExternalEditorDefault",
+      replaceOperation: true,
+    });
+  } finally {
+    externalEditorDefaultReady.value = true;
+  }
+}
+
+async function toggleExternalEditorDefaultEnabled() {
+  if (!externalEditorDefaultReady.value || externalEditorDefaultBusy.value) return;
+  externalEditorDefaultBusy.value = true;
+  try {
+    externalEditorDefaultEnabled.value = await setUnityExternalEditorDefaultEnabled(
+      !externalEditorDefaultEnabled.value,
+    );
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnityExternalEditorDefault",
+      replaceOperation: true,
+    });
+    await refreshExternalEditorDefaultEnabled();
+  } finally {
+    externalEditorDefaultBusy.value = false;
+  }
+}
+
+const unityEmbedEnabled = ref(true);
+const unityEmbedReady = ref(false);
+const unityEmbedBusy = ref(false);
+
+async function refreshUnityEmbedEnabled() {
+  try {
+    unityEmbedEnabled.value = await getUnityEmbedEnabled();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadUnityEmbedEnabled",
+      replaceOperation: true,
+    });
+  } finally {
+    unityEmbedReady.value = true;
+  }
+}
+
+async function toggleUnityEmbedEnabled() {
+  if (!unityEmbedReady.value || unityEmbedBusy.value) return;
+  unityEmbedBusy.value = true;
+  try {
+    unityEmbedEnabled.value = await setUnityEmbedEnabled(!unityEmbedEnabled.value);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnityEmbedEnabled",
+      replaceOperation: true,
+    });
+    await refreshUnityEmbedEnabled();
+  } finally {
+    unityEmbedBusy.value = false;
+  }
+}
+
+const unityTestToolsStatus = ref<UnityTestToolsWorkspaceStatus | null>(null);
+const unityTestToolsReady = ref(false);
+const unityTestToolsBusy = ref(false);
+
+const unityTestToolsDescription = computed(() => {
+  const status = unityTestToolsStatus.value;
+  if (!status) return t("common.loading");
+  if (!status.enabled) return t("settings.unityConnection.unityTestDisabled");
+  if (!status.packageInstalled) return t("settings.unityConnection.unityTestPackageMissing");
+  return t("settings.unityConnection.unityTestReady");
+});
+
+async function refreshUnityTestToolsStatus() {
+  try {
+    unityTestToolsStatus.value = await getUnityTestToolsWorkspaceStatus();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadUnityTestToolsWorkspaceStatus",
+      replaceOperation: true,
+    });
+  } finally {
+    unityTestToolsReady.value = true;
+  }
+}
+
+async function toggleUnityTestToolsEnabled(value: boolean) {
+  if (!unityTestToolsReady.value || unityTestToolsBusy.value) return;
+  unityTestToolsBusy.value = true;
+  try {
+    unityTestToolsStatus.value = await setUnityTestToolsWorkspaceEnabled(value);
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleUnityTestToolsWorkspace",
+      replaceOperation: true,
+    });
+    await refreshUnityTestToolsStatus();
+  } finally {
+    unityTestToolsBusy.value = false;
+  }
+}
 
 // ── native plugin bridge ─────────────────────────────────────────────
 
@@ -300,6 +430,9 @@ async function toggleBackgroundHookEnabled() {
 }
 
 onMounted(() => {
+  void refreshExternalEditorDefaultEnabled();
+  void refreshUnityEmbedEnabled();
+  void refreshUnityTestToolsStatus();
   void refreshNativeBridgeStatus();
   void subscribeUnityNativeBridgeSelfTest((payload) => {
     nativeTestRunning.value = payload.running && !payload.finished;
@@ -348,6 +481,72 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.unityConnection.scriptEditorTitle") }}</div>
+    <div class="tool-card">
+      <div class="tool-row master-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.unityConnection.scriptEditorLabel") }}</span>
+          <span class="tool-desc">{{ t("settings.unityConnection.scriptEditorDesc") }}</span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="externalEditorDefaultReady"
+            :model-value="externalEditorDefaultEnabled"
+            :disabled="externalEditorDefaultBusy"
+            :aria-label="t('settings.unityConnection.scriptEditorLabel')"
+            @update:model-value="toggleExternalEditorDefaultEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.unityConnection.embedTitle") }}</div>
+    <div class="tool-card">
+      <div class="tool-row master-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.unityConnection.embedLabel") }}</span>
+          <span class="tool-desc">{{ t("settings.unityConnection.embedDesc") }}</span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="unityEmbedReady"
+            :model-value="unityEmbedEnabled"
+            :disabled="unityEmbedBusy"
+            :aria-label="t('settings.unityConnection.embedLabel')"
+            @update:model-value="toggleUnityEmbedEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.unityConnection.unityTestTitle") }}</div>
+    <div class="tool-card">
+      <div class="tool-row master-row">
+        <div class="tool-info">
+          <span class="tool-name">{{ t("settings.unityConnection.unityTestLabel") }}</span>
+          <span class="tool-desc">{{ unityTestToolsDescription }}</span>
+        </div>
+        <div class="master-actions">
+          <BaseSwitch
+            v-if="unityTestToolsReady"
+            :model-value="unityTestToolsStatus?.enabled ?? false"
+            :disabled="unityTestToolsBusy"
+            :aria-label="t('settings.unityConnection.unityTestLabel')"
+            @update:model-value="toggleUnityTestToolsEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="settings-section">
     <div class="section-label">{{ t("settings.testing.nativeBridge") }}</div>
     <p class="section-desc">{{ t("settings.testing.nativeBridgeDesc") }}</p>

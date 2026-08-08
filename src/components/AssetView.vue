@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref } from "vue";
+import { computed, defineAsyncComponent, ref, watch } from "vue";
 import { useAssetState } from "../composables/useAssetState";
+import { useUiStore } from "../stores/ui";
 import { t } from "../i18n";
 import AssetExplorer from "./asset/AssetExplorer.vue";
 import AssetLegacyExplorer from "./asset/AssetLegacyExplorer.vue";
@@ -17,6 +18,7 @@ const AssetPreviewHost = defineAsyncComponent(
 const props = defineProps<{
   workingDir: string;
 }>();
+const uiStore = useUiStore();
 
 const {
   error,
@@ -44,6 +46,7 @@ const {
   runFilenameSearch,
   updateSearchScope,
   selectFromSearchResult,
+  openAssetPath,
   visibleDirectoryEntries,
   currentFolderLoading,
   currentFolderLoaded,
@@ -52,6 +55,7 @@ const {
   previewNode,
   previewLoading,
   previewError,
+  previewFocusLine,
   activeTargetId,
   targetCache,
   targetLoading,
@@ -65,6 +69,22 @@ const {
   onResizeStart,
   onDirectoryResizeStart,
 } = useAssetState(props);
+
+function normalizeProjectPath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
+}
+
+watch(
+  () => [uiStore.pendingAssetOpen?.id ?? null, props.workingDir] as const,
+  async () => {
+    const pending = uiStore.pendingAssetOpen;
+    if (!pending || !props.workingDir.trim()) return;
+    if (normalizeProjectPath(pending.projectPath) !== normalizeProjectPath(props.workingDir)) return;
+    const opened = await openAssetPath(pending.assetPath, pending.line);
+    if (opened) uiStore.clearPendingAssetOpen(pending.id);
+  },
+  { immediate: true },
+);
 
 type AssetLayoutMode = "single" | "double";
 
@@ -187,6 +207,7 @@ const layoutToggleTitle = computed(() => (
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"
+              :focus-line="previewFocusLine"
               :selected-name="previewDisplayName"
               :selected-path="previewDisplayPath"
               :active-target-id="activeTargetId"
@@ -296,6 +317,7 @@ const layoutToggleTitle = computed(() => (
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"
+              :focus-line="previewFocusLine"
               :selected-name="previewDisplayName"
               :selected-path="previewDisplayPath"
               :active-target-id="activeTargetId"

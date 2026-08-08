@@ -284,7 +284,7 @@ MonoBehaviour:
     let text = String::from_utf8_lossy(yaml);
     let lines: Vec<&str> = text.lines().collect();
     let docs = parse_yaml_docs(yaml);
-    let guid_resolver = |_hex: &str| -> Option<String> { None };
+    let guid_resolver = |_hex: &str, _file_id: Option<i64>| -> Option<String> { None };
     let internal_resolver = |_fid: i64| -> Option<String> { None };
 
     let rendered = resolve_references_in_lines_skipping_fields(
@@ -544,7 +544,7 @@ MonoBehaviour:
     let text = String::from_utf8_lossy(yaml);
     let lines: Vec<&str> = text.lines().collect();
 
-    let guid_resolver = |hex: &str| -> Option<String> {
+    let guid_resolver = |hex: &str, _file_id: Option<i64>| -> Option<String> {
         if hex == "aabbccdd11223344aabbccdd11223344" {
             Some("Assets/Scripts/PlayerController.cs".to_string())
         } else {
@@ -578,11 +578,16 @@ MonoBehaviour:
     let text = String::from_utf8_lossy(yaml);
     let lines: Vec<&str> = text.lines().collect();
 
-    let guid_resolver = |hex: &str| -> Option<String> {
-        if hex == "aabbccdd11223344aabbccdd11223344" {
-            Some("Assets/Animations/Idle.anim".to_string())
-        } else {
-            None
+    let guid_resolver = |hex: &str, file_id: Option<i64>| -> Option<String> {
+        if hex != "aabbccdd11223344aabbccdd11223344" {
+            return None;
+        }
+        match file_id {
+            Some(11500000) => Some("Assets/Animations/Idle.anim".to_string()),
+            Some(4041797215495687746) => {
+                Some("Assets/Models/Hero.fbx/Light_DashAttack.1".to_string())
+            }
+            _ => None,
         }
     };
 
@@ -599,10 +604,9 @@ MonoBehaviour:
         resolved.contains("Assets/Animations/Idle.anim"),
         "single-line ref should resolve"
     );
-    let multiline_count = resolved.matches("Assets/Animations/Idle.anim").count();
-    assert_eq!(
-        multiline_count, 2,
-        "both single-line and multi-line refs should resolve, got:\n{}",
+    assert!(
+        resolved.contains("Assets/Models/Hero.fbx/Light_DashAttack.1"),
+        "multi-line subasset ref should resolve by fileID, got:\n{}",
         resolved
     );
     assert!(
@@ -1077,6 +1081,10 @@ PrefabInstance:
       propertyPath: m_IsActive
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 200, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Animation
+      value:
+      objectReference: {fileID: 7400000, guid: ccccddddccccddddccccddddccccdddd, type: 3}
   m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
 "#;
     let docs = parse_yaml_docs(yaml);
@@ -1086,12 +1094,18 @@ PrefabInstance:
     let ir = &irs[0];
 
     let resolver = |_: &Guid| -> Option<String> { None };
+    let object_resolver = |guid: &Guid, file_id: i64| -> Option<String> {
+        (guid_to_hex(guid) == "ccccddddccccddddccccddddccccdddd" && file_id == 7400000)
+            .then(|| "Assets/Models/Hero.fbx/Light_DashAttack.1".to_string())
+    };
     let stripped = extract_stripped_mappings(&docs, &lines);
-    let detail = format_prefab_instance_detail(ir, &resolver, None, &stripped);
+    let detail = format_prefab_instance_detail(ir, &resolver, &object_resolver, None, &stripped);
 
     assert!(detail.contains("=== Detail: DetailTest"));
     assert!(detail.contains("m_Name = DetailTest"));
     assert!(detail.contains("m_IsActive = 0"));
+    assert!(detail.contains("m_Animation"));
+    assert!(detail.contains("{Assets/Models/Hero.fbx/Light_DashAttack.1}"));
     assert!(
         !detail.contains("fileID"),
         "detail leaked fileID:\n{}",
@@ -1983,7 +1997,7 @@ fn test_decimal_display_preserves_small_values() {
     // float-noise like 0.30000001192092896 to 0.3.
     let yaml = "--- !u!114 &100\nMonoBehaviour:\n  intensity: 0.001\n  weight: 0.30000001192092896\n  tiny: 1.5e-07\n  plain: 3.14\n";
     let lines: Vec<&str> = yaml.lines().collect();
-    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|_| None);
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_, _| None, &|_| None);
     assert!(out.contains("intensity: 0.001"), "got: {out}");
     assert!(out.contains("weight: 0.3\n"), "got: {out}");
     assert!(
@@ -2001,7 +2015,7 @@ fn test_cjk_key_with_trailing_space_does_not_panic() {
     // (issue #97 class). C# permits CJK identifiers, so these keys are real.
     let yaml = "--- !u!114 &100\nMonoBehaviour:\n  血量: 1.5 \n  攻击力: 0.30000001192092896 \n";
     let lines: Vec<&str> = yaml.lines().collect();
-    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|_| None);
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_, _| None, &|_| None);
     assert!(out.contains("血量"), "CJK key preserved intact, got: {out}");
     assert!(out.contains("攻击力: 0.3"), "got: {out}");
 }
@@ -2013,7 +2027,7 @@ fn test_cjk_field_next_to_reference_not_mangled() {
     // into Latin-1 mojibake.
     let yaml = "--- !u!114 &100\nMonoBehaviour:\n  目标对象: {fileID: 200}\n";
     let lines: Vec<&str> = yaml.lines().collect();
-    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_| None, &|fid| {
+    let out = resolve_references_in_lines(&lines, 2, lines.len(), &|_, _| None, &|fid| {
         (fid == 200).then(|| "GO:Player".to_string())
     });
     assert!(out.contains("目标对象: {GO:Player}"), "got: {out}");

@@ -97,6 +97,7 @@ export function useAssetState(props: AssetProps) {
   const previewNode = ref<AssetPreviewFileNode | null>(null);
   const previewLoading = ref(false);
   const previewError = ref("");
+  const previewFocusLine = ref<number | null>(null);
   const activeTargetId = ref<string | null>(null);
   const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
   const targetLoading = ref(false);
@@ -114,6 +115,7 @@ export function useAssetState(props: AssetProps) {
     previewNode.value = null;
     previewLoading.value = false;
     previewError.value = "";
+    previewFocusLine.value = null;
     activeTargetId.value = null;
     targetCache.value = new Map();
     targetLoading.value = false;
@@ -637,8 +639,53 @@ export function useAssetState(props: AssetProps) {
     }
   }
 
+  function normalizeOpenAssetPath(path: string): string | null {
+    const normalized = path.trim().replace(/\\/g, "/");
+    if (!normalized) return null;
+    const workspace = props.workingDir.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+    const relative = normalized.toLowerCase().startsWith(`${workspace.toLowerCase()}/`)
+      ? normalized.slice(workspace.length + 1)
+      : normalized.replace(/^\/+/, "");
+    return FIXED_ROOTS.some((root) => relative === root || relative.startsWith(`${root}/`))
+      ? relative
+      : null;
+  }
+
+  async function openAssetPath(path: string, focusLine?: number): Promise<boolean> {
+    if (!hasWorkspace.value) return false;
+    const assetPath = normalizeOpenAssetPath(path);
+    if (!assetPath) return false;
+
+    selectedSearchKey.value = null;
+    await expandToPath(assetPath);
+    await materializePath(assetPath);
+    const parentPath = parentFolderPath(assetPath);
+    if (parentPath) {
+      await selectFolder(parentPath, {
+        preservePreview: true,
+        revealInTree: "ancestors",
+      });
+    }
+    let node = findNodeByPath(assetPath);
+    if (!node) {
+      const segments = assetPath.split("/").filter(Boolean);
+      node = {
+        kind: "file",
+        name: segments[segments.length - 1] ?? assetPath,
+        path: assetPath,
+        depth: Math.max(0, segments.length - 1),
+      };
+    }
+    if (node.kind !== "file") return false;
+
+    selectedNode.value = node;
+    viewMode.value = "preview";
+    await loadPreview(node, focusLine);
+    return true;
+  }
+
   // ── Preview ──────────────────────────────────────────────
-  async function loadPreview(file: string | AssetPreviewFileNode) {
+  async function loadPreview(file: string | AssetPreviewFileNode, focusLine?: number) {
     const nextNode = toPreviewFileNode(file);
     if (!hasWorkspace.value) {
       invalidatePreviewSession();
@@ -649,6 +696,9 @@ export function useAssetState(props: AssetProps) {
     const keepCurrentPreview = previewPayload.value !== null;
     previewLoading.value = true;
     previewError.value = "";
+    previewFocusLine.value = focusLine != null && Number.isFinite(focusLine)
+      ? Math.max(1, Math.floor(focusLine))
+      : null;
     targetLoading.value = false;
     if (!keepCurrentPreview) {
       previewNode.value = nextNode;
@@ -657,7 +707,10 @@ export function useAssetState(props: AssetProps) {
       targetCache.value = new Map();
     }
     try {
-      const payload = await previewWorkspaceAsset(nextNode.path);
+      const payload = await previewWorkspaceAsset(
+        nextNode.path,
+        previewFocusLine.value ?? undefined,
+      );
       if (session !== previewSession) return;
       previewPayload.value = payload;
       previewNode.value = nextNode;
@@ -1045,6 +1098,7 @@ export function useAssetState(props: AssetProps) {
     previewNode,
     previewLoading,
     previewError,
+    previewFocusLine,
     activeTargetId,
     targetCache,
     targetLoading,
@@ -1065,6 +1119,7 @@ export function useAssetState(props: AssetProps) {
     runFilenameSearch,
     updateSearchScope,
     selectFromSearchResult,
+    openAssetPath,
     loadPreview,
     loadTarget,
     refreshDbOverview,

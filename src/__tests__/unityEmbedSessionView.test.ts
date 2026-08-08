@@ -125,7 +125,8 @@ describe("Unity embedded session view", () => {
 
     expect(unityWindow).toContain("private const double ResizeSyncIntervalSeconds = 1d / 60d;");
     expect(unityWindow).toContain("private const double ResizeBoostDurationSeconds = 0.35d;");
-    expect(unityWindow).toContain("resizeBoostActive ? ResizeSyncIntervalSeconds : SyncIntervalSeconds");
+    expect(unityWindow).toContain("? ResizeSyncIntervalSeconds");
+    expect(unityWindow).toContain("InactiveSyncIntervalSeconds");
     expect(unityWindow).toContain("MarkResizeSyncBoost();");
   });
 
@@ -173,6 +174,37 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("cancel_transient_close_destroy(&label);");
   });
 
+  it("detaches embedded WebViews before closing Unity for a plugin update", () => {
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const workspace = read("src-tauri/src/commands/workspace.rs");
+
+    expect(command).toContain("pub(crate) struct UnityEmbedQuiesceGuard");
+    expect(command).toContain("pub(crate) async fn quiesce_unity_embed_control_windows");
+    expect(command).toContain("run_on_main_thread");
+    expect(command).toContain("UNITY_EMBED_QUIESCE_TIMEOUT");
+    expect(command).toContain("fn quiesce_unity_embed_control_windows_on_main");
+    expect(command).toContain("windows_impl::prepare_for_editor_shutdown();");
+    expect(command).toContain("windows_impl::quiesce_owned_overlay(&window)");
+    expect(command).toContain("SetParent(child, None)");
+    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, 0)");
+    expect(command).toContain("let _ = ShowWindow(child, SW_HIDE);");
+    expect(command).toContain("record_all_embed_windows_quiesced();");
+    expect(command).toContain("received_while_quiesced");
+    expect(command).toContain("unity_embed_control_epoch() != expected_epoch");
+
+    const quiesceCall = workspace.indexOf(
+      "let unity_embed_quiesce = super::quiesce_unity_embed_control_windows(&app_handle).await?;",
+    );
+    const installCall = workspace.indexOf(
+      "let install_result = crate::unity_bridge::install_or_update_plugin_with_force_close(",
+      quiesceCall,
+    );
+    const releaseCall = workspace.indexOf("drop(unity_embed_quiesce);", installCall);
+    expect(quiesceCall).toBeGreaterThan(-1);
+    expect(installCall).toBeGreaterThan(quiesceCall);
+    expect(releaseCall).toBeGreaterThan(installCall);
+  });
+
   it("suppresses Windows mouse activation for the embedded overlay outside the composer", () => {
     const view = read("src/components/UnityEmbeddedSessionView.vue");
     const service = read("src/services/unity.ts");
@@ -198,7 +230,9 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("MouseActivationState");
     expect(command).toContain("guard_enabled");
     expect(command).toContain("const USE_CHILD_EMBED_OVERLAY: bool = true;");
-    expect(command).toContain("return position_popup_overlay(window, msg);");
+    expect(command).toContain("PopupSyncMode::Intentional");
+    expect(command).toContain("PopupSyncMode::Recoverable");
+    expect(command).toContain("OverlayMountOutcome::DeferredParent");
     expect(command).toContain("transient_unity_embed_parent_owner");
     expect(command).toContain("position_transient_parent_overlay");
     expect(command).toContain("position_popup_overlay_with_owner");
@@ -228,14 +262,16 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("collect_descendant_windows");
     expect(command).toContain("GW_CHILD");
     expect(command).toContain("mouse_hook_sync_loop");
+    expect(command).toContain("reconcile_mouse_activate_hooks");
+    expect(command).toContain("current_hwnds.difference(&previous_hwnds)");
     expect(command).toContain("activate_for_input");
     expect(command).toContain("focus_embed_window_for_input");
     expect(command).toContain("AttachThreadInput");
     expect(command).toContain("SetKeyboardFocus");
     expect(command).toContain("COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC");
     expect(command).toContain("controller.MoveFocus");
-    expect(command).toContain("for (label, window) in windows");
-    expect(command).toContain("if !synced_any || !is_activation_guard_enabled()");
+    expect(command).toContain("MOUSE_HOOK_ROOT_COUNT");
+    expect(command).toContain("mouse_hook_sync_notify().notified()");
     expect(command).toContain("mouse_activate_hook_installed");
     expect(command).toContain("mouse_activate_hooked_hwnd_count");
     expect(command).toContain("mouse_activate_block_count");
@@ -253,7 +289,10 @@ describe("Unity embedded session view", () => {
   it("sends the current Unity host HWND for child-window mounting", () => {
     const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
 
-    expect(unityWindow).toContain("GetUnityHostHwnd(_screenX, _screenY, _screenWidth, _screenHeight)");
+    expect(unityWindow).toContain("parentHwnd = GetUnityHostHwnd(");
+    expect(unityWindow).toContain("forceHostProbe);");
+    expect(unityWindow).toContain("IsUnityHostWindowForRect");
+    expect(unityWindow).toContain("IsUnityProcessForeground");
     expect(unityWindow).toContain("FindUnityHostWindowForRect");
     expect(unityWindow).toContain("EnumWindows");
     expect(unityWindow).toContain("GetWindowThreadProcessId");
@@ -265,6 +304,9 @@ describe("Unity embedded session view", () => {
 
     expect(command).toContain("sync_popup_overlay_z_order(parent, child, target_rect);");
     expect(command).toContain("fn sync_popup_overlay_z_order");
+    expect(command).toContain("if decision.positioned");
+    expect(command).toContain("SetWinEventHook");
+    expect(command).toContain("popup_sync_notify().notified()");
     expect(command).toContain("SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE");
   });
 
@@ -380,6 +422,10 @@ describe("Unity embedded session view", () => {
     expect(service).toContain("subscribeUnityEmbedAssetDragState");
     expect(registry).toContain('name: "/unity-console"');
     expect(registry).toContain('commandType: "unity-console"');
+    expect(registry).toContain('name: "/console-error"');
+    expect(registry).toContain('commandType: "unity-console-error"');
+    expect(service).toContain("filterUnityConsoleErrorPayload");
+    expect(input).toContain('attachUnityConsoleFromCommand("error")');
     expect(service).not.toContain("[Locus][UnityEmbedDrag]");
     expect(view).toContain("@dragover.capture=\"handleUnityAssetDrag\"");
     expect(view).toContain("@drop.capture=\"handleUnityAssetDrop\"");
@@ -463,6 +509,7 @@ describe("Unity embedded session view", () => {
     const chat = read("src/components/ChatView.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const assetChip = read("src/components/AssetChip.vue");
+    const knowledgeOpen = read("src/composables/useKnowledgeDocumentOpen.ts");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
@@ -487,7 +534,7 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain("doAssetRefOpenInKnowledge");
     expect(chat).toContain("function handleKnowledgeRefClick");
     expect(chat).toContain("knowledgeRevealTarget({");
-    expect(chat).toContain("uiStore.stageKnowledgeSelection({");
+    expect(chat).toContain("openKnowledgeDocumentInKnowledge(target.docType, target.path)");
     expect(chat).toContain("openFileExternal(target.filePath)");
     expect(chat).toContain("showInFolder(target.filePath)");
     expect(chat).toContain("navigator.clipboard.writeText(path)");
@@ -498,7 +545,9 @@ describe("Unity embedded session view", () => {
     expect(assetChip).toContain(':data-ref-kind="effectiveKind"');
     expect(assetChip).toContain(":data-knowledge-type=\"knowledgeRef?.docType\"");
     expect(assetChip).toContain(":data-knowledge-path=\"knowledgeRef?.path\"");
-    expect(assetChip).toContain("uiStore.setTab(\"knowledge\")");
+    expect(assetChip).toContain("await openKnowledgeDocument(knowledgeRef.value.docType");
+    expect(knowledgeOpen).toContain("uiStore.stageKnowledgeSelection({");
+    expect(knowledgeOpen).toContain('uiStore.setTab("knowledge")');
     expect(assetChip).toContain(':data-asset-path="effectiveKind === \'asset\' ? normalizedPath : undefined"');
     expect(assetChip).toContain(":data-scene-path=\"sceneObjectRef?.scenePath\"");
     expect(assetChip).toContain('contextMenuMode?: "copyPath" | "inherit";');

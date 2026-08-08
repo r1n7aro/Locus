@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json.Nodes;
+using Microsoft.CodeAnalysis.CSharp;
 using Xunit;
 
 namespace Locus.CompileServer.Tests;
@@ -193,6 +194,64 @@ public class CompileServiceTests
         string error = result["error"]!.GetValue<string>();
         Assert.StartsWith("compilation failed:\n", error);
         Assert.Contains("\n\nexpression fallback:\ncompilation failed:\n", error);
+    }
+
+    [Fact]
+    public void Sync_snippet_wrapper_allows_ref_locals_under_csharp9()
+    {
+        const string body = "var values = new[] { 41 };\n" +
+            "ref int value = ref values[0];\n" +
+            "value++;\n" +
+            "print(value);";
+        var parseOptions = new CSharpParseOptions(LanguageVersion.CSharp9);
+        bool useAsyncWrapper = UnitySnippetSource.RequiresAsyncWrapper(body, parseOptions);
+        Assert.False(useAsyncWrapper);
+
+        string wrapper = UnitySnippetSource.BuildAsyncSnippetSource(
+            UnitySnippetSource.HostTypeName,
+            "",
+            body,
+            expressionMode: false,
+            useAsyncWrapper: useAsyncWrapper);
+        const string hostStubs = @"
+namespace UnityEngine
+{
+    public class Object { }
+    namespace SceneManagement { public sealed class Scene { } }
+}
+namespace UnityEditor
+{
+    namespace SceneManagement { public sealed class EditorSceneManager { } }
+    namespace Animations { public sealed class AnimatorController { } }
+}
+namespace Locus
+{
+    public static class LocusBridge
+    {
+        public sealed class ScriptGlobals
+        {
+            public void print(object value) { }
+            public void printJson(object value) { }
+            public void clear() { }
+        }
+
+        public sealed class ExecuteCodeContext
+        {
+            public void ThrowIfCancellationRequested() { }
+        }
+    }
+}";
+
+        var service = new CompileService();
+        JsonNode result = service.HandleCompileRaw(new JsonObject
+        {
+            ["sources"] = new JsonArray(
+                new JsonObject { ["path"] = UnitySnippetSource.SourcePath, ["text"] = wrapper },
+                new JsonObject { ["path"] = "SnippetHostStubs.cs", ["text"] = hostStubs }),
+            ["useHostBcl"] = true,
+        });
+
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
     }
 
     [Fact]

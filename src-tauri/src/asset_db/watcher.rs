@@ -3013,8 +3013,7 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.dequeue(&stop), Some((asset_path.to_string(), false)));
-        process_dirty_asset(asset_path, &root, &state, &stop, false)
-            .expect("process stale resync");
+        process_dirty_asset(asset_path, &root, &state, &stop, false).expect("process stale resync");
 
         mtime_scan_once(&queue, &stop, &state, &root, &activity, true);
         assert_eq!(queue.len(), 0);
@@ -3207,8 +3206,7 @@ mod tests {
         // resync) takes the unchanged-content fast path, which must still
         // refresh the stored mtimes — otherwise the 60 s sweep re-flags the
         // path on every round, forever.
-        let root =
-            std::env::temp_dir().join(format!("locus-watcher-fastpath-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("locus-watcher-fastpath-{}", Uuid::new_v4()));
         std::fs::create_dir_all(root.join("Assets/Prefabs")).expect("create temp assets");
         let content = b"%YAML 1.1\n--- !u!1 &1000\nGameObject:\n  m_Name: Hero\n";
         write_asset(
@@ -3243,10 +3241,9 @@ mod tests {
         // The skip must leave the indexed rows fully queryable.
         let guard = state.lock().expect("lock graph");
         let graph = guard.as_ref().expect("graph exists");
-        let freshness =
-            db::get_stored_asset_freshness(&graph.conn, "Assets/Prefabs/Hero.prefab")
-                .expect("read freshness")
-                .expect("asset row exists");
+        let freshness = db::get_stored_asset_freshness(&graph.conn, "Assets/Prefabs/Hero.prefab")
+            .expect("read freshness")
+            .expect("asset row exists");
         assert!(freshness.exists_on_disk);
         assert_eq!(freshness.content_hash, hash128(content));
 

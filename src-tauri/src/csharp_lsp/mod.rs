@@ -552,17 +552,30 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
     let (connected, _, _) = crate::unity_bridge::query_unity_status(&workspace).await;
     if connected {
         server.set_phase_unthrottled(Phase::GeneratingProjectFiles);
-        match crate::unity_bridge::unity_execute_code(
-            &workspace,
-            &unity_sync::editor_sync_snippet(),
-        )
-        .await
-        {
+        match crate::unity_bridge::sync_project_files(&workspace).await {
             Ok(output) => eprintln!(
-                "[CsharpLsp] editor project-file sync: {}",
+                "[CsharpLsp] Locus project-file sync: {}",
                 output.replace('\n', " | ")
             ),
-            Err(error) => eprintln!("[CsharpLsp] editor project-file sync failed: {error}"),
+            Err(error) => {
+                eprintln!(
+                    "[CsharpLsp] Locus project-file sync unavailable ({error}); trying compatibility sync"
+                );
+                match crate::unity_bridge::unity_execute_code(
+                    &workspace,
+                    &unity_sync::editor_sync_snippet(),
+                )
+                .await
+                {
+                    Ok(output) => eprintln!(
+                        "[CsharpLsp] compatibility project-file sync: {}",
+                        output.replace('\n', " | ")
+                    ),
+                    Err(error) => {
+                        eprintln!("[CsharpLsp] compatibility project-file sync failed: {error}")
+                    }
+                }
+            }
         }
         for _ in 0..10 {
             if let Some(target) = scan_project_target(root) {
@@ -571,9 +584,8 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         return Err(
-            "The connected Unity editor did not produce .sln/.csproj. In Unity, set an \
-             external script editor (Edit > Preferences > External Tools, e.g. Visual Studio \
-             or Rider) and click 'Regenerate project files', then retry."
+            "The connected Unity editor did not produce .sln/.csproj. Update the Locus Unity \
+             plugin and ensure a Unity IDE project-generator package is installed, then retry."
                 .to_string(),
         );
     }
@@ -584,7 +596,7 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
     unity_sync::generate_headless(root).await?;
     scan_project_target(root).ok_or_else(|| {
         "Unity batch generation finished but no .sln/.csproj appeared in the workspace root. \
-         Open the project in Unity once with an external script editor configured, then retry."
+         Open the project in Unity once with the Locus plugin installed, then retry."
             .to_string()
     })
 }

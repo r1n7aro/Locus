@@ -1307,6 +1307,8 @@ pub struct AssetTextPreview {
     /// Total lines in the file (informational; lets the frontend display
     /// "showing 200 / 1245 lines").
     pub total_lines: u32,
+    /// One-based line number represented by the first line in `snippet`.
+    pub start_line: u32,
     /// Lowercase language identifier (e.g. "csharp", "json", "yaml").
     /// `None` when the extension does not map to a known language.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1678,7 +1680,7 @@ fn resolve_workspace_path(
 /// count; when truncated it is the lower-bound shown count. We deliberately do
 /// not scan the rest of the file just to compute a precise total — that would
 /// reintroduce the DoS we just fixed.
-fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
+fn read_text_snippet(path: &Path, focus_line: Option<u32>) -> Result<AssetTextPreview, AppError> {
     use std::io::{BufRead, BufReader, Read};
 
     let file = std::fs::File::open(path).map_err(|e| {
@@ -1689,10 +1691,32 @@ fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
     })?;
     let mut reader = BufReader::new(file);
 
+    let requested_line = focus_line.unwrap_or(1).max(1);
+    let start_line = if requested_line > TEXT_SNIPPET_MAX_LINES as u32 / 2 {
+        requested_line.saturating_sub(50).max(1)
+    } else {
+        1
+    };
+    let mut skipped_lines: u32 = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    while skipped_lines < start_line.saturating_sub(1) {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).map_err(|e| {
+            AppError::new(
+                "asset.preview.read_failed",
+                format!("Failed to seek to source line: {}", e),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        skipped_lines = skipped_lines.saturating_add(1);
+    }
+
+    let actual_start_line = skipped_lines.saturating_add(1);
     let mut snippet = String::with_capacity(TEXT_SNIPPET_MAX_BYTES.min(8 * 1024));
     let mut emitted_lines: u32 = 0;
-    let mut truncated = false;
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut truncated = skipped_lines > 0;
 
     loop {
         if (emitted_lines as usize) >= TEXT_SNIPPET_MAX_LINES {
@@ -1757,7 +1781,8 @@ fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
     Ok(AssetTextPreview {
         snippet,
         truncated,
-        total_lines: emitted_lines,
+        total_lines: skipped_lines.saturating_add(emitted_lines),
+        start_line: actual_start_line,
         language,
     })
 }
@@ -2760,6 +2785,7 @@ pub async fn render_workspace_asset_preview_frame(
 #[tauri::command]
 pub async fn preview_workspace_asset(
     file_path: String,
+    focus_line: Option<u32>,
     workspace: State<'_, Arc<Workspace>>,
     ref_graph_state: State<'_, AssetDbState>,
     binary_cache: State<'_, Arc<BinaryCache>>,
@@ -2787,7 +2813,7 @@ pub async fn preview_workspace_asset(
         // Text path: read snippet inline. (Slice 3a does not yet share state
         // with `commands::knowledge::preview_workspace_file`; the snippet
         // budgets are matched manually so users see consistent output.)
-        let preview = read_text_snippet(&canonical)?;
+        let preview = read_text_snippet(&canonical, focus_line)?;
         return Ok(AssetPreviewPayload::Text(preview));
     }
 
@@ -2869,6 +2895,23 @@ mod tests {
                 false
             }
         }
+    }
+
+    #[test]
+    fn text_preview_centers_the_requested_source_line() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let path = temp.path().join("LongScript.cs");
+        let source = (1..=300)
+            .map(|line| format!("// line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, source).expect("write script");
+
+        let preview = read_text_snippet(&path, Some(250)).expect("preview script");
+        assert_eq!(preview.start_line, 200);
+        assert!(preview.snippet.contains("// line 250"));
+        assert!(!preview.snippet.contains("// line 1\n"));
+        assert!(preview.truncated);
     }
 
     fn test_yaml_doc(doc_index: usize) -> YamlDoc {

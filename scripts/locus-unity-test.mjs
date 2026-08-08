@@ -39,6 +39,12 @@ for (let index = 0; index < args.length; index += 1) {
 
 const bun = process.execPath;
 
+// Keep the integration driver from silently exercising an old sidecar after
+// compile-server request/response changes. This is deliberately explicit even
+// though Tauri's beforeDevCommand performs the same check: the test launcher is
+// an independent contract and should remain safe if the Tauri hook changes.
+await runRequired(bun, ["run", "compile-server:ensure"]);
+
 if (prepareUnityBundle) {
   await runRequired(bun, ["run", "unity:bundle"]);
 } else if (prepareNative) {
@@ -91,7 +97,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | all
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | unity-test | all
                               hot-reload-release runs Release first, then switches to Debug at runtime and runs again
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all

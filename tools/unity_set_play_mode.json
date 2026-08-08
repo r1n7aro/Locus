@@ -1,0 +1,14 @@
+{
+  "description": "Set the connected Unity Editor to Play Mode or Edit Mode and wait until the requested mode is reached. Use this tool whenever the task only needs to start, resume, or stop Play Mode. Reserve `unity_execute` for C# operations that inspect or change Unity objects, assets, scenes, or editor data.\n\n`play` starts Play Mode from Edit Mode and resumes the Editor when Play Mode is paused. `edit` stops Play Mode, including paused Play Mode. Calling the tool when Unity already matches the requested mode succeeds without changing state.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["play", "edit"],
+        "description": "Target Unity mode. `play` starts or resumes Play Mode; `edit` stops Play Mode and returns to Edit Mode."
+      }
+    },
+    "required": ["mode"]
+  }
+}

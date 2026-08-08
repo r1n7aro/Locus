@@ -1658,7 +1658,7 @@ async fn observe_project_once_with_native_broker_status(
     // on the pipe — so the native signal is available even while the pipe is
     // silent.
     let (pipe_probe, process) = tokio::join!(
-        super::query_unity_status_response_with_timeout(
+        super::try_query_unity_status_response_with_timeout(
             project_path,
             std::time::Duration::from_millis(800)
         ),
@@ -1701,6 +1701,10 @@ async fn observe_project_once_with_native_broker_status(
             );
         }
         Ok(None) => {
+            // Reaching the writer try-lock requires a successfully resolved
+            // pipe connection. Preserve liveness while recording that the
+            // control channel is momentarily occupied.
+            pipe_connected = true;
             control_channel_state = "busy".to_string();
             pipe_error =
                 Some("Unity status poll skipped because the pipe writer is busy".to_string());

@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -101,6 +103,11 @@ public sealed class CompileSnippetRequestDto
 
     [JsonPropertyName("returnAssemblyPath")]
     public bool ReturnAssemblyPath { get; set; }
+
+    /// <summary>Diagnostic-only compiler/runtime policy used by the Unity
+    /// integration suite. See <see cref="NonPublicAccessProbeMode"/>.</summary>
+    [JsonPropertyName("nonPublicAccessProbeMode")]
+    public string? NonPublicAccessProbeMode { get; set; }
 }
 
 public sealed class CompileRunStatesRequestDto
@@ -119,6 +126,10 @@ public sealed class CompileRunStatesRequestDto
 
     [JsonPropertyName("returnAssemblyPath")]
     public bool ReturnAssemblyPath { get; set; }
+
+    /// <summary>See <see cref="CompileSnippetRequestDto.NonPublicAccessProbeMode"/>.</summary>
+    [JsonPropertyName("nonPublicAccessProbeMode")]
+    public string? NonPublicAccessProbeMode { get; set; }
 }
 
 public sealed class CompileViewScriptRequestDto
@@ -313,13 +324,18 @@ public sealed class CompileAccessProbeRequestDto
 {
     [JsonPropertyName("params")]
     public CompileParamsDto? Params { get; set; }
+
+    /// <summary>Runtime-bypass variant. Omitted keeps the production C0 probe's
+    /// historical IgnoresAccessChecksTo-only behavior.</summary>
+    [JsonPropertyName("nonPublicAccessProbeMode")]
+    public string? NonPublicAccessProbeMode { get; set; }
 }
 
 // ── service ──────────────────────────────────────────────────────────
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 6;
+    public const int ProtocolVersion = 8;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -328,7 +344,53 @@ public sealed class CompileService
     /// </summary>
     public const int WrapperContractVersion = 1;
 
+    public const string AccessProbeCompilerOnly = "compiler_only";
+    public const string AccessProbeIgnoresAccessChecksTo = "ignores_access_checks_to";
+    public const string AccessProbeSkipVerification = "skip_verification";
+    public const string AccessProbeCombined = "combined";
+
     private static readonly UTF8Encoding Utf8NoBom = new(false);
+
+    private readonly record struct NonPublicAccessProbeOptions(
+        bool Enabled,
+        bool EmitIgnoresAccessChecksTo,
+        bool EmitSkipVerification,
+        string Mode);
+
+    private static bool TryResolveNonPublicAccessProbeOptions(
+        string? mode,
+        bool accessProbeDefault,
+        out NonPublicAccessProbeOptions options,
+        out string? error)
+    {
+        string? normalized = string.IsNullOrWhiteSpace(mode)
+            ? (accessProbeDefault ? AccessProbeIgnoresAccessChecksTo : null)
+            : mode.Trim().ToLowerInvariant();
+        options = normalized switch
+        {
+            null => new(false, false, false, "none"),
+            AccessProbeCompilerOnly => new(true, false, false, AccessProbeCompilerOnly),
+            AccessProbeIgnoresAccessChecksTo => new(true, true, false, AccessProbeIgnoresAccessChecksTo),
+            AccessProbeSkipVerification => new(true, false, true, AccessProbeSkipVerification),
+            AccessProbeCombined => new(true, true, true, AccessProbeCombined),
+            _ => default,
+        };
+        if (normalized is null || options.Enabled)
+        {
+            error = null;
+            return true;
+        }
+
+        error = "unknown nonPublicAccessProbeMode '" + mode + "'; expected one of: " +
+            string.Join(", ", new[]
+            {
+                AccessProbeCompilerOnly,
+                AccessProbeIgnoresAccessChecksTo,
+                AccessProbeSkipVerification,
+                AccessProbeCombined,
+            });
+        return false;
+    }
 
     /// <summary>Mirror of the Unity-side SnippetCompilationOptions.</summary>
     private static readonly CSharpCompilationOptions SnippetCompilationOptions = new(
@@ -512,17 +574,28 @@ public sealed class CompileService
         long startedAt = Environment.TickCount64;
 
         UnitySnippetSource.SplitLeadingUsings(request.Code, out string leadingUsings, out string bodyCode);
+        bool useAsyncWrapper = UnitySnippetSource.RequiresAsyncWrapper(
+            bodyCode,
+            ResolveParseOptions(request.Params));
 
         // Same two-attempt semantics as the Unity-side CompileAsyncSnippet:
         // statement mode first, expression mode as the fallback, errors of
         // both attempts combined in the legacy format.
         var (bytes, assemblyName, primaryError) = CompileSnippetAttempt(
-            request, leadingUsings, bodyCode, expressionMode: false);
+            request,
+            leadingUsings,
+            bodyCode,
+            expressionMode: false,
+            useAsyncWrapper: useAsyncWrapper);
         if (bytes != null)
             return SnippetSuccessResult(bytes, assemblyName!, "statements", request, startedAt);
 
         var (fallbackBytes, fallbackAssemblyName, fallbackError) = CompileSnippetAttempt(
-            request, leadingUsings, bodyCode, expressionMode: true);
+            request,
+            leadingUsings,
+            bodyCode,
+            expressionMode: true,
+            useAsyncWrapper: useAsyncWrapper);
         if (fallbackBytes != null)
             return SnippetSuccessResult(fallbackBytes, fallbackAssemblyName!, "expression", request, startedAt);
 
@@ -604,7 +677,8 @@ public sealed class CompileService
             source,
             RunStatesSource.SourcePath,
             request.Params,
-            request.ReferenceSessionImages);
+            request.ReferenceSessionImages,
+            request.NonPublicAccessProbeMode);
 
         if (bytes == null)
             return FailureResult(error!, "compile", startedAt);
@@ -614,6 +688,8 @@ public sealed class CompileService
 
         JsonNode result = SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
         result["entryType"] = RunStatesSource.FullHostTypeName;
+        if (!string.IsNullOrWhiteSpace(request.NonPublicAccessProbeMode))
+            result["nonPublicAccessProbeMode"] = request.NonPublicAccessProbeMode;
         return result;
     }
 
@@ -1600,63 +1676,48 @@ public sealed class CompileService
 
     /// <summary>
     /// C0: compile the fixed access-probe source (AccessProbeSource) against
-    /// the project's reference set, with the same accessibility suppression
-    /// as hot patches (IgnoreAccessibility + IgnoresAccessChecksTo tree +
-    /// MetadataImportOptions.All; allowUnsafe stays false). No diff/rewrite,
-    /// no session images, and NO image registration: the assembly is loaded
-    /// once on the Unity side, JIT-probed, and never referenced again. The
-    /// assembly name deliberately avoids the __LocusHotPatch_ prefix — it
-    /// must not be skipped by the Unity original-type resolution, and it
-    /// never enters the patch registries.
+    /// the project's reference set. The request selects compiler-only,
+    /// IgnoresAccessChecksTo, SkipVerification, or their combination while
+    /// every variant shares MetadataImportOptions.All + IgnoreAccessibility.
+    /// No diff/rewrite, no session images, and no image registration: Unity
+    /// loads each assembly once, executes every cell, and discards it at the
+    /// next domain reload.
     /// </summary>
     public JsonNode HandleCompileAccessProbe(JsonNode? @params)
     {
         var request = Deserialize<CompileAccessProbeRequestDto>(@params);
         long startedAt = Environment.TickCount64;
 
-        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
-        ImmutableArray<MetadataReference> references = ResolveReferences(request.Params, useHostBcl: false);
-
-        var trees = new List<SyntaxTree>
+        if (!TryResolveNonPublicAccessProbeOptions(
+                request.NonPublicAccessProbeMode,
+                accessProbeDefault: true,
+                out NonPublicAccessProbeOptions accessProbe,
+                out string? accessProbeError))
         {
-            CSharpSyntaxTree.ParseText(
-                AccessProbeSource.BuildSource(),
-                parseOptions,
-                path: AccessProbeSource.SourcePath,
-                encoding: Utf8NoBom),
-            BuildAccessChecksTree(ReferenceAssemblyNames(references), parseOptions),
-        };
+            return FailureResult(accessProbeError!, "validation", startedAt);
+        }
+
+        CSharpParseOptions parseOptions = ResolveParseOptions(request.Params);
+        SyntaxTree probeTree = CSharpSyntaxTree.ParseText(
+            AccessProbeSource.BuildSource(),
+            parseOptions,
+            path: AccessProbeSource.SourcePath,
+            encoding: Utf8NoBom);
 
         string assemblyName = NextAssemblyName("AccessProbe", request.Params?.DomainGeneration);
+        var (bytes, error) = EmitCompilation(
+            assemblyName,
+            new[] { probeTree },
+            request.Params,
+            useHostBcl: false,
+            referenceSessionImages: false,
+            nonPublicAccessProbeMode: accessProbe.Mode);
+        if (bytes == null)
+            return FailureResult(error!, "compile", startedAt);
 
-        CSharpCompilationOptions options = SnippetCompilationOptions
-            .WithMetadataImportOptions(MetadataImportOptions.All);
-        ApplyIgnoreAccessibility(options);
-
-        CSharpCompilation compilation = CSharpCompilation.Create(
-            assemblyName: assemblyName,
-            syntaxTrees: trees,
-            references: references,
-            options: options);
-
-        using var peStream = new MemoryStream(64 * 1024);
-        EmitResult emitResult;
-        try
-        {
-            emitResult = compilation.Emit(peStream, options: LightweightEmitOptions);
-        }
-        catch (Exception ex)
-        {
-            return FailureResult("emit failed: " + ex, "compile", startedAt);
-        }
-
-        if (!emitResult.Success)
-        {
-            string? text = DiagnosticText.BuildDiagnosticErrorText(emitResult.Diagnostics);
-            return FailureResult(text ?? "unknown compilation failure", "compile", startedAt);
-        }
-
-        JsonNode result = SuccessResult(peStream.ToArray(), assemblyName, startedAt);
+        JsonNode result = SuccessResult(bytes, assemblyName, startedAt);
+        result["nonPublicAccessProbeMode"] = accessProbe.Mode;
+        result["skipVerificationDeclSecurity"] = accessProbe.EmitSkipVerification;
         var cells = new JsonArray();
         foreach (AccessProbeCell cell in AccessProbeSource.Cells)
         {
@@ -1665,6 +1726,7 @@ public sealed class CompileService
                 ["method"] = cell.Method,
                 ["op"] = cell.Op,
                 ["visibility"] = cell.Visibility,
+                ["expected"] = cell.Expected,
             });
         }
         result["cells"] = cells;
@@ -2829,6 +2891,70 @@ namespace System.Runtime.CompilerServices
     }
 
     /// <summary>
+    /// Mono-specific assembly declaration: Mono's JIT treats a non-GAC
+    /// assembly requesting SkipVerification as `dont_verify`, which gates the
+    /// CLI member-visibility checks. Roslyn emits this security attribute into
+    /// the DeclSecurity metadata table rather than CustomAttribute.
+    /// </summary>
+    private static SyntaxTree BuildSkipVerificationTree(CSharpParseOptions parseOptions)
+    {
+        const string source = @"
+#pragma warning disable 618
+#pragma warning disable SYSLIB0003
+[assembly: global::System.Security.Permissions.SecurityPermissionAttribute(
+    global::System.Security.Permissions.SecurityAction.RequestMinimum,
+    SkipVerification = true)]
+";
+        return CSharpSyntaxTree.ParseText(
+            source,
+            parseOptions,
+            path: "LocusSkipVerification.cs",
+            encoding: Utf8NoBom);
+    }
+
+    private static bool BlobContains(byte[] blob, string value, Encoding encoding)
+    {
+        byte[] needle = encoding.GetBytes(value);
+        return blob.AsSpan().IndexOf(needle) >= 0;
+    }
+
+    /// <summary>Fail the experiment closed when Roslyn accepted the source but
+    /// did not encode the Mono-recognized RequestMinimum permission set.</summary>
+    private static string? ValidateSkipVerificationDeclSecurity(byte[] peBytes)
+    {
+        try
+        {
+            using var stream = new MemoryStream(peBytes, writable: false);
+            using var pe = new PEReader(stream);
+            if (!pe.HasMetadata)
+                return "skip_verification probe emitted an assembly without metadata";
+
+            MetadataReader metadata = pe.GetMetadataReader();
+            foreach (DeclarativeSecurityAttributeHandle handle in metadata.DeclarativeSecurityAttributes)
+            {
+                DeclarativeSecurityAttribute declaration = metadata.GetDeclarativeSecurityAttribute(handle);
+                if (declaration.Action != System.Reflection.DeclarativeSecurityAction.RequestMinimum)
+                    continue;
+
+                byte[] blob = metadata.GetBlobBytes(declaration.PermissionSet);
+                bool namesPermission =
+                    BlobContains(blob, "System.Security.Permissions.SecurityPermissionAttribute", Encoding.UTF8) ||
+                    BlobContains(blob, "System.Security.Permissions.SecurityPermissionAttribute", Encoding.Unicode);
+                bool requestsSkip =
+                    BlobContains(blob, "SkipVerification", Encoding.UTF8) ||
+                    BlobContains(blob, "SkipVerification", Encoding.Unicode);
+                if (namesPermission && requestsSkip)
+                    return null;
+            }
+            return "skip_verification probe did not emit RequestMinimum/SkipVerification DeclSecurity metadata";
+        }
+        catch (Exception ex)
+        {
+            return "skip_verification DeclSecurity validation failed: " + ex.Message;
+        }
+    }
+
+    /// <summary>
     /// Flip Roslyn's internal TopLevelBinderFlags to IgnoreAccessibility
     /// (1 &lt;&lt; 22): the established mechanism for compiling code that
     /// reaches private members of referenced assemblies, paired with the
@@ -2862,10 +2988,15 @@ namespace System.Runtime.CompilerServices
         CompileSnippetRequestDto request,
         string leadingUsings,
         string bodyCode,
-        bool expressionMode)
+        bool expressionMode,
+        bool useAsyncWrapper)
     {
         string source = UnitySnippetSource.BuildAsyncSnippetSource(
-            UnitySnippetSource.HostTypeName, leadingUsings, bodyCode, expressionMode);
+            UnitySnippetSource.HostTypeName,
+            leadingUsings,
+            bodyCode,
+            expressionMode,
+            useAsyncWrapper);
         // Keep the legacy "__LocusRuntimeAsync_" prefix: the Unity-side type
         // index skips snippet assemblies by that prefix, and a different name
         // would invalidate (and force a full re-export of) the type index
@@ -2877,7 +3008,8 @@ namespace System.Runtime.CompilerServices
             source,
             UnitySnippetSource.SourcePath,
             request.Params,
-            request.ReferenceSessionImages);
+            request.ReferenceSessionImages,
+            request.NonPublicAccessProbeMode);
 
         return (bytes, bytes != null ? assemblyName : null, error);
     }
@@ -2895,6 +3027,8 @@ namespace System.Runtime.CompilerServices
         JsonNode result = SuccessResult(bytes, assemblyName, startedAt, request.ReturnAssemblyPath);
         result["entryType"] = UnitySnippetSource.FullHostTypeName;
         result["mode"] = mode;
+        if (!string.IsNullOrWhiteSpace(request.NonPublicAccessProbeMode))
+            result["nonPublicAccessProbeMode"] = request.NonPublicAccessProbeMode;
         return result;
     }
 
@@ -2910,7 +3044,8 @@ namespace System.Runtime.CompilerServices
         string source,
         string sourcePath,
         CompileParamsDto? compileParams,
-        bool referenceSessionImages)
+        bool referenceSessionImages,
+        string? nonPublicAccessProbeMode = null)
     {
         CSharpParseOptions parseOptions = ResolveParseOptions(compileParams);
 
@@ -2928,7 +3063,13 @@ namespace System.Runtime.CompilerServices
             return (null, "parse failed: " + ex);
         }
 
-        return EmitCompilation(assemblyName, new[] { syntaxTree }, compileParams, useHostBcl: false, referenceSessionImages);
+        return EmitCompilation(
+            assemblyName,
+            new[] { syntaxTree },
+            compileParams,
+            useHostBcl: false,
+            referenceSessionImages,
+            nonPublicAccessProbeMode: nonPublicAccessProbeMode);
     }
 
     private (byte[]? Bytes, string? Error) CompileSources(
@@ -2992,8 +3133,18 @@ namespace System.Runtime.CompilerServices
         bool useHostBcl,
         bool referenceSessionImages,
         DiagnosticStyle style = DiagnosticStyle.Snippet,
-        bool emitDebugSymbols = false)
+        bool emitDebugSymbols = false,
+        string? nonPublicAccessProbeMode = null)
     {
+        if (!TryResolveNonPublicAccessProbeOptions(
+                nonPublicAccessProbeMode,
+                accessProbeDefault: false,
+                out NonPublicAccessProbeOptions accessProbe,
+                out string? accessProbeError))
+        {
+            return (null, accessProbeError);
+        }
+
         ImmutableArray<MetadataReference> references = ResolveReferences(compileParams, useHostBcl);
         if (referenceSessionImages)
         {
@@ -3002,11 +3153,34 @@ namespace System.Runtime.CompilerServices
                 references = references.AddRange(images);
         }
 
+        IReadOnlyList<SyntaxTree> compilationTrees = trees;
+        CSharpCompilationOptions compilationOptions = SnippetCompilationOptions;
+        if (accessProbe.Enabled)
+        {
+            // Compiler half of every variant: import and bind private/internal
+            // metadata. Runtime declarations are independently composable so
+            // the integration suite can attribute the winning mechanism.
+            var expandedTrees = new List<SyntaxTree>(trees);
+            CSharpParseOptions parseOptions = ResolveParseOptions(compileParams);
+            if (accessProbe.EmitIgnoresAccessChecksTo)
+            {
+                expandedTrees.Add(BuildAccessChecksTree(
+                    ReferenceAssemblyNames(references),
+                    parseOptions));
+            }
+            if (accessProbe.EmitSkipVerification)
+                expandedTrees.Add(BuildSkipVerificationTree(parseOptions));
+            compilationTrees = expandedTrees;
+            compilationOptions = compilationOptions
+                .WithMetadataImportOptions(MetadataImportOptions.All);
+            ApplyIgnoreAccessibility(compilationOptions);
+        }
+
         CSharpCompilation compilation = CSharpCompilation.Create(
             assemblyName: assemblyName,
-            syntaxTrees: trees,
+            syntaxTrees: compilationTrees,
             references: references,
-            options: SnippetCompilationOptions);
+            options: compilationOptions);
 
         using var peStream = new MemoryStream(64 * 1024);
         EmitResult emitResult;
@@ -3028,7 +3202,15 @@ namespace System.Runtime.CompilerServices
             return (null, text ?? "unknown compilation failure");
         }
 
-        return (peStream.ToArray(), null);
+        byte[] peBytes = peStream.ToArray();
+        if (accessProbe.EmitSkipVerification)
+        {
+            string? validationError = ValidateSkipVerificationDeclSecurity(peBytes);
+            if (validationError != null)
+                return (null, validationError);
+        }
+
+        return (peBytes, null);
     }
 
     // ── references / options ─────────────────────────────────────────

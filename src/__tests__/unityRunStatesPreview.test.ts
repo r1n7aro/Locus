@@ -148,8 +148,8 @@ describe("unityRunStatesPreview", () => {
     expect(stateProperties.variables.description).toContain("state's start, update, and end");
     expect(definition.description).toContain("ctx.Global<T>");
     expect(definition.description).toContain("100000 estimated tokens");
-    expect(definition.description).toContain("knowledge_read");
-    expect(definition.description).toContain("skill/profiler.md");
+    expect(definition.description).toContain("knowledge_query");
+    expect(definition.description).toContain("use `read`");
     expect(read("knowledge/skill/profiler.md")).toContain("Unity Profiler Runtime Sampling");
     const runStatesBridge = read("locus_unity/Editor/LocusBridge.RunStates.cs");
     const profilerSkill = read("knowledge/skill/profiler.md");

@@ -12,6 +12,7 @@ using System.Runtime.CompilerServices;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
 using Assembly = System.Reflection.Assembly;
 
@@ -798,15 +799,28 @@ namespace Locus
             string leadingUsings;
             string bodyCode;
             SplitLeadingUsings(code, out leadingUsings, out bodyCode);
+            bool useAsyncWrapper = RequiresAsyncWrapper(bodyCode, SnippetParseOptions);
 
             CompiledAsyncSnippet snippet;
             string primaryError;
 
-            if (TryCompileAsyncSnippet(bodyCode, leadingUsings, false, out snippet, out primaryError))
+            if (TryCompileAsyncSnippet(
+                    bodyCode,
+                    leadingUsings,
+                    false,
+                    useAsyncWrapper,
+                    out snippet,
+                    out primaryError))
                 return snippet;
 
             string fallbackError;
-            if (TryCompileAsyncSnippet(bodyCode, leadingUsings, true, out snippet, out fallbackError))
+            if (TryCompileAsyncSnippet(
+                    bodyCode,
+                    leadingUsings,
+                    true,
+                    useAsyncWrapper,
+                    out snippet,
+                    out fallbackError))
                 return snippet;
 
             var sb = new StringBuilder();
@@ -830,6 +844,7 @@ namespace Locus
             string bodyCode,
             string leadingUsings,
             bool expressionMode,
+            bool useAsyncWrapper,
             out CompiledAsyncSnippet snippet,
             out string error)
         {
@@ -839,7 +854,12 @@ namespace Locus
             const string hostTypeName = "__LocusAsyncSnippetHost";
             const string fullTypeName = "Locus.RuntimeSnippets.__LocusAsyncSnippetHost";
 
-            string source = BuildAsyncSnippetSource(hostTypeName, leadingUsings, bodyCode, expressionMode);
+            string source = BuildAsyncSnippetSource(
+                hostTypeName,
+                leadingUsings,
+                bodyCode,
+                expressionMode,
+                useAsyncWrapper);
 
             SyntaxTree syntaxTree;
             try
@@ -924,11 +944,46 @@ namespace Locus
             }
         }
 
+        private static bool RequiresAsyncWrapper(
+            string bodyCode,
+            CSharpParseOptions parseOptions)
+        {
+            if (string.IsNullOrWhiteSpace(bodyCode))
+                return false;
+
+            StatementSyntax body = SyntaxFactory.ParseStatement(
+                "{\n" + bodyCode + "\n}",
+                options: parseOptions,
+                consumeFullText: true);
+            return ContainsTopLevelAwait(body);
+        }
+
+        private static bool ContainsTopLevelAwait(SyntaxNode node)
+        {
+            if (node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax)
+                return false;
+
+            foreach (SyntaxToken token in node.ChildTokens())
+            {
+                if (token.IsKind(SyntaxKind.AwaitKeyword))
+                    return true;
+            }
+
+            foreach (SyntaxNode child in node.ChildNodes())
+            {
+                if (ContainsTopLevelAwait(child))
+                    return true;
+            }
+
+            return false;
+        }
+
         private static string BuildAsyncSnippetSource(
             string hostTypeName,
             string leadingUsings,
             string bodyCode,
-            bool expressionMode)
+            bool expressionMode,
+            bool useAsyncWrapper)
         {
             var sb = new StringBuilder(4096);
 
@@ -956,7 +1011,21 @@ namespace Locus
             sb.AppendLine("{");
             sb.Append("    public static class ").Append(hostTypeName).AppendLine();
             sb.AppendLine("    {");
-            sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+
+            if (useAsyncWrapper)
+            {
+                sb.AppendLine("        public static async global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+            }
+            else
+            {
+                sb.AppendLine("        public static global::System.Threading.Tasks.Task<object> ExecuteAsync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+                sb.AppendLine("        {");
+                sb.AppendLine("            return global::System.Threading.Tasks.Task.FromResult<object>(ExecuteSync(globals, ctx, cancellationToken));");
+                sb.AppendLine("        }");
+                sb.AppendLine();
+                sb.AppendLine("        private static object ExecuteSync(global::Locus.LocusBridge.ScriptGlobals globals, global::Locus.LocusBridge.ExecuteCodeContext ctx, global::System.Threading.CancellationToken cancellationToken)");
+            }
+
             sb.AppendLine("        {");
             sb.AppendLine("            var print = new global::System.Action<object>(globals.print);");
             sb.AppendLine("            var printJson = new global::System.Action<object>(globals.printJson);");
@@ -1285,6 +1354,15 @@ namespace Locus
                     throw new ArgumentNullException("predicate");
 
                 return new ExecuteCodeFrameAwaitable(this, 0, 0, predicate);
+            }
+
+            public ConsoleLogResult GetConsoleLog(string level = null, int limit = 50)
+            {
+                TouchActivity();
+                ThrowIfCancellationRequested();
+                ConsoleLogResult result = BuildConsoleLogResult(level, limit);
+                TouchActivity();
+                return result;
             }
 
             public bool Progress(string title, string info, float progress)

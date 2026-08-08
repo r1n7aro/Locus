@@ -205,6 +205,8 @@ describe("native bridge migration", () => {
     expect(process).toContain("force_close_current_project_unity_processes");
     expect(process).toContain("unity_process_args_are_worker");
     expect(cli).toContain("check_or_install_plugin(&project, config.install_plugin, &sink).await?");
+    expect(workspace).toContain("quiesce_unity_embed_control_windows(&app_handle).await?");
+    expect(workspace).toContain("drop(unity_embed_quiesce);");
     expect(workspace).toContain("install_or_update_plugin_with_force_close");
   });
 });
