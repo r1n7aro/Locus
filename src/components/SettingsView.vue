@@ -20,6 +20,7 @@ import ProxySettings from "./settings/ProxySettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
 import CustomProviderModal from "./settings/CustomProviderModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
+import ModelUsageStats from "./settings/ModelUsageStats.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
 import McpSettings from "./settings/McpSettings.vue";
@@ -27,6 +28,7 @@ import McpServerSettings from "./settings/McpServerSettings.vue";
 import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
+import ExperimentalSettings from "./settings/ExperimentalSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
@@ -53,7 +55,7 @@ const {
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, loadCodexRateLimits, consumeCodexResetCredit,
+  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexExtendedContext, setCodexSessionTitleGeneration, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
@@ -103,6 +105,16 @@ watch(
             <path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 9 13.5v-3z"/>
           </svg>
           <span>{{ t("settings.tab.models") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'modelUsage' }"
+          @click="activeCategory = 'modelUsage'"
+        >
+          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true">
+            <path d="M2.5 13.5V8.75h2.25v4.75H2.5zm4.375 0V5.25h2.25v8.25h-2.25zm4.375 0V2.5h2.25v11h-2.25z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+          </svg>
+          <span>{{ t("settings.tab.modelUsage") }}</span>
         </button>
         <div class="sidebar-group-label">{{ t("settings.group.codeUnity") }}</div>
         <button
@@ -257,6 +269,16 @@ watch(
           </svg>
           <span>{{ t("settings.tab.about") }}</span>
         </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'experimental' }"
+          @click="activeCategory = 'experimental'"
+        >
+          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true">
+            <path d="M5.5 1.5h5M7 1.5v3.25L3.4 11a2.25 2.25 0 0 0 1.95 3.5h5.3A2.25 2.25 0 0 0 12.6 11L9 4.75V1.5M5.1 10h5.8" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span>{{ t("settings.tab.experimental") }}</span>
+        </button>
       </div>
     </div>
 
@@ -282,6 +304,8 @@ watch(
           :codex-reset-credit-busy-id="codexResetCreditBusyId"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
+          :codex-extended-context="codexModelConfig.extendedContext"
+          :codex-session-title-generation="codexModelConfig.generateSessionTitles"
           :dynamic-tool-loading-mode="dynamicToolLoadingMode"
           :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
           :anthropic-native-lazy-enabled="anthropicNativeLazyEnabled"
@@ -316,6 +340,8 @@ watch(
           @consume-codex-reset-credit="consumeCodexResetCredit"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
+          @update:codex-extended-context="setCodexExtendedContext"
+          @update:codex-session-title-generation="setCodexSessionTitleGeneration"
           @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
           @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"
           @start-add-provider="startAddCustomProvider"
@@ -336,6 +362,10 @@ watch(
           @update:model-defaults="modelDefaults = $event"
           @save="saveModelDefaults"
         />
+      </template>
+
+      <template v-if="activeCategory === 'modelUsage'">
+        <ModelUsageStats />
       </template>
 
       <template v-if="activeCategory === 'mcpServer'">
@@ -404,6 +434,10 @@ watch(
 
       <template v-if="activeCategory === 'about'">
         <AboutSettings />
+      </template>
+
+      <template v-if="activeCategory === 'experimental'">
+        <ExperimentalSettings />
       </template>
 
       <template v-if="activeCategory === 'general'">

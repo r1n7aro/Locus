@@ -12,9 +12,7 @@ pub async fn mcp_servers_get() -> Result<Vec<McpServerConfig>, AppError> {
 /// Inserts or updates one server (matched by id; an empty id means insert
 /// with a generated slug). Returns the full normalized list.
 #[tauri::command]
-pub async fn mcp_servers_upsert(
-    server: McpServerConfig,
-) -> Result<Vec<McpServerConfig>, AppError> {
+pub async fn mcp_servers_upsert(server: McpServerConfig) -> Result<Vec<McpServerConfig>, AppError> {
     let mut servers = config::load_servers();
     let editing_id = server.id.trim().to_string();
     let position = servers.iter().position(|s| s.id == editing_id);

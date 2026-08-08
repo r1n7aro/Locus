@@ -10,6 +10,7 @@
       "./gen/licenses-bundle": "licenses/third_party/",
       "./gen/ort-runtime": "ort-runtime/",
       "./gen/gh-runtime": "gh-runtime/",
+      "../python/locus": "locus-python-sdk/locus/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

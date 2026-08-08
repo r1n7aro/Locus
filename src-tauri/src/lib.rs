@@ -20,6 +20,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 mod agent;
 pub mod asset_db;
+mod async_tasks;
 mod auth;
 pub mod binary_cache;
 mod cli_driver;
@@ -35,15 +36,16 @@ pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
 pub mod extra_workdirs;
-pub mod mcp;
 mod feishu_docs;
 pub mod file_log;
 pub mod keychain;
 pub mod knowledge_index;
+pub mod knowledge_source_registry;
 pub mod knowledge_store;
 mod knowledge_watcher;
 mod llm;
 mod local_docs;
+pub mod mcp;
 pub(crate) mod merge;
 pub mod model_catalog;
 pub mod network;
@@ -52,6 +54,7 @@ pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
 mod session;
+mod sdk;
 mod sqlite_maint;
 mod tool;
 pub mod unity_bridge;
@@ -221,6 +224,7 @@ impl AgentDefRegistryState {
     pub async fn snapshot(&self) -> Arc<AgentDefRegistry> {
         Arc::new(self.0.read().await.clone())
     }
+
 }
 
 use asset_db::watcher::AssetDbWatcher;
@@ -302,6 +306,7 @@ mod state_type_tests {
 pub fn run() {
     let startup_trace = StartupTrace::new();
     std::eprintln!("[startup] phase=run_enter total=0ms delta=0ms");
+    let external_script_open_request = unity_bridge::external_script_open_request_from_env_args();
     let cli_driver_config = match cli_driver::CliDriverConfig::from_env_args() {
         Some(Ok(config)) => Some(config),
         Some(Err(error)) => {
@@ -335,9 +340,11 @@ pub fn run() {
     let startup_for_page_load = startup_trace.clone();
     let startup_for_setup = startup_trace.clone();
     let cli_driver_for_setup = cli_driver_config.clone();
+    let external_script_open_for_setup = external_script_open_request.clone();
 
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
+            let page_finished = matches!(payload.event(), PageLoadEvent::Finished);
             let event = match payload.event() {
                 PageLoadEvent::Started => "started",
                 PageLoadEvent::Finished => "finished",
@@ -349,6 +356,12 @@ pub fn run() {
                 payload.url(),
                 startup_for_page_load.elapsed_ms()
             );
+            #[cfg(target_os = "windows")]
+            if page_finished {
+                if let Err(error) = windows_resize_sync::sync_after_page_load(webview) {
+                    eprintln!("[Locus] warning: failed to sync WebView2 after page load: {error}");
+                }
+            }
         })
         .register_uri_scheme_protocol("locus-binary", move |_ctx, request| {
             let request_start = Instant::now();
@@ -393,7 +406,6 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             commands::handle_locus_window_event(window, event);
-            commands::handle_agent_graph_tool_window_event(window, event);
             commands::handle_sub_window_event(window, event);
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
@@ -437,9 +449,13 @@ pub fn run() {
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             unity_bridge::initialize_state_probe(config.unity_state_probe_enabled());
             unity_bridge::initialize_native_bridge(config.unity_native_bridge_enabled());
+            unity_bridge::initialize_external_editor_default(
+                config.unity_external_editor_default_enabled(),
+            );
             csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
             csharp_compile::initialize(
                 config.unity_sidecar_compiler_enabled(),
+                config.unity_non_public_access_enabled(),
                 app.handle().clone(),
             );
             csharp_compile::set_in_process_fallback(
@@ -486,20 +502,41 @@ pub fn run() {
             store.clone().spawn_vacuum_if_fragmented();
 
             let working_dir_file = data_dir.join("working_dir.txt");
-            let initial_working_dir = std::fs::read_to_string(&working_dir_file)
-                .ok()
-                .and_then(|s| {
-                    let trimmed = s.trim().to_string();
-                    if std::path::Path::new(&trimmed).is_dir() {
-                        Some(trimmed)
-                    } else {
-                        None
-                    }
+            let requested_working_dir = cli_driver_for_setup
+                .as_ref()
+                .and_then(|driver| driver.project_path.as_ref())
+                .map(|path| path.trim().to_string())
+                .or_else(|| {
+                    external_script_open_for_setup
+                        .as_ref()
+                        .map(|request| request.project_path.trim().to_string())
                 })
-                .unwrap_or_default();
+                .filter(|path| {
+                    let root = std::path::Path::new(path);
+                    root.is_dir() && root.join("Assets").is_dir()
+                })
+                .map(|path| {
+                    dunce::canonicalize(&path)
+                        .map(|value| value.display().to_string())
+                        .unwrap_or(path)
+                });
+            let initial_working_dir = requested_working_dir.unwrap_or_else(|| {
+                std::fs::read_to_string(&working_dir_file)
+                    .ok()
+                    .and_then(|s| {
+                        let trimmed = s.trim().to_string();
+                        if std::path::Path::new(&trimmed).is_dir() {
+                            Some(trimmed)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            });
             println!("[Locus] working_dir: {}", initial_working_dir);
 
             if !initial_working_dir.is_empty() {
+                let _ = std::fs::write(&working_dir_file, &initial_working_dir);
                 commands::save_recent_dir_pub(&data_dir, &initial_working_dir);
             }
 
@@ -529,12 +566,25 @@ pub fn run() {
                         error
                     );
                 }
+                if let Err(error) = unity_bridge::sync_unity_embed_enabled_marker(
+                    &initial_working_dir,
+                    config.unity_embed_enabled(),
+                ) {
+                    eprintln!(
+                        "[Locus] warning: failed to sync Unity embed marker on startup: {}",
+                        error
+                    );
+                }
             }
             println!("[Locus] workspace_id: {:?}", initial_workspace_id);
             startup_for_setup.mark("setup_workspace_ready");
 
             let initial_working_dir_copy = initial_working_dir.clone();
             let workspace = Arc::new(Workspace::new(initial_working_dir, initial_workspace_id));
+            let pending_external_script_open =
+                unity_bridge::PendingExternalScriptOpenRequest::new(
+                    external_script_open_for_setup.clone(),
+                );
 
             let mut app_agent_dir_candidates = vec![
                 std::path::PathBuf::from("../agent"), // dev: src-tauri/../agent
@@ -648,10 +698,9 @@ pub fn run() {
             let active_tasks: ActiveTasks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let pending_input_queue: PendingInputQueueHandle =
                 Arc::new(std::sync::Mutex::new(session::pending_inputs::PendingInputQueue::default()));
+            let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::default());
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let agent_graph_tool_store: commands::AgentGraphToolStore =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -884,7 +933,7 @@ pub fn run() {
 
             if !initial_working_dir_copy.trim().is_empty() {
                 if let Err(error) =
-                    crate::knowledge_store::ensure_knowledge_roots(&initial_working_dir_copy)
+                    crate::knowledge_store::ensure_workspace_knowledge_layout(&initial_working_dir_copy)
                 {
                     eprintln!(
                         "[Locus] warning: failed to prepare knowledge roots before watcher start: {}",
@@ -926,6 +975,7 @@ pub fn run() {
             startup_for_setup.mark("setup_watchers_ready");
 
             app.manage(config);
+            app.manage(pending_external_script_open);
             app.manage(auth_state);
             app.manage(codex_state);
             app.manage(api_key_state);
@@ -936,10 +986,12 @@ pub fn run() {
             app.manage(registry);
             app.manage(tool_registry);
             app.manage(std::sync::Arc::new(mcp::server::McpServerHandle::default()));
+            app.manage(std::sync::Arc::new(sdk::SdkServerHandle::default()));
             app.manage(workspace.clone());
             app.manage(raw_context_store);
             app.manage(active_tasks);
             app.manage(pending_input_queue);
+            app.manage(async_task_manager);
             app.manage(unity_monitor.clone());
             app.manage(ref_graph_state);
             app.manage(watcher_handle);
@@ -952,7 +1004,6 @@ pub fn run() {
             app.manage(preview_cache);
             app.manage(dir_entries_cache);
             app.manage(question_store);
-            app.manage(agent_graph_tool_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(undo_manager);
             app.manage(view_automation_store);
@@ -967,6 +1018,19 @@ pub fn run() {
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
             startup_for_setup.mark("setup_backend_ready");
+
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match sdk::start(app_handle).await {
+                        Ok(address) => eprintln!("[LocusSdk] listening on http://{address}/sdk"),
+                        Err(error) => {
+                            python_runtime::clear_locus_sdk_connection();
+                            eprintln!("[LocusSdk] failed to start: {error}");
+                        }
+                    }
+                });
+            }
 
             if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
                 cli_driver::spawn(app.handle().clone(), workspace.clone(), cli_driver_config);
@@ -1116,6 +1180,7 @@ pub fn run() {
             commands::set_agent_tool_direct_load,
             commands::set_agent_tool_enabled,
             commands::load_session,
+            commands::get_compacted_context_output,
             commands::list_sessions,
             commands::list_archived_sessions,
             commands::get_active_session_selection,
@@ -1125,6 +1190,7 @@ pub fn run() {
             commands::unarchive_session,
             commands::delete_session,
             commands::get_session_usage,
+            commands::get_model_usage_stats,
             commands::get_session_active_run,
             commands::list_session_events,
             commands::get_auth_status,
@@ -1414,6 +1480,8 @@ pub fn run() {
             commands::set_subagent_max_concurrent,
             commands::get_file_tool_workspace_boundary,
             commands::set_file_tool_workspace_boundary,
+            commands::get_unity_test_tools_workspace_status,
+            commands::set_unity_test_tools_workspace_enabled,
             commands::get_tool_permission_mode,
             commands::save_tool_permission_mode,
             commands::get_tool_permissions,
@@ -1430,9 +1498,14 @@ pub fn run() {
             commands::set_dynamic_tool_loading_mode,
             commands::get_anthropic_native_lazy_enabled,
             commands::set_anthropic_native_lazy_enabled,
+            commands::get_async_tasks_enabled,
+            commands::set_async_tasks_enabled,
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
+            commands::get_unity_external_editor_default_enabled,
+            commands::set_unity_external_editor_default_enabled,
+            commands::take_external_script_open_request,
             commands::get_unity_state_probe_enabled,
             commands::set_unity_state_probe_enabled,
             commands::get_unity_state_probe_status,
@@ -1449,6 +1522,7 @@ pub fn run() {
             commands::csharp_lsp_restart,
             commands::unity_sidecar_compiler_get_status,
             commands::unity_sidecar_compiler_set_enabled,
+            commands::unity_non_public_access_set_enabled,
             commands::unity_in_process_compile_fallback_get_enabled,
             commands::unity_in_process_compile_fallback_set_enabled,
             commands::unity_hot_reload_set_enabled,
@@ -1479,6 +1553,8 @@ pub fn run() {
             commands::append_frontend_logs,
             commands::reveal_log_file,
             commands::unity_embed_status,
+            commands::get_unity_embed_enabled,
+            commands::set_unity_embed_enabled,
             commands::unity_embed_open_frontend_window,
             commands::unity_embed_set_mouse_activation_suppressed,
             commands::unity_embed_activate_for_input,
@@ -1539,10 +1615,6 @@ pub fn run() {
             commands::view_fs_rename,
             commands::view_fs_copy_file,
             commands::view_automation_respond,
-            commands::agent_graph_tool_request,
-            commands::agent_graph_tool_submit,
-            commands::agent_graph_tool_cancel,
-            commands::agent_graph_tool_reopen,
             commands::fetch_app_update_manifest,
         ])
         .run(tauri::generate_context!())

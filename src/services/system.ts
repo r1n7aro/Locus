@@ -70,6 +70,14 @@ export function setAnthropicNativeLazyEnabled(value: boolean): Promise<void> {
   return ipcInvoke<void>("set_anthropic_native_lazy_enabled", { value });
 }
 
+export function getAsyncTasksEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_async_tasks_enabled");
+}
+
+export function setAsyncTasksEnabled(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_async_tasks_enabled", { value });
+}
+
 export function getLlmRetryMaxAttempts(): Promise<number> {
   return ipcInvoke<number>("get_llm_retry_max_attempts");
 }
@@ -104,6 +112,25 @@ export function setUnityBackgroundHookEnabled(value: boolean): Promise<UnityBack
 
 export function getUnityBackgroundHookStatus(): Promise<UnityBackgroundHookStatus> {
   return ipcInvoke<UnityBackgroundHookStatus>("get_unity_background_hook_status");
+}
+
+export interface ExternalScriptOpenRequest {
+  projectPath: string;
+  assetPath: string;
+  line: number;
+  column: number;
+}
+
+export function getUnityExternalEditorDefaultEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_unity_external_editor_default_enabled");
+}
+
+export function setUnityExternalEditorDefaultEnabled(value: boolean): Promise<boolean> {
+  return ipcInvoke<boolean>("set_unity_external_editor_default_enabled", { value });
+}
+
+export function takeExternalScriptOpenRequest(): Promise<ExternalScriptOpenRequest | null> {
+  return ipcInvoke<ExternalScriptOpenRequest | null>("take_external_script_open_request");
 }
 
 export function getViewWindowsAboveMain(): Promise<boolean> {

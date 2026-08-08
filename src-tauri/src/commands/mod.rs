@@ -1,4 +1,3 @@
-mod agent_graph;
 pub mod asset;
 mod auth;
 mod csharp_lsp;
@@ -251,8 +250,6 @@ pub enum StreamEvent {
         tool_call_id: String,
         question: String,
         options: Vec<AskOption>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sheet: Option<SheetRequest>,
     },
     #[serde(rename_all = "camelCase")]
     ToolConfirm {
@@ -335,32 +332,6 @@ pub struct StreamEventEnvelope {
 pub struct AskOption {
     pub label: String,
     pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SheetField {
-    pub key: String,
-    pub label: String,
-    pub value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub multiline: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<String>,
-    #[serde(default)]
-    pub readonly: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SheetRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirm_label: Option<String>,
-    pub fields: Vec<SheetField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,7 +417,35 @@ pub struct TokenUsage {
     pub context_limit: u32,
 }
 
-pub use agent_graph::*;
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageMetrics {
+    pub request_count: u64,
+    pub session_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageGroup {
+    pub model_id: String,
+    pub provider: String,
+    pub usage: ModelUsageMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageReport {
+    pub usage: ModelUsageMetrics,
+    pub by_model: Vec<ModelUsageGroup>,
+    pub recorded_from: Option<i64>,
+    pub recorded_to: Option<i64>,
+}
+
 pub use asset::*;
 pub use auth::*;
 pub use csharp_lsp::*;

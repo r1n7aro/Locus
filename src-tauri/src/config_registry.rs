@@ -109,6 +109,18 @@ fn collect_display(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
         storage: "localStorage: locus-theme-preference".into(),
         current_value: "(frontend-only)".into(),
     });
+    let unity_embed_enabled = app_handle
+        .try_state::<Arc<crate::config::AppConfig>>()
+        .map(|config| config.unity_embed_enabled())
+        .unwrap_or(true);
+    out.push(ConfigEntry {
+        key: "display.unity_embed_enabled".into(),
+        category: "display".into(),
+        label: "Unity Embedded Window".into(),
+        description: "Show Locus desktop content inside Unity editor windows.".into(),
+        storage: "persistent_config_dir/config.json → unity_embed_enabled".into(),
+        current_value: unity_embed_enabled.to_string(),
+    });
     out.push(ConfigEntry {
         key: "display.theme.unity_embed_window".into(),
         category: "display".into(),
@@ -344,7 +356,9 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
         current_value: codex_status.into(),
     });
 
-    let codex_transport = crate::commands::load_codex_model_config()
+    let codex_model_config = crate::commands::load_codex_model_config().ok();
+    let codex_transport = codex_model_config
+        .as_ref()
         .map(|config| match config.transport {
             crate::commands::CodexTransportMode::Http => "http",
             crate::commands::CodexTransportMode::Websocket => "websocket",
@@ -360,6 +374,32 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
                 .into(),
         storage: "persistent_config_dir/codex_model_config.json → transport".into(),
         current_value: codex_transport.into(),
+    });
+
+    out.push(ConfigEntry {
+        key: "api.codex_extended_context".into(),
+        category: "api".into(),
+        label: "Codex Extended Context".into(),
+        description: "Use the larger GPT-5.6 context window advertised by Codex and raise the automatic compaction threshold accordingly."
+            .into(),
+        storage: "persistent_config_dir/codex_model_config.json → extendedContext".into(),
+        current_value: codex_model_config
+            .as_ref()
+            .is_some_and(|config| config.extended_context)
+            .to_string(),
+    });
+
+    out.push(ConfigEntry {
+        key: "api.codex_session_titles".into(),
+        category: "api".into(),
+        label: "Codex Session Titles".into(),
+        description: "Generate titles for new chat sessions through the current Codex OAuth login using GPT-5.6 Luna with low reasoning effort."
+            .into(),
+        storage: "persistent_config_dir/codex_model_config.json → generateSessionTitles".into(),
+        current_value: codex_model_config
+            .as_ref()
+            .is_some_and(|config| config.generate_session_titles)
+            .to_string(),
     });
 
     // Custom endpoints – count only, no secrets
@@ -506,14 +546,21 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("task", "Sub-agent delegation"),
         ("todowrite", "TODO list management"),
         ("ask_user_question", "Ask user a question"),
-        ("sheet", "Confirm a multi-field form"),
-        ("graph_view", "Show or edit an interactive graph"),
         ("write", "File creation (new files only)"),
         ("edit", "File editing (partial)"),
         ("bash", "Shell command execution"),
         ("web_fetch", "HTTP fetch from the web"),
-        ("unity_execute", "Execute C# code in Unity"),
-        ("unity_run_states", "Run Unity state-machine debugging flow"),
+        (
+            "unity_execute",
+            "Execute C# in Unity with direct private/internal access",
+        ),
+        ("unity_set_play_mode", "Start or stop Unity Play Mode"),
+        ("unity_test_list", "List tests from Unity Test Framework"),
+        ("unity_test_run", "Run tests through Unity Test Framework"),
+        (
+            "unity_run_states",
+            "Run Unity state-machine debugging with direct private/internal access",
+        ),
         ("unity_recompile", "Trigger Unity recompilation"),
         ("unity_hot_reload", "Hot-patch C# method edits into Unity"),
         ("unity_ref_search", "Unity reference graph search"),
@@ -527,18 +574,13 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("unity_yaml_list", "List Unity YAML hierarchy"),
         ("unity_yaml_search", "Search Unity YAML hierarchy"),
         ("unity_yaml_read", "Read Unity YAML detail"),
-        ("knowledge_list", "Unified knowledge document listing"),
         ("knowledge_query", "Unified knowledge document search"),
-        ("knowledge_read", "Unified knowledge entry read"),
-        ("knowledge_create", "Unified knowledge entry create"),
-        ("knowledge_delete", "Unified knowledge entry delete"),
-        ("knowledge_move", "Unified knowledge entry move"),
-        ("knowledge_edit", "Unified knowledge entry edit"),
     ];
 
     for (name, desc) in tool_list {
         let default_mode = match name {
-            "write" | "edit" | "bash" | "web_fetch" | "unity_execute" | "unity_run_states" => "ask",
+            "write" | "edit" | "bash" | "web_fetch" | "unity_execute" | "unity_run_states"
+            | "unity_test_run" => "ask",
             _ => "auto",
         };
         let current = perms.get(name).map(|s| s.as_str()).unwrap_or(default_mode);

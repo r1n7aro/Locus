@@ -202,6 +202,8 @@ export function useSettingsState(emit: SettingsEmit) {
   ): CodexModelConfig {
     return {
       transport: config?.transport === "http" ? "http" : "websocket",
+      extendedContext: config?.extendedContext === true,
+      generateSessionTitles: config?.generateSessionTitles === true,
     };
   }
 
@@ -410,7 +412,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -878,8 +880,9 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   async function setCodexTransportMode(transport: CodexTransportMode) {
-    const next = normalizeCodexModelConfig({ transport });
+    const next = normalizeCodexModelConfig({ ...codexModelConfig.value, transport });
     if (codexModelConfig.value.transport === next.transport) return;
+    const previous = codexModelConfig.value;
     codexModelConfig.value = next;
     try {
       await serviceSaveCodexModelConfig(next);
@@ -892,7 +895,53 @@ export function useSettingsState(emit: SettingsEmit) {
         code: err.code,
         operation: "saveCodexModelConfig",
       });
-      await loadCodexModelConfig();
+      codexModelConfig.value = previous;
+    }
+  }
+
+  async function setCodexExtendedContext(enabled: boolean) {
+    const next = normalizeCodexModelConfig({
+      ...codexModelConfig.value,
+      extendedContext: enabled,
+    });
+    if (codexModelConfig.value.extendedContext === next.extendedContext) return;
+    const previous = codexModelConfig.value;
+    codexModelConfig.value = next;
+    try {
+      await serviceSaveCodexModelConfig(next);
+      emit("codexTransportChanged", next);
+      successMsg.value = t("settings.codex.extendedContextSaved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.extendedContextSaveFailed", err.message), {
+        code: err.code,
+        operation: "saveCodexModelConfig",
+      });
+      codexModelConfig.value = previous;
+    }
+  }
+
+  async function setCodexSessionTitleGeneration(enabled: boolean) {
+    const next = normalizeCodexModelConfig({
+      ...codexModelConfig.value,
+      generateSessionTitles: enabled,
+    });
+    if (codexModelConfig.value.generateSessionTitles === next.generateSessionTitles) return;
+    const previous = codexModelConfig.value;
+    codexModelConfig.value = next;
+    try {
+      await serviceSaveCodexModelConfig(next);
+      emit("codexTransportChanged", next);
+      successMsg.value = t("settings.codex.sessionTitleSaved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.sessionTitleSaveFailed", err.message), {
+        code: err.code,
+        operation: "saveCodexModelConfig",
+      });
+      codexModelConfig.value = previous;
     }
   }
 
@@ -1067,14 +1116,15 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "task",               label: "task",               desc: t("tool.desc.task"),               defaultMode: "ask"  as const },
     { name: "todowrite",          label: "todowrite",          desc: t("tool.desc.todowrite"),          defaultMode: "auto" as const },
     { name: "ask_user_question",  label: "ask_user_question",  desc: t("tool.desc.ask_user_question"),  defaultMode: "auto" as const },
-    { name: "sheet",              label: "sheet",              desc: t("tool.desc.sheet"),              defaultMode: "auto" as const },
-    { name: "graph_view",         label: "graph_view",         desc: t("tool.desc.graph_view"),         defaultMode: "auto" as const },
     { name: "write",              label: "write",              desc: t("tool.desc.write"),              defaultMode: "ask"  as const },
     { name: "edit",               label: "edit",               desc: t("tool.desc.edit"),               defaultMode: "ask"  as const },
     { name: "bash",               label: "bash",               desc: t("tool.desc.bash"),               defaultMode: "ask"  as const },
     { name: "web_fetch",          label: "web_fetch",          desc: t("tool.desc.web_fetch"),          defaultMode: "ask"  as const },
+    { name: "unity_set_play_mode", label: "unity_set_play_mode", desc: t("tool.desc.unity_set_play_mode"), defaultMode: "auto" as const },
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
+    { name: "unity_test_list",    label: "unity_test_list",    desc: t("tool.desc.unity_test_list"),    defaultMode: "auto" as const },
+    { name: "unity_test_run",     label: "unity_test_run",     desc: t("tool.desc.unity_test_run"),     defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
     { name: "unity_hot_reload",   label: "unity_hot_reload",   desc: t("tool.desc.unity_hot_reload"),   defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
@@ -1088,14 +1138,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_yaml_list",    label: "unity_yaml_list",    desc: t("tool.desc.unity_yaml_list"),    defaultMode: "auto" as const },
     { name: "unity_yaml_search",  label: "unity_yaml_search",  desc: t("tool.desc.unity_yaml_search"),  defaultMode: "auto" as const },
     { name: "unity_yaml_read",    label: "unity_yaml_read",    desc: t("tool.desc.unity_yaml_read"),    defaultMode: "auto" as const },
-    { name: "knowledge_list",     label: "knowledge_list",     desc: t("tool.desc.knowledge_list"),     defaultMode: "auto" as const },
     { name: "knowledge_query",    label: "knowledge_query",    desc: t("tool.desc.knowledge_query"),    defaultMode: "auto" as const },
-    { name: "knowledge_read",     label: "knowledge_read",     desc: t("tool.desc.knowledge_read"),     defaultMode: "auto" as const },
-    { name: "knowledge_create",   label: "knowledge_create",   desc: t("tool.desc.knowledge_create"),   defaultMode: "auto" as const },
-    { name: "knowledge_delete",   label: "knowledge_delete",   desc: t("tool.desc.knowledge_delete"),   defaultMode: "auto" as const },
-    { name: "knowledge_move",     label: "knowledge_move",     desc: t("tool.desc.knowledge_move"),     defaultMode: "auto" as const },
-    { name: "knowledge_edit",     label: "knowledge_edit",     desc: t("tool.desc.knowledge_edit"),     defaultMode: "auto" as const },
-    { name: "skill_create",       label: "skill_create",       desc: t("tool.desc.skill_create"),       defaultMode: "auto" as const },
     { name: "skill_reload",       label: "skill_reload",       desc: t("tool.desc.skill_reload"),       defaultMode: "auto" as const },
     { name: "skill_list",         label: "skill_list",         desc: t("tool.desc.skill_list"),         defaultMode: "auto" as const },
   ]);
@@ -1637,6 +1680,8 @@ export function useSettingsState(emit: SettingsEmit) {
     retryCodexValidation,
     copyCode,
     setCodexTransportMode,
+    setCodexExtendedContext,
+    setCodexSessionTitleGeneration,
 
     requestCodexLogin,
 

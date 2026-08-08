@@ -30,7 +30,7 @@ interface PendingChatPrefill extends ChatPrefillOptions {
 
 export const useUiStore = defineStore("ui", () => {
   const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "plugins" | "agent" | "settings">("chat");
-  const settingsCategoryHint = ref<"api" | "models" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | null>(null);
+  const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);
@@ -44,6 +44,13 @@ export const useUiStore = defineStore("ui", () => {
     id: number;
     dashboard: "design" | "memory" | "skill" | "reference";
     path: string;
+  } | null>(null);
+  const pendingAssetOpen = ref<{
+    id: number;
+    projectPath: string;
+    assetPath: string;
+    line: number;
+    column: number;
   } | null>(null);
 
   const collabMounted = ref(false);
@@ -264,6 +271,20 @@ export const useUiStore = defineStore("ui", () => {
     pendingKnowledgeSelection.value = null;
   }
 
+  function stageAssetOpen(request: Omit<NonNullable<typeof pendingAssetOpen.value>, "id">) {
+    pendingAssetOpen.value = {
+      id: Date.now(),
+      ...request,
+    };
+    setTab("asset");
+  }
+
+  function clearPendingAssetOpen(id?: number) {
+    if (!pendingAssetOpen.value) return;
+    if (id != null && pendingAssetOpen.value.id !== id) return;
+    pendingAssetOpen.value = null;
+  }
+
   async function toggleAlwaysOnTop() {
     const window = resolveAppWindow();
     if (!window) return;
@@ -316,6 +337,7 @@ export const useUiStore = defineStore("ui", () => {
     showOnboarding,
     pendingChatPrefill,
     pendingKnowledgeSelection,
+    pendingAssetOpen,
     collabMounted,
     knowledgeMounted,
     assetMounted,
@@ -333,6 +355,8 @@ export const useUiStore = defineStore("ui", () => {
     clearPendingChatPrefill,
     stageKnowledgeSelection,
     clearPendingKnowledgeSelection,
+    stageAssetOpen,
+    clearPendingAssetOpen,
     toggleAlwaysOnTop,
     winMinimize,
     winToggleMaximize,

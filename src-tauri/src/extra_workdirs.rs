@@ -169,13 +169,15 @@ mod tests {
     fn save_and_load_roundtrip() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().to_string_lossy().to_string();
-        let entries = vec![entry("D:/Art/Sources", "美术资产目录"), entry("D:/Docs", "")];
+        let entries = vec![
+            entry("D:/Art/Sources", "美术资产目录"),
+            entry("D:/Docs", ""),
+        ];
 
         save_entries(&workspace, &entries).unwrap();
         assert_eq!(load_entries(&workspace), entries);
-        assert!(config_path(&workspace).starts_with(
-            Path::new(&workspace).join("Library").join("Locus")
-        ));
+        assert!(config_path(&workspace)
+            .starts_with(Path::new(&workspace).join("Library").join("Locus")));
     }
 
     #[test]
@@ -194,7 +196,11 @@ mod tests {
     #[test]
     fn normalize_drops_empty_duplicate_and_workspace_paths() {
         let workspace = if cfg!(windows) { "C:\\Proj" } else { "/proj" };
-        let inside = if cfg!(windows) { "C:\\Proj\\Assets" } else { "/proj/Assets" };
+        let inside = if cfg!(windows) {
+            "C:\\Proj\\Assets"
+        } else {
+            "/proj/Assets"
+        };
         let duplicate = if cfg!(windows) { "D:/Art/" } else { "/art/" };
         let duplicate_alt = if cfg!(windows) { "D:\\ART" } else { "/art" };
         let normalized = normalize_entries(
@@ -210,10 +216,7 @@ mod tests {
         );
         assert_eq!(
             normalized,
-            vec![
-                entry(duplicate.trim(), "first"),
-                entry("E:/Docs", "note"),
-            ]
+            vec![entry(duplicate.trim(), "first"), entry("E:/Docs", "note"),]
         );
     }
 

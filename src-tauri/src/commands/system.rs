@@ -177,6 +177,23 @@ pub fn set_anthropic_native_lazy_enabled(
 }
 
 #[tauri::command]
+pub fn get_async_tasks_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.async_tasks_enabled())
+}
+
+#[tauri::command]
+pub fn set_async_tasks_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_async_tasks_enabled(value)
+        .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
 pub fn get_unity_background_hook_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {
@@ -257,6 +274,48 @@ pub async fn set_unity_background_hook_enabled(
 pub fn get_unity_background_hook_status(
 ) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
     Ok(crate::unity_bridge::background_hook_status())
+}
+
+#[tauri::command]
+pub fn get_unity_external_editor_default_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.unity_external_editor_default_enabled())
+}
+
+#[tauri::command]
+pub async fn set_unity_external_editor_default_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<bool, crate::error::AppError> {
+    config
+        .set_unity_external_editor_default_enabled(value)
+        .map_err(crate::error::AppError::from)?;
+    crate::unity_bridge::set_external_editor_default(value);
+
+    let project = workspace.path.read().await.clone();
+    if !project.trim().is_empty() && crate::unity_bridge::is_unity_project(&project) {
+        let (connected, _, _) = crate::unity_bridge::query_unity_status(&project).await;
+        if connected {
+            if let Err(error) =
+                crate::unity_bridge::configure_locus_external_editor(&project, value).await
+            {
+                eprintln!(
+                    "[Locus] warning: failed to apply Unity external editor setting immediately: {}",
+                    error
+                );
+            }
+        }
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+pub fn take_external_script_open_request(
+    pending: State<'_, crate::unity_bridge::PendingExternalScriptOpenRequest>,
+) -> Result<Option<crate::unity_bridge::ExternalScriptOpenRequest>, crate::error::AppError> {
+    Ok(pending.take())
 }
 
 #[tauri::command]
