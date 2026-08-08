@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use tauri::{AppHandle, Manager};
 
 const CONFIG_FILE: &str = "python_runtime_config.json";
 const MANAGED_RESOURCE_DIR: &str = "managed-python";
+const LOCUS_SDK_RESOURCE_DIR: &str = "locus-python-sdk";
 const MANAGED_WINDOWS_X64_ID: &str = "managed:windows-x64";
 const MANAGED_PIP_ZIPAPP: &str = "pip.pyz";
 const PY_LAUNCHER_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -60,6 +61,49 @@ pub struct ResolvedPythonRuntime {
     pub home: Option<PathBuf>,
     pub package_dir: Option<PathBuf>,
     pub pip_zipapp: Option<PathBuf>,
+    /// Directory placed on PYTHONPATH that contains the bundled `locus`
+    /// package. Available to both managed and selected system runtimes.
+    pub sdk_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct LocusSdkConnection {
+    url: String,
+    token: String,
+}
+
+fn locus_sdk_connection() -> &'static RwLock<Option<LocusSdkConnection>> {
+    static CONNECTION: OnceLock<RwLock<Option<LocusSdkConnection>>> = OnceLock::new();
+    CONNECTION.get_or_init(|| RwLock::new(None))
+}
+
+pub fn set_locus_sdk_connection(url: String, token: String) {
+    let mut connection = locus_sdk_connection()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *connection = Some(LocusSdkConnection { url, token });
+}
+
+pub fn clear_locus_sdk_connection() {
+    let mut connection = locus_sdk_connection()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *connection = None;
+}
+
+pub fn locus_sdk_invocation_env() -> Vec<(String, String)> {
+    let connection = locus_sdk_connection()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    connection
+        .map(|connection| {
+            vec![
+                ("LOCUS_SDK_URL".to_string(), connection.url),
+                ("LOCUS_SDK_TOKEN".to_string(), connection.token),
+            ]
+        })
+        .unwrap_or_default()
 }
 
 type PythonRuntimeDiscoveryCache = Option<Vec<PythonRuntimeInfo>>;
@@ -335,6 +379,7 @@ pub fn resolve_effective_python(app_handle: Option<&AppHandle>) -> Option<Resolv
     } else {
         None
     };
+    let sdk_dir = locus_python_sdk_dir(app_handle);
     Some(ResolvedPythonRuntime {
         path,
         version,
@@ -342,6 +387,7 @@ pub fn resolve_effective_python(app_handle: Option<&AppHandle>) -> Option<Resolv
         home,
         package_dir,
         pip_zipapp,
+        sdk_dir,
     })
 }
 
@@ -377,6 +423,14 @@ fn python_invocation_env(runtime: &ResolvedPythonRuntime) -> Vec<(&'static str, 
             env.push(("PIP_TARGET", package_dir.display().to_string()));
         }
     }
+    for (key, value) in locus_sdk_invocation_env() {
+        let key = match key.as_str() {
+            "LOCUS_SDK_URL" => "LOCUS_SDK_URL",
+            "LOCUS_SDK_TOKEN" => "LOCUS_SDK_TOKEN",
+            _ => continue,
+        };
+        env.push((key, value));
+    }
     env
 }
 
@@ -386,6 +440,17 @@ fn managed_package_dir(runtime: &ResolvedPythonRuntime) -> Option<&PathBuf> {
     } else {
         None
     }
+}
+
+fn python_path_dirs(runtime: &ResolvedPythonRuntime) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(sdk_dir) = runtime.sdk_dir.as_ref() {
+        dirs.push(sdk_dir.clone());
+    }
+    if let Some(package_dir) = managed_package_dir(runtime) {
+        dirs.push(package_dir.clone());
+    }
+    dirs
 }
 
 /// `VAR='value' ` assignment prefix for sh function bodies and shim scripts.
@@ -399,8 +464,13 @@ fn sh_python_env_assignments(runtime: &ResolvedPythonRuntime) -> String {
         assigns.push_str(&shell_quote_posix(&value.replace('\\', "/")));
         assigns.push(' ');
     }
-    if let Some(package_dir) = managed_package_dir(runtime) {
-        let quoted = shell_quote_posix(&package_dir.display().to_string().replace('\\', "/"));
+    let python_path = python_path_dirs(runtime);
+    if !python_path.is_empty() {
+        let joined = std::env::join_paths(&python_path)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let quoted = shell_quote_posix(&joined);
         let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
         assigns.push_str(&format!(
             "PYTHONPATH={quoted}\"${{PYTHONPATH:+{sep}$PYTHONPATH}}\" "
@@ -425,8 +495,12 @@ pub fn ensure_python_shim_dir(runtime: &ResolvedPythonRuntime) -> Option<PathBuf
         for (key, value) in python_invocation_env(runtime) {
             env_lines.push_str(&format!("set \"{}={}\"\r\n", key, value));
         }
-        if let Some(package_dir) = managed_package_dir(runtime) {
-            let pkg = package_dir.display().to_string();
+        let python_path = python_path_dirs(runtime);
+        if !python_path.is_empty() {
+            let pkg = std::env::join_paths(&python_path)
+                .ok()?
+                .to_string_lossy()
+                .to_string();
             env_lines.push_str(&format!(
                 "if defined PYTHONPATH (set \"PYTHONPATH={pkg};%PYTHONPATH%\") else (set \"PYTHONPATH={pkg}\")\r\n"
             ));
@@ -520,11 +594,11 @@ pub fn managed_python_path_env(
     current_path: Option<OsString>,
     runtime: &ResolvedPythonRuntime,
 ) -> Option<OsString> {
-    if !matches!(&runtime.source, PythonRuntimeSource::Managed) {
+    let dirs = python_path_dirs(runtime);
+    if dirs.is_empty() {
         return current_path;
     }
-    let package_dir = runtime.package_dir.as_ref()?.to_path_buf();
-    crate::process_util::prepend_paths(current_path, vec![package_dir])
+    crate::process_util::prepend_paths(current_path, dirs)
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -657,6 +731,27 @@ fn managed_python_pip_zipapp_path(app_handle: Option<&AppHandle>) -> Option<Path
         .into_iter()
         .map(|root| root.join(MANAGED_RESOURCE_DIR).join(MANAGED_PIP_ZIPAPP))
         .find(|candidate| candidate.is_file())
+}
+
+fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(app) = app_handle {
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            candidates.push(resource_dir.join(LOCUS_SDK_RESOURCE_DIR));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(LOCUS_SDK_RESOURCE_DIR));
+            candidates.push(exe_dir.join("resources").join(LOCUS_SDK_RESOURCE_DIR));
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python"));
+    candidates.into_iter().find(|root| {
+        root.join("locus")
+            .join("__init__.py")
+            .is_file()
+    })
 }
 
 fn find_managed_python_executable(roots: &[PathBuf]) -> Option<PathBuf> {
@@ -980,6 +1075,7 @@ mod tests {
             home: None,
             package_dir: None,
             pip_zipapp: None,
+            sdk_dir: None,
         }
     }
 
@@ -992,6 +1088,7 @@ mod tests {
             version: Some("3.13.12".to_string()),
             source: super::PythonRuntimeSource::Managed,
             pip_zipapp: None,
+            sdk_dir: None,
         }
     }
 

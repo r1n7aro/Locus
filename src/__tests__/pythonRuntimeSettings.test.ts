@@ -112,7 +112,7 @@ describe("Python runtime settings", () => {
     expect(tauriConfig).toContain('"./gen/managed-git": "managed-git/"');
     expect(tauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
     expect(baseTauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
-    expect(baseTauriConfig).toContain("bun run github-cli:bundle && bun run dev");
+    expect(baseTauriConfig).toContain("bun run github-cli:bundle && bun run renderdoc:bundle && bun run dev");
     expect(withoutEmbedConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
     expect(installer).toContain("Function LocusDetectSystemGit");
     expect(installer).toContain("SearchPath $LocusGitProbePath \"git.exe\"");
