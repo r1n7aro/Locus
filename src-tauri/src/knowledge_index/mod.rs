@@ -1685,10 +1685,16 @@ fn collect_vector_backfill_candidates(
     let mut selection = EmbeddingBackfillSelection::default();
     let mut access_cache = HashMap::new();
     let general_config = load_general_config(&library_dir_for_working_dir(working_dir));
+    let existing_states = db.list_all_index_states()?;
+    let state_doc_ids = existing_states
+        .iter()
+        .map(|state| state.doc_id.clone())
+        .collect::<Vec<_>>();
+    let catalog_documents = load_cached_documents_by_ids(db, &state_doc_ids)?;
 
-    for existing_state in db.list_all_index_states()? {
+    for existing_state in existing_states {
         let doc_type = knowledge_type_from_str(&existing_state.doc_type)?;
-        let access = apply_general_search_config(
+        let mut access = apply_general_search_config(
             cached_document_search_access(
                 working_dir,
                 app_knowledge_dir,
@@ -1698,6 +1704,15 @@ fn collect_vector_backfill_candidates(
             )?,
             &general_config,
         );
+        if doc_type == KnowledgeType::Skill {
+            let Some(document) = catalog_documents.get(&existing_state.doc_id) else {
+                continue;
+            };
+            access = apply_model_recall_to_search_access(
+                access,
+                cached_document_entry_allows_model_recall(working_dir, document)?,
+            );
+        }
         if !access.vector_enabled {
             continue;
         }
@@ -2271,8 +2286,12 @@ where
             &mut access_cache,
         )?;
 
-        let batch =
-            batch_document_search_inputs(documents_batch.to_vec(), &access_cache, &general_config);
+        let batch = batch_document_search_inputs(
+            working_dir,
+            documents_batch.to_vec(),
+            &access_cache,
+            &general_config,
+        )?;
         let parallelize_prepare_analysis =
             should_parallelize_prepare_analysis(embedding_backfill_ready, &batch);
         let current_file = batch.last().map(|(document, _)| document.path.as_str());
@@ -3016,6 +3035,10 @@ pub async fn upsert_document(
         )?,
         &general_config,
     );
+    let access = apply_model_recall_to_search_access(
+        access,
+        document_allows_model_recall(working_dir, &document)?,
+    );
     let desired_state = build_index_state(&document, &mgr.backend_signature_json(), access);
     let catalog_row = build_document_catalog_row(&document, access)?;
     let prepared =
@@ -3155,6 +3178,11 @@ pub async fn build_overview(
                 &mut access_cache,
             )?,
             &general_config,
+        );
+        let cached_document = catalog_row_to_cached_document(row.clone())?;
+        let access = apply_model_recall_to_search_access(
+            access,
+            cached_document_entry_allows_model_recall(working_dir, &cached_document)?,
         );
         if access.lexical_enabled {
             lexical_indexable_count += 1;
@@ -3443,7 +3471,15 @@ where
                 truncate_query_progress_info(value, 80),
                 0.22,
             );
-            catalog_title_search_documents(&db, value, types, path_prefix, query_limit * 6)?
+            catalog_title_search_documents(
+                working_dir,
+                &db,
+                value,
+                types,
+                path_prefix,
+                query_limit * 6,
+                include_hidden,
+            )?
         }
         None => Vec::new(),
     };
@@ -3542,10 +3578,12 @@ where
                     0.52,
                 );
                 semantic_recall(
+                    working_dir,
                     &db,
                     &mgr,
                     semantic_query.unwrap_or_default(),
                     query_limit * 6,
+                    include_hidden,
                 )?
             } else {
                 Vec::new()
@@ -3774,9 +3812,23 @@ where
                 semantic_score: entry.semantic_score,
                 semantic_confidence: entry.semantic_score.map(semantic_confidence),
                 estimated_tokens: Some(document.estimated_tokens),
+                physical_path: String::new(),
+                display_path: String::new(),
+                start_line: 0,
+                end_line: 0,
+                summary_start_line: None,
+                body_start_line: 0,
             })
         })
         .collect::<Vec<_>>();
+
+    enrich_search_hit_source_locations(
+        working_dir,
+        app_knowledge_dir,
+        lexical_query,
+        semantic_query,
+        &mut results,
+    );
 
     results.sort_by(|left, right| {
         right
@@ -3786,6 +3838,236 @@ where
     });
     results.truncate(query_limit);
     Ok(results)
+}
+
+fn enrich_search_hit_source_locations(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    lexical_query: Option<&str>,
+    semantic_query: Option<&str>,
+    hits: &mut [KnowledgeSearchHit],
+) {
+    let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+        working_dir,
+        app_knowledge_dir,
+    );
+    for hit in hits {
+        let resolved = registry.resolve_logical(hit.doc_type, &hit.path);
+        let resolved = if resolved.as_ref().is_some_and(|value| {
+            value.physical_path.is_file()
+                && value.kind
+                    != crate::knowledge_source_registry::KnowledgeSourceKind::ManagedReference
+        }) {
+            resolved
+        } else if hit.doc_type == KnowledgeType::Reference {
+            materialize_reference_search_hit(working_dir, app_knowledge_dir, &registry, &hit.path)
+                .or(resolved)
+        } else {
+            resolved
+        };
+        let Some(resolved) = resolved else {
+            continue;
+        };
+        hit.physical_path = resolved.physical_path.to_string_lossy().replace('\\', "/");
+        hit.display_path = resolved.display_path;
+        let (start_line, end_line) = locate_search_hit_line_range(
+            &resolved.physical_path,
+            lexical_query,
+            semantic_query,
+            &hit.matched_terms,
+            &hit.snippet,
+            &hit.title,
+        );
+        hit.start_line = start_line;
+        hit.end_line = end_line;
+        if let Some(context) =
+            read_search_hit_context(&resolved.physical_path, start_line, end_line)
+        {
+            hit.snippet = context;
+        }
+        let (summary_start_line, body_start_line) =
+            locate_document_section_start_lines(&resolved.physical_path);
+        hit.summary_start_line = summary_start_line;
+        hit.body_start_line = body_start_line;
+    }
+}
+
+fn materialize_reference_search_hit(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
+    logical_path: &str,
+) -> Option<crate::knowledge_source_registry::ResolvedKnowledgePath> {
+    let target = registry.managed_materialization_target(KnowledgeType::Reference, logical_path)?;
+    let document = knowledge_store::load_document_by_path_with_app_root(
+        working_dir,
+        app_knowledge_dir,
+        KnowledgeType::Reference,
+        logical_path,
+    )
+    .ok()?;
+    let content = knowledge_store::render_document_for_filesystem_read(&document).ok()?;
+    if let Some(parent) = target.physical_path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&target.physical_path, content).ok()?;
+    Some(target)
+}
+
+fn locate_search_hit_line_range(
+    physical_path: &std::path::Path,
+    lexical_query: Option<&str>,
+    semantic_query: Option<&str>,
+    matched_terms: &[String],
+    snippet: &str,
+    title: &str,
+) -> (u32, u32) {
+    let Ok(raw) = std::fs::read_to_string(physical_path) else {
+        return (1, 1);
+    };
+    let normalized = raw.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return (1, 1);
+    }
+
+    let mut needles = matched_terms
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    for query in [lexical_query, semantic_query].into_iter().flatten() {
+        let query = query.trim().to_lowercase();
+        if !query.is_empty() && !needles.contains(&query) {
+            needles.push(query);
+        }
+    }
+    let snippet_lines = snippet
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.chars().count() >= 6)
+        .map(|line| line.chars().take(120).collect::<String>().to_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut best_index = None;
+    let mut best_score = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let term_score = needles
+            .iter()
+            .filter(|needle| lower.contains(needle.as_str()))
+            .count()
+            * 10;
+        let snippet_score = if lower.trim().is_empty() {
+            0
+        } else {
+            snippet_lines
+                .iter()
+                .filter(|needle| lower.contains(needle.as_str()) || needle.contains(&lower))
+                .count()
+                * 4
+        };
+        let title_score =
+            if !title.trim().is_empty() && lower.contains(&title.trim().to_lowercase()) {
+                1
+            } else {
+                0
+            };
+        let score = term_score + snippet_score + title_score;
+        if score > best_score {
+            best_score = score;
+            best_index = Some(index);
+        }
+    }
+
+    let index = best_index.unwrap_or_else(|| {
+        lines
+            .iter()
+            .position(|line| !line.trim().is_empty() && line.trim() != "---")
+            .unwrap_or(0)
+    });
+    let mut start = index;
+    while start > 0 && index.saturating_sub(start) < 8 {
+        if lines[start - 1].trim().is_empty() {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = index;
+    while end + 1 < lines.len() && end.saturating_sub(index) < 24 {
+        if lines[end + 1].trim().is_empty() {
+            break;
+        }
+        end += 1;
+    }
+    (start as u32 + 1, end as u32 + 1)
+}
+
+fn read_search_hit_context(
+    physical_path: &std::path::Path,
+    start_line: u32,
+    end_line: u32,
+) -> Option<String> {
+    let raw = std::fs::read_to_string(physical_path).ok()?;
+    let normalized = raw.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = start_line.max(1).saturating_sub(1) as usize;
+    let end = end_line.max(start_line).max(1) as usize;
+    if start >= lines.len() {
+        return None;
+    }
+
+    let context = lines[start..end.min(lines.len())]
+        .join("\n")
+        .trim()
+        .to_string();
+    (!context.is_empty()).then_some(context)
+}
+
+fn locate_document_section_start_lines(physical_path: &std::path::Path) -> (Option<u32>, u32) {
+    let Ok(raw) = std::fs::read_to_string(physical_path) else {
+        return (None, 1);
+    };
+    let normalized = raw.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return (None, 1);
+    }
+
+    let has_frontmatter = lines
+        .first()
+        .is_some_and(|line| line.trim_start_matches('\u{feff}').trim() == "---");
+    if !has_frontmatter {
+        let body_index = lines
+            .iter()
+            .position(|line| !line.trim().is_empty())
+            .unwrap_or(0);
+        return (None, body_index as u32 + 1);
+    }
+
+    let frontmatter_end = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, line)| (line.trim() == "---").then_some(index));
+    let Some(frontmatter_end) = frontmatter_end else {
+        return (None, 1);
+    };
+
+    let summary_start_line = lines[1..frontmatter_end]
+        .iter()
+        .position(|line| line.trim_start().starts_with("summary:"))
+        .map(|index| index as u32 + 2);
+    let mut body_index = frontmatter_end + 1;
+    while body_index < lines.len() && lines[body_index].trim().is_empty() {
+        body_index += 1;
+    }
+
+    (summary_start_line, body_index as u32 + 1)
 }
 
 type PendingRebuildDocument = (
@@ -4195,6 +4477,9 @@ fn load_all_documents(
         None,
         excluded_prefixes,
     )?;
+    // Keep disabled package documents in the catalog so the knowledge tree can
+    // display and configure them. Reconcile applies the model-recall gate to
+    // their lexical/vector access before producing chunks or embeddings.
     documents.extend(
         crate::commands::list_skill_package_knowledge_documents_sync_with_hidden(
             working_dir,
@@ -4216,6 +4501,36 @@ fn document_is_excluded(
             && (document.path == prefix.as_str()
                 || document.path.starts_with(&format!("{}/", prefix)))
     })
+}
+
+fn document_allows_model_recall(
+    working_dir: &str,
+    document: &KnowledgeDocument,
+) -> Result<bool, String> {
+    if document.doc_type != KnowledgeType::Skill {
+        return Ok(true);
+    }
+    if let Some(allowed) = crate::commands::skill_package_virtual_path_allows_model_recall_sync(
+        working_dir,
+        &document.path,
+    )? {
+        return Ok(allowed);
+    }
+    Ok(knowledge_store::document_allows_model_recall(document))
+}
+
+fn apply_model_recall_to_search_access(
+    access: DirectorySearchAccess,
+    model_recall_allowed: bool,
+) -> DirectorySearchAccess {
+    if model_recall_allowed {
+        access
+    } else {
+        DirectorySearchAccess {
+            lexical_enabled: false,
+            vector_enabled: false,
+        }
+    }
 }
 
 fn cached_document_entry_allows_model_recall(
@@ -4385,7 +4700,7 @@ fn directory_access_cache_path(doc_type: KnowledgeType, doc_path: &str) -> Optio
     {
         return Some(unity_docs::UNITY_REFERENCE_MANAGED_DIR.to_string());
     }
-    document_parent_directory(doc_path)
+    Some(document_parent_directory(doc_path).unwrap_or_default())
 }
 
 fn build_embedding_backend_state_marker(
@@ -4520,10 +4835,11 @@ fn populate_document_access_cache_for_batch(
 }
 
 fn batch_document_search_inputs(
+    working_dir: &str,
     documents: Vec<KnowledgeDocument>,
     cache: &HashMap<DirectoryAccessCacheKey, DirectorySearchAccess>,
     general_config: &KnowledgeGeneralConfig,
-) -> Vec<PendingDocumentAnalysisInput> {
+) -> Result<Vec<PendingDocumentAnalysisInput>, String> {
     documents
         .into_iter()
         .map(|document| {
@@ -4540,10 +4856,12 @@ fn batch_document_search_inputs(
                     lexical_enabled: true,
                     vector_enabled: true,
                 });
-            (
-                document,
-                apply_general_search_config(access, general_config),
-            )
+            let access = apply_general_search_config(access, general_config);
+            let access = apply_model_recall_to_search_access(
+                access,
+                document_allows_model_recall(working_dir, &document)?,
+            );
+            Ok((document, access))
         })
         .collect()
 }
@@ -4722,11 +5040,13 @@ fn title_path_match_score(needle: &str, title: &str, path: &str) -> Option<f32> 
 /// (2-3 char n-grams) and semantic recall (>= 2 chars), this stays usable for
 /// single-character queries and does not depend on the search index toggles.
 fn catalog_title_search_documents(
+    working_dir: &str,
     db: &KnowledgeDb,
     query: &str,
     types: Option<&[KnowledgeType]>,
     path_prefix: Option<&str>,
     limit: usize,
+    include_hidden: bool,
 ) -> Result<Vec<LexicalHit>, String> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() || limit == 0 {
@@ -4748,6 +5068,12 @@ fn catalog_title_search_documents(
 
     let mut scored = Vec::with_capacity(rows.len());
     for row in rows {
+        if !include_hidden {
+            let document = catalog_row_to_cached_document(row.clone())?;
+            if !cached_document_entry_allows_model_recall(working_dir, &document)? {
+                continue;
+            }
+        }
         let Some(score) = title_path_match_score(&needle, &row.title, &row.doc_path) else {
             continue;
         };
@@ -5496,7 +5822,7 @@ where
                 title: document.title,
                 path: document.path,
                 score,
-                snippet: truncate_snippet(&snippet, 220),
+                snippet: truncate_snippet(&snippet, 1000),
                 matched_terms,
             });
         }
@@ -5529,10 +5855,12 @@ where
 }
 
 fn semantic_recall(
+    working_dir: &str,
     db: &KnowledgeDb,
     embedding_mgr: &EmbeddingManager,
     query: &str,
     top_k: usize,
+    include_hidden: bool,
 ) -> Result<Vec<SemanticHit>, String> {
     let query_vec = match embedding_mgr.embed_query(query) {
         Some(Ok(vectors)) if !vectors.is_empty() => vectors.into_iter().next().unwrap(),
@@ -5545,10 +5873,35 @@ fn semantic_recall(
         return Ok(Vec::new());
     }
 
+    let allowed_doc_ids = if include_hidden {
+        None
+    } else {
+        let doc_ids = all_embeddings
+            .iter()
+            .map(|row| row.doc_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let documents = load_cached_documents_by_ids(db, &doc_ids)?;
+        let mut allowed = HashSet::with_capacity(documents.len());
+        for (doc_id, document) in documents {
+            if cached_document_entry_allows_model_recall(working_dir, &document)? {
+                allowed.insert(doc_id);
+            }
+        }
+        Some(allowed)
+    };
+
     let mut scored: Vec<(usize, f32)> = all_embeddings
         .par_iter()
         .enumerate()
         .filter_map(|(index, row)| {
+            if allowed_doc_ids
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&row.doc_id))
+            {
+                return None;
+            }
             let score = cosine_similarity(&query_vec, &row.vector);
             passes_semantic_score_threshold(score).then_some((index, score))
         })
@@ -5572,7 +5925,7 @@ fn semantic_recall(
             let snippet = chunks
                 .iter()
                 .find(|chunk| chunk.section == row.section && chunk.seq == row.seq)
-                .map(|chunk| truncate_snippet(&chunk.text, 220))
+                .map(|chunk| truncate_snippet(&chunk.text, 1000))
                 .unwrap_or_default();
 
             SemanticHit {
@@ -5673,14 +6026,10 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn truncate_snippet(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut end = max_chars;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -5730,9 +6079,10 @@ mod tests {
     use super::{
         build_embedding_backend_state_marker, build_overview, embedding_rebuild_detail,
         embedding_stage_progress, lexical_stage_progress, library_dir_for_working_dir,
-        list_cached_documents, needs_embedding_backfill, plan_managed_directory_reuse,
-        query_documents, query_documents_with_progress_with_timeout, rebuild_plan_for_document,
-        rebuild_reason_for_document, reconcile_unity_reference_import,
+        list_cached_documents, locate_document_section_start_lines, locate_search_hit_line_range,
+        needs_embedding_backfill, plan_managed_directory_reuse, query_documents,
+        query_documents_with_progress_with_timeout, read_search_hit_context,
+        rebuild_plan_for_document, rebuild_reason_for_document, reconcile_unity_reference_import,
         reconcile_workspace_internal, save_general_config,
         text_scan_search_documents_with_progress, DirectorySearchAccess, KnowledgeGeneralConfig,
         KnowledgeIndexState, KnowledgeRuntime, RebuildReason, INDEX_VERSION,
@@ -5744,7 +6094,7 @@ mod tests {
         FolderIndexRuleSetting, KnowledgeConfigSource, KnowledgeConfigSourceKind,
         KnowledgeDocument, KnowledgeExternalSource, KnowledgeInjectMode,
         KnowledgeSearchMatchSection, KnowledgeSourceProvider, KnowledgeStorageSource,
-        KnowledgeType,
+        KnowledgeType, SkillSurface,
     };
     use crate::unity_docs;
     use std::{path::Path, sync::Arc, time::Duration};
@@ -5772,6 +6122,45 @@ mod tests {
         assert!(config.enabled);
         assert!(!config.lexical_search_enabled);
         assert!(!config.semantic_search_enabled);
+    }
+
+    #[test]
+    fn search_line_ranges_count_frontmatter_physical_lines() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("knowledge.md");
+        std::fs::write(
+            &path,
+            "---\nid: kd_test\ntype: design\npath: knowledge.md\ntitle: Knowledge\n---\n\n# Body\n\nPhysical target line\nMore context\n",
+        )
+        .expect("write knowledge file");
+
+        let range = locate_search_hit_line_range(
+            &path,
+            Some("Physical target"),
+            None,
+            &["Physical".to_string(), "target".to_string()],
+            "Physical target line",
+            "Knowledge",
+        );
+        assert_eq!(range, (10, 11));
+        assert_eq!(
+            read_search_hit_context(&path, range.0, range.1).as_deref(),
+            Some("Physical target line\nMore context")
+        );
+        assert_eq!(locate_document_section_start_lines(&path), (None, 8));
+    }
+
+    #[test]
+    fn section_start_lines_include_frontmatter_summary_and_body() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("knowledge.md");
+        std::fs::write(
+            &path,
+            "---\nid: kd_test\nsummary: |-\n  Summary text\n---\n\nBody text\n",
+        )
+        .expect("write knowledge file");
+
+        assert_eq!(locate_document_section_start_lines(&path), (Some(3), 7));
     }
 
     #[test]
@@ -5943,6 +6332,61 @@ mod tests {
             "正文",
             1,
         );
+    }
+
+    fn save_skill_document(
+        working_dir: &str,
+        id: &str,
+        path: &str,
+        title: &str,
+        body: &str,
+        enabled: bool,
+        external_package: bool,
+    ) {
+        save_document(
+            working_dir,
+            KnowledgeDocument {
+                id: id.to_string(),
+                doc_type: KnowledgeType::Skill,
+                path: path.to_string(),
+                title: title.to_string(),
+                inject_mode: KnowledgeInjectMode::Excerpt,
+                inherit_inject_mode: false,
+                inject_mode_source: KnowledgeConfigSource {
+                    kind: KnowledgeConfigSourceKind::SelfValue,
+                    path: None,
+                },
+                summary_enabled: true,
+                command_enabled: enabled,
+                read_only: external_package,
+                ai_maintained: false,
+                storage_source: KnowledgeStorageSource::Project,
+                inherit_ai_config: false,
+                ai_config_source: KnowledgeConfigSource {
+                    kind: KnowledgeConfigSourceKind::SelfValue,
+                    path: None,
+                },
+                explicit_maintenance_rules: false,
+                external_source: external_package.then(|| KnowledgeExternalSource {
+                    provider: KnowledgeSourceProvider::Package,
+                    locator: Some(format!("external://test/{}", path)),
+                    source_id: Some(path.to_string()),
+                    sync_enabled: false,
+                    ..Default::default()
+                }),
+                skill_enabled: Some(enabled),
+                skill_surface: Some(SkillSurface::Both),
+                command_trigger: None,
+                argument_hint: None,
+                tools: Vec::new(),
+                summary: Some(title.to_string()),
+                body: body.to_string(),
+                maintenance_rules: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .expect("save skill document");
     }
 
     fn memory_document(index: usize, body: String, updated_at: i64) -> KnowledgeDocument {
@@ -6735,6 +7179,92 @@ mod tests {
         let overview = result.expect("build overview");
         assert!(overview.total_document_count >= 1);
         assert!(overview.full_text.indexable_item_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_external_skill_folder_stays_visible_without_entering_the_index() {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        save_skill_document(
+            &working_dir,
+            "kd_external_alpha",
+            "external/agents/alpha/SKILL.md",
+            "External Alpha",
+            "disabled-parent-index-sentinel alpha",
+            false,
+            true,
+        );
+        save_skill_document(
+            &working_dir,
+            "kd_external_beta",
+            "external/agents/beta/SKILL.md",
+            "External Beta",
+            "disabled-parent-index-sentinel beta",
+            false,
+            true,
+        );
+        save_skill_document(
+            &working_dir,
+            "kd_active_skill",
+            "active/enabled.md",
+            "Active Skill",
+            "active-skill-index-sentinel",
+            true,
+            false,
+        );
+        save_test_general_config(&working_dir, true, false);
+        let state = create_state(&working_dir);
+
+        let external_items = list_cached_documents(
+            &working_dir,
+            None,
+            Some(KnowledgeType::Skill),
+            Some("external/agents"),
+            state.clone(),
+        )
+        .await
+        .expect("list disabled external skills from catalog");
+
+        assert_eq!(external_items.len(), 2);
+        assert!(external_items
+            .iter()
+            .all(|item| item.lexical_search_enabled == Some(false)));
+        assert_eq!(
+            state
+                .db()
+                .count_chunks_for_doc("kd_external_alpha")
+                .expect("count alpha chunks"),
+            0
+        );
+        assert_eq!(
+            state
+                .db()
+                .count_chunks_for_doc("kd_external_beta")
+                .expect("count beta chunks"),
+            0
+        );
+        assert!(
+            state
+                .db()
+                .count_chunks_for_doc("kd_active_skill")
+                .expect("count active skill chunks")
+                > 0
+        );
+
+        let hidden_hits = query_documents(
+            &working_dir,
+            None,
+            Some("disabled-parent-index-sentinel"),
+            None,
+            Some(&[KnowledgeType::Skill]),
+            Some("external/agents"),
+            10,
+            false,
+            state,
+        )
+        .await
+        .expect("query disabled external skill folder");
+        assert!(hidden_hits.is_empty());
     }
 
     #[tokio::test]

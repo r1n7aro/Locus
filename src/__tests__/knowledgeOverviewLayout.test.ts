@@ -15,7 +15,7 @@ function cssRuleBlock(source: string, selector: string): string {
 }
 
 describe("KnowledgeOverviewPanel layout", () => {
-  it("keeps the overview grid stable and moves reference import guidance into the folder flow", () => {
+  it("keeps the unified overview grid stable", () => {
     const overview = read("src/components/knowledge/KnowledgeOverviewPanel.vue");
     const leftStackRule = cssRuleBlock(overview, ".overview-left-stack");
     const defaultGridRule = cssRuleBlock(overview, ".overview-grid-default");
@@ -31,14 +31,11 @@ describe("KnowledgeOverviewPanel layout", () => {
     expect(overview).toMatch(/\.overview-grid-default\s*>\s*\.overview-right-stack\s*>\s*\.overview-card-token\s*\{[\s\S]*grid-area:\s*token;/);
     expect(overview).toMatch(/\.overview-grid-default\s*>\s*\.overview-right-stack\s*>\s*\.overview-card-recent\s*\{[\s\S]*grid-area:\s*recent;/);
     expect(overview).toMatch(/\.overview-grid-default\s*>\s*\.overview-left-stack\s*>\s*\.overview-card-primary,\s*[\s\S]*\.overview-grid-default\s*>\s*\.overview-right-stack\s*>\s*\.overview-card-recent\s*\{[\s\S]*height:\s*100%;/);
-    expect(overview).toContain('t("knowledge.referenceFolder.external.overviewHint")');
-    expect(overview).toContain('t("knowledge.referenceFolder.external.createAction")');
-    expect(overview).toContain('t("knowledge.referenceFolder.external.unityOverviewHint")');
-    expect(overview).toContain('t("knowledge.referenceFolder.external.importUnityAction")');
-    expect(overview).toContain("@click=\"emit('createExternalFolder')\"");
-    expect(overview).toContain("@click=\"emit('createExternalFolder', 'unity')\"");
-    expect(overview).toContain('class="overview-card overview-card-note"');
-    expect(overview).toContain('class="overview-note-action-row"');
+    expect(overview).toContain('t("knowledge.dashboard.unified.title")');
+    expect(overview).toContain('t("knowledge.dashboard.unified.subtitle")');
+    expect(overview).toContain("const KNOWLEDGE_TYPES: KnowledgeDocumentType[]");
+    expect(overview).not.toContain("@click=\"emit('createExternalFolder')\"");
+    expect(overview).not.toContain("@click=\"emit('createExternalFolder', 'unity')\"");
     expect(overview).not.toContain("source-stack");
     expect(overview).not.toContain("source-card");
     expect(leftStackRule).not.toContain("grid-area");
@@ -67,20 +64,29 @@ describe("KnowledgeOverviewPanel layout", () => {
     expect(overview).toMatch(/\.overview-card-recent\s*\{[\s\S]*min-height:\s*220px;/);
   });
 
-  it("responds to the right workspace width so external import actions stay visible", () => {
+  it("keeps L1, L2, and L3 documents outside fallback visibility limits", () => {
     const overview = read("src/components/knowledge/KnowledgeOverviewPanel.vue");
 
-    expect(overview).toContain('class="overview-card-action"');
-    expect(overview).toContain('class="overview-note-action"');
+    expect(overview).toContain("promptFileBypassesVisibilityLimit");
+    expect(overview).toContain('document.effectiveInjectMode === "excerpt"');
+    expect(overview).toContain('document.effectiveInjectMode === "full"');
+    expect(overview).toContain('document.effectiveInjectMode === "rule"');
+    expect(overview).toContain(
+      "bypassesLimit ||\n      (showFiles && limitedVisibleFiles < maxVisibleFiles)",
+    );
+  });
+
+  it("responds to the right workspace width", () => {
+    const overview = read("src/components/knowledge/KnowledgeOverviewPanel.vue");
+
     expect(overview).toMatch(/\.overview-panel\s*\{[\s\S]*container-type:\s*inline-size;/);
     expect(overview).toMatch(/\.overview-grid-top\s*\{[\s\S]*grid-template-columns:\s*minmax\(340px,\s*0\.86fr\)\s*minmax\(300px,\s*1\.14fr\);/);
     expect(overview).toMatch(/\.card-title-row\s*\{[\s\S]*flex-wrap:\s*wrap;/);
-    expect(overview).toMatch(/\.overview-note-action-row\s*\{[\s\S]*flex-wrap:\s*wrap;/);
     expect(overview).toContain("@container (max-width: 1040px)");
     expect(overview).toContain("@container (max-width: 720px)");
     expect(overview).toContain("@container (max-width: 760px)");
     expect(overview).toMatch(/@container \(max-width: 1040px\)\s*\{[\s\S]*\.stats-grid-three,\s*[\s\S]*\.stats-grid-four\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
     expect(overview).toMatch(/@container \(max-width: 720px\)\s*\{[\s\S]*\.overview-grid-top\s*\{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
-    expect(overview).toMatch(/@container \(max-width: 760px\)\s*\{[\s\S]*\.overview-card-action,\s*[\s\S]*\.overview-note-action\s*\{[\s\S]*width:\s*100%;/);
+    expect(overview).toMatch(/@container \(max-width: 760px\)\s*\{[\s\S]*\.stats-grid-three,\s*[\s\S]*\.stats-grid-four\s*\{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
   });
 });

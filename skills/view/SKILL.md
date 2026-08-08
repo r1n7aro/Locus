@@ -1,5 +1,7 @@
 ---
 tools:
+  - knowledge_query
+  - read
   - view_list
   - view_create
   - view_reload
@@ -44,7 +46,7 @@ Use this workflow when the user asks for a Locus View or a frontend-built Unity 
    - Code shared across Views in the same workspace lives in the workspace `src/` and is imported as `@locus/project-view`.
 
 4. Resolve API details through the stable View contract, in this order:
-   - `runtime-api.md` in this skill package: the quick reference for `@locus/view-runtime` services (Unity property editing, drawers, drag/drop, graph/canvas, session, LLM, storage, fs, logs) and `@locus/components` components. Load it with `knowledge_read` path `skill/view/runtime-api.md`.
+   - `runtime-api.md` in this skill package: the quick reference for `@locus/view-runtime` services (Unity property editing, drawers, drag/drop, graph/canvas, session, LLM, storage, fs, logs) and `@locus/components` components. Locate it with `knowledge_query`, then `read` the returned physical path.
    - Exported runtime sources under this skill package's `app/view-runtime/src/`: exact component props, graph/canvas data shapes, and release behavior.
    - Locus application sources: only present in a development checkout. Installed releases do not ship them, so never depend on them from package code or instructions.
 
@@ -72,6 +74,6 @@ import { UnitySerializedPropertyTree, GraphView } from "@locus/components";
 
 7. Validate, debug, and report.
    - Run `view_reload` after edits: it validates the manifest and refreshes an open host. Use `view_run` to open or focus the View host.
-   - If the View fails to load or misbehaves, read `debug.md` with `knowledge_read` path `skill/view/debug.md`. That read activates the debugging tools (`view_capture`, `view_snapshot`, `view_action`, `view_wait`, `view_console_read`, `view_debug_eval`); plain file reads do not. Check `view_console_read` first for frontend runtime errors.
+   - If the View fails to load or misbehaves, locate `debug.md` with `knowledge_query`, then `read` the returned physical path. Reading a registered Skill document activates its debugging tools (`view_capture`, `view_snapshot`, `view_action`, `view_wait`, `view_console_read`, `view_debug_eval`). Check `view_console_read` first for frontend runtime errors.
    - When the user-facing reply should reference the finished View, put a standalone line in this exact format: `view:<view-id>`, using the id returned by `view_create`, `view_list`, or `view_reload`. The Locus frontend renders that line as a View reference block with an Open View button.
    - Report the View id, `packageRoot`, template used, files changed, reload or run result, and the standalone `view:<view-id>` reference line.

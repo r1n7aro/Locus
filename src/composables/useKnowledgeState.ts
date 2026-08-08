@@ -83,7 +83,7 @@ import {
   buildKnowledgeCreateDefaults,
   defaultSummaryEnabledForType,
 } from "../components/knowledge/knowledgeEditMode";
-import { pruneKnowledgeDeleteTargets } from "../components/knowledge/knowledgeExplorerSelection";
+import { pruneKnowledgeDragNodes } from "../components/knowledge/knowledgeExplorerSelection";
 import { t } from "../i18n";
 
 interface KnowledgeProps {
@@ -97,14 +97,17 @@ export type KnowledgeViewMode = "browse" | "search";
 export type ExplorerNode =
   | {
       kind: "folder";
+      type: KnowledgeDocumentType;
       path: string;
       relativePath: string;
       name: string;
       depth: number;
       children: ExplorerNode[];
+      specialRoot?: boolean;
     }
   | {
       kind: "package";
+      type: KnowledgeDocumentType;
       path: string;
       relativePath: string;
       packageId: string;
@@ -116,6 +119,7 @@ export type ExplorerNode =
     }
   | {
       kind: "document";
+      type: KnowledgeDocumentType;
       path: string;
       name: string;
       depth: number;
@@ -124,7 +128,6 @@ export type ExplorerNode =
 
 type FolderNode = Extract<ExplorerNode, { kind: "folder" }>;
 type PackageNode = Extract<ExplorerNode, { kind: "package" }>;
-type DocumentNode = Extract<ExplorerNode, { kind: "document" }>;
 type BranchNode = FolderNode | PackageNode;
 
 const DEFAULT_TYPE_ORDER: KnowledgeDocumentType[] = [
@@ -243,7 +246,8 @@ function typeRootPath(type: KnowledgeDocumentType): string {
 }
 
 function fullDocumentPath(type: KnowledgeDocumentType, path: string): string {
-  return `${type}/${path.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  return normalized ? `${type}/${normalized}` : type;
 }
 
 function ensureMarkdownDocumentPath(path: string): string {
@@ -421,6 +425,7 @@ function ensureFolderNode(
   if (!normalized) {
     const rootNode: FolderNode = {
       kind: "folder",
+      type,
       path: rootPath,
       relativePath: "",
       name: type,
@@ -437,6 +442,7 @@ function ensureFolderNode(
   const fullPath = fullDocumentPath(type, normalized);
   const folderNode: FolderNode = {
     kind: "folder",
+    type,
     path: fullPath,
     relativePath: normalized,
     name: segments[segments.length - 1] ?? normalized,
@@ -529,6 +535,7 @@ function createPackageNode(
   });
   return {
     kind: "package",
+    type: "skill",
     path: fullDocumentPath("skill", packageId),
     relativePath: packageId,
     packageId,
@@ -539,6 +546,7 @@ function createPackageNode(
     children: [
       {
         kind: "document",
+        type: "skill",
         path: fullDocumentPath("skill", normalizedDocumentPath),
         name: "SKILL.md",
         depth: depth + 1,
@@ -599,6 +607,7 @@ function buildExplorerTree(
       const parentNode = ensureFolderNode(folderMap, type, parentRelativePath);
       parentNode.children.push({
         kind: "document",
+        type,
         path: fullDocumentPath(type, normalizedPath),
         name: fileName,
         depth: segments.length,
@@ -615,6 +624,117 @@ function buildExplorerTree(
     sortChildren(rootNode);
     return rootNode;
   });
+}
+
+function buildUnifiedExplorerTree(typeRoots: FolderNode[]): ExplorerNode[] {
+  const rootNames: Record<KnowledgeDocumentType, string> = {
+    design: "Design",
+    memory: "Memory",
+    skill: "Skill",
+    reference: "Reference",
+  };
+  return typeRoots.map((node) => ({
+    ...node,
+    specialRoot: true,
+    name: rootNames[node.type],
+  }));
+}
+
+function searchResultKey(
+  type: KnowledgeDocumentType,
+  path: string,
+): string {
+  return `${type}:${path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")}`;
+}
+
+function searchResultDocumentSummary(
+  result: KnowledgeSearchResult,
+): KnowledgeDocumentSummary {
+  return {
+    id: result.id,
+    type: result.type,
+    path: result.path,
+    title: result.title,
+    injectMode: result.effectiveInjectMode,
+    effectiveInjectMode: result.effectiveInjectMode,
+    readOnly: true,
+    aiMaintained: result.effectiveAiMaintained,
+    effectiveAiMaintained: result.effectiveAiMaintained,
+    storageSource: result.storageSource ?? "project",
+    summary: null,
+    modifiedAt: result.modifiedAt ?? 0,
+  };
+}
+
+function filterSearchTreeNodes(
+  nodes: ExplorerNode[],
+  matchedDocumentKeys: Set<string>,
+): ExplorerNode[] {
+  const filtered: ExplorerNode[] = [];
+  for (const node of nodes) {
+    if (node.kind === "document") {
+      if (matchedDocumentKeys.has(searchResultKey(node.type, node.document.path))) {
+        filtered.push(node);
+      }
+      continue;
+    }
+    const children = filterSearchTreeNodes(node.children, matchedDocumentKeys);
+    if (children.length > 0) filtered.push({ ...node, children });
+  }
+  return filtered;
+}
+
+export function buildSearchExplorerTree(
+  results: KnowledgeSearchResult[],
+  existingDocuments: KnowledgeDocumentSummary[],
+): ExplorerNode[] {
+  const existingById = new Map(existingDocuments.map((document) => [document.id, document]));
+  const existingByPath = new Map(
+    existingDocuments.map((document) => [
+      searchResultKey(document.type, document.path),
+      document,
+    ]),
+  );
+  const matchedDocumentKeys = new Set<string>();
+  const documentsByKey = new Map<string, KnowledgeDocumentSummary>();
+
+  for (const result of results) {
+    const key = searchResultKey(result.type, result.path);
+    matchedDocumentKeys.add(key);
+    if (documentsByKey.has(key)) continue;
+    const existing = existingById.get(result.id) ?? existingByPath.get(key);
+    documentsByKey.set(key, existing ?? searchResultDocumentSummary(result));
+  }
+
+  // A matched file inside a skill package still needs its package root in the
+  // input tree so search preserves the same package branch used while browsing.
+  const packageRoots = existingDocuments.filter(isSkillPackageRootDocument);
+  for (const document of documentsByKey.values()) {
+    if (document.type !== "skill") continue;
+    const normalizedPath = document.path.replace(/\\/g, "/").replace(/^\/+/, "");
+    const packageRoot = packageRoots.find((candidate) => {
+      const packageId = skillPackageIdForDocument(candidate);
+      return packageId && normalizedPath.startsWith(`${packageId}/`);
+    });
+    if (!packageRoot) continue;
+    const packageRootKey = searchResultKey(packageRoot.type, packageRoot.path);
+    if (!documentsByKey.has(packageRootKey)) {
+      documentsByKey.set(packageRootKey, packageRoot);
+    }
+  }
+
+  const grouped: Record<KnowledgeDocumentType, KnowledgeDocumentSummary[]> = {
+    design: [],
+    memory: [],
+    skill: [],
+    reference: [],
+  };
+  for (const document of documentsByKey.values()) grouped[document.type].push(document);
+
+  return filterSearchTreeNodes(
+    buildUnifiedExplorerTree(buildExplorerTree(grouped, emptyDirectoryGroups())),
+    matchedDocumentKeys,
+  );
 }
 
 export function useKnowledgeState(props: KnowledgeProps) {
@@ -644,6 +764,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   const selectedDocument = ref<KnowledgeDocument | null>(null);
   const selectedDocumentLoading = ref(false);
   const selectedPackageDocument = ref<KnowledgeDocumentSummary | null>(null);
+  const selectedDirectoryType = ref<KnowledgeDocumentType | null>(null);
   const selectedDirectoryPath = ref<string | null>(null);
   const selectedDirectoryConfig = ref<KnowledgeDirectoryConfigRecord | null>(
     null,
@@ -809,21 +930,26 @@ export function useKnowledgeState(props: KnowledgeProps) {
     return grouped;
   });
 
-  const explorerTree = computed(() =>
+  const explorerTypeRoots = computed(() =>
     buildExplorerTree(documentsByType.value, directoryGroups.value),
   );
-
-  const currentExplorerRoot = computed(
-    () =>
-      explorerTree.value.find(
-        (node) => node.path === typeRootPath(activeType.value),
-      ) ?? null,
+  const explorerTree = computed(() =>
+    buildUnifiedExplorerTree(explorerTypeRoots.value),
   );
-  const visibleExplorerTree = computed(
-    () => currentExplorerRoot.value?.children ?? [],
+  const searchExplorerTree = computed(() =>
+    buildSearchExplorerTree(searchResults.value, documents.value),
+  );
+  const currentExplorerRoot = computed(
+    () => explorerTypeRoots.value.find((node) => node.type === activeType.value) ?? null,
+  );
+  const visibleExplorerTree = computed(() =>
+    searchQuery.value.trim() ? searchExplorerTree.value : explorerTree.value,
   );
   const activeDirectoryCount = computed(
-    () => directoryGroups.value[activeType.value].length,
+    () => DEFAULT_TYPE_ORDER.reduce(
+      (total, type) => total + directoryGroups.value[type].length,
+      0,
+    ),
   );
   const selectedDocumentSummary = computed(
     () =>
@@ -846,8 +972,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
               selectedPackageDocument.value.type,
               skillPackageIdForDocument(selectedPackageDocument.value),
             )
-        : selectedDirectoryPath.value
-          ? fullDocumentPath(activeType.value, selectedDirectoryPath.value)
+        : selectedDirectoryConfig.value && selectedDirectoryType.value
+          ? fullDocumentPath(
+            selectedDirectoryType.value,
+            selectedDirectoryConfig.value.path,
+          )
           : null,
   );
   const viewMode = computed<KnowledgeViewMode>(() =>
@@ -866,15 +995,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
     for (const doc of documents.value) {
       byType[doc.type] += 1;
       byStorageSource[doc.storageSource ?? "project"] += 1;
-      if (doc.commandEnabled) commandEnabled += 1;
-      if (doc.aiMaintained) aiMaintained += 1;
+      if (doc.skillEnabled && (doc.skillSurface === "command" || doc.skillSurface === "both")) {
+        commandEnabled += 1;
+      }
+      if (doc.effectiveAiMaintained) aiMaintained += 1;
       if (
         (doc.type === "design" || doc.type === "memory") &&
-        doc.injectMode === "full"
+        doc.effectiveInjectMode === "full"
       ) {
         fullInjectable += 1;
       }
-      if (doc.summaryEnabled && !doc.hasSummary) summaryMissing += 1;
+      if (defaultSummaryEnabledForType(doc.type) && !doc.summary?.trim()) summaryMissing += 1;
       if (doc.externalSource) external += 1;
     }
 
@@ -1385,6 +1516,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   }
 
   function clearSelectedDirectoryState() {
+    selectedDirectoryType.value = null;
     selectedDirectoryPath.value = null;
     selectedDirectoryConfig.value = null;
     selectedDirectoryLoading.value = false;
@@ -1488,10 +1620,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       directories: isStructureChange || isConfigChange || targetKind === "directory",
     });
 
-    if (type !== activeType.value) {
-      return;
-    }
-
     if (targetKind === "document" && path) {
       if (isStructureChange && type === "reference") {
         await refreshExternalDirectoryDocuments(type, parentPath, request);
@@ -1514,11 +1642,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
       if (!isCurrentWorkspaceRequest(request)) return;
 
       if (
+        selectedDirectoryType.value === type &&
         selectedDirectoryPath.value &&
         normalizeDirectorySelectionPath(selectedDirectoryPath.value) === parentPath &&
         (isStructureChange || isConfigChange)
       ) {
-        await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+        await loadSelectedDirectoryConfig(selectedDirectoryPath.value, type);
         if (!isCurrentWorkspaceRequest(request)) return;
       }
 
@@ -1545,11 +1674,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
         ? normalizeDirectorySelectionPath(selectedDirectoryPath.value)
         : "";
       if (
+        selectedDirectoryType.value === type &&
         normalizedSelectedDirectory &&
         pathMatchesSubtree(normalizedSelectedDirectory, path)
       ) {
         if (directoryGroups.value[type].includes(normalizedSelectedDirectory)) {
-          await loadSelectedDirectoryConfig(selectedDirectoryPath.value);
+          await loadSelectedDirectoryConfig(selectedDirectoryPath.value, type);
           if (!isCurrentWorkspaceRequest(request)) return;
         } else {
           clearSelectedDirectoryState();
@@ -1644,6 +1774,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDocument.value = null;
     selectedDocumentLoading.value = false;
     selectedPackageDocument.value = null;
+    selectedDirectoryType.value = null;
     selectedDirectoryPath.value = null;
     selectedDirectoryConfig.value = null;
     selectedDirectoryLoading.value = false;
@@ -1928,15 +2059,20 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const nextPaths = [...paths].sort((left, right) =>
         left.localeCompare(right, undefined, { sensitivity: "base" }),
       );
-      const rootPaths = nextPaths.filter(isRootDirectoryPath);
+      const configTargets = [
+        { key: "", path: type },
+        ...nextPaths
+          .filter(isRootDirectoryPath)
+          .map((path) => ({ key: path, path })),
+      ];
       const settled = await Promise.allSettled(
-        rootPaths.map(async (path) => {
+        configTargets.map(async (target) => {
           const result = await knowledgeRead({
             kind: "directory",
-            path,
+            path: target.path,
             type,
           });
-          return result.directory;
+          return { key: target.key, directory: result.directory };
         }),
       );
       if (!isCurrentWorkspaceRequest(request)) {
@@ -1945,8 +2081,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const configs = settled.reduce<
         Record<string, KnowledgeDirectoryConfigRecord>
       >((acc, entry) => {
-        if (entry.status !== "fulfilled" || !entry.value) return acc;
-        acc[entry.value.path] = entry.value;
+        if (entry.status !== "fulfilled" || !entry.value.directory) return acc;
+        acc[entry.value.key] = entry.value.directory;
         return acc;
       }, {});
       directoryGroups.value = {
@@ -2114,6 +2250,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         path: refTarget.path,
         type: refTarget.type,
         part: "full",
+        ...(refTarget.type === "skill" || refTarget.type === "reference"
+          ? { includeHistory: true }
+          : {}),
       });
       const doc = result.document;
       if (!doc) throw new Error("knowledge_read returned no document");
@@ -2157,42 +2296,56 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function loadSelectedDirectoryConfig(targetPath?: string | null) {
-    if (!hasWorkspace.value) return;
+  async function loadSelectedDirectoryConfig(
+    targetPath?: string | null,
+    targetType?: KnowledgeDocumentType | null,
+  ): Promise<boolean> {
+    if (!hasWorkspace.value) return false;
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey) return false;
     const seq = selectionSeq;
-    const refPath = normalizeDirectorySelectionPath(
-      targetPath ?? selectedDirectoryPath.value ?? "",
+    const refType = targetType ?? selectedDirectoryType.value ?? activeType.value;
+    const rawPath = targetPath ?? selectedDirectoryPath.value ?? "";
+    const refPath = normalizeDirectorySelectionPath(rawPath);
+    const rootRequested = refPath === refType || (
+      !refPath
+      && selectedDirectoryConfig.value?.path === ""
+      && selectedDirectoryType.value === refType
     );
-    if (!refPath) {
+    if (!refPath && !rootRequested) {
       selectedDirectoryPath.value = null;
+      selectedDirectoryType.value = null;
       selectedDirectoryConfig.value = null;
-      return;
+      return false;
     }
+    const requestPath = rootRequested ? refType : refPath;
 
     selectedDirectoryLoading.value = true;
     error.value = "";
     try {
       const result = await knowledgeRead({
         kind: "directory",
-        path: refPath,
-        type: activeType.value,
+        path: requestPath,
+        type: refType,
       });
       const config = result.directory;
       if (!config)
         throw new Error("knowledge_read returned no directory config");
       if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
-        return;
+        return false;
       }
       selectedDirectoryPath.value = config.path;
+      selectedDirectoryType.value = config.type;
+      activeType.value = config.type;
       selectedDirectoryConfig.value = config;
       expandAncestors(fullDocumentPath(config.type, config.path));
+      return true;
     } catch (cause) {
       if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
-        return;
+        return false;
       }
       notifyError("knowledge_read.directory", cause);
+      return false;
     } finally {
       if (isCurrentWorkspaceRequest(request) && seq === selectionSeq) {
         selectedDirectoryLoading.value = false;
@@ -2232,16 +2385,20 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const includeOverview = options?.includeOverview ?? true;
     const silentSelectedDocument = options?.silentSelectedDocument ?? false;
     consumePendingUiSelection();
-    await ensureTypeDataLoaded(activeType.value, {
-      force,
-      includeOverview,
-    });
+    await Promise.all(DEFAULT_TYPE_ORDER.map((type) =>
+      ensureTypeDataLoaded(type, {
+        force,
+        includeOverview: includeOverview && type === activeType.value,
+      })
+    ));
     if (!isCurrentWorkspaceRequest(request)) {
       return;
     }
     if (pendingSelectionPath.value) {
       const pendingPath = pendingSelectionPath.value;
-      const next = documents.value.find((doc) => doc.path === pendingPath);
+      const next = documents.value.find(
+        (doc) => doc.type === activeType.value && doc.path === pendingPath,
+      );
       if (next) {
         pendingSelectionPath.value = null;
         await loadSelectedDocument(next);
@@ -2252,15 +2409,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
           title: pendingPath.split("/").pop() ?? pendingPath,
           type: activeType.value,
           injectMode: "excerpt",
-          summaryEnabled: defaultSummaryEnabledForType(activeType.value),
-          commandEnabled: false,
+          effectiveInjectMode: "excerpt",
           readOnly: activeType.value === "reference",
           aiMaintained: false,
-          explicitMaintenanceRules: false,
+          effectiveAiMaintained: false,
           summary: null,
-          createdAt: 0,
-          updatedAt: 0,
-          hasSummary: false,
+          modifiedAt: 0,
         });
         pendingSelectionPath.value = null;
       }
@@ -2275,13 +2429,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
           isSkillPackageRootDocument(doc),
       );
       selectedPackageDocument.value = next ?? null;
-    } else if (selectedDirectoryPath.value) {
-      const stillExists = directoryGroups.value[activeType.value].includes(
-        selectedDirectoryPath.value,
-      );
+    } else if (selectedDirectoryConfig.value && selectedDirectoryType.value) {
+      const directoryType = selectedDirectoryType.value ?? activeType.value;
+      const selectedPath = selectedDirectoryConfig.value.path;
+      const stillExists = selectedPath === ""
+        || directoryGroups.value[directoryType].includes(selectedPath);
       if (stillExists) {
-        await loadSelectedDirectoryConfig();
+        await loadSelectedDirectoryConfig(
+          selectedPath || directoryType,
+          directoryType,
+        );
       } else {
+        selectedDirectoryType.value = null;
         selectedDirectoryPath.value = null;
         selectedDirectoryConfig.value = null;
       }
@@ -2334,15 +2493,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
   }
 
-  function collapseAllForType(type: KnowledgeDocumentType) {
-    const prefix = `${type}/`;
-    expandedPaths.value = new Set(
-      Array.from(expandedPaths.value).filter(
-        (entry) => !entry.startsWith(prefix),
-      ),
-    );
-  }
-
   function pruneUnityReferenceManagedEntries() {
     documents.value = documents.value.filter(
       (doc) =>
@@ -2369,6 +2519,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
 
     if (isUnityReferenceManagedPath(selectedDirectoryPath.value)) {
+      selectedDirectoryType.value = null;
       selectedDirectoryPath.value = null;
       selectedDirectoryConfig.value = null;
       selectedDirectoryLoading.value = false;
@@ -2402,6 +2553,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
 
     if (isFeishuReferenceManagedPath(selectedDirectoryPath.value)) {
+      selectedDirectoryType.value = null;
       selectedDirectoryPath.value = null;
       selectedDirectoryConfig.value = null;
       selectedDirectoryLoading.value = false;
@@ -2452,18 +2604,26 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function selectDirectory(path: string) {
+  async function selectDirectory(
+    typeOrPath: KnowledgeDocumentType | string,
+    maybePath?: string,
+  ) {
+    const type = maybePath ? typeOrPath as KnowledgeDocumentType : activeType.value;
+    const path = maybePath ?? typeOrPath;
     const normalized = normalizeDirectorySelectionPath(path);
     if (!normalized) return;
     selectionSeq += 1;
     selectedSearchContext.value = null;
+    pendingSelectionPath.value = null;
+    // Keep the current detail visible while the target config is read. The
+    // mutually-exclusive preview components swap only after a successful
+    // response, so there is no intermediate empty/loading frame.
+    const loaded = await loadSelectedDirectoryConfig(normalized, type);
+    if (!loaded) return;
     clearSelectedPackageState();
     selectedDocumentId.value = null;
     selectedDocument.value = null;
     selectedDocumentLoading.value = false;
-    pendingSelectionPath.value = null;
-    selectedDirectoryPath.value = normalized;
-    await loadSelectedDirectoryConfig(normalized);
   }
 
   async function selectPackage(summary: KnowledgeDocumentSummary) {
@@ -2480,13 +2640,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDirectoryConfig.value = null;
     selectedDirectoryLoading.value = false;
     selectedPackageDocument.value = summary;
-    expandPath(fullDocumentPath(summary.type, packageId));
+    selectedDirectoryType.value = null;
   }
 
   async function selectSearchResult(result: KnowledgeSearchResult) {
     const searchContext = buildSearchSelectionContext(result);
     const matched = documents.value.find(
-      (doc) => doc.id === result.id || doc.path === result.path,
+      (doc) => doc.id === result.id || (
+        doc.type === result.type && doc.path === result.path
+      ),
     );
     if (matched) {
       await selectDocument(matched, { searchContext });
@@ -2505,16 +2667,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
         title: result.title,
         type: result.type,
         storageSource: result.storageSource ?? "project",
-        injectMode: result.injectMode,
-        summaryEnabled: defaultSummaryEnabledForType(result.type),
-        commandEnabled: false,
+        injectMode: result.effectiveInjectMode,
+        effectiveInjectMode: result.effectiveInjectMode,
         readOnly: false,
-        aiMaintained: result.aiMaintained,
-        explicitMaintenanceRules: false,
+        aiMaintained: result.effectiveAiMaintained,
+        effectiveAiMaintained: result.effectiveAiMaintained,
         summary: null,
-        createdAt: 0,
-        updatedAt: result.updatedAt ?? 0,
-        hasSummary: false,
+        modifiedAt: result.modifiedAt ?? 0,
       }),
     ]);
   }
@@ -2527,6 +2686,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDocumentLoading.value = false;
     pendingSelectionPath.value = null;
     selectedPackageDocument.value = null;
+    selectedDirectoryType.value = null;
     selectedDirectoryPath.value = null;
     selectedDirectoryConfig.value = null;
     selectedDirectoryLoading.value = false;
@@ -3045,7 +3205,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function createDocument(title: string, parentDir = "") {
+  async function createDocument(
+    title: string,
+    parentDir = "",
+    type: KnowledgeDocumentType = activeType.value,
+  ) {
     if (!hasWorkspace.value) return;
     const trimmed = title.trim();
     if (!trimmed) return;
@@ -3058,8 +3222,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
         .replace(/\\/g, "/")
         .replace(/^\/+|\/+$/g, "");
       const slug = slugifyKnowledgePath(documentTitle);
-      if (activeType.value === "skill") {
-        const path = buildCreatePath(activeType.value, slug, relativeDir);
+      activeType.value = type;
+      if (type === "skill") {
+        const path = buildCreatePath(type, slug, relativeDir);
         const manifest = await enqueueMutation(() =>
           createSkillScaffold({
             kind: "md",
@@ -3081,24 +3246,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
         expandAncestors(fullDocumentPath("skill", docPath));
         return;
       }
-      const filePath = buildCreatePath(activeType.value, slug, relativeDir);
-      const defaults = buildKnowledgeCreateDefaults(activeType.value);
+      const filePath = buildCreatePath(type, slug, relativeDir);
+      const defaults = buildKnowledgeCreateDefaults(type);
       const result = await enqueueMutation(() =>
         knowledgeCreate({
           kind: "document",
-          type: activeType.value,
+          type,
           path: filePath,
           document: {
-            title: documentTitle,
             body: "",
-            inheritInjectMode: defaults.inheritInjectMode,
-            summaryEnabled: defaults.summaryEnabled,
-            skillEnabled: activeType.value === "skill" ? true : undefined,
-            skillSurface: activeType.value === "skill" ? "command" : undefined,
-            commandTrigger:
-              activeType.value === "skill" ? `/${slug}` : undefined,
+            injectMode: defaults.injectMode,
             readOnly: defaults.readOnly,
-            inheritAiConfig: defaults.inheritAiConfig,
+            aiMaintained: defaults.aiMaintained,
           },
         }),
       );
@@ -3109,7 +3268,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       expandAncestors(fullDocumentPath(doc.type, doc.path));
     } catch (cause) {
       notifyError(
-        activeType.value === "skill" ? "skill_create" : "knowledge_create.document",
+        type === "skill" ? "create_skill_scaffold" : "knowledge_create.document",
         cause,
       );
     } finally {
@@ -3117,7 +3276,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function createDocumentAt(parentDir: string, name: string) {
+  async function createDocumentAt(
+    parentDir: string,
+    name: string,
+    type: KnowledgeDocumentType = activeType.value,
+  ) {
     if (!hasWorkspace.value) return;
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -3126,16 +3289,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
       .replace(/\\/g, "/")
       .replace(/^\/+|\/+$/g, "");
     const slug =
-      activeType.value === "skill"
+      type === "skill"
         ? slugifyKnowledgePath(
             trimmed.replace(/\/SKILL\.md$/i, "").replace(/\.md$/i, ""),
           )
         : trimmed;
-    const pathName = buildCreatePath(activeType.value, slug, normalizedParent);
+    const pathName = buildCreatePath(type, slug, normalizedParent);
     creatingDocument.value = true;
     error.value = "";
     try {
-      if (activeType.value === "skill") {
+      activeType.value = type;
+      if (type === "skill") {
         const manifest = await enqueueMutation(() =>
           createSkillScaffold({
             kind: "md",
@@ -3157,23 +3321,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
         expandAncestors(fullDocumentPath("skill", docPath));
         return;
       }
-      const defaults = buildKnowledgeCreateDefaults(activeType.value);
+      const defaults = buildKnowledgeCreateDefaults(type);
       const result = await enqueueMutation(() =>
         knowledgeCreate({
           kind: "document",
-          type: activeType.value,
+          type,
           path: pathName,
           document: {
-            title: trimmed.replace(/\.md$/i, ""),
             body: "",
-            inheritInjectMode: defaults.inheritInjectMode,
-            summaryEnabled: defaults.summaryEnabled,
-            skillEnabled: activeType.value === "skill" ? true : undefined,
-            skillSurface: activeType.value === "skill" ? "command" : undefined,
-            commandTrigger:
-              activeType.value === "skill" ? `/${slug}` : undefined,
+            injectMode: defaults.injectMode,
             readOnly: defaults.readOnly,
-            inheritAiConfig: defaults.inheritAiConfig,
+            aiMaintained: defaults.aiMaintained,
           },
         }),
       );
@@ -3184,7 +3342,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       expandAncestors(fullDocumentPath(doc.type, doc.path));
     } catch (cause) {
       notifyError(
-        activeType.value === "skill" ? "skill_create" : "knowledge_create.document",
+        type === "skill" ? "create_skill_scaffold" : "knowledge_create.document",
         cause,
       );
     } finally {
@@ -3192,7 +3350,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function createFolder(parentDir: string, name: string) {
+  async function createFolder(
+    parentDir: string,
+    name: string,
+    type: KnowledgeDocumentType = activeType.value,
+  ) {
     if (!hasWorkspace.value) return;
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -3209,12 +3371,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await enqueueMutation(() =>
         knowledgeCreate({
           kind: "directory",
-          type: activeType.value,
+          type,
           path,
         }),
       );
       await refreshKnowledgeData();
-      const fullPath = fullDocumentPath(activeType.value, path);
+      activeType.value = type;
+      const fullPath = fullDocumentPath(type, path);
       expandAncestors(fullPath);
       expandPath(fullPath);
     } catch (cause) {
@@ -3237,7 +3400,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const updated = await enqueueMutation(async () => {
         const result = await knowledgeEdit({
           kind: "document",
-          type: activeType.value,
+          type: selectedDocument.value?.type ?? activeType.value,
           path,
           document: {
             id,
@@ -3296,7 +3459,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const updated = await enqueueMutation(async () => {
         const result = await knowledgeEdit({
           kind: "document",
-          type: activeType.value,
+          type: selectedDocument.value?.type ?? activeType.value,
           path,
           document: {
             id,
@@ -3336,7 +3499,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         meta.commandTrigger === undefined
           ? current.commandTrigger ?? ""
           : meta.commandTrigger ?? "",
-      injectMode: meta.injectMode,
+      injectMode: meta.injectMode === "inherit" ? undefined : meta.injectMode,
     };
 
     // Optimistic flip before the IPC round trip so the switch responds on
@@ -3344,7 +3507,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
     // on disk in the same order the UI showed.
     const optimisticPatch: Partial<KnowledgeDocumentSummary> = {
       injectMode: nextConfig.injectMode ?? current.injectMode,
-      inheritInjectMode: meta.inheritInjectMode ?? current.inheritInjectMode,
+      effectiveInjectMode:
+        nextConfig.injectMode
+          ? nextConfig.injectMode
+          : current.effectiveInjectMode,
       skillEnabled: nextConfig.enabled,
       skillSurface: nextConfig.surface,
       commandTrigger: nextConfig.commandTrigger,
@@ -3387,11 +3553,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
     beginSave();
     error.value = "";
     try {
+      const directoryType = selectedDirectoryType.value ?? activeType.value;
       const updated = await enqueueMutation(async () => {
         const result = await knowledgeEdit({
           kind: "directory",
-          type: activeType.value,
-          path,
+          type: directoryType,
+          path: path || directoryType,
           config,
         });
         return result.directory;
@@ -3399,8 +3566,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
       if (!updated)
         throw new Error("knowledge_edit returned no directory config");
       selectedDirectoryPath.value = updated.path;
+      selectedDirectoryType.value = updated.type;
       selectedDirectoryConfig.value = updated;
-      if (isRootDirectoryPath(updated.path)) {
+      if (updated.path === "" || isRootDirectoryPath(updated.path)) {
         rootDirectoryConfigs.value = {
           ...rootDirectoryConfigs.value,
           [updated.type]: {
@@ -3541,15 +3709,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
   }
 
-  function selectionAffectedByDirectory(path: string): boolean {
+  function selectionAffectedByDirectory(
+    type: KnowledgeDocumentType,
+    path: string,
+  ): boolean {
     const normalizedPath = normalizeDirectorySelectionPath(path);
     const selectedDocumentPath = selectedDocument.value?.path ?? null;
     const selectedDirectoryValue = selectedDirectoryPath.value;
     return (
-      (!!selectedDocumentPath &&
+      (selectedDocument.value?.type === type && !!selectedDocumentPath &&
         (selectedDocumentPath === normalizedPath ||
           selectedDocumentPath.startsWith(`${normalizedPath}/`))) ||
-      (!!selectedDirectoryValue &&
+      (selectedDirectoryType.value === type && !!selectedDirectoryValue &&
         (selectedDirectoryValue === normalizedPath ||
           selectedDirectoryValue.startsWith(`${normalizedPath}/`)))
     );
@@ -3630,7 +3801,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       if (!node.relativePath) return;
       try {
         const externalSources =
-          activeType.value === "reference"
+          node.type === "reference"
             ? externalSourcesForReferenceDirectory(node.relativePath)
             : [];
         if (externalSources.length > 0) {
@@ -3642,13 +3813,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
           await enqueueMutation(() =>
             knowledgeDelete({
               kind: "directory",
-              type: activeType.value,
+              type: node.type,
               path: node.relativePath,
             }),
           );
           await refreshKnowledgeData();
         }
-        if (selectionAffectedByDirectory(node.relativePath)) {
+        if (selectionAffectedByDirectory(node.type, node.relativePath)) {
           clearSelection();
         }
         collapseBranch(node.path);
@@ -3662,113 +3833,23 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   async function deleteExplorerNodes(nodes: ExplorerNode[]) {
     if (!hasWorkspace.value || nodes.length === 0) return;
-    nodes = nodes.filter((node) => !isPluginManagedExplorerNode(node));
-    if (nodes.length === 0) return;
-    const packageNodes = nodes.filter(
-      (node): node is PackageNode => node.kind === "package",
+    const deletableNodes = pruneKnowledgeDragNodes(
+      nodes.filter((node) => !isPluginManagedExplorerNode(node)),
     );
-    if (packageNodes.length > 0) {
-      const packageIds = new Set(packageNodes.map((node) => node.packageId));
-      const remainingNodes = nodes.filter((node) => {
-        if (node.kind === "package") return true;
-        if (activeType.value !== "skill") return true;
-        const nodePath =
-          node.kind === "folder" ? node.relativePath : node.document.path;
-        return !Array.from(packageIds).some(
-          (packageId) =>
-            nodePath === packageId || nodePath.startsWith(`${packageId}/`),
-        );
-      });
-      for (const node of remainingNodes) {
-        await deleteExplorerNode(node);
-      }
-      return;
-    }
-    const deletableNodes = nodes.filter(
-      (node): node is FolderNode | DocumentNode => node.kind !== "package",
-    );
-    if (deletableNodes.length === 0) return;
-
-    const prunedTargets = pruneKnowledgeDeleteTargets(
-      deletableNodes.map((node) => ({
-        kind: node.kind,
-        path: node.kind === "folder" ? node.relativePath : node.document.path,
-      })),
-    );
-    const prunedNodes = prunedTargets
-      .map((target) =>
-        deletableNodes.find((node) =>
-          target.kind === "folder"
-            ? node.kind === "folder" && node.relativePath === target.path
-            : node.kind === "document" && node.document.path === target.path,
-        ),
-      )
-      .filter((node): node is FolderNode | DocumentNode => !!node);
-    const containsManagedExternalFolder = prunedNodes.some(
-      (node) =>
-        node.kind === "folder" &&
-        activeType.value === "reference" &&
-        externalSourcesForReferenceDirectory(node.relativePath).length > 0,
-    );
-    if (containsManagedExternalFolder) {
-      for (const node of prunedNodes) {
-        await deleteExplorerNode(node);
-      }
-      return;
-    }
-
-    const selectedDocumentPath = selectedDocument.value?.path ?? null;
-    const selectedDirectoryValue = selectedDirectoryPath.value;
-
-    const affectsSelectedDocument =
-      !!selectedDocumentPath &&
-      prunedTargets.some((target) => {
-        if (target.kind === "document")
-          return target.path === selectedDocumentPath;
-        return (
-          selectedDocumentPath === target.path ||
-          selectedDocumentPath.startsWith(`${target.path}/`)
-        );
-      });
-    const affectsSelectedDirectory =
-      !!selectedDirectoryValue &&
-      prunedTargets.some((target) => {
-        if (target.kind === "document") return false;
-        return (
-          selectedDirectoryValue === target.path ||
-          selectedDirectoryValue.startsWith(`${target.path}/`)
-        );
-      });
-
-    deletingDocument.value = true;
-    error.value = "";
-    try {
-      await enqueueMutation(async () => {
-        for (const target of prunedTargets) {
-          await knowledgeDelete({
-            kind: target.kind === "folder" ? "directory" : "document",
-            type: activeType.value,
-            path: target.path,
-          });
-        }
-      });
-      if (affectsSelectedDocument || affectsSelectedDirectory) {
-        clearSelection();
-      }
-      for (const node of deletableNodes) {
-        if (node.kind === "folder") {
-          collapseBranch(node.path);
-        }
-      }
-      await refreshKnowledgeData();
-    } catch (cause) {
-      notifyError("knowledge_delete.selection", cause);
-    } finally {
-      deletingDocument.value = false;
+    for (const node of deletableNodes) {
+      await deleteExplorerNode(node);
     }
   }
 
-  function syncSelectedDocumentPath(sourcePath: string, targetPath: string) {
+  function syncSelectedDocumentPath(
+    type: KnowledgeDocumentType,
+    sourcePath: string,
+    targetPath: string,
+  ) {
+    const selectedType = selectedDocument.value?.type
+      ?? selectedDocumentSummary.value?.type
+      ?? activeType.value;
+    if (selectedType !== type) return;
     if (pendingSelectionPath.value === sourcePath) {
       pendingSelectionPath.value = targetPath;
     } else if (
@@ -3785,12 +3866,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  function syncDirectoryMoveSelection(sourcePath: string, targetPath: string) {
-    const nextDirectoryPath = replaceRelativePathPrefix(
-      selectedDirectoryPath.value,
-      sourcePath,
-      targetPath,
-    );
+  function syncDirectoryMoveSelection(
+    type: KnowledgeDocumentType,
+    sourcePath: string,
+    targetPath: string,
+  ) {
+    const nextDirectoryPath = selectedDirectoryType.value === type
+      ? replaceRelativePathPrefix(
+        selectedDirectoryPath.value,
+        sourcePath,
+        targetPath,
+      )
+      : null;
     if (nextDirectoryPath) {
       selectedDirectoryPath.value = nextDirectoryPath;
       if (selectedDirectoryConfig.value) {
@@ -3801,7 +3888,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
     }
 
-    const nextDocumentPath =
+    const selectedDocumentType = selectedDocument.value?.type
+      ?? selectedDocumentSummary.value?.type
+      ?? activeType.value;
+    const nextDocumentPath = selectedDocumentType === type ? (
       replaceRelativePathPrefix(
         pendingSelectionPath.value,
         sourcePath,
@@ -3816,7 +3906,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
         selectedDocumentSummary.value?.path,
         sourcePath,
         targetPath,
-      );
+      )
+    ) : null;
     if (nextDocumentPath) {
       pendingSelectionPath.value = nextDocumentPath;
       if (selectedDocument.value) {
@@ -3828,7 +3919,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function moveDirectoryPath(sourcePath: string, targetPath: string) {
+  async function moveDirectoryPath(
+    sourcePath: string,
+    targetPath: string,
+    type: KnowledgeDocumentType,
+  ) {
     const normalizedSourcePath = normalizeDirectorySelectionPath(sourcePath);
     const normalizedTargetPath = normalizeDirectorySelectionPath(targetPath);
     if (
@@ -3844,15 +3939,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await enqueueMutation(() =>
         knowledgeMove({
           kind: "directory",
-          type: activeType.value,
+          type,
           path: normalizedSourcePath,
           newPath: normalizedTargetPath,
         }),
       );
-      syncDirectoryMoveSelection(normalizedSourcePath, normalizedTargetPath);
-      collapseBranch(fullDocumentPath(activeType.value, normalizedSourcePath));
+      syncDirectoryMoveSelection(type, normalizedSourcePath, normalizedTargetPath);
+      collapseBranch(fullDocumentPath(type, normalizedSourcePath));
       await refreshKnowledgeData();
-      const fullPath = fullDocumentPath(activeType.value, normalizedTargetPath);
+      const fullPath = fullDocumentPath(type, normalizedTargetPath);
       expandAncestors(fullPath);
       expandPath(fullPath);
     } catch (cause) {
@@ -3860,7 +3955,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function renameExplorerFolder(path: string, name: string) {
+  async function renameExplorerFolder(
+    path: string,
+    name: string,
+    type: KnowledgeDocumentType = activeType.value,
+  ) {
     if (!hasWorkspace.value) return;
     const normalizedName = normalizeRelativeEntryName(name);
     if (!normalizedName) return;
@@ -3871,7 +3970,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       );
       return;
     }
-    await moveDirectoryPath(path, siblingRelativePath(path, normalizedName));
+    await moveDirectoryPath(path, siblingRelativePath(path, normalizedName), type);
   }
 
   async function renameExplorerDocument(
@@ -3899,7 +3998,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function copyExplorerRelativePath(node: ExplorerNode) {
     const relativePath =
       node.kind === "folder"
-        ? fullDocumentPath(activeType.value, node.relativePath)
+        ? fullDocumentPath(node.type, node.relativePath)
         : node.kind === "package"
           ? fullDocumentPath("skill", node.packageId)
           : fullDocumentPath(node.document.type, node.document.path);
@@ -3956,8 +4055,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
         docType: node.kind === "package"
           ? "skill"
           : isFolder
-            ? activeType.value
-            : (document?.type ?? activeType.value),
+            ? node.type
+            : (document?.type ?? node.type),
         path: node.kind === "package"
           ? node.packageId
           : isFolder
@@ -3986,7 +4085,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     beginSave();
     error.value = "";
     try {
-      syncSelectedDocumentPath(normalizedPath, normalizedNextPath);
+      syncSelectedDocumentPath(docType, normalizedPath, normalizedNextPath);
       await enqueueMutation(() =>
         knowledgeMove({
           kind: "document",
@@ -4004,9 +4103,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  async function moveExplorerNode(node: ExplorerNode, targetDir: string) {
+  async function moveExplorerNode(
+    node: ExplorerNode,
+    targetDir: string,
+    targetType: KnowledgeDocumentType = node.type,
+  ) {
     if (!hasWorkspace.value) return;
     if (node.kind === "package") return;
+    if (node.type !== targetType) return;
     const normalizedTargetDir = targetDir
       .trim()
       .replace(/\\/g, "/")
@@ -4014,7 +4118,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     if (node.kind === "folder") {
       const nextPath = joinRelativePath(normalizedTargetDir, node.name);
-      await moveDirectoryPath(node.relativePath, nextPath);
+      await moveDirectoryPath(node.relativePath, nextPath, node.type);
       return;
     }
 
@@ -4028,12 +4132,16 @@ export function useKnowledgeState(props: KnowledgeProps) {
     await moveDocumentPath(node.document.path, nextPath, node.document.type);
   }
 
-  async function moveExplorerNodes(nodes: ExplorerNode[], targetDir: string) {
+  async function moveExplorerNodes(
+    nodes: ExplorerNode[],
+    targetDir: string,
+    targetType: KnowledgeDocumentType = nodes[0]?.type ?? activeType.value,
+  ) {
     // Sequential on purpose: each move funnels through enqueueMutation and
     // refreshes shared state; firing them concurrently would race selection
     // syncing for multi-node drags.
     for (const node of nodes) {
-      await moveExplorerNode(node, targetDir);
+      await moveExplorerNode(node, targetDir, targetType);
     }
   }
 
@@ -4189,6 +4297,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDocumentSummary,
     selectedDocumentLoading,
     selectedPackageDocument,
+    selectedDirectoryType,
     selectedDirectoryPath,
     selectedDirectoryConfig,
     selectedDirectoryLoading,
@@ -4223,7 +4332,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     togglePath,
     expandPath,
     expandAncestors,
-    collapseAllForType,
     hasMoreRootDocuments,
     hasMoreDirectoryDocuments,
     hasLoadedDirectoryDocuments,

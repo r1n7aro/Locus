@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import type {
   KnowledgeDocument,
   KnowledgeDocumentPatch,
@@ -49,19 +49,13 @@ import {
   mergeKnowledgeEditorDraftValues,
   normalizeKnowledgeEditorValue,
 } from "./knowledgeEditorDrafts";
-import { getKnowledgeDocumentEditorSections } from "./knowledgeDocumentSections";
 import {
   buildKnowledgeEditModePatch,
-  defaultExplicitMaintenanceRulesForType,
   defaultMaintenanceRulesForType,
   getKnowledgeEditMode,
   isKnowledgeEditModeLocked,
 } from "./knowledgeEditMode";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
-import {
-  createAnimationFrameResizeObserver,
-  type ResizeObserverHandle,
-} from "../../composables/resizeObserver";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import {
   useMarkdownEditorViewMode,
@@ -76,15 +70,6 @@ const MIN_SIDE_PANEL_WIDTH = 280;
 const MAX_SIDE_PANEL_WIDTH = 720;
 const MIN_MAIN_COLUMN_WIDTH = 320;
 const SIDE_RAIL_COLLAPSED_STORAGE_KEY = "locus:knowledgePreviewSideRailCollapsed";
-const SUPPORT_PANELS_STORAGE_KEY = "locus:knowledgePreviewSupportPanelsCollapsed";
-const SUPPORT_STRIP_HEIGHT_STORAGE_KEY = "locus:knowledgePreviewSupportStripHeight";
-const SUPPORT_SECTION_WIDTH_STORAGE_KEY = "locus:knowledgePreviewSupportSectionWidth";
-const DEFAULT_SUPPORT_STRIP_HEIGHT = 182;
-const MIN_SUPPORT_STRIP_HEIGHT = 112;
-const MIN_BODY_HEIGHT = 180;
-const DEFAULT_SUPPORT_SECTION_WIDTH = 360;
-const MIN_SUPPORT_SECTION_WIDTH = 180;
-const SUPPORT_LAYOUT_COMPACT_WIDTH = 680;
 const MEMORY_PREVIEW_PATH_PREFIX = "unity-project-understanding";
 const BUILTIN_MEMORY_PREVIEW_PATHS = new Set([
   "project-mistake-note.md",
@@ -117,48 +102,26 @@ const fileNameDirty = ref(false);
 const dirtySections = ref<Set<KnowledgeDocumentSection>>(new Set());
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
-const confirmDelete = ref(false);
 const metaCollapsed = ref(loadStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY) ?? false);
 const isSideResizing = ref(false);
-const isSupportHeightResizing = ref(false);
-const isSupportWidthResizing = ref(false);
-const sidePanelTab = ref<"meta" | "chat">("chat");
 const sidePanelWidth = ref(DEFAULT_SIDE_PANEL_WIDTH);
 const skillCommandDraft = ref("");
 const skillArgumentHintDraft = ref("");
 const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
 const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
-const supportPanelsCollapsedPreference = ref<boolean | null>(loadStoredSupportPanelsCollapsed());
-const supportPanelsCollapsed = ref(supportPanelsCollapsedPreference.value ?? true);
 const previewMainRef = ref<HTMLElement | null>(null);
-const supportLayoutRef = ref<HTMLElement | null>(null);
 const summaryRenderedSearchRef = ref<HTMLElement | null>(null);
 const rulesRenderedSearchRef = ref<HTMLElement | null>(null);
 const bodyRenderedSearchRef = ref<HTMLElement | null>(null);
-const supportLayoutCompact = ref(false);
-const supportStripHeight = ref(loadStoredPanelSize(
-  SUPPORT_STRIP_HEIGHT_STORAGE_KEY,
-  DEFAULT_SUPPORT_STRIP_HEIGHT,
-));
-const supportPrimaryWidth = ref(loadStoredPanelSize(
-  SUPPORT_SECTION_WIDTH_STORAGE_KEY,
-  DEFAULT_SUPPORT_SECTION_WIDTH,
-));
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let sideResizing = false;
-let supportHeightResizing = false;
-let supportWidthResizing = false;
 let sideResizeStartX = 0;
 let sideResizeStartWidth = DEFAULT_SIDE_PANEL_WIDTH;
-let supportHeightResizeStartY = 0;
-let supportHeightResizeStartValue = DEFAULT_SUPPORT_STRIP_HEIGHT;
-let supportWidthResizeStartX = 0;
-let supportWidthResizeStartValue = DEFAULT_SUPPORT_SECTION_WIDTH;
 let bodyCursorBeforeResize = "";
 let releaseSelectionLock: (() => void) | null = null;
-let layoutResizeObserver: ResizeObserverHandle | null = null;
 let searchMatchScrollFrame = 0;
+let skillUnityStatusRequestId = 0;
 
 function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefined): string {
   if (!document) return "";
@@ -196,26 +159,30 @@ function skillPackageL1Unavailable(): boolean {
 const isReadOnly = computed(() => !!props.document?.readOnly);
 const isEditModeLocked = computed(() => isKnowledgeEditModeLocked(props.document));
 const documentPath = computed(() => props.document?.path?.trim() || "");
+const documentContentKey = computed(() =>
+  `${props.document?.type ?? ""}:${props.document?.id ?? ""}:${documentPath.value}`
+);
 const documentDisplayPath = computed(() => formatDocumentDisplayPath(props.document));
 const documentTitle = computed(() => currentDocumentFileStem.value || t("knowledge.preview.untitled"));
 const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
 const scopeLabel = computed(() => labelForStoredScope(props.document));
-const injectMode = computed(() => props.document?.injectMode ?? "none");
+const injectMode = computed(() => props.document?.effectiveInjectMode ?? "none");
 // Skill documents show the effective auto-channel mode: a surface without the
 // auto side reads as "none" regardless of the stored injectMode.
 const displayInjectMode = computed<KnowledgeInjectMode>(() => (
   props.document?.type === "skill"
-    ? effectiveSkillInjectMode(props.document?.skillSurface, props.document?.injectMode)
+    ? effectiveSkillInjectMode(props.document?.skillSurface, props.document?.effectiveInjectMode)
     : injectMode.value
 ));
 const injectModeSelection = computed<InjectModeSelection>(() => (
-  props.document?.inheritInjectMode ? "inherit_parent" : displayInjectMode.value
+  props.document?.injectMode === "inherit" ? "inherit_parent" : displayInjectMode.value
 ));
-const summaryEnabled = computed(() => !!props.document?.summaryEnabled);
+const summaryEnabled = computed(() => !!props.document?.summary?.trim());
+const showExtendedDocumentProperties = computed(() => (
+  props.document?.type === "skill" || props.document?.type === "reference"
+));
 const editMode = computed<KnowledgeEditMode>(() => getKnowledgeEditMode(props.document));
-const explicitRulesEnabled = computed(() => !!props.document?.explicitMaintenanceRules);
-const explicitRulesLocked = computed(() => editMode.value === "auto" || editMode.value === "inherit_parent");
 const injectModeOptions = computed(() => [
   {
     value: "inherit_parent",
@@ -275,29 +242,27 @@ const editModeOptions = computed(() => [
   },
 ]);
 const effectiveEditMode = computed<Exclude<KnowledgeEditMode, "inherit_parent">>(() => {
-  if (props.document?.readOnly && !props.document?.inheritAiConfig) return "read_only";
-  return props.document?.aiMaintained ? "auto" : "proposal";
+  if (props.document?.readOnly && props.document?.aiMaintained !== "inherit") return "read_only";
+  return props.document?.effectiveAiMaintained ? "auto" : "proposal";
 });
 const injectModeDropdownLabel = computed(() => {
   if (!props.document) return "";
   const effectiveLabel = labelForInjectMode(displayInjectMode.value, props.document.type);
-  return props.document.inheritInjectMode
+  return props.document.injectMode === "inherit"
     ? labelForInheritedValue(effectiveLabel, props.document.injectModeSource)
     : effectiveLabel;
 });
 const editModeDropdownLabel = computed(() => {
   if (!props.document) return "";
   const effectiveLabel = labelForKnowledgeEditMode(effectiveEditMode.value);
-  return props.document.inheritAiConfig
+  return props.document.aiMaintained === "inherit"
     ? labelForInheritedValue(effectiveLabel, props.document.aiConfigSource)
     : labelForKnowledgeEditMode(editMode.value);
 });
-const rulesEditorDisabled = computed(() => isReadOnly.value || !!props.document?.inheritAiConfig);
-const rulesHint = computed(() => (
-  props.document?.inheritAiConfig
-    ? t("knowledge.preview.rulesInheritedHint")
-    : t("knowledge.preview.rulesHint")
-));
+const usesInheritedMaintenanceRules = computed(() => props.document?.aiMaintained === "inherit");
+const rulesEditorDisabled = computed(() => isReadOnly.value);
+const rulesHint = computed(() => t("knowledge.preview.rulesHint"));
+const rulesPropertyValue = computed(() => rulesDraft.value);
 
 const sourceSummary = computed(() => {
   const source = props.document?.externalSource;
@@ -320,6 +285,11 @@ const fileLengthLabel = computed(() =>
 const estimatedTokensLabel = computed(() =>
   formatCount(documentFileMetadata.value?.estimatedTokens),
 );
+const fileDetailLabel = computed(() => (
+  [fileSizeLabel.value, fileLengthLabel.value, `${estimatedTokensLabel.value} tokens`]
+    .filter((value) => value && value !== "—" && value !== "— tokens")
+    .join(" · ") || "—"
+));
 const modifiedAtLabel = computed(() =>
   formatDateTime(documentFileMetadata.value?.modifiedAt),
 );
@@ -356,9 +326,6 @@ const footerLabel = computed(() =>
 const footerWarning = computed(() =>
   hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value,
 );
-const visibleSections = computed(() => getKnowledgeDocumentEditorSections(props.document));
-const hasSupportPanels = computed(() => visibleSections.value.summary || visibleSections.value.maintenanceRules);
-const hasTwoSupportSections = computed(() => visibleSections.value.summary && visibleSections.value.maintenanceRules);
 const sidePanelOptions = computed(() => [
   { value: "meta", label: t("knowledge.side.meta") },
   { value: "chat", label: t("knowledge.side.chat") },
@@ -384,7 +351,7 @@ const skillCommandChannelOn = computed(() => (
 ));
 const skillAutoChannelOn = computed(() => (
   isSkillDocument.value
-    && effectiveSkillInjectMode(props.document?.skillSurface, props.document?.injectMode) !== "none"
+    && effectiveSkillInjectMode(props.document?.skillSurface, props.document?.effectiveInjectMode) !== "none"
 ));
 const skillActivationWarningVisible = computed(() => (
   isSkillDocument.value
@@ -392,7 +359,7 @@ const skillActivationWarningVisible = computed(() => (
     && skillActivationInactive({
       skillEnabled: props.document?.skillEnabled,
       skillSurface: props.document?.skillSurface,
-      injectMode: props.document?.injectMode,
+      injectMode: props.document?.effectiveInjectMode,
     })
 ));
 const currentSkillCommandTrigger = computed(() => {
@@ -452,28 +419,7 @@ const sideRailStyle = computed(() => {
     width: `clamp(${MIN_SIDE_PANEL_WIDTH}px, ${sidePanelWidth.value}px, calc(100% - ${MIN_MAIN_COLUMN_WIDTH}px))`,
   };
 });
-const summaryPreviewText = computed(() => buildCollapsedPreview(summaryDraft.value, t("knowledge.preview.summaryPlaceholder")));
-const rulesPreviewText = computed(() => buildCollapsedPreview(rulesDraft.value, t("knowledge.preview.rulesPlaceholder")));
-const supportStripStyle = computed(() => {
-  if (!hasSupportPanels.value || supportPanelsCollapsed.value) return undefined;
-  return {
-    height: `${supportStripHeight.value}px`,
-  };
-});
-const supportLayoutStyle = computed(() => {
-  if (!hasTwoSupportSections.value) return undefined;
-  if (supportLayoutCompact.value) {
-    return {
-      gridTemplateRows: "minmax(0, 1fr) 8px minmax(0, 1fr)",
-    };
-  }
-  return {
-    gridTemplateColumns: `${supportPrimaryWidth.value}px 8px minmax(0, 1fr)`,
-  };
-});
-const isPreviewResizing = computed(() =>
-  isSideResizing.value || isSupportHeightResizing.value || isSupportWidthResizing.value,
-);
+const isPreviewResizing = computed(() => isSideResizing.value);
 const activeSearchContext = computed(() => {
   if (!props.document || !props.searchContext) return null;
   const result = props.searchContext.result;
@@ -501,10 +447,6 @@ const searchHighlightRe = computed<RegExp | null>(() => {
   return new RegExp(`(${searchQueryTerms.value.map(escapeRegExp).join("|")})`, "gi");
 });
 
-function loadStoredSupportPanelsCollapsed(): boolean | null {
-  return loadStoredBoolean(SUPPORT_PANELS_STORAGE_KEY);
-}
-
 function loadStoredBoolean(storageKey: string): boolean | null {
   try {
     const raw = localStorage.getItem(storageKey);
@@ -516,25 +458,6 @@ function loadStoredBoolean(storageKey: string): boolean | null {
   return null;
 }
 
-function loadStoredPanelSize(storageKey: string, fallback: number): number {
-  try {
-    const raw = localStorage.getItem(storageKey);
-    const parsed = raw ? Number(raw) : Number.NaN;
-    if (Number.isFinite(parsed)) return parsed;
-  } catch {
-    // ignore persistence failures
-  }
-  return fallback;
-}
-
-function persistStoredPanelSize(storageKey: string, value: number) {
-  try {
-    localStorage.setItem(storageKey, String(Math.round(value)));
-  } catch {
-    // ignore persistence failures
-  }
-}
-
 function persistStoredBoolean(storageKey: string, value: boolean) {
   try {
     localStorage.setItem(storageKey, String(value));
@@ -543,25 +466,13 @@ function persistStoredBoolean(storageKey: string, value: boolean) {
   }
 }
 
-function persistSupportPanelsCollapsed(value: boolean) {
-  persistStoredBoolean(SUPPORT_PANELS_STORAGE_KEY, value);
-}
-
 function toggleSideRail() {
   const nextValue = !metaCollapsed.value;
   metaCollapsed.value = nextValue;
   persistStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY, nextValue);
 }
 
-function toggleSupportPanels() {
-  const nextValue = !supportPanelsCollapsed.value;
-  supportPanelsCollapsed.value = nextValue;
-  supportPanelsCollapsedPreference.value = nextValue;
-  persistSupportPanelsCollapsed(nextValue);
-  if (!nextValue) refreshSupportLayoutMetrics();
-}
-
-function lockResizeInteraction(cursor: "col-resize" | "row-resize") {
+function lockResizeInteraction(cursor: "col-resize") {
   bodyCursorBeforeResize = document.body.style.cursor;
   document.body.style.cursor = cursor;
   releaseSelectionLock?.();
@@ -574,68 +485,8 @@ function unlockResizeInteraction() {
   releaseSelectionLock = null;
 }
 
-function currentSupportLayoutWidth() {
-  return supportLayoutRef.value?.getBoundingClientRect().width ?? 0;
-}
-
-function currentSupportStripMinHeight() {
-  return hasTwoSupportSections.value && supportLayoutCompact.value
-    ? MIN_SUPPORT_STRIP_HEIGHT * 2 + 8
-    : MIN_SUPPORT_STRIP_HEIGHT;
-}
-
-function clampSupportStripHeight(next: number) {
-  const minHeight = currentSupportStripMinHeight();
-  const containerHeight = previewMainRef.value?.getBoundingClientRect().height ?? 0;
-  if (!containerHeight) return Math.max(minHeight, next);
-  const maxHeight = Math.max(minHeight, containerHeight - MIN_BODY_HEIGHT);
-  return Math.min(maxHeight, Math.max(minHeight, next));
-}
-
-function clampSupportPrimaryWidth(next: number) {
-  const layoutWidth = currentSupportLayoutWidth();
-  if (!layoutWidth || supportLayoutCompact.value || !hasTwoSupportSections.value) {
-    return Math.max(MIN_SUPPORT_SECTION_WIDTH, next);
-  }
-  const minWidth = Math.min(MIN_SUPPORT_SECTION_WIDTH, Math.max(140, Math.floor(layoutWidth * 0.25)));
-  const maxWidth = Math.max(minWidth, layoutWidth - minWidth - 8);
-  return Math.min(maxWidth, Math.max(minWidth, next));
-}
-
-function syncSupportLayoutMetrics() {
-  const layoutWidth = currentSupportLayoutWidth();
-  supportLayoutCompact.value = !!layoutWidth && layoutWidth <= SUPPORT_LAYOUT_COMPACT_WIDTH;
-  supportStripHeight.value = clampSupportStripHeight(supportStripHeight.value);
-  supportPrimaryWidth.value = clampSupportPrimaryWidth(supportPrimaryWidth.value);
-}
-
-function observeSupportLayout() {
-  layoutResizeObserver?.disconnect();
-  layoutResizeObserver = null;
-  if (typeof ResizeObserver === "undefined") return;
-  layoutResizeObserver = createAnimationFrameResizeObserver(() => {
-    syncSupportLayoutMetrics();
-  });
-  if (!layoutResizeObserver) return;
-  if (previewMainRef.value) layoutResizeObserver.observe(previewMainRef.value);
-  if (supportLayoutRef.value) layoutResizeObserver.observe(supportLayoutRef.value);
-}
-
-function refreshSupportLayoutMetrics() {
-  void nextTick(() => {
-    observeSupportLayout();
-    syncSupportLayoutMetrics();
-  });
-}
-
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function searchSectionLabel(section: KnowledgeSearchMatchSection): string {
-  if (section === "summary") return t("knowledge.preview.summary");
-  if (section === "maintenanceRules") return t("knowledge.preview.rules");
-  return t("knowledge.preview.body");
 }
 
 function formatDateTime(value: number | null | undefined): string {
@@ -674,14 +525,6 @@ function formatDocumentLength(
     ? countFormatter.format(Math.round(charCount))
     : "—";
   return t("knowledge.meta.lengthValue", normalizedLineCount, normalizedCharCount);
-}
-
-function searchSnippetTitle() {
-  const kind = activeSearchContext.value?.result.matchKind ?? "semantic";
-  if (kind === "lexical") return t("knowledge.preview.searchHitLexical");
-  if (kind === "semantic") return t("knowledge.preview.searchHitSemantic");
-  if (kind === "grep") return t("knowledge.preview.searchHitGrep");
-  return t("knowledge.preview.searchHitHybrid");
 }
 
 function isSearchMatchSection(section: KnowledgeSearchMatchSection): boolean {
@@ -823,19 +666,7 @@ watch(
   (document, previousDocument) => {
     const resetDrafts = (document?.id ?? "") !== (previousDocument?.id ?? "")
       || (document?.type ?? "") !== (previousDocument?.type ?? "");
-    if ((document?.id ?? "") !== (previousDocument?.id ?? "")) {
-      sidePanelTab.value = "chat";
-    }
-    if (resetDrafts) {
-      if (supportPanelsCollapsedPreference.value == null) {
-        resetSupportPanels(document);
-      } else {
-        supportPanelsCollapsed.value = supportPanelsCollapsedPreference.value;
-      }
-    }
     syncDrafts(resetDrafts);
-    refreshSupportLayoutMetrics();
-    confirmDelete.value = false;
   },
   { immediate: true },
 );
@@ -869,39 +700,14 @@ watch(
 watch(
   () => [
     props.document?.id ?? "",
-    hasSupportPanels.value,
-    hasTwoSupportSections.value,
-    supportPanelsCollapsed.value,
-  ],
-  () => {
-    refreshSupportLayoutMetrics();
-  },
-);
-
-watch(
-  () => [props.document?.id ?? "", searchMatchSection.value, !!activeSearchContext.value] as const,
-  ([documentId, section, hasSearchContext]) => {
-    if (!documentId || !hasSearchContext) return;
-    if (section === "summary" || section === "maintenanceRules") {
-      supportPanelsCollapsed.value = false;
-      refreshSupportLayoutMetrics();
-    }
-  },
-);
-
-watch(
-  () => [
-    props.document?.id ?? "",
     props.loading,
     showSearchRenderedContent.value,
     searchMatchSection.value,
     activeSearchContext.value?.query ?? "",
     activeSearchContext.value?.result.snippet ?? "",
-    supportPanelsCollapsed.value,
   ] as const,
-  ([documentId, loading, showRenderedContent, section, query]) => {
+  ([documentId, loading, showRenderedContent, , query]) => {
     if (!documentId || loading || !showRenderedContent || !query) return;
-    if ((section === "summary" || section === "maintenanceRules") && supportPanelsCollapsed.value) return;
     scheduleSearchMatchScroll();
   },
   { flush: "post" },
@@ -915,7 +721,7 @@ watch(() => props.saveLoading, (loading, wasLoading) => {
 });
 
 watch(
-  () => [props.document?.id ?? "", props.document?.updatedAt ?? 0, props.document?.type ?? ""],
+  () => [props.document?.id ?? "", props.document?.modifiedAt ?? 0, props.document?.type ?? ""],
   ([documentId, , documentType]) => {
     if (!documentId || documentType !== "skill") {
       notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
@@ -942,24 +748,11 @@ watch(skillPackageId, () => {
   void refreshSkillUnityStatus();
 }, { immediate: true });
 
-onMounted(() => {
-  observeSupportLayout();
-  syncSupportLayoutMetrics();
-  window.addEventListener("resize", syncSupportLayoutMetrics);
-});
-
 onUnmounted(() => {
   clearAutoSaveTimer();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
   document.removeEventListener("mousemove", onSideResizeMove);
   document.removeEventListener("mouseup", onSideResizeEnd);
-  document.removeEventListener("mousemove", onSupportHeightResizeMove);
-  document.removeEventListener("mouseup", onSupportHeightResizeEnd);
-  document.removeEventListener("mousemove", onSupportWidthResizeMove);
-  document.removeEventListener("mouseup", onSupportWidthResizeEnd);
-  window.removeEventListener("resize", syncSupportLayoutMetrics);
-  layoutResizeObserver?.disconnect();
-  layoutResizeObserver = null;
   cancelSearchMatchScroll();
   unlockResizeInteraction();
 });
@@ -1157,17 +950,12 @@ function updateMeta(patch: KnowledgeDocumentPatch) {
   emit("updateMeta", renamePatch ? { ...patch, ...renamePatch } : patch);
 }
 
-function onSummaryEnabledChange(value: boolean) {
-  updateMeta({ summaryEnabled: value });
-}
-
 function onInjectModeChange(value: string) {
   if (value === "inherit_parent") {
-    updateMeta({ inheritInjectMode: true });
+    updateMeta({ injectMode: "inherit" });
     return;
   }
   const patch: KnowledgeDocumentPatch = {
-    inheritInjectMode: false,
     injectMode: value as KnowledgeInjectMode,
   };
   // For skills the inject mode drives the auto channel, so it also derives
@@ -1207,31 +995,6 @@ function onEditModeChange(value: string) {
   updateMeta(nextPatch);
 }
 
-function onExplicitRulesChange(value: boolean) {
-  if (!props.document || isReadOnly.value) return;
-  if (props.document.inheritAiConfig || (!value && explicitRulesLocked.value)) return;
-
-  if (!value) {
-    updateMeta({
-      explicitMaintenanceRules: false,
-    });
-    return;
-  }
-
-  const nextPatch: KnowledgeDocumentPatch = {
-    explicitMaintenanceRules: true,
-  };
-  if (!rulesDraft.value.trim()) {
-    const defaultRules = defaultMaintenanceRulesForType(props.document.type)
-      ?? (defaultExplicitMaintenanceRulesForType(props.document.type) ? "" : null);
-    if (defaultRules !== null) {
-      rulesDraft.value = defaultRules;
-      nextPatch.maintenanceRules = defaultRules;
-    }
-  }
-  updateMeta(nextPatch);
-}
-
 function onSideResizeStart(event: MouseEvent) {
   if (metaCollapsed.value) return;
   event.preventDefault();
@@ -1258,60 +1021,6 @@ function onSideResizeEnd() {
   isSideResizing.value = false;
   document.removeEventListener("mousemove", onSideResizeMove);
   document.removeEventListener("mouseup", onSideResizeEnd);
-  unlockResizeInteraction();
-}
-
-function onSupportHeightResizeStart(event: MouseEvent) {
-  if (!hasSupportPanels.value || supportPanelsCollapsed.value) return;
-  event.preventDefault();
-  supportHeightResizing = true;
-  isSupportHeightResizing.value = true;
-  supportHeightResizeStartY = event.clientY;
-  supportHeightResizeStartValue = supportStripHeight.value;
-  document.addEventListener("mousemove", onSupportHeightResizeMove);
-  document.addEventListener("mouseup", onSupportHeightResizeEnd);
-  lockResizeInteraction("row-resize");
-}
-
-function onSupportHeightResizeMove(event: MouseEvent) {
-  if (!supportHeightResizing) return;
-  const delta = event.clientY - supportHeightResizeStartY;
-  supportStripHeight.value = clampSupportStripHeight(supportHeightResizeStartValue + delta);
-}
-
-function onSupportHeightResizeEnd() {
-  supportHeightResizing = false;
-  isSupportHeightResizing.value = false;
-  document.removeEventListener("mousemove", onSupportHeightResizeMove);
-  document.removeEventListener("mouseup", onSupportHeightResizeEnd);
-  persistStoredPanelSize(SUPPORT_STRIP_HEIGHT_STORAGE_KEY, supportStripHeight.value);
-  unlockResizeInteraction();
-}
-
-function onSupportWidthResizeStart(event: MouseEvent) {
-  if (!hasTwoSupportSections.value || supportLayoutCompact.value) return;
-  event.preventDefault();
-  supportWidthResizing = true;
-  isSupportWidthResizing.value = true;
-  supportWidthResizeStartX = event.clientX;
-  supportWidthResizeStartValue = supportPrimaryWidth.value;
-  document.addEventListener("mousemove", onSupportWidthResizeMove);
-  document.addEventListener("mouseup", onSupportWidthResizeEnd);
-  lockResizeInteraction("col-resize");
-}
-
-function onSupportWidthResizeMove(event: MouseEvent) {
-  if (!supportWidthResizing) return;
-  const delta = event.clientX - supportWidthResizeStartX;
-  supportPrimaryWidth.value = clampSupportPrimaryWidth(supportWidthResizeStartValue + delta);
-}
-
-function onSupportWidthResizeEnd() {
-  supportWidthResizing = false;
-  isSupportWidthResizing.value = false;
-  document.removeEventListener("mousemove", onSupportWidthResizeMove);
-  document.removeEventListener("mouseup", onSupportWidthResizeEnd);
-  persistStoredPanelSize(SUPPORT_SECTION_WIDTH_STORAGE_KEY, supportPrimaryWidth.value);
   unlockResizeInteraction();
 }
 
@@ -1405,24 +1114,6 @@ function normalizeNullableInput(value: string): string | null {
   return normalized ? normalized : null;
 }
 
-function buildCollapsedPreview(value: string, fallback: string): string {
-  const normalized = normalizeKnowledgeEditorValue(value).replace(/\s+/g, " ").trim();
-  if (!normalized) return fallback;
-  return normalized.length > 84 ? `${normalized.slice(0, 84).trimEnd()}…` : normalized;
-}
-
-function resetSupportPanels(document: KnowledgeDocument | null) {
-  if (!document) {
-    supportPanelsCollapsed.value = true;
-    return;
-  }
-  const summaryVisible = getKnowledgeDocumentEditorSections(document).summary;
-  const rulesVisible = getKnowledgeDocumentEditorSections(document).maintenanceRules;
-  const summaryReady = !summaryVisible || !!normalizeKnowledgeEditorValue(document.summary ?? "");
-  const rulesReady = !rulesVisible || !!normalizeKnowledgeEditorValue(document.maintenanceRules ?? "");
-  supportPanelsCollapsed.value = summaryReady && rulesReady;
-}
-
 function persistSkillArgumentHint() {
   if (!props.document || props.document.type !== "skill" || isReadOnly.value) return;
   const nextValue = normalizeNullableInput(skillArgumentHintDraft.value);
@@ -1446,8 +1137,6 @@ function onSkillArgumentHintKeydown(event: KeyboardEvent) {
     (event.target as HTMLInputElement | null)?.blur();
   }
 }
-
-let skillUnityStatusRequestId = 0;
 
 async function refreshSkillUnityStatus() {
   // Guard against stale responses: rapid package switches must not let a slow
@@ -1562,24 +1251,6 @@ function labelForProvider(provider?: string | null): string {
       <div class="preview-main-column">
         <div class="preview-header">
           <div class="preview-header-main">
-            <span
-              v-if="document && !isReadOnly"
-              class="preview-title-input-shell"
-              :data-value="titleMeasureText"
-            >
-              <input
-                :value="fileNameDraft"
-                class="preview-title-input"
-                type="text"
-                :disabled="saveLoading"
-                :placeholder="t('knowledge.preview.titlePlaceholder')"
-                :aria-label="t('knowledge.preview.titleLabel')"
-                @input="onFileNameInputEvent"
-                @blur="flushPendingChanges('manual')"
-                @keydown="onFileNameKeydown"
-              />
-            </span>
-            <span v-else class="preview-title">{{ documentTitle }}</span>
             <span v-if="documentDisplayPath" class="preview-path">{{ documentDisplayPath }}</span>
           </div>
           <div class="preview-header-actions">
@@ -1598,170 +1269,252 @@ function labelForProvider(provider?: string | null): string {
         <div ref="previewMainRef" class="preview-main">
           <div v-if="loading && !document" class="preview-empty">{{ t("common.loading") }}</div>
           <div v-else-if="!document" class="preview-empty">{{ t("knowledge.empty.title") }}</div>
-          <template v-else>
-            <section
-              v-if="hasSupportPanels"
-              class="preview-support-strip"
-              :class="{
-                'is-warning': document.aiMaintained && (!document.explicitMaintenanceRules || !rulesDraft.trim()),
-                'has-resize-divider': !supportPanelsCollapsed,
-              }"
-              :style="supportStripStyle"
-            >
-              <button
-                type="button"
-                class="preview-support-toggle"
-                :aria-expanded="!supportPanelsCollapsed"
-                @click="toggleSupportPanels"
+          <article v-else class="document-page">
+            <header class="document-heading">
+              <span
+                v-if="!isReadOnly"
+                class="document-title-input-shell"
+                :data-value="titleMeasureText"
               >
-                <span class="preview-support-chevron" :class="{ open: !supportPanelsCollapsed }">▶</span>
-              </button>
+                <input
+                  :value="fileNameDraft"
+                  class="document-title-input"
+                  type="text"
+                  :disabled="saveLoading"
+                  :placeholder="t('knowledge.preview.titlePlaceholder')"
+                  :aria-label="t('knowledge.preview.titleLabel')"
+                  @input="onFileNameInputEvent"
+                  @blur="flushPendingChanges('manual')"
+                  @keydown="onFileNameKeydown"
+                />
+              </span>
+              <h1 v-else class="document-title">{{ documentTitle }}</h1>
+            </header>
 
-              <div
-                ref="supportLayoutRef"
-                class="preview-support-layout"
-                :class="{
-                  'has-two-sections': visibleSections.summary && visibleSections.maintenanceRules,
-                  'is-compact': supportLayoutCompact,
-                }"
-                :style="supportLayoutStyle"
-              >
-                <div
-                  v-if="visibleSections.summary"
-                  class="preview-support-section preview-support-section-first"
-                  :class="{ 'is-search-match': isSearchMatchSection('summary') }"
-                >
-                  <div class="preview-support-section-header">
-                    <span class="preview-support-title">{{ t("knowledge.preview.summary") }}</span>
-                    <span class="preview-support-text">
-                      {{ supportPanelsCollapsed ? summaryPreviewText : t("knowledge.preview.summaryHint") }}
-                    </span>
-                  </div>
-                  <div v-if="!supportPanelsCollapsed" class="preview-support-section-body" :class="{ 'is-loading': loading }">
-                    <div v-if="searchSnippetVisible('summary')" class="preview-search-hit">
-                      <div class="preview-search-hit-header">
-                        <span class="preview-search-hit-label">{{ searchSnippetTitle() }}</span>
-                        <span class="preview-search-hit-section">
-                          {{ t("knowledge.preview.searchMatchedField") }} · {{ searchSectionLabel("summary") }}
-                        </span>
-                      </div>
-                      <div class="preview-search-hit-text">
-                        <template v-for="(segment, index) in searchSnippetSegments('summary')" :key="`summary-${index}`">
-                          <mark v-if="segment.hit" class="preview-search-hit-mark">{{ segment.text }}</mark>
-                          <template v-else>{{ segment.text }}</template>
-                        </template>
-                      </div>
-                    </div>
-                    <div
-                      v-if="showSearchRenderedContent"
-                      ref="summaryRenderedSearchRef"
-                      class="preview-rendered-search"
-                    >
-                      <MarkdownRenderer
-                        :content="summaryDraft"
-                        :highlight-terms="searchQueryTerms"
-                      />
-                    </div>
-                    <BaseMarkdownEditor
-                      v-else
-                      :model-value="summaryDraft"
-                      :disabled="isReadOnly"
-                      :view-mode="editorViewMode"
-                      :placeholder="t('knowledge.preview.summaryPlaceholder')"
-                      @update:model-value="onSectionInput('summary', $event)"
-                      @shortcut-save="flushPendingChanges('manual')"
-                    />
-                  </div>
+            <section class="document-properties" :aria-label="t('knowledge.preview.properties')">
+              <div class="document-properties-title">{{ t("knowledge.preview.properties") }}</div>
+
+              <div v-if="document.type === 'skill' || document.type === 'reference'" class="document-property-row">
+                <span class="document-property-label">{{ t("knowledge.meta.type") }}</span>
+                <span class="document-property-value">{{ typeLabel }}</span>
+              </div>
+              <template v-if="showExtendedDocumentProperties">
+                <div class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.meta.scope") }}</span>
+                  <span class="document-property-value">{{ scopeLabel }}</span>
                 </div>
+                <div class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.meta.source") }}</span>
+                  <span class="document-property-value document-property-value-wrap">{{ sourceSummary }}</span>
+                </div>
+              </template>
+              <div class="document-property-row">
+                <span class="document-property-label">{{ t("knowledge.meta.injectMode") }}</span>
+                <BaseDropdown
+                  class="document-property-dropdown meta-dropdown"
+                  :model-value="injectModeSelection"
+                  :selected-label="injectModeDropdownLabel"
+                  :options="injectModeOptions"
+                  teleport
+                  :disabled="isReadOnly"
+                  :aria-label="t('knowledge.meta.injectMode')"
+                  @update:model-value="onInjectModeChange"
+                />
+              </div>
+              <div class="document-property-row">
+                <span class="document-property-label">{{ t("knowledge.meta.editMode") }}</span>
+                <BaseDropdown
+                  class="document-property-dropdown meta-dropdown"
+                  :model-value="editMode"
+                  :selected-label="editModeDropdownLabel"
+                  :options="editModeOptions"
+                  teleport
+                  :disabled="isEditModeLocked"
+                  :aria-label="t('knowledge.meta.editMode')"
+                  @update:model-value="onEditModeChange"
+                />
+              </div>
 
-                <div
-                  v-if="visibleSections.summary && visibleSections.maintenanceRules"
-                  class="preview-support-divider"
-                  :class="{
-                    'is-resizable': !supportLayoutCompact,
-                    dragging: isSupportWidthResizing,
-                  }"
-                  aria-hidden="true"
-                  @mousedown="onSupportWidthResizeStart"
-                ></div>
-
-                <div
-                  v-if="visibleSections.maintenanceRules"
-                  class="preview-support-section"
-                  :class="{
-                    'preview-support-section-first': !visibleSections.summary,
-                    'is-warning': document.aiMaintained && (!document.explicitMaintenanceRules || !rulesDraft.trim()),
-                    'is-search-match': isSearchMatchSection('maintenanceRules'),
-                  }"
-                >
-                  <div class="preview-support-section-header">
-                    <span class="preview-support-title">{{ t("knowledge.preview.rules") }}</span>
-                    <span class="preview-support-text">
-                      {{ supportPanelsCollapsed ? rulesPreviewText : rulesHint }}
+              <template v-if="document.type === 'skill'">
+                <div class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.skill.enabledLabel") }}</span>
+                  <BaseSwitch
+                    :model-value="skillEnabled"
+                    :disabled="isReadOnly"
+                    :aria-label="t('knowledge.skill.enabledLabel')"
+                    @update:model-value="onSkillEnabledChange"
+                  />
+                </div>
+                <div class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.skill.commandChannelLabel") }}</span>
+                  <BaseSwitch
+                    :model-value="skillCommandChannelOn"
+                    :disabled="isReadOnly"
+                    :aria-label="t('knowledge.skill.commandChannelLabel')"
+                    @update:model-value="onSkillCommandChannelChange"
+                  />
+                </div>
+                <div v-if="showSkillCommandFields" class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.skill.commandTrigger") }}</span>
+                  <input
+                    v-model="skillCommandDraft"
+                    class="document-property-input"
+                    type="text"
+                    :disabled="skillCommandInputDisabled"
+                    :placeholder="t('knowledge.skill.commandTriggerPlaceholder')"
+                    @blur="onSkillCommandBlur"
+                    @keydown="onSkillCommandKeydown"
+                  />
+                </div>
+                <div v-if="showSkillCommandFields" class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.skill.argumentHint") }}</span>
+                  <input
+                    v-model="skillArgumentHintDraft"
+                    class="document-property-input"
+                    type="text"
+                    :disabled="isReadOnly"
+                    @blur="persistSkillArgumentHint"
+                    @keydown="onSkillArgumentHintKeydown"
+                  />
+                </div>
+                <div v-if="skillActivationWarningVisible" class="document-property-warning">
+                  {{ t("knowledge.skill.activationWarning") }}
+                </div>
+                <template v-if="skillPackageId && (skillUnityStatusLoading || showSkillUnityStatus)">
+                  <div class="document-property-row">
+                    <span class="document-property-label">{{ t("knowledge.skill.unityStatus.label") }}</span>
+                    <span class="document-property-value document-property-value-wrap">
+                      {{ skillUnityStatusLoading ? t("knowledge.skill.unityStatus.loading") : skillUnityStatusLabel }}
                     </span>
                   </div>
-                  <div v-if="!supportPanelsCollapsed" class="preview-support-section-body" :class="{ 'is-loading': loading }">
-                    <div v-if="searchSnippetVisible('maintenanceRules')" class="preview-search-hit">
-                      <div class="preview-search-hit-header">
-                        <span class="preview-search-hit-label">{{ searchSnippetTitle() }}</span>
-                        <span class="preview-search-hit-section">
-                          {{ t("knowledge.preview.searchMatchedField") }} · {{ searchSectionLabel("maintenanceRules") }}
-                        </span>
-                      </div>
-                      <div class="preview-search-hit-text">
-                        <template
-                          v-for="(segment, index) in searchSnippetSegments('maintenanceRules')"
-                          :key="`rules-${index}`"
-                        >
-                          <mark v-if="segment.hit" class="preview-search-hit-mark">{{ segment.text }}</mark>
-                          <template v-else>{{ segment.text }}</template>
-                        </template>
-                      </div>
-                    </div>
-                    <div
-                      v-if="showSearchRenderedContent"
-                      ref="rulesRenderedSearchRef"
-                      class="preview-rendered-search"
-                    >
-                      <MarkdownRenderer
-                        :content="rulesDraft"
-                        :highlight-terms="searchQueryTerms"
-                      />
-                    </div>
-                    <BaseMarkdownEditor
-                      v-else
-                      :model-value="rulesDraft"
-                      :disabled="rulesEditorDisabled"
-                      :view-mode="editorViewMode"
-                      :placeholder="t('knowledge.preview.rulesPlaceholder')"
-                      @update:model-value="onSectionInput('maintenanceRules', $event)"
-                      @shortcut-save="flushPendingChanges('manual')"
-                    />
+                  <div v-if="skillUnityStatus?.installRoot" class="document-property-row">
+                    <span class="document-property-label">{{ t("knowledge.skill.unityStatus.path") }}</span>
+                    <span class="document-property-value document-property-value-wrap">{{ skillUnityStatus.installRoot }}</span>
                   </div>
+                  <div class="document-property-row">
+                    <span class="document-property-label"></span>
+                    <div class="skill-unity-actions">
+                      <button
+                        type="button"
+                        class="skill-unity-action"
+                        :disabled="skillUnityStatusLoading || skillUnityActionPending || !canInstallSkillUnityFiles"
+                        @click="installSkillUnity"
+                      >
+                        {{ t("knowledge.skill.unityStatus.install") }}
+                      </button>
+                      <button
+                        type="button"
+                        class="skill-unity-action danger"
+                        :disabled="skillUnityStatusLoading || skillUnityActionPending || !canRemoveSkillUnityFiles"
+                        @click="removeSkillUnity"
+                      >
+                        {{ t("knowledge.skill.unityStatus.remove") }}
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </template>
+
+              <div v-if="documentFileMetadata" class="document-property-row">
+                <span class="document-property-label">{{ t("knowledge.meta.fileSize") }}</span>
+                <span class="document-property-value">{{ fileDetailLabel }}</span>
+              </div>
+              <template v-if="showExtendedDocumentProperties && documentFileMetadata">
+                <div class="document-property-row">
+                  <span class="document-property-label">{{ t("knowledge.meta.modifiedAt") }}</span>
+                  <span class="document-property-value document-property-value-wrap">
+                    {{ modifiedAtLabel }}<template v-if="showLastCommit"> · {{ lastCommitLabel }}</template>
+                  </span>
+                </div>
+              </template>
+            </section>
+
+            <section
+              v-if="summaryEnabled || !isReadOnly"
+              class="document-inline-field document-inline-summary"
+              :class="{ 'is-search-match': isSearchMatchSection('summary') }"
+            >
+              <div class="document-inline-label">{{ t("knowledge.preview.summary") }}</div>
+              <div v-if="searchSnippetVisible('summary')" class="preview-search-hit">
+                <div class="preview-search-hit-text">
+                  <template v-for="(segment, index) in searchSnippetSegments('summary')" :key="`summary-${index}`">
+                    <mark v-if="segment.hit" class="preview-search-hit-mark">{{ segment.text }}</mark>
+                    <template v-else>{{ segment.text }}</template>
+                  </template>
                 </div>
               </div>
+              <div v-if="showSearchRenderedContent" ref="summaryRenderedSearchRef" class="preview-rendered-search">
+                <MarkdownRenderer :content="summaryDraft" :highlight-terms="searchQueryTerms" />
+              </div>
+              <BaseMarkdownEditor
+                v-else
+                :model-value="summaryDraft"
+                :disabled="isReadOnly"
+                :view-mode="editorViewMode"
+                :content-key="`${documentContentKey}:summary`"
+                defer-rendered-editor
+                auto-grow
+                :min-height="64"
+                :placeholder="t('knowledge.preview.summaryPlaceholder')"
+                @update:model-value="onSectionInput('summary', $event)"
+                @shortcut-save="flushPendingChanges('manual')"
+              />
+            </section>
+
+            <section
+              v-if="
+                !usesInheritedMaintenanceRules &&
+                (rulesPropertyValue.trim() || !rulesEditorDisabled)
+              "
+              class="document-inline-field document-inline-rules"
+              :class="{
+                'is-search-match': isSearchMatchSection('maintenanceRules'),
+                'is-warning': document.effectiveAiMaintained && !rulesPropertyValue.trim(),
+              }"
+            >
+              <div class="document-inline-label-row">
+                <span class="document-inline-label">{{ t("knowledge.preview.rules") }}</span>
+                <span class="document-inline-source">{{ rulesHint }}</span>
+              </div>
+              <div v-if="searchSnippetVisible('maintenanceRules')" class="preview-search-hit">
+                <div class="preview-search-hit-text">
+                  <template v-for="(segment, index) in searchSnippetSegments('maintenanceRules')" :key="`rules-${index}`">
+                    <mark v-if="segment.hit" class="preview-search-hit-mark">{{ segment.text }}</mark>
+                    <template v-else>{{ segment.text }}</template>
+                  </template>
+                </div>
+              </div>
+              <div v-if="showSearchRenderedContent" ref="rulesRenderedSearchRef" class="preview-rendered-search">
+                <MarkdownRenderer :content="rulesPropertyValue" :highlight-terms="searchQueryTerms" />
+              </div>
+              <BaseMarkdownEditor
+                v-else
+                :model-value="rulesPropertyValue"
+                :disabled="rulesEditorDisabled"
+                :view-mode="editorViewMode"
+                :content-key="`${documentContentKey}:maintenanceRules`"
+                defer-rendered-editor
+                auto-grow
+                :min-height="104"
+                :placeholder="t('knowledge.preview.rulesPlaceholder')"
+                @update:model-value="onSectionInput('maintenanceRules', $event)"
+                @shortcut-save="flushPendingChanges('manual')"
+              />
             </section>
 
             <div
-              v-if="hasSupportPanels && !supportPanelsCollapsed"
-              class="preview-main-divider"
-              :class="{ dragging: isSupportHeightResizing }"
-              aria-hidden="true"
-              @mousedown="onSupportHeightResizeStart"
-            ></div>
+              v-if="
+                !usesInheritedMaintenanceRules &&
+                document.effectiveAiMaintained &&
+                !rulesPropertyValue.trim()
+              "
+              class="document-property-warning"
+            >
+              {{ t("knowledge.meta.rulesRequiredHint") }}
+            </div>
 
-            <section class="preview-pane preview-pane-body" :class="{ 'is-search-match': isSearchMatchSection('body') }">
-              <div class="preview-pane-header">
-                <span>{{ t("knowledge.preview.body") }}</span>
-              </div>
-              <div class="preview-body" :class="{ 'is-loading': loading }">
+            <section class="document-body" :class="{ 'is-search-match': isSearchMatchSection('body'), 'is-loading': loading }">
                 <div v-if="searchSnippetVisible('body')" class="preview-search-hit preview-search-hit-body">
-                  <div class="preview-search-hit-header">
-                    <span class="preview-search-hit-label">{{ searchSnippetTitle() }}</span>
-                    <span class="preview-search-hit-section">
-                      {{ t("knowledge.preview.searchMatchedField") }} · {{ searchSectionLabel("body") }}
-                    </span>
-                  </div>
                   <div class="preview-search-hit-text">
                     <template v-for="(segment, index) in searchSnippetSegments('body')" :key="`body-${index}`">
                       <mark v-if="segment.hit" class="preview-search-hit-mark">{{ segment.text }}</mark>
@@ -1792,17 +1545,20 @@ function labelForProvider(provider?: string | null): string {
                   :disabled="isReadOnly"
                   :view-mode="editorViewMode"
                   :content-path="documentPath"
+                  :content-key="`${documentContentKey}:body`"
+                  defer-rendered-editor
+                  auto-grow
+                  :min-height="360"
                   :placeholder="t('knowledge.preview.bodyPlaceholder')"
                   @update:model-value="onSectionInput('body', $event)"
                   @shortcut-save="flushPendingChanges('manual')"
                 />
-              </div>
             </section>
 
             <div v-if="footerLabel" class="editor-footnote" :class="{ 'is-warning': footerWarning }">
               {{ footerLabel }}
             </div>
-          </template>
+          </article>
         </div>
       </div>
 
@@ -1833,223 +1589,17 @@ function labelForProvider(provider?: string | null): string {
               v-show="!metaCollapsed"
               type="button"
               class="preview-side-tab"
-              :class="{ active: sidePanelTab === 'chat' }"
+              :class="{ active: true }"
               role="tab"
-              :aria-selected="sidePanelTab === 'chat'"
-              @click="sidePanelTab = 'chat'"
+              :aria-selected="true"
             >
               {{ sidePanelOptions[1]?.label }}
-            </button>
-            <button
-              v-show="!metaCollapsed"
-              type="button"
-              class="preview-side-tab"
-              :class="{ active: sidePanelTab === 'meta' }"
-              role="tab"
-              :aria-selected="sidePanelTab === 'meta'"
-              @click="sidePanelTab = 'meta'"
-            >
-              {{ sidePanelOptions[0]?.label }}
             </button>
           </div>
         </div>
 
-        <div v-show="!metaCollapsed" class="preview-side-rail-body">
-          <div v-show="sidePanelTab === 'meta'" class="preview-side-rail-panel preview-side-rail-panel-meta">
-            <div class="meta-stack">
-              <div class="meta-group">
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.type") }}</span>
-                  <span class="meta-value">{{ typeLabel }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.scope") }}</span>
-                  <span class="meta-value">{{ scopeLabel }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.source") }}</span>
-                  <span class="meta-value">{{ sourceSummary }}</span>
-                </div>
-              </div>
-              <div class="meta-group">
-                <div class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.meta.summaryEnabled") }}</span>
-                  <div class="meta-control meta-control-switch">
-                    <BaseSwitch
-                      :model-value="summaryEnabled"
-                      :disabled="isReadOnly"
-                      :aria-label="t('knowledge.meta.summaryEnabled')"
-                      @update:model-value="onSummaryEnabledChange"
-                    />
-                  </div>
-                </div>
-                <div class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.meta.explicitMaintenanceRules") }}</span>
-                  <div
-                    class="meta-control meta-control-switch"
-                    :title="t('knowledge.meta.explicitMaintenanceRulesHint')"
-                  >
-                    <BaseSwitch
-                      :model-value="explicitRulesEnabled"
-                      :disabled="isReadOnly || explicitRulesLocked"
-                      :aria-label="t('knowledge.meta.explicitMaintenanceRules')"
-                      @update:model-value="onExplicitRulesChange"
-                    />
-                  </div>
-                </div>
-                <div class="meta-row meta-row-control meta-row-inject">
-                  <span class="meta-label">{{ t("knowledge.meta.injectMode") }}</span>
-                  <div class="meta-control">
-                    <BaseDropdown
-                      class="meta-dropdown"
-                      :model-value="injectModeSelection"
-                      :selected-label="injectModeDropdownLabel"
-                      :options="injectModeOptions"
-                      :disabled="isReadOnly"
-                      :aria-label="t('knowledge.meta.injectMode')"
-                      @update:model-value="onInjectModeChange"
-                    />
-                  </div>
-                </div>
-                <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.skill.enabledLabel") }}</span>
-                  <div class="meta-control">
-                    <BaseSwitch
-                      :model-value="skillEnabled"
-                      :disabled="isReadOnly"
-                      :aria-label="t('knowledge.skill.enabledLabel')"
-                      @update:model-value="onSkillEnabledChange"
-                    />
-                  </div>
-                </div>
-                <div v-if="document.type === 'skill'" class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.skill.commandChannelLabel") }}</span>
-                  <div class="meta-control">
-                    <BaseSwitch
-                      :model-value="skillCommandChannelOn"
-                      :disabled="isReadOnly"
-                      :aria-label="t('knowledge.skill.commandChannelLabel')"
-                      @update:model-value="onSkillCommandChannelChange"
-                    />
-                  </div>
-                </div>
-                <div
-                  v-if="skillActivationWarningVisible"
-                  class="meta-row skill-activation-warning"
-                >
-                  {{ t("knowledge.skill.activationWarning") }}
-                </div>
-                <div v-if="showSkillCommandFields" class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.skill.commandTrigger") }}</span>
-                  <div class="meta-control">
-                    <input
-                      v-model="skillCommandDraft"
-                      class="meta-text-input"
-                      type="text"
-                      :disabled="skillCommandInputDisabled"
-                      :placeholder="t('knowledge.skill.commandTriggerPlaceholder')"
-                      @blur="onSkillCommandBlur"
-                      @keydown="onSkillCommandKeydown"
-                    />
-                  </div>
-                </div>
-                <div v-if="showSkillCommandFields" class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.skill.argumentHint") }}</span>
-                  <div class="meta-control">
-                    <input
-                      v-model="skillArgumentHintDraft"
-                      class="meta-text-input"
-                      type="text"
-                      :disabled="isReadOnly"
-                      @blur="persistSkillArgumentHint"
-                      @keydown="onSkillArgumentHintKeydown"
-                    />
-                  </div>
-                </div>
-                <div
-                  v-if="skillPackageId && (skillUnityStatusLoading || showSkillUnityStatus)"
-                  class="meta-group skill-unity-group"
-                >
-                  <div class="meta-row">
-                    <span class="meta-label">{{ t("knowledge.skill.unityStatus.label") }}</span>
-                    <span class="meta-value meta-value-wrap">
-                      {{
-                        skillUnityStatusLoading
-                          ? t("knowledge.skill.unityStatus.loading")
-                          : skillUnityStatusLabel
-                      }}
-                    </span>
-                  </div>
-                  <div v-if="skillUnityStatus?.installRoot" class="meta-row">
-                    <span class="meta-label">{{ t("knowledge.skill.unityStatus.path") }}</span>
-                    <span class="meta-value meta-value-wrap">{{ skillUnityStatus.installRoot }}</span>
-                  </div>
-                  <div class="skill-unity-actions">
-                    <button
-                      type="button"
-                      class="skill-unity-action"
-                      :disabled="skillUnityStatusLoading || skillUnityActionPending || !canInstallSkillUnityFiles"
-                      @click="installSkillUnity"
-                    >
-                      {{ t("knowledge.skill.unityStatus.install") }}
-                    </button>
-                    <button
-                      type="button"
-                      class="skill-unity-action danger"
-                      :disabled="skillUnityStatusLoading || skillUnityActionPending || !canRemoveSkillUnityFiles"
-                      @click="removeSkillUnity"
-                    >
-                      {{ t("knowledge.skill.unityStatus.remove") }}
-                    </button>
-                  </div>
-                </div>
-                <div class="meta-row meta-row-control">
-                  <span class="meta-label">{{ t("knowledge.meta.editMode") }}</span>
-                  <div class="meta-control">
-                    <BaseDropdown
-                      class="meta-dropdown"
-                      :model-value="editMode"
-                      :selected-label="editModeDropdownLabel"
-                      :options="editModeOptions"
-                      :disabled="isEditModeLocked"
-                      :aria-label="t('knowledge.meta.editMode')"
-                      @update:model-value="onEditModeChange"
-                    />
-                  </div>
-                </div>
-              </div>
-              <div
-                v-if="document.aiMaintained && (!document.explicitMaintenanceRules || !rulesDraft.trim())"
-                class="meta-warning"
-              >
-                {{ t("knowledge.meta.rulesRequiredHint") }}
-              </div>
-              <div v-if="documentFileMetadata" class="meta-group meta-group-file">
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.fileSize") }}</span>
-                  <span class="meta-value">{{ fileSizeLabel }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.length") }}</span>
-                  <span class="meta-value">{{ fileLengthLabel }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.estimatedTokens") }}</span>
-                  <span class="meta-value">{{ estimatedTokensLabel }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.modifiedAt") }}</span>
-                  <span class="meta-value">{{ modifiedAtLabel }}</span>
-                </div>
-                <div v-if="showLastCommit" class="meta-row">
-                  <span class="meta-label">{{ t("knowledge.meta.lastCommit") }}</span>
-                  <span class="meta-value meta-value-wrap">{{ lastCommitLabel }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div v-show="sidePanelTab === 'chat'" class="preview-side-rail-panel preview-side-rail-panel-chat">
+          <div v-if="!metaCollapsed" class="preview-side-rail-body">
+          <div class="preview-side-rail-panel preview-side-rail-panel-chat">
             <KnowledgeChatPane :document="document" />
           </div>
         </div>
@@ -3127,6 +2677,277 @@ function labelForProvider(provider?: string | null): string {
 
   .preview-support-section-body {
     min-height: 112px;
+  }
+}
+
+/* Continuous document workspace. Metadata and content share one scroll plane. */
+.preview-main {
+  display: block;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-secondary) 34%, transparent) transparent;
+}
+
+.document-page {
+  position: relative;
+  width: min(100%, 980px);
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 32px 44px 72px;
+  box-sizing: border-box;
+}
+
+.document-heading {
+  margin: 0 0 22px;
+}
+
+.document-title,
+.document-title-input {
+  margin: 0;
+  color: var(--text-color);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+
+.document-title-input-shell {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+}
+
+.document-title-input-shell::after {
+  content: attr(data-value) " ";
+  grid-area: 1 / 1;
+  visibility: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.document-title-input {
+  grid-area: 1 / 1;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0 4px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  outline: none;
+}
+
+.document-title-input:hover {
+  border-bottom-color: var(--border-color);
+}
+
+.document-title-input:focus {
+  border-bottom-color: color-mix(in srgb, var(--accent-color) 48%, var(--border-color));
+}
+
+.document-title-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.62;
+}
+
+.document-properties {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: 24px;
+}
+
+.document-properties-title {
+  margin-bottom: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.document-property-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 30px;
+  padding: 1px 0;
+}
+
+.document-property-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.document-property-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-color);
+  font-size: 13px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-property-value-wrap {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.document-property-dropdown {
+  width: min(300px, 100%);
+}
+
+.document-property-dropdown :deep(.base-dropdown-trigger) {
+  min-height: 28px;
+  padding-inline: 8px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.document-property-dropdown :deep(.base-dropdown-trigger:hover),
+.document-property-dropdown.open :deep(.base-dropdown-trigger) {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+}
+
+.document-property-input {
+  width: min(360px, 100%);
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-color);
+  font: inherit;
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  outline: none;
+}
+
+.document-property-input:hover,
+.document-property-input:focus {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+}
+
+.document-property-warning {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--status-warn-border);
+  color: var(--status-warn-fg);
+  background: color-mix(in srgb, var(--status-warn-bg) 48%, transparent);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.document-inline-field {
+  margin: 0 0 22px;
+  padding: 0;
+}
+
+.document-inline-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.document-inline-label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.document-inline-source {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  opacity: 0.68;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-inline-field :deep(.base-markdown-editor) {
+  height: auto;
+  border-left: 1px solid var(--border-color);
+}
+
+.document-inline-summary :deep(.base-markdown-editor) {
+  min-height: 64px;
+}
+
+.document-inline-rules :deep(.base-markdown-editor) {
+  min-height: 104px;
+}
+
+.document-inline-field :deep(.base-markdown-editor .vditor),
+.document-inline-field :deep(.base-markdown-editor-native),
+.document-inline-field :deep(.base-markdown-editor-rendered) {
+  background: transparent;
+}
+
+.document-inline-field.is-search-match,
+.document-body.is-search-match {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-color) 46%, transparent);
+}
+
+.document-inline-field.is-warning .document-inline-label {
+  color: var(--status-warn-fg);
+}
+
+.document-body {
+  min-height: 360px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-color);
+}
+
+.document-body :deep(.base-markdown-editor) {
+  min-height: 360px;
+  height: auto;
+  padding-bottom: 32px;
+}
+
+.document-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset),
+.document-body :deep(.base-markdown-editor .base-markdown-editor-textarea) {
+  height: auto;
+  min-height: 360px;
+  overflow-y: visible;
+}
+
+.document-page .preview-search-hit {
+  margin: 6px 0 8px;
+}
+
+.document-page .preview-rendered-search {
+  min-height: 80px;
+  overflow: visible;
+  padding: 8px 0;
+}
+
+.document-page .preview-rendered-search-body {
+  min-height: 360px;
+  padding-bottom: 32px;
+}
+
+.document-page .editor-footnote {
+  position: fixed;
+  right: calc(var(--knowledge-chat-offset, 16px) + 16px);
+  bottom: 10px;
+}
+
+@media (max-width: 860px) {
+  .document-page {
+    padding: 24px 24px 64px;
+  }
+
+  .document-property-row {
+    grid-template-columns: 96px minmax(0, 1fr);
   }
 }
 </style>

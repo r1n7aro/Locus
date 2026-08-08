@@ -16,8 +16,10 @@ tools:
   - bash
   - mcp_reload
   - web_fetch
-  - knowledge_create
-  - knowledge_edit
+  - knowledge_query
+  - read
+  - write
+  - edit
 createdAt: 1784246400000
 updatedAt: 1784419200000
 ---
@@ -125,7 +127,7 @@ Prefer vendor/official over community, recently pushed over stale, and a README 
 
 ## Persist what you learned
 
-After the first successful end-to-end call, record the integration so future sessions skip the setup pain. Check the knowledge tree for an existing document first, then `knowledge_create` (or `knowledge_edit`) `memory/integrations/<software>.md` containing, briefly:
+After the first successful end-to-end call, record the integration so future sessions skip the setup pain. Use `knowledge_query` to check for an existing document, then `write` a new `Locus/knowledge/memory/integrations/<software>.md` or `edit` the returned physical path. Supply ordinary Markdown only when creating the file; Locus generates its frontmatter and reports the generated metadata.
 
 - channel and config location (the `mcp_servers.json` entry, CLI name, or API base URL)
 - auth: which env var and where it is set — never the secret itself

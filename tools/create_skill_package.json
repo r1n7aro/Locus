@@ -1,0 +1,46 @@
+{
+  "description": "Create an app Skill package with validated package metadata. The package is installed under the Locus app Skill directory, such as `%APPDATA%/locus/skills/<package-id>/` on Windows, and starts with `skill.json` plus `SKILL.md`. Returns the created Skill path, command trigger, and packageRoot for later filesystem edits. Omit `packageId` to derive a short kebab-case id from `name`; provide it for distributed packages or a specific namespace.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Display-oriented package name."
+      },
+      "packageId": {
+        "type": ["string", "null"],
+        "description": "Optional app Skill package id, for example `asset-audit`, `studio.tools.asset-audit`, or `io.github.user.asset-audit`. When omitted, Locus derives a short `<name-slug>` package id."
+      },
+      "version": {
+        "type": "string",
+        "description": "Required semantic version, for example `0.1.0`."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Required one-line package description and fallback load guidance."
+      },
+      "body": {
+        "type": "string",
+        "description": "Optional initial `SKILL.md` body. Omit to create the standard L1 and Instructions scaffold."
+      },
+      "argumentHint": {
+        "type": ["string", "null"],
+        "description": "Optional slash-command argument hint."
+      },
+      "commandTrigger": {
+        "type": ["string", "null"],
+        "description": "Optional slash command trigger. Defaults to the final package-id segment."
+      },
+      "commandEnabled": {
+        "type": "boolean",
+        "description": "Whether the package exposes a slash command. Defaults to true."
+      },
+      "modelInvocationEnabled": {
+        "type": "boolean",
+        "description": "Whether the package can be selected automatically by the model. Defaults to true."
+      }
+    },
+    "required": ["name", "version", "summary"]
+  }
+}

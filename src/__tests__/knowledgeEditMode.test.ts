@@ -4,14 +4,13 @@ import { isKnowledgeEditModeLocked } from "../components/knowledge/knowledgeEdit
 
 function makeEditModeDocument(
   overrides: Partial<
-    Pick<KnowledgeDocument, "type" | "readOnly" | "aiMaintained" | "inheritAiConfig" | "externalSource">
+    Pick<KnowledgeDocument, "type" | "readOnly" | "aiMaintained" | "externalSource">
   > = {},
-): Pick<KnowledgeDocument, "type" | "readOnly" | "aiMaintained" | "inheritAiConfig" | "externalSource"> {
+): Pick<KnowledgeDocument, "type" | "readOnly" | "aiMaintained" | "externalSource"> {
   return {
     type: "design",
     readOnly: false,
     aiMaintained: false,
-    inheritAiConfig: false,
     externalSource: null,
     ...overrides,
   };

@@ -1,19 +1,10 @@
 import type { KnowledgeDocument, KnowledgeDocumentSection } from "../../types";
-import { defaultSummaryEnabledForType } from "./knowledgeEditMode";
 
 export interface KnowledgeDocumentEditorSections
   extends Record<KnowledgeDocumentSection, boolean> {}
 
 function hasSectionContent(value?: string | null): boolean {
   return !!value?.trim();
-}
-
-function isSummaryEnabledByDefault(
-  type?: KnowledgeDocument["type"] | null,
-  summaryEnabled?: boolean,
-): boolean {
-  if (summaryEnabled !== undefined) return summaryEnabled;
-  return type ? defaultSummaryEnabledForType(type) : false;
 }
 
 function typeNeedsMaintenanceRules(type?: KnowledgeDocument["type"] | null): boolean {
@@ -23,15 +14,12 @@ function typeNeedsMaintenanceRules(type?: KnowledgeDocument["type"] | null): boo
 function isExplicitMaintenanceRulesEnabled(
   document: Pick<
     KnowledgeDocument,
-    "type" | "maintenanceRules" | "aiMaintained" | "explicitMaintenanceRules"
+    "type" | "maintenanceRules" | "aiMaintained" | "effectiveAiMaintained"
   >,
 ): boolean {
-  if (typeof document.explicitMaintenanceRules === "boolean") {
-    return document.explicitMaintenanceRules;
-  }
   return (
     typeNeedsMaintenanceRules(document.type)
-    || !!document.aiMaintained
+    || document.effectiveAiMaintained
     || hasSectionContent(document.maintenanceRules)
   );
 }
@@ -41,10 +29,9 @@ export function getKnowledgeDocumentEditorSections(
     KnowledgeDocument,
     | "type"
     | "summary"
-    | "summaryEnabled"
     | "maintenanceRules"
     | "aiMaintained"
-    | "explicitMaintenanceRules"
+    | "effectiveAiMaintained"
   > | null | undefined,
 ): KnowledgeDocumentEditorSections {
   if (!document) {
@@ -56,10 +43,9 @@ export function getKnowledgeDocumentEditorSections(
   }
 
   return {
-    summary: isSummaryEnabledByDefault(document.type, document.summaryEnabled),
+    summary: hasSectionContent(document.summary),
     maintenanceRules:
-      isExplicitMaintenanceRulesEnabled(document)
-      || !!document.aiMaintained,
+      isExplicitMaintenanceRulesEnabled(document),
     body: true,
   };
 }

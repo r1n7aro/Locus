@@ -13,9 +13,9 @@ import {
   startUnityReferenceHtmlDrag,
 } from "../composables/useUnityReferenceDragSource";
 import { normalizeAppError } from "../services/errors";
+import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
-import { useUiStore } from "../stores/ui";
 import type { AssetRefAttachment, AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
@@ -36,7 +36,7 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
-const uiStore = useUiStore();
+const { openDocument: openKnowledgeDocument } = useKnowledgeDocumentOpen();
 const KNOWLEDGE_REF_ROOT_RE = /^(design|memory|skill|reference)\/.+\.md$/i;
 
 const normalizedPath = computed(() =>
@@ -109,11 +109,7 @@ const unityDragRef = computed<AssetRefAttachment | null>(() => {
 async function handleClick(e: MouseEvent) {
   try {
     if (knowledgeRef.value) {
-      uiStore.stageKnowledgeSelection({
-        dashboard: knowledgeRef.value.docType,
-        path: knowledgeRef.value.path,
-      });
-      uiStore.setTab("knowledge");
+      await openKnowledgeDocument(knowledgeRef.value.docType, knowledgeRef.value.path);
       return;
     }
     if (sceneObjectRef.value) {

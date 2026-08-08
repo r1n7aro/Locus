@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRenderer, defineComponent, nextTick, reactive } from "vue";
 import { createPinia, setActivePinia } from "pinia";
-import { useKnowledgeState } from "../composables/useKnowledgeState";
+import {
+  buildSearchExplorerTree,
+  useKnowledgeState,
+  type ExplorerNode,
+} from "../composables/useKnowledgeState";
 import type {
   FeishuReferenceImportStatus,
   KnowledgeChangedEvent,
@@ -204,6 +208,16 @@ async function flushPromises(rounds = 4) {
   }
 }
 
+function findSpecialRoot(
+  state: ReturnType<typeof useKnowledgeState>,
+  type: "design" | "memory" | "skill" | "reference",
+): Extract<ExplorerNode, { kind: "folder" }> | undefined {
+  return state.visibleExplorerTree.value.find(
+    (node): node is Extract<ExplorerNode, { kind: "folder" }> =>
+      node.kind === "folder" && node.type === type && !!node.specialRoot,
+  );
+}
+
 type KnowledgeStateProps = {
   workingDir: string;
   selectedModelId: string;
@@ -302,15 +316,12 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
       {
         id: "memory-1",
@@ -318,17 +329,14 @@ describe("useKnowledgeState", () => {
         path: "project-understanding.md",
         title: "项目理解",
         injectMode: "full",
-        summaryEnabled: false,
-        commandEnabled: false,
+        effectiveInjectMode: "full",
         readOnly: false,
         aiMaintained: true,
-        explicitMaintenanceRules: true,
+        effectiveAiMaintained: true,
         lexicalSearch: "enabled",
         vectorSearch: "disabled",
         summary: null,
-        createdAt: 1,
-        updatedAt: 3,
-        hasSummary: false,
+        modifiedAt: 3,
       },
     ]);
     knowledgeMocks.knowledgeListPage.mockResolvedValue({
@@ -338,23 +346,27 @@ describe("useKnowledgeState", () => {
 
     knowledgeMocks.knowledgeRead.mockImplementation(async (input: any) => {
       if (input.kind === "directory") {
+        const directoryPath = input.path === input.type ? "" : input.path;
         return {
           kind: "directory",
           directory: {
             version: 4,
             type: input.type ?? "design",
-            path: input.path,
-            configPath: `${input.path}.locus-meta`,
+            path: directoryPath,
+            configPath: directoryPath
+              ? `${directoryPath}.locus-meta`
+              : `${input.type}.locus-meta`,
             exists: true,
-            updatedAt: 2,
+            modifiedAt: 2,
             summary: "维护战斗结构缓存",
             injectMode: "excerpt",
+            effectiveInjectMode: "excerpt",
             inheritInjectMode: true,
             injectModeSource: { kind: "type_default", path: null },
             aiMaintained: false,
+            effectiveAiMaintained: false,
             inheritAiConfig: true,
             aiConfigSource: { kind: "type_default", path: null },
-            explicitMaintenanceRules: false,
             lexicalSearch: "inherit",
             vectorSearch: "inherit",
             effectiveLexicalSearch: { enabled: true, source: "default" },
@@ -377,21 +389,18 @@ describe("useKnowledgeState", () => {
           path: input.path,
           title: "核心循环",
           injectMode: "excerpt",
+          effectiveInjectMode: "excerpt",
           inheritInjectMode: false,
           injectModeSource: { kind: "self", path: null },
-          summaryEnabled: true,
-          commandEnabled: false,
           readOnly: false,
           aiMaintained: false,
+          effectiveAiMaintained: false,
           inheritAiConfig: false,
           aiConfigSource: { kind: "self", path: null },
-          explicitMaintenanceRules: false,
           summary: "摘要",
           body: "正文",
           maintenanceRules: null,
-          createdAt: 1,
-          updatedAt: 2,
-          hasSummary: true,
+          modifiedAt: 2,
         },
       };
     });
@@ -570,15 +579,16 @@ describe("useKnowledgeState", () => {
             path: input.path,
             configPath: `${input.path}.locus-meta`,
             exists: true,
-            updatedAt: 2,
+            modifiedAt: 2,
             summary: "",
             injectMode: "excerpt",
+            effectiveInjectMode: "excerpt",
             inheritInjectMode: true,
             injectModeSource: { kind: "type_default", path: null },
             aiMaintained: false,
+            effectiveAiMaintained: false,
             inheritAiConfig: true,
             aiConfigSource: { kind: "type_default", path: null },
-            explicitMaintenanceRules: false,
             lexicalSearch: "inherit",
             vectorSearch: "inherit",
             effectiveLexicalSearch: { enabled: true, source: "default" },
@@ -603,33 +613,30 @@ describe("useKnowledgeState", () => {
           type: input.type ?? "design",
           path: input.path ?? "new-doc.md",
           title: input.document?.title ?? "新文档",
-          injectMode: "none",
-          inheritInjectMode: input.document?.inheritInjectMode ?? false,
+          injectMode: input.document?.injectMode ?? "inherit",
+          effectiveInjectMode:
+            input.document?.injectMode && input.document.injectMode !== "inherit"
+              ? input.document.injectMode
+              : "none",
           injectModeSource: {
-            kind: input.document?.inheritInjectMode ? "type_default" : "self",
+            kind: input.document?.injectMode === "inherit" ? "type_default" : "self",
             path: null,
           },
-          summaryEnabled: input.document?.summaryEnabled ?? false,
-          commandEnabled: input.document?.commandEnabled ?? false,
           readOnly: input.document?.readOnly ?? false,
-          aiMaintained: input.document?.aiMaintained ?? false,
-          inheritAiConfig: input.document?.inheritAiConfig ?? false,
+          aiMaintained: input.document?.aiMaintained ?? "inherit",
+          effectiveAiMaintained: input.document?.aiMaintained === true,
           aiConfigSource: {
-            kind: input.document?.inheritAiConfig ? "type_default" : "self",
+            kind: input.document?.aiMaintained === "inherit" ? "type_default" : "self",
             path: null,
           },
-          explicitMaintenanceRules:
-            input.document?.explicitMaintenanceRules ?? false,
           summary: input.document?.summary ?? null,
           body: input.document?.body ?? "",
           maintenanceRules: input.document?.maintenanceRules ?? null,
+          effectiveMaintenanceRules: input.document?.maintenanceRules ?? null,
           skillEnabled: input.document?.skillEnabled ?? null,
           skillSurface: input.document?.skillSurface ?? null,
           commandTrigger: input.document?.commandTrigger ?? null,
-          createdAt: 1,
-          updatedAt: 2,
-          hasSummary:
-            !!input.document?.summaryEnabled && !!input.document?.summary,
+          modifiedAt: 2,
         },
       };
     });
@@ -645,7 +652,7 @@ describe("useKnowledgeState", () => {
         dirName,
         source: "project",
         relPath: `skill/${dirName}.md`,
-        updatedAt: 2,
+        modifiedAt: 2,
         skillEnabled: true,
         skillSurface: "command",
         skillDescription: input.summary ?? null,
@@ -659,6 +666,7 @@ describe("useKnowledgeState", () => {
     });
     knowledgeMocks.knowledgeEdit.mockImplementation(async (input: any) => {
       if (input.kind === "directory") {
+        const directoryPath = input.path === input.type ? "" : input.path;
         return {
           kind: "directory",
           type: input.type ?? "design",
@@ -666,25 +674,28 @@ describe("useKnowledgeState", () => {
           directory: {
             version: input.config?.version ?? 4,
             type: input.type ?? "design",
-            path: input.path,
-            configPath: `${input.path}.locus-meta`,
+            path: directoryPath,
+            configPath: directoryPath
+              ? `${directoryPath}.locus-meta`
+              : `${input.type}.locus-meta`,
             exists: true,
-            updatedAt: 3,
+            modifiedAt: 3,
             summary: input.config?.summary ?? "",
-            injectMode: input.config?.injectMode ?? "excerpt",
-            inheritInjectMode: input.config?.inheritInjectMode ?? false,
+            injectMode: input.config?.injectMode ?? "inherit",
+            effectiveInjectMode:
+              input.config?.injectMode && input.config.injectMode !== "inherit"
+                ? input.config.injectMode
+                : "excerpt",
             injectModeSource: {
-              kind: input.config?.inheritInjectMode ? "type_default" : "self",
+              kind: input.config?.injectMode === "inherit" ? "type_default" : "self",
               path: null,
             },
-            aiMaintained: input.config?.aiMaintained ?? false,
-            inheritAiConfig: input.config?.inheritAiConfig ?? false,
+            aiMaintained: input.config?.aiMaintained ?? "inherit",
+            effectiveAiMaintained: input.config?.aiMaintained === true,
             aiConfigSource: {
-              kind: input.config?.inheritAiConfig ? "type_default" : "self",
+              kind: input.config?.aiMaintained === "inherit" ? "type_default" : "self",
               path: null,
             },
-            explicitMaintenanceRules:
-              input.config?.explicitMaintenanceRules ?? false,
             lexicalSearch: input.config?.lexicalSearch ?? "inherit",
             vectorSearch: input.config?.vectorSearch ?? "inherit",
             effectiveLexicalSearch: {
@@ -708,7 +719,8 @@ describe("useKnowledgeState", () => {
               input.config?.allowCreateDirectories ?? true,
             allowMoveDocuments: input.config?.allowMoveDocuments ?? true,
             allowMoveDirectories: input.config?.allowMoveDirectories ?? true,
-            maintenanceRules: input.config?.maintenanceRules ?? "",
+            maintenanceRules: input.config?.maintenanceRules ?? null,
+            effectiveMaintenanceRules: input.config?.maintenanceRules ?? null,
           },
         };
       }
@@ -723,29 +735,27 @@ describe("useKnowledgeState", () => {
           type: input.type ?? "design",
           path: input.document?.newPath ?? input.path,
           title: input.document?.title ?? "核心循环",
-          injectMode: "excerpt",
-          inheritInjectMode: input.document?.inheritInjectMode ?? false,
+          injectMode: input.document?.injectMode ?? "inherit",
+          effectiveInjectMode:
+            input.document?.injectMode && input.document.injectMode !== "inherit"
+              ? input.document.injectMode
+              : "excerpt",
           injectModeSource: {
-            kind: input.document?.inheritInjectMode ? "type_default" : "self",
+            kind: input.document?.injectMode === "inherit" ? "type_default" : "self",
             path: null,
           },
-          summaryEnabled: true,
-          commandEnabled: false,
           readOnly: input.document?.readOnly ?? false,
-          aiMaintained: input.document?.aiMaintained ?? false,
-          inheritAiConfig: input.document?.inheritAiConfig ?? false,
+          aiMaintained: input.document?.aiMaintained ?? "inherit",
+          effectiveAiMaintained: input.document?.aiMaintained === true,
           aiConfigSource: {
-            kind: input.document?.inheritAiConfig ? "type_default" : "self",
+            kind: input.document?.aiMaintained === "inherit" ? "type_default" : "self",
             path: null,
           },
-          explicitMaintenanceRules:
-            input.document?.explicitMaintenanceRules ?? false,
           summary: input.document?.summary ?? "摘要",
           body: input.document?.body ?? "正文",
           maintenanceRules: input.document?.maintenanceRules ?? null,
-          createdAt: 1,
-          updatedAt: 3,
-          hasSummary: true,
+          effectiveMaintenanceRules: input.document?.maintenanceRules ?? null,
+          modifiedAt: 3,
         },
       };
     });
@@ -762,21 +772,17 @@ describe("useKnowledgeState", () => {
               path: input.newPath,
               title: "核心循环",
               injectMode: "excerpt",
-              inheritInjectMode: false,
+              effectiveInjectMode: "excerpt",
               injectModeSource: { kind: "self", path: null },
-              summaryEnabled: true,
-              commandEnabled: false,
               readOnly: false,
               aiMaintained: false,
-              inheritAiConfig: false,
+              effectiveAiMaintained: false,
               aiConfigSource: { kind: "self", path: null },
-              explicitMaintenanceRules: false,
               summary: "摘要",
               body: "正文",
               maintenanceRules: null,
-              createdAt: 1,
-              updatedAt: 3,
-              hasSummary: true,
+              effectiveMaintenanceRules: null,
+              modifiedAt: 3,
             }
           : null,
     }));
@@ -815,6 +821,108 @@ describe("useKnowledgeState", () => {
       kind: "folder",
       name: "combat",
     });
+    expect(state.visibleExplorerTree.value).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "folder", name: "Design", specialRoot: true }),
+        expect.objectContaining({ kind: "folder", name: "Memory", specialRoot: true }),
+        expect.objectContaining({ kind: "folder", name: "Skill", specialRoot: true }),
+        expect.objectContaining({ kind: "folder", name: "Reference", specialRoot: true }),
+      ]),
+    );
+  });
+
+  it("keeps unloaded search matches in their type and folder hierarchy", () => {
+    const tree = buildSearchExplorerTree(
+      [
+        {
+          id: "reference-ecs",
+          type: "reference",
+          path: "ecs-migration/plans/ECS-overview.md",
+          title: "ECS 迁移总览",
+          storageSource: "project",
+          effectiveInjectMode: "excerpt",
+          effectiveAiMaintained: false,
+          snippet: "ECS 迁移",
+          matchKind: "lexical",
+          score: 0.95,
+        },
+      ],
+      [],
+    );
+
+    expect(tree).toMatchObject([
+      {
+        kind: "folder",
+        name: "Reference",
+        specialRoot: true,
+        children: [
+          {
+            kind: "folder",
+            name: "ecs-migration",
+            children: [
+              {
+                kind: "folder",
+                name: "plans",
+                children: [
+                  {
+                    kind: "document",
+                    path: "reference/ecs-migration/plans/ECS-overview.md",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("opens the physical type root as an editable directory config", async () => {
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.refreshKnowledgeData();
+    await state.selectDirectory("design", "design");
+
+    expect(knowledgeMocks.knowledgeRead).toHaveBeenCalledWith({
+      kind: "directory",
+      path: "design",
+      type: "design",
+    });
+    expect(state.selectedDirectoryType.value).toBe("design");
+    expect(state.selectedDirectoryConfig.value?.path).toBe("");
+    expect(state.selectedPath.value).toBe("design");
+
+    await state.saveDirectoryConfig("", {
+      version: 4,
+      summary: "Design 根规则",
+      injectMode: "path",
+      effectiveInjectMode: "path",
+      aiMaintained: false,
+      effectiveAiMaintained: false,
+      lexicalSearch: "enabled",
+      vectorSearch: "enabled",
+      inheritToChildren: true,
+      allowCreateDocuments: true,
+      allowCreateDirectories: true,
+      allowMoveDocuments: true,
+      allowMoveDirectories: true,
+      maintenanceRules: "",
+      effectiveMaintenanceRules: "",
+    });
+    expect(knowledgeMocks.knowledgeEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "directory",
+        type: "design",
+        path: "design",
+      }),
+    );
+    expect(state.selectedDirectoryConfig.value?.path).toBe("");
   });
 
   it("reloads the active knowledge list when the workspace changes", async () => {
@@ -825,15 +933,12 @@ describe("useKnowledgeState", () => {
         path: "repo-a.md",
         title: "Repo A",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "A",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ];
     knowledgeMocks.knowledgeList.mockImplementation(async () => currentDocs);
@@ -857,15 +962,12 @@ describe("useKnowledgeState", () => {
         path: "repo-b.md",
         title: "Repo B",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "B",
-        createdAt: 3,
-        updatedAt: 4,
-        hasSummary: true,
+        modifiedAt: 4,
       },
     ];
     props.workingDir = "F:/repo-b";
@@ -875,7 +977,7 @@ describe("useKnowledgeState", () => {
     expect(state.documents.value.map((doc) => doc.path)).toEqual([
       "repo-b.md",
     ]);
-    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(2);
+    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(6);
   });
 
   it("drops queued external knowledge changes after the workspace changes", async () => {
@@ -925,15 +1027,12 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ];
     let skillDocs: KnowledgeDocumentSummary[] = [
@@ -943,15 +1042,12 @@ describe("useKnowledgeState", () => {
         path: "old-plugin/SKILL.md",
         title: "Old Plugin",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: true,
+        effectiveInjectMode: "excerpt",
         readOnly: true,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "Old",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ];
     knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
@@ -976,15 +1072,12 @@ describe("useKnowledgeState", () => {
         path: "new-plugin/SKILL.md",
         title: "New Plugin",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: true,
+        effectiveInjectMode: "excerpt",
         readOnly: true,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "New",
-        createdAt: 3,
-        updatedAt: 4,
-        hasSummary: true,
+        modifiedAt: 4,
       },
     ];
 
@@ -1054,21 +1147,18 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
+        effectiveInjectMode: "excerpt",
         inheritInjectMode: false,
         injectModeSource: { kind: "self", path: null },
-        summaryEnabled: true,
-        commandEnabled: false,
         readOnly: false,
         aiMaintained: false,
+        effectiveAiMaintained: false,
         inheritAiConfig: false,
         aiConfigSource: { kind: "self", path: null },
-        explicitMaintenanceRules: false,
         summary: "摘要",
         body: "正文 v3",
         maintenanceRules: null,
-        createdAt: 1,
-        updatedAt: 4,
-        hasSummary: true,
+        modifiedAt: 4,
       },
     });
     await flushPromises(8);
@@ -1110,8 +1200,8 @@ describe("useKnowledgeState", () => {
         type: "design",
         path: "old-project.md",
         title: "Old Project",
-        injectMode: "excerpt",
-        aiMaintained: false,
+        effectiveInjectMode: "excerpt",
+        effectiveAiMaintained: false,
         snippet: "stale",
         matchKind: "lexical",
         score: 1,
@@ -1546,15 +1636,12 @@ describe("useKnowledgeState", () => {
             syncEnabled: true,
           },
           injectMode: "none",
-          summaryEnabled: false,
-          commandEnabled: false,
+          effectiveInjectMode: "none",
           readOnly: true,
           aiMaintained: false,
-          explicitMaintenanceRules: true,
+          effectiveAiMaintained: false,
           summary: null,
-          createdAt: 1,
-          updatedAt: 2,
-          hasSummary: false,
+          modifiedAt: 2,
         },
       ])
       .mockResolvedValueOnce([]);
@@ -1605,7 +1692,13 @@ describe("useKnowledgeState", () => {
     expect(
       knowledgeMocks.knowledgeDeleteUnityReferenceDocs,
     ).toHaveBeenCalledTimes(1);
-    expect(state.documents.value).toHaveLength(0);
+    expect(
+      state.documents.value.some(
+        (doc) =>
+          doc.type === "reference" &&
+          doc.path.startsWith("unity-official-docs/"),
+      ),
+    ).toBe(false);
     expect(state.unityReferenceImportStatus.value).toMatchObject({
       state: "missing",
       importedDocsVersion: null,
@@ -1671,15 +1764,12 @@ describe("useKnowledgeState", () => {
       path: "combat/core-loop.md",
       title: "核心循环",
       injectMode: "excerpt",
-      summaryEnabled: true,
-      commandEnabled: false,
+      effectiveInjectMode: "excerpt",
       readOnly: false,
       aiMaintained: false,
-      explicitMaintenanceRules: false,
+      effectiveAiMaintained: false,
       summary: "摘要",
-      createdAt: 1,
-      updatedAt: 2,
-      hasSummary: true,
+      modifiedAt: 2,
     };
     const memoryDoc: KnowledgeDocumentSummary = {
       id: "memory-1",
@@ -1687,15 +1777,12 @@ describe("useKnowledgeState", () => {
       path: "project-understanding.md",
       title: "项目理解",
       injectMode: "full",
-      summaryEnabled: false,
-      commandEnabled: false,
+      effectiveInjectMode: "full",
       readOnly: false,
       aiMaintained: true,
-      explicitMaintenanceRules: true,
+      effectiveAiMaintained: true,
       summary: null,
-      createdAt: 1,
-      updatedAt: 3,
-      hasSummary: false,
+      modifiedAt: 3,
     };
 
     knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) => {
@@ -1763,13 +1850,15 @@ describe("useKnowledgeState", () => {
           path: "combat/core-loop.md",
           title: "核心循环",
           injectMode: "excerpt",
+          effectiveInjectMode: "excerpt",
           aiMaintained: false,
+          effectiveAiMaintained: false,
           snippet: "核心循环",
           matchKind: "lexical",
           matchedSection: "body",
           score: 0.92,
           estimatedTokens: 42,
-          updatedAt: 2,
+          modifiedAt: 2,
         },
       ]);
 
@@ -1787,6 +1876,24 @@ describe("useKnowledgeState", () => {
       await vi.advanceTimersByTimeAsync(220);
 
       expect(state.searchResults.value).toHaveLength(1);
+      expect(state.visibleExplorerTree.value).toHaveLength(1);
+      expect(state.visibleExplorerTree.value[0]).toMatchObject({
+        kind: "folder",
+        name: "Design",
+        specialRoot: true,
+        children: [
+          {
+            kind: "folder",
+            name: "combat",
+            children: [
+              {
+                kind: "document",
+                path: "design/combat/core-loop.md",
+              },
+            ],
+          },
+        ],
+      });
 
       await state.selectSearchResult(state.searchResults.value[0]!);
 
@@ -1835,6 +1942,69 @@ describe("useKnowledgeState", () => {
     expect(state.selectedPath.value).toBe("design/combat");
   });
 
+  it("keeps the current document visible while a folder config is loading", async () => {
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.refreshKnowledgeData();
+    await state.selectDocument(state.documents.value[0]!);
+
+    let resolveDirectory!: (value: any) => void;
+    knowledgeMocks.knowledgeRead.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveDirectory = resolve;
+      }),
+    );
+
+    const pendingSelection = state.selectDirectory("combat");
+    await Promise.resolve();
+
+    expect(state.selectedDirectoryLoading.value).toBe(true);
+    expect(state.selectedDocument.value?.path).toBe("combat/core-loop.md");
+    expect(state.selectedDirectoryConfig.value).toBeNull();
+
+    resolveDirectory({
+      kind: "directory",
+      directory: {
+        version: 4,
+        type: "design",
+        path: "combat",
+        configPath: "combat.locus-meta",
+        exists: true,
+        modifiedAt: 2,
+        summary: "维护战斗结构缓存",
+        injectMode: "excerpt",
+        effectiveInjectMode: "excerpt",
+        inheritInjectMode: true,
+        injectModeSource: { kind: "type_default", path: null },
+        aiMaintained: false,
+        effectiveAiMaintained: false,
+        inheritAiConfig: true,
+        aiConfigSource: { kind: "type_default", path: null },
+        lexicalSearch: "inherit",
+        vectorSearch: "inherit",
+        effectiveLexicalSearch: { enabled: true, source: "default" },
+        effectiveVectorSearch: { enabled: true, source: "default" },
+        inheritToChildren: true,
+        allowCreateDocuments: true,
+        allowCreateDirectories: true,
+        allowMoveDocuments: true,
+        allowMoveDirectories: true,
+        maintenanceRules: "",
+      },
+    });
+    await pendingSelection;
+
+    expect(state.selectedDirectoryLoading.value).toBe(false);
+    expect(state.selectedDocument.value).toBeNull();
+    expect(state.selectedDirectoryConfig.value?.path).toBe("combat");
+  });
+
   it("shows directory-only memory cache folders in the explorer tree", async () => {
     knowledgeMocks.knowledgeListDirectories.mockImplementation(
       async (type: string) =>
@@ -1862,22 +2032,19 @@ describe("useKnowledgeState", () => {
     );
   });
 
-  it("reloads an inactive memory type after an external knowledge change", async () => {
+  it("refreshes memory documents while another type is selected", async () => {
     const designDoc = {
       id: "design-1",
       type: "design" as const,
       path: "combat/core-loop.md",
       title: "核心循环",
       injectMode: "excerpt" as const,
-      summaryEnabled: true,
-      commandEnabled: false,
+      effectiveInjectMode: "excerpt" as const,
       readOnly: false,
       aiMaintained: false,
-      explicitMaintenanceRules: false,
+      effectiveAiMaintained: false,
       summary: "摘要",
-      createdAt: 1,
-      updatedAt: 2,
-      hasSummary: true,
+      modifiedAt: 2,
     };
     const initialMemoryDoc = {
       id: "memory-1",
@@ -1885,15 +2052,12 @@ describe("useKnowledgeState", () => {
       path: "project-understanding.md",
       title: "项目理解",
       injectMode: "full" as const,
-      summaryEnabled: false,
-      commandEnabled: false,
+      effectiveInjectMode: "full" as const,
       readOnly: false,
       aiMaintained: true,
-      explicitMaintenanceRules: true,
+      effectiveAiMaintained: true,
       summary: null,
-      createdAt: 1,
-      updatedAt: 3,
-      hasSummary: false,
+      modifiedAt: 3,
     };
     const nextMemoryDoc = {
       id: "memory-2",
@@ -1901,15 +2065,12 @@ describe("useKnowledgeState", () => {
       path: "project-memory.md",
       title: "项目记忆",
       injectMode: "full" as const,
-      summaryEnabled: false,
-      commandEnabled: false,
+      effectiveInjectMode: "full" as const,
       readOnly: false,
       aiMaintained: true,
-      explicitMaintenanceRules: true,
+      effectiveAiMaintained: true,
       summary: null,
-      createdAt: 4,
-      updatedAt: 5,
-      hasSummary: false,
+      modifiedAt: 5,
     };
 
     knowledgeMocks.knowledgeList.mockImplementation(
@@ -1957,13 +2118,22 @@ describe("useKnowledgeState", () => {
       ([input]) => input?.type === "memory",
     ).length;
 
+    expect(state.documents.value).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "memory",
+          path: "project-memory.md",
+        }),
+      ]),
+    );
+
     await state.selectType("memory");
 
     expect(
       knowledgeMocks.knowledgeList.mock.calls.filter(
         ([input]) => input?.type === "memory",
       ).length,
-    ).toBeGreaterThan(memoryCallCountBeforeSwitch);
+    ).toBe(memoryCallCountBeforeSwitch);
     expect(state.documents.value).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2009,15 +2179,12 @@ describe("useKnowledgeState", () => {
                 syncEnabled: true,
               },
               injectMode: "none",
-              summaryEnabled: false,
-              commandEnabled: false,
+              effectiveInjectMode: "none",
               readOnly: true,
               aiMaintained: false,
-              explicitMaintenanceRules: false,
+              effectiveAiMaintained: false,
               summary: null,
-              createdAt: 1,
-              updatedAt: 2,
-              hasSummary: false,
+              modifiedAt: 2,
             },
           ],
           nextCursor: null,
@@ -2129,15 +2296,12 @@ describe("useKnowledgeState", () => {
               path: "system/主要玩法.md",
               title: "主要玩法",
               injectMode: "excerpt",
-              summaryEnabled: true,
-              commandEnabled: false,
+              effectiveInjectMode: "excerpt",
               readOnly: false,
               aiMaintained: false,
-              explicitMaintenanceRules: false,
+              effectiveAiMaintained: false,
               summary: "摘要",
-              createdAt: 1,
-              updatedAt: 2,
-              hasSummary: true,
+              modifiedAt: 2,
             },
           ],
           nextCursor: null,
@@ -2220,17 +2384,14 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
         body: "正文 v2",
         maintenanceRules: null,
-        createdAt: 1,
-        updatedAt: 3,
-        hasSummary: true,
+        modifiedAt: 3,
       },
     });
 
@@ -2274,12 +2435,10 @@ describe("useKnowledgeState", () => {
         kind: "document",
         path: "新文档.md",
         document: expect.objectContaining({
-          title: "新文档",
           body: "",
-          inheritInjectMode: true,
-          summaryEnabled: false,
+          injectMode: "inherit",
           readOnly: false,
-          inheritAiConfig: true,
+          aiMaintained: "inherit",
         }),
       }),
     );
@@ -2303,12 +2462,10 @@ describe("useKnowledgeState", () => {
         type: "memory",
         path: "项目记忆.md",
         document: expect.objectContaining({
-          title: "项目记忆",
           body: "",
-          inheritInjectMode: true,
-          summaryEnabled: false,
+          injectMode: "inherit",
           readOnly: false,
-          inheritAiConfig: true,
+          aiMaintained: "inherit",
         }),
       }),
     );
@@ -2449,15 +2606,12 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ]);
     knowledgeMocks.knowledgeListDirectories.mockImplementation(
@@ -2493,12 +2647,11 @@ describe("useKnowledgeState", () => {
       path: "com.feishu.cli/SKILL.md",
       title: "Feishu CLI",
       injectMode: "excerpt",
-      summaryEnabled: true,
-      commandEnabled: true,
+      effectiveInjectMode: "excerpt",
       readOnly: true,
       aiMaintained: false,
+      effectiveAiMaintained: false,
       storageSource: "app",
-      explicitMaintenanceRules: false,
       externalSource: {
         provider: "package",
         sourceId: "com.feishu.cli",
@@ -2509,9 +2662,7 @@ describe("useKnowledgeState", () => {
       commandTrigger: "/feishu",
       argumentHint: "[resource]",
       summary: "Use Feishu safely.",
-      createdAt: 1,
-      updatedAt: 2,
-      hasSummary: true,
+      modifiedAt: 2,
     };
     const childSkill: KnowledgeDocumentSummary = {
       ...rootSkill,
@@ -2543,7 +2694,7 @@ describe("useKnowledgeState", () => {
     );
 
     await state.selectType("skill");
-    const packageNode = state.visibleExplorerTree.value[0];
+    const packageNode = findSpecialRoot(state, "skill")?.children[0];
     expect(packageNode).toMatchObject({
       kind: "package",
       name: "com.feishu.cli",
@@ -2617,12 +2768,11 @@ describe("useKnowledgeState", () => {
       path: "external/claude/grill-me/SKILL.md",
       title: "grill-me",
       injectMode: "excerpt",
-      summaryEnabled: true,
-      commandEnabled: false,
+      effectiveInjectMode: "excerpt",
       readOnly: true,
       aiMaintained: false,
+      effectiveAiMaintained: false,
       storageSource: "app",
-      explicitMaintenanceRules: false,
       externalSource: {
         provider: "package",
         sourceId: "external/claude/grill-me",
@@ -2633,9 +2783,7 @@ describe("useKnowledgeState", () => {
       commandTrigger: "/grill-me",
       argumentHint: "<plan>",
       summary: "Interrogate a plan before coding.",
-      createdAt: 1,
-      updatedAt: 2,
-      hasSummary: true,
+      modifiedAt: 2,
     };
     knowledgeMocks.knowledgeList.mockImplementation(async (input: any = {}) =>
       input.type === "skill" ? [externalSkill] : [],
@@ -2651,7 +2799,7 @@ describe("useKnowledgeState", () => {
     );
 
     await state.selectType("skill");
-    const externalFolder = state.visibleExplorerTree.value[0];
+    const externalFolder = findSpecialRoot(state, "skill")?.children[0];
     expect(externalFolder).toMatchObject({
       kind: "folder",
       relativePath: "external",
@@ -2699,6 +2847,7 @@ describe("useKnowledgeState", () => {
         surface: "both",
         commandTrigger: "/grill-me",
         injectMode: undefined,
+        effectiveInjectMode: undefined,
       },
     );
   });
@@ -2710,12 +2859,11 @@ describe("useKnowledgeState", () => {
       path: "com.feishu.cli/SKILL.md",
       title: "Feishu CLI",
       injectMode: "excerpt",
-      summaryEnabled: true,
-      commandEnabled: true,
+      effectiveInjectMode: "excerpt",
       readOnly: true,
       aiMaintained: false,
+      effectiveAiMaintained: false,
       storageSource: "app",
-      explicitMaintenanceRules: false,
       externalSource: {
         provider: "package",
         sourceId: "com.feishu.cli",
@@ -2726,9 +2874,7 @@ describe("useKnowledgeState", () => {
       commandTrigger: "/feishu",
       argumentHint: "[resource]",
       summary: "Use Feishu safely.",
-      createdAt: 1,
-      updatedAt: 2,
-      hasSummary: true,
+      modifiedAt: 2,
     };
     const childSkill: KnowledgeDocumentSummary = {
       ...rootSkill,
@@ -2755,7 +2901,7 @@ describe("useKnowledgeState", () => {
       }),
     );
     await state.selectType("skill");
-    const packageNode = state.visibleExplorerTree.value[0];
+    const packageNode = findSpecialRoot(state, "skill")?.children[0];
     if (packageNode?.kind !== "package") {
       throw new Error("missing package node");
     }
@@ -2916,7 +3062,7 @@ describe("useKnowledgeState", () => {
         body: "",
         maintenanceRules: null,
         skillEnabled: false,
-        updatedAt: 9,
+        modifiedAt: 9,
       },
     });
 
@@ -2927,7 +3073,7 @@ describe("useKnowledgeState", () => {
     expect(state.selectedDocument.value?.skillEnabled).toBe(false);
     await pending;
 
-    expect(state.selectedDocument.value?.updatedAt).toBe(9);
+    expect(state.selectedDocument.value?.modifiedAt).toBe(9);
     expect(
       state.documents.value.find((doc) => doc.id === childSkill.id)
         ?.skillEnabled,
@@ -2945,15 +3091,12 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ];
     const designDirectories = ["combat"];
@@ -3012,15 +3155,12 @@ describe("useKnowledgeState", () => {
         path: "combat/core-loop.md",
         title: "核心循环",
         injectMode: "excerpt",
-        summaryEnabled: true,
-        commandEnabled: false,
+        effectiveInjectMode: "excerpt",
         readOnly: false,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
         summary: "摘要",
-        createdAt: 1,
-        updatedAt: 2,
-        hasSummary: true,
+        modifiedAt: 2,
       },
     ];
     knowledgeMocks.knowledgeList.mockImplementation(async () => designDocs);
@@ -3050,21 +3190,18 @@ describe("useKnowledgeState", () => {
                 path: input.newPath,
                 title: "系统循环",
                 injectMode: "excerpt",
+                effectiveInjectMode: "excerpt",
                 inheritInjectMode: false,
                 injectModeSource: { kind: "self", path: null },
-                summaryEnabled: true,
-                commandEnabled: false,
                 readOnly: false,
                 aiMaintained: false,
+                effectiveAiMaintained: false,
                 inheritAiConfig: false,
                 aiConfigSource: { kind: "self", path: null },
-                explicitMaintenanceRules: false,
                 summary: "摘要",
                 body: "正文",
                 maintenanceRules: null,
-                createdAt: 1,
-                updatedAt: 3,
-                hasSummary: true,
+                modifiedAt: 3,
               }
             : null,
       };
@@ -3081,7 +3218,6 @@ describe("useKnowledgeState", () => {
     await state.refreshKnowledgeData();
     await state.selectDocument({
       ...designDocs[0],
-      explicitMaintenanceRules: false,
     });
     await state.renameExplorerDocument(
       "combat/core-loop.md",
@@ -3173,8 +3309,9 @@ describe("useKnowledgeState", () => {
       version: 4,
       summary: "维护战斗与角色组织",
       injectMode: "path",
+      effectiveInjectMode: "path",
       aiMaintained: true,
-      explicitMaintenanceRules: true,
+      effectiveAiMaintained: true,
       lexicalSearch: "enabled",
       vectorSearch: "disabled",
       inheritToChildren: true,
@@ -3183,6 +3320,7 @@ describe("useKnowledgeState", () => {
       allowMoveDocuments: true,
       allowMoveDirectories: true,
       maintenanceRules: "- 只记录稳定结构事实",
+      effectiveMaintenanceRules: "- 只记录稳定结构事实",
     });
 
     expect(knowledgeMocks.knowledgeEdit).toHaveBeenCalledWith({
@@ -3191,8 +3329,9 @@ describe("useKnowledgeState", () => {
       path: "combat",
       config: expect.objectContaining({
         injectMode: "path",
+        effectiveInjectMode: "path",
         aiMaintained: true,
-        explicitMaintenanceRules: true,
+        effectiveAiMaintained: true,
         maintenanceRules: "- 只记录稳定结构事实",
       }),
     });

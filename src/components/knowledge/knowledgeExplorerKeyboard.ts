@@ -11,7 +11,6 @@ export type KnowledgeTreeKeyboardAction =
   | { type: "expand"; path: string }
   | { type: "collapse"; path: string }
   | { type: "activate"; path: string }
-  | { type: "rename"; path: string }
   | { type: "delete"; path: string }
   | { type: "select-all" }
   | { type: "clear-selection" };
@@ -84,10 +83,6 @@ export function resolveKnowledgeTreeKeyboardAction(
     case "Enter":
     case " ":
       return focused ? { type: "activate", path: focused.path } : null;
-    case "F2":
-      return focused && focused.kind !== "package"
-        ? { type: "rename", path: focused.path }
-        : null;
     case "Delete":
       return focused ? { type: "delete", path: focused.path } : null;
     default:

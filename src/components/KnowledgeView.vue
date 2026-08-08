@@ -71,7 +71,6 @@ const {
   isPathExpanded,
   togglePath,
   expandAncestors,
-  collapseAllForType,
   hasMoreRootDocuments,
   hasMoreDirectoryDocuments,
   hasLoadedDirectoryDocuments,
@@ -91,7 +90,6 @@ const {
   activateSemanticRuntime,
   rebuildLexicalIndex,
   refreshRetrievalState,
-  selectType,
   selectDocument,
   selectPackage,
   selectDirectory,
@@ -129,35 +127,6 @@ const embeddingRuntimeLoading = computed(
   () => !!embeddingStatus.value?.activating,
 );
 
-const knowledgeTypes = computed<
-  Array<{
-    value: KnowledgeDocumentType;
-    label: string;
-    description: string;
-  }>
->(() => [
-  {
-    value: "design",
-    label: t("knowledge.type.design"),
-    description: t("knowledge.type.designDesc"),
-  },
-  {
-    value: "memory",
-    label: t("knowledge.type.memory"),
-    description: t("knowledge.type.memoryDesc"),
-  },
-  {
-    value: "skill",
-    label: t("knowledge.type.skill"),
-    description: t("knowledge.type.skillDesc"),
-  },
-  {
-    value: "reference",
-    label: t("knowledge.type.reference"),
-    description: t("knowledge.type.referenceDesc"),
-  },
-]);
-
 let resizing: "sidebar" | null = null;
 let resizeStartX = 0;
 let resizeStartWidth = 0;
@@ -188,7 +157,7 @@ function handleSelectType(type: KnowledgeDocumentType) {
   specialPage.value = null;
   overviewDismissed.value = false;
   clearSearch();
-  void selectType(type);
+  void selectDirectory(type, type);
 }
 
 function updateSearchQuery(value: string) {
@@ -217,10 +186,10 @@ function handleSelectPackage(summary: Parameters<typeof selectPackage>[0]) {
   void selectPackage(summary);
 }
 
-function handleSelectDirectory(path: string) {
+function handleSelectDirectory(type: KnowledgeDocumentType, path: string) {
   specialPage.value = null;
   overviewDismissed.value = false;
-  void selectDirectory(path);
+  void selectDirectory(type, path);
 }
 
 function handleSelectSearchResult(
@@ -265,36 +234,20 @@ watch(
   },
 );
 
-function hasMoreActiveFolderDocuments(path: string): boolean {
-  return hasMoreDirectoryDocuments(activeType.value, path);
+function handleLoadMoreRoot(type: KnowledgeDocumentType) {
+  void loadMoreRootDocuments(type);
 }
 
-function hasLoadedActiveFolderDocuments(path: string): boolean {
-  return hasLoadedDirectoryDocuments(activeType.value, path);
+function handleLoadMoreFolder(type: KnowledgeDocumentType, path: string) {
+  void loadMoreDirectoryDocuments(type, path);
 }
 
-function isActiveFolderDocumentsLoading(path: string): boolean {
-  return isDirectoryDocumentsLoading(activeType.value, path);
-}
-
-function handleLoadMoreRoot() {
-  void loadMoreRootDocuments(activeType.value);
-}
-
-function handleLoadMoreFolder(path: string) {
-  void loadMoreDirectoryDocuments(activeType.value, path);
-}
-
-function handleCollapseAll() {
-  collapseAllForType(activeType.value);
-}
-
-function handleExpandToSelection() {
-  if (selectedPath.value) expandAncestors(selectedPath.value);
-}
-
-function handleMoveNodes(nodes: ExplorerNode[], targetDir: string) {
-  void moveExplorerNodes(nodes, targetDir);
+function handleMoveNodes(
+  nodes: ExplorerNode[],
+  targetDir: string,
+  type: KnowledgeDocumentType,
+) {
+  void moveExplorerNodes(nodes, targetDir, type);
 }
 
 async function handleRevealSearchResult(result: KnowledgeSearchResult) {
@@ -339,7 +292,10 @@ function referenceFolderExists(
   const normalizedPath = normalizeRelativePath(path);
   for (const node of nodes) {
     if (node.kind !== "folder") continue;
-    if (normalizeRelativePath(node.relativePath) === normalizedPath)
+    if (
+      node.type === "reference"
+      && normalizeRelativePath(node.relativePath) === normalizedPath
+    )
       return true;
     if (referenceFolderExists(normalizedPath, node.children)) return true;
   }
@@ -358,7 +314,7 @@ function openExternalImportWindow(
   parentDir = "",
   initialSource: ReferenceExternalImportSource | null = null,
 ) {
-  if (activeType.value !== "reference") return;
+  activeType.value = "reference";
   const normalizedParent = normalizeRelativePath(parentDir);
   const preferredSource =
     initialSource ??
@@ -376,7 +332,7 @@ async function ensureReferenceDirectory(path: string): Promise<boolean> {
   const segments = normalizedPath.split("/").filter(Boolean);
   const name = segments.pop();
   if (!name) return false;
-  await createFolder(segments.join("/"), name);
+  await createFolder(segments.join("/"), name, "reference");
   return referenceFolderExists(normalizedPath);
 }
 
@@ -385,7 +341,7 @@ async function focusReferenceDirectory(path: string) {
   if (!normalizedPath) return;
   specialPage.value = null;
   overviewDismissed.value = false;
-  await selectDirectory(normalizedPath);
+  await selectDirectory("reference", normalizedPath);
 }
 
 function handleToggleLexical(value: boolean) {
@@ -489,55 +445,7 @@ onUnmounted(() => {
     />
 
     <template v-else>
-      <div class="kx-type-sidebar">
-        <div class="kx-type-sidebar-list">
-          <button
-            v-for="item in knowledgeTypes"
-            :key="item.value"
-            type="button"
-            class="kx-type-tab"
-            :class="{ active: !specialPage && activeType === item.value }"
-            @click="handleSelectType(item.value)"
-          >
-            <div class="kx-type-tab-name">{{ item.label }}</div>
-            <div class="kx-type-tab-meta">{{ item.description }}</div>
-          </button>
-          <div class="kx-type-tab-divider" aria-hidden="true"></div>
-          <button
-            type="button"
-            class="kx-type-tab"
-            :class="{ active: specialPage === 'retrieval' }"
-            @click="openRetrievalSettings"
-          >
-            <div class="kx-type-tab-name">
-              {{ t("knowledge.retrieval.entry") }}
-            </div>
-            <div class="kx-type-tab-meta">
-              {{
-                embeddingRuntimeLoading
-                  ? t("knowledge.retrieval.runtimeStarting")
-                  : t("knowledge.retrieval.entryHint")
-              }}
-            </div>
-          </button>
-          <button
-            type="button"
-            class="kx-type-tab"
-            :class="{ active: specialPage === 'injection' }"
-            @click="openInjectionPreview"
-          >
-            <div class="kx-type-tab-name">
-              {{ t("knowledge.injectionPreview.entry") }}
-            </div>
-            <div class="kx-type-tab-meta">
-              {{ t("knowledge.injectionPreview.entryHint") }}
-            </div>
-          </button>
-        </div>
-      </div>
-
       <div
-        v-if="!specialPage"
         class="kx-side"
         :style="{ width: sidebarWidth + 'px' }"
       >
@@ -550,26 +458,23 @@ onUnmounted(() => {
         <KnowledgeExplorer
           :tree="visibleExplorerTree"
           :active-type="activeType"
-          :root-directory-configs="rootDirectoryConfigs[activeType]"
-          :external-directory-sources="
-            activeType === 'reference' ? referenceExternalDirectorySources : {}
-          "
-          :folder-stats="
-            activeType === 'reference' ? referenceManagedDirectoryStats : {}
-          "
+          :root-directory-configs="rootDirectoryConfigs"
+          :external-directory-sources="referenceExternalDirectorySources"
+          :folder-stats="referenceManagedDirectoryStats"
           :selected-path="selectedPath"
           :is-path-expanded="isPathExpanded"
-          :has-more-root-documents="hasMoreRootDocuments(activeType)"
-          :root-documents-loading="isRootDocumentsLoading(activeType)"
-          :has-more-folder-documents="hasMoreActiveFolderDocuments"
-          :folder-documents-loaded="hasLoadedActiveFolderDocuments"
-          :folder-documents-loading="isActiveFolderDocumentsLoading"
+          :has-more-root-documents="hasMoreRootDocuments"
+          :root-documents-loading="isRootDocumentsLoading"
+          :has-more-folder-documents="hasMoreDirectoryDocuments"
+          :folder-documents-loaded="hasLoadedDirectoryDocuments"
+          :folder-documents-loading="isDirectoryDocumentsLoading"
           :loading="loading"
           :search-query="searchQuery"
           :search-results="searchResults"
           :searching="searching"
           @select-document="handleSelectDocument"
           @select-package="handleSelectPackage"
+          @select-type-root="handleSelectType"
           @select-search-result="handleSelectSearchResult"
           @select-folder-config="handleSelectDirectory"
           @import-skill-package="handleImportSkillPackage"
@@ -589,8 +494,6 @@ onUnmounted(() => {
           @open-in-file-system="openExplorerInFileSystem"
           @request-delete-nodes="requestDeleteNodes"
           @move-nodes="handleMoveNodes"
-          @collapse-all="handleCollapseAll"
-          @expand-to-selection="handleExpandToSelection"
           @reveal-search-result="
             (result) => void handleRevealSearchResult(result)
           "
@@ -601,9 +504,26 @@ onUnmounted(() => {
               dragging ? beginExplorerDrag() : endExplorerDrag()
           "
         />
+        <div class="kx-side-tools">
+          <button
+            type="button"
+            class="kx-side-tool"
+            :class="{ active: specialPage === 'retrieval' }"
+            @click="openRetrievalSettings"
+          >
+            {{ t("knowledge.retrieval.entry") }}
+          </button>
+          <button
+            type="button"
+            class="kx-side-tool"
+            :class="{ active: specialPage === 'injection' }"
+            @click="openInjectionPreview"
+          >
+            {{ t("knowledge.injectionPreview.entry") }}
+          </button>
+        </div>
       </div>
       <div
-        v-if="!specialPage"
         class="resize-handle"
         @mousedown="onResizeStart"
       ></div>
@@ -699,9 +619,6 @@ onUnmounted(() => {
             :directory-count="activeDirectoryCount"
             :tree="visibleExplorerTree"
             @close="handleCloseOverview"
-            @create-external-folder="
-              (source) => void openExternalImportWindow('', source)
-            "
           />
 
           <div v-else class="knowledge-empty-panel">
@@ -772,99 +689,6 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.kx-type-sidebar {
-  width: 94px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--sidebar-bg) 90%, var(--bg-color) 10%);
-  overflow-y: auto;
-}
-
-.kx-type-sidebar-list {
-  display: flex;
-  flex-direction: column;
-  padding-top: 8px;
-}
-
-.kx-type-tab-divider {
-  position: relative;
-  height: 10px;
-  margin: 10px 10px 8px;
-}
-
-.kx-type-tab-divider::before,
-.kx-type-tab-divider::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-}
-
-.kx-type-tab-divider::before {
-  top: 4px;
-  height: 1px;
-  background: color-mix(
-    in srgb,
-    var(--border-strong) 68%,
-    var(--text-secondary) 32%
-  );
-}
-
-.kx-type-tab-divider::after {
-  top: 5px;
-  height: 1px;
-  background: color-mix(in srgb, var(--sidebar-bg) 62%, transparent);
-  opacity: 0.72;
-}
-
-.kx-type-tab {
-  appearance: none;
-  width: 100%;
-  box-sizing: border-box;
-  padding: 10px 14px;
-  border: none;
-  border-left: 3px solid transparent;
-  background: transparent;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background 0.12s,
-    border-color 0.12s;
-}
-
-.kx-type-tab:hover {
-  background: var(--hover-bg);
-}
-
-.kx-type-tab.active {
-  background: var(--active-bg, var(--hover-bg));
-  border-left-color: var(--accent-color);
-}
-
-.kx-type-tab-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-color);
-  line-height: 1.3;
-}
-
-.kx-type-tab.active .kx-type-tab-name {
-  color: var(--accent-color);
-}
-
-.kx-type-tab-meta {
-  font-size: 11px;
-  color: var(--text-secondary);
-  opacity: 0.65;
-  line-height: 1.3;
-}
-
 .kx-side {
   flex-shrink: 0;
   display: flex;
@@ -873,6 +697,35 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--bg-color) 16%);
   min-width: 220px;
   overflow: hidden;
+}
+
+.kx-side-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--sidebar-bg) 72%, var(--panel-bg));
+}
+
+.kx-side-tool {
+  min-width: 0;
+  min-height: 26px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.kx-side-tool:hover,
+.kx-side-tool.active {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+  color: var(--text-color);
 }
 
 .resize-handle {
@@ -1177,16 +1030,6 @@ onUnmounted(() => {
 .commit-confirm-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
-}
-
-@media (max-width: 980px) {
-  .kx-type-sidebar {
-    width: 82px;
-  }
-
-  .kx-type-tab {
-    padding-inline: 12px;
-  }
 }
 
 @media (max-width: 720px) {

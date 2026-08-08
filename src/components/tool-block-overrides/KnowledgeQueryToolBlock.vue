@@ -79,6 +79,39 @@ const progressPercent = computed(() =>
 const progressWidth = computed(() =>
   progressRatio.value === null ? "0%" : `${Math.round(progressRatio.value * 100)}%`,
 );
+const parsedArgs = computed(() => {
+  try {
+    const args = JSON.parse(props.toolCall.arguments);
+    if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
+    return Object.entries(args).map(([key, value]) => ({
+      key,
+      value,
+      isLong: typeof value === "string" && value.length > 80,
+      isMultiline: typeof value === "string" && value.includes("\n"),
+    }));
+  } catch {
+    return [];
+  }
+});
+const rawArgsFallback = computed(() => (
+  parsedArgs.value.length > 0 ? "" : props.toolCall.arguments
+));
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return String(value);
+  if (value === null) return "null";
+  return JSON.stringify(value, null, 2);
+}
+
+function prettifyKey(key: string): string {
+  return key
+    .replace(/_/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+}
+
 const headerSummary = computed(() => {
   if (props.toolCall.status === "running" && progress.value) {
     return [progress.value.title, progress.value.info].filter((part) => part.trim()).join(" - ");
@@ -140,7 +173,23 @@ const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
       <template v-if="!showRuntimeOnly">
         <div class="tool-call-section">
           <div class="tool-call-section-label">{{ t("tool.section.args") }}</div>
-          <pre class="tool-call-pre ui-select-text">{{ toolCall.arguments }}</pre>
+          <div v-if="parsedArgs.length > 0" class="tool-args-table">
+            <div
+              v-for="arg in parsedArgs"
+              :key="arg.key"
+              class="tool-arg-row"
+              :class="{ 'arg-block': arg.isMultiline || arg.isLong }"
+            >
+              <span class="tool-arg-key">{{ prettifyKey(arg.key) }}</span>
+              <pre v-if="arg.isMultiline" class="tool-arg-value-block ui-select-text">{{ formatValue(arg.value) }}</pre>
+              <span
+                v-else
+                class="tool-arg-value ui-select-text"
+                :class="{ 'value-bool': typeof arg.value === 'boolean', 'value-num': typeof arg.value === 'number' }"
+              >{{ formatValue(arg.value) }}</span>
+            </div>
+          </div>
+          <pre v-else-if="rawArgsFallback" class="tool-call-pre ui-select-text">{{ rawArgsFallback }}</pre>
         </div>
 
         <div v-if="toolCall.output !== undefined" class="tool-call-section">
@@ -377,6 +426,60 @@ const isFramed = computed(() => infoExpanded.value || showProgressLine.value);
   letter-spacing: 0.5px;
   color: var(--text-secondary);
   margin-bottom: 4px;
+}
+
+.tool-args-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--hover-bg);
+}
+
+.tool-arg-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tool-arg-row.arg-block {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-arg-key {
+  min-width: 60px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.tool-arg-value,
+.tool-arg-value-block {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.tool-arg-value-block {
+  align-self: stretch;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.tool-arg-value.value-bool {
+  color: var(--md-syntax-literal);
+}
+
+.tool-arg-value.value-num {
+  color: var(--md-syntax-number);
 }
 
 .tool-call-pre {

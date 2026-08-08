@@ -13,10 +13,10 @@ skillSurface: command
 commandTrigger: /dream
 argumentHint: "[scope]"
 tools:
-  - knowledge_list
   - knowledge_query
-  - knowledge_read
-  - knowledge_edit
+  - read
+  - list
+  - edit
 createdAt: 1783036800000
 updatedAt: 1783036800000
 ---
@@ -34,7 +34,7 @@ Command arguments: `[scope]` optionally narrows the pass to one Memory document 
 A dream pass is a dedicated consolidation session, separate from normal task work. End-of-run maintenance happens while the context is full of task noise; a dream pass starts clean, reads Memory as its primary subject, and converges it. Consolidation only removes, merges, or tightens — never invent new facts during a dream pass.
 
 1. Inventory.
-   - List all Memory documents in scope with `knowledge_list`, then read each one with `knowledge_read`, including its maintenance rules.
+   - Use the injected knowledge structure and `knowledge_query` to locate every Memory document in scope. Use `list` for workspace Memory directories and `read` for each returned physical path, including its frontmatter metadata.
    - Note each document's approximate size before changes so the report can show the delta.
    - Skip documents whose AI edit mode is read-only. For documents in proposal mode, collect suggested edits for the report instead of writing.
 
@@ -55,6 +55,6 @@ A dream pass is a dedicated consolidation session, separate from normal task wor
    - Project-specific habits found in user-level preferences belong in project Memory; move them when both documents are auto-editable, otherwise list the move in the report.
 
 5. Apply and report.
-   - Write consolidated content with `knowledge_edit` only to documents whose AI edit mode allows automatic editing.
+   - Write consolidated content with `edit` only to documents whose AI edit mode allows automatic editing. Use the exact workspace-relative or absolute physical path returned by the knowledge structure or query.
    - Never delete a whole document; when one has become empty or redundant, say so in the report and let the user decide.
    - End with a short report: per document, the counts of merged, deleted, and rewritten entries with the before and after size; then the suggested Design moves, entries kept but marked unverified, and anything left for the user to handle.

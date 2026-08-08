@@ -438,10 +438,13 @@ pub async fn set_skill_config(
     description: Option<String>,
     command_trigger: Option<String>,
     inject_mode: Option<KnowledgeInjectMode>,
+    app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<(), AppError> {
     let working_dir = workspace.path.read().await.clone();
     let mut map = load_skill_config(&working_dir);
+    let previous_map = map.clone();
     let key = normalize_skill_config_key(&rel_path, source.as_deref());
     let existing = map.get(&key).cloned().unwrap_or_default();
     // Omitted fields keep their stored override state instead of pinning the
@@ -458,7 +461,36 @@ pub async fn set_skill_config(
     let fallback = super::skill::fallback_command_name_for_skill_ref(&key);
     let config = super::skill::normalize_and_validate_skill_config(&config, &fallback)?;
     map.insert(key, config);
-    save_skill_config(&working_dir, &map).map_err(Into::into)
+    save_skill_config(&working_dir, &map).map_err(AppError::from)?;
+
+    if let Err(error) = reconcile_and_emit_knowledge_changed(
+        &app_handle,
+        &working_dir,
+        knowledge_index_state.inner().clone(),
+        "set_skill_config",
+    )
+    .await
+    {
+        let rollback_result = save_skill_config(&working_dir, &previous_map);
+        if rollback_result.is_ok() {
+            let _ = reconcile_and_emit_knowledge_changed(
+                &app_handle,
+                &working_dir,
+                knowledge_index_state.inner().clone(),
+                "set_skill_config_rollback",
+            )
+            .await;
+        }
+        return match rollback_result {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(AppError::from(format!(
+                "{}; failed to restore previous Skill config: {}",
+                error.message, rollback_error
+            ))),
+        };
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -677,7 +709,7 @@ fn resolve_knowledge_directory_target(
     doc_type_hint: Option<KnowledgeType>,
     raw_path: &str,
 ) -> Result<(KnowledgeType, String), String> {
-    let inferred_type = parse_knowledge_type_from_path(raw_path);
+    let inferred_type = parse_knowledge_type_from_prefix(raw_path);
     let doc_type = doc_type_hint.or(inferred_type).ok_or_else(|| {
         "knowledge directory target requires a type-prefixed path or an explicit type.".to_string()
     })?;
@@ -690,7 +722,7 @@ fn resolve_knowledge_directory_target(
         }
     }
 
-    let normalized_path = normalize_knowledge_directory_path(raw_path)?;
+    let normalized_path = normalize_knowledge_path_prefix(raw_path)?;
     Ok((doc_type, normalized_path))
 }
 
@@ -804,19 +836,20 @@ fn merge_document_create_patch(
     base
 }
 
-fn ensure_parent_directory_allows_create(
+pub(crate) fn ensure_parent_directory_allows_create(
     working_dir: &str,
     doc_type: KnowledgeType,
     parent_path: Option<&str>,
     kind: KnowledgeTargetKind,
 ) -> Result<(), String> {
-    let Some(parent_path) = parent_path.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
+    let parent_path = parent_path.map(str::trim).unwrap_or_default();
 
-    let parent_dir = knowledge_store::knowledge_root(working_dir)
-        .join(doc_type.as_str())
-        .join(parent_path);
+    let type_root = knowledge_store::knowledge_root(working_dir).join(doc_type.as_str());
+    let parent_dir = if parent_path.is_empty() {
+        type_root
+    } else {
+        type_root.join(parent_path)
+    };
     if !parent_dir.is_dir()
         && !knowledge_store::directory_exists(working_dir, doc_type, parent_path)?
     {
@@ -824,14 +857,19 @@ fn ensure_parent_directory_allows_create(
     }
 
     let parent = knowledge_store::read_directory_config(working_dir, doc_type, parent_path)?;
+    let display_path = if parent_path.is_empty() {
+        doc_type.as_str()
+    } else {
+        parent_path
+    };
     match kind {
         KnowledgeTargetKind::Document if !parent.config.allow_create_documents => Err(format!(
             "Knowledge directory '{}' does not allow creating child documents",
-            parent_path
+            display_path
         )),
         KnowledgeTargetKind::Directory if !parent.config.allow_create_directories => Err(format!(
             "Knowledge directory '{}' does not allow creating child directories",
-            parent_path
+            display_path
         )),
         _ => Ok(()),
     }
@@ -897,6 +935,7 @@ pub(crate) fn execute_knowledge_read_request(
                 doc_type,
                 &normalized_path,
                 requested_part,
+                request.include_history,
             )?;
             Ok(KnowledgeReadResponse {
                 kind: KnowledgeTargetKind::Document,
@@ -950,7 +989,7 @@ pub(crate) fn execute_knowledge_create_request(
             )?;
             if doc_type == KnowledgeType::Skill {
                 return Err(
-                    "knowledge_create cannot create Skill documents; use skill_create instead."
+                    "knowledge_create cannot create Skill documents; use the filesystem write workflow instead."
                         .to_string(),
                 );
             }
@@ -1009,9 +1048,12 @@ pub(crate) fn execute_knowledge_create_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            if normalized_path.is_empty() {
+                return Err("knowledge_create cannot create a knowledge type root".to_string());
+            }
             if doc_type == KnowledgeType::Skill {
                 return Err(
-                    "knowledge_create cannot create Skill directories; use skill_create instead."
+                    "knowledge_create cannot create Skill directories; use the filesystem workflow instead."
                         .to_string(),
                 );
             }
@@ -1082,7 +1124,29 @@ pub(crate) fn execute_knowledge_edit_request(
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let current =
                 knowledge_store::read_directory_config(working_dir, doc_type, &normalized_path)?;
-            let merged = merge_directory_config(doc_type, Some(current), &config_patch);
+            let mut merged = merge_directory_config(doc_type, Some(current), &config_patch);
+            if config_patch.inherit_inject_mode == Some(true)
+                || config_patch.inherit_ai_config == Some(true)
+            {
+                let inherited = if normalized_path.is_empty() {
+                    knowledge_store::default_directory_config_for_type(doc_type)
+                } else {
+                    let parent_path = parent_directory_from_directory_path(&normalized_path);
+                    knowledge_store::effective_child_directory_config(
+                        working_dir,
+                        doc_type,
+                        parent_path.as_deref(),
+                    )?
+                };
+                if config_patch.inherit_inject_mode == Some(true) {
+                    merged.inject_mode = inherited.inject_mode;
+                }
+                if config_patch.inherit_ai_config == Some(true) {
+                    merged.ai_maintained = inherited.ai_maintained;
+                    merged.explicit_maintenance_rules = inherited.explicit_maintenance_rules;
+                    merged.maintenance_rules = inherited.maintenance_rules;
+                }
+            }
             let directory = knowledge_store::update_directory_config(
                 working_dir,
                 doc_type,
@@ -1142,9 +1206,15 @@ pub(crate) fn execute_knowledge_move_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            if normalized_path.is_empty() {
+                return Err("knowledge_move cannot move a knowledge type root".to_string());
+            }
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let (_, normalized_target_path) =
                 resolve_knowledge_directory_target(Some(doc_type), &request.new_path)?;
+            if normalized_target_path.is_empty() {
+                return Err("knowledge_move cannot replace a knowledge type root".to_string());
+            }
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_target_path)?;
             let result_path = knowledge_store::move_directory(
                 working_dir,
@@ -1199,6 +1269,9 @@ pub(crate) fn execute_knowledge_delete_request(
         KnowledgeTargetKind::Directory => {
             let (doc_type, normalized_path) =
                 resolve_knowledge_directory_target(request.doc_type, &request.path)?;
+            if normalized_path.is_empty() {
+                return Err("knowledge_delete cannot delete a knowledge type root".to_string());
+            }
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             let result_path =
                 knowledge_store::delete_directory(working_dir, doc_type, &normalized_path)?;
@@ -1216,12 +1289,9 @@ pub(crate) fn execute_knowledge_delete_request(
 
 fn ensure_memory_builtins_for_type(
     working_dir: &str,
-    doc_type: Option<KnowledgeType>,
+    _doc_type: Option<KnowledgeType>,
 ) -> Result<(), String> {
-    if matches!(doc_type, Some(KnowledgeType::Memory)) {
-        knowledge_store::ensure_memory_builtin_documents(working_dir)?;
-    }
-    Ok(())
+    knowledge_store::ensure_workspace_knowledge_layout(working_dir)
 }
 
 // Skill packages are mounted into the skill tree as read-only virtual paths;
@@ -1550,8 +1620,7 @@ pub async fn knowledge_cancel_local_embedding_model_download(
 pub async fn knowledge_close_download_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_DOWNLOAD_WINDOW_LABEL)
-    else {
+    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_DOWNLOAD_WINDOW_LABEL) else {
         return Ok(());
     };
     window.close().map_err(|error| {
@@ -1567,8 +1636,7 @@ pub async fn knowledge_close_download_progress_window(
 pub async fn knowledge_close_lexical_progress_window(
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let Some(window) =
-        super::find_sub_window(&app_handle, KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
+    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
     else {
         return Ok(());
     };
@@ -2215,12 +2283,18 @@ fn enrich_knowledge_list_items(
                 item.byte_size = knowledge_store::rendered_document_size_bytes(&document).ok();
             }
         }
-        if let Ok(access) = knowledge_store::effective_document_search_access_with_app_root(
+        if let Ok(mut access) = knowledge_store::effective_document_search_access_with_app_root(
             working_dir,
             app_root,
             item.doc_type,
             &item.path,
         ) {
+            if item.doc_type == KnowledgeType::Skill
+                && !item_model_recall_allowed(working_dir, item).unwrap_or(false)
+            {
+                access.lexical_enabled = false;
+                access.vector_enabled = false;
+            }
             item.lexical_search_enabled = Some(
                 general_config.enabled
                     && general_config.lexical_search_enabled
@@ -3317,13 +3391,16 @@ pub struct WorkspaceFilePreview {
 }
 
 const HOVER_PREVIEW_MAX_FILE_BYTES: u64 = 256 * 1024;
+const FULL_PREVIEW_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn preview_workspace_file(
     file_path: String,
     line: Option<u32>,
+    full: Option<bool>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<WorkspaceFilePreview, AppError> {
+    let full = full.unwrap_or(false);
     let working_dir = workspace.path.read().await.clone();
     let canonical = match resolve_openable_file_ref_path(&file_path, &working_dir) {
         Ok(p) => p,
@@ -3381,7 +3458,12 @@ pub async fn preview_workspace_file(
         "external"
     };
 
-    if file_size > HOVER_PREVIEW_MAX_FILE_BYTES {
+    let max_file_bytes = if full {
+        FULL_PREVIEW_MAX_FILE_BYTES
+    } else {
+        HOVER_PREVIEW_MAX_FILE_BYTES
+    };
+    if file_size > max_file_bytes {
         return Ok(WorkspaceFilePreview {
             display_path: file_path,
             exists: true,
@@ -3414,8 +3496,12 @@ pub async fn preview_workspace_file(
     }
 
     // Text file: read snippet
-    const MAX_LINES: usize = 50;
-    const MAX_BYTES: u64 = 5 * 1024;
+    let max_lines: usize = if full { 20_000 } else { 50 };
+    let max_bytes: u64 = if full {
+        FULL_PREVIEW_MAX_FILE_BYTES
+    } else {
+        5 * 1024
+    };
 
     let content = std::fs::read_to_string(&canonical).unwrap_or_default();
     let all_lines: Vec<&str> = content.lines().collect();
@@ -3424,12 +3510,12 @@ pub async fn preview_workspace_file(
     // Determine snippet window based on optional line number
     let (start_idx, end_idx) = if let Some(target) = line {
         let target = target.saturating_sub(1) as usize; // 0-indexed
-        let half = MAX_LINES / 2;
+        let half = max_lines / 2;
         let start = target.saturating_sub(half);
-        let end = (start + MAX_LINES).min(total_lines);
+        let end = (start + max_lines).min(total_lines);
         (start, end)
     } else {
-        (0, MAX_LINES.min(total_lines))
+        (0, max_lines.min(total_lines))
     };
 
     let window = &all_lines[start_idx..end_idx];
@@ -3438,7 +3524,7 @@ pub async fn preview_workspace_file(
     let mut truncated = end_idx < total_lines;
 
     for line_str in window {
-        if byte_count + line_str.len() as u64 + 1 > MAX_BYTES {
+        if byte_count + line_str.len() as u64 + 1 > max_bytes {
             truncated = true;
             break;
         }
@@ -4528,8 +4614,7 @@ mod tests {
         let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
         assert_eq!(resolved, ws_canonical.join("LinkedDir").join("Linked.cs"));
 
-        let revealed =
-            resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
+        let revealed = resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
         assert_eq!(revealed, ws_canonical.join("LinkedDir").join("Linked.cs"));
     }
 
@@ -4549,8 +4634,7 @@ mod tests {
         std::fs::remove_dir_all(external.path()).unwrap();
 
         let working_dir = workspace.path().to_string_lossy().to_string();
-        let revealed =
-            resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
+        let revealed = resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
 
         // The file inside the dead junction is unreachable, but the junction
         // entry itself still exists and stays revealable.
@@ -4760,6 +4844,59 @@ mod tests {
     }
 
     #[test]
+    fn type_prefixed_directory_root_resolves_to_the_physical_type_root() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        let response = execute_knowledge_read_request(
+            &working_dir,
+            None,
+            KnowledgeReadRequest {
+                kind: KnowledgeTargetKind::Directory,
+                path: "design".to_string(),
+                doc_type: Some(KnowledgeType::Design),
+                ..Default::default()
+            },
+        )
+        .expect("read Design type root");
+        let directory = response.directory.expect("root directory config");
+        assert_eq!(directory.path, "");
+        assert_eq!(directory.config_path, "design.locus-meta");
+
+        let mut root_config = sample_parent_config();
+        root_config.allow_create_documents = false;
+        knowledge_store::update_directory_config(
+            &working_dir,
+            KnowledgeType::Design,
+            "",
+            root_config,
+        )
+        .expect("write Design root config");
+        let create_document_error = execute_knowledge_create_request(
+            &working_dir,
+            KnowledgeCreateRequest {
+                kind: KnowledgeTargetKind::Document,
+                path: "design/root.md".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect_err("root permissions should gate direct children");
+        assert!(create_document_error.contains("does not allow creating child documents"));
+
+        let err = execute_knowledge_create_request(
+            &working_dir,
+            KnowledgeCreateRequest {
+                kind: KnowledgeTargetKind::Directory,
+                path: "design".to_string(),
+                doc_type: Some(KnowledgeType::Design),
+                ..Default::default()
+            },
+        )
+        .expect_err("type root creation should be rejected");
+        assert!(err.contains("type root"));
+    }
+
+    #[test]
     fn execute_knowledge_create_inherits_parent_rules_for_path_only_document() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -4850,6 +4987,51 @@ mod tests {
             knowledge_store::KnowledgeConfigSourceKind::ParentDirectory
         );
         assert_eq!(directory.ai_config_source.path.as_deref(), Some("combat"));
+        assert!(directory.config.explicit_maintenance_rules);
+        assert_eq!(
+            directory.config.maintenance_rules,
+            "- Keep inherited child knowledge stable"
+        );
+    }
+
+    #[test]
+    fn execute_knowledge_edit_keeps_parent_rules_when_directory_inherits_ai_config() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        knowledge_store::create_directory(&working_dir, KnowledgeType::Design, "combat")
+            .expect("create parent");
+        knowledge_store::create_directory(&working_dir, KnowledgeType::Design, "combat/notes")
+            .expect("create child");
+        knowledge_store::update_directory_config(
+            &working_dir,
+            KnowledgeType::Design,
+            "combat",
+            sample_parent_config(),
+        )
+        .expect("save parent config");
+
+        let result = execute_knowledge_edit_request(
+            &working_dir,
+            KnowledgeEditRequest {
+                kind: KnowledgeTargetKind::Directory,
+                path: "design/combat/notes".to_string(),
+                config: Some(KnowledgeDirectoryConfigPatch {
+                    summary: Some("Updated notes summary".to_string()),
+                    inherit_ai_config: Some(true),
+                    explicit_maintenance_rules: Some(false),
+                    maintenance_rules: Some(String::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("edit inherited directory config");
+
+        let directory = result.directory.expect("directory");
+        assert_eq!(directory.config.summary, "Updated notes summary");
+        assert!(directory.config.inherit_ai_config);
+        assert!(directory.config.ai_maintained);
         assert!(directory.config.explicit_maintenance_rules);
         assert_eq!(
             directory.config.maintenance_rules,

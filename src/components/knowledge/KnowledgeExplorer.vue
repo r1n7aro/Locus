@@ -2,11 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import {
-  BadgeInfo,
   BookOpen,
   Check,
-  ChevronRight,
-  ChevronsDownUp,
   Copy,
   Download,
   FilePlus,
@@ -15,7 +12,6 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
-  ListTree,
   LocateFixed,
   Lock,
   Package,
@@ -38,13 +34,14 @@ import type {
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
-import FileTreeList from "../explorer/FileTreeList.vue";
+import WorkspaceTree, {
+  type WorkspaceTreeItem,
+  type WorkspaceTreeRow,
+} from "../explorer/WorkspaceTree.vue";
 import {
   buildFolderListTags,
   buildExternalFolderTag,
-  buildKnowledgeLegendEntries,
   buildKnowledgeListTags,
-  buildKnowledgeSearchMatchTags,
   type KnowledgeListTag,
 } from "./knowledgeMetaLabels";
 import { buildFolderDisplayStats } from "./knowledgeExplorerFolderCounts";
@@ -63,7 +60,6 @@ import {
   type KnowledgeTreeKeyboardAction,
   type KnowledgeTreeKeyboardRow,
 } from "./knowledgeExplorerKeyboard";
-import { buildKnowledgeSnippetSegments } from "./knowledgeSearchSnippet";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
   unityAssetIconClassForPath,
@@ -78,16 +74,19 @@ type BranchNode = FolderNode | PackageNode;
 const props = defineProps<{
   tree: ExplorerNode[];
   activeType: KnowledgeDocumentType;
-  rootDirectoryConfigs: Record<string, KnowledgeDirectoryConfigRecord>;
+  rootDirectoryConfigs: Record<
+    KnowledgeDocumentType,
+    Record<string, KnowledgeDirectoryConfigRecord>
+  >;
   externalDirectorySources: Record<string, KnowledgeExternalSource[]>;
   folderStats: Record<string, KnowledgeFolderDisplayStats>;
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
-  hasMoreRootDocuments: boolean;
-  rootDocumentsLoading: boolean;
-  hasMoreFolderDocuments: (path: string) => boolean;
-  folderDocumentsLoaded: (path: string) => boolean;
-  folderDocumentsLoading: (path: string) => boolean;
+  hasMoreRootDocuments: (type: KnowledgeDocumentType) => boolean;
+  rootDocumentsLoading: (type: KnowledgeDocumentType) => boolean;
+  hasMoreFolderDocuments: (type: KnowledgeDocumentType, path: string) => boolean;
+  folderDocumentsLoaded: (type: KnowledgeDocumentType, path: string) => boolean;
+  folderDocumentsLoading: (type: KnowledgeDocumentType, path: string) => boolean;
   loading: boolean;
   searchQuery: string;
   searchResults: KnowledgeSearchResult[];
@@ -98,14 +97,15 @@ const emit = defineEmits<{
   (e: "selectDocument", document: DocumentNode["document"]): void;
   (e: "selectPackage", document: PackageNode["document"]): void;
   (e: "selectSearchResult", result: KnowledgeSearchResult): void;
-  (e: "selectFolderConfig", path: string): void;
+  (e: "selectTypeRoot", type: KnowledgeDocumentType): void;
+  (e: "selectFolderConfig", type: KnowledgeDocumentType, path: string): void;
   (e: "toggle", path: string): void;
   (e: "importSkillPackage"): void;
   (e: "exportPackage", node: PackageNode): void;
   (e: "requestExternalImportFolder", parentDir: string): void;
-  (e: "createFolder", parentDir: string, name: string): void;
-  (e: "createDocument", parentDir: string, name: string): void;
-  (e: "renameFolder", path: string, name: string): void;
+  (e: "createFolder", parentDir: string, name: string, type: KnowledgeDocumentType): void;
+  (e: "createDocument", parentDir: string, name: string, type: KnowledgeDocumentType): void;
+  (e: "renameFolder", path: string, name: string, type: KnowledgeDocumentType): void;
   (
     e: "renameDocument",
     path: string,
@@ -115,13 +115,16 @@ const emit = defineEmits<{
   (e: "copyRelativePath", node: ExplorerNode): void;
   (e: "openInFileSystem", node: ExplorerNode): void;
   (e: "requestDeleteNodes", nodes: ExplorerNode[]): void;
-  (e: "moveNodes", nodes: ExplorerNode[], targetDir: string): void;
-  (e: "collapseAll"): void;
-  (e: "expandToSelection"): void;
+  (
+    e: "moveNodes",
+    nodes: ExplorerNode[],
+    targetDir: string,
+    type: KnowledgeDocumentType,
+  ): void;
   (e: "revealSearchResult", result: KnowledgeSearchResult): void;
   (e: "copySearchResultPath", result: KnowledgeSearchResult): void;
-  (e: "loadMoreRoot"): void;
-  (e: "loadMoreFolder", path: string): void;
+  (e: "loadMoreRoot", type: KnowledgeDocumentType): void;
+  (e: "loadMoreFolder", type: KnowledgeDocumentType, path: string): void;
   (e: "dragStateChange", dragging: boolean): void;
 }>();
 
@@ -155,6 +158,7 @@ type ContextMenuState =
       x: number;
       y: number;
       kind: "root";
+      type: KnowledgeDocumentType;
       anchorPath: string;
     }
   | {
@@ -167,6 +171,7 @@ type ContextMenuState =
 
 interface InlineCreateState {
   kind: "folder" | "document";
+  type: KnowledgeDocumentType;
   parentDir: string;
   anchorPath: string;
   depth: number;
@@ -175,6 +180,7 @@ interface InlineCreateState {
 
 interface InlineRenameState {
   kind: "folder" | "document";
+  type: KnowledgeDocumentType;
   anchorPath: string;
   relativePath: string;
   currentName: string;
@@ -182,14 +188,16 @@ interface InlineRenameState {
 }
 
 type VisibleEntry =
-  | { type: "row"; key: string; row: FlatRow }
-  | { type: "create"; key: string; draft: InlineCreateState }
+  | { type: "row"; key: string; row: FlatRow; treeRow: WorkspaceTreeRow }
+  | { type: "create"; key: string; draft: InlineCreateState; treeRow: null }
   | {
       type: "loadMore";
       key: string;
+      nodeType: KnowledgeDocumentType;
       path: string | null;
       depth: number;
       loading: boolean;
+      treeRow: null;
     };
 
 const ctxMenu = ref<ContextMenuState | null>(null);
@@ -199,7 +207,7 @@ const inlineInputRef = ref<HTMLInputElement | null>(null);
 const inlineCreateRowRef = ref<HTMLElement | null>(null);
 const inlineRenameInputRef = ref<HTMLInputElement | null>(null);
 const inlineRenameRowRef = ref<HTMLElement | null>(null);
-const treeListRef = ref<InstanceType<typeof FileTreeList> | null>(null);
+const treeListRef = ref<InstanceType<typeof WorkspaceTree> | null>(null);
 const draggingNodes = ref<ExplorerNode[]>([]);
 const dragTargetPath = ref<string | null>(null);
 const isSearchMode = computed(() => !!props.searchQuery.trim());
@@ -207,13 +215,12 @@ const selectedPaths = ref<Set<string>>(new Set());
 const lastAnchorPath = ref<string | null>(null);
 const focusedPath = ref<string | null>(null);
 const pendingRevealPath = ref<string | null>(null);
-const legendMenu = ref<{ x: number; y: number } | null>(null);
+const searchCollapsedPaths = ref<Set<string>>(new Set());
 const searchCtxMenu = ref<{
   x: number;
   y: number;
   result: KnowledgeSearchResult;
 } | null>(null);
-const legendEntries = computed(() => buildKnowledgeLegendEntries());
 const draggingPaths = computed(
   () => new Set(draggingNodes.value.map((node) => node.path)),
 );
@@ -230,8 +237,20 @@ const contextSelectedPath = computed(() => {
   return path;
 });
 const folderDisplayStats = computed(() =>
-  buildFolderDisplayStats(props.tree, props.folderStats),
+  buildFolderDisplayStats(
+    props.tree,
+    isSearchMode.value ? undefined : props.folderStats,
+  ),
 );
+const searchResultsByPath = computed(() => {
+  const byPath = new Map<string, KnowledgeSearchResult>();
+  for (const result of props.searchResults) {
+    const path = result.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const key = `${result.type}/${path}`;
+    if (!byPath.has(key)) byPath.set(key, result);
+  }
+  return byPath;
+});
 
 function isBranchNode(node: ExplorerNode): node is BranchNode {
   return node.kind === "folder" || node.kind === "package";
@@ -239,53 +258,107 @@ function isBranchNode(node: ExplorerNode): node is BranchNode {
 
 const visibleRows = computed<VisibleEntry[]>(() => {
   const out: VisibleEntry[] = [];
-  if (inlineCreate.value?.anchorPath === props.activeType) {
-    out.push({
-      type: "create",
-      key: `create:${props.activeType}:${inlineCreate.value.kind}`,
-      draft: inlineCreate.value,
-    });
-  }
 
   const walk = (nodes: ExplorerNode[]) => {
     for (const node of nodes) {
       const branch = isBranchNode(node);
-      const expanded = branch ? props.isPathExpanded(node.path) : false;
+      const expanded = branch
+        ? isSearchMode.value
+          ? !searchCollapsedPaths.value.has(node.path)
+          : props.isPathExpanded(node.path)
+        : false;
       const folderStats =
         branch ? folderDisplayStats.value.get(node.path) : null;
       const folderLoaded =
         node.kind === "folder"
-          ? props.folderDocumentsLoaded(node.relativePath)
+          ? props.folderDocumentsLoaded(node.type, node.relativePath)
           : false;
       const directChildCount =
         folderStats?.directChildCount ??
         (branch ? node.children.length : 0);
+      const row: FlatRow = { node, expanded, directChildCount };
       out.push({
         type: "row",
         key: node.path,
-        row: { node, expanded, directChildCount },
+        row,
+        treeRow: {
+          key: node.path,
+          name: node.name,
+          depth: node.depth,
+          kind: node.kind === "document" ? "file" : node.kind,
+          expandable: branch && directChildCount > 0,
+          expanded,
+          selected:
+            props.selectedPath === node.path
+            || selectedPaths.value.has(node.path)
+            || (
+              node.kind === "folder"
+              && !!node.specialRoot
+              && props.activeType === node.type
+              && !props.selectedPath
+            ),
+          focused: focusedPath.value === node.path,
+          editing: isRenamingRow(row),
+          draggable: !isSearchMode.value && canDragNode(node),
+          domId: rowDomId(node.path),
+          title: skillNodeInactive(node)
+            ? t("knowledge.explorer.skillInactiveHint")
+            : node.path,
+          classes: {
+            "kx-folder": node.kind === "folder",
+            "kx-package": node.kind === "package",
+            "kx-leaf": node.kind === "document",
+            "kx-skill-inactive": skillNodeInactive(node),
+            "is-open": props.selectedPath === node.path,
+            "is-marked": selectedPaths.value.has(node.path),
+            "context-selected": contextSelectedPath.value === node.path,
+            dragging: draggingPaths.value.has(node.path),
+            "drop-target": dragTargetPath.value === node.path,
+            "is-special-root": node.kind === "folder" && !!node.specialRoot,
+          },
+        },
       });
       if (inlineCreate.value?.anchorPath === node.path) {
         out.push({
           type: "create",
           key: `create:${node.path}:${inlineCreate.value.kind}`,
           draft: inlineCreate.value,
+          treeRow: null,
         });
       }
       if (branch && expanded) {
         walk(node.children);
         if (
+          !isSearchMode.value &&
           node.kind === "folder" &&
           folderLoaded &&
-          (props.hasMoreFolderDocuments(node.relativePath) ||
-            props.folderDocumentsLoading(node.relativePath))
+          (props.hasMoreFolderDocuments(node.type, node.relativePath) ||
+            props.folderDocumentsLoading(node.type, node.relativePath))
         ) {
           out.push({
             type: "loadMore",
             key: `${node.path}::load-more`,
+            nodeType: node.type,
             path: node.relativePath,
             depth: node.depth + 1,
-            loading: props.folderDocumentsLoading(node.relativePath),
+            loading: props.folderDocumentsLoading(node.type, node.relativePath),
+            treeRow: null,
+          });
+        }
+        if (
+          !isSearchMode.value &&
+          node.kind === "folder" &&
+          node.specialRoot &&
+          (props.hasMoreRootDocuments(node.type) || props.rootDocumentsLoading(node.type))
+        ) {
+          out.push({
+            type: "loadMore",
+            key: `${node.type}::root-load-more`,
+            nodeType: node.type,
+            path: null,
+            depth: 1,
+            loading: props.rootDocumentsLoading(node.type),
+            treeRow: null,
           });
         }
       }
@@ -293,15 +366,6 @@ const visibleRows = computed<VisibleEntry[]>(() => {
   };
 
   walk(props.tree);
-  if (props.hasMoreRootDocuments || props.rootDocumentsLoading) {
-    out.push({
-      type: "loadMore",
-      key: `${props.activeType}::root-load-more`,
-      path: null,
-      depth: 1,
-      loading: props.rootDocumentsLoading,
-    });
-  }
   return out;
 });
 
@@ -378,11 +442,15 @@ function selectedSeedPath(): string | null {
 }
 
 function rowClick(row: FlatRow, event: MouseEvent) {
-  if (isSearchMode.value) return;
   closeContextMenu();
   closeInlineCreate();
   closeInlineRename();
   focusedPath.value = row.node.path;
+  if (isSearchMode.value) {
+    if (event.detail >= 2) return;
+    activateNode(row);
+    return;
+  }
   const selection = resolveKnowledgeExplorerSelection({
     visiblePaths: selectablePaths.value,
     selectedPaths: selectedPaths.value,
@@ -396,57 +464,52 @@ function rowClick(row: FlatRow, event: MouseEvent) {
   selectedPaths.value = selection.nextSelectedPaths;
   lastAnchorPath.value = selection.nextLastAnchorPath;
   if (!selection.shouldHandleAsPlainClick) return;
-  // The first click of a double-click already ran the plain-click action;
-  // swallowing the second keeps dblclick-rename from toggling branches twice.
+  // Keep rapid repeated clicks from toggling the same branch twice.
   if (event.detail >= 2) return;
   activateNode(row);
 }
 
-// Unified single-click semantics: every node selects (shows its detail on the
-// right) and branch nodes additionally toggle. Packages keep their detail
-// pane stable while expanded children are open, so a second click on the
-// already-open package only toggles.
+// Folder rows are navigation controls: clicking the row or its chevron toggles
+// the same branch. Folder configuration remains an explicit context-menu
+// action, so ordinary browsing never replaces the current document preview.
 function activateNode(row: FlatRow) {
   if (row.node.kind === "folder") {
-    emit("toggle", row.node.path);
-    if (props.selectedPath !== row.node.path) {
-      emit("selectFolderConfig", row.node.relativePath);
-    }
+    toggleExpansion(row);
+    return;
+  }
+  const searchResult = searchResultForNode(row.node);
+  if (isSearchMode.value && searchResult) {
+    emit("selectSearchResult", searchResult);
     return;
   }
   if (row.node.kind === "package") {
-    if (props.selectedPath === row.node.path) {
-      emit("toggle", row.node.path);
-      return;
-    }
     emit("selectPackage", row.node.document);
     return;
   }
   emit("selectDocument", row.node.document);
 }
 
-function onRowDoubleClick(row: FlatRow) {
-  if (isSearchMode.value) return;
-  if (row.node.kind === "package") return;
-  if (isManagedNode(row.node)) return;
-  void startRenameNode(row.node);
-}
-
 function toggleExpansion(row: FlatRow) {
   if (!isBranchNode(row.node)) return;
+  if (isSearchMode.value) {
+    const next = new Set(searchCollapsedPaths.value);
+    if (next.has(row.node.path)) next.delete(row.node.path);
+    else next.add(row.node.path);
+    searchCollapsedPaths.value = next;
+    return;
+  }
   emit("toggle", row.node.path);
 }
 
-const TREE_INDENT_BASE_PX = 12;
-const TREE_INDENT_STEP_PX = 20;
-
-function treeIndentPx(depth: number): number {
-  if (depth <= 1) return TREE_INDENT_BASE_PX;
-  return TREE_INDENT_BASE_PX + (depth - 1) * TREE_INDENT_STEP_PX;
+function searchResultForNode(
+  node: DocumentNode | PackageNode,
+): KnowledgeSearchResult | null {
+  const path = node.document.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  return searchResultsByPath.value.get(`${node.type}/${path}`) ?? null;
 }
 
-function indentPx(node: ExplorerNode): number {
-  return treeIndentPx(node.depth);
+function treeIndentPx(depth: number): number {
+  return 10 + Math.max(0, depth) * 14;
 }
 
 function createIndentPx(depth: number): number {
@@ -462,7 +525,15 @@ function nodeParentDir(node: FolderNode): string {
 }
 
 function openContextMenu(event: MouseEvent, row: FlatRow) {
-  if (isSearchMode.value) return;
+  if (isSearchMode.value) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (row.node.kind === "document" || row.node.kind === "package") {
+      const result = searchResultForNode(row.node);
+      if (result) openSearchContextMenu(event, result);
+    }
+    return;
+  }
   event.preventDefault();
   event.stopPropagation();
   closeInlineCreate();
@@ -523,7 +594,8 @@ function openRootContextMenu(event: MouseEvent) {
     x: event.clientX,
     y: event.clientY,
     kind: "root",
-    anchorPath: props.activeType,
+    type: "design",
+    anchorPath: "design",
   };
 }
 
@@ -532,7 +604,7 @@ function onTreeContextMenu(event: MouseEvent) {
   if (
     target instanceof Element &&
     target.closest(
-      ".kx-row-shell, .kx-create-row, .kx-load-row, .kx-search-row",
+      ".workspace-tree-row-shell, .kx-create-row, .kx-load-row",
     )
   ) {
     return;
@@ -609,13 +681,19 @@ function parentDirectory(node: ExplorerNode): string {
 }
 
 function canDragNode(node: ExplorerNode): boolean {
+  if (node.kind === "folder" && node.specialRoot) return false;
   if (isManagedNode(node)) return false;
   if (node.kind === "document") return true;
   if (node.kind === "package") return false;
   return !!node.relativePath.trim();
 }
 
-function canDropOnDir(node: ExplorerNode, targetDir: string): boolean {
+function canDropOnDir(
+  node: ExplorerNode,
+  targetDir: string,
+  targetType: KnowledgeDocumentType,
+): boolean {
+  if (node.type !== targetType) return false;
   const normalizedTargetDir = normalizeRelativePath(targetDir);
   if (node.kind === "package") return false;
   if (node.kind === "document") {
@@ -629,12 +707,12 @@ function canDropOnDir(node: ExplorerNode, targetDir: string): boolean {
   return parentDirectory(node) !== normalizedTargetDir;
 }
 
-function dropTargetAccepts(targetDir: string): boolean {
-  return draggingNodes.value.some((node) => canDropOnDir(node, targetDir));
+function dropTargetAccepts(targetDir: string, targetType: KnowledgeDocumentType): boolean {
+  return draggingNodes.value.some((node) => canDropOnDir(node, targetDir, targetType));
 }
 
-function droppableNodes(targetDir: string): ExplorerNode[] {
-  return draggingNodes.value.filter((node) => canDropOnDir(node, targetDir));
+function droppableNodes(targetDir: string, targetType: KnowledgeDocumentType): ExplorerNode[] {
+  return draggingNodes.value.filter((node) => canDropOnDir(node, targetDir, targetType));
 }
 
 function onNodeDragStart(row: FlatRow, event: DragEvent) {
@@ -683,7 +761,7 @@ function onFolderDragOver(row: FlatRow, event: DragEvent) {
     return;
   }
   const targetDir = row.node.relativePath;
-  if (!dropTargetAccepts(targetDir)) {
+  if (!dropTargetAccepts(targetDir, row.node.type)) {
     cancelDragExpand();
     return;
   }
@@ -700,7 +778,7 @@ function onFolderDrop(row: FlatRow, event: DragEvent) {
     return;
   }
   const targetDir = row.node.relativePath;
-  const movable = droppableNodes(targetDir);
+  const movable = droppableNodes(targetDir, row.node.type);
   if (!movable.length) {
     clearDragState();
     return;
@@ -708,7 +786,7 @@ function onFolderDrop(row: FlatRow, event: DragEvent) {
   event.preventDefault();
   event.stopPropagation();
   clearDragState();
-  emit("moveNodes", movable, targetDir);
+  emit("moveNodes", movable, targetDir, row.node.type);
 }
 
 function onTreeDragOver(event: DragEvent) {
@@ -718,15 +796,15 @@ function onTreeDragOver(event: DragEvent) {
   if (
     target instanceof Element &&
     target.closest(
-      ".kx-row-shell, .kx-create-row, .kx-load-row, .kx-search-row",
+      ".workspace-tree-row-shell, .kx-create-row, .kx-load-row",
     )
   ) {
     return;
   }
-  if (!dropTargetAccepts("")) return;
+  if (!dropTargetAccepts("", "design")) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  dragTargetPath.value = props.activeType;
+  dragTargetPath.value = "design";
 }
 
 function onTreeDrop(event: DragEvent) {
@@ -736,19 +814,19 @@ function onTreeDrop(event: DragEvent) {
   if (
     target instanceof Element &&
     target.closest(
-      ".kx-row-shell, .kx-create-row, .kx-load-row, .kx-search-row",
+      ".workspace-tree-row-shell, .kx-create-row, .kx-load-row",
     )
   ) {
     return;
   }
-  const movable = droppableNodes("");
+  const movable = droppableNodes("", "design");
   if (!movable.length) {
     clearDragState();
     return;
   }
   event.preventDefault();
   clearDragState();
-  emit("moveNodes", movable, "");
+  emit("moveNodes", movable, "", "design");
 }
 
 function canDeleteFolder(
@@ -785,13 +863,21 @@ function isExternalSkillNode(node: ExplorerNode): boolean {
 // carry skillEnabled=false by design, so only the package root and plain
 // skill documents participate.
 function skillNodeInactive(node: ExplorerNode): boolean {
-  if (node.kind === "package") return skillActivationInactive(node.document);
+  if (node.kind === "package") {
+    return skillActivationInactive({
+      ...node.document,
+      injectMode: node.document.effectiveInjectMode,
+    });
+  }
   if (node.kind !== "document") return false;
   const document = node.document;
   if (document.type !== "skill") return false;
   const isPackageDocument = document.externalSource?.provider === "package";
   if (isPackageDocument && !isSkillPackageRootDocument(document)) return false;
-  return skillActivationInactive(document);
+  return skillActivationInactive({
+    ...document,
+    injectMode: document.effectiveInjectMode,
+  });
 }
 
 // Skill package contents are read-only virtual paths mounted into the tree;
@@ -862,7 +948,10 @@ function deleteBlocked(
 function renameBlocked(
   menu: Extract<ContextMenuState, { kind: "folder" | "leaf" }>,
 ): boolean {
-  return menu.targetNodes.some(isManagedNode);
+  return (
+    (menu.kind === "folder" && !!menu.node.specialRoot)
+    || menu.targetNodes.some(isManagedNode)
+  );
 }
 
 function requestDeleteSelectedNodes() {
@@ -877,7 +966,11 @@ function openSelectedFolderConfig() {
   const menu = ctxMenu.value;
   if (!menu || menu.kind !== "folder" || menu.targetNodes.length !== 1) return;
   closeContextMenu();
-  emit("selectFolderConfig", menu.node.relativePath);
+  if (menu.node.specialRoot) {
+    emit("selectTypeRoot", menu.node.type);
+  } else {
+    emit("selectFolderConfig", menu.node.type, menu.node.relativePath);
+  }
 }
 
 function createActionLabel(kind: InlineCreateState["kind"]): string {
@@ -887,7 +980,11 @@ function createActionLabel(kind: InlineCreateState["kind"]): string {
 }
 
 function openExternalImportFolderDialog() {
-  if (!ctxMenu.value || props.activeType !== "reference") return;
+  if (!ctxMenu.value) return;
+  const menuType = ctxMenu.value.kind === "root"
+    ? ctxMenu.value.type
+    : ctxMenu.value.node.type;
+  if (menuType !== "reference") return;
   if (ctxMenu.value.kind === "leaf" || ctxMenu.value.kind === "package") return;
   const parentDir =
     ctxMenu.value.kind === "folder" ? ctxMenu.value.parentDir : "";
@@ -896,10 +993,17 @@ function openExternalImportFolderDialog() {
 }
 
 function importSkillPackageArchive() {
-  if (!ctxMenu.value || props.activeType !== "skill") return;
-  if (ctxMenu.value.kind !== "root") return;
+  if (!ctxMenu.value) return;
+  const menuType = ctxMenu.value.kind === "root"
+    ? ctxMenu.value.type
+    : ctxMenu.value.node.type;
+  if (menuType !== "skill") return;
   closeContextMenu();
   emit("importSkillPackage");
+}
+
+function contextMenuType(menu: ContextMenuState): KnowledgeDocumentType {
+  return menu.kind === "root" ? menu.type : menu.node.type;
 }
 
 function exportSelectedPackage() {
@@ -912,6 +1016,7 @@ function exportSelectedPackage() {
 async function openInlineCreateAt(
   kind: InlineCreateState["kind"],
   target: {
+    type: KnowledgeDocumentType;
     parentDir: string;
     anchorPath: string;
     depth: number;
@@ -924,6 +1029,7 @@ async function openInlineCreateAt(
   }
   inlineCreate.value = {
     kind,
+    type: target.type,
     parentDir: target.parentDir,
     anchorPath: target.anchorPath,
     depth: target.depth,
@@ -943,6 +1049,7 @@ async function openCreateInline(kind: InlineCreateState["kind"]) {
   }
   const menu = ctxMenu.value;
   await openInlineCreateAt(kind, {
+    type: menu.kind === "folder" ? menu.node.type : menu.type,
     parentDir: menu.kind === "folder" ? menu.parentDir : "",
     anchorPath: menu.anchorPath,
     depth: menu.kind === "folder" ? menu.depth + 1 : 1,
@@ -951,9 +1058,7 @@ async function openCreateInline(kind: InlineCreateState["kind"]) {
   });
 }
 
-// Toolbar create targets the selected folder when one is open in the detail
-// pane, otherwise the type root.
-async function openToolbarCreate(kind: InlineCreateState["kind"]) {
+async function openEmptyStateCreate(kind: InlineCreateState["kind"]) {
   if (isSearchMode.value) return;
   closeContextMenu();
   const selected = props.selectedPath
@@ -965,6 +1070,7 @@ async function openToolbarCreate(kind: InlineCreateState["kind"]) {
     !isManagedNode(selected.node)
   ) {
     await openInlineCreateAt(kind, {
+      type: selected.node.type,
       parentDir: selected.node.relativePath,
       anchorPath: selected.node.path,
       depth: selected.node.depth + 1,
@@ -973,23 +1079,24 @@ async function openToolbarCreate(kind: InlineCreateState["kind"]) {
     return;
   }
   await openInlineCreateAt(kind, {
+    type: "design",
     parentDir: "",
-    anchorPath: props.activeType,
-    depth: 1,
+    anchorPath: "design",
+    depth: 0,
   });
 }
 
-const showToolbarImport = computed(
+const showEmptyStateImport = computed(
   () => props.activeType === "skill" || props.activeType === "reference",
 );
 
-const toolbarImportLabel = computed(() =>
+const emptyStateImportLabel = computed(() =>
   props.activeType === "skill"
     ? t("knowledge.explorer.importSkillPackage")
     : t("knowledge.explorer.importExternalFolder"),
 );
 
-function toolbarImport() {
+function emptyStateImport() {
   if (props.activeType === "skill") {
     emit("importSkillPackage");
     return;
@@ -999,32 +1106,13 @@ function toolbarImport() {
   }
 }
 
-function openLegendMenu(event: MouseEvent) {
-  const button = event.currentTarget;
-  const rect =
-    button instanceof HTMLElement ? button.getBoundingClientRect() : null;
-  legendMenu.value = rect
-    ? { x: rect.left, y: rect.bottom + 4 }
-    : { x: event.clientX, y: event.clientY };
-}
-
-function legendFlagClass(tone: string): Record<string, boolean> {
-  return {
-    "flag-inject": tone === "inject",
-    "flag-inject-strong": tone === "inject-strong",
-    "flag-auto": tone === "auto",
-    "flag-command": tone === "command",
-    "flag-search-on": tone === "search-on",
-    "flag-external": tone === "external",
-  };
-}
-
 async function startRenameNode(node: FolderNode | DocumentNode) {
   closeInlineCreate();
   inlineRename.value =
     node.kind === "folder"
       ? {
           kind: "folder",
+          type: node.type,
           anchorPath: node.path,
           relativePath: node.relativePath,
           currentName: node.name,
@@ -1032,6 +1120,7 @@ async function startRenameNode(node: FolderNode | DocumentNode) {
         }
       : {
           kind: "document",
+          type: node.type,
           anchorPath: node.path,
           relativePath: node.document.path,
           currentName: node.name,
@@ -1075,8 +1164,8 @@ function submitInlineCreate() {
   if (!draft) return;
   const name = draft.name.trim();
   if (!name) return;
-  if (draft.kind === "folder") emit("createFolder", draft.parentDir, name);
-  else emit("createDocument", draft.parentDir, name);
+  if (draft.kind === "folder") emit("createFolder", draft.parentDir, name, draft.type);
+  else emit("createDocument", draft.parentDir, name, draft.type);
   closeInlineCreate();
 }
 
@@ -1087,10 +1176,10 @@ function submitInlineRename() {
   closeInlineRename();
   if (!name || name === draft.currentName) return;
   if (draft.kind === "folder") {
-    emit("renameFolder", draft.relativePath, name);
+    emit("renameFolder", draft.relativePath, name, draft.type);
     return;
   }
-  emit("renameDocument", draft.relativePath, name, props.activeType);
+  emit("renameDocument", draft.relativePath, name, draft.type);
 }
 
 function isRenamingRow(row: FlatRow): boolean {
@@ -1134,16 +1223,6 @@ function revealVisiblePath(
   if (index < 0) return false;
   treeListRef.value?.scrollToIndex(index, options);
   return true;
-}
-
-// Toolbar "reveal selection": the host expands ancestors, then the row scrolls
-// into view once it lands in the flattened rows.
-function requestRevealSelection() {
-  const path = props.selectedPath;
-  if (!path) return;
-  pendingRevealPath.value = path;
-  emit("expandToSelection");
-  void nextTick(() => flushPendingReveal());
 }
 
 function flushPendingReveal() {
@@ -1199,13 +1278,13 @@ watch(
     closeInlineRename();
     focusedPath.value = null;
     pendingRevealPath.value = null;
-    legendMenu.value = null;
     searchCtxMenu.value = null;
   },
 );
 
 watch(isSearchMode, (value) => {
   if (value) {
+    searchCollapsedPaths.value = new Set();
     clearMultiSelection(true);
     closeContextMenu();
     closeInlineCreate();
@@ -1217,6 +1296,13 @@ watch(isSearchMode, (value) => {
   const path = props.selectedPath;
   if (path) void nextTick(() => revealVisiblePath(path));
 });
+
+watch(
+  () => props.searchQuery,
+  () => {
+    searchCollapsedPaths.value = new Set();
+  },
+);
 
 watch(
   () => props.selectedPath,
@@ -1247,7 +1333,6 @@ const focusedRowDomId = computed(() =>
 );
 
 function onTreeKeydown(event: KeyboardEvent) {
-  if (isSearchMode.value) return;
   if (inlineCreate.value || inlineRename.value) return;
   const target = event.target;
   if (
@@ -1276,10 +1361,12 @@ function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
       revealVisiblePath(action.path);
       return;
     case "expand":
-    case "collapse":
+    case "collapse": {
       focusedPath.value = action.path;
-      emit("toggle", action.path);
+      const row = selectableRowMap.value.get(action.path);
+      if (row) toggleExpansion(row);
       return;
+    }
     case "activate": {
       const row = selectableRowMap.value.get(action.path);
       if (!row) return;
@@ -1288,14 +1375,8 @@ function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
       activateNode(row);
       return;
     }
-    case "rename": {
-      const row = selectableRowMap.value.get(action.path);
-      if (!row || row.node.kind === "package") return;
-      if (isManagedNode(row.node)) return;
-      void startRenameNode(row.node);
-      return;
-    }
     case "delete": {
+      if (isSearchMode.value) return;
       const row = selectableRowMap.value.get(action.path);
       if (!row) return;
       const targetPaths = resolveKnowledgeContextSelection({
@@ -1311,6 +1392,7 @@ function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {
       return;
     }
     case "select-all":
+      if (isSearchMode.value) return;
       selectedPaths.value = new Set(selectablePaths.value);
       lastAnchorPath.value = selectablePaths.value[0] ?? null;
       return;
@@ -1349,24 +1431,12 @@ function documentTags(node: DocumentNode): Array<{
       // Skills show the effective auto-channel mode: a surface without the
       // auto side reads as no injection regardless of the stored value.
       injectMode: isSkill
-        ? effectiveSkillInjectMode(node.document.skillSurface, node.document.injectMode)
-        : node.document.injectMode,
-      aiMaintained: node.document.aiMaintained,
+        ? effectiveSkillInjectMode(node.document.skillSurface, node.document.effectiveInjectMode)
+        : node.document.effectiveInjectMode,
+      aiMaintained: node.document.effectiveAiMaintained,
     }),
   );
   return tags;
-}
-
-function searchResultTags(result: KnowledgeSearchResult) {
-  return buildKnowledgeSearchMatchTags(result.matchKind);
-}
-
-function searchSnippetSegments(result: KnowledgeSearchResult) {
-  return buildKnowledgeSnippetSegments(
-    result.snippet,
-    result.matchedTerms,
-    props.searchQuery,
-  );
 }
 
 function openSearchContextMenu(
@@ -1403,24 +1473,34 @@ function copySearchResultPathFromMenu() {
   emit("copySearchResultPath", menu.result);
 }
 
-function isSelectedSearchResult(result: KnowledgeSearchResult): boolean {
-  const normalizedPath = result.path.replace(/\\/g, "/").replace(/^\/+/, "");
-  return props.selectedPath === `${result.type}/${normalizedPath}`;
-}
-
 function folderTags(node: FolderNode) {
   const tags = [];
   const externalTag = buildExternalFolderTag(
-    props.externalDirectorySources[node.relativePath],
+    node.type === "reference"
+      ? props.externalDirectorySources[node.relativePath]
+      : undefined,
   );
   if (externalTag) tags.push(externalTag);
   if (isBuiltinSkillGroupFolder(node)) return tags;
-  if (node.depth !== 1) return tags;
-  const config = props.rootDirectoryConfigs[node.relativePath];
+  if (node.specialRoot) {
+    const config = props.rootDirectoryConfigs[node.type][""];
+    if (!config) return tags;
+    tags.push(
+      ...buildFolderListTags({
+        injectMode: config.effectiveInjectMode,
+        lexicalEnabled: config.effectiveLexicalSearch.enabled,
+        semanticEnabled: config.effectiveVectorSearch.enabled,
+      }),
+    );
+    return tags;
+  }
+  const rootDirectoryDepth = 1;
+  if (node.depth !== rootDirectoryDepth) return tags;
+  const config = props.rootDirectoryConfigs[node.type][node.relativePath];
   if (!config) return tags;
   tags.push(
     ...buildFolderListTags({
-      injectMode: config.injectMode,
+      injectMode: config.effectiveInjectMode,
       lexicalEnabled: config.effectiveLexicalSearch.enabled,
       semanticEnabled: config.effectiveVectorSearch.enabled,
     }),
@@ -1429,21 +1509,19 @@ function folderTags(node: FolderNode) {
 }
 
 function isBuiltinSkillGroupFolder(node: FolderNode): boolean {
-  return props.activeType === "skill" && node.depth === 1 && node.relativePath === "builtin";
+  return node.type === "skill" && node.depth === 1 && node.relativePath === "builtin";
 }
 
-function documentKindIconClass(node: DocumentNode): string {
-  return node.document.type === "skill" ? "skill-document" : "document";
-}
-
-function documentIconNode(node: DocumentNode) {
-  return unityAssetIconNodeForPath(node.document.path || node.path, {
+function documentIconNode(node: ExplorerNode) {
+  const path = node.kind === "document" ? node.document.path : node.path;
+  return unityAssetIconNodeForPath(path || node.path, {
     isFolder: false,
   });
 }
 
-function documentIconClass(node: DocumentNode) {
-  return unityAssetIconClassForPath(node.document.path || node.path, {
+function documentIconClass(node: ExplorerNode) {
+  const path = node.kind === "document" ? node.document.path : node.path;
+  return unityAssetIconClassForPath(path || node.path, {
     isFolder: false,
   });
 }
@@ -1468,7 +1546,7 @@ function packageTags(node: PackageNode): Array<{
   }
   const effectiveInject = effectiveSkillInjectMode(
     node.document.skillSurface,
-    node.document.injectMode,
+    node.document.effectiveInjectMode,
   );
   if (effectiveInject === "excerpt") {
     tags.push(
@@ -1513,96 +1591,74 @@ function handleVisibleRangeChange(payload: { start: number; end: number }) {
     if (entry.loading) continue;
     if (entry.path) {
       if (!scrollDriven) continue;
-      if (!props.hasMoreFolderDocuments(entry.path)) continue;
-      emit("loadMoreFolder", entry.path);
+      if (!props.hasMoreFolderDocuments(entry.nodeType, entry.path)) continue;
+      emit("loadMoreFolder", entry.nodeType, entry.path);
       continue;
     }
-    if (!props.hasMoreRootDocuments) continue;
-    emit("loadMoreRoot");
+    if (!props.hasMoreRootDocuments(entry.nodeType)) continue;
+    emit("loadMoreRoot", entry.nodeType);
   }
 }
 
 function requestLoadMore(entry: VisibleEntry) {
   if (entry.type !== "loadMore" || entry.loading) return;
   if (entry.path) {
-    if (!props.hasMoreFolderDocuments(entry.path)) return;
-    emit("loadMoreFolder", entry.path);
+    if (!props.hasMoreFolderDocuments(entry.nodeType, entry.path)) return;
+    emit("loadMoreFolder", entry.nodeType, entry.path);
     return;
   }
-  if (!props.hasMoreRootDocuments) return;
-  emit("loadMoreRoot");
+  if (!props.hasMoreRootDocuments(entry.nodeType)) return;
+  emit("loadMoreRoot", entry.nodeType);
 }
 
 function asVisibleEntry(item: { key: string }): VisibleEntry {
   return item as VisibleEntry;
 }
+
+function workspaceRow(item: WorkspaceTreeItem): Extract<VisibleEntry, { type: "row" }> | null {
+  const entry = asVisibleEntry(item);
+  return entry.type === "row" ? entry : null;
+}
+
+function activateWorkspaceItem(item: WorkspaceTreeItem, event: MouseEvent) {
+  const entry = workspaceRow(item);
+  if (entry) rowClick(entry.row, event);
+}
+
+function toggleWorkspaceItem(item: WorkspaceTreeItem) {
+  const entry = workspaceRow(item);
+  if (entry) toggleExpansion(entry.row);
+}
+
+function contextWorkspaceItem(item: WorkspaceTreeItem, event: MouseEvent) {
+  const entry = workspaceRow(item);
+  if (entry) openContextMenu(event, entry.row);
+}
+
+function dragStartWorkspaceItem(item: WorkspaceTreeItem, event: DragEvent) {
+  const entry = workspaceRow(item);
+  if (entry) onNodeDragStart(entry.row, event);
+}
+
+function dragOverWorkspaceItem(item: WorkspaceTreeItem, event: DragEvent) {
+  const entry = workspaceRow(item);
+  if (entry) onFolderDragOver(entry.row, event);
+}
+
+function dropWorkspaceItem(item: WorkspaceTreeItem, event: DragEvent) {
+  const entry = workspaceRow(item);
+  if (entry) onFolderDrop(entry.row, event);
+}
 </script>
 
 <template>
   <div class="kx-explorer">
-    <div v-if="!isSearchMode" class="kx-toolbar">
-      <BaseButton
-        class="kx-toolbar-btn"
-        type="button"
-        :title="t('knowledge.explorer.createDoc')"
-        @click="openToolbarCreate('document')"
-      >
-        <LucideIcon :icon="FilePlus" :size="13" :stroke-width="2" />
-      </BaseButton>
-      <BaseButton
-        class="kx-toolbar-btn"
-        type="button"
-        :title="t('knowledge.explorer.createFolder')"
-        @click="openToolbarCreate('folder')"
-      >
-        <LucideIcon :icon="FolderPlus" :size="13" :stroke-width="2" />
-      </BaseButton>
-      <BaseButton
-        v-if="showToolbarImport"
-        class="kx-toolbar-btn"
-        type="button"
-        :title="toolbarImportLabel"
-        @click="toolbarImport"
-      >
-        <LucideIcon
-          :icon="activeType === 'skill' ? PackagePlus : FolderInput"
-          :size="13"
-          :stroke-width="2"
-        />
-      </BaseButton>
-      <span class="kx-toolbar-spacer"></span>
-      <BaseButton
-        class="kx-toolbar-btn"
-        type="button"
-        :title="t('knowledge.explorer.collapseAll')"
-        @click="emit('collapseAll')"
-      >
-        <LucideIcon :icon="ChevronsDownUp" :size="13" :stroke-width="2" />
-      </BaseButton>
-      <BaseButton
-        class="kx-toolbar-btn"
-        type="button"
-        :disabled="!selectedPath"
-        :title="t('knowledge.explorer.revealSelection')"
-        @click="requestRevealSelection"
-      >
-        <LucideIcon :icon="LocateFixed" :size="13" :stroke-width="2" />
-      </BaseButton>
-      <BaseButton
-        class="kx-toolbar-btn"
-        type="button"
-        :title="t('knowledge.explorer.legend')"
-        @click="openLegendMenu"
-      >
-        <LucideIcon :icon="BadgeInfo" :size="13" :stroke-width="2" />
-      </BaseButton>
-    </div>
     <div
       class="kx-tree-shell"
-      :class="{ 'is-root-drop-target': dragTargetPath === activeType }"
+      :class="{ 'is-root-drop-target': dragTargetPath === 'design' }"
       role="tree"
       :aria-label="t('knowledge.explorer.title')"
-      :tabindex="isSearchMode ? -1 : 0"
+      tabindex="0"
       :aria-activedescendant="focusedRowDomId"
       @keydown="onTreeKeydown"
       @contextmenu.prevent="onTreeContextMenu($event)"
@@ -1612,202 +1668,84 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       <div v-if="isSearchMode && searching" class="kx-tree-static">
         <div class="kx-empty">{{ t("common.loading") }}</div>
       </div>
-      <div v-else-if="isSearchMode" class="kx-tree-static">
-        <div
-          v-for="result in searchResults"
-          :key="`${result.id}-${result.path}`"
-          role="button"
-          tabindex="0"
-          class="kx-search-row"
-          :class="{ selected: isSelectedSearchResult(result) }"
-          @click="emit('selectSearchResult', result)"
-          @keydown.enter.prevent="emit('selectSearchResult', result)"
-          @keydown.space.prevent="emit('selectSearchResult', result)"
-          @contextmenu="openSearchContextMenu($event, result)"
-        >
-          <div class="kx-search-main">
-            <span class="kx-search-title">{{ result.title }}</span>
-            <span class="kx-search-path">{{ result.path }}</span>
-            <span
-              v-if="searchSnippetSegments(result).length"
-              class="kx-search-snippet"
-            >
-              <template
-                v-for="(segment, segmentIndex) in searchSnippetSegments(result)"
-                :key="segmentIndex"
-              >
-                <mark v-if="segment.highlighted" class="kx-search-mark">{{
-                  segment.text
-                }}</mark>
-                <template v-else>{{ segment.text }}</template>
-              </template>
-            </span>
-          </div>
-          <div class="kx-search-side">
-            <div v-if="searchResultTags(result).length" class="kx-search-tags">
-              <span
-                v-for="tag in searchResultTags(result)"
-                :key="`${result.id}-${tag.text}`"
-                class="kx-flag"
-                :class="{
-                  'flag-inject': tag.tone === 'inject',
-                  'flag-auto': tag.tone === 'auto',
-                }"
-                :title="tag.title"
-              >
-                {{ tag.text }}
-              </span>
-            </div>
-            <button
-              type="button"
-              class="kx-search-reveal"
-              :title="t('knowledge.search.revealInTree')"
-              @click.stop="emit('revealSearchResult', result)"
-            >
-              <LucideIcon :icon="ListTree" :size="13" :stroke-width="2" />
-            </button>
-          </div>
-        </div>
-        <div v-if="!searchResults.length" class="kx-empty">
-          {{ t("knowledge.search.noResults") }}
-        </div>
-      </div>
       <div v-else-if="loading && !tree.length" class="kx-tree-static">
         <div class="kx-empty">{{ t("common.loading") }}</div>
       </div>
-      <FileTreeList
+      <WorkspaceTree
         v-else-if="visibleRows.length"
         ref="treeListRef"
         class="kx-tree"
         :items="visibleRows"
         :row-height="30"
+        :base-indent="10"
+        :indent-size="14"
+        @activate="activateWorkspaceItem"
+        @toggle="toggleWorkspaceItem"
+        @contextmenu="contextWorkspaceItem"
+        @dragstart="dragStartWorkspaceItem"
+        @dragend="onNodeDragEnd"
+        @dragover="dragOverWorkspaceItem"
+        @drop="dropWorkspaceItem"
         @visible-range-change="handleVisibleRangeChange"
       >
-        <template #item="{ item }">
+        <template #icon="{ item }">
           <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
-            <div
+            <LucideIcon
+              v-if="entry.type === 'row' && entry.row.node.kind === 'folder'"
+              :icon="entry.row.expanded ? FolderOpen : Folder"
+              :size="13"
+              :stroke-width="2"
+            />
+            <LucideIcon
+              v-else-if="entry.type === 'row' && entry.row.node.kind === 'package'"
+              :icon="Package"
+              :size="13"
+              :stroke-width="2"
+            />
+            <LucideIcon
+              v-else-if="entry.type === 'row'"
+              :class="documentIconClass(entry.row.node)"
+              :icon="documentIconNode(entry.row.node)"
+              :size="13"
+              :stroke-width="2"
+            />
+          </template>
+        </template>
+
+        <template #name="{ item }">
+          <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
+            <span v-if="entry.type === 'row'" class="kx-name">
+              {{ entry.row.node.name }}
+            </span>
+          </template>
+        </template>
+
+        <template #editor="{ item }">
+          <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
+            <span
               v-if="entry.type === 'row'"
-              :id="rowDomId(entry.row.node.path)"
-              class="kx-row-shell"
-              :class="{
-                'kx-folder': entry.row.node.kind === 'folder',
-                'kx-package': entry.row.node.kind === 'package',
-                'kx-leaf': entry.row.node.kind === 'document',
-                'kx-skill-inactive': skillNodeInactive(entry.row.node),
-                'is-open': selectedPath === entry.row.node.path,
-                'is-marked': selectedPaths.has(entry.row.node.path),
-                'is-focused': focusedPath === entry.row.node.path,
-                'context-selected': contextSelectedPath === entry.row.node.path,
-                dragging: draggingPaths.has(entry.row.node.path),
-                'drop-target': dragTargetPath === entry.row.node.path,
-              }"
-              :title="skillNodeInactive(entry.row.node) ? t('knowledge.explorer.skillInactiveHint') : undefined"
-              role="treeitem"
-              :aria-level="entry.row.node.depth"
-              :aria-expanded="
-                entry.row.node.kind !== 'document' &&
-                entry.row.directChildCount > 0
-                  ? entry.row.expanded
-                  : undefined
-              "
-              :aria-selected="
-                selectedPath === entry.row.node.path ||
-                selectedPaths.has(entry.row.node.path)
-              "
-              :draggable="!isRenamingRow(entry.row) && canDragNode(entry.row.node)"
-              @contextmenu.prevent="openContextMenu($event, entry.row)"
-              @dblclick="onRowDoubleClick(entry.row)"
-              @dragstart="onNodeDragStart(entry.row, $event)"
-              @dragend="onNodeDragEnd"
-              @dragover="onFolderDragOver(entry.row, $event)"
-              @drop="onFolderDrop(entry.row, $event)"
+              class="kx-name-edit"
+              :ref="setInlineRenameRowRef"
             >
-              <component
-                :is="isRenamingRow(entry.row) ? 'div' : 'button'"
-                :type="isRenamingRow(entry.row) ? undefined : 'button'"
-                class="kx-row"
-                :class="{ 'kx-row-editing': isRenamingRow(entry.row) }"
-                :style="{ paddingLeft: indentPx(entry.row.node) + 'px' }"
-                tabindex="-1"
-                @click="
-                  !isRenamingRow(entry.row) && rowClick(entry.row, $event)
-                "
-              >
-                <span
-                  v-if="
-                    entry.row.node.kind !== 'document' &&
-                    entry.row.directChildCount > 0
-                  "
-                  class="kx-branch-slot"
-                  @click.stop="toggleExpansion(entry.row)"
-                >
-                  <LucideIcon
-                    class="kx-chevron"
-                    :class="{ open: entry.row.expanded }"
-                    :icon="ChevronRight"
-                    :size="10"
-                    :stroke-width="2.4"
-                  />
-                </span>
-                <span
-                  v-else
-                  class="kx-branch-spacer"
-                  aria-hidden="true"
-                ></span>
-                <span
-                  v-if="entry.row.node.kind === 'folder'"
-                  class="kx-kind-icon folder"
-                  :class="{ open: entry.row.expanded }"
-                  aria-hidden="true"
-                >
-                  <LucideIcon
-                    :icon="entry.row.expanded ? FolderOpen : Folder"
-                    :size="13"
-                    :stroke-width="2"
-                  />
-                </span>
-                <span
-                  v-else-if="entry.row.node.kind === 'package'"
-                  class="kx-kind-icon package"
-                  :class="{ open: entry.row.expanded }"
-                  aria-hidden="true"
-                >
-                  <LucideIcon :icon="Package" :size="13" :stroke-width="2" />
-                </span>
-                <span
-                  v-else
-                  class="kx-kind-icon document"
-                  :class="documentKindIconClass(entry.row.node)"
-                  aria-hidden="true"
-                >
-                  <LucideIcon
-                    :class="documentIconClass(entry.row.node)"
-                    :icon="documentIconNode(entry.row.node)"
-                    :size="13"
-                    :stroke-width="2"
-                  />
-                </span>
+              <input
+                :ref="setInlineRenameInputRef"
+                v-model="inlineRenameName"
+                class="kx-rename-input"
+                :placeholder="t('knowledge.explorer.namePlaceholder')"
+                :aria-label="t('knowledge.explorer.rename')"
+                @pointerdown.stop
+                @click.stop
+                @keydown.enter.prevent="submitInlineRename"
+                @keydown.esc.prevent="closeInlineRename"
+                @blur="submitInlineRename"
+              />
+            </span>
+          </template>
+        </template>
 
-                <template v-if="isRenamingRow(entry.row)">
-                  <span class="kx-name-edit" :ref="setInlineRenameRowRef">
-                    <input
-                      :ref="setInlineRenameInputRef"
-                      v-model="inlineRenameName"
-                      class="kx-rename-input"
-                      :placeholder="t('knowledge.explorer.namePlaceholder')"
-                      :aria-label="t('knowledge.explorer.rename')"
-                      @pointerdown.stop
-                      @click.stop
-                      @keydown.enter.prevent="submitInlineRename"
-                      @keydown.esc.prevent="closeInlineRename"
-                      @blur="submitInlineRename"
-                    />
-                  </span>
-                </template>
-                <span v-else class="kx-name">{{ entry.row.node.name }}</span>
-              </component>
-
-              <div v-if="entry.row.node.kind === 'folder'" class="kx-row-side">
+        <template #trailing="{ item }">
+          <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
+            <div v-if="entry.type === 'row' && entry.row.node.kind === 'folder'" class="kx-row-side">
                 <span
                   v-if="rowLockTitle(entry.row.node)"
                   class="kx-lock"
@@ -1829,9 +1767,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 >
                   {{ tag.text }}
                 </span>
-              </div>
-              <div
-                v-else-if="entry.row.node.kind === 'package'"
+            </div>
+            <div
+                v-else-if="entry.type === 'row' && entry.row.node.kind === 'package'"
                 class="kx-row-side"
               >
                 <span
@@ -1854,11 +1792,13 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 >
                   {{ tag.text }}
                 </span>
-              </div>
-              <div
+            </div>
+            <div
                 v-else-if="
-                  documentTags(entry.row.node).length ||
-                  isPluginManagedNode(entry.row.node)
+                  entry.type === 'row' &&
+                  entry.row.node.kind === 'document' &&
+                  (documentTags(entry.row.node).length ||
+                    isPluginManagedNode(entry.row.node))
                 "
                 class="kx-row-side"
               >
@@ -1883,11 +1823,14 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
                 >
                   {{ tag.text }}
                 </span>
-              </div>
             </div>
+          </template>
+        </template>
 
+        <template #custom="{ item }">
+          <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
             <div
-              v-else-if="entry.type === 'create'"
+              v-if="entry.type === 'create'"
               class="kx-create-row"
               :ref="setInlineCreateRowRef"
               :style="{ paddingLeft: createIndentPx(entry.draft.depth) + 'px' }"
@@ -1926,7 +1869,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </div>
 
             <button
-              v-else
+              v-else-if="entry.type === 'loadMore'"
               class="kx-load-row"
               :class="{ 'is-loading': entry.loading }"
               type="button"
@@ -1941,7 +1884,10 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
           </template>
         </template>
-      </FileTreeList>
+      </WorkspaceTree>
+      <div v-else-if="isSearchMode" class="kx-tree-static">
+        <div class="kx-empty">{{ t("knowledge.search.noResults") }}</div>
+      </div>
       <div
         v-else
         class="kx-empty-state"
@@ -1953,17 +1899,17 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
           <BaseButton
             class="kx-empty-action"
             type="button"
-            @click="openToolbarCreate('document')"
+            @click="openEmptyStateCreate('document')"
           >
             {{ t("knowledge.explorer.createDoc") }}
           </BaseButton>
           <BaseButton
-            v-if="showToolbarImport"
+            v-if="showEmptyStateImport"
             class="kx-empty-action"
             type="button"
-            @click="toolbarImport"
+            @click="emptyStateImport"
           >
-            {{ toolbarImportLabel }}
+            {{ emptyStateImportLabel }}
           </BaseButton>
         </div>
       </div>
@@ -1980,7 +1926,8 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
           <template v-if="ctxMenu.kind === 'folder' || ctxMenu.kind === 'root'">
             <button
               v-if="
-                ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1
+                ctxMenu.kind === 'folder' &&
+                ctxMenu.targetNodes.length === 1
               "
               type="button"
               class="kx-ctx-item"
@@ -1991,7 +1938,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
             <button
               v-if="
-                ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
               "
               type="button"
               class="kx-ctx-item"
@@ -2004,7 +1953,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
             <button
               v-if="
-                ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
               "
               type="button"
               class="kx-ctx-item"
@@ -2015,7 +1966,9 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
             <button
               v-if="
-                ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
               "
               type="button"
               class="kx-ctx-item"
@@ -2040,7 +1993,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
             </button>
             <button
               v-if="
-                props.activeType === 'reference' &&
+                contextMenuType(ctxMenu) === 'reference' &&
                 (ctxMenu.kind === 'root' ||
                   (ctxMenu.kind === 'folder' &&
                     ctxMenu.targetNodes.length === 1))
@@ -2053,7 +2006,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
               {{ t("knowledge.explorer.importExternalFolder") }}
             </button>
             <button
-              v-if="props.activeType === 'skill' && ctxMenu.kind === 'root'"
+              v-if="contextMenuType(ctxMenu) === 'skill'"
               type="button"
               class="kx-ctx-item"
               @click="importSkillPackageArchive"
@@ -2201,31 +2154,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
       </button>
     </BaseContextMenu>
 
-    <BaseContextMenu
-      v-if="legendMenu"
-      class="kx-legend-menu"
-      :x="legendMenu.x"
-      :y="legendMenu.y"
-      :z-index="80"
-      role="dialog"
-      :aria-label="t('knowledge.explorer.legend')"
-      @close="legendMenu = null"
-    >
-      <div class="kx-legend-title">{{ t("knowledge.explorer.legend") }}</div>
-      <div
-        v-for="entry in legendEntries"
-        :key="`${entry.tag.text}-${entry.label}`"
-        class="kx-legend-row"
-      >
-        <span class="kx-flag" :class="legendFlagClass(entry.tag.tone)">{{
-          entry.tag.text
-        }}</span>
-        <span class="kx-legend-text">
-          <span class="kx-legend-label">{{ entry.label }}</span>
-          <span class="kx-legend-desc">{{ entry.description }}</span>
-        </span>
-      </div>
-    </BaseContextMenu>
   </div>
 </template>
 
@@ -2239,29 +2167,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   overflow: hidden;
   /* Inline-size container so badges can degrade at narrow sidebar widths. */
   container-type: inline-size;
-}
-
-.kx-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 4px 8px;
-  border-bottom: 1px solid
-    color-mix(in srgb, var(--border-color) 72%, transparent);
-  flex-shrink: 0;
-}
-
-.kx-toolbar-spacer {
-  flex: 1;
-}
-
-.kx-toolbar-btn {
-  width: 24px;
-  min-width: 24px;
-  min-height: 24px;
-  height: 24px;
-  padding: 0;
-  border-color: transparent;
 }
 
 .kx-tree-shell {
@@ -2329,203 +2234,51 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   font-size: 12px;
 }
 
-.kx-search-row {
-  width: 100%;
-  padding: 8px 12px;
-  border: none;
-  border-bottom: 1px solid
-    color-mix(in srgb, var(--border-color) 74%, transparent);
-  background: transparent;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.kx-search-row:hover {
-  background: var(--hover-bg);
-}
-
-.kx-search-row.selected,
-.kx-search-row.selected:hover {
-  background: var(--active-bg);
-}
-
-.kx-search-main,
-.kx-search-side {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.kx-search-main {
-  flex: 1;
-}
-
-.kx-search-side {
-  align-items: flex-end;
-  flex-shrink: 0;
-}
-
-.kx-search-tags {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 4px;
-  min-height: 16px;
-}
-
-.kx-search-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-color);
-  line-height: 1.35;
-}
-
-.kx-search-path {
-  font-size: 11px;
-  color: var(--text-secondary);
-  line-height: 1.35;
-}
-
-.kx-search-path {
-  font-family: var(--font-mono-identifier);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.kx-search-snippet {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  margin-top: 2px;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--text-secondary);
-  word-break: break-word;
-}
-
-.kx-search-mark {
-  background: color-mix(in srgb, var(--accent-color) 22%, transparent);
-  color: var(--text-color);
-  border-radius: 2px;
-  padding: 0 1px;
-}
-
-.kx-search-reveal {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border: none;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  opacity: 0;
-  transition:
-    opacity 0.12s,
-    background 0.12s;
-}
-
-.kx-search-row:hover .kx-search-reveal,
-.kx-search-row:focus-within .kx-search-reveal,
-.kx-search-reveal:focus-visible {
-  opacity: 1;
-}
-
-.kx-search-reveal:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.kx-row-shell {
-  position: relative;
-  display: flex;
-  align-items: stretch;
-  gap: 6px;
-  width: 100%;
-  min-width: 0;
-  /* Must equal FileTreeList's row-height so virtualization math stays exact. */
-  height: 30px;
-  background: transparent;
-  transition: background 0.1s;
-}
-
-.kx-row-shell:hover {
-  background: var(--hover-bg);
-}
-
-/* The document open in the detail pane: filled row plus an accent bar. */
-.kx-row-shell.is-open,
-.kx-row-shell.is-open:hover {
+.kx-tree :deep(.workspace-tree-row-shell.is-open),
+.kx-tree :deep(.workspace-tree-row-shell.is-open:hover) {
   background: var(--active-bg);
   box-shadow: inset 2px 0 0 var(--accent-color);
 }
 
-/* Multi-select marks stay visually lighter than the opened row. */
-.kx-row-shell.is-marked,
-.kx-row-shell.is-marked:hover {
+.kx-tree :deep(.workspace-tree-row-shell.is-marked:not(.is-open)) {
   background: color-mix(in srgb, var(--active-bg) 55%, transparent);
 }
 
-.kx-row-shell.is-open.is-marked,
-.kx-row-shell.is-open.is-marked:hover {
-  background: var(--active-bg);
-  box-shadow: inset 2px 0 0 var(--accent-color);
-}
-
-.kx-tree-shell:focus-within .kx-row-shell.is-focused {
+.kx-tree-shell:focus-within :deep(.workspace-tree-row-shell.focused) {
   outline: 1px solid color-mix(in srgb, var(--accent-color) 55%, transparent);
   outline-offset: -1px;
 }
 
-.kx-row-shell.context-selected,
-.kx-row-shell.context-selected:hover {
+.kx-tree :deep(.workspace-tree-row-shell.context-selected) {
   background: color-mix(in srgb, var(--active-bg) 52%, var(--hover-bg) 48%);
-  box-shadow: inset 0 0 0 1px
-    color-mix(in srgb, var(--accent-color) 16%, var(--border-color));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 16%, var(--border-color));
 }
 
-.kx-row-shell.dragging {
+.kx-tree :deep(.workspace-tree-row-shell.dragging) {
   opacity: 0.48;
 }
 
-.kx-row-shell.drop-target,
-.kx-row-shell.drop-target:hover {
+.kx-tree :deep(.workspace-tree-row-shell.drop-target) {
   background: color-mix(in srgb, var(--active-bg) 62%, transparent);
-  box-shadow: inset 0 0 0 1px
-    color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
 }
 
-.kx-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  height: 100%;
-  padding: 2px 12px 2px 16px;
-  border: none;
-  background: transparent;
-  color: var(--text-color);
-  font: inherit;
-  font-size: 13px;
-  text-align: left;
-  cursor: pointer;
-  overflow: hidden;
-  min-width: 0;
+.kx-tree :deep(.workspace-tree-icon.kind-folder) {
+  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
 }
 
-.kx-row:focus-visible {
-  outline: 2px solid var(--accent-color);
-  outline-offset: -2px;
+.kx-tree :deep(.workspace-tree-icon.kind-package) {
+  color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
+}
+
+.kx-tree :deep(.workspace-tree-row-shell.is-special-root .workspace-tree-name) {
+  font-weight: 600;
+}
+
+.kx-tree :deep(.workspace-tree-row-shell.kx-skill-inactive .workspace-tree-name),
+.kx-tree :deep(.workspace-tree-row-shell.kx-skill-inactive .workspace-tree-icon),
+.kx-tree :deep(.workspace-tree-row-shell.kx-skill-inactive .kx-flag) {
+  opacity: 0.48;
 }
 
 .kx-row-side {
@@ -2547,10 +2300,7 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   flex-shrink: 0;
 }
 
-.kx-branch-slot,
-.kx-branch-spacer,
-.kx-bullet-slot,
-.kx-kind-icon {
+.kx-bullet-slot {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2558,52 +2308,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   min-width: 14px;
   height: 16px;
   flex-shrink: 0;
-}
-
-.kx-branch-slot {
-  border-radius: 4px;
-}
-
-.kx-branch-slot:hover {
-  background: color-mix(in srgb, var(--hover-bg) 78%, transparent);
-}
-
-.kx-chevron {
-  flex-shrink: 0;
-  opacity: 0.55;
-  transition: transform 0.15s;
-}
-
-.kx-chevron.open {
-  transform: rotate(90deg);
-}
-
-.kx-kind-icon {
-  transition: color 0.15s ease;
-}
-
-.kx-kind-icon.folder {
-  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
-}
-
-.kx-kind-icon.folder.open {
-  color: color-mix(in srgb, var(--accent-color) 54%, var(--text-secondary) 46%);
-}
-
-.kx-kind-icon.package {
-  color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
-}
-
-.kx-kind-icon.package.open {
-  color: var(--accent-color);
-}
-
-.kx-kind-icon.document {
-  color: color-mix(in srgb, var(--text-secondary) 82%, var(--text-color) 18%);
-}
-
-.kx-kind-icon.document.skill-document {
-  color: color-mix(in srgb, var(--accent-color) 46%, var(--text-secondary) 54%);
 }
 
 .kx-bullet {
@@ -2636,14 +2340,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   font-family: var(--font-mono-identifier);
   font-size: 12px;
   color: var(--text-color);
-}
-
-/* Skills that will not take effect (disabled, or all channels off) render
-   dimmed so the inactive state is visible at a glance. */
-.kx-row-shell.kx-skill-inactive .kx-name,
-.kx-row-shell.kx-skill-inactive .kx-kind-icon,
-.kx-row-shell.kx-skill-inactive .kx-flag {
-  opacity: 0.48;
 }
 
 .kx-name-edit {
@@ -2822,50 +2518,6 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
   font-family: var(--font-mono-identifier);
   font-size: 12px;
   color: var(--text-secondary);
-}
-
-.kx-legend-menu {
-  width: 264px;
-  padding: 8px;
-}
-
-.kx-legend-title {
-  padding: 2px 4px 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-color);
-}
-
-.kx-legend-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 4px;
-  border-radius: 6px;
-}
-
-.kx-legend-row .kx-flag {
-  margin-top: 1px;
-}
-
-.kx-legend-text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-.kx-legend-label {
-  font-size: 12px;
-  line-height: 1.35;
-  color: var(--text-color);
-}
-
-.kx-legend-desc {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-secondary);
-  white-space: normal;
 }
 
 /* Narrow sidebar: keep only the inject level; secondary chips would

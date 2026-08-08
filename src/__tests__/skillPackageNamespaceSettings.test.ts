@@ -18,7 +18,9 @@ describe("skill package namespace settings", () => {
     const settingsState = read("src/composables/useSettingsState.ts");
     const uiStore = read("src/stores/ui.ts");
     const knowledgeService = read("src/services/knowledge.ts");
-    const skillCreateTool = read("tools/skill_create.json");
+    const devAgent = read("agent/dev/config.json");
+    const knowledgeAgent = read("agent/knowledge/config.json");
+    const createSkillPackageTool = read("tools/create_skill_package.json");
     const createSkillDoc = read("knowledge/skill/create-skill.md");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
@@ -40,9 +42,14 @@ describe("skill package namespace settings", () => {
     expect(uiStore).not.toContain('"knowledge" | "archived"');
     expect(knowledgeService).toContain("get_default_skill_package_namespace");
     expect(knowledgeService).toContain("set_default_skill_package_namespace");
+    expect(devAgent).not.toContain("create_skill_package");
+    expect(knowledgeAgent).not.toContain("create_skill_package");
+    expect(settingsState).not.toContain("create_skill_package");
 
-    expect(skillCreateTool).toContain("short kebab-case package id");
-    expect(skillCreateTool).toContain("studio.tools.asset-audit");
+    expect(createSkillPackageTool).toContain("short kebab-case id");
+    expect(createSkillPackageTool).toContain("studio.tools.asset-audit");
+    expect(createSkillDoc).toContain("  - create_skill_package");
+    expect(createSkillDoc).toContain("call `create_skill_package`");
     expect(createSkillDoc).toContain("short kebab-case package ids");
     expect(createSkillDoc).toContain("studio.tools.asset-audit");
     expect(zh).not.toContain('"settings.tab.knowledge"');

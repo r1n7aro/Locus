@@ -12,9 +12,13 @@ import { useAgentStore } from "../../stores/agent";
 import type { ExplorerNode } from "../../composables/useKnowledgeState";
 import { estimateTextTokens } from "../../utils/tokenEstimate";
 import { labelForInjectMode } from "./knowledgeMetaLabels";
-import BaseButton from "../ui/BaseButton.vue";
 
-const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
+const KNOWLEDGE_TYPES: KnowledgeDocumentType[] = [
+  "design",
+  "memory",
+  "skill",
+  "reference",
+];
 
 const props = defineProps<{
   stats: KnowledgeCatalogStats | null;
@@ -27,34 +31,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "close"): void;
-  (e: "createExternalFolder", source?: "feishu" | "unity"): void;
 }>();
-
-function typeLabel(type: KnowledgeDocumentType): string {
-  switch (type) {
-    case "design":
-      return t("knowledge.type.design");
-    case "memory":
-      return t("knowledge.type.memory");
-    case "skill":
-      return t("knowledge.type.skill");
-    case "reference":
-      return t("knowledge.type.reference");
-  }
-}
-
-function subtitleForType(type: KnowledgeDocumentType): string {
-  switch (type) {
-    case "design":
-      return t("knowledge.dashboard.design.subtitle");
-    case "memory":
-      return t("knowledge.dashboard.memoryType.subtitle");
-    case "skill":
-      return t("knowledge.dashboard.skillType.subtitle");
-    case "reference":
-      return t("knowledge.dashboard.reference.subtitle");
-  }
-}
 
 function formatDateTime(value: number): string {
   if (!value) return "—";
@@ -86,34 +63,6 @@ function formatByteSize(value: number): string {
   return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function normalizeRelativePath(path: string): string {
-  return path
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+|\/+$/g, "");
-}
-
-function isUnityReferenceDocumentPath(path: string): boolean {
-  const normalized = normalizeRelativePath(path);
-  return (
-    normalized === UNITY_REFERENCE_MANAGED_DIR ||
-    normalized.startsWith(`${UNITY_REFERENCE_MANAGED_DIR}/`)
-  );
-}
-
-function treeHasUnityReferenceFolder(nodes: ExplorerNode[]): boolean {
-  for (const node of nodes) {
-    if (node.kind !== "folder") continue;
-    if (
-      normalizeRelativePath(node.relativePath) === UNITY_REFERENCE_MANAGED_DIR
-    ) {
-      return true;
-    }
-    if (treeHasUnityReferenceFolder(node.children)) return true;
-  }
-  return false;
-}
-
 function promptTypeLabel(type: KnowledgeDocumentType): string {
   switch (type) {
     case "design":
@@ -134,6 +83,16 @@ function promptFileName(document: KnowledgeDocumentSummary): string {
 
 function promptFileDesc(document: KnowledgeDocumentSummary): string {
   return document.title.trim() || promptFileName(document);
+}
+
+function promptFileBypassesVisibilityLimit(
+  document: KnowledgeDocumentSummary,
+): boolean {
+  return (
+    document.effectiveInjectMode === "excerpt" ||
+    document.effectiveInjectMode === "full" ||
+    document.effectiveInjectMode === "rule"
+  );
 }
 
 function renderFallbackTreeLines(
@@ -177,23 +136,28 @@ function renderFallbackTreeLines(
     });
   }
 
-  if (showFiles) {
-    for (const documentNode of documentNodes.slice(0, maxVisibleFiles)) {
+  let limitedVisibleFiles = 0;
+  let hiddenCount = 0;
+  for (const documentNode of documentNodes) {
+    const bypassesLimit = promptFileBypassesVisibilityLimit(
+      documentNode.document,
+    );
+    const visible =
+      bypassesLimit ||
+      (showFiles && limitedVisibleFiles < maxVisibleFiles);
+    if (visible) {
       entries.push({
         label: `${promptFileName(documentNode.document)} :: ${promptFileDesc(documentNode.document)}`,
         nested: [],
       });
+      if (!bypassesLimit) limitedVisibleFiles += 1;
+    } else {
+      hiddenCount += 1;
     }
-    const hiddenCount = Math.max(0, documentNodes.length - maxVisibleFiles);
-    if (hiddenCount > 0) {
-      entries.push({
-        label: `<${hiddenCount} files hidden>`,
-        nested: [],
-      });
-    }
-  } else if (documentNodes.length > 0) {
+  }
+  if (hiddenCount > 0) {
     entries.push({
-      label: `<${documentNodes.length} files hidden>`,
+      label: `<${hiddenCount} files hidden>`,
       nested: [],
     });
   }
@@ -314,19 +278,6 @@ function isKnowledgeRuleItem(item: InjectedPromptItem): boolean {
   return item.id.startsWith("knowledge_rule::");
 }
 
-function injectedItemDocType(
-  item: InjectedPromptItem,
-): KnowledgeDocumentType | null {
-  const docType = (item.meta as { docType?: unknown } | null | undefined)
-    ?.docType;
-  return docType === "design" ||
-    docType === "memory" ||
-    docType === "skill" ||
-    docType === "reference"
-    ? docType
-    : null;
-}
-
 const agentStore = useAgentStore();
 const injectedItems = ref<InjectedPromptItem[]>([]);
 const knowledgeContext = computed(() =>
@@ -357,48 +308,37 @@ watch(
 
 const activeDocuments = computed(() =>
   props.documents
-    .filter((doc) => doc.type === props.activeType)
-    .sort((left, right) => right.updatedAt - left.updatedAt),
+    .sort((left, right) => right.modifiedAt - left.modifiedAt),
 );
 
 const totalDocuments = computed(() => activeDocuments.value.length);
-const hasUnityReferenceDocs = computed(
-  () =>
-    props.documents.some(
-      (doc) =>
-        doc.type === "reference" && isUnityReferenceDocumentPath(doc.path),
-    ) || treeHasUnityReferenceFolder(props.tree ?? []),
-);
-const showUnityImportHint = computed(
-  () => props.activeType === "reference" && !hasUnityReferenceDocs.value,
-);
 const totalBytes = computed(() =>
   activeDocuments.value.reduce((sum, doc) => sum + (doc.byteSize ?? 0), 0),
 );
 const pathCount = computed(
-  () => activeDocuments.value.filter((doc) => doc.injectMode === "path").length,
+  () => activeDocuments.value.filter((doc) => doc.effectiveInjectMode === "path").length,
 );
 const excerptCount = computed(
   () =>
-    activeDocuments.value.filter((doc) => doc.injectMode === "excerpt").length,
+    activeDocuments.value.filter((doc) => doc.effectiveInjectMode === "excerpt").length,
 );
 const fullCount = computed(
-  () => activeDocuments.value.filter((doc) => doc.injectMode === "full").length,
+  () => activeDocuments.value.filter((doc) => doc.effectiveInjectMode === "full").length,
 );
 const ruleCount = computed(
-  () => activeDocuments.value.filter((doc) => doc.injectMode === "rule").length,
+  () => activeDocuments.value.filter((doc) => doc.effectiveInjectMode === "rule").length,
 );
 const noneCount = computed(
-  () => activeDocuments.value.filter((doc) => doc.injectMode === "none").length,
+  () => activeDocuments.value.filter((doc) => doc.effectiveInjectMode === "none").length,
 );
 const autoMaintainedCount = computed(
   () =>
-    activeDocuments.value.filter((doc) => !doc.readOnly && doc.aiMaintained)
+    activeDocuments.value.filter((doc) => !doc.readOnly && doc.effectiveAiMaintained)
       .length,
 );
 const proposalMaintainedCount = computed(
   () =>
-    activeDocuments.value.filter((doc) => !doc.readOnly && !doc.aiMaintained)
+    activeDocuments.value.filter((doc) => !doc.readOnly && !doc.effectiveAiMaintained)
       .length,
 );
 const readOnlyCount = computed(
@@ -462,7 +402,7 @@ const retrievalItems = computed(() => [
 ]);
 const injectModeItems = computed(() => [
   {
-    label: labelForInjectMode("none", props.activeType),
+    label: labelForInjectMode("none"),
     value: noneCount.value,
   },
   {
@@ -485,29 +425,34 @@ const injectModeItems = computed(() => [
 const recentDocuments = computed(() => activeDocuments.value.slice(0, 8));
 const activeTree = computed(() => props.tree ?? []);
 const fallbackAlwaysOnTokens = computed(() =>
-  estimateTextTokens(fallbackAlwaysOnText(props.activeType, activeTree.value)),
+  KNOWLEDGE_TYPES.reduce(
+    (total, type) => total + estimateTextTokens(
+      fallbackAlwaysOnText(type, activeTree.value),
+    ),
+    0,
+  ),
 );
 const structureTokenEstimate = computed(() => {
   const structureSection = extractKnowledgeStructureBlock(
     knowledgeContext.value,
   );
-  const typeBranch = extractStructureBranch(structureSection, props.activeType);
-  return typeBranch
-    ? estimateTextTokens(typeBranch)
-    : fallbackAlwaysOnTokens.value;
+  const total = KNOWLEDGE_TYPES.reduce((sum, type) => {
+    const branch = extractStructureBranch(structureSection, type);
+    return sum + (branch ? estimateTextTokens(branch) : 0);
+  }, 0);
+  return total || fallbackAlwaysOnTokens.value;
 });
 const l2FullDocumentTokenEstimate = computed(() =>
-  estimateTextTokens(
-    extractL2FullDocumentBlock(knowledgeContext.value, props.activeType),
+  KNOWLEDGE_TYPES.reduce(
+    (total, type) => total + estimateTextTokens(
+      extractL2FullDocumentBlock(knowledgeContext.value, type),
+    ),
+    0,
   ),
 );
 const l3RuleTokenEstimate = computed(() =>
   injectedItems.value
-    .filter(
-      (item) =>
-        isKnowledgeRuleItem(item) &&
-        injectedItemDocType(item) === props.activeType,
-    )
+    .filter((item) => isKnowledgeRuleItem(item))
     .reduce((total, item) => total + estimateTextTokens(item.content), 0),
 );
 const alwaysOnTokenEstimate = computed(
@@ -554,12 +499,12 @@ const overviewMeta = computed(() => {
     <div class="overview-header">
       <div class="overview-header-main">
         <div class="overview-title-row">
-          <span class="overview-title">{{ typeLabel(activeType) }}</span>
+          <span class="overview-title">{{ t("knowledge.dashboard.unified.title") }}</span>
           <span v-if="overviewMeta" class="overview-title-meta"
             >· {{ overviewMeta }}</span
           >
         </div>
-        <div class="overview-subtitle">{{ subtitleForType(activeType) }}</div>
+        <div class="overview-subtitle">{{ t("knowledge.dashboard.unified.subtitle") }}</div>
       </div>
       <button
         type="button"
@@ -662,10 +607,7 @@ const overviewMeta = computed(() => {
         </div>
 
         <div class="overview-right-stack">
-          <section
-            v-if="activeType !== 'reference'"
-            class="overview-card overview-card-token"
-          >
+          <section class="overview-card overview-card-token">
             <div class="card-title">
               {{ t("knowledge.dashboard.tokenUsage") }}
             </div>
@@ -693,36 +635,6 @@ const overviewMeta = computed(() => {
             </div>
           </section>
 
-          <section v-else class="overview-card overview-card-note">
-            <div class="card-title-row">
-              <span class="card-title">{{
-                t("knowledge.directoryConfig.panel.external")
-              }}</span>
-              <BaseButton
-                class="overview-card-action"
-                size="sm"
-                @click="emit('createExternalFolder')"
-              >
-                {{ t("knowledge.referenceFolder.external.createAction") }}
-              </BaseButton>
-            </div>
-            <div class="overview-note-copy">
-              {{ t("knowledge.referenceFolder.external.overviewHint") }}
-            </div>
-            <div v-if="showUnityImportHint" class="overview-note-action-row">
-              <span class="overview-note-emphasis">
-                {{ t("knowledge.referenceFolder.external.unityOverviewHint") }}
-              </span>
-              <BaseButton
-                class="overview-note-action"
-                size="sm"
-                @click="emit('createExternalFolder', 'unity')"
-              >
-                {{ t("knowledge.referenceFolder.external.importUnityAction") }}
-              </BaseButton>
-            </div>
-          </section>
-
           <section class="overview-card overview-card-recent">
             <div class="card-title-row">
               <span class="card-title">{{
@@ -734,14 +646,14 @@ const overviewMeta = computed(() => {
                 v-for="document in recentDocuments"
                 :key="document.id"
                 class="recent-row"
-                :class="{ 'recent-row-with-time': document.updatedAt > 0 }"
+                :class="{ 'recent-row-with-time': document.modifiedAt > 0 }"
               >
                 <span class="recent-main">
                   <span class="recent-title">{{ document.title }}</span>
                   <span class="recent-path">{{ document.path }}</span>
                 </span>
-                <span v-if="document.updatedAt > 0" class="recent-time">{{
-                  formatDateTime(document.updatedAt)
+                <span v-if="document.modifiedAt > 0" class="recent-time">{{
+                  formatDateTime(document.modifiedAt)
                 }}</span>
               </div>
             </div>

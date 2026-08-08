@@ -82,8 +82,8 @@ describe("KnowledgeExplorer skill command tags", () => {
     expect(packageTagsBlock).toContain("buildKnowledgeListTags({");
     expect(packageTagsBlock).toContain("injectMode: effectiveInject,");
     expect(packageTagsBlock).toContain("aiMaintained: false,");
-    expect(explorer).toMatch(
-      /v-else-if="entry\.row\.node\.kind === 'package'"[\s\S]*'flag-inject': tag\.tone === 'inject'[\s\S]*'flag-command': tag\.tone === 'command'/,
-    );
+    expect(explorer).toContain('v-for="tag in packageTags(entry.row.node)"');
+    expect(explorer).toContain("'flag-inject': tag.tone === 'inject'");
+    expect(explorer).toContain("'flag-command': tag.tone === 'command'");
   });
 });

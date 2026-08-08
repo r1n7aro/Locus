@@ -15,6 +15,27 @@ function knowledgeReadToolCall(args: Record<string, unknown>, overrides: Partial
 }
 
 describe("chat skill loaded marker", () => {
+  it("recognizes generic read calls for workspace Skill files", () => {
+    const marker = resolveSkillLoadedMarkerForToolCall(
+      {
+        id: "call_read_skill_file",
+        name: "read",
+        arguments: JSON.stringify({
+          filePath: "Locus/knowledge/skill/builtin/profiler.md",
+          offset: 1,
+          limit: 80,
+        }),
+        outcome: "done",
+      },
+      "     18\t# Unity Profiler Runtime Sampling",
+    );
+
+    expect(marker).toEqual({
+      name: "Unity Profiler Runtime Sampling",
+      path: "skill/builtin/profiler.md",
+    });
+  });
+
   it("uses the full knowledge_read heading as the loaded Skill name", () => {
     const marker = resolveSkillLoadedMarkerForToolCall(
       knowledgeReadToolCall({ path: "skill/builtin/profiler.md" }),

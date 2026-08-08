@@ -7,6 +7,7 @@ describe("knowledge explorer folder counts", () => {
     const tree: ExplorerNode[] = [
       {
         kind: "folder",
+        type: "reference",
         path: "reference/unity-official-docs",
         relativePath: "unity-official-docs",
         name: "unity-official-docs",
@@ -14,6 +15,7 @@ describe("knowledge explorer folder counts", () => {
         children: [
           {
             kind: "document",
+            type: "reference",
             path: "reference/unity-official-docs/index.md",
             name: "index.md",
             depth: 2,
@@ -23,19 +25,18 @@ describe("knowledge explorer folder counts", () => {
               title: "Unity Index",
               type: "reference",
               injectMode: "none",
-              hasSummary: true,
+              effectiveInjectMode: "none",
+              summary: "Summary",
               hasBodyContent: true,
-              summaryEnabled: true,
-              commandEnabled: false,
               readOnly: true,
               aiMaintained: false,
-              explicitMaintenanceRules: false,
-              createdAt: 1,
-              updatedAt: 1,
+              effectiveAiMaintained: false,
+              modifiedAt: 1,
             },
           },
           {
             kind: "folder",
+            type: "reference",
             path: "reference/unity-official-docs/script-reference",
             relativePath: "unity-official-docs/script-reference",
             name: "script-reference",
@@ -43,6 +44,7 @@ describe("knowledge explorer folder counts", () => {
             children: [
               {
                 kind: "folder",
+                type: "reference",
                 path: "reference/unity-official-docs/script-reference/Advertisements",
                 relativePath: "unity-official-docs/script-reference/Advertisements",
                 name: "Advertisements",
@@ -50,6 +52,7 @@ describe("knowledge explorer folder counts", () => {
                 children: [
                   {
                     kind: "folder",
+                    type: "reference",
                     path: "reference/unity-official-docs/script-reference/Advertisements/AdvertisementSettings",
                     relativePath: "unity-official-docs/script-reference/Advertisements/AdvertisementSettings",
                     name: "AdvertisementSettings",
@@ -57,6 +60,7 @@ describe("knowledge explorer folder counts", () => {
                     children: [
                       {
                         kind: "document",
+                        type: "reference",
                         path: "reference/unity-official-docs/script-reference/Advertisements/AdvertisementSettings/Advertisements.AdvertisementSettings.md",
                         name: "Advertisements.AdvertisementSettings.md",
                         depth: 5,
@@ -66,19 +70,18 @@ describe("knowledge explorer folder counts", () => {
                           title: "AdvertisementSettings",
                           type: "reference",
                           injectMode: "none",
-                          hasSummary: true,
+                          effectiveInjectMode: "none",
+                          summary: "Summary",
                           hasBodyContent: true,
-                          summaryEnabled: true,
-                          commandEnabled: false,
                           readOnly: true,
                           aiMaintained: false,
-                          explicitMaintenanceRules: false,
-                          createdAt: 1,
-                          updatedAt: 1,
+                          effectiveAiMaintained: false,
+                          modifiedAt: 1,
                         },
                       },
                       {
                         kind: "document",
+                        type: "reference",
                         path: "reference/unity-official-docs/script-reference/Advertisements/AdvertisementSettings/Advertisements.AdvertisementSettings.GetGameId.md",
                         name: "Advertisements.AdvertisementSettings.GetGameId.md",
                         depth: 5,
@@ -88,15 +91,13 @@ describe("knowledge explorer folder counts", () => {
                           title: "AdvertisementSettings.GetGameId",
                           type: "reference",
                           injectMode: "none",
-                          hasSummary: true,
+                          effectiveInjectMode: "none",
+                          summary: "Summary",
                           hasBodyContent: true,
-                          summaryEnabled: true,
-                          commandEnabled: false,
                           readOnly: true,
                           aiMaintained: false,
-                          explicitMaintenanceRules: false,
-                          createdAt: 1,
-                          updatedAt: 1,
+                          effectiveAiMaintained: false,
+                          modifiedAt: 1,
                         },
                       },
                     ],
@@ -129,6 +130,7 @@ describe("knowledge explorer folder counts", () => {
     const tree: ExplorerNode[] = [
       {
         kind: "folder",
+        type: "reference",
         path: "reference/unity-official-docs",
         relativePath: "unity-official-docs",
         name: "unity-official-docs",
@@ -136,6 +138,7 @@ describe("knowledge explorer folder counts", () => {
         children: [
           {
             kind: "folder",
+            type: "reference",
             path: "reference/unity-official-docs/manual",
             relativePath: "unity-official-docs/manual",
             name: "manual",

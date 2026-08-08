@@ -20,12 +20,14 @@ describe("BaseMarkdownEditor source", () => {
   it("supports a shared native markdown source view", () => {
     expect(source).toContain("viewMode?: MarkdownEditorViewMode;");
     expect(source).toContain("contentPath?: string;");
+    expect(source).toContain("contentKey?: string;");
+    expect(source).toContain("deferRenderedEditor?: boolean;");
     expect(source).toContain("viewMode: \"rendered\"");
     expect(source).toContain("contentPath: \"\"");
     expect(source).toContain("const isNativeMode = computed(() => props.viewMode === \"native\")");
-    expect(source).toContain("const isReadonlyRenderedMode = computed(() => props.disabled && props.viewMode === \"rendered\")");
+    expect(source).toContain("const isRenderedPreviewMode = computed(() =>");
     expect(source).toContain("const readonlyCodeLanguage = computed(() =>");
-    expect(source).toContain("const shouldUseVditor = computed(() => !isNativeMode.value && !isReadonlyRenderedMode.value)");
+    expect(source).toContain("const shouldUseVditor = computed(() => !isNativeMode.value && !isRenderedPreviewMode.value)");
     expect(source).toContain("class=\"base-markdown-editor-textarea\"");
     expect(source).toContain("font-family: var(--font-mono-editor);");
     expect(source).toContain("function handleNativeInput(event: Event)");
@@ -60,9 +62,19 @@ describe("BaseMarkdownEditor source", () => {
 
   it("keeps a compact left gutter for knowledge editing", () => {
     expect(source).toContain("padding: 14px 14px 16px 16px !important;");
-    expect(source).toContain("padding-left: 14px;");
+    expect(source).toContain("padding-left: var(--markdown-document-list-indent);");
     expect(source).toContain("content: none;");
     expect(source).toContain("display: none;");
+  });
+
+  it("keeps preview and focused editor typography geometrically aligned", () => {
+    expect(source).toContain("--markdown-document-font-size: 14px;");
+    expect(source).toContain("--markdown-document-line-height: 1.68;");
+    expect(source).toContain("--markdown-document-list-indent: 20px;");
+    expect(source).toMatch(/\.base-markdown-editor-rendered :deep\(\.markdown-body\)[\s\S]*font-size:\s*var\(--markdown-document-font-size\);[\s\S]*line-height:\s*var\(--markdown-document-line-height\);/);
+    expect(source).toMatch(/\.vditor-ir pre\.vditor-reset\)[\s\S]*font-size:\s*var\(--markdown-document-font-size\);[\s\S]*line-height:\s*var\(--markdown-document-line-height\);/);
+    expect(source).toContain(".vditor-reset > :last-child");
+    expect(source).toContain(".vditor-reset ul li::marker");
   });
 
   it("uses a neutral cursor for disabled read-only content", () => {
@@ -74,5 +86,23 @@ describe("BaseMarkdownEditor source", () => {
     expect(source).toContain("<SemanticCodeRenderer");
     expect(source).toContain("<MarkdownRenderer v-else :content=\"modelValue\" />");
     expect(source).not.toContain("cursor: wait;");
+  });
+
+  it("keeps Vditor resources warm and resets history between documents", () => {
+    expect(source).toContain('import "vditor/dist/js/icons/ant.js"');
+    expect(source).toContain('const VDITOR_ICON_SCRIPT_ID = "vditorIconScript"');
+    expect(source).toContain("ensureVditorIconMarker()");
+    expect(source).toContain("syncFromModel(props.modelValue, true)");
+    expect(source).toContain("deferRenderedEditor && !renderedEditing.value");
+  });
+
+  it("supports document-flow auto growth without nested vertical scrolling", () => {
+    expect(source).toContain("autoGrow?: boolean;");
+    expect(source).toContain("minHeight?: number;");
+    expect(source).toContain("function syncNativeAutoGrowHeight()");
+    expect(source).toContain("'auto-grow': autoGrow");
+    expect(source).toMatch(/\.base-markdown-editor\.auto-grow[\s\S]*height:\s*auto;/);
+    expect(source).toMatch(/\.base-markdown-editor\.auto-grow :deep\(\.vditor\),[\s\S]*overflow-y:\s*visible;/);
+    expect(source).toContain("field-sizing: content;");
   });
 });

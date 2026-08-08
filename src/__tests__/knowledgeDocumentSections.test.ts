@@ -7,10 +7,9 @@ describe("knowledgeDocumentSections", () => {
       getKnowledgeDocumentEditorSections({
         type: "design",
         summary: null,
-        summaryEnabled: false,
         maintenanceRules: null,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
       }),
     ).toEqual({
       summary: false,
@@ -24,10 +23,9 @@ describe("knowledgeDocumentSections", () => {
       getKnowledgeDocumentEditorSections({
         type: "memory",
         summary: null,
-        summaryEnabled: false,
         maintenanceRules: null,
         aiMaintained: false,
-        explicitMaintenanceRules: true,
+        effectiveAiMaintained: false,
       }),
     ).toEqual({
       summary: false,
@@ -41,10 +39,9 @@ describe("knowledgeDocumentSections", () => {
       getKnowledgeDocumentEditorSections({
         type: "skill",
         summary: "Quick guide",
-        summaryEnabled: true,
         maintenanceRules: "- Refresh after release changes",
         aiMaintained: false,
-        explicitMaintenanceRules: true,
+        effectiveAiMaintained: false,
       }),
     ).toEqual({
       summary: true,
@@ -53,18 +50,17 @@ describe("knowledgeDocumentSections", () => {
     });
   });
 
-  it("shows summary when the config is enabled", () => {
+  it("keeps an absent summary disabled", () => {
     expect(
       getKnowledgeDocumentEditorSections({
         type: "reference",
         summary: null,
-        summaryEnabled: true,
         maintenanceRules: null,
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
       }),
     ).toEqual({
-      summary: true,
+      summary: false,
       maintenanceRules: false,
       body: true,
     });
@@ -75,10 +71,9 @@ describe("knowledgeDocumentSections", () => {
       getKnowledgeDocumentEditorSections({
         type: "reference",
         summary: null,
-        summaryEnabled: false,
         maintenanceRules: null,
         aiMaintained: true,
-        explicitMaintenanceRules: true,
+        effectiveAiMaintained: true,
       }),
     ).toEqual({
       summary: false,
@@ -87,19 +82,18 @@ describe("knowledgeDocumentSections", () => {
     });
   });
 
-  it("keeps cached optional content hidden when the switches are off", () => {
+  it("enables optional content by field presence", () => {
     expect(
       getKnowledgeDocumentEditorSections({
         type: "design",
         summary: "Cached summary",
-        summaryEnabled: false,
         maintenanceRules: "- Cached rule",
         aiMaintained: false,
-        explicitMaintenanceRules: false,
+        effectiveAiMaintained: false,
       }),
     ).toEqual({
-      summary: false,
-      maintenanceRules: false,
+      summary: true,
+      maintenanceRules: true,
       body: true,
     });
   });

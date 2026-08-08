@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("Knowledge external import entry", () => {
-  it("routes the explorer and overview entry points into a dedicated source-first import window", () => {
+  it("routes the Reference tree context action into the source-first import window", () => {
     const view = read("src/components/KnowledgeView.vue");
 
     expect(view).toContain("../services/referenceExternalImportWindow");
@@ -25,10 +25,8 @@ describe("Knowledge external import entry", () => {
     expect(view).toContain("void openReferenceExternalImportWindow({");
     expect(view).toContain('@request-external-import-folder="');
     expect(view).toContain("(parentDir) => void openExternalImportWindow(parentDir)");
-    expect(view).toContain('@create-external-folder="');
-    expect(view).toContain("(source) => void openExternalImportWindow('', source)");
     expect(view).toContain("async function ensureReferenceDirectory(path: string): Promise<boolean>");
-    expect(view).toContain('await createFolder(segments.join("/"), name);');
+    expect(view).toContain('await createFolder(segments.join("/"), name, "reference");');
     expect(view).not.toContain('import ReferenceExternalImportPanel from "./knowledge/ReferenceExternalImportPanel.vue"');
     expect(view).not.toContain("externalImportDialog");
     expect(view).not.toContain('class="knowledge-modal knowledge-modal-wide"');

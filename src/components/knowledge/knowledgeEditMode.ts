@@ -8,29 +8,29 @@ import type {
 
 type EditModeDocument = Pick<
   KnowledgeDocument,
-  "type" | "readOnly" | "aiMaintained" | "inheritAiConfig" | "externalSource"
+  "type" | "readOnly" | "aiMaintained" | "externalSource"
 >;
 
 export function getKnowledgeEditMode(
-  document: Pick<KnowledgeDocument, "readOnly" | "aiMaintained" | "inheritAiConfig"> | null | undefined,
+  document: Pick<KnowledgeDocument, "readOnly" | "aiMaintained"> | null | undefined,
 ): KnowledgeEditMode {
-  if (document?.inheritAiConfig) return "inherit_parent";
+  if (document?.aiMaintained === "inherit") return "inherit_parent";
   if (document?.readOnly) return "read_only";
   return document?.aiMaintained ? "auto" : "proposal";
 }
 
 export function buildKnowledgeEditModePatch(
   mode: KnowledgeEditMode,
-): Pick<KnowledgeDocumentPatch, "readOnly" | "aiMaintained" | "inheritAiConfig" | "explicitMaintenanceRules"> {
+): Pick<KnowledgeDocumentPatch, "readOnly" | "aiMaintained"> {
   switch (mode) {
     case "inherit_parent":
-      return { readOnly: false, inheritAiConfig: true };
+      return { readOnly: false, aiMaintained: "inherit" };
     case "read_only":
-      return { readOnly: true, inheritAiConfig: false, aiMaintained: false };
+      return { readOnly: true, aiMaintained: false };
     case "auto":
-      return { readOnly: false, inheritAiConfig: false, aiMaintained: true, explicitMaintenanceRules: true };
+      return { readOnly: false, aiMaintained: true };
     default:
-      return { readOnly: false, inheritAiConfig: false, aiMaintained: false };
+      return { readOnly: false, aiMaintained: false };
   }
 }
 
@@ -72,7 +72,6 @@ export function buildKnowledgeCreateDefaults(type: KnowledgeDocumentType) {
   const patch = buildKnowledgeEditModePatch(mode);
   return {
     ...patch,
-    inheritInjectMode: true,
-    summaryEnabled: defaultSummaryEnabledForType(type),
+    injectMode: "inherit" as const,
   };
 }

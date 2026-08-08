@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
+import "vditor/dist/js/icons/ant.js";
 import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import SemanticCodeRenderer from "./SemanticCodeRenderer.vue";
@@ -24,11 +25,19 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   viewMode?: MarkdownEditorViewMode;
   contentPath?: string;
+  contentKey?: string;
+  autoGrow?: boolean;
+  minHeight?: number;
+  deferRenderedEditor?: boolean;
 }>(), {
   disabled: false,
   placeholder: "",
   viewMode: "rendered",
   contentPath: "",
+  contentKey: "",
+  autoGrow: false,
+  minHeight: 80,
+  deferRenderedEditor: false,
 });
 
 const emit = defineEmits<{
@@ -40,18 +49,38 @@ const mountRef = ref<HTMLDivElement | null>(null);
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const editorReady = ref(false);
 const focused = ref(false);
+const renderedEditing = ref(false);
 const syncing = ref(false);
 const pendingModelValue = ref<string | null>(null);
 const isNativeMode = computed(() => props.viewMode === "native");
-const isReadonlyRenderedMode = computed(() => props.disabled && props.viewMode === "rendered");
-const readonlyCodeLanguage = computed(() =>
-  isReadonlyRenderedMode.value ? semanticCodeLanguageFromPath(props.contentPath) : null
+const isRenderedPreviewMode = computed(() =>
+  props.viewMode === "rendered"
+  && (props.disabled || (props.deferRenderedEditor && !renderedEditing.value))
 );
-const shouldUseVditor = computed(() => !isNativeMode.value && !isReadonlyRenderedMode.value);
+const readonlyCodeLanguage = computed(() =>
+  isRenderedPreviewMode.value ? semanticCodeLanguageFromPath(props.contentPath) : null
+);
+const shouldUseVditor = computed(() => !isNativeMode.value && !isRenderedPreviewMode.value);
 let editor: Vditor | null = null;
 let themeObserver: MutationObserver | null = null;
 let layoutSync: { disconnect(): void } | null = null;
 let pasteInterceptorCleanup: (() => void) | null = null;
+
+const VDITOR_ICON_SCRIPT_ID = "vditorIconScript";
+
+// Vditor falls back to a synchronous XMLHttpRequest whenever this marker is
+// absent. The icon sprite is bundled above, so keep a lightweight marker for
+// the whole app lifetime and restore it after Vditor.destroy() removes it.
+function ensureVditorIconMarker() {
+  if (typeof document === "undefined" || document.getElementById(VDITOR_ICON_SCRIPT_ID)) return;
+  const marker = document.createElement("script");
+  marker.id = VDITOR_ICON_SCRIPT_ID;
+  marker.type = "application/json";
+  marker.dataset.locusVditorIconMarker = "true";
+  document.head.appendChild(marker);
+}
+
+ensureVditorIconMarker();
 
 const editorCdnBase = computed(() => {
   const base = import.meta.env.BASE_URL || "/";
@@ -137,12 +166,14 @@ function destroyEditor() {
   pendingModelValue.value = null;
   editor?.destroy();
   editor = null;
+  ensureVditorIconMarker();
 }
 
 function syncFromModel(nextValue: string, clearStack = false) {
   if (!editor) return;
   const normalizedNext = normalizeMarkdown(nextValue);
   if (currentEditorValue() === normalizedNext) {
+    if (clearStack) editor.clearStack();
     pendingModelValue.value = null;
     return;
   }
@@ -177,12 +208,24 @@ function handleNativeKeydown(event: KeyboardEvent) {
 
 function handleNativeInput(event: Event) {
   emitMarkdown((event.target as HTMLTextAreaElement | null)?.value ?? "");
+  syncNativeAutoGrowHeight();
+}
+
+function syncNativeAutoGrowHeight() {
+  if (!props.autoGrow || !isNativeMode.value) return;
+  void nextTick(() => {
+    const textarea = textareaRef.value;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.max(props.minHeight, textarea.scrollHeight)}px`;
+  });
 }
 
 function mountEditor() {
   const target = mountRef.value;
   if (!target || editor) return;
 
+  ensureVditorIconMarker();
   editor = new Vditor(target, {
     value: props.modelValue,
     height: MARKDOWN_EDITOR_PANEL_HEIGHT,
@@ -227,9 +270,12 @@ function mountEditor() {
       if (pendingModelValue.value !== null) {
         if (canSyncMarkdownEditorWhileFocused(currentEditorValue(), pendingModelValue.value)) {
           pendingModelValue.value = null;
-          return;
+        } else {
+          syncFromModel(pendingModelValue.value);
         }
-        syncFromModel(pendingModelValue.value);
+      }
+      if (props.deferRenderedEditor) {
+        renderedEditing.value = false;
       }
     },
     keydown(event) {
@@ -244,13 +290,30 @@ function mountEditor() {
       syncPanelLayout();
       layoutSync?.disconnect();
       layoutSync = createMarkdownEditorResizeSync(mountRef.value, syncPanelLayout);
+      if (renderedEditing.value) {
+        requestAnimationFrame(() => editor?.focus());
+      }
     },
   });
 }
 
 watch(
+  () => props.contentKey,
+  (nextKey, previousKey) => {
+    if (nextKey === previousKey) return;
+    pendingModelValue.value = null;
+    if (!shouldUseVditor.value || !editorReady.value || !editor) return;
+    // A Vditor instance may stay mounted while the knowledge document changes.
+    // Resetting the stack prevents cross-document undo history and avoids
+    // retaining diff snapshots for every document visited in this panel.
+    syncFromModel(props.modelValue, true);
+  },
+);
+
+watch(
   () => props.modelValue,
   (nextValue) => {
+    syncNativeAutoGrowHeight();
     if (!shouldUseVditor.value || !editorReady.value || !editor) return;
     const currentValue = currentEditorValue();
     if (canSyncMarkdownEditorWhileFocused(currentValue, nextValue)) {
@@ -279,6 +342,14 @@ watch(
 );
 
 watch(
+  () => [props.autoGrow, props.minHeight, props.viewMode],
+  () => {
+    if (props.viewMode !== "rendered") renderedEditing.value = false;
+    syncNativeAutoGrowHeight();
+  },
+);
+
+watch(
   () => props.disabled,
   () => {
     if (!editorReady.value) return;
@@ -302,17 +373,32 @@ onMounted(() => {
     attributeFilter: ["data-theme"],
   });
   if (shouldUseVditor.value) mountEditor();
+  syncNativeAutoGrowHeight();
+  window.addEventListener("resize", syncNativeAutoGrowHeight);
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("resize", syncNativeAutoGrowHeight);
   themeObserver?.disconnect();
   themeObserver = null;
   destroyEditor();
 });
+
+function activateRenderedEditor() {
+  if (props.disabled || !props.deferRenderedEditor || props.viewMode !== "rendered") return;
+  renderedEditing.value = true;
+  void nextTick(() => {
+    mountEditor();
+  });
+}
 </script>
 
 <template>
-  <div class="base-markdown-editor" :class="{ disabled, 'is-native': isNativeMode }">
+  <div
+    class="base-markdown-editor"
+    :class="{ disabled, 'is-native': isNativeMode, 'auto-grow': autoGrow }"
+    :style="{ '--markdown-editor-min-height': `${minHeight}px` }"
+  >
     <div v-if="isNativeMode" class="base-markdown-editor-native">
       <textarea
         ref="textareaRef"
@@ -325,13 +411,25 @@ onBeforeUnmount(() => {
         @keydown="handleNativeKeydown"
       />
     </div>
-    <div v-else-if="isReadonlyRenderedMode" class="base-markdown-editor-rendered">
+    <div
+      v-else-if="isRenderedPreviewMode"
+      class="base-markdown-editor-rendered"
+      :class="{ 'is-editable-preview': !disabled && deferRenderedEditor }"
+      :tabindex="!disabled && deferRenderedEditor ? 0 : undefined"
+      :role="!disabled && deferRenderedEditor ? 'textbox' : undefined"
+      :aria-readonly="!disabled && deferRenderedEditor ? 'false' : undefined"
+      @click="activateRenderedEditor"
+      @keydown.enter.prevent="activateRenderedEditor"
+    >
       <SemanticCodeRenderer
         v-if="readonlyCodeLanguage"
         :content="modelValue"
         :language="readonlyCodeLanguage"
       />
       <MarkdownRenderer v-else :content="modelValue" />
+      <span v-if="!modelValue.trim()" class="base-markdown-editor-rendered-placeholder">
+        {{ placeholder }}
+      </span>
     </div>
     <div v-else ref="mountRef" class="base-markdown-editor-host" />
   </div>
@@ -339,6 +437,9 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .base-markdown-editor {
+  --markdown-document-font-size: 14px;
+  --markdown-document-line-height: 1.68;
+  --markdown-document-list-indent: 20px;
   height: 100%;
   min-height: 0;
   min-width: 0;
@@ -349,6 +450,44 @@ onBeforeUnmount(() => {
 
 .base-markdown-editor.disabled {
   cursor: default;
+}
+
+.base-markdown-editor.auto-grow {
+  height: auto;
+  min-height: var(--markdown-editor-min-height);
+  flex: none;
+}
+
+.base-markdown-editor.auto-grow .base-markdown-editor-native,
+.base-markdown-editor.auto-grow .base-markdown-editor-host,
+.base-markdown-editor.auto-grow .base-markdown-editor-rendered {
+  flex: none;
+  height: auto;
+  min-height: var(--markdown-editor-min-height);
+  overflow: visible;
+}
+
+.base-markdown-editor.auto-grow .base-markdown-editor-textarea {
+  flex: none;
+  height: auto;
+  min-height: var(--markdown-editor-min-height);
+  overflow-y: hidden;
+  field-sizing: content;
+}
+
+.base-markdown-editor.auto-grow :deep(.vditor),
+.base-markdown-editor.auto-grow :deep(.vditor-content),
+.base-markdown-editor.auto-grow :deep(.vditor-ir),
+.base-markdown-editor.auto-grow :deep(.vditor-ir pre.vditor-reset) {
+  height: auto !important;
+  min-height: var(--markdown-editor-min-height);
+  overflow-y: visible;
+}
+
+.base-markdown-editor.auto-grow :deep(.vditor-content),
+.base-markdown-editor.auto-grow :deep(.vditor-ir) {
+  flex: none;
+  overflow: visible;
 }
 
 .base-markdown-editor-native {
@@ -366,6 +505,7 @@ onBeforeUnmount(() => {
 }
 
 .base-markdown-editor-rendered {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -374,8 +514,29 @@ onBeforeUnmount(() => {
   overscroll-behavior: contain;
 }
 
+.base-markdown-editor-rendered.is-editable-preview {
+  cursor: text;
+  outline: none;
+}
+
+.base-markdown-editor-rendered.is-editable-preview:focus-visible {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 42%, transparent);
+}
+
+.base-markdown-editor-rendered-placeholder {
+  color: var(--text-secondary);
+  opacity: 0.55;
+  font-size: 13px;
+  line-height: 1.65;
+  pointer-events: none;
+}
+
 .base-markdown-editor-rendered :deep(.markdown-body) {
   min-height: 100%;
+  font-family: var(--font-prose);
+  font-size: var(--markdown-document-font-size);
+  line-height: var(--markdown-document-line-height);
+  text-rendering: optimizeLegibility;
 }
 
 .base-markdown-editor-textarea {
@@ -467,9 +628,10 @@ onBeforeUnmount(() => {
   background: transparent;
   color: var(--text-color);
   font-family: var(--font-prose);
-  font-size: 14px;
-  line-height: 1.68;
+  font-size: var(--markdown-document-font-size);
+  line-height: var(--markdown-document-line-height);
   white-space: pre-wrap;
+  text-rendering: optimizeLegibility;
 }
 
 .base-markdown-editor :deep(.vditor-ir pre.vditor-reset:focus) {
@@ -562,7 +724,7 @@ onBeforeUnmount(() => {
 
 .base-markdown-editor :deep(.vditor-reset ul),
 .base-markdown-editor :deep(.vditor-reset ol) {
-  padding-left: 14px;
+  padding-left: var(--markdown-document-list-indent);
 }
 
 .base-markdown-editor :deep(.vditor-reset li) {
@@ -573,6 +735,19 @@ onBeforeUnmount(() => {
 .base-markdown-editor :deep(.vditor-reset li > ol) {
   margin-top: 6px;
   margin-bottom: 6px;
+}
+
+.base-markdown-editor :deep(.vditor-reset > :last-child) {
+  margin-bottom: 0;
+}
+
+.base-markdown-editor :deep(.vditor-reset ul li::marker) {
+  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
+}
+
+.base-markdown-editor :deep(.vditor-reset ol li::marker) {
+  color: var(--text-secondary);
+  font-weight: 600;
 }
 
 .base-markdown-editor :deep(.vditor-reset blockquote) {

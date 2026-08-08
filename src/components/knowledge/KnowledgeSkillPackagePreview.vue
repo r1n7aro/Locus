@@ -239,10 +239,10 @@ const surfaceText = computed(() => {
   return t("knowledge.skill.channelsNone");
 });
 const updatedLabel = computed(() =>
-  formatDateTime(manifest.value?.updatedAt ?? props.packageDocument.updatedAt),
+  formatDateTime(manifest.value?.updatedAt ?? props.packageDocument.modifiedAt),
 );
 const injectMode = computed(
-  () => props.packageDocument.injectMode ?? "none",
+  () => props.packageDocument.effectiveInjectMode ?? "none",
 );
 const injectModeDropdownLabel = computed(() =>
   labelForInjectMode(effectiveInjectValue.value, "skill"),
@@ -395,7 +395,6 @@ function onInjectModeChange(value: string) {
   if (!["none", "path", "excerpt"].includes(value)) return;
   emit("updateConfig", {
     injectMode: value as KnowledgeInjectMode,
-    inheritInjectMode: false,
     skillSurface: deriveSkillSurface(commandChannelOn.value, value !== "none"),
   });
 }

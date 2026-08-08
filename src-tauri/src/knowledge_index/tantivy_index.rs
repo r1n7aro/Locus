@@ -396,7 +396,7 @@ impl KnowledgeTantivyIndex {
                 title: get_text(&retrieved, self.f_title),
                 path: get_text(&retrieved, self.f_path),
                 score,
-                snippet: truncate_snippet(&body, 220),
+                snippet: truncate_snippet(&body, 1000),
                 matched_terms: Vec::new(),
             });
         }
@@ -422,14 +422,10 @@ fn get_text(doc: &tantivy::TantivyDocument, field: Field) -> String {
 }
 
 fn truncate_snippet(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut end = max_chars;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
 }
 
 fn is_lock_busy_error(error: &str) -> bool {

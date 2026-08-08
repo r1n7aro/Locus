@@ -157,9 +157,7 @@ pub(crate) fn external_allowed_tool_activation_names(
             .filter_map(|item| item.as_str())
             .map(str::to_string)
             .collect(),
-        serde_json::Value::String(joined) => {
-            joined.split(',').map(str::to_string).collect()
-        }
+        serde_json::Value::String(joined) => joined.split(',').map(str::to_string).collect(),
         _ => Vec::new(),
     };
     let mut names = Vec::new();
@@ -366,6 +364,14 @@ fn external_skill_scan_roots(working_dir: &str) -> Vec<ExternalSkillScanRoot> {
         }
         roots
     }
+}
+
+pub(crate) fn external_skill_watch_roots(working_dir: &str) -> Vec<PathBuf> {
+    external_skill_scan_roots(working_dir)
+        .into_iter()
+        .map(|root| root.path)
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 fn canonical_path_key(path: &Path) -> String {
@@ -575,10 +581,10 @@ pub(crate) fn invalidate_external_skill_cache() {
 
 /// External skills are disabled by default; enabling one is an explicit
 /// per-workspace user action stored in the skill config.
-pub(crate) fn configured_external_skill_enabled(
-    override_config: Option<&SkillConfig>,
-) -> bool {
-    override_config.map(|config| config.enabled).unwrap_or(false)
+pub(crate) fn configured_external_skill_enabled(override_config: Option<&SkillConfig>) -> bool {
+    override_config
+        .map(|config| config.enabled)
+        .unwrap_or(false)
 }
 
 /// Default surface honors the skill author's declaration.
@@ -714,9 +720,7 @@ pub(crate) fn external_record_for_virtual_path(
     let normalized = normalize_external_virtual_path(virtual_path);
     records
         .iter()
-        .find(|record| {
-            normalized == record.dir_name() || normalized == record.virtual_path()
-        })
+        .find(|record| normalized == record.dir_name() || normalized == record.virtual_path())
         .cloned()
 }
 
@@ -834,7 +838,9 @@ fn external_document_id(record: &ExternalSkillRecord) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
-    let hash = blake3::hash(record.dir_name().as_bytes()).to_hex().to_string();
+    let hash = blake3::hash(record.dir_name().as_bytes())
+        .to_hex()
+        .to_string();
     format!("kd_skill_external_{}_{}", sanitized, &hash[..8])
 }
 
@@ -862,7 +868,9 @@ fn external_source_summary(
     })
 }
 
-fn external_storage_source(record: &ExternalSkillRecord) -> knowledge_store::KnowledgeStorageSource {
+fn external_storage_source(
+    record: &ExternalSkillRecord,
+) -> knowledge_store::KnowledgeStorageSource {
     match record.scope {
         ExternalSkillScope::Project => knowledge_store::KnowledgeStorageSource::Project,
         ExternalSkillScope::User => knowledge_store::KnowledgeStorageSource::App,
@@ -1465,10 +1473,11 @@ mod tests {
             external_record_for_virtual_path(&records, "skill/external/claude/grill-me").is_some()
         );
         assert!(external_record_for_virtual_path(&records, "external/claude/other").is_none());
-        assert!(
-            external_record_for_virtual_path(&records, "external/claude/grill-me/references/x.md")
-                .is_none()
-        );
+        assert!(external_record_for_virtual_path(
+            &records,
+            "external/claude/grill-me/references/x.md"
+        )
+        .is_none());
 
         assert!(external_record_for_dir_name(&records, "external/claude/grill-me").is_some());
         assert!(external_record_for_dir_name(&records, "external/agents/grill-me").is_none());
@@ -1607,11 +1616,9 @@ mod tests {
         )
         .expect("deep path resolves");
         assert_eq!(rel, "references/details.md");
-        let (_, root_rel) = external_record_and_doc_rel_path_for_virtual_path(
-            &records,
-            "external/claude/grill-me",
-        )
-        .expect("dir resolves to root doc");
+        let (_, root_rel) =
+            external_record_and_doc_rel_path_for_virtual_path(&records, "external/claude/grill-me")
+                .expect("dir resolves to root doc");
         assert_eq!(root_rel, "SKILL.md");
 
         // Traversal and non-markdown paths never resolve.
@@ -1780,15 +1787,16 @@ mod tests {
         assert_eq!(solo.dir_name(), "external/claude/solo");
 
         let ambiguous = resolve_external_record_by_name(&records, "grill-me", None);
-        assert!(ambiguous
-            .unwrap_err()
-            .contains("ambiguous"));
+        assert!(ambiguous.unwrap_err().contains("ambiguous"));
 
         let missing = resolve_external_record_by_name(&records, "nope", None);
         assert!(missing.unwrap_err().contains("not found"));
 
-        let wrong_source =
-            resolve_external_record_by_name(&records, "external/claude/solo", Some("externalProject"));
+        let wrong_source = resolve_external_record_by_name(
+            &records,
+            "external/claude/solo",
+            Some("externalProject"),
+        );
         assert!(wrong_source.unwrap_err().contains("externalUser"));
         assert!(resolve_external_record_by_name(
             &records,

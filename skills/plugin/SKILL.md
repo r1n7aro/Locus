@@ -10,9 +10,9 @@ tools:
   - skill_reload
   - view_list
   - view_reload
-  - knowledge_read
+  - knowledge_query
+  - read
   - ask_user_question
-  - sheet
 ---
 
 # Plugin
@@ -38,14 +38,13 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
 
 3. Use progressive disclosure for specialized editing.
    - Keep `/plugin` focused on plugin lifecycle, ownership, packaging, dependency metadata, and publishing decisions.
-   - To create or edit a View, load the View skill with `knowledge_read` using `path: "skill/view"` and `part: "body"`, then follow that skill.
-   - To create or edit a Skill, load the Create Skill workflow with `knowledge_read` using `path: "skill/create-skill.md"` and `part: "body"`, then follow that workflow.
-   - To give `unity_yaml_read` a typed reader for custom or built-in YAML asset types, load the [extension guide](yaml-read-extensions.md) with `knowledge_read` using `path: "skill/plugin/yaml-read-extensions.md"` and `part: "body"`, then follow it. The reader is a Skill package `unityYamlReadExtensions` entry plus a C# file compiled in the connected Unity Editor.
+   - To create or edit a View, locate the View Skill with `knowledge_query`, `read` its returned physical path, then follow that Skill.
+   - To create or edit a Skill, locate the Create Skill workflow with `knowledge_query`, `read` its returned physical path, then follow that workflow.
+   - To give `unity_yaml_read` a typed reader for custom or built-in YAML asset types, locate the [extension guide](yaml-read-extensions.md) with `knowledge_query`, `read` its returned physical path, then follow it. The reader is a Skill package `unityYamlReadExtensions` entry plus a C# file compiled in the connected Unity Editor.
    - Return to this workflow after the component edit is validated, then continue packaging, installation, ownership transfer, or publishing.
 
 4. Ask when a choice changes the result.
-   - Use `ask_user_question` when multiple registry matches are plausible, install or uninstall scope is unclear, component selection is unclear, import mode is unclear, publish target is unclear, or GitHub authentication is missing.
-   - Use `sheet` to confirm collected multi-field metadata in one pass (export step 10, registry entry metadata in the publishing workflow) instead of asking field by field.
+   - Use `ask_user_question` when multiple registry matches are plausible, install or uninstall scope is unclear, component selection is unclear, import mode is unclear, publish target is unclear, GitHub authentication is missing, or collected metadata needs explicit approval. Present collected metadata as a concise text block before asking for approval.
    - Always ask before creating, exporting, or publishing a new plugin id. The package name is the plugin id, and the user must choose or enter it before export.
    - Show any proposed id explicitly. A proposal may come from an existing plugin id, selected Skill/View slug, repository owner, or authenticated GitHub login, but none of those sources decides the final id.
    - Prefer concise package-manager style ids such as `asset-browser-tools` or `locus-workspace`. Use reverse-DNS or owner-prefixed ids only when the user chooses that naming scheme or a collision needs disambiguation.
@@ -78,15 +77,15 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - Set `compatibility.projectIndependent = true` only when the audit finds no project dependencies; otherwise set it to `false` and fill `dependencies.project`.
 
 10. Export only after approval.
-   - Confirm the export metadata with the `sheet` tool: one sheet titled with the plugin id and version, with fields for plugin id, name, version, selected Skill package ids, selected View ids, output path, install scope, and dependency metadata. Summarize checked files and remaining risks in the sheet description. Mark values the user already fixed as readonly and leave the rest editable.
-   - The sheet confirms collected values; it does not collect missing ones. Ask with `ask_user_question` first when the output path, version, package id, or publish target is still unknown.
+   - Present the export metadata in one concise block titled with the plugin id and version: plugin id, name, version, selected Skill package ids, selected View ids, output path, install scope, dependency metadata, checked files, and remaining risks. Mark user-fixed values clearly, then ask for explicit approval with `ask_user_question`.
+   - Collect any missing output path, version, package id, or publish target with `ask_user_question` before presenting the approval block.
    - For new plugins, force the package name question even when a high-confidence id is available.
-   - When the sheet returns a change request, revise the proposal and present an updated sheet. Never call `plugin_export` while the latest sheet outcome is a change request.
+   - When the user requests changes, revise the proposal, present the updated metadata block, and ask for approval again. Call `plugin_export` after the latest proposal is approved.
    - Before export, run `plugin_list` and check installed app/workspace plugins for the selected id. If it already exists, ask whether to update that plugin, choose another id, or stop.
-   - Call `plugin_export` only after the audit, structure plan, and sheet confirmation are complete. Pass detailed `auditSummary` and `structurePlan`, and record the confirmed sheet values, including user edits, in `userApproval`.
+   - Call `plugin_export` only after the audit, structure plan, and metadata approval are complete. Pass detailed `auditSummary` and `structurePlan`, and record the approved values, including user edits, in `userApproval`.
    - For plugin creation from existing components, pass `installAfterExport: true` and `transferOwnership: true` so the created plugin installs locally and takes ownership of the components. Use `installScope: "app"` by default; use `"project"` when the plugin should stay in the current workspace.
    - After export, report the installed plugin root and the transferred Skill/View component ids. Continue future edits inside the installed plugin root.
 
 11. Publish.
    - For zip-only publishing, the approved `plugin_export` archive is the deliverable; report the output path.
-   - For GitHub release, plugin repository, or registry publishing, load the [publishing workflow](publish.md) with `knowledge_read` using `path: "skill/plugin/publish.md"` and `part: "body"`, then follow it end to end. Do not improvise GitHub or registry mechanics from memory.
+   - For GitHub release, plugin repository, or registry publishing, locate the [publishing workflow](publish.md) with `knowledge_query`, `read` its returned physical path, then follow it end to end. Do not improvise GitHub or registry mechanics from memory.

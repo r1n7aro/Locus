@@ -332,6 +332,35 @@ fn normalize_body(raw: &str) -> String {
     }
 }
 
+fn strip_imported_markdown_frontmatter(body: &str) -> String {
+    if !body.starts_with("---\n") {
+        return body.to_string();
+    }
+    let mut consumed = 4;
+    for line in body[4..].split_inclusive('\n') {
+        consumed += line.len();
+        if line.trim() == "---" {
+            return normalize_body(body[consumed..].trim_start_matches('\n'));
+        }
+    }
+    body.to_string()
+}
+
+fn normalize_imported_body(raw: &str, source_path: &Path) -> String {
+    let body = normalize_body(raw);
+    let is_markdown = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        });
+    if is_markdown {
+        strip_imported_markdown_frontmatter(&body)
+    } else {
+        body
+    }
+}
+
 fn supported_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -424,14 +453,14 @@ fn create_directory_link(source: &Path, link_path: &Path) -> Result<(), String> 
     // Junctions do not require developer mode or elevation on Windows.
     match junction::create(source, link_path) {
         Ok(()) => Ok(()),
-        Err(junction_error) => std::os::windows::fs::symlink_dir(source, link_path).map_err(
-            |symlink_error| {
+        Err(junction_error) => {
+            std::os::windows::fs::symlink_dir(source, link_path).map_err(|symlink_error| {
                 format!(
                     "无法创建目录链接（junction：{}；symlink：{}）。",
                     junction_error, symlink_error
                 )
-            },
-        ),
+            })
+        }
     }
 }
 
@@ -462,10 +491,7 @@ fn remove_link_entry(link_path: &Path) -> Result<(), String> {
         return Ok(());
     };
     if !metadata.file_type().is_symlink() {
-        return Err(format!(
-            "目标不是链接，拒绝删除：{}",
-            link_path.display()
-        ));
+        return Err(format!("目标不是链接，拒绝删除：{}", link_path.display()));
     }
     let result = if std::fs::metadata(link_path)
         .map(|target| target.is_dir())
@@ -482,9 +508,7 @@ fn remove_link_entry(link_path: &Path) -> Result<(), String> {
         // platforms; retry with the opposite removal primitive before failing.
         Err(_) => std::fs::remove_file(link_path)
             .or_else(|_| std::fs::remove_dir(link_path))
-            .map_err(|error| {
-                format!("无法删除链接 '{}'：{}", link_path.display(), error)
-            }),
+            .map_err(|error| format!("无法删除链接 '{}'：{}", link_path.display(), error)),
     }
 }
 
@@ -608,9 +632,11 @@ fn scan_local_source(
                 parent
                     .components()
                     .filter_map(|component| match component {
-                        std::path::Component::Normal(value) => {
-                            Some(sanitize_segment(&value.to_string_lossy(), "dir", &source_rel))
-                        }
+                        std::path::Component::Normal(value) => Some(sanitize_segment(
+                            &value.to_string_lossy(),
+                            "dir",
+                            &source_rel,
+                        )),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -688,7 +714,7 @@ fn build_local_document(
             error
         )
     })?;
-    let body = normalize_body(&raw);
+    let body = normalize_imported_body(&raw, &planned.source_abs);
     let read_only = !(mode == KnowledgeLocalSourceMode::Snapshot && ai_editable);
     Ok(KnowledgeDocument {
         id: stable_document_id(source_root, &planned.source_rel),
@@ -793,12 +819,14 @@ fn read_local_binding(
     working_dir: &str,
     target_path: &str,
 ) -> Result<Option<LocalReferenceBinding>, String> {
-    let record =
-        match knowledge_store::read_directory_config(working_dir, KnowledgeType::Reference, target_path)
-        {
-            Ok(record) => record,
-            Err(_) => return Ok(None),
-        };
+    let record = match knowledge_store::read_directory_config(
+        working_dir,
+        KnowledgeType::Reference,
+        target_path,
+    ) {
+        Ok(record) => record,
+        Err(_) => return Ok(None),
+    };
     if !record.exists {
         return Ok(None);
     }
@@ -849,9 +877,7 @@ fn ensure_valid_target_directory(
     }
     match local_binding_from_sources(&record.external_sources) {
         Some(binding) if binding.mode != requested_mode => {
-            return Err(
-                "目标目录已使用另一种模式导入，请先删除现有导入再切换模式。".to_string(),
-            );
+            return Err("目标目录已使用另一种模式导入，请先删除现有导入再切换模式。".to_string());
         }
         Some(_) => {}
         None => {
@@ -915,10 +941,7 @@ fn swap_reference_directory(
         .join("reference")
         .join(target_path.replace('/', std::path::MAIN_SEPARATOR_STR));
     if !incoming.is_dir() {
-        return Err(format!(
-            "本地导入临时目录缺失：{}",
-            incoming.display()
-        ));
+        return Err(format!("本地导入临时目录缺失：{}", incoming.display()));
     }
     let managed = knowledge_reference_dir(working_dir, target_path);
     let backup = backup_dir_path(working_dir);
@@ -1098,8 +1121,7 @@ pub fn list_local_live_links(working_dir: &str) -> Vec<LocalLiveLink> {
         let Ok(rel) = entry.path().strip_prefix(&reference_root) else {
             continue;
         };
-        let Some(target_path) = directory_path_from_sidecar_name(&normalize_source_rel(rel))
-        else {
+        let Some(target_path) = directory_path_from_sidecar_name(&normalize_source_rel(rel)) else {
             continue;
         };
         if !seen.insert(target_path.to_lowercase()) {
@@ -1143,7 +1165,7 @@ fn live_synthetic_document(
             error
         )
     })?;
-    let body = normalize_body(&raw);
+    let body = normalize_imported_body(&raw, source_file);
     let source_root = link.source_root.to_string_lossy().to_string();
     let timestamp = std::fs::metadata(source_file)
         .ok()
@@ -1208,12 +1230,10 @@ fn is_live_text_document_name(name: &str) -> bool {
 
 fn live_inner_rel_valid(inner_rel: &str) -> bool {
     !inner_rel.is_empty()
-        && inner_rel
-            .split('/')
-            .all(|segment| {
-                let trimmed = segment.trim();
-                !trimmed.is_empty() && trimmed != "." && trimmed != ".." && !segment.starts_with('.')
-            })
+        && inner_rel.split('/').all(|segment| {
+            let trimmed = segment.trim();
+            !trimmed.is_empty() && trimmed != "." && trimmed != ".." && !segment.starts_with('.')
+        })
 }
 
 /// Enumerate synthesized documents for one live link (folder sources walk the
@@ -1228,8 +1248,7 @@ pub fn list_live_documents_for_link(link: &LocalLiveLink) -> Vec<KnowledgeDocume
                 .map(|value| value.to_string_lossy().to_string())
                 .unwrap_or_default();
             if is_live_text_document_name(&file_name) && link.source_root.is_file() {
-                if let Ok(document) = live_synthetic_document(link, &file_name, &link.source_root)
-                {
+                if let Ok(document) = live_synthetic_document(link, &file_name, &link.source_root) {
                     documents.push(document);
                 }
             }
@@ -1393,8 +1412,7 @@ pub fn list_live_directories(working_dir: &str) -> Vec<String> {
 pub fn path_within_live_links(links: &[LocalLiveLink], rel_path: &str) -> bool {
     let normalized = rel_path.trim().trim_matches('/').replace('\\', "/");
     links.iter().any(|link| {
-        normalized == link.target_path
-            || normalized.starts_with(&format!("{}/", link.target_path))
+        normalized == link.target_path || normalized.starts_with(&format!("{}/", link.target_path))
     })
 }
 
@@ -1465,7 +1483,14 @@ pub fn load_live_document(
 pub fn sync_local_reference_documents(
     working_dir: &str,
     target_path: &str,
-) -> Result<(LocalReferenceSyncStats, LocalReferenceBinding, LocalScanOutcome), String> {
+) -> Result<
+    (
+        LocalReferenceSyncStats,
+        LocalReferenceBinding,
+        LocalScanOutcome,
+    ),
+    String,
+> {
     let target_path = normalize_target_path(target_path)?;
     let binding = read_local_binding(working_dir, &target_path)?
         .ok_or_else(|| LOCAL_REFERENCE_BINDING_GONE.to_string())?;
@@ -1474,10 +1499,7 @@ pub fn sync_local_reference_documents(
     }
     let source = PathBuf::from(&binding.source_path);
     if !source.exists() {
-        return Err(format!(
-            "本地源路径不存在：{}",
-            source.display()
-        ));
+        return Err(format!("本地源路径不存在：{}", source.display()));
     }
     let source_root = source.to_string_lossy().to_string();
     let outcome = scan_local_source(&source, None)?;
@@ -1515,7 +1537,7 @@ pub fn sync_local_reference_documents(
                 error
             )
         })?;
-        let body = normalize_body(&raw);
+        let body = normalize_imported_body(&raw, &planned.source_abs);
         match existing_by_source_id.get(&planned.source_rel) {
             Some((existing_path, existing_document)) => {
                 let existing_target_rel = existing_path
@@ -1573,11 +1595,7 @@ pub fn sync_local_reference_documents(
         }
         if let Some((file_path, _)) = existing_by_source_id.get(&source_id) {
             std::fs::remove_file(file_path).map_err(|error| {
-                format!(
-                    "无法删除已移除的文档 '{}'：{}",
-                    file_path.display(),
-                    error
-                )
+                format!("无法删除已移除的文档 '{}'：{}", file_path.display(), error)
             })?;
             stats.removed += 1;
         }
@@ -1612,13 +1630,10 @@ fn remove_live_target_artifacts(target_abs: &Path) -> Result<(), String> {
         return Ok(());
     }
     if !target_abs.is_dir() {
-        return Err(format!(
-            "目标位置已被文件占用：{}",
-            target_abs.display()
-        ));
+        return Err(format!("目标位置已被文件占用：{}", target_abs.display()));
     }
-    let entries = std::fs::read_dir(target_abs)
-        .map_err(|error| format!("无法检查目标目录：{}", error))?;
+    let entries =
+        std::fs::read_dir(target_abs).map_err(|error| format!("无法检查目标目录：{}", error))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("无法检查目标目录：{}", error))?;
         if is_link_entry(&entry.path()) {
@@ -1630,8 +1645,7 @@ fn remove_live_target_artifacts(target_abs: &Path) -> Result<(), String> {
             ));
         }
     }
-    std::fs::remove_dir(target_abs)
-        .map_err(|error| format!("无法移除旧链接目录：{}", error))
+    std::fs::remove_dir(target_abs).map_err(|error| format!("无法移除旧链接目录：{}", error))
 }
 
 /// Count (searchable documents, total files) reachable through a live source.
@@ -1641,7 +1655,11 @@ fn count_live_source_documents(source: &Path) -> (u32, u32) {
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
-        let docs = if is_live_text_document_name(&name) { 1 } else { 0 };
+        let docs = if is_live_text_document_name(&name) {
+            1
+        } else {
+            0
+        };
         return (docs, 1);
     }
     if !source.is_dir() {
@@ -1913,11 +1931,9 @@ async fn run_local_reference_import(
 
     let temp_root = temp_root_path(&working_dir);
     remove_dir_if_exists(&temp_root).map_err(LocalReferenceImportRunError::Failed)?;
-    std::fs::create_dir_all(&temp_root)
-        .map_err(|error| LocalReferenceImportRunError::Failed(format!(
-            "无法创建本地导入临时目录：{}",
-            error
-        )))?;
+    std::fs::create_dir_all(&temp_root).map_err(|error| {
+        LocalReferenceImportRunError::Failed(format!("无法创建本地导入临时目录：{}", error))
+    })?;
 
     let progress_state = state.clone();
     let progress_working_dir = working_dir.clone();
@@ -1954,10 +1970,9 @@ async fn run_local_reference_import(
             )
         })
         .await
-        .map_err(|error| LocalReferenceImportRunError::Failed(format!(
-            "本地导入任务执行失败：{}",
-            error
-        )))?
+        .map_err(|error| {
+            LocalReferenceImportRunError::Failed(format!("本地导入任务执行失败：{}", error))
+        })?
     };
     if let Err(error) = write_result {
         let _ = remove_dir_if_exists(&temp_root);
@@ -2150,11 +2165,9 @@ pub async fn start_local_reference_import(
                 set_runtime_status(state_for_task, &working_dir_for_task, status).await;
             }
             Err(LocalReferenceImportRunError::Cancelled) => {
-                let fallback = status_from_binding(
-                    &working_dir_for_task,
-                    Some(&target_path_for_task),
-                )
-                .unwrap_or_default();
+                let fallback =
+                    status_from_binding(&working_dir_for_task, Some(&target_path_for_task))
+                        .unwrap_or_default();
                 set_runtime_status(
                     state_for_task,
                     &working_dir_for_task,
@@ -2174,11 +2187,9 @@ pub async fn start_local_reference_import(
                 .await;
             }
             Err(LocalReferenceImportRunError::Failed(error)) => {
-                let fallback = status_from_binding(
-                    &working_dir_for_task,
-                    Some(&target_path_for_task),
-                )
-                .unwrap_or_default();
+                let fallback =
+                    status_from_binding(&working_dir_for_task, Some(&target_path_for_task))
+                        .unwrap_or_default();
                 set_runtime_status(
                     state_for_task,
                     &working_dir_for_task,
@@ -2205,10 +2216,7 @@ fn status_from_binding(
     working_dir: &str,
     target_path: Option<&str>,
 ) -> Result<LocalReferenceImportStatus, String> {
-    let Some(target_path) = target_path
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(target_path) = target_path.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(LocalReferenceImportStatus {
             message: "尚未选择本地导入目录。".to_string(),
             ..Default::default()
@@ -2449,10 +2457,7 @@ pub fn register_live_watcher(
     } else if source_path.is_dir() {
         (source_path.clone(), RecursiveMode::Recursive)
     } else {
-        return Err(format!(
-            "本地源路径不存在：{}",
-            source_path.display()
-        ));
+        return Err(format!("本地源路径不存在：{}", source_path.display()));
     };
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2460,19 +2465,16 @@ pub fn register_live_watcher(
         .map_err(|error| format!("无法创建本地源监听器：{}", error))?;
     os_watcher
         .watch(&watch_root, recursive_mode)
-        .map_err(|error| {
-            format!(
-                "无法监听本地源路径 '{}'：{}",
-                watch_root.display(),
-                error
-            )
-        })?;
+        .map_err(|error| format!("无法监听本地源路径 '{}'：{}", watch_root.display(), error))?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
     let worker_target = target_path.clone();
     let worker = std::thread::Builder::new()
-        .name(format!("local-reference-watcher-{}", short_token(&target_path)))
+        .name(format!(
+            "local-reference-watcher-{}",
+            short_token(&target_path)
+        ))
         .spawn(move || {
             live_watcher_loop(
                 rx,
@@ -2536,7 +2538,8 @@ fn live_watcher_loop(
         };
 
         let mut batch = vec![first];
-        let deadline = Instant::now() + Duration::from_millis(LOCAL_REFERENCE_WATCH_BATCH_WINDOW_MS);
+        let deadline =
+            Instant::now() + Duration::from_millis(LOCAL_REFERENCE_WATCH_BATCH_WINDOW_MS);
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(remaining) {
@@ -2712,7 +2715,10 @@ mod tests {
             .iter()
             .map(|planned| planned.source_rel.as_str())
             .collect();
-        assert_eq!(rels, vec!["docs/deep/topic.markdown", "guide.md", "notes.TXT"]);
+        assert_eq!(
+            rels,
+            vec!["docs/deep/topic.markdown", "guide.md", "notes.TXT"]
+        );
         let targets: Vec<_> = outcome
             .planned
             .iter()
@@ -2941,6 +2947,16 @@ mod tests {
     }
 
     #[test]
+    fn markdown_import_discards_source_frontmatter() {
+        let raw = "---\ntitle: Source title\ntags:\n  - imported\n---\n\n# Body\n";
+        assert_eq!(
+            normalize_imported_body(raw, Path::new("guide.md")),
+            "# Body\n"
+        );
+        assert_eq!(normalize_imported_body(raw, Path::new("guide.txt")), raw);
+    }
+
+    #[test]
     fn target_path_normalization_rejects_traversal() {
         assert!(normalize_target_path("../escape").is_err());
         assert!(normalize_target_path("a/../b").is_err());
@@ -3008,7 +3024,10 @@ mod tests {
 
         let (doc_count, total_files) = count_live_source_documents(source.path());
         assert_eq!(doc_count, 3);
-        assert_eq!(total_files, 4, "non-text files still count toward the total");
+        assert_eq!(
+            total_files, 4,
+            "non-text files still count toward the total"
+        );
 
         let directories = list_live_directories(&working_dir);
         assert!(directories.contains(&"local-live".to_string()));
@@ -3023,7 +3042,9 @@ mod tests {
         assert!(doc.read_only);
         assert_eq!(normalize_body(&doc.body), "guide v1\n");
         assert_eq!(
-            doc.external_source.as_ref().and_then(|source| source.local_mode),
+            doc.external_source
+                .as_ref()
+                .and_then(|source| source.local_mode),
             Some(KnowledgeLocalSourceMode::Live)
         );
 
@@ -3061,7 +3082,12 @@ mod tests {
             .filter(|item| item.path.starts_with("local-live/"))
             .map(|item| item.path.clone())
             .collect();
-        assert_eq!(live_paths.len(), 3, "live docs listed exactly once: {:?}", live_paths);
+        assert_eq!(
+            live_paths.len(),
+            3,
+            "live docs listed exactly once: {:?}",
+            live_paths
+        );
     }
 
     #[test]
@@ -3116,8 +3142,8 @@ mod tests {
         std::fs::create_dir_all(&real_dir).expect("create real dir");
         std::fs::write(real_dir.join("data.md"), "real content").expect("write real doc");
 
-        let error = remove_live_target_artifacts(&real_dir)
-            .expect_err("must refuse to clear real content");
+        let error =
+            remove_live_target_artifacts(&real_dir).expect_err("must refuse to clear real content");
         assert!(error.contains("非链接"), "{}", error);
         assert!(real_dir.join("data.md").is_file());
     }
@@ -3131,7 +3157,10 @@ mod tests {
         }];
         assert!(path_within_live_links(&links, "docs/local-live"));
         assert!(path_within_live_links(&links, "docs/local-live/guide.md"));
-        assert!(!path_within_live_links(&links, "docs/local-live-other/guide.md"));
+        assert!(!path_within_live_links(
+            &links,
+            "docs/local-live-other/guide.md"
+        ));
         assert!(!path_within_live_links(&links, "docs"));
     }
 }

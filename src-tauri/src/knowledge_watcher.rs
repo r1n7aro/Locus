@@ -11,6 +11,7 @@ use tauri::AppHandle;
 
 use crate::commands::{self, KnowledgeChangedTarget};
 use crate::knowledge_index::KnowledgeIndexState;
+use crate::knowledge_source_registry::{KnowledgeSourceKind, KnowledgeSourceRegistry};
 use crate::knowledge_store::KnowledgeType;
 
 const WATCHER_BATCH_WINDOW_MS: u64 = 180;
@@ -20,12 +21,16 @@ const WATCHER_IDLE_POLL_MS: u64 = 250;
 enum KnowledgeRootKind {
     Workspace,
     App,
+    Registered,
+    Discovery,
 }
 
 #[derive(Clone, Debug)]
 struct WatchedKnowledgeRoot {
     path: PathBuf,
     kind: KnowledgeRootKind,
+    doc_type: Option<KnowledgeType>,
+    logical_prefix: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +73,7 @@ enum ResolvedKnowledgeChange {
         path: String,
         parent_path: Option<String>,
         change_kind: KnowledgeFsChangeKind,
+        full_reconcile: bool,
     },
     Directory {
         doc_type: KnowledgeType,
@@ -75,6 +81,7 @@ enum ResolvedKnowledgeChange {
         parent_path: Option<String>,
         change_kind: KnowledgeFsChangeKind,
         subtree: bool,
+        full_reconcile: bool,
     },
 }
 
@@ -92,6 +99,14 @@ impl ResolvedKnowledgeChange {
         }
     }
 
+    fn requires_full_reconcile(&self) -> bool {
+        match self {
+            Self::Document { full_reconcile, .. } | Self::Directory { full_reconcile, .. } => {
+                *full_reconcile
+            }
+        }
+    }
+
     fn merge(self, next: Self) -> Self {
         match (self, next) {
             (
@@ -100,9 +115,11 @@ impl ResolvedKnowledgeChange {
                     path,
                     parent_path,
                     change_kind,
+                    full_reconcile,
                 },
                 Self::Document {
                     change_kind: next_kind,
+                    full_reconcile: next_full_reconcile,
                     ..
                 },
             ) => Self::Document {
@@ -110,6 +127,7 @@ impl ResolvedKnowledgeChange {
                 path,
                 parent_path,
                 change_kind: change_kind.merge(next_kind),
+                full_reconcile: full_reconcile || next_full_reconcile,
             },
             (
                 Self::Directory {
@@ -118,10 +136,12 @@ impl ResolvedKnowledgeChange {
                     parent_path,
                     change_kind,
                     subtree,
+                    full_reconcile,
                 },
                 Self::Directory {
                     change_kind: next_kind,
                     subtree: next_subtree,
+                    full_reconcile: next_full_reconcile,
                     ..
                 },
             ) => Self::Directory {
@@ -130,6 +150,7 @@ impl ResolvedKnowledgeChange {
                 parent_path,
                 change_kind: change_kind.merge(next_kind),
                 subtree: subtree || next_subtree,
+                full_reconcile: full_reconcile || next_full_reconcile,
             },
             (_, other) => other,
         }
@@ -210,20 +231,61 @@ fn watched_roots(
         roots.push(WatchedKnowledgeRoot {
             path: workspace_root,
             kind: KnowledgeRootKind::Workspace,
+            doc_type: None,
+            logical_prefix: String::new(),
         });
     }
-    if let Some(app_root) = app_knowledge_dir {
+
+    if let Some(app_root) = app_knowledge_dir.as_ref() {
         if app_root.is_dir() {
             let is_duplicate = roots
                 .iter()
-                .any(|existing| same_path(&existing.path, &app_root));
+                .any(|existing| same_path(&existing.path, app_root));
             if !is_duplicate {
                 roots.push(WatchedKnowledgeRoot {
-                    path: app_root,
+                    path: app_root.clone(),
                     kind: KnowledgeRootKind::App,
+                    doc_type: None,
+                    logical_prefix: String::new(),
                 });
             }
         }
+    }
+
+    let registry = KnowledgeSourceRegistry::build(working_dir, app_knowledge_dir.as_ref());
+    for source in registry.sources() {
+        if matches!(
+            source.kind,
+            KnowledgeSourceKind::WorkspaceKnowledge | KnowledgeSourceKind::AppKnowledge
+        ) || !source.watch
+            || !source.physical_root.is_dir()
+            || roots
+                .iter()
+                .any(|existing| same_path(&existing.path, &source.physical_root))
+        {
+            continue;
+        }
+        roots.push(WatchedKnowledgeRoot {
+            path: source.physical_root.clone(),
+            kind: KnowledgeRootKind::Registered,
+            doc_type: Some(source.doc_type),
+            logical_prefix: source.logical_prefix.clone(),
+        });
+    }
+    for path in registry.discovery_roots().iter().cloned() {
+        if !path.is_dir()
+            || roots
+                .iter()
+                .any(|existing| same_path(&existing.path, &path))
+        {
+            continue;
+        }
+        roots.push(WatchedKnowledgeRoot {
+            path,
+            kind: KnowledgeRootKind::Discovery,
+            doc_type: Some(KnowledgeType::Skill),
+            logical_prefix: String::new(),
+        });
     }
     roots
 }
@@ -372,13 +434,49 @@ fn resolve_path_change(
     change_kind: KnowledgeFsChangeKind,
 ) -> Option<ResolvedKnowledgeChange> {
     let relative = path.strip_prefix(&root.path).ok()?;
-    let mut components = relative.components();
-    let type_component = match components.next()? {
-        Component::Normal(value) => value.to_string_lossy().to_string(),
-        _ => return None,
+    if root.kind == KnowledgeRootKind::Discovery {
+        let within_root = path_components_to_slash(relative.components());
+        if within_root.is_empty() {
+            return None;
+        }
+        let parent_path = parent_directory(&within_root);
+        if is_markdown_path(path) || path.extension().is_some() {
+            return Some(ResolvedKnowledgeChange::Document {
+                doc_type: KnowledgeType::Skill,
+                path: within_root,
+                parent_path,
+                change_kind,
+                full_reconcile: true,
+            });
+        }
+        return Some(ResolvedKnowledgeChange::Directory {
+            doc_type: KnowledgeType::Skill,
+            path: within_root,
+            parent_path,
+            change_kind,
+            subtree: true,
+            full_reconcile: true,
+        });
+    }
+    let (doc_type, within_type, full_reconcile) = if let Some(doc_type) = root.doc_type {
+        let within_root = path_components_to_slash(relative.components());
+        (
+            doc_type,
+            join_logical_path(&root.logical_prefix, &within_root),
+            true,
+        )
+    } else {
+        let mut components = relative.components();
+        let type_component = match components.next()? {
+            Component::Normal(value) => value.to_string_lossy().to_string(),
+            _ => return None,
+        };
+        (
+            parse_knowledge_type(&type_component)?,
+            path_components_to_slash(components),
+            false,
+        )
     };
-    let doc_type = parse_knowledge_type(&type_component)?;
-    let within_type = path_components_to_slash(components);
 
     if within_type.is_empty() {
         return None;
@@ -391,6 +489,7 @@ fn resolve_path_change(
             path: within_type,
             parent_path,
             change_kind,
+            full_reconcile,
         });
     }
 
@@ -403,6 +502,7 @@ fn resolve_path_change(
             parent_path,
             change_kind: KnowledgeFsChangeKind::Config,
             subtree: true,
+            full_reconcile,
         });
     }
 
@@ -417,10 +517,21 @@ fn resolve_path_change(
             parent_path,
             change_kind,
             subtree: true,
+            full_reconcile,
         });
     }
 
     None
+}
+
+fn join_logical_path(prefix: &str, relative: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    let relative = relative.trim_matches('/');
+    match (prefix.is_empty(), relative.is_empty()) {
+        (true, _) => relative.to_string(),
+        (_, true) => prefix.to_string(),
+        _ => format!("{prefix}/{relative}"),
+    }
 }
 
 fn path_components_to_slash<'a>(components: impl Iterator<Item = Component<'a>>) -> String {
@@ -501,6 +612,25 @@ async fn process_batch_changes(
     knowledge_index_state: Arc<KnowledgeIndexState>,
     changes: Vec<ResolvedKnowledgeChange>,
 ) -> Result<(), String> {
+    if changes
+        .iter()
+        .any(ResolvedKnowledgeChange::requires_full_reconcile)
+    {
+        crate::commands::invalidate_external_skill_cache();
+        commands::reconcile_and_emit_knowledge_changed(
+            app_handle,
+            working_dir,
+            knowledge_index_state,
+            "knowledge_fs_watcher",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        for change in &changes {
+            emit_change_event(app_handle, working_dir, change);
+        }
+        return Ok(());
+    }
+
     for change in changes {
         match &change {
             ResolvedKnowledgeChange::Document { doc_type, path, .. } => {
@@ -550,6 +680,7 @@ fn emit_change_event(app_handle: &AppHandle, working_dir: &str, change: &Resolve
             path,
             parent_path,
             change_kind,
+            ..
         } => KnowledgeChangedTarget {
             doc_type: Some(*doc_type),
             path: Some(path.clone()),
@@ -564,6 +695,7 @@ fn emit_change_event(app_handle: &AppHandle, working_dir: &str, change: &Resolve
             parent_path,
             change_kind,
             subtree,
+            ..
         } => KnowledgeChangedTarget {
             doc_type: Some(*doc_type),
             path: Some(path.clone()),
@@ -583,8 +715,12 @@ fn emit_change_event(app_handle: &AppHandle, working_dir: &str, change: &Resolve
 
 #[cfg(test)]
 mod tests {
-    use super::{directory_path_from_sidecar, parent_directory, parse_knowledge_type};
+    use super::{
+        directory_path_from_sidecar, parent_directory, parse_knowledge_type, resolve_path_change,
+        KnowledgeFsChangeKind, KnowledgeRootKind, ResolvedKnowledgeChange, WatchedKnowledgeRoot,
+    };
     use crate::knowledge_store::KnowledgeType;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_directory_path_from_locus_meta_sidecar() {
@@ -617,5 +753,35 @@ mod tests {
             Some(KnowledgeType::Reference)
         );
         assert_eq!(parse_knowledge_type("unknown"), None);
+    }
+
+    #[test]
+    fn registered_source_changes_keep_the_registry_logical_prefix() {
+        let temp = tempdir().expect("temp dir");
+        let file = temp.path().join("references/details.md");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create parent");
+        std::fs::write(&file, "details").expect("write file");
+        let root = WatchedKnowledgeRoot {
+            path: temp.path().to_path_buf(),
+            kind: KnowledgeRootKind::Registered,
+            doc_type: Some(KnowledgeType::Skill),
+            logical_prefix: "package-id".to_string(),
+        };
+
+        let resolved = resolve_path_change(&file, &root, KnowledgeFsChangeKind::Content)
+            .expect("resolve registered change");
+        match resolved {
+            ResolvedKnowledgeChange::Document {
+                doc_type,
+                path,
+                full_reconcile,
+                ..
+            } => {
+                assert_eq!(doc_type, KnowledgeType::Skill);
+                assert_eq!(path, "package-id/references/details.md");
+                assert!(full_reconcile);
+            }
+            _ => panic!("expected document change"),
+        }
     }
 }

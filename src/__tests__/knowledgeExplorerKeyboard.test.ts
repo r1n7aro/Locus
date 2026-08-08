@@ -88,7 +88,7 @@ describe("resolveKnowledgeTreeKeyboardAction", () => {
     expect(resolve("ArrowLeft", "skill/psd-to-ugui")).toBeNull();
   });
 
-  it("activates, renames, and deletes the focused row", () => {
+  it("activates and deletes the focused row", () => {
     expect(resolve("Enter", "skill/builtin")).toEqual({
       type: "activate",
       path: "skill/builtin",
@@ -97,11 +97,8 @@ describe("resolveKnowledgeTreeKeyboardAction", () => {
       type: "activate",
       path: "skill/psd-to-ugui",
     });
-    expect(resolve("F2", "skill/builtin/create-skill.md")).toEqual({
-      type: "rename",
-      path: "skill/builtin/create-skill.md",
-    });
-    // Packages cannot be renamed from the tree.
+    // Rename is intentionally available only from the context menu.
+    expect(resolve("F2", "skill/builtin/create-skill.md")).toBeNull();
     expect(resolve("F2", "skill/psd-to-ugui")).toBeNull();
     expect(resolve("Delete", "skill/builtin/create-skill.md")).toEqual({
       type: "delete",

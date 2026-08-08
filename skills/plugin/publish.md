@@ -2,7 +2,7 @@
 title: Plugin Publishing
 tools:
   - bash
-  - sheet
+  - ask_user_question
 ---
 
 # Plugin Publishing
@@ -41,7 +41,7 @@ Write the source entry:
 - Include standard stats definitions for GitHub-hosted plugins: `githubStars` with label `Stars` and `releaseDownloads` with label `Release downloads`. Registry CI refreshes the stat values.
 - Store `downloadSource`, never generated `download`, `latestVersion`, or release SHA fields; CI resolves `latestVersion`, `download.url`, `download.sha256`, `download.sizeBytes`, `updatedAt`, and `downloadSource.version` into `public/v1`. Use `downloadSource.type: "latestRelease"` for normal GitHub release publishing. Omit `asset` when each release has exactly one plugin zip. Use `assetPattern` such as `locus-workspace-*.zip` when asset names include the version, and never set `asset` to a versioned filename. A release with multiple zip assets must set `asset` or `assetPattern` so CI fails instead of guessing.
 - After the user confirms the plugin id, check registry duplicates on the target base branch: compute the bucket and read the entry path. If the id exists, ask whether this is a new version of that plugin, a replacement or fork under a new id, or a stop.
-- Before opening the PR, confirm the registry metadata with the `sheet` tool in one form: target repository, plugin id, author, release source rule, top-level `summary`, top-level `description`, `summaryI18n.en`, `summaryI18n.zh`, `descriptionI18n.en`, `descriptionI18n.zh`, `descriptionSource`, `descriptionSourceI18n.en`, `descriptionSourceI18n.zh`, license, compatibility, dependency metadata, plugin purpose, usage instructions, and stats definitions. Prefer repository README files such as `README.en.md` and `README.zh.md` for localized `descriptionSourceI18n` values, with `README.md` as the shared fallback. Apply user edits from the confirmed sheet to the source entry. After a change request, revise and present an updated sheet before continuing.
+- Before opening the PR, present the registry metadata in one concise block: target repository, plugin id, author, release source rule, top-level `summary`, top-level `description`, `summaryI18n.en`, `summaryI18n.zh`, `descriptionI18n.en`, `descriptionI18n.zh`, `descriptionSource`, `descriptionSourceI18n.en`, `descriptionSourceI18n.zh`, license, compatibility, dependency metadata, plugin purpose, usage instructions, and stats definitions. Prefer repository README files such as `README.en.md` and `README.zh.md` for localized `descriptionSourceI18n` values, with `README.md` as the shared fallback. Ask for explicit approval with `ask_user_question`, apply user edits to the source entry, and repeat the approval step after each change request.
 
 Open the PR from a fork:
 

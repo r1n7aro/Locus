@@ -241,6 +241,10 @@ pub struct SkillPackageManifestFile {
     pub tools: Vec<SkillPackageToolManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unity_yaml_read_extensions: Vec<SkillPackageUnityYamlReadExtension>,
+    /// Package-relative glob patterns for Markdown files that are bundled as
+    /// assets but should stay outside the Knowledge surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_markdown_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,6 +363,47 @@ pub struct SkillCreateRequest {
     pub model_invocation_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillPackageCreateRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_invocation_enabled: Option<bool>,
+}
+
+impl From<SkillPackageCreateRequest> for SkillCreateRequest {
+    fn from(request: SkillPackageCreateRequest) -> Self {
+        Self {
+            kind: SkillCreateKind::Package,
+            name: request.name,
+            path: None,
+            package_id: request.package_id,
+            version: request.version,
+            summary: request.summary,
+            body: request.body,
+            argument_hint: request.argument_hint,
+            command_trigger: request.command_trigger,
+            command_enabled: request.command_enabled,
+            model_invocation_enabled: request.model_invocation_enabled,
+            tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -729,7 +774,7 @@ fn skill_package_slug_from_name(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn resolve_skill_create_package_id(
+fn resolve_skill_package_create_id(
     package_id: Option<String>,
     _default_namespace: Option<&str>,
     name: &str,
@@ -788,6 +833,9 @@ fn package_doc_rel_path_for_virtual_path(
     if !package_rel_path_is_markdown_document(rest) {
         return Ok(None);
     }
+    if package_markdown_file_is_ignored(manifest, rest) {
+        return Ok(None);
+    }
     Ok(Some(rest.to_string()))
 }
 
@@ -797,6 +845,98 @@ pub(crate) fn package_rel_path_is_markdown_document(rel_path: &str) -> bool {
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("md"))
         .unwrap_or(false)
+}
+
+fn normalize_ignored_markdown_pattern(value: &str) -> Result<String, String> {
+    let normalized = value.trim().replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains('\0')
+        || normalized
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "Invalid ignoredMarkdownFiles package-relative glob: {}",
+            value
+        ));
+    }
+    Ok(normalized)
+}
+
+fn wildcard_segment_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = value.chars().collect::<Vec<_>>();
+    let mut pattern_index = 0usize;
+    let mut value_index = 0usize;
+    let mut star_index = None;
+    let mut star_value_index = 0usize;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star) = star_index {
+            star_value_index += 1;
+            value_index = star_value_index;
+            pattern_index = star + 1;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn markdown_path_matches_ignore_pattern(pattern: &str, rel_path: &str) -> bool {
+    fn matches_segments(
+        pattern: &[&str],
+        path: &[&str],
+        pattern_index: usize,
+        path_index: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(cached) = memo[pattern_index][path_index] {
+            return cached;
+        }
+        if pattern_index == pattern.len() {
+            let result = path_index == path.len();
+            memo[pattern_index][path_index] = Some(result);
+            return result;
+        }
+        let result = if pattern[pattern_index] == "**" {
+            matches_segments(pattern, path, pattern_index + 1, path_index, memo)
+                || (path_index < path.len()
+                    && matches_segments(pattern, path, pattern_index, path_index + 1, memo))
+        } else {
+            path_index < path.len()
+                && wildcard_segment_matches(pattern[pattern_index], path[path_index])
+                && matches_segments(pattern, path, pattern_index + 1, path_index + 1, memo)
+        };
+        memo[pattern_index][path_index] = Some(result);
+        result
+    }
+
+    let pattern_segments = pattern.split('/').collect::<Vec<_>>();
+    let path_segments = rel_path.split('/').collect::<Vec<_>>();
+    let mut memo = vec![vec![None; path_segments.len() + 1]; pattern_segments.len() + 1];
+    matches_segments(&pattern_segments, &path_segments, 0, 0, &mut memo)
+}
+
+fn package_markdown_file_is_ignored(manifest: &SkillPackageManifestFile, rel_path: &str) -> bool {
+    manifest
+        .ignored_markdown_files
+        .iter()
+        .any(|pattern| markdown_path_matches_ignore_pattern(pattern, rel_path))
 }
 
 fn package_file_path(root: &Path, rel_path: &str) -> Result<PathBuf, String> {
@@ -957,6 +1097,17 @@ fn normalize_package_manifest(
     for extension in manifest.unity_yaml_read_extensions.iter_mut() {
         normalize_package_unity_yaml_read_extension(extension)?;
     }
+    let mut ignored_markdown_files = BTreeSet::new();
+    for pattern in &manifest.ignored_markdown_files {
+        let normalized = normalize_ignored_markdown_pattern(pattern)?;
+        if markdown_path_matches_ignore_pattern(&normalized, SKILL_PACKAGE_ROOT_DOC_FILE_NAME) {
+            return Err(
+                "Skill package ignoredMarkdownFiles cannot match the required SKILL.md".to_string(),
+            );
+        }
+        ignored_markdown_files.insert(normalized);
+    }
+    manifest.ignored_markdown_files = ignored_markdown_files.into_iter().collect();
     Ok(manifest)
 }
 
@@ -1053,9 +1204,10 @@ fn normalize_package_tool_manifest(tool: &mut SkillPackageToolManifest) -> Resul
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
             if let Some(status) = tool.request_editor_status.as_deref() {
-                if status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
-                    || !crate::unity_bridge::is_known_editor_status(status)
-                {
+                let supported = status == "any"
+                    || (status != crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
+                        && crate::unity_bridge::is_known_editor_status(status));
+                if !supported {
                     return Err(format!(
                         "Skill package Unity tool '{}' has invalid requestEditorStatus '{}'",
                         tool.name, status
@@ -2239,6 +2391,9 @@ fn configure_skill_process_env(
     }
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PYTHONUTF8", "1");
+    for (key, value) in crate::python_runtime::locus_sdk_invocation_env() {
+        cmd.env(key, value);
+    }
 
     if let Some(python) = python {
         cmd.env("LOCUS_PYTHON", &python.path);
@@ -2254,13 +2409,12 @@ fn configure_skill_process_env(
             cmd.env("PIP_NO_WARN_SCRIPT_LOCATION", "1");
             if let Some(package_dir) = python.package_dir.as_ref() {
                 cmd.env("PIP_TARGET", package_dir);
-                if let Some(python_path) = crate::python_runtime::managed_python_path_env(
-                    std::env::var_os("PYTHONPATH"),
-                    python,
-                ) {
-                    cmd.env("PYTHONPATH", python_path);
-                }
             }
+        }
+        if let Some(python_path) =
+            crate::python_runtime::managed_python_path_env(std::env::var_os("PYTHONPATH"), python)
+        {
+            cmd.env("PYTHONPATH", python_path);
         }
     }
 
@@ -2588,7 +2742,7 @@ async fn run_skill_package_unity_tool(
     if !connected {
         return Err("Unity Editor not connected".to_string());
     }
-    if actual_status != requested_status {
+    if requested_status != "any" && actual_status != requested_status {
         return Err(format!(
             "Unity Editor status is \"{}\". Skill package Unity tool '{}' requires \"{}\".",
             actual_status, tool.name, requested_status
@@ -2674,11 +2828,38 @@ async fn run_skill_package_dynamic_unity_tool(
     if assembly_id.is_empty() {
         return Err("Skill package compile response is missing assemblyId".to_string());
     }
-    let payload =
-        skill_package_invoke_payload(package_id, Some(assembly_id), &entry_type, method, args)?;
+    let invoke_args = skill_package_dynamic_unity_args(package_root, project_path, args)?;
+    let payload = skill_package_invoke_payload(
+        package_id,
+        Some(assembly_id),
+        &entry_type,
+        method,
+        &invoke_args,
+    )?;
     let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
 
     Ok(format_json_or_text(&raw))
+}
+
+fn skill_package_dynamic_unity_args(
+    package_root: &Path,
+    project_path: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut object = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Skill package Unity tool arguments must be a JSON object.".to_string())?;
+    let resolved_root =
+        dunce::canonicalize(package_root).unwrap_or_else(|_| package_root.to_path_buf());
+    object.insert(
+        "__locus".to_string(),
+        serde_json::json!({
+            "skillPackageRoot": resolved_root.to_string_lossy(),
+            "workingDirectory": project_path,
+        }),
+    );
+    Ok(serde_json::Value::Object(object))
 }
 
 fn format_json_or_text(raw: &str) -> String {
@@ -3001,9 +3182,9 @@ pub(crate) fn read_skill_package_document_sync(
         "maintenanceRules" => "maintenanceRules",
         other => {
             return Err(format!(
-                "knowledge_read part must be one of: full, summary, body, maintenanceRules (got '{}')",
-                other
-            ))
+            "knowledge_read part must be one of: full, summary, body, maintenanceRules (got '{}')",
+            other
+        ))
         }
     };
 
@@ -3023,7 +3204,10 @@ pub(crate) fn read_skill_package_document_sync(
         let Some(mut document) =
             super::skill_external::external_to_document_for(&record, &doc_rel_path, config)
         else {
-            return Err(format!("External skill document not found: {}", virtual_path));
+            return Err(format!(
+                "External skill document not found: {}",
+                virtual_path
+            ));
         };
         match normalized_part {
             "full" => {}
@@ -3635,6 +3819,9 @@ fn list_package_document_rel_paths(record: &SkillPackageRecord) -> Vec<String> {
         if !package_rel_path_is_markdown_document(&normalized_rel_path) {
             continue;
         }
+        if package_markdown_file_is_ignored(&record.manifest, &normalized_rel_path) {
+            continue;
+        }
         if std::fs::read_to_string(entry.path()).is_err() {
             continue;
         }
@@ -3709,7 +3896,9 @@ pub(crate) fn list_skill_package_knowledge_items_sync_with_hidden(
         {
             continue;
         }
-        items.extend(super::skill_external::external_to_list_items(record, config));
+        items.extend(super::skill_external::external_to_list_items(
+            record, config,
+        ));
     }
     items
         .into_iter()
@@ -4183,6 +4372,13 @@ fn required_skill_create_text(value: Option<String>, field: &str) -> Result<Stri
     optional_trimmed(value).ok_or_else(|| format!("'{}' parameter is required.", field))
 }
 
+fn required_skill_package_version(value: Option<String>) -> Result<String, String> {
+    let version = required_skill_create_text(value, "version")?;
+    semver::Version::parse(&version)
+        .map_err(|error| format!("Invalid semantic version '{}': {}", version, error))?;
+    Ok(version)
+}
+
 pub(crate) fn default_package_command_name(package_id: &str) -> String {
     package_id
         .rsplit('.')
@@ -4302,8 +4498,8 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
     }
 
     let name = required_skill_create_text(Some(request.name), "name")?;
-    let package_id = resolve_skill_create_package_id(request.package_id, default_namespace, &name)?;
-    let version = required_skill_create_text(request.version, "version")?;
+    let package_id = resolve_skill_package_create_id(request.package_id, default_namespace, &name)?;
+    let version = required_skill_package_version(request.version)?;
     let summary = required_skill_create_text(request.summary, "summary")?;
     let argument_hint = optional_trimmed(request.argument_hint);
     let command_enabled = request.command_enabled.unwrap_or(true);
@@ -4348,6 +4544,7 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             capabilities: SkillPackageCapabilities::default(),
             tools: Vec::new(),
             unity_yaml_read_extensions: Vec::new(),
+            ignored_markdown_files: Vec::new(),
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| format!("Failed to render Skill package manifest: {}", e))?;
@@ -5798,6 +5995,7 @@ Create a project skill.
                 path: "skill/psd-tools/references".to_string(),
                 doc_type: None,
                 part: None,
+                include_history: false,
             },
         )
         .expect("knowledge_read directory should succeed for package subdirectory");
@@ -6287,11 +6485,55 @@ Use Feishu safely.
     }
 
     #[test]
+    fn markdown_ignore_globs_match_package_relative_paths() {
+        assert!(super::markdown_path_matches_ignore_pattern(
+            "runtime/**/LICENSE.md",
+            "runtime/windows-x64/LICENSE.md"
+        ));
+        assert!(super::markdown_path_matches_ignore_pattern(
+            "**/LICENSE.md",
+            "LICENSE.md"
+        ));
+        assert!(super::markdown_path_matches_ignore_pattern(
+            "references/*.md",
+            "references/usage.md"
+        ));
+        assert!(!super::markdown_path_matches_ignore_pattern(
+            "references/*.md",
+            "references/nested/usage.md"
+        ));
+        assert!(!super::markdown_path_matches_ignore_pattern(
+            "runtime/**/LICENSE.md",
+            "runtime/windows-x64/README.md"
+        ));
+    }
+
+    #[test]
+    fn package_manifest_rejects_ignoring_required_root_document() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "root-ignore",
+  "name": "Root Ignore",
+  "ignoredMarkdownFiles": ["**/*.md"]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# Root Ignore\n").unwrap();
+
+        let error = super::load_skill_package_record(temp.path()).unwrap_err();
+        assert!(error.contains("cannot match the required SKILL.md"));
+    }
+
+    #[test]
     fn package_knowledge_items_include_markdown_subfiles_only() {
         let temp = TempDir::new().unwrap();
         std::fs::create_dir_all(temp.path().join("references")).unwrap();
         std::fs::create_dir_all(temp.path().join("scripts").join("__pycache__")).unwrap();
         std::fs::create_dir_all(temp.path().join("unity").join("Editor")).unwrap();
+        std::fs::create_dir_all(temp.path().join("runtime").join("windows-x64")).unwrap();
         std::fs::write(
             temp.path().join("skill.json"),
             r#"{
@@ -6300,6 +6542,7 @@ Use Feishu safely.
   "version": "0.1.0",
   "name": "PSD to uGUI",
   "description": "Parse PSD files.",
+  "ignoredMarkdownFiles": ["runtime/**/LICENSE.md"],
   "command": {
     "enabled": true,
     "trigger": "/psd-to-ugui"
@@ -6338,8 +6581,28 @@ Use Feishu safely.
             "public static class PsdToUguiBridge {}\n",
         )
         .unwrap();
+        std::fs::write(
+            temp.path()
+                .join("runtime")
+                .join("windows-x64")
+                .join("LICENSE.md"),
+            "# Bundled dependency license\n",
+        )
+        .unwrap();
 
         let record = super::load_skill_package_record(temp.path()).unwrap();
+        assert_eq!(
+            record.manifest.ignored_markdown_files,
+            vec!["runtime/**/LICENSE.md"]
+        );
+        assert_eq!(
+            super::package_doc_rel_path_for_virtual_path(
+                &record.manifest,
+                "com.locus.psd-to-ugui/runtime/windows-x64/LICENSE.md"
+            )
+            .unwrap(),
+            None
+        );
         let items = super::package_to_list_items(&record, None);
         let paths = items
             .iter()
@@ -6492,6 +6755,68 @@ Use Feishu safely.
     }
 
     #[test]
+    fn dynamic_unity_tool_args_include_reserved_skill_context() {
+        let temp = TempDir::new().unwrap();
+        let args = super::skill_package_dynamic_unity_args(
+            temp.path(),
+            r#"F:\Projects\Example"#,
+            &serde_json::json!({
+                "target": "game",
+                "__locus": { "skillPackageRoot": "untrusted" }
+            }),
+        )
+        .expect("contextual args");
+
+        assert_eq!(args["target"], "game");
+        assert_eq!(
+            args["__locus"]["workingDirectory"],
+            r#"F:\Projects\Example"#
+        );
+        assert_eq!(
+            args["__locus"]["skillPackageRoot"],
+            dunce::canonicalize(temp.path())
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn skill_package_unity_tool_accepts_any_editor_status() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "renderdoc",
+  "version": "0.1.0",
+  "name": "RenderDoc",
+  "description": "Capture frames.",
+  "tools": [
+    {
+      "name": "renderdoc-capture-frame",
+      "description": "Capture a frame.",
+      "runtime": "unity",
+      "path": "unity/Editor/RenderDocCapture.cs",
+      "entryType": "Locus.Skills.RenderDocCapture",
+      "method": "CaptureFrame",
+      "requestEditorStatus": "any",
+      "parameters": { "type": "object", "properties": {} }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# RenderDoc\n").unwrap();
+
+        let record = super::load_skill_package_record(temp.path()).expect("load package");
+        assert_eq!(
+            record.manifest.tools[0].request_editor_status.as_deref(),
+            Some("any")
+        );
+    }
+
+    #[test]
     fn create_skill_document_sync_requires_summary_metadata() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -6513,7 +6838,10 @@ Use Feishu safely.
                 kind: super::SkillCreateKind::Md,
                 name: "asset-audit".to_string(),
                 summary: Some("Audit Unity assets.".to_string()),
-                tools: vec!["skill_create".to_string(), "skill_reload".to_string()],
+                tools: vec![
+                    "create_skill_package".to_string(),
+                    "skill_reload".to_string(),
+                ],
                 ..Default::default()
             },
         )
@@ -6521,7 +6849,7 @@ Use Feishu safely.
         assert_eq!(manifest.dir_name, "asset-audit");
         assert_eq!(manifest.command_trigger, "/asset-audit");
         assert_eq!(manifest.description, "Audit Unity assets.");
-        assert_eq!(manifest.tools, vec!["skill_create", "skill_reload"]);
+        assert_eq!(manifest.tools, vec!["create_skill_package", "skill_reload"]);
 
         let saved = crate::knowledge_store::read_document(
             &working_dir,
@@ -6531,7 +6859,10 @@ Use Feishu safely.
         )
         .expect("read created skill document");
         assert_eq!(saved.document.body, "## Instructions");
-        assert_eq!(saved.document.tools, vec!["skill_create", "skill_reload"]);
+        assert_eq!(
+            saved.document.tools,
+            vec!["create_skill_package", "skill_reload"]
+        );
     }
 
     #[test]
@@ -6831,6 +7162,27 @@ Use Feishu safely.
     }
 
     #[test]
+    fn create_skill_package_rejects_invalid_semantic_version() {
+        let temp = TempDir::new().unwrap();
+
+        let err = super::create_skill_package_in_parent_sync(
+            temp.path(),
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                name: "Asset Audit".to_string(),
+                package_id: Some("asset-audit".to_string()),
+                version: Some("latest".to_string()),
+                summary: Some("Audit Unity assets.".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect_err("invalid semantic version should be rejected");
+
+        assert!(err.contains("Invalid semantic version 'latest'"));
+        assert!(!temp.path().join("asset-audit").exists());
+    }
+
+    #[test]
     fn package_default_command_uses_package_tail_not_display_name() {
         let temp = TempDir::new().unwrap();
         std::fs::write(
@@ -6984,12 +7336,35 @@ Create a project skill.
         )
         .expect("create package");
         let package_root = source_parent.path().join("com.example.asset-audit");
+        let manifest_path = package_root.join("skill.json");
+        let mut manifest_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("read package manifest"),
+        )
+        .expect("parse package manifest");
+        manifest_json["ignoredMarkdownFiles"] = serde_json::json!(["runtime/**/LICENSE.md"]);
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&manifest_json).expect("render package manifest")
+            ),
+        )
+        .expect("write package manifest");
         std::fs::create_dir_all(package_root.join("docs")).unwrap();
         std::fs::write(package_root.join("docs").join("usage.md"), "# Usage\n").unwrap();
         std::fs::create_dir_all(package_root.join("scripts")).unwrap();
         std::fs::write(
             package_root.join("scripts").join("audit.py"),
             "print('ok')\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(package_root.join("runtime").join("windows-x64")).unwrap();
+        std::fs::write(
+            package_root
+                .join("runtime")
+                .join("windows-x64")
+                .join("LICENSE.md"),
+            "# Dependency license\n",
         )
         .unwrap();
 
@@ -7015,6 +7390,16 @@ Create a project skill.
         assert!(imported_root.join("SKILL.md").is_file());
         assert!(imported_root.join("docs").join("usage.md").is_file());
         assert!(imported_root.join("scripts").join("audit.py").is_file());
+        assert!(imported_root
+            .join("runtime")
+            .join("windows-x64")
+            .join("LICENSE.md")
+            .is_file());
+        let imported_record =
+            super::load_skill_package_record(&imported_root).expect("load imported package");
+        assert!(!super::package_to_list_items(&imported_record, None)
+            .iter()
+            .any(|item| item.path.ends_with("LICENSE.md")));
     }
 
     #[test]

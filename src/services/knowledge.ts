@@ -20,6 +20,9 @@ import type {
   KnowledgeMutationResult,
   KnowledgeReadResult,
   KnowledgeSearchResult,
+  KnowledgeInjectMode,
+  KnowledgeInjectModeSetting,
+  KnowledgeAiMaintainedSetting,
   EmbeddingConfig,
   EmbeddingLocalModelCatalog,
   EmbeddingLocalModelDirectoryInspection,
@@ -51,7 +54,7 @@ interface KnowledgeReadPayload {
   type: KnowledgeDocument["type"];
   path: string;
   title: string;
-  injectMode: KnowledgeDocument["injectMode"];
+  injectMode: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   injectModeSource?: KnowledgeConfigSource | null;
   summaryEnabled: boolean;
@@ -84,8 +87,8 @@ interface KnowledgeQueryPayload {
   path: string;
   title: string;
   storageSource?: KnowledgeSearchResult["storageSource"];
-  injectMode: KnowledgeSearchResult["injectMode"];
-  aiMaintained: KnowledgeSearchResult["aiMaintained"];
+  injectMode: KnowledgeInjectMode;
+  aiMaintained: boolean;
   score: number;
   snippet: string;
   matchedSection?: KnowledgeSearchResult["matchedSection"] | null;
@@ -96,6 +99,23 @@ interface KnowledgeQueryPayload {
   semanticScore?: number | null;
   semanticConfidence?: number | null;
   estimatedTokens?: number | null;
+  physicalPath?: string;
+  displayPath?: string;
+  startLine?: number;
+  endLine?: number;
+  summaryStartLine?: number | null;
+  bodyStartLine?: number;
+}
+
+interface KnowledgeDocumentSummaryPayload
+  extends Omit<
+    KnowledgeReadPayload,
+    "body" | "maintenanceRules" | "part" | "fileMetadata"
+  > {
+  hasBodyContent?: boolean;
+  byteSize?: number | null;
+  lexicalSearchEnabled?: boolean | null;
+  semanticSearchEnabled?: boolean | null;
 }
 
 interface KnowledgeReadResultPayload {
@@ -116,7 +136,7 @@ interface KnowledgeMutationPayload {
 interface KnowledgeDirectoryConfigPayload {
   version: number;
   summary: string;
-  injectMode?: KnowledgeDocument["injectMode"];
+  injectMode?: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   aiMaintained: boolean;
   inheritAiConfig?: boolean;
@@ -200,50 +220,94 @@ function resolveKnowledgeDirectoryPath(
 }
 
 function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
+  const summary = payload.summaryEnabled && payload.summary?.trim()
+    ? payload.summary.trim()
+    : null;
+  const injectMode: KnowledgeInjectModeSetting = payload.inheritInjectMode
+    ? "inherit"
+    : payload.injectMode;
+  const aiMaintained: KnowledgeAiMaintainedSetting = payload.inheritAiConfig
+    ? "inherit"
+    : payload.aiMaintained;
+  const maintenanceRules = !payload.inheritAiConfig
+    && payload.explicitMaintenanceRules
+    && payload.maintenanceRules?.trim()
+    ? payload.maintenanceRules
+    : null;
   return {
     id: payload.id,
     type: payload.type,
     path: payload.path,
     title: payload.title,
-    injectMode: payload.injectMode,
-    inheritInjectMode: payload.inheritInjectMode ?? false,
+    injectMode,
+    effectiveInjectMode: payload.injectMode,
     injectModeSource: payload.injectModeSource ?? { kind: "self", path: null },
-    summaryEnabled: payload.summaryEnabled,
-    commandEnabled: payload.commandEnabled,
     readOnly: payload.readOnly,
-    aiMaintained: payload.aiMaintained,
+    aiMaintained,
+    effectiveAiMaintained: payload.aiMaintained,
     storageSource: payload.storageSource ?? "project",
-    inheritAiConfig: payload.inheritAiConfig ?? false,
     aiConfigSource: payload.aiConfigSource ?? { kind: "self", path: null },
-    explicitMaintenanceRules: payload.explicitMaintenanceRules ?? false,
     externalSource: payload.externalSource ?? null,
     skillEnabled: payload.skillEnabled ?? null,
     skillSurface: payload.skillSurface ?? null,
     commandTrigger: payload.commandTrigger ?? null,
     argumentHint: payload.argumentHint ?? null,
     tools: payload.tools ?? [],
-    summary: payload.summary ?? null,
+    summary,
     body: payload.body ?? "",
-    maintenanceRules: payload.maintenanceRules ?? null,
-    createdAt: payload.createdAt,
-    updatedAt: payload.updatedAt,
-    hasSummary: payload.summaryEnabled && !!payload.summary?.trim(),
+    maintenanceRules,
+    effectiveMaintenanceRules: payload.maintenanceRules ?? null,
+    modifiedAt: payload.updatedAt,
     hasBodyContent: payload.hasBodyContent ?? !!payload.body?.trim(),
     fileMetadata: payload.fileMetadata ?? null,
+  };
+}
+
+function normalizeDocumentSummary(
+  payload: KnowledgeDocumentSummaryPayload,
+): KnowledgeDocumentSummary {
+  const document = normalizeDocument({
+    ...payload,
+    body: "",
+    maintenanceRules: null,
+  });
+  const {
+    body: _body,
+    maintenanceRules: _maintenanceRules,
+    effectiveMaintenanceRules: _effectiveMaintenanceRules,
+    fileMetadata: _fileMetadata,
+    ...summary
+  } = document;
+  return {
+    ...summary,
+    hasBodyContent: payload.hasBodyContent ?? false,
+    byteSize: payload.byteSize ?? undefined,
+    lexicalSearchEnabled: payload.lexicalSearchEnabled ?? undefined,
+    semanticSearchEnabled: payload.semanticSearchEnabled ?? undefined,
   };
 }
 
 function normalizeDirectoryConfig(
   payload: KnowledgeDirectoryConfigPayload,
 ): KnowledgeDirectoryConfigRecord {
+  const injectMode: KnowledgeInjectModeSetting = payload.inheritInjectMode
+    ? "inherit"
+    : (payload.injectMode ?? "excerpt");
+  const aiMaintained: KnowledgeAiMaintainedSetting = payload.inheritAiConfig
+    ? "inherit"
+    : !!payload.aiMaintained;
+  const maintenanceRules = !payload.inheritAiConfig
+    && payload.explicitMaintenanceRules
+    && payload.maintenanceRules?.trim()
+    ? payload.maintenanceRules
+    : null;
   return {
     version: payload.version,
     summary: payload.summary ?? "",
-    injectMode: payload.injectMode ?? "excerpt",
-    inheritInjectMode: payload.inheritInjectMode ?? false,
-    aiMaintained: !!payload.aiMaintained,
-    inheritAiConfig: payload.inheritAiConfig ?? false,
-    explicitMaintenanceRules: !!payload.explicitMaintenanceRules,
+    injectMode,
+    effectiveInjectMode: payload.injectMode ?? "excerpt",
+    aiMaintained,
+    effectiveAiMaintained: !!payload.aiMaintained,
     lexicalSearch: payload.lexicalSearch ?? "inherit",
     vectorSearch: payload.vectorSearch ?? "inherit",
     inheritToChildren: payload.inheritToChildren !== false,
@@ -251,7 +315,8 @@ function normalizeDirectoryConfig(
     allowCreateDirectories: payload.allowCreateDirectories !== false,
     allowMoveDocuments: payload.allowMoveDocuments !== false,
     allowMoveDirectories: payload.allowMoveDirectories !== false,
-    maintenanceRules: payload.maintenanceRules ?? "",
+    maintenanceRules,
+    effectiveMaintenanceRules: payload.maintenanceRules ?? null,
     type: payload.type,
     path: payload.path,
     configPath: payload.configPath,
@@ -310,25 +375,104 @@ function normalizeMutationResult(
   };
 }
 
-export function knowledgeList(
+export async function knowledgeList(
   input: KnowledgeDocumentListInput = {},
 ): Promise<KnowledgeDocumentSummary[]> {
-  return ipcInvoke<KnowledgeDocumentSummary[]>("knowledge_list", {
+  const payload = await ipcInvoke<KnowledgeDocumentSummaryPayload[]>("knowledge_list", {
     docType: input.type,
     pathPrefix: input.pathPrefix,
     includeHidden: input.includeHidden ?? true,
   });
+  return payload.map(normalizeDocumentSummary);
 }
 
-export function knowledgeListPage(
+function documentPatchForIpc(
+  patch: NonNullable<KnowledgeCreateInput["document"] | KnowledgeEditInput["document"]>,
+) {
+  const payload: Record<string, unknown> = { ...patch };
+  delete payload.effectiveInjectMode;
+  delete payload.effectiveAiMaintained;
+  delete payload.effectiveMaintenanceRules;
+  if (patch.injectMode !== undefined) {
+    if (patch.injectMode === "inherit") {
+      payload.inheritInjectMode = true;
+      delete payload.injectMode;
+    } else {
+      payload.inheritInjectMode = false;
+      payload.injectMode = patch.injectMode;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "summary")) {
+    payload.summaryEnabled = !!patch.summary?.trim();
+  }
+  if (patch.aiMaintained !== undefined) {
+    if (patch.aiMaintained === "inherit") {
+      payload.inheritAiConfig = true;
+      delete payload.aiMaintained;
+    } else {
+      payload.inheritAiConfig = false;
+      payload.aiMaintained = patch.aiMaintained;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "maintenanceRules")) {
+    payload.explicitMaintenanceRules = !!patch.maintenanceRules?.trim();
+  }
+  return payload;
+}
+
+function directoryPatchForIpc(
+  patch: NonNullable<KnowledgeEditInput["config"]>,
+) {
+  const payload: Record<string, unknown> = { ...patch };
+  delete payload.effectiveInjectMode;
+  delete payload.effectiveAiMaintained;
+  delete payload.effectiveMaintenanceRules;
+  if (patch.injectMode !== undefined) {
+    if (patch.injectMode === "inherit") {
+      payload.inheritInjectMode = true;
+      delete payload.injectMode;
+    } else {
+      payload.inheritInjectMode = false;
+      payload.injectMode = patch.injectMode;
+    }
+  }
+  if (patch.aiMaintained !== undefined) {
+    if (patch.aiMaintained === "inherit") {
+      payload.inheritAiConfig = true;
+      delete payload.aiMaintained;
+      delete payload.explicitMaintenanceRules;
+      delete payload.maintenanceRules;
+    } else {
+      payload.inheritAiConfig = false;
+      payload.aiMaintained = patch.aiMaintained;
+    }
+  }
+  if (
+    patch.aiMaintained !== "inherit" &&
+    Object.prototype.hasOwnProperty.call(patch, "maintenanceRules")
+  ) {
+    payload.explicitMaintenanceRules = !!patch.maintenanceRules?.trim();
+    payload.maintenanceRules = patch.maintenanceRules ?? "";
+  }
+  return payload;
+}
+
+export async function knowledgeListPage(
   input: KnowledgeDocumentListInput = {},
 ): Promise<KnowledgeDocumentListPage> {
-  return ipcInvoke<KnowledgeDocumentListPage>("knowledge_list_page", {
+  const payload = await ipcInvoke<{
+    items: KnowledgeDocumentSummaryPayload[];
+    nextCursor?: string | null;
+  }>("knowledge_list_page", {
     docType: input.type,
     pathPrefix: input.pathPrefix,
     cursor: input.cursor,
     limit: input.limit,
   });
+  return {
+    items: payload.items.map(normalizeDocumentSummary),
+    nextCursor: payload.nextCursor ?? null,
+  };
 }
 
 export function knowledgeListDirectories(
@@ -337,22 +481,26 @@ export function knowledgeListDirectories(
   return ipcInvoke<string[]>("knowledge_list_directories", { docType: type });
 }
 
-export function knowledgeListDirectoryDocuments(
+export async function knowledgeListDirectoryDocuments(
   type: KnowledgeDocument["type"],
   path: string,
 ): Promise<KnowledgeDocumentSummary[]> {
-  return ipcInvoke<KnowledgeDocumentSummary[]>(
+  const payload = await ipcInvoke<KnowledgeDocumentSummaryPayload[]>(
     "knowledge_list_directory_documents",
     { docType: type, path },
   );
+  return payload.map(normalizeDocumentSummary);
 }
 
-export function knowledgeListDirectoryDocumentsPage(
+export async function knowledgeListDirectoryDocumentsPage(
   type: KnowledgeDocument["type"],
   path: string,
   options: { cursor?: string | null; limit?: number } = {},
 ): Promise<KnowledgeDocumentListPage> {
-  return ipcInvoke<KnowledgeDocumentListPage>(
+  const payload = await ipcInvoke<{
+    items: KnowledgeDocumentSummaryPayload[];
+    nextCursor?: string | null;
+  }>(
     "knowledge_list_directory_documents_page",
     {
       docType: type,
@@ -361,6 +509,10 @@ export function knowledgeListDirectoryDocumentsPage(
       limit: options.limit,
     },
   );
+  return {
+    items: payload.items.map(normalizeDocumentSummary),
+    nextCursor: payload.nextCursor ?? null,
+  };
 }
 
 export async function knowledgeListExternalReferenceDirectories(): Promise<
@@ -388,7 +540,7 @@ export async function knowledgeQuery(
     limit: input.limit,
     types: input.types,
     pathPrefix: input.pathPrefix,
-    includeHidden: input.includeHidden ?? true,
+    includeHidden: input.includeHidden ?? false,
   });
 
   return results.map((result) => ({
@@ -397,8 +549,8 @@ export async function knowledgeQuery(
     path: result.path,
     title: result.title,
     storageSource: result.storageSource ?? "project",
-    injectMode: result.injectMode,
-    aiMaintained: result.aiMaintained,
+    effectiveInjectMode: result.injectMode,
+    effectiveAiMaintained: result.aiMaintained,
     score: result.score,
     snippet: result.snippet,
     matchKind: result.matchKind ?? "lexical",
@@ -407,7 +559,13 @@ export async function knowledgeQuery(
     semanticScore: result.semanticScore ?? null,
     semanticConfidence: result.semanticConfidence ?? null,
     estimatedTokens: result.estimatedTokens ?? undefined,
-    updatedAt: result.updatedAt,
+    modifiedAt: result.updatedAt,
+    physicalPath: result.physicalPath || undefined,
+    displayPath: result.displayPath || undefined,
+    startLine: result.startLine || undefined,
+    endLine: result.endLine || undefined,
+    summaryStartLine: result.summaryStartLine ?? undefined,
+    bodyStartLine: result.bodyStartLine || undefined,
   }));
 }
 
@@ -746,6 +904,7 @@ export async function knowledgeRead(
         path,
         type: input.type,
         part: input.part ?? "full",
+        includeHistory: input.includeHistory ?? false,
       },
     },
   );
@@ -766,7 +925,7 @@ export async function knowledgeCreate(
         kind: input.kind,
         path,
         type: input.type,
-        document: input.document,
+        document: input.document ? documentPatchForIpc(input.document) : undefined,
       },
     },
   );
@@ -785,8 +944,8 @@ export async function knowledgeEdit(
       kind: input.kind,
       path,
       type: input.type,
-      document: input.document,
-      config: input.config,
+      document: input.document ? documentPatchForIpc(input.document) : undefined,
+      config: input.config ? directoryPatchForIpc(input.config) : undefined,
     },
   });
   return normalizeMutationResult(payload);

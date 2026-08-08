@@ -1,6 +1,174 @@
 use super::misc::truncate_utf8_prefix;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending};
+use tauri::Manager;
+use tokio::io::AsyncWriteExt;
+
+fn knowledge_registry_for_context(
+    ctx: &crate::tool::ToolExecutionContext,
+) -> Option<crate::knowledge_source_registry::KnowledgeSourceRegistry> {
+    let working_dir = ctx.working_dir.as_deref()?;
+    let app_knowledge_dir = ctx
+        .app_handle
+        .as_ref()
+        .and_then(|handle| handle.try_state::<crate::commands::AppKnowledgeDir>())
+        .and_then(|state| state.0.as_ref().as_ref().cloned());
+    Some(
+        crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+            working_dir,
+            app_knowledge_dir.as_ref(),
+        ),
+    )
+}
+
+fn knowledge_l1_summary_for_read(
+    ctx: &crate::tool::ToolExecutionContext,
+    file_path: &str,
+    content: &str,
+) -> Option<String> {
+    let working_dir = ctx.working_dir.as_deref()?;
+    let registry = knowledge_registry_for_context(ctx)?;
+    let target = registry.classify_path_string(file_path)?;
+
+    if let Ok(document) =
+        crate::knowledge_store::read_document_from_file(target.physical_path.as_path())
+    {
+        if let Some(summary) = document.summary.map(|value| value.trim().to_string()) {
+            if !summary.is_empty() {
+                return Some(summary);
+            }
+        }
+    }
+
+    if let Some(summary) = super::read_outline::markdown_section_text(content, "L1") {
+        return Some(summary);
+    }
+
+    if target.doc_type != crate::knowledge_store::KnowledgeType::Skill {
+        return None;
+    }
+
+    let app_knowledge_dir = ctx
+        .app_handle
+        .as_ref()
+        .and_then(|handle| handle.try_state::<crate::commands::AppKnowledgeDir>())
+        .and_then(|state| state.0.as_ref().as_ref().cloned());
+    crate::commands::execute_knowledge_read_request(
+        working_dir,
+        app_knowledge_dir.as_ref(),
+        crate::knowledge_store::KnowledgeReadRequest {
+            kind: crate::knowledge_store::KnowledgeTargetKind::Document,
+            path: target.logical_path,
+            doc_type: Some(target.doc_type),
+            part: Some("summary".to_string()),
+            include_history: false,
+        },
+    )
+    .ok()?
+    .document?
+    .document
+    .summary
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn format_generated_knowledge_frontmatter(
+    resolved: &crate::knowledge_source_registry::ResolvedKnowledgePath,
+    prepared: &crate::knowledge_store::PreparedGenericKnowledgeWrite,
+) -> String {
+    format!(
+        "\nKnowledge document registered\n  path: {}\n  physicalPath: {}\n  contentStartLine: {}\nGenerated frontmatter:\n---\n{}---",
+        resolved.display_path,
+        resolved.physical_path.to_string_lossy().replace('\\', "/"),
+        prepared.content_start_line,
+        prepared.frontmatter
+    )
+}
+
+fn has_complete_frontmatter(content: &str) -> bool {
+    let normalized = normalize_lf(content);
+    let content = normalized.trim_start_matches('\u{feff}');
+    content.starts_with("---\n") && content[4..].contains("\n---\n")
+}
+
+fn prepare_missing_knowledge_frontmatter(
+    ctx: &crate::tool::ToolExecutionContext,
+    target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
+    content: &str,
+) -> Result<Option<crate::knowledge_store::PreparedGenericKnowledgeWrite>, String> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    if target.kind != crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+        || has_complete_frontmatter(content)
+    {
+        return Ok(None);
+    }
+    let working_dir = ctx
+        .working_dir
+        .as_deref()
+        .ok_or_else(|| "Knowledge frontmatter generation requires a workspace".to_string())?;
+    crate::knowledge_store::prepare_generic_knowledge_write(
+        working_dir,
+        target.doc_type,
+        &target.logical_path,
+        content,
+    )
+    .map(Some)
+}
+
+async fn sync_written_knowledge(
+    ctx: &crate::tool::ToolExecutionContext,
+    target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
+) -> Option<String> {
+    let target = target?;
+    let working_dir = ctx.working_dir.as_deref()?;
+    let app_handle = ctx.app_handle.as_ref()?;
+    let Some(state) =
+        app_handle.try_state::<std::sync::Arc<crate::knowledge_index::KnowledgeIndexState>>()
+    else {
+        return Some("Knowledge index: filesystem watcher pending".to_string());
+    };
+
+    let result = if target.kind
+        == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+    {
+        crate::commands::sync_visible_document_for_path(
+            app_handle,
+            working_dir,
+            state.inner().clone(),
+            target.doc_type,
+            &target.logical_path,
+        )
+        .await
+    } else {
+        crate::commands::reconcile_and_emit_knowledge_changed(
+            app_handle,
+            working_dir,
+            state.inner().clone(),
+            "generic_file_tool",
+        )
+        .await
+    };
+
+    match result {
+        Ok(()) => {
+            if target.kind
+                == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+            {
+                crate::commands::emit_knowledge_changed(
+                    app_handle,
+                    working_dir,
+                    "generic_file_tool",
+                );
+            }
+            Some("Knowledge index: updated".to_string())
+        }
+        Err(error) => Some(format!(
+            "Knowledge index: immediate update failed; filesystem watcher will retry ({error})"
+        )),
+    }
+}
 
 // ─── read ───────────────────────────────────────────────────────────────────
 
@@ -21,6 +189,19 @@ pub(super) fn read() -> ToolDef {
                             is_error: true,
                         };
                     }
+                };
+
+                let outline = match args.get("outline") {
+                    None => false,
+                    Some(value) => match value.as_bool() {
+                        Some(value) => value,
+                        None => {
+                            return ToolResult {
+                                output: "Parameter 'outline' must be a boolean".to_string(),
+                                is_error: true,
+                            };
+                        }
+                    },
                 };
 
                 let offset = args
@@ -85,6 +266,23 @@ pub(super) fn read() -> ToolDef {
                         is_error: true,
                     }
                 } else {
+                    let outline_kind = if outline {
+                        match super::read_outline::ReadOutlineKind::from_path(&file_path) {
+                            Some(kind) => Some(kind),
+                            None => {
+                                return ToolResult {
+                                    output: format!(
+                                        "Outline mode does not support '{}'. Supported file types: C# (.cs) and Markdown (.md).",
+                                        file_path
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     if ctx.should_redirect_unity_asset_read(&file_path) {
                         return ToolResult {
                             output: format!(
@@ -105,6 +303,28 @@ pub(super) fn read() -> ToolDef {
                     match tokio::fs::read_to_string(&file_path).await {
                         Ok(content) => {
                             let normalized_content = normalize_lf(&content);
+                            if let Some(kind) = outline_kind {
+                                let l1_summary = knowledge_l1_summary_for_read(
+                                    &ctx,
+                                    &file_path,
+                                    &normalized_content,
+                                );
+                                return match super::read_outline::render_outline(
+                                    &file_path,
+                                    &normalized_content,
+                                    kind,
+                                    l1_summary.as_deref(),
+                                ) {
+                                    Ok(output) => ToolResult {
+                                        output,
+                                        is_error: false,
+                                    },
+                                    Err(error) => ToolResult {
+                                        output: error,
+                                        is_error: true,
+                                    },
+                                };
+                            }
                             let lines: Vec<&str> = normalized_content.lines().collect();
                             let total = lines.len();
 
@@ -254,6 +474,123 @@ async fn append_unity_csharp_write_feedback(
     }
 }
 
+async fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file_path)
+        .await?;
+    if let Err(error) = file.write_all(content).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(file_path).await;
+        return Err(error);
+    }
+    file.flush().await
+}
+
+async fn ensure_edit_base_is_current(file_path: &str, expected: &str) -> Result<(), String> {
+    let current = tokio::fs::read_to_string(file_path)
+        .await
+        .map_err(|error| format!("Failed to re-read file '{}': {}", file_path, error))?;
+    if current == expected {
+        return Ok(());
+    }
+    eprintln!(
+        "[FilesystemEdit] conflict path={} expected_bytes={} current_bytes={}",
+        file_path,
+        expected.len(),
+        current.len()
+    );
+    Err(format!(
+        "Edit conflict: '{}' changed after this edit read it. No content was written. Read the current file and retry the replacement.",
+        file_path
+    ))
+}
+
+async fn replace_file_atomically(
+    file_path: &str,
+    content: &[u8],
+    expected_base: Option<&str>,
+) -> Result<(), String> {
+    let path = std::path::PathBuf::from(file_path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("File path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("File path has no file name: {}", path.display()))?
+        .to_string_lossy();
+    let temp_path = parent.join(format!(".{}.locus-{}.tmp", file_name, uuid::Uuid::new_v4()));
+    tokio::fs::write(&temp_path, content)
+        .await
+        .map_err(|error| format!("Failed to write temporary edit file: {}", error))?;
+
+    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        if let Err(error) = tokio::fs::set_permissions(&temp_path, metadata.permissions()).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(format!(
+                "Failed to preserve permissions for '{}': {}",
+                file_path, error
+            ));
+        }
+    }
+
+    if let Some(expected) = expected_base {
+        if let Err(error) = ensure_edit_base_is_current(file_path, expected).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let replace_result = {
+        let temp_path_for_replace = temp_path.clone();
+        let target_path_for_replace = path.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            use windows_core::PCWSTR;
+
+            let temp_wide = temp_path_for_replace
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let target_wide = target_path_for_replace
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(temp_wide.as_ptr()),
+                    PCWSTR(target_wide.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("Atomic edit replace task failed: {}", error))?
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let replace_result = tokio::fs::rename(&temp_path, &path)
+        .await
+        .map_err(|error| error.to_string());
+
+    if let Err(error) = replace_result {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!(
+            "Failed to atomically replace '{}': {}",
+            file_path, error
+        ));
+    }
+    Ok(())
+}
+
 // ─── write ──────────────────────────────────────────────────────────────────
 
 pub(super) fn write() -> ToolDef {
@@ -308,6 +645,71 @@ pub(super) fn write() -> ToolDef {
                     }
                 }
 
+                let knowledge_target = knowledge_registry_for_context(&ctx)
+                    .and_then(|registry| registry.classify_path_string(&file_path));
+                if let Some(target) = knowledge_target.as_ref() {
+                    if !target.mutability.is_writable() {
+                        return ToolResult {
+                            output: format!(
+                                "Knowledge source is {} and cannot be written: {}",
+                                target.mutability.label(),
+                                target.display_path
+                            ),
+                            is_error: true,
+                        };
+                    }
+                }
+
+                let prepared_knowledge = match (
+                    ctx.working_dir.as_deref(),
+                    knowledge_target.as_ref(),
+                ) {
+                    (Some(working_dir), Some(target))
+                        if target.kind
+                            == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge =>
+                    {
+                        let parent_path = std::path::Path::new(&target.logical_path)
+                            .parent()
+                            .map(|path| path.to_string_lossy().replace('\\', "/"))
+                            .filter(|path| !path.is_empty() && path != ".");
+                        if let Err(error) =
+                            crate::commands::ensure_parent_directory_allows_create(
+                                working_dir,
+                                target.doc_type,
+                                parent_path.as_deref(),
+                                crate::knowledge_store::KnowledgeTargetKind::Document,
+                            )
+                        {
+                            return ToolResult {
+                                output: error,
+                                is_error: true,
+                            };
+                        }
+                        match crate::knowledge_store::prepare_generic_knowledge_write(
+                            working_dir,
+                            target.doc_type,
+                            &target.logical_path,
+                            &content,
+                        ) {
+                            Ok(prepared) => Some(prepared),
+                            Err(error) => {
+                                return ToolResult {
+                                    output: format!(
+                                        "Failed to generate knowledge frontmatter for '{}': {}",
+                                        target.display_path, error
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let content_to_write = prepared_knowledge
+                    .as_ref()
+                    .map(|prepared| prepared.content.as_str())
+                    .unwrap_or(content.as_str());
+
                 if let Some(parent) = std::path::Path::new(&file_path).parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         return ToolResult {
@@ -317,7 +719,7 @@ pub(super) fn write() -> ToolDef {
                     }
                 }
 
-                match tokio::fs::write(&file_path, &content).await {
+                match create_new_file(&file_path, content_to_write.as_bytes()).await {
                     Ok(()) => {
                         // Hot reload tracks the pre-edit baseline of every
                         // touched .cs source; a brand-new file's baseline is
@@ -329,9 +731,24 @@ pub(super) fn write() -> ToolDef {
                                 String::new(),
                             )
                             .await;
+                            crate::workspace::note_unity_test_source_written(project, &file_path);
+                        }
+                        let mut base_output = format!("Created {}", file_path);
+                        if let (Some(target), Some(prepared)) =
+                            (knowledge_target.as_ref(), prepared_knowledge.as_ref())
+                        {
+                            base_output.push_str(&format_generated_knowledge_frontmatter(
+                                target, prepared,
+                            ));
+                        }
+                        if let Some(sync_status) =
+                            sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
+                        {
+                            base_output.push('\n');
+                            base_output.push_str(&sync_status);
                         }
                         let output = append_unity_csharp_write_feedback(
-                            format!("Created {}", file_path),
+                            base_output,
                             ctx.working_dir.as_deref(),
                             &file_path,
                         )
@@ -341,8 +758,15 @@ pub(super) fn write() -> ToolDef {
                             is_error: false,
                         }
                     }
-                    Err(e) => ToolResult {
-                        output: format!("Failed to write file '{}': {}", file_path, e),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => ToolResult {
+                        output: format!(
+                            "Path already exists: {} (file)\nUse the write tool only for new files. Use edit for existing files.",
+                            file_path
+                        ),
+                        is_error: true,
+                    },
+                    Err(error) => ToolResult {
+                        output: format!("Failed to write file '{}': {}", file_path, error),
                         is_error: true,
                     },
                 }
@@ -386,6 +810,43 @@ pub(super) fn edit() -> ToolDef {
                         output: format!("Path is a directory: {}", file_path),
                         is_error: true,
                     };
+                }
+
+                let knowledge_target = knowledge_registry_for_context(&ctx)
+                    .and_then(|registry| registry.classify_path_string(&file_path));
+                if let Some(target) = knowledge_target.as_ref() {
+                    if !target.mutability.is_writable() {
+                        return ToolResult {
+                            output: format!(
+                                "Knowledge source is {} and cannot be edited: {}",
+                                target.mutability.label(),
+                                target.display_path
+                            ),
+                            is_error: true,
+                        };
+                    }
+                    if target.kind
+                        == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                        && target.doc_type == crate::knowledge_store::KnowledgeType::Reference
+                    {
+                        if let Some(working_dir) = ctx.working_dir.as_deref() {
+                            if crate::knowledge_store::load_document_by_path(
+                                working_dir,
+                                target.doc_type,
+                                &target.logical_path,
+                            )
+                            .is_ok_and(|document| document.read_only)
+                            {
+                                return ToolResult {
+                                    output: format!(
+                                        "Knowledge document is read-only and cannot be edited: {}",
+                                        target.display_path
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
                 }
 
                 let content = match tokio::fs::read_to_string(&file_path).await {
@@ -503,8 +964,34 @@ pub(super) fn edit() -> ToolDef {
                     }
 
                     if op.old_string.is_empty() {
-                        let rewritten = apply_line_ending(&op.new_string, file_eol);
-                        match tokio::fs::write(&file_path, rewritten).await {
+                        let prepared_knowledge = match prepare_missing_knowledge_frontmatter(
+                            &ctx,
+                            knowledge_target.as_ref(),
+                            &op.new_string,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                return ToolResult {
+                                    output: format!(
+                                        "Failed to generate knowledge frontmatter for '{}': {}",
+                                        file_path, error
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                        };
+                        let final_content = prepared_knowledge
+                            .as_ref()
+                            .map(|prepared| prepared.content.as_str())
+                            .unwrap_or(op.new_string.as_str());
+                        let rewritten = apply_line_ending(final_content, file_eol);
+                        match replace_file_atomically(
+                            &file_path,
+                            rewritten.as_bytes(),
+                            Some(&content),
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 if let Some(project) = ctx.working_dir.as_deref() {
                                     crate::unity_hotreload::coordinator::note_cs_written(
@@ -513,9 +1000,26 @@ pub(super) fn edit() -> ToolDef {
                                         content.clone(),
                                     )
                                     .await;
+                                    crate::workspace::note_unity_test_source_written(
+                                        project, &file_path,
+                                    );
+                                }
+                                let mut base_output = format!("Edited {} [lines:1]", file_path);
+                                if let (Some(target), Some(prepared)) =
+                                    (knowledge_target.as_ref(), prepared_knowledge.as_ref())
+                                {
+                                    base_output.push_str(&format_generated_knowledge_frontmatter(
+                                        target, prepared,
+                                    ));
+                                }
+                                if let Some(sync_status) =
+                                    sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
+                                {
+                                    base_output.push('\n');
+                                    base_output.push_str(&sync_status);
                                 }
                                 let output = append_unity_csharp_write_feedback(
-                                    format!("Created {}", file_path),
+                                    base_output,
                                     ctx.working_dir.as_deref(),
                                     &file_path,
                                 )
@@ -560,8 +1064,30 @@ pub(super) fn edit() -> ToolDef {
                     }
                 }
 
-                let rewritten = apply_line_ending(&current_content, file_eol);
-                match tokio::fs::write(&file_path, rewritten).await {
+                let prepared_knowledge = match prepare_missing_knowledge_frontmatter(
+                    &ctx,
+                    knowledge_target.as_ref(),
+                    &current_content,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!(
+                                "Failed to generate knowledge frontmatter for '{}': {}",
+                                file_path, error
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
+                let final_content = prepared_knowledge
+                    .as_ref()
+                    .map(|prepared| prepared.content.as_str())
+                    .unwrap_or(current_content.as_str());
+                let rewritten = apply_line_ending(final_content, file_eol);
+                match replace_file_atomically(&file_path, rewritten.as_bytes(), Some(&content))
+                    .await
+                {
                     Ok(()) => {
                         // Baseline for hot reload = the file as it was when
                         // the loaded assemblies were compiled (first edit's
@@ -573,6 +1099,7 @@ pub(super) fn edit() -> ToolDef {
                                 content.clone(),
                             )
                             .await;
+                            crate::workspace::note_unity_test_source_written(project, &file_path);
                         }
                         let lines_info = if !start_lines.is_empty() {
                             let nums: Vec<String> =
@@ -581,7 +1108,7 @@ pub(super) fn edit() -> ToolDef {
                         } else {
                             String::new()
                         };
-                        let output = if applied_count > 1 {
+                        let mut output = if applied_count > 1 {
                             format!(
                                 "Edited {} ({} edits applied){}",
                                 file_path, applied_count, lines_info
@@ -589,6 +1116,19 @@ pub(super) fn edit() -> ToolDef {
                         } else {
                             format!("Edited {}{}", file_path, lines_info)
                         };
+                        if let (Some(target), Some(prepared)) =
+                            (knowledge_target.as_ref(), prepared_knowledge.as_ref())
+                        {
+                            output.push_str(&format_generated_knowledge_frontmatter(
+                                target, prepared,
+                            ));
+                        }
+                        if let Some(sync_status) =
+                            sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
+                        {
+                            output.push('\n');
+                            output.push_str(&sync_status);
+                        }
                         let output = append_unity_csharp_write_feedback(
                             output,
                             ctx.working_dir.as_deref(),
@@ -1070,6 +1610,154 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_write_calls_create_same_path_exactly_once() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("race.txt");
+        let target_str = target.to_string_lossy().to_string();
+
+        let (first, second) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let first_tool = write();
+                let second_tool = write();
+                tokio::join!(
+                    (first_tool.execute)(
+                        json!({
+                            "filePath": target_str,
+                            "content": "first payload\n"
+                        }),
+                        ToolExecutionContext::default(),
+                    ),
+                    (second_tool.execute)(
+                        json!({
+                            "filePath": target.to_string_lossy().to_string(),
+                            "content": "second payload\n"
+                        }),
+                        ToolExecutionContext::default(),
+                    )
+                )
+            });
+
+        assert_ne!(first.is_error, second.is_error);
+        let content = std::fs::read_to_string(&target).expect("read winner");
+        assert!(content == "first payload\n" || content == "second payload\n");
+        let loser = if first.is_error { &first } else { &second };
+        assert!(loser.output.contains("Path already exists"));
+    }
+
+    #[test]
+    fn edit_base_check_rejects_external_change() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("external-change.txt");
+        std::fs::write(&target, "current\n").expect("seed file");
+
+        let result = tokio::runtime::Runtime::new().expect("runtime").block_on(
+            super::ensure_edit_base_is_current(&target.to_string_lossy(), "stale\n"),
+        );
+
+        let error = result.expect_err("stale edit must conflict");
+        assert!(error.contains("Edit conflict"));
+        assert_eq!(
+            std::fs::read_to_string(target).expect("read unchanged file"),
+            "current\n"
+        );
+    }
+
+    #[test]
+    fn atomic_replace_leaves_complete_file_and_no_temp_artifact() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("atomic.txt");
+        std::fs::write(&target, "before\n").expect("seed file");
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(super::replace_file_atomically(
+                &target.to_string_lossy(),
+                b"after\n",
+                None,
+            ))
+            .expect("atomic replace");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read replaced file"),
+            "after\n"
+        );
+        let leftovers = std::fs::read_dir(root.path())
+            .expect("list temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".locus-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn write_generates_and_reports_workspace_knowledge_frontmatter() {
+        let root = tempdir().expect("temp dir");
+        let target = root
+            .path()
+            .join("Locus/knowledge/design/gameplay/new-loop.md");
+        let context = ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (write().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "content": "# New Loop\n\n## Content\nThis heading remains ordinary Markdown."
+                    }),
+                    context,
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Generated frontmatter:\n---\n"));
+        assert!(result.output.contains("bodyFormat: markdown"));
+        assert!(result.output.contains("contentStartLine:"));
+        let raw = std::fs::read_to_string(target).expect("read knowledge file");
+        assert!(raw.starts_with("---\n"));
+        assert!(
+            raw.ends_with("# New Loop\n\n## Content\nThis heading remains ordinary Markdown.\n")
+        );
+    }
+
+    #[test]
+    fn edit_adds_and_reports_frontmatter_for_unregistered_plain_knowledge_file() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("Locus/knowledge/memory/context.md");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("create parent");
+        std::fs::write(&target, "Durable preference\n").expect("seed plain markdown");
+        let context = ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "oldString": "Durable preference",
+                        "newString": "Updated durable preference"
+                    }),
+                    context,
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Generated frontmatter:\n---\n"));
+        let raw = std::fs::read_to_string(target).expect("read knowledge file");
+        assert!(raw.starts_with("---\n"));
+        assert!(raw.ends_with("Updated durable preference\n"));
+    }
+
+    #[test]
     fn list_skips_generated_root_directories_by_default() {
         let root = tempdir().expect("temp dir");
         std::fs::create_dir_all(root.path().join("Assets/Scripts")).expect("create scripts");
@@ -1151,6 +1839,85 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.output.contains("<content>\nalpha\nbeta"));
         assert!(!result.output.contains('\r'));
+    }
+
+    #[test]
+    fn read_outline_returns_markdown_ranges_and_injects_knowledge_l1() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("Locus/knowledge/skill/audit.md");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("create parent");
+        std::fs::write(
+            &target,
+            "# Audit\n\n## L1\nUse for focused audits.\n\n## Instructions\nInspect the project.\n",
+        )
+        .expect("seed knowledge markdown");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (read().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "outline": true,
+                        "offset": 999,
+                        "limit": 1
+                    }),
+                    ToolExecutionContext {
+                        working_dir: Some(root.path().to_string_lossy().to_string()),
+                        ..ToolExecutionContext::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("# Audit [lines 1-7]"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("## L1 [lines 3-5]"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("L1 summary (knowledge):\n  Use for focused audits."),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Inspect the project."),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn read_outline_rejects_unsupported_file_types() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("notes.txt");
+        std::fs::write(&target, "notes\n").expect("seed text file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (read().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "outline": true
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("Supported file types: C# (.cs) and Markdown (.md)"));
     }
 
     #[test]

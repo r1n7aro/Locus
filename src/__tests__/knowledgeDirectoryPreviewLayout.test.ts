@@ -19,14 +19,22 @@ describe("KnowledgeDirectoryPreview layout", () => {
     expect(en).toContain('"knowledge.meta.editMode.proposal": "Proposal-based"');
   });
 
-  it("drops the legacy save button and folder meta strip", () => {
+  it("uses the same continuous page structure as document config", () => {
     const preview = read("src/components/knowledge/KnowledgeDirectoryPreview.vue");
 
     expect(preview).not.toContain('t("common.save")');
     expect(preview).not.toContain('class="directory-meta-strip"');
-    expect(preview).not.toContain("directory-meta-item");
     expect(preview).toContain('class="directory-preview-main"');
-    expect(preview).toContain('class="directory-preview-scroll"');
+    expect(preview).toContain('class="directory-config-page"');
+    expect(preview).toContain('class="directory-config-heading"');
+    expect(preview).toContain('class="directory-config-title"');
+    expect(preview).toContain('class="directory-properties"');
+    expect(preview).toContain('class="directory-property-row"');
+    expect(preview).toContain('class="directory-property-dropdown"');
+    expect(preview).not.toContain('class="directory-primary-grid"');
+    expect(preview).not.toContain('class="directory-option-row"');
+    expect(preview).toMatch(/\.directory-config-page\s*\{[\s\S]*width:\s*min\(100%,\s*980px\);/);
+    expect(preview).toMatch(/\.directory-property-row\s*\{[\s\S]*grid-template-columns:\s*140px minmax\(0,\s*1fr\);/);
   });
 
   it("autosaves directory edits and renders a lightweight save footnote", () => {
@@ -47,27 +55,30 @@ describe("KnowledgeDirectoryPreview layout", () => {
     expect(preview).toContain("const editorViewMode = computed<MarkdownEditorViewMode>({");
     expect(preview).toContain('class="directory-view-segmented"');
     expect(preview).toContain(":view-mode=\"editorViewMode\"");
+    expect(preview).toContain(':content-key="`${directoryContentKey}:summary`"');
+    expect(preview).toContain(':content-key="`${directoryContentKey}:maintenanceRules`"');
+    expect(preview).toContain("defer-rendered-editor");
+    expect(preview).toContain("auto-grow");
+    expect(preview).toContain(':min-height="64"');
+    expect(preview).toContain(':min-height="104"');
+    expect(preview).toContain("const directoryContentKey = computed(() =>");
     expect(preview).toContain("import BaseSegmented from \"../ui/BaseSegmented.vue\"");
-    expect(preview).toMatch(/\.directory-rules-editor\s*:deep\(\.base-markdown-editor \.base-markdown-editor-textarea\)\s*\{[\s\S]*height:\s*100%;[\s\S]*box-sizing:\s*border-box;/);
+    expect(preview).toMatch(/\.directory-inline-field\s*:deep\(\.base-markdown-editor\)\s*\{[\s\S]*height:\s*auto;[\s\S]*border-left:\s*1px solid var\(--border-color\);/);
   });
 
-  it("keeps inject mode, search rules, and capabilities ahead of summary and rules", () => {
+  it("keeps the current folder visible until the next folder is ready", () => {
     const preview = read("src/components/knowledge/KnowledgeDirectoryPreview.vue");
 
-    expect(preview).toContain('class="directory-primary-grid"');
-    expect(preview).toContain(
-      'class="directory-card directory-card-plain directory-card-span"',
-    );
+    expect(preview).toContain('v-if="loading && !directory"');
+  });
+
+  it("keeps directory controls in compact property rows ahead of inline content", () => {
+    const preview = read("src/components/knowledge/KnowledgeDirectoryPreview.vue");
+
     expect(preview).not.toContain('t("knowledge.directoryConfig.retrieval")');
     expect(preview).not.toContain('t("knowledge.directoryConfig.retrievalHint")');
-    expect(preview).toMatch(/class="directory-primary-grid"[\s\S]*knowledge\.directoryConfig\.injectMode[\s\S]*knowledge\.directoryConfig\.aiConfig[\s\S]*knowledge\.directoryConfig\.lexicalSearch[\s\S]*knowledge\.directoryConfig\.semanticSearch[\s\S]*knowledge\.directoryConfig\.capabilities/);
-    expect(preview).toMatch(/knowledge\.directoryConfig\.capabilities[\s\S]*knowledge\.directoryConfig\.summary[\s\S]*knowledge\.directoryConfig\.maintenanceRules/);
-    expect(preview).toMatch(
-      /\.directory-card-plain\s*\{[\s\S]*border:\s*none;[\s\S]*background:\s*transparent;/,
-    );
-    expect(preview).toMatch(/\.directory-primary-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
-    expect(preview).toMatch(/\.directory-search-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
-    expect(preview).toMatch(/\.directory-capability-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);/);
+    expect(preview).toMatch(/class="directory-properties"[\s\S]*knowledge\.directoryConfig\.injectMode[\s\S]*knowledge\.directoryConfig\.aiConfig[\s\S]*knowledge\.directoryConfig\.lexicalSearch[\s\S]*knowledge\.directoryConfig\.semanticSearch[\s\S]*knowledge\.directoryConfig\.explicitMaintenanceRules[\s\S]*knowledge\.directoryConfig\.allowMoveDirectories/);
+    expect(preview).toMatch(/knowledge\.directoryConfig\.allowMoveDirectories[\s\S]*class="directory-inline-field directory-inline-summary"[\s\S]*class="directory-inline-field directory-inline-rules"/);
   });
 
   it("shows the effective search rule label when a folder rule inherits", () => {
@@ -81,8 +92,7 @@ describe("KnowledgeDirectoryPreview layout", () => {
     expect(preview).toContain('{ kind: "type_default", path: null }');
     expect(preview).toContain(":options=\"lexicalRuleOptions\"");
     expect(preview).toContain(":options=\"semanticRuleOptions\"");
-    expect(preview).toContain('effectiveCapabilityLabel("lexical", effectiveLexicalSearch)');
-    expect(preview).toContain('effectiveCapabilityLabel("semantic", effectiveVectorSearch)');
+    expect(preview).toContain("const effectiveLabel = effectiveCapabilityLabel(kind, effectiveState);");
     expect(preview).toContain("draft.lexicalSearch,");
     expect(preview).toContain("effectiveLexicalSearch,");
     expect(preview).toContain("draft.vectorSearch,");

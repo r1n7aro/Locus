@@ -1,7 +1,7 @@
 use crate::session::models::ImageData;
 use crate::tool::ToolResult;
 
-use super::{AgentInstance, ExecutedToolResult};
+use super::{AgentInstance, ExecutedToolResult, LazyToolRenderer, ToolRunOutcome};
 
 const MAX_READ_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -10,6 +10,8 @@ impl AgentInstance {
         &self,
         app_handle: &tauri::AppHandle,
         args: &serde_json::Value,
+        tool_call_id: &str,
+        run_id: &str,
     ) -> ExecutedToolResult {
         let file_path = match args.get("filePath").and_then(|value| value.as_str()) {
             Some(path) => path.trim(),
@@ -21,21 +23,56 @@ impl AgentInstance {
             }
         };
 
+        let outline = match args.get("outline") {
+            None => false,
+            Some(value) => match value.as_bool() {
+                Some(value) => value,
+                None => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: "Parameter 'outline' must be a boolean".to_string(),
+                        is_error: true,
+                    });
+                }
+            },
+        };
+        if outline && !Self::is_read_outline_path(file_path) {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "Outline mode does not support '{}'. Supported file types: C# (.cs) and Markdown (.md).",
+                    file_path
+                ),
+                is_error: true,
+            });
+        }
+
         if !Self::is_read_image_path(file_path) {
-            let tool_context = self.build_tool_execution_context(app_handle, "read").await;
-            return self
+            let tool_context = self
+                .build_tool_execution_context(app_handle, "read", args)
+                .await;
+            let mut result = self
                 .await_tool_result(self.tool_registry.execute_with_context(
                     "read",
                     args,
                     tool_context,
                 ))
                 .await;
+            self.enrich_registered_knowledge_read(
+                app_handle,
+                file_path,
+                tool_call_id,
+                run_id,
+                &mut result,
+            )
+            .await;
+            return result;
         }
 
         let metadata = match tokio::fs::metadata(file_path).await {
             Ok(metadata) => metadata,
             Err(_) => {
-                let tool_context = self.build_tool_execution_context(app_handle, "read").await;
+                let tool_context = self
+                    .build_tool_execution_context(app_handle, "read", args)
+                    .await;
                 return self
                     .await_tool_result(self.tool_registry.execute_with_context(
                         "read",
@@ -47,7 +84,9 @@ impl AgentInstance {
         };
 
         if metadata.is_dir() {
-            let tool_context = self.build_tool_execution_context(app_handle, "read").await;
+            let tool_context = self
+                .build_tool_execution_context(app_handle, "read", args)
+                .await;
             return self
                 .await_tool_result(self.tool_registry.execute_with_context(
                     "read",
@@ -125,6 +164,15 @@ impl AgentInstance {
         )
     }
 
+    fn is_read_outline_path(file_path: &str) -> bool {
+        let ext = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|value| value.to_str());
+        ext.is_some_and(|value| {
+            value.eq_ignore_ascii_case("cs") || value.eq_ignore_ascii_case("md")
+        })
+    }
+
     fn detect_read_image_mime(bytes: &[u8]) -> Option<&'static str> {
         if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
             return Some("image/png");
@@ -141,6 +189,105 @@ impl AgentInstance {
 
         None
     }
+
+    async fn enrich_registered_knowledge_read(
+        &self,
+        app_handle: &tauri::AppHandle,
+        file_path: &str,
+        tool_call_id: &str,
+        run_id: &str,
+        result: &mut ExecutedToolResult,
+    ) {
+        if result.outcome != ToolRunOutcome::Done {
+            return;
+        }
+
+        let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+            &self.working_dir,
+            self.app_knowledge_dir.as_ref().as_ref(),
+        );
+        let Some(target) = registry.classify_path_string(file_path) else {
+            return;
+        };
+        if target.doc_type != crate::knowledge_store::KnowledgeType::Skill {
+            return;
+        }
+
+        let response = crate::commands::execute_knowledge_read_request(
+            &self.working_dir,
+            self.app_knowledge_dir.as_ref().as_ref(),
+            crate::knowledge_store::KnowledgeReadRequest {
+                kind: crate::knowledge_store::KnowledgeTargetKind::Document,
+                path: target.logical_path.clone(),
+                doc_type: Some(target.doc_type),
+                part: Some("full".to_string()),
+                include_history: false,
+            },
+        );
+        let Ok(response) = response else {
+            return;
+        };
+        let tool_names = response
+            .document
+            .as_ref()
+            .map(|document| document.document.tools.clone())
+            .unwrap_or_default();
+        let activated_tools = self.activate_document_skill_tool_names(&tool_names);
+        let mut referenced_tools = Vec::new();
+        for name in &tool_names {
+            let Some(canonical) = self.canonical_tool_name(name) else {
+                continue;
+            };
+            if Self::is_meta_tool(&canonical) || referenced_tools.contains(&canonical) {
+                continue;
+            }
+            referenced_tools.push(canonical);
+        }
+
+        match self
+            .compile_skill_package_unity_scripts_for_knowledge_read(
+                app_handle,
+                tool_call_id,
+                run_id,
+                &target.logical_path,
+            )
+            .await
+        {
+            Ok(Some(note)) => {
+                result.output.push_str("\n\n");
+                result.output.push_str(&note);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                result.output.push_str(&format!(
+                    "\n\nLocus Skill runtime: Unity C# scripts are not ready.\n{error}"
+                ));
+            }
+        }
+
+        if !activated_tools.is_empty() {
+            result
+                .output
+                .push_str("\n\nLoaded Skill document tools for the next step: ");
+            result.output.push_str(&activated_tools.join(", "));
+        }
+        match self.cached_lazy_tool_renderer() {
+            LazyToolRenderer::AnthropicNative => {
+                crate::llm::tool_references::append_tool_reference_marker(
+                    &mut result.output,
+                    &referenced_tools,
+                );
+            }
+            LazyToolRenderer::CodexNative if !referenced_tools.is_empty() => {
+                result.output.push_str(&format!(
+                    "\n\nThe Skill tools above are deferred. Call `{}` with a matching query to load their schemas before use: {}",
+                    super::CODEX_TOOL_SEARCH_TOOL_NAME,
+                    referenced_tools.join(", ")
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +301,14 @@ mod tests {
         assert!(AgentInstance::is_read_image_path("Assets/hero.webp"));
         assert!(!AgentInstance::is_read_image_path("Assets/hero.svg"));
         assert!(!AgentInstance::is_read_image_path("Assets/hero.psd"));
+    }
+
+    #[test]
+    fn read_outline_path_accepts_only_csharp_and_markdown() {
+        assert!(AgentInstance::is_read_outline_path("Assets/Player.CS"));
+        assert!(AgentInstance::is_read_outline_path("Docs/guide.md"));
+        assert!(!AgentInstance::is_read_outline_path("Docs/guide.txt"));
+        assert!(!AgentInstance::is_read_outline_path("Assets/hero.png"));
     }
 
     #[test]

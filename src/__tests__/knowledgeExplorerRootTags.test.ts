@@ -12,17 +12,19 @@ describe("KnowledgeExplorer root retrieval tags", () => {
   it("passes root directory configs from the view into the explorer", () => {
     const view = read("src/components/KnowledgeView.vue");
 
-    expect(view).toContain(':root-directory-configs="rootDirectoryConfigs[activeType]"');
+    expect(view).toContain(':root-directory-configs="rootDirectoryConfigs"');
   });
 
-  it("renders folder config tags only for first-level folders", () => {
+  it("renders type-root and first-level folder config tags", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 
-    expect(explorer).toContain("rootDirectoryConfigs: Record<string, KnowledgeDirectoryConfigRecord>;");
+    expect(explorer).toContain("Record<string, KnowledgeDirectoryConfigRecord>");
     expect(explorer).toContain("externalDirectorySources: Record<string, KnowledgeExternalSource[]>;");
     expect(explorer).toContain("if (isBuiltinSkillGroupFolder(node)) return tags;");
-    expect(explorer).toContain('props.activeType === "skill" && node.depth === 1 && node.relativePath === "builtin"');
-    expect(explorer).toContain("if (node.depth !== 1) return tags;");
+    expect(explorer).toContain('return node.type === "skill" && node.depth === 1 && node.relativePath === "builtin";');
+    expect(explorer).toContain('props.rootDirectoryConfigs[node.type][""]');
+    expect(explorer).toContain("if (node.depth !== rootDirectoryDepth) return tags;");
+    expect(explorer).toContain("props.rootDirectoryConfigs[node.type][node.relativePath]");
     expect(explorer).toContain("buildExternalFolderTag(");
     expect(explorer).toContain("buildFolderListTags({");
     expect(explorer).toContain("'flag-external': tag.tone === 'external'");
@@ -33,12 +35,13 @@ describe("KnowledgeExplorer root retrieval tags", () => {
     expect(explorer).not.toContain("flag-search-off");
   });
 
-  it("renders recall-path tags inside search results", () => {
+  it("reuses ordinary folder and document tags while filtering the tree", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 
-    expect(explorer).toContain('function searchResultTags(result: KnowledgeSearchResult) {');
-    expect(explorer).toContain("return buildKnowledgeSearchMatchTags(result.matchKind);");
-    expect(explorer).toContain("buildKnowledgeSearchMatchTags(result.matchKind)");
-    expect(explorer).toContain("flex-wrap: wrap;");
+    expect(explorer).toContain("function documentTags(node: DocumentNode)");
+    expect(explorer).toContain("function folderTags(node: FolderNode)");
+    expect(explorer).toContain("isSearchMode.value ? undefined : props.folderStats");
+    expect(explorer).not.toContain("buildKnowledgeSearchMatchTags");
+    expect(explorer).not.toContain("searchResultTags");
   });
 });

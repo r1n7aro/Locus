@@ -50,27 +50,26 @@ describe("knowledgeContextCost", () => {
       content: "abcd".repeat(10),
       source: "system",
     };
-    const knowledgeRead = makeToolItem("knowledge_read");
-    const knowledgeCreate = makeToolItem("knowledge_create");
+    const knowledgeQuery = makeToolItem("knowledge_query");
+    const retiredKnowledgeRead = makeToolItem("knowledge_read");
     const read = makeToolItem("read");
 
     const total = estimateKnowledgeContextCostTokens([
       knowledgeContext,
       knowledgeRule,
-      knowledgeRead,
-      knowledgeCreate,
+      knowledgeQuery,
+      retiredKnowledgeRead,
       read,
     ]);
 
     expect(isKnowledgeInjectionItem(knowledgeContext)).toBe(true);
-    expect(isDirectKnowledgeToolItem(knowledgeRead)).toBe(true);
-    expect(isDirectKnowledgeToolItem(knowledgeCreate)).toBe(true);
+    expect(isDirectKnowledgeToolItem(knowledgeQuery)).toBe(true);
+    expect(isDirectKnowledgeToolItem(retiredKnowledgeRead)).toBe(false);
     expect(isDirectKnowledgeToolItem(read)).toBe(false);
     expect(total).toBe(
       estimatePromptTokens(knowledgeContext.content.length)
         + estimatePromptTokens(knowledgeRule.content.length)
-        + estimateToolPrompt(knowledgeRead.meta).tokens
-        + estimateToolPrompt(knowledgeCreate.meta).tokens,
+        + estimateToolPrompt(knowledgeQuery.meta).tokens,
     );
   });
 });

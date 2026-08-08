@@ -1,6 +1,9 @@
+// @vitest-environment jsdom
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createApp, nextTick } from "vue";
 import { describe, expect, it } from "vitest";
+import KnowledgeQueryToolBlock from "../components/tool-block-overrides/KnowledgeQueryToolBlock.vue";
 
 const cwd = process.cwd();
 
@@ -53,7 +56,80 @@ describe("knowledgeQueryProgress", () => {
     expect(blockSource).toContain("class=\"tool-call-progress-line\"");
     expect(blockSource).toContain("class=\"knowledge-query-progress-track\"");
     expect(blockSource).toContain("buildToolCallArgsSummary");
+    expect(blockSource).toContain("class=\"tool-args-table\"");
+    expect(blockSource).toContain("v-for=\"arg in parsedArgs\"");
+    expect(blockSource).not.toContain("{{ toolCall.arguments }}</pre>");
     expect(blockSource).toContain("var(--border-color)");
     expect(blockSource).not.toContain("#8b7cf6");
+  });
+
+  it("returns physical source text around each knowledge hit", () => {
+    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
+    const indexSource = read("src-tauri/src/knowledge_index/mod.rs");
+
+    expect(indexSource).toContain("read_search_hit_context(&resolved.physical_path");
+    expect(indexSource).toContain("hit.snippet = context;");
+    expect(agentSource).toContain("knowledge_hit_context_anchor");
+    expect(agentSource).toContain('output.push_str("\\ncontext:")');
+  });
+
+  it("renders knowledge_query arguments with the standard key-value layout", async () => {
+    const host = document.createElement("div");
+    const app = createApp(KnowledgeQueryToolBlock, {
+      toolCall: {
+        id: "tool-knowledge-query",
+        name: "knowledge_query",
+        arguments: JSON.stringify({
+          lexicalQuery: "memory preferences",
+          limit: 5,
+          includeSummary: false,
+          includeHitContext: true,
+        }),
+        status: "done",
+        output: "No results.",
+      },
+    });
+    app.mount(host);
+    host.querySelector<HTMLButtonElement>(".tool-call-header")?.click();
+    await nextTick();
+
+    const rows = [...host.querySelectorAll<HTMLElement>(".tool-arg-row")];
+    expect(rows.map((row) => row.querySelector(".tool-arg-key")?.textContent)).toEqual([
+      "lexical query",
+      "limit",
+      "include summary",
+      "include hit context",
+    ]);
+    expect(rows.map((row) => row.querySelector(".tool-arg-value")?.textContent)).toEqual([
+      "memory preferences",
+      "5",
+      "false",
+      "true",
+    ]);
+    expect(host.querySelector(".tool-call-section:first-child .tool-call-pre")).toBeNull();
+
+    app.unmount();
+  });
+
+  it("injects registered physical knowledge directories without a synthetic tree root", () => {
+    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
+
+    expect(agentSource).toContain("prompt_relative_physical_path(&resolved.physical_path");
+    expect(agentSource).toContain("`Structure` lists registered physical directories directly");
+    expect(agentSource).toContain('render_scope("Project", project_roots)');
+    expect(agentSource).toContain('render_scope("App", app_roots)');
+    expect(agentSource).toContain("let skill_node = prompt_tree_node_mut(&mut tree, &skill_parts)");
+    expect(agentSource).toContain("skill_node.dirs.insert(");
+    expect(agentSource).toContain(".filter(|root| !prompt_physical_root_is_package(root))");
+    expect(agentSource).not.toContain('"knowledge/".to_string(),');
+  });
+
+  it("hides L1 structure entries without explicit summaries", () => {
+    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
+
+    expect(agentSource).not.toContain("body_excerpt");
+    expect(agentSource).toContain("return summary;");
+    expect(agentSource).toContain("KnowledgeInjectMode::Excerpt => item");
+    expect(agentSource).toContain(".is_some_and(|summary| !summary.trim().is_empty())");
   });
 });

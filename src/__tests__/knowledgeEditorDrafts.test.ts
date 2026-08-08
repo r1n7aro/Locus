@@ -12,11 +12,10 @@ function makeDocument(overrides: Partial<KnowledgeDocument> = {}): KnowledgeDocu
     path: "combat/core-loop.md",
     title: "核心循环",
     injectMode: "excerpt",
-    summaryEnabled: true,
-    commandEnabled: false,
+    effectiveInjectMode: "excerpt",
     readOnly: false,
     aiMaintained: false,
-    explicitMaintenanceRules: true,
+    effectiveAiMaintained: false,
     externalSource: null,
     skillEnabled: null,
     skillSurface: null,
@@ -25,9 +24,8 @@ function makeDocument(overrides: Partial<KnowledgeDocument> = {}): KnowledgeDocu
     summary: "摘要 v1",
     body: "正文 v1",
     maintenanceRules: "规则 v1",
-    createdAt: 1,
-    updatedAt: 2,
-    hasSummary: true,
+    effectiveMaintenanceRules: "规则 v1",
+    modifiedAt: 2,
     ...overrides,
   };
 }
@@ -39,7 +37,7 @@ describe("knowledgeEditorDrafts", () => {
     drafts.body = "正文 v2";
 
     const updated = makeDocument({
-      updatedAt: 3,
+      modifiedAt: 3,
       summary: "摘要 v2",
       body: "正文 v1",
     });
@@ -57,7 +55,7 @@ describe("knowledgeEditorDrafts", () => {
 
   it("clears dirty sections when the persisted content catches up", () => {
     const updated = makeDocument({
-      updatedAt: 3,
+      modifiedAt: 3,
       body: "正文 v2",
     });
     const drafts = createKnowledgeEditorDraftValues(makeDocument());

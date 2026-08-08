@@ -53,11 +53,10 @@ const activePanelTab = ref<DirectoryPanelTab>("config");
 const draft = ref<KnowledgeDirectoryConfig>({
   version: 4,
   summary: "",
-  injectMode: "excerpt",
-  inheritInjectMode: true,
-  aiMaintained: false,
-  inheritAiConfig: true,
-  explicitMaintenanceRules: false,
+  injectMode: "inherit",
+  effectiveInjectMode: "excerpt",
+  aiMaintained: "inherit",
+  effectiveAiMaintained: false,
   lexicalSearch: "inherit",
   vectorSearch: "inherit",
   inheritToChildren: true,
@@ -65,7 +64,8 @@ const draft = ref<KnowledgeDirectoryConfig>({
   allowCreateDirectories: true,
   allowMoveDocuments: true,
   allowMoveDirectories: true,
-  maintenanceRules: "",
+  maintenanceRules: null,
+  effectiveMaintenanceRules: null,
 });
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
@@ -80,11 +80,10 @@ watch(
     draft.value = {
       version: directory.version,
       summary: directory.summary ?? "",
-      injectMode: directory.injectMode ?? "excerpt",
-      inheritInjectMode: directory.inheritInjectMode ?? false,
-      aiMaintained: !!directory.aiMaintained,
-      inheritAiConfig: directory.inheritAiConfig ?? false,
-      explicitMaintenanceRules: !!directory.explicitMaintenanceRules,
+      injectMode: directory.injectMode,
+      effectiveInjectMode: directory.effectiveInjectMode,
+      aiMaintained: directory.aiMaintained,
+      effectiveAiMaintained: directory.effectiveAiMaintained,
       lexicalSearch: directory.lexicalSearch ?? "inherit",
       vectorSearch: directory.vectorSearch ?? "inherit",
       inheritToChildren: directory.inheritToChildren !== false,
@@ -92,7 +91,8 @@ watch(
       allowCreateDirectories: directory.allowCreateDirectories !== false,
       allowMoveDocuments: directory.allowMoveDocuments !== false,
       allowMoveDirectories: directory.allowMoveDirectories !== false,
-      maintenanceRules: directory.maintenanceRules ?? "",
+      maintenanceRules: directory.maintenanceRules,
+      effectiveMaintenanceRules: directory.effectiveMaintenanceRules,
     };
   },
   { immediate: true },
@@ -136,13 +136,14 @@ const editorViewMode = computed<MarkdownEditorViewMode>({
   get: () => markdownEditorViewMode.value,
   set: (value) => setMarkdownEditorViewMode(value),
 });
+const directoryContentKey = computed(() =>
+  `${props.directory?.type ?? ""}:${props.directory?.path ?? ""}:maintenanceRules`
+);
 
 const hasRulesWarning = computed(
   () =>
-    !draft.value.inheritAiConfig &&
-    !!draft.value.aiMaintained &&
-    (!draft.value.explicitMaintenanceRules ||
-      !draft.value.maintenanceRules.trim()),
+    draft.value.aiMaintained === true &&
+    !draft.value.maintenanceRules?.trim(),
 );
 
 const injectModeOptions = computed(() => [
@@ -190,21 +191,21 @@ const lexicalRuleOptions = computed(() => buildFolderIndexRuleOptions("lexical")
 const semanticRuleOptions = computed(() => buildFolderIndexRuleOptions("semantic"));
 
 const injectModeValue = computed<DirectoryInjectModeSelection>(() => (
-  draft.value.inheritInjectMode ? "inherit_parent" : (draft.value.injectMode ?? "excerpt")
+  draft.value.injectMode === "inherit" ? "inherit_parent" : draft.value.injectMode
 ));
 
 const aiConfigValue = computed<DirectoryAiConfigMode>(() => {
-  if (draft.value.inheritAiConfig) return "inherit_parent";
+  if (draft.value.aiMaintained === "inherit") return "inherit_parent";
   return draft.value.aiMaintained ? "auto" : "manual";
 });
 
 const injectModeDropdownLabel = computed(() => {
   if (!props.directory) return "";
-  const explicitLabel = labelForInjectMode(draft.value.injectMode ?? "excerpt");
-  if (!draft.value.inheritInjectMode) return explicitLabel;
-  if (props.directory.inheritInjectMode) {
+  const explicitLabel = labelForInjectMode(draft.value.effectiveInjectMode);
+  if (draft.value.injectMode !== "inherit") return explicitLabel;
+  if (props.directory.injectMode === "inherit") {
     return labelForInheritedValue(
-      labelForInjectMode(props.directory.injectMode ?? "excerpt"),
+      labelForInjectMode(props.directory.effectiveInjectMode),
       props.directory.injectModeSource,
     );
   }
@@ -213,12 +214,12 @@ const injectModeDropdownLabel = computed(() => {
 
 const aiConfigDropdownLabel = computed(() => {
   if (!props.directory) return "";
-  const explicitLabel = draft.value.aiMaintained
+  const explicitLabel = draft.value.effectiveAiMaintained
     ? t("knowledge.directoryConfig.aiConfig.auto")
     : t("knowledge.directoryConfig.aiConfig.manual");
-  if (!draft.value.inheritAiConfig) return explicitLabel;
-  if (props.directory.inheritAiConfig) {
-    const effectiveLabel = props.directory.aiMaintained
+  if (draft.value.aiMaintained !== "inherit") return explicitLabel;
+  if (props.directory.aiMaintained === "inherit") {
+    const effectiveLabel = props.directory.effectiveAiMaintained
       ? t("knowledge.directoryConfig.aiConfig.auto")
       : t("knowledge.directoryConfig.aiConfig.manual");
     return labelForInheritedValue(effectiveLabel, props.directory.aiConfigSource);
@@ -226,7 +227,7 @@ const aiConfigDropdownLabel = computed(() => {
   return t("knowledge.meta.inheritParent");
 });
 
-const rulesEditorDisabled = computed(() => props.saveLoading || draft.value.inheritAiConfig);
+const rulesEditorDisabled = computed(() => props.saveLoading || draft.value.aiMaintained === "inherit");
 
 const effectiveLexicalSearch = computed<EffectiveCapabilityState>(() => (
   props.directory?.effectiveLexicalSearch ?? {
@@ -249,11 +250,10 @@ const isDirty = computed(() => {
     JSON.stringify({
       version: directory.version,
       summary: directory.summary ?? "",
-      injectMode: directory.injectMode ?? "excerpt",
-      inheritInjectMode: directory.inheritInjectMode ?? false,
-      aiMaintained: !!directory.aiMaintained,
-      inheritAiConfig: directory.inheritAiConfig ?? false,
-      explicitMaintenanceRules: !!directory.explicitMaintenanceRules,
+      injectMode: directory.injectMode,
+      effectiveInjectMode: directory.effectiveInjectMode,
+      aiMaintained: directory.aiMaintained,
+      effectiveAiMaintained: directory.effectiveAiMaintained,
       lexicalSearch: directory.lexicalSearch ?? "inherit",
       vectorSearch: directory.vectorSearch ?? "inherit",
       inheritToChildren: directory.inheritToChildren !== false,
@@ -261,14 +261,25 @@ const isDirty = computed(() => {
       allowCreateDirectories: directory.allowCreateDirectories !== false,
       allowMoveDocuments: directory.allowMoveDocuments !== false,
       allowMoveDirectories: directory.allowMoveDirectories !== false,
-      maintenanceRules: directory.maintenanceRules ?? "",
+      maintenanceRules: directory.maintenanceRules,
+      effectiveMaintenanceRules: directory.effectiveMaintenanceRules,
     }) !== JSON.stringify(draft.value)
   );
 });
 
 const pathLabel = computed(() =>
-  props.directory ? `${props.directory.type}/${props.directory.path}` : "",
+  props.directory
+    ? props.directory.path
+      ? `${props.directory.type}/${props.directory.path}`
+      : props.directory.type
+    : "",
 );
+const directoryTitle = computed(() => {
+  const path = props.directory?.path.trim();
+  if (!path) return t("knowledge.directoryConfig.title");
+  const segments = path.split("/").filter(Boolean);
+  return segments[segments.length - 1] ?? path;
+});
 const panelTabOptions = computed(() => {
   const options = [
     {
@@ -354,15 +365,14 @@ function toggle<K extends keyof KnowledgeDirectoryConfig>(
 }
 
 function toggleExplicitMaintenanceRules(value: boolean) {
-  if (draft.value.inheritAiConfig || (!value && draft.value.aiMaintained)) return;
+  if (draft.value.aiMaintained === "inherit" || (!value && draft.value.aiMaintained === true)) return;
   draft.value = {
     ...draft.value,
-    explicitMaintenanceRules: value,
     maintenanceRules: value
       ? draft.value.maintenanceRules ||
         defaultMaintenanceRulesForType(props.directory?.type ?? "design") ||
         ""
-      : "",
+      : null,
   };
   maybeScheduleAutoSave();
 }
@@ -371,7 +381,7 @@ function onInjectModeChange(value: string) {
   if (value === "inherit_parent") {
     draft.value = {
       ...draft.value,
-      inheritInjectMode: true,
+      injectMode: "inherit",
     };
     maybeScheduleAutoSave();
     return;
@@ -379,7 +389,7 @@ function onInjectModeChange(value: string) {
   draft.value = {
     ...draft.value,
     injectMode: value as KnowledgeInjectMode,
-    inheritInjectMode: false,
+    effectiveInjectMode: value as KnowledgeInjectMode,
   };
   maybeScheduleAutoSave();
 }
@@ -388,7 +398,7 @@ function onAiConfigChange(value: string) {
   if (value === "inherit_parent") {
     draft.value = {
       ...draft.value,
-      inheritAiConfig: true,
+      aiMaintained: "inherit",
     };
     maybeScheduleAutoSave();
     return;
@@ -397,11 +407,10 @@ function onAiConfigChange(value: string) {
   if (value === "auto") {
     draft.value = {
       ...draft.value,
-      inheritAiConfig: false,
       aiMaintained: true,
-      explicitMaintenanceRules: true,
+      effectiveAiMaintained: true,
       maintenanceRules:
-        draft.value.maintenanceRules.trim()
+        draft.value.maintenanceRules?.trim()
           ? draft.value.maintenanceRules
           : defaultMaintenanceRulesForType(props.directory?.type ?? "design") || "",
     };
@@ -411,8 +420,8 @@ function onAiConfigChange(value: string) {
 
   draft.value = {
     ...draft.value,
-    inheritAiConfig: false,
     aiMaintained: false,
+    effectiveAiMaintained: false,
   };
   maybeScheduleAutoSave();
 }
@@ -422,16 +431,6 @@ function onFolderIndexRuleChange(
   value: string,
 ) {
   toggle(key, value as FolderIndexRuleSetting);
-}
-
-function onSummaryInput(event: Event) {
-  const target = event.target as HTMLTextAreaElement | null;
-  if (!target) return;
-  draft.value = {
-    ...draft.value,
-    summary: target.value,
-  };
-  maybeScheduleAutoSave();
 }
 
 function hintForDirectoryInjectMode(mode: KnowledgeInjectMode): string {
@@ -504,31 +503,13 @@ function effectiveCapabilityLabel(
   return labelForFolderSearchRule(kind, state.enabled);
 }
 
-function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string {
-  switch (state.source) {
-    case "self":
-      return t("knowledge.folder.ruleExplicit");
-    case "parent": {
-      const sourceDir = state.sourceDir?.trim();
-      return sourceDir
-        ? `${t("knowledge.folder.ruleInherited")} / ${sourceDir}`
-        : t("knowledge.folder.ruleInherited");
-    }
-    default:
-      return t("knowledge.folder.ruleDefault");
-  }
-}
-
 </script>
 
 <template>
   <div class="directory-preview" @keydown.capture="handleKeydown">
     <div class="directory-preview-header">
-      <div class="directory-preview-head">
-        <div class="directory-preview-title">
-          {{ t("knowledge.directoryConfig.title") }}
-        </div>
-        <div class="directory-preview-subtitle">{{ pathLabel }}</div>
+      <div class="directory-preview-header-main">
+        <span class="directory-preview-path">{{ pathLabel }}</span>
       </div>
       <div class="directory-preview-actions">
         <BaseSegmented
@@ -553,7 +534,7 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
       </div>
     </div>
 
-    <div v-if="loading" class="directory-preview-empty">
+    <div v-if="loading && !directory" class="directory-preview-empty">
       {{ t("common.loading") }}
     </div>
     <div v-else-if="!directory" class="directory-preview-empty">
@@ -585,278 +566,221 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
         </section>
       </div>
 
-      <div v-else class="directory-preview-scroll">
-        <div class="directory-primary-grid">
-          <section class="directory-card">
-            <div class="directory-section-title">
-              {{ t("knowledge.directoryConfig.injectMode") }}
+      <div v-else class="directory-preview-scroll directory-config-scroll">
+        <article class="directory-config-page">
+          <header class="directory-config-heading">
+            <h1 class="directory-config-title">{{ directoryTitle }}</h1>
+          </header>
+
+          <section
+            class="directory-properties"
+            :aria-label="t('knowledge.preview.properties')"
+          >
+            <div class="directory-properties-title">
+              {{ t("knowledge.preview.properties") }}
             </div>
-            <div class="directory-section-hint">
-              {{ t("knowledge.directoryConfig.injectModeHint") }}
-            </div>
-            <div class="directory-inline-control">
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.injectMode") }}
+              </span>
               <BaseDropdown
-                class="directory-dropdown"
+                class="directory-property-dropdown"
                 :model-value="injectModeValue"
                 :selected-label="injectModeDropdownLabel"
                 :options="injectModeOptions"
+                teleport
                 :disabled="interactionDisabled"
                 :aria-label="t('knowledge.directoryConfig.injectMode')"
                 @update:model-value="onInjectModeChange"
               />
             </div>
-          </section>
 
-          <section class="directory-card">
-            <div class="directory-section-title">
-              {{ t("knowledge.directoryConfig.aiConfig") }}
-            </div>
-            <div class="directory-section-hint">
-              {{ t("knowledge.directoryConfig.aiConfigHint") }}
-            </div>
-            <div class="directory-inline-control">
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.aiConfig") }}
+              </span>
               <BaseDropdown
-                class="directory-dropdown"
+                class="directory-property-dropdown"
                 :model-value="aiConfigValue"
                 :selected-label="aiConfigDropdownLabel"
                 :options="aiConfigOptions"
+                teleport
                 :disabled="interactionDisabled"
                 :aria-label="t('knowledge.directoryConfig.aiConfig')"
                 @update:model-value="onAiConfigChange"
               />
             </div>
-          </section>
 
-          <section class="directory-card directory-card-plain directory-card-span">
-            <div class="directory-search-grid">
-              <div class="directory-search-rule">
-                <div class="directory-rule-title">
-                  {{ t("knowledge.directoryConfig.lexicalSearch") }}
-                </div>
-                <div class="directory-rule-hint">
-                  {{ t("knowledge.directoryConfig.lexicalSearchHint") }}
-                </div>
-                <div class="directory-inline-control">
-                  <BaseDropdown
-                    class="directory-dropdown"
-                    :model-value="draft.lexicalSearch"
-                    :selected-label="
-                      dropdownLabelForFolderIndexRule(
-                        'lexical',
-                        draft.lexicalSearch,
-                        effectiveLexicalSearch,
-                      )
-                    "
-                    :options="lexicalRuleOptions"
-                    :disabled="interactionDisabled"
-                    :aria-label="t('knowledge.directoryConfig.lexicalSearch')"
-                    @update:model-value="
-                      onFolderIndexRuleChange('lexicalSearch', $event)
-                    "
-                  />
-                </div>
-                <div class="directory-rule-status">
-                  <span class="directory-rule-value">
-                    {{ effectiveCapabilityLabel("lexical", effectiveLexicalSearch) }}
-                  </span>
-                  <span class="directory-rule-meta">
-                    {{ effectiveCapabilitySourceLabel(effectiveLexicalSearch) }}
-                  </span>
-                </div>
-              </div>
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.lexicalSearch") }}
+              </span>
+              <BaseDropdown
+                class="directory-property-dropdown"
+                :model-value="draft.lexicalSearch"
+                :selected-label="
+                  dropdownLabelForFolderIndexRule(
+                    'lexical',
+                    draft.lexicalSearch,
+                    effectiveLexicalSearch,
+                  )
+                "
+                :options="lexicalRuleOptions"
+                teleport
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.lexicalSearch')"
+                @update:model-value="
+                  onFolderIndexRuleChange('lexicalSearch', $event)
+                "
+              />
+            </div>
 
-              <div class="directory-search-rule">
-                <div class="directory-rule-title">
-                  {{ t("knowledge.directoryConfig.semanticSearch") }}
-                </div>
-                <div class="directory-rule-hint">
-                  {{ t("knowledge.directoryConfig.semanticSearchHint") }}
-                </div>
-                <div class="directory-inline-control">
-                  <BaseDropdown
-                    class="directory-dropdown"
-                    :model-value="draft.vectorSearch"
-                    :selected-label="
-                      dropdownLabelForFolderIndexRule(
-                        'semantic',
-                        draft.vectorSearch,
-                        effectiveVectorSearch,
-                      )
-                    "
-                    :options="semanticRuleOptions"
-                    :disabled="interactionDisabled"
-                    :aria-label="t('knowledge.directoryConfig.semanticSearch')"
-                    @update:model-value="
-                      onFolderIndexRuleChange('vectorSearch', $event)
-                    "
-                  />
-                </div>
-                <div class="directory-rule-status">
-                  <span class="directory-rule-value">
-                    {{ effectiveCapabilityLabel("semantic", effectiveVectorSearch) }}
-                  </span>
-                  <span class="directory-rule-meta">
-                    {{ effectiveCapabilitySourceLabel(effectiveVectorSearch) }}
-                  </span>
-                </div>
-              </div>
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.semanticSearch") }}
+              </span>
+              <BaseDropdown
+                class="directory-property-dropdown"
+                :model-value="draft.vectorSearch"
+                :selected-label="
+                  dropdownLabelForFolderIndexRule(
+                    'semantic',
+                    draft.vectorSearch,
+                    effectiveVectorSearch,
+                  )
+                "
+                :options="semanticRuleOptions"
+                teleport
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.semanticSearch')"
+                @update:model-value="
+                  onFolderIndexRuleChange('vectorSearch', $event)
+                "
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.explicitMaintenanceRules") }}
+              </span>
+              <BaseCheckbox
+                :model-value="!!draft.maintenanceRules?.trim()"
+                :disabled="
+                  interactionDisabled ||
+                  draft.aiMaintained === 'inherit' ||
+                  draft.aiMaintained === true
+                "
+                :aria-label="t('knowledge.directoryConfig.explicitMaintenanceRules')"
+                @update:model-value="toggleExplicitMaintenanceRules"
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.inheritToChildren") }}
+              </span>
+              <BaseCheckbox
+                :model-value="draft.inheritToChildren"
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.inheritToChildren')"
+                @update:model-value="toggle('inheritToChildren', $event)"
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.allowCreateDocuments") }}
+              </span>
+              <BaseCheckbox
+                :model-value="draft.allowCreateDocuments"
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.allowCreateDocuments')"
+                @update:model-value="toggle('allowCreateDocuments', $event)"
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.allowCreateDirectories") }}
+              </span>
+              <BaseCheckbox
+                :model-value="draft.allowCreateDirectories"
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.allowCreateDirectories')"
+                @update:model-value="toggle('allowCreateDirectories', $event)"
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.allowMoveDocuments") }}
+              </span>
+              <BaseCheckbox
+                :model-value="draft.allowMoveDocuments"
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.allowMoveDocuments')"
+                @update:model-value="toggle('allowMoveDocuments', $event)"
+              />
+            </div>
+
+            <div class="directory-property-row">
+              <span class="directory-property-label">
+                {{ t("knowledge.directoryConfig.allowMoveDirectories") }}
+              </span>
+              <BaseCheckbox
+                :model-value="draft.allowMoveDirectories"
+                :disabled="interactionDisabled"
+                :aria-label="t('knowledge.directoryConfig.allowMoveDirectories')"
+                @update:model-value="toggle('allowMoveDirectories', $event)"
+              />
             </div>
           </section>
 
-          <section class="directory-card directory-card-span">
-            <div class="directory-section-title">
-              {{ t("knowledge.directoryConfig.capabilities") }}
+          <section class="directory-inline-field directory-inline-summary">
+            <div class="directory-inline-label">
+              {{ t("knowledge.directoryConfig.summary") }}
             </div>
-            <div class="directory-capability-grid">
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.explicitMaintenanceRules"
-                  :disabled="interactionDisabled || draft.inheritAiConfig || draft.aiMaintained"
-                  :aria-label="
-                    t('knowledge.directoryConfig.explicitMaintenanceRules')
-                  "
-                  @update:model-value="toggleExplicitMaintenanceRules"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.explicitMaintenanceRules")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.explicitMaintenanceRulesHint")
-                  }}</span>
-                </span>
-              </label>
-
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.inheritToChildren"
-                  :disabled="interactionDisabled"
-                  :aria-label="t('knowledge.directoryConfig.inheritToChildren')"
-                  @update:model-value="toggle('inheritToChildren', $event)"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.inheritToChildren")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.inheritToChildrenHint")
-                  }}</span>
-                </span>
-              </label>
-
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.allowCreateDocuments"
-                  :disabled="interactionDisabled"
-                  :aria-label="t('knowledge.directoryConfig.allowCreateDocuments')"
-                  @update:model-value="toggle('allowCreateDocuments', $event)"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.allowCreateDocuments")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.allowCreateDocumentsHint")
-                  }}</span>
-                </span>
-              </label>
-
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.allowCreateDirectories"
-                  :disabled="interactionDisabled"
-                  :aria-label="
-                    t('knowledge.directoryConfig.allowCreateDirectories')
-                  "
-                  @update:model-value="toggle('allowCreateDirectories', $event)"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.allowCreateDirectories")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.allowCreateDirectoriesHint")
-                  }}</span>
-                </span>
-              </label>
-
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.allowMoveDocuments"
-                  :disabled="interactionDisabled"
-                  :aria-label="t('knowledge.directoryConfig.allowMoveDocuments')"
-                  @update:model-value="toggle('allowMoveDocuments', $event)"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.allowMoveDocuments")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.allowMoveDocumentsHint")
-                  }}</span>
-                </span>
-              </label>
-
-              <label class="directory-option-row">
-                <BaseCheckbox
-                  :model-value="draft.allowMoveDirectories"
-                  :disabled="interactionDisabled"
-                  :aria-label="t('knowledge.directoryConfig.allowMoveDirectories')"
-                  @update:model-value="toggle('allowMoveDirectories', $event)"
-                />
-                <span class="directory-option-text">
-                  <span class="directory-option-title">{{
-                    t("knowledge.directoryConfig.allowMoveDirectories")
-                  }}</span>
-                  <span class="directory-option-hint">{{
-                    t("knowledge.directoryConfig.allowMoveDirectoriesHint")
-                  }}</span>
-                </span>
-              </label>
-            </div>
-          </section>
-        </div>
-
-        <section class="directory-card">
-          <div class="directory-section-title">
-            {{ t("knowledge.directoryConfig.summary") }}
-          </div>
-          <textarea
-            :value="draft.summary"
-            class="directory-summary-input"
-            :disabled="interactionDisabled"
-            :placeholder="t('knowledge.directoryConfig.summaryPlaceholder')"
-            @input="onSummaryInput"
-          />
-        </section>
-
-        <div v-if="hasRulesWarning" class="directory-warning">
-          {{ t("knowledge.directoryConfig.rulesRequiredHint") }}
-        </div>
-
-        <section
-          v-if="draft.explicitMaintenanceRules"
-          class="directory-card directory-card-rules"
-        >
-          <div class="directory-section-title">
-            {{ t("knowledge.directoryConfig.maintenanceRules") }}
-          </div>
-          <div class="directory-section-hint">
-            {{ t("knowledge.directoryConfig.maintenanceRulesHint") }}
-          </div>
-          <div class="directory-rules-editor">
             <BaseMarkdownEditor
-              :model-value="draft.maintenanceRules"
+              :model-value="draft.summary"
+              :disabled="interactionDisabled"
+              :view-mode="editorViewMode"
+              :content-key="`${directoryContentKey}:summary`"
+              defer-rendered-editor
+              auto-grow
+              :min-height="64"
+              :placeholder="t('knowledge.directoryConfig.summaryPlaceholder')"
+              @update:model-value="toggle('summary', $event)"
+              @shortcut-save="saveConfig('manual')"
+            />
+          </section>
+
+          <div v-if="hasRulesWarning" class="directory-property-warning">
+            {{ t("knowledge.directoryConfig.rulesRequiredHint") }}
+          </div>
+
+          <section
+            v-if="draft.aiMaintained !== 'inherit' && !!draft.maintenanceRules?.trim()"
+            class="directory-inline-field directory-inline-rules"
+            :class="{ 'is-warning': hasRulesWarning }"
+          >
+            <div class="directory-inline-label">
+              {{ t("knowledge.directoryConfig.maintenanceRules") }}
+            </div>
+            <BaseMarkdownEditor
+              :model-value="draft.maintenanceRules ?? ''"
               :disabled="rulesEditorDisabled || interactionDisabled"
               :view-mode="editorViewMode"
-              :placeholder="
-                t('knowledge.directoryConfig.maintenanceRulesPlaceholder')
-              "
+              :content-key="`${directoryContentKey}:maintenanceRules`"
+              defer-rendered-editor
+              auto-grow
+              :min-height="104"
+              :placeholder="t('knowledge.directoryConfig.maintenanceRulesPlaceholder')"
               @update:model-value="toggle('maintenanceRules', $event)"
               @shortcut-save="saveConfig('manual')"
             />
-          </div>
-        </section>
+          </section>
+        </article>
       </div>
 
       <div
@@ -886,30 +810,24 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   gap: 12px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
 }
 
-.directory-preview-head {
+.directory-preview-header-main {
   min-width: 0;
+  flex: 1;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
 }
 
-.directory-preview-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-color);
-  line-height: 1.35;
-}
-
-.directory-preview-subtitle {
-  font-size: 11px;
-  color: var(--text-secondary);
-  font-family: var(--font-mono-identifier);
-  opacity: 0.52;
-  white-space: nowrap;
+.directory-preview-path {
+  min-width: 0;
   overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .directory-preview-actions {
@@ -940,7 +858,7 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   flex-direction: column;
   position: relative;
   overflow: hidden;
-  background: color-mix(in srgb, var(--panel-bg) 90%, var(--bg-color) 10%);
+  background: var(--panel-bg);
 }
 
 .directory-preview-scroll {
@@ -951,12 +869,6 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   flex-direction: column;
   gap: 12px;
   padding: 12px 16px 44px;
-}
-
-.directory-primary-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
 }
 
 .directory-card {
@@ -970,15 +882,6 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   background: color-mix(in srgb, var(--panel-bg) 78%, var(--bg-color));
 }
 
-.directory-card-plain {
-  border: none;
-  background: transparent;
-}
-
-.directory-card-span {
-  grid-column: 1 / -1;
-}
-
 .directory-section-title {
   font-size: 12px;
   font-weight: 600;
@@ -990,154 +893,124 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   color: var(--text-secondary);
 }
 
-.directory-summary-input {
-  width: 100%;
-  min-height: 92px;
-  resize: vertical;
+.directory-config-scroll {
+  display: block;
+  padding: 0;
+}
+
+.directory-config-page {
+  position: relative;
+  width: min(100%, 980px);
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 32px 44px 72px;
   box-sizing: border-box;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-color) 84%, var(--panel-bg) 16%);
+}
+
+.directory-config-heading {
+  margin: 0 0 22px;
+}
+
+.directory-config-title {
+  margin: 0;
   color: var(--text-color);
-  padding: 10px 12px;
-  font: inherit;
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+}
+
+.directory-properties {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: 24px;
+}
+
+.directory-properties-title {
+  margin-bottom: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.directory-property-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 30px;
+  padding: 1px 0;
+}
+
+.directory-property-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.directory-property-dropdown {
+  width: min(300px, 100%);
+}
+
+.directory-property-dropdown :deep(.base-dropdown-trigger) {
+  min-height: 28px;
+  padding-inline: 8px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.directory-property-dropdown :deep(.base-dropdown-trigger:hover),
+.directory-property-dropdown.open :deep(.base-dropdown-trigger) {
+  border-color: var(--border-color);
+  background: var(--hover-bg);
+}
+
+.directory-property-warning {
+  margin: 8px 0 22px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--status-warn-border);
+  color: var(--status-warn-fg);
+  background: color-mix(in srgb, var(--status-warn-bg) 48%, transparent);
+  font-size: 11px;
   line-height: 1.55;
 }
 
-.directory-summary-input:focus-visible {
-  outline: none;
-  border-color: color-mix(
-    in srgb,
-    var(--accent-color) 60%,
-    var(--border-color) 40%
-  );
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-color) 14%, transparent);
+.directory-inline-field {
+  margin: 0 0 22px;
+  padding: 0;
 }
 
-.directory-inline-control {
-  width: min(320px, 100%);
-}
-
-.directory-dropdown {
-  width: 100%;
-}
-
-.directory-search-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.directory-search-rule {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--sidebar-bg) 22%, var(--panel-bg) 78%);
-}
-
-.directory-rule-title {
+.directory-inline-label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--text-secondary);
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-color);
-  line-height: 1.4;
 }
 
-.directory-rule-hint {
-  font-size: 11px;
-  color: var(--text-secondary);
-  line-height: 1.45;
+.directory-inline-field :deep(.base-markdown-editor) {
+  height: auto;
+  border-left: 1px solid var(--border-color);
 }
 
-.directory-rule-status {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
+.directory-inline-summary :deep(.base-markdown-editor) {
+  min-height: 64px;
 }
 
-.directory-rule-value {
-  font-size: 11px;
-  color: var(--text-color);
-  white-space: nowrap;
+.directory-inline-rules :deep(.base-markdown-editor) {
+  min-height: 104px;
 }
 
-.directory-rule-meta {
-  min-width: 0;
-  font-size: 11px;
-  color: var(--text-secondary);
-  text-align: right;
-  line-height: 1.45;
+.directory-inline-field :deep(.base-markdown-editor .vditor),
+.directory-inline-field :deep(.base-markdown-editor-native),
+.directory-inline-field :deep(.base-markdown-editor-rendered) {
+  background: transparent;
 }
 
-.directory-capability-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px 12px;
-}
-
-.directory-option-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  min-width: 0;
-  padding: 8px 9px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--sidebar-bg) 34%, var(--panel-bg) 66%);
-}
-
-.directory-option-text {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.directory-option-title {
-  font-size: 12px;
-  color: var(--text-color);
-  line-height: 1.4;
-}
-
-.directory-option-hint {
-  font-size: 11px;
-  color: var(--text-secondary);
-  line-height: 1.45;
-}
-
-.directory-rules-editor {
-  min-height: 280px;
-  display: flex;
-  overflow: hidden;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-}
-
-.directory-rules-editor :deep(.base-markdown-editor) {
-  flex: 1;
-  min-height: 0;
-  border: none;
-}
-
-.directory-rules-editor :deep(.base-markdown-editor .base-markdown-editor-textarea) {
-  height: 100%;
-  min-height: 100%;
-  box-sizing: border-box;
-}
-
-.directory-warning {
-  padding: 10px 12px;
-  border: 1px solid var(--status-warn-border);
-  border-radius: 8px;
-  background: var(--status-warn-bg);
+.directory-inline-field.is-warning .directory-inline-label {
   color: var(--status-warn-fg);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
 .directory-footnote {
@@ -1163,30 +1036,13 @@ function effectiveCapabilitySourceLabel(state: EffectiveCapabilityState): string
   opacity: 0.74;
 }
 
-@media (max-width: 1120px) {
-  .directory-search-grid,
-  .directory-capability-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 @media (max-width: 960px) {
-  .directory-preview-header {
-    flex-direction: column;
-    align-items: stretch;
+  .directory-config-page {
+    padding: 24px 24px 64px;
   }
 
-  .directory-preview-actions {
-    justify-content: flex-end;
-  }
-
-  .directory-primary-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .directory-search-grid,
-  .directory-capability-grid {
-    grid-template-columns: minmax(0, 1fr);
+  .directory-property-row {
+    grid-template-columns: 120px minmax(0, 1fr);
   }
 }
 </style>

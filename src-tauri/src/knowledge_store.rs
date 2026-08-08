@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
 use rayon::prelude::*;
@@ -9,6 +10,7 @@ use crate::unity_docs;
 
 const KNOWLEDGE_ROOT_DIR: &str = "Locus/knowledge";
 const DOCUMENT_LOAD_PARALLEL_THRESHOLD: usize = 48;
+static KNOWLEDGE_LAYOUT_MIGRATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -255,31 +257,38 @@ pub struct KnowledgeDocument {
 #[serde(rename_all = "camelCase")]
 struct KnowledgeFrontmatter {
     pub id: String,
-    #[serde(rename = "type")]
-    pub doc_type: KnowledgeType,
-    #[serde(default)]
-    pub path: String,
-    pub title: String,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<KnowledgeType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inject_mode: Option<KnowledgeInjectMode>,
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mode: Option<KnowledgeFrontmatterInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_cache: Option<String>,
-    #[serde(default)]
-    pub command_enabled: bool,
-    #[serde(default)]
-    pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_maintained: Option<bool>,
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_maintained: Option<KnowledgeFrontmatterAiMaintained>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_ai_config: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit_maintenance_rules: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance_rules_cache: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_rules: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_source: Option<KnowledgeExternalSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,10 +301,70 @@ struct KnowledgeFrontmatter {
     pub argument_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
-    #[serde(default)]
-    pub created_at: i64,
-    #[serde(default)]
-    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum KnowledgeFrontmatterInjectMode {
+    Inherit,
+    None,
+    Path,
+    Excerpt,
+    Full,
+    Rule,
+}
+
+impl KnowledgeFrontmatterInjectMode {
+    fn from_document(document: &KnowledgeDocument) -> Self {
+        if document.inherit_inject_mode {
+            return Self::Inherit;
+        }
+        match document.inject_mode {
+            KnowledgeInjectMode::None => Self::None,
+            KnowledgeInjectMode::Path => Self::Path,
+            KnowledgeInjectMode::Excerpt => Self::Excerpt,
+            KnowledgeInjectMode::Full => Self::Full,
+            KnowledgeInjectMode::Rule => Self::Rule,
+        }
+    }
+
+    fn explicit_mode(self) -> Option<KnowledgeInjectMode> {
+        match self {
+            Self::Inherit => None,
+            Self::None => Some(KnowledgeInjectMode::None),
+            Self::Path => Some(KnowledgeInjectMode::Path),
+            Self::Excerpt => Some(KnowledgeInjectMode::Excerpt),
+            Self::Full => Some(KnowledgeInjectMode::Full),
+            Self::Rule => Some(KnowledgeInjectMode::Rule),
+        }
+    }
+
+    fn from_explicit_mode(mode: KnowledgeInjectMode) -> Self {
+        match mode {
+            KnowledgeInjectMode::None => Self::None,
+            KnowledgeInjectMode::Path => Self::Path,
+            KnowledgeInjectMode::Excerpt => Self::Excerpt,
+            KnowledgeInjectMode::Full => Self::Full,
+            KnowledgeInjectMode::Rule => Self::Rule,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum KnowledgeFrontmatterInheritMarker {
+    Inherit,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum KnowledgeFrontmatterAiMaintained {
+    Explicit(bool),
+    Mode(KnowledgeFrontmatterInheritMarker),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -699,6 +768,8 @@ pub struct KnowledgeReadRequest {
     pub doc_type: Option<KnowledgeType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+    #[serde(default)]
+    pub include_history: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -801,6 +872,18 @@ pub struct KnowledgeSearchHit {
     pub semantic_confidence: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub physical_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_path: String,
+    #[serde(default)]
+    pub start_line: u32,
+    #[serde(default)]
+    pub end_line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_start_line: Option<u32>,
+    #[serde(default)]
+    pub body_start_line: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -878,6 +961,31 @@ pub struct KnowledgeUpdateRequest {
 
 fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+fn system_time_millis(value: std::time::SystemTime) -> Option<i64> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+}
+
+fn apply_file_timestamps(document: &mut KnowledgeDocument, path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_millis)
+        .unwrap_or(0);
+    let created_at = metadata
+        .created()
+        .ok()
+        .and_then(system_time_millis)
+        .unwrap_or(modified_at);
+    document.created_at = created_at;
+    document.updated_at = modified_at;
 }
 
 fn provider_is_read_only(provider: KnowledgeSourceProvider) -> bool {
@@ -1016,6 +1124,11 @@ pub fn default_directory_config_for_type(doc_type: KnowledgeType) -> KnowledgeDi
 }
 
 const MEMORY_BUILTIN_SEED_VERSION: u32 = 11;
+const UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION: u32 = 3;
+const LEGACY_DESIGN_FOLDER: &str = "Design";
+const LEGACY_MEMORY_FOLDER: &str = "Memory";
+const LEGACY_DESIGN_FOLDER_RULES: &str = "- 仅维护用户与 AI 已共同确认的需求、方案、约束与阶段性设计结论\n- 新增设计方向、产品意图或方案决策前先取得用户确认\n- 优先保留仍会影响后续实现与判断的结论，合并重复内容\n- 删除已废弃、已被替代或缺少依据的设计记录";
+const LEGACY_MEMORY_FOLDER_RULES: &str = "- 仅维护用户明确表达的长期偏好、稳定背景与跨任务上下文\n- 优先保留语言、汇报方式、代码风格、禁忌、长期目标与明确约束\n- 修改或删除记忆时保持用户原意，合并重复内容\n- 删除一次性安排、临时口径与未经确认的推断";
 const KNOWLEDGE_DIRECTORY_CONFIG_SUFFIX: &str = ".locus-meta";
 const LEGACY_KNOWLEDGE_DIRECTORY_CONFIG_SUFFIX: &str = ".meta";
 const MEMORY_UNITY_PROJECT_UNDERSTANDING_PATH: &str = "unity-project-understanding";
@@ -1218,6 +1331,43 @@ fn write_memory_builtin_seed_version(working_dir: &str, version: u32) -> Result<
     }
     std::fs::write(&path, version.to_string())
         .map_err(|e| format!("Failed to write memory seed marker: {}", e))
+}
+
+fn unified_knowledge_tree_migration_marker_path(working_dir: &str) -> PathBuf {
+    Path::new(working_dir)
+        .join("Library")
+        .join("Locus")
+        .join("knowledge_unified_tree_version.txt")
+}
+
+fn read_unified_knowledge_tree_migration_version(working_dir: &str) -> u32 {
+    std::fs::read_to_string(unified_knowledge_tree_migration_marker_path(working_dir))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_unified_knowledge_tree_migration_version(
+    working_dir: &str,
+    version: u32,
+) -> Result<(), String> {
+    let path = unified_knowledge_tree_migration_marker_path(working_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create unified knowledge tree marker directory '{}': {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    std::fs::write(&path, version.to_string()).map_err(|e| {
+        format!(
+            "Failed to write unified knowledge tree marker '{}': {}",
+            path.display(),
+            e
+        )
+    })
 }
 
 fn migrate_builtin_memory_document_rules(
@@ -1606,6 +1756,7 @@ fn normalize_command_trigger_value(value: Option<String>) -> Option<String> {
 
 fn ensure_summary_state(document: &mut KnowledgeDocument) {
     document.summary = normalize_optional_text(document.summary.take());
+    document.summary_enabled = document.summary.is_some();
 }
 
 fn has_maintenance_rules_content(value: Option<&str>) -> bool {
@@ -1642,15 +1793,13 @@ fn inherited_document_config_and_sources_from_root(
         ));
     };
 
-    let Some(parent_path) = relative_parent_directory(path) else {
-        return Ok((
-            default_document_inherited_config_for_type(doc_type),
-            type_default_config_source(),
-            type_default_config_source(),
-        ));
+    let parent_path = relative_parent_directory(path).unwrap_or_default();
+    let type_root = type_root_in_knowledge_root(knowledge_root, doc_type);
+    let parent_dir = if parent_path.is_empty() {
+        type_root
+    } else {
+        type_root.join(&parent_path)
     };
-
-    let parent_dir = type_root_in_knowledge_root(knowledge_root, doc_type).join(&parent_path);
     if !parent_dir.is_dir() {
         return Ok((
             default_document_inherited_config_for_type(doc_type),
@@ -1719,18 +1868,19 @@ fn resolve_document_inheritance_from_root(
 }
 
 fn ensure_maintenance_rules(document: &mut KnowledgeDocument) {
-    if document.ai_maintained {
-        document.explicit_maintenance_rules = true;
-    }
-
     let normalized_rules = normalize_optional_text(document.maintenance_rules.take());
     document.maintenance_rules = normalized_rules;
+
+    if !document.inherit_ai_config {
+        document.explicit_maintenance_rules = document.maintenance_rules.is_some();
+    }
 
     if document.ai_maintained
         && !has_maintenance_rules_content(document.maintenance_rules.as_deref())
     {
         document.maintenance_rules =
             default_maintenance_rules_for_type(document.doc_type).map(str::to_string);
+        document.explicit_maintenance_rules = true;
     }
 }
 
@@ -1808,6 +1958,314 @@ pub fn ensure_knowledge_roots(working_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn move_knowledge_migration_entry(source: &Path, target: &Path) -> Result<(), String> {
+    if source.is_dir() && target.is_dir() {
+        for entry in std::fs::read_dir(source).map_err(|e| {
+            format!(
+                "Failed to read legacy knowledge directory '{}': {}",
+                source.display(),
+                e
+            )
+        })? {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "Failed to inspect legacy knowledge directory '{}': {}",
+                    source.display(),
+                    e
+                )
+            })?;
+            move_knowledge_migration_entry(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        std::fs::remove_dir(source).map_err(|e| {
+            format!(
+                "Failed to remove migrated legacy knowledge directory '{}': {}",
+                source.display(),
+                e
+            )
+        })?;
+        return Ok(());
+    }
+
+    let resolved_target = if target.exists() {
+        let parent = target.parent().ok_or_else(|| {
+            format!(
+                "Legacy knowledge migration target has no parent: {}",
+                target.display()
+            )
+        })?;
+        let stem = target
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("migrated");
+        let extension = target.extension().and_then(|value| value.to_str());
+        (2..=999)
+            .map(|index| {
+                let name = match extension {
+                    Some(extension) => format!("{}-migrated-{}.{}", stem, index, extension),
+                    None => format!("{}-migrated-{}", stem, index),
+                };
+                parent.join(name)
+            })
+            .find(|candidate| !candidate.exists())
+            .ok_or_else(|| {
+                format!(
+                    "Failed to resolve a unique legacy knowledge migration target for '{}'",
+                    target.display()
+                )
+            })?
+    } else {
+        target.to_path_buf()
+    };
+
+    std::fs::rename(source, &resolved_target).map_err(|e| {
+        format!(
+            "Failed to migrate legacy knowledge entry '{}' to '{}': {}",
+            source.display(),
+            resolved_target.display(),
+            e
+        )
+    })
+}
+
+fn legacy_category_directory_config(
+    summary: &str,
+    maintenance_rules: &str,
+    ai_maintained: bool,
+) -> KnowledgeDirectoryConfig {
+    KnowledgeDirectoryConfig {
+        version: default_directory_config_version(),
+        summary: summary.to_string(),
+        inject_mode: KnowledgeInjectMode::Excerpt,
+        inherit_inject_mode: true,
+        ai_maintained,
+        inherit_ai_config: false,
+        explicit_maintenance_rules: true,
+        lexical_search: FolderIndexRuleSetting::Inherit,
+        vector_search: FolderIndexRuleSetting::Inherit,
+        inherit_to_children: true,
+        allow_create_documents: true,
+        allow_create_directories: true,
+        allow_move_documents: true,
+        allow_move_directories: true,
+        maintenance_rules: maintenance_rules.to_string(),
+    }
+}
+
+fn preserve_superseded_root_config(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    legacy_config: &Path,
+) -> Result<(), String> {
+    let backup_dir = Path::new(working_dir)
+        .join("Library")
+        .join("Locus")
+        .join("knowledge_migration_backups");
+    std::fs::create_dir_all(&backup_dir).map_err(|e| {
+        format!(
+            "Failed to create knowledge migration backup directory '{}': {}",
+            backup_dir.display(),
+            e
+        )
+    })?;
+    let backup_path = backup_dir.join(format!(
+        "{}-wrapped-root{}",
+        doc_type.as_str(),
+        KNOWLEDGE_DIRECTORY_CONFIG_SUFFIX
+    ));
+    move_knowledge_migration_entry(legacy_config, &backup_path)
+}
+
+fn migrate_wrapped_type_folder_to_root(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    folder_name: &str,
+    summary: &str,
+    maintenance_rules: &str,
+    ai_maintained: bool,
+) -> Result<(), String> {
+    let root = type_root(working_dir, doc_type);
+    let wrapped_dir = root.join(folder_name);
+    if wrapped_dir.is_dir() {
+        let entries = std::fs::read_dir(&wrapped_dir)
+            .map_err(|e| {
+                format!(
+                    "Failed to read wrapped knowledge directory '{}': {}",
+                    wrapped_dir.display(),
+                    e
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                format!(
+                    "Failed to inspect wrapped knowledge directory '{}': {}",
+                    wrapped_dir.display(),
+                    e
+                )
+            })?;
+        for entry in entries {
+            move_knowledge_migration_entry(&entry.path(), &root.join(entry.file_name()))?;
+        }
+        std::fs::remove_dir(&wrapped_dir).map_err(|e| {
+            format!(
+                "Failed to remove migrated knowledge wrapper '{}': {}",
+                wrapped_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    let (wrapped_config, _) = directory_config_path(working_dir, doc_type, folder_name)?;
+    let (root_config, _) = directory_config_path(working_dir, doc_type, "")?;
+    if !root_config.is_file() && wrapped_config.is_file() {
+        std::fs::rename(&wrapped_config, &root_config).map_err(|e| {
+            format!(
+                "Failed to migrate knowledge root config '{}' -> '{}': {}",
+                wrapped_config.display(),
+                root_config.display(),
+                e
+            )
+        })?;
+    } else if root_config.is_file() && wrapped_config.is_file() {
+        let root_content = std::fs::read(&root_config).map_err(|e| {
+            format!(
+                "Failed to read knowledge root config '{}': {}",
+                root_config.display(),
+                e
+            )
+        })?;
+        let wrapped_content = std::fs::read(&wrapped_config).map_err(|e| {
+            format!(
+                "Failed to read wrapped knowledge config '{}': {}",
+                wrapped_config.display(),
+                e
+            )
+        })?;
+        let same_content = root_content == wrapped_content;
+        if same_content {
+            std::fs::remove_file(&wrapped_config).map_err(|e| {
+                format!(
+                    "Failed to remove duplicate wrapped knowledge config '{}': {}",
+                    wrapped_config.display(),
+                    e
+                )
+            })?;
+        } else {
+            preserve_superseded_root_config(working_dir, doc_type, &wrapped_config)?;
+        }
+    }
+
+    if !root_config.is_file() {
+        update_directory_config(
+            working_dir,
+            doc_type,
+            "",
+            legacy_category_directory_config(summary, maintenance_rules, ai_maintained),
+        )?;
+    }
+    Ok(())
+}
+
+fn knowledge_layout_migration_guard() -> Result<MutexGuard<'static, ()>, String> {
+    KNOWLEDGE_LAYOUT_MIGRATION_LOCK
+        .lock()
+        .map_err(|_| "Knowledge layout migration lock is poisoned".to_string())
+}
+
+fn upgrade_generated_memory_folder_to_auto_maintenance(
+    working_dir: &str,
+    previous_version: u32,
+) -> Result<(), String> {
+    let memory_folder = type_root(working_dir, KnowledgeType::Memory).join(LEGACY_MEMORY_FOLDER);
+    let (config_file, _) =
+        directory_config_path(working_dir, KnowledgeType::Memory, LEGACY_MEMORY_FOLDER)?;
+    if !memory_folder.is_dir() || !config_file.is_file() {
+        return Ok(());
+    }
+
+    if previous_version == 1 {
+        let marker_file = unified_knowledge_tree_migration_marker_path(working_dir);
+        let marker_modified = std::fs::metadata(&marker_file)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let config_modified = std::fs::metadata(&config_file)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if matches!((marker_modified, config_modified), (Some(marker), Some(config)) if config > marker)
+        {
+            return Ok(());
+        }
+    }
+
+    let record = read_directory_config(working_dir, KnowledgeType::Memory, LEGACY_MEMORY_FOLDER)?;
+    if record.config.ai_maintained
+        || record.config.inherit_ai_config
+        || !record.config.explicit_maintenance_rules
+        || record.config.summary != "用户长期偏好、稳定背景与跨任务上下文"
+        || record.config.maintenance_rules != LEGACY_MEMORY_FOLDER_RULES
+    {
+        return Ok(());
+    }
+
+    let mut config = record.config;
+    config.ai_maintained = true;
+    update_directory_config(
+        working_dir,
+        KnowledgeType::Memory,
+        LEGACY_MEMORY_FOLDER,
+        config,
+    )?;
+    Ok(())
+}
+
+fn ensure_unified_knowledge_tree_layout_locked(working_dir: &str) -> Result<(), String> {
+    if working_dir.trim().is_empty() {
+        return Ok(());
+    }
+
+    let previous_version = read_unified_knowledge_tree_migration_version(working_dir);
+    if previous_version >= UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION {
+        return Ok(());
+    }
+
+    ensure_knowledge_roots(working_dir)?;
+    if previous_version < 2 {
+        upgrade_generated_memory_folder_to_auto_maintenance(working_dir, previous_version)?;
+    }
+    if previous_version < 3 {
+        migrate_wrapped_type_folder_to_root(
+            working_dir,
+            KnowledgeType::Design,
+            LEGACY_DESIGN_FOLDER,
+            "项目需求、方案、约束与阶段性设计结论",
+            LEGACY_DESIGN_FOLDER_RULES,
+            false,
+        )?;
+        migrate_wrapped_type_folder_to_root(
+            working_dir,
+            KnowledgeType::Memory,
+            LEGACY_MEMORY_FOLDER,
+            "用户长期偏好、稳定背景与跨任务上下文",
+            LEGACY_MEMORY_FOLDER_RULES,
+            true,
+        )?;
+    }
+    write_unified_knowledge_tree_migration_version(
+        working_dir,
+        UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION,
+    )
+}
+
+pub fn ensure_unified_knowledge_tree_layout(working_dir: &str) -> Result<(), String> {
+    let _migration_guard = knowledge_layout_migration_guard()?;
+    ensure_unified_knowledge_tree_layout_locked(working_dir)
+}
+
+pub fn ensure_workspace_knowledge_layout(working_dir: &str) -> Result<(), String> {
+    let _migration_guard = knowledge_layout_migration_guard()?;
+    ensure_memory_builtin_documents(working_dir)?;
+    ensure_unified_knowledge_tree_layout_locked(working_dir)
+}
+
 fn normalize_relative_path(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -1878,7 +2336,18 @@ fn directory_config_path_in_type_root_with_suffix(
     path: &str,
     suffix: &str,
 ) -> Result<(PathBuf, String), String> {
-    let rel = normalize_relative_directory_path(path)?;
+    let rel = normalize_relative_prefix(path)?;
+    if rel.is_empty() {
+        let knowledge_root = type_root
+            .parent()
+            .ok_or_else(|| "Knowledge type root has no parent".to_string())?;
+        let type_name = type_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "Knowledge type root name is invalid".to_string())?;
+        let file_name = directory_config_file_name_with_suffix(type_name, suffix)?;
+        return Ok((knowledge_root.join(&file_name), file_name));
+    }
     let rel_path = Path::new(&rel);
     let parent = rel_path.parent().unwrap_or_else(|| Path::new(""));
     let dir_name = rel_path
@@ -2461,9 +2930,13 @@ fn read_directory_config_from_knowledge_root_internal(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<KnowledgeDirectoryConfigRecord, String> {
-    let dir_path = normalize_relative_directory_path(path)?;
+    let dir_path = normalize_relative_prefix(path)?;
     let type_root = type_root_in_knowledge_root(knowledge_root, doc_type);
-    let target_dir = type_root.join(&dir_path);
+    let target_dir = if dir_path.is_empty() {
+        type_root.clone()
+    } else {
+        type_root.join(&dir_path)
+    };
     if !target_dir.is_dir() {
         return Err(format!("Knowledge directory not found: {}", dir_path));
     }
@@ -2475,16 +2948,16 @@ fn read_directory_config_from_knowledge_root_internal(
     } else {
         None
     };
-    let parent_config = relative_parent_directory(&dir_path)
-        .as_deref()
-        .map(|parent_path| {
-            read_directory_config_from_knowledge_root_internal(
-                knowledge_root,
-                doc_type,
-                parent_path,
-            )
-        })
-        .transpose()?;
+    let parent_config = if dir_path.is_empty() {
+        None
+    } else {
+        let parent_path = relative_parent_directory(&dir_path).unwrap_or_default();
+        Some(read_directory_config_from_knowledge_root_internal(
+            knowledge_root,
+            doc_type,
+            &parent_path,
+        )?)
+    };
 
     let updated_at = if exists {
         std::fs::metadata(&config_file)
@@ -2513,7 +2986,7 @@ fn read_virtual_workspace_directory_config(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<KnowledgeDirectoryConfigRecord, String> {
-    let dir_path = normalize_relative_directory_path(path)?;
+    let dir_path = normalize_relative_prefix(path)?;
     let (config_file, config_rel) = directory_config_path(working_dir, doc_type, &dir_path)?;
     let exists = config_file.is_file();
     let stored = if exists {
@@ -2521,10 +2994,12 @@ fn read_virtual_workspace_directory_config(
     } else {
         None
     };
-    let parent_config = relative_parent_directory(&dir_path)
-        .as_deref()
-        .map(|parent_path| read_directory_config(working_dir, doc_type, parent_path))
-        .transpose()?;
+    let parent_config = if dir_path.is_empty() {
+        None
+    } else {
+        let parent_path = relative_parent_directory(&dir_path).unwrap_or_default();
+        Some(read_directory_config(working_dir, doc_type, &parent_path)?)
+    };
     let updated_at = if exists {
         std::fs::metadata(&config_file)
             .ok()
@@ -2552,11 +3027,13 @@ pub fn directory_exists(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<bool, String> {
-    let normalized_path = normalize_relative_directory_path(path)?;
-    if type_root(working_dir, doc_type)
-        .join(&normalized_path)
-        .is_dir()
-    {
+    let normalized_path = normalize_relative_prefix(path)?;
+    let target = if normalized_path.is_empty() {
+        type_root(working_dir, doc_type)
+    } else {
+        type_root(working_dir, doc_type).join(&normalized_path)
+    };
+    if target.is_dir() {
         return Ok(true);
     }
     if doc_type == KnowledgeType::Reference {
@@ -2592,9 +3069,7 @@ pub fn effective_child_directory_config(
     doc_type: KnowledgeType,
     parent_path: Option<&str>,
 ) -> Result<KnowledgeDirectoryConfig, String> {
-    let Some(parent_path) = parent_path.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(default_directory_config_for_type(doc_type));
-    };
+    let parent_path = parent_path.map(str::trim).unwrap_or_default();
 
     if !directory_exists(working_dir, doc_type, parent_path)? {
         return Ok(default_directory_config_for_type(doc_type));
@@ -2621,14 +3096,19 @@ pub fn effective_directory_search_access_with_app_root(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<DirectorySearchAccess, String> {
-    let normalized_path = normalize_relative_directory_path(path)?;
+    let normalized_path = normalize_relative_prefix(path)?;
     if directory_exists(working_dir, doc_type, &normalized_path)? {
         let record = read_directory_config(working_dir, doc_type, &normalized_path)?;
         return Ok(directory_search_access_from_record(&record));
     }
 
     if let Some(app_root) = app_knowledge_dir {
-        let app_dir = type_root_in_knowledge_root(app_root, doc_type).join(&normalized_path);
+        let app_type_root = type_root_in_knowledge_root(app_root, doc_type);
+        let app_dir = if normalized_path.is_empty() {
+            app_type_root
+        } else {
+            app_type_root.join(&normalized_path)
+        };
         if app_dir.is_dir() {
             let record = read_directory_config_from_root(app_root, doc_type, &normalized_path)?;
             return Ok(directory_search_access_from_record(&record));
@@ -2644,9 +3124,7 @@ pub fn effective_document_search_access_with_app_root(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<DirectorySearchAccess, String> {
-    let Some(parent_path) = relative_parent_directory(path) else {
-        return Ok(default_directory_search_access());
-    };
+    let parent_path = relative_parent_directory(path).unwrap_or_default();
     effective_directory_search_access_with_app_root(
         working_dir,
         app_knowledge_dir,
@@ -2786,8 +3264,12 @@ fn write_directory_config_record(
 ) -> Result<KnowledgeDirectoryConfigRecord, String> {
     ensure_knowledge_roots(working_dir)?;
 
-    let dir_path = normalize_relative_directory_path(path)?;
-    let target_dir = type_root(working_dir, doc_type).join(&dir_path);
+    let dir_path = normalize_relative_prefix(path)?;
+    let target_dir = if dir_path.is_empty() {
+        type_root(working_dir, doc_type)
+    } else {
+        type_root(working_dir, doc_type).join(&dir_path)
+    };
     let managed_virtual_directory = doc_type == KnowledgeType::Reference
         && crate::unity_docs::managed_directory_exists(working_dir, &dir_path)?;
     if !target_dir.is_dir() && !managed_virtual_directory {
@@ -2830,10 +3312,12 @@ fn write_directory_config_record(
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_else(now_millis);
-    let parent_config = relative_parent_directory(&dir_path)
-        .as_deref()
-        .map(|parent_path| read_directory_config(working_dir, doc_type, parent_path))
-        .transpose()?;
+    let parent_config = if dir_path.is_empty() {
+        None
+    } else {
+        let parent_path = relative_parent_directory(&dir_path).unwrap_or_default();
+        Some(read_directory_config(working_dir, doc_type, &parent_path)?)
+    };
     let (_, inject_mode_source, ai_config_source) =
         inherited_directory_config_and_sources(doc_type, parent_config.as_ref());
     let inject_mode_source = if normalized.inherit_inject_mode {
@@ -2879,7 +3363,7 @@ pub fn update_directory_config(
     path: &str,
     config: KnowledgeDirectoryConfig,
 ) -> Result<KnowledgeDirectoryConfigRecord, String> {
-    let dir_path = normalize_relative_directory_path(path)?;
+    let dir_path = normalize_relative_prefix(path)?;
     let (config_file, _) = directory_config_path(working_dir, doc_type, &dir_path)?;
     let external_sources = if config_file.is_file() {
         read_stored_directory_config(&config_file)?.external_sources
@@ -3192,13 +3676,56 @@ fn parse_frontmatter(content: &str) -> Result<(KnowledgeFrontmatter, &str), Stri
     let (yaml, body) = split_frontmatter(content)?;
     let frontmatter: KnowledgeFrontmatter = serde_yaml::from_str(yaml)
         .map_err(|e| format!("Failed to parse knowledge frontmatter: {}", e))?;
-    if frontmatter.path.trim().is_empty() {
-        return Err("Knowledge frontmatter path is required".to_string());
-    }
-    if frontmatter.title.trim().is_empty() {
-        return Err("Knowledge frontmatter title is required".to_string());
-    }
     Ok((frontmatter, body))
+}
+
+const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
+    "id",
+    "injectMode",
+    "summary",
+    "readOnly",
+    "aiMaintained",
+    "maintenanceRules",
+    "externalSource",
+    "skillEnabled",
+    "skillSurface",
+    "commandTrigger",
+    "argumentHint",
+    "tools",
+];
+
+fn frontmatter_needs_normalization(content: &str) -> bool {
+    let Ok((yaml, _)) = split_frontmatter(content) else {
+        return false;
+    };
+    let Ok(serde_yaml::Value::Mapping(mapping)) = serde_yaml::from_str(yaml) else {
+        return false;
+    };
+    mapping.keys().any(|key| {
+        key.as_str()
+            .is_some_and(|key| !CANONICAL_FRONTMATTER_KEYS.contains(&key))
+    }) || mapping
+        .get(&serde_yaml::Value::String("readOnly".to_string()))
+        .is_some_and(|value| value.as_bool() == Some(false))
+}
+
+fn has_frontmatter_opening(content: &str) -> bool {
+    content.trim_start().starts_with("---")
+}
+
+fn uses_raw_markdown_body_format(content: &str) -> bool {
+    parse_frontmatter(content)
+        .ok()
+        .is_some_and(|(frontmatter, _)| {
+            frontmatter
+                .body_format
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("markdown"))
+                || (frontmatter.body_format.is_none()
+                    && frontmatter.doc_type.is_none()
+                    && frontmatter.path.is_none()
+                    && frontmatter.title.is_none())
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3321,19 +3848,6 @@ fn parse_sectioned_body(body: &str) -> ParsedSections {
     sections
 }
 
-fn render_memory_comment_block(start: &str, end: &str, content: &str) -> String {
-    let mut rendered = String::new();
-    rendered.push_str(start);
-    rendered.push('\n');
-    let trimmed = content.trim_matches('\n');
-    if !trimmed.is_empty() {
-        rendered.push_str(trimmed);
-        rendered.push('\n');
-    }
-    rendered.push_str(end);
-    rendered
-}
-
 fn parse_memory_comment_sections(content: &str) -> Result<Option<MemoryCommentSections>, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Block {
@@ -3439,23 +3953,31 @@ fn parse_memory_body_sections(
 fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
     let frontmatter = KnowledgeFrontmatter {
         id: doc.id.clone(),
-        doc_type: doc.doc_type,
-        path: doc.path.clone(),
-        title: doc.title.clone(),
-        inject_mode: (!doc.inherit_inject_mode).then_some(doc.inject_mode),
-        inherit_inject_mode: doc.inherit_inject_mode.then_some(true),
-        summary_enabled: Some(doc.summary_enabled),
-        summary_cache: (!doc.summary_enabled)
-            .then(|| doc.summary.clone())
-            .flatten(),
-        command_enabled: doc.command_enabled,
-        read_only: doc.read_only,
-        ai_maintained: (!doc.inherit_ai_config).then_some(doc.ai_maintained),
-        inherit_ai_config: doc.inherit_ai_config.then_some(true),
-        explicit_maintenance_rules: (!doc.inherit_ai_config)
-            .then_some(doc.explicit_maintenance_rules),
-        maintenance_rules_cache: (!doc.inherit_ai_config && !doc.explicit_maintenance_rules)
-            .then(|| doc.maintenance_rules.clone())
+        doc_type: None,
+        path: None,
+        title: None,
+        body_format: None,
+        inject_mode: Some(KnowledgeFrontmatterInjectMode::from_document(doc)),
+        inherit_inject_mode: None,
+        summary_enabled: None,
+        summary_cache: None,
+        summary: doc.summary.clone().filter(|value| !value.trim().is_empty()),
+        command_enabled: None,
+        read_only: doc.read_only.then_some(true),
+        ai_maintained: Some(if doc.inherit_ai_config {
+            KnowledgeFrontmatterAiMaintained::Mode(KnowledgeFrontmatterInheritMarker::Inherit)
+        } else {
+            KnowledgeFrontmatterAiMaintained::Explicit(doc.ai_maintained)
+        }),
+        inherit_ai_config: None,
+        explicit_maintenance_rules: None,
+        maintenance_rules_cache: None,
+        maintenance_rules: (!doc.inherit_ai_config)
+            .then(|| {
+                doc.maintenance_rules
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            })
             .flatten(),
         external_source: doc.external_source.clone(),
         skill_enabled: doc.skill_enabled,
@@ -3463,60 +3985,94 @@ fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
         command_trigger: doc.command_trigger.clone(),
         argument_hint: doc.argument_hint.clone(),
         tools: doc.tools.clone(),
-        created_at: doc.created_at,
-        updated_at: doc.updated_at,
+        created_at: None,
+        updated_at: None,
     };
 
     serde_yaml::to_string(&frontmatter)
         .map_err(|e| format!("Failed to serialize knowledge frontmatter: {}", e))
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedGenericKnowledgeWrite {
+    pub content: String,
+    pub frontmatter: String,
+    pub content_start_line: usize,
+}
+
+/// Build the on-disk representation for a generic `write` call targeting a
+/// workspace knowledge document. The caller supplies ordinary Markdown body
+/// content; Locus owns the frontmatter required by the knowledge catalog.
+pub fn prepare_generic_knowledge_write(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    logical_path: &str,
+    body: &str,
+) -> Result<PreparedGenericKnowledgeWrite, String> {
+    let path = normalize_relative_path(logical_path)?;
+    let mut document = KnowledgeDocument {
+        id: format!("kd_{}", uuid::Uuid::new_v4()),
+        doc_type,
+        path,
+        title: String::new(),
+        inject_mode: default_document_inject_mode_for_type(doc_type),
+        inherit_inject_mode: true,
+        inject_mode_source: KnowledgeConfigSource::default(),
+        summary_enabled: default_summary_enabled_for_type(doc_type),
+        command_enabled: false,
+        read_only: false,
+        ai_maintained: default_ai_maintained_for_type(doc_type),
+        storage_source: KnowledgeStorageSource::Project,
+        inherit_ai_config: true,
+        ai_config_source: KnowledgeConfigSource::default(),
+        explicit_maintenance_rules: default_explicit_maintenance_rules_for_type(doc_type),
+        external_source: None,
+        skill_enabled: None,
+        skill_surface: None,
+        command_trigger: None,
+        argument_hint: None,
+        tools: Vec::new(),
+        summary: None,
+        body: body.to_string(),
+        maintenance_rules: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+
+    document.path = normalize_relative_path(&document.path)?;
+    sync_title_with_document_path(&mut document)?;
+    resolve_document_inheritance(Some(working_dir), &mut document)?;
+    apply_external_source_defaults(&mut document);
+    apply_read_only_policy(&mut document);
+    ensure_summary_state(&mut document);
+    ensure_maintenance_rules(&mut document);
+    ensure_skill_defaults(&mut document);
+    validate_document(&document)?;
+
+    let yaml = render_frontmatter(&document)?;
+    let prefix = format!("---\n{}---\n\n", yaml);
+    let content_start_line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let mut content = prefix;
+    content.push_str(body.trim_start_matches('\u{feff}'));
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    Ok(PreparedGenericKnowledgeWrite {
+        content,
+        frontmatter: yaml,
+        content_start_line,
+    })
+}
+
 fn render_document_body(doc: &KnowledgeDocument) -> Result<String, String> {
-    let mut rendered = String::new();
-    rendered.push_str("# ");
-    rendered.push_str(doc.title.trim());
-    rendered.push_str("\n\n");
-
-    if let Some(summary) = active_summary(doc) {
-        rendered.push_str("## Summary\n");
-        rendered.push_str(summary.trim());
-        rendered.push_str("\n\n");
-    }
-
-    if doc.doc_type == KnowledgeType::Memory {
-        if doc.explicit_maintenance_rules && !doc.inherit_ai_config {
-            let rules = active_maintenance_rules(doc).unwrap_or_default();
-            rendered.push_str(&render_memory_comment_block(
-                MEMORY_MAINTAIN_RULES_START,
-                MEMORY_MAINTAIN_RULES_END,
-                rules,
-            ));
-            rendered.push_str("\n\n");
-        } else if doc.ai_maintained && !doc.inherit_ai_config {
-            return Err("aiMaintained=true requires maintenance rules".to_string());
-        }
-
-        rendered.push_str(&render_memory_comment_block(
-            MEMORY_BODY_START,
-            MEMORY_BODY_END,
-            doc.body.trim_end(),
-        ));
-        rendered.push('\n');
-        return Ok(rendered);
-    }
-
-    if doc.explicit_maintenance_rules && !doc.inherit_ai_config {
-        rendered.push_str("## Maintenance Rules\n");
-        if let Some(rules) = active_maintenance_rules(doc) {
-            rendered.push_str(rules.trim());
-            rendered.push('\n');
-        }
-        rendered.push('\n');
-    } else if doc.ai_maintained && !doc.inherit_ai_config {
+    if doc.ai_maintained
+        && !doc.inherit_ai_config
+        && !has_maintenance_rules_content(doc.maintenance_rules.as_deref())
+    {
         return Err("aiMaintained=true requires maintenance rules".to_string());
     }
-
-    rendered.push_str("## Content\n");
+    let mut rendered = String::new();
     rendered.push_str(doc.body.trim_end());
     rendered.push('\n');
     Ok(rendered)
@@ -3532,6 +4088,10 @@ fn render_document(doc: &KnowledgeDocument) -> Result<String, String> {
     rendered.push_str("---\n\n");
     rendered.push_str(&render_document_body(&normalized)?);
     Ok(rendered)
+}
+
+pub fn render_document_for_filesystem_read(doc: &KnowledgeDocument) -> Result<String, String> {
+    render_document(doc)
 }
 
 pub fn rendered_document_size_bytes(doc: &KnowledgeDocument) -> Result<u64, String> {
@@ -3588,48 +4148,112 @@ fn validate_document(doc: &KnowledgeDocument) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDocument, String> {
+fn parse_document(
+    content: &str,
+    doc_type_hint: Option<KnowledgeType>,
+    path_hint: Option<&str>,
+) -> Result<KnowledgeDocument, String> {
     let (frontmatter, body) = parse_frontmatter(content)?;
-    let sections = parse_sectioned_body(body);
-    let path = if frontmatter.path.trim().is_empty() {
-        normalize_relative_path(path_hint.unwrap_or(&frontmatter.path))?
+    let doc_type = doc_type_hint
+        .or(frontmatter.doc_type)
+        .or_else(|| path_hint.and_then(guess_type_from_path))
+        .ok_or_else(|| {
+            "Knowledge document type cannot be derived from its physical directory".to_string()
+        })?;
+    let path = if let Some(path_hint) = path_hint {
+        normalize_relative_path(path_hint)?
     } else {
-        normalize_relative_path(&frontmatter.path)?
+        normalize_relative_path(frontmatter.path.as_deref().unwrap_or_default())?
     };
     let title = default_document_title_from_path(&path)?;
-    let (summary, parsed_rules, body) = if frontmatter.doc_type == KnowledgeType::Memory {
-        parse_memory_body_sections(sections)?
-    } else {
+    let raw_markdown = frontmatter
+        .body_format
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("markdown"))
+        || (frontmatter.body_format.is_none()
+            && frontmatter.doc_type.is_none()
+            && frontmatter.path.is_none()
+            && frontmatter.title.is_none());
+    let (parsed_summary, parsed_rules, body) = if raw_markdown {
         (
-            sections.summary,
-            sections.maintenance_rules,
-            sections
-                .content
-                .ok_or_else(|| "Knowledge document missing ## Content section".to_string())?,
+            None,
+            None,
+            normalize_markdown(body)
+                .trim_start_matches('\n')
+                .trim_end_matches('\n')
+                .to_string(),
         )
+    } else {
+        let sections = parse_sectioned_body(body);
+        if doc_type == KnowledgeType::Memory {
+            parse_memory_body_sections(sections)?
+        } else {
+            (
+                sections.summary,
+                sections.maintenance_rules,
+                sections
+                    .content
+                    .ok_or_else(|| "Knowledge document missing ## Content section".to_string())?,
+            )
+        }
     };
-    let summary = summary.or(frontmatter.summary_cache.clone());
-    let inherit_inject_mode = frontmatter.inherit_inject_mode.unwrap_or(false);
-    let inherit_ai_config = frontmatter.inherit_ai_config.unwrap_or(false);
-    let has_rules = has_maintenance_rules_content(parsed_rules.as_deref());
-    let maintenance_rules = if inherit_ai_config {
+    let summary = frontmatter
+        .summary
+        .clone()
+        .or(parsed_summary)
+        .or(frontmatter.summary_cache.clone());
+    let summary = if frontmatter.summary_enabled == Some(false) {
         None
     } else {
-        parsed_rules.or(frontmatter.maintenance_rules_cache.clone())
+        normalize_optional_text(summary)
     };
-    let summary_enabled = frontmatter.summary_enabled.unwrap_or_else(|| {
-        has_summary_content(summary.as_deref())
-            || default_summary_enabled_for_type(frontmatter.doc_type)
+    let inject_setting = frontmatter.inject_mode.unwrap_or_else(|| {
+        if frontmatter.inherit_inject_mode == Some(true) {
+            KnowledgeFrontmatterInjectMode::Inherit
+        } else {
+            KnowledgeFrontmatterInjectMode::from_explicit_mode(
+                default_document_inject_mode_for_type(doc_type),
+            )
+        }
     });
+    let inherit_inject_mode = frontmatter.inherit_inject_mode == Some(true)
+        || inject_setting == KnowledgeFrontmatterInjectMode::Inherit;
+    let inject_mode = inject_setting
+        .explicit_mode()
+        .unwrap_or_else(|| default_document_inject_mode_for_type(doc_type));
+    let inherit_ai_config = frontmatter.inherit_ai_config == Some(true)
+        || matches!(
+            frontmatter.ai_maintained,
+            Some(KnowledgeFrontmatterAiMaintained::Mode(
+                KnowledgeFrontmatterInheritMarker::Inherit
+            ))
+        );
+    let ai_maintained = match frontmatter.ai_maintained {
+        Some(KnowledgeFrontmatterAiMaintained::Explicit(value)) => value,
+        Some(KnowledgeFrontmatterAiMaintained::Mode(_)) => default_ai_maintained_for_type(doc_type),
+        None => default_ai_maintained_for_type(doc_type),
+    };
+    let maintenance_rules =
+        if inherit_ai_config || frontmatter.explicit_maintenance_rules == Some(false) {
+            None
+        } else {
+            normalize_optional_text(
+                frontmatter
+                    .maintenance_rules
+                    .clone()
+                    .or(parsed_rules)
+                    .or(frontmatter.maintenance_rules_cache.clone()),
+            )
+        };
+    let summary_enabled = summary.is_some();
+    let explicit_maintenance_rules = maintenance_rules.is_some();
 
     let mut doc = KnowledgeDocument {
         id: frontmatter.id,
-        doc_type: frontmatter.doc_type,
+        doc_type,
         path,
         title,
-        inject_mode: frontmatter
-            .inject_mode
-            .unwrap_or_else(|| default_document_inject_mode_for_type(frontmatter.doc_type)),
+        inject_mode,
         inherit_inject_mode,
         inject_mode_source: if inherit_inject_mode {
             type_default_config_source()
@@ -3637,11 +4261,9 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
             self_config_source()
         },
         summary_enabled,
-        command_enabled: frontmatter.command_enabled,
-        read_only: frontmatter.read_only,
-        ai_maintained: frontmatter
-            .ai_maintained
-            .unwrap_or_else(|| default_ai_maintained_for_type(frontmatter.doc_type)),
+        command_enabled: frontmatter.command_enabled.unwrap_or(false),
+        read_only: frontmatter.read_only.unwrap_or(false),
+        ai_maintained,
         storage_source: KnowledgeStorageSource::Project,
         inherit_ai_config,
         ai_config_source: if inherit_ai_config {
@@ -3649,11 +4271,7 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
         } else {
             self_config_source()
         },
-        explicit_maintenance_rules: frontmatter.explicit_maintenance_rules.unwrap_or_else(|| {
-            default_explicit_maintenance_rules_for_type(frontmatter.doc_type)
-                || frontmatter.ai_maintained.unwrap_or(false)
-                || has_rules
-        }),
+        explicit_maintenance_rules,
         external_source: frontmatter.external_source,
         skill_enabled: frontmatter.skill_enabled,
         skill_surface: frontmatter.skill_surface,
@@ -3663,16 +4281,9 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
         summary,
         body,
         maintenance_rules,
-        created_at: frontmatter.created_at,
-        updated_at: frontmatter.updated_at,
+        created_at: frontmatter.created_at.unwrap_or(0),
+        updated_at: frontmatter.updated_at.unwrap_or(0),
     };
-
-    if doc.created_at == 0 {
-        doc.created_at = now_millis();
-    }
-    if doc.updated_at == 0 {
-        doc.updated_at = doc.created_at;
-    }
     apply_external_source_defaults(&mut doc);
     resolve_document_inheritance(None, &mut doc)?;
     ensure_summary_state(&mut doc);
@@ -3681,17 +4292,47 @@ fn parse_document(content: &str, path_hint: Option<&str>) -> Result<KnowledgeDoc
     apply_read_only_policy(&mut doc);
     validate_document(&doc)?;
 
-    if let Some(hint) = path_hint {
-        let normalized = normalize_relative_path(hint)?;
-        if doc.path != normalized {
-            return Err(format!(
-                "Knowledge document path '{}' does not match the file path '{}'",
-                doc.path, normalized
-            ));
-        }
-    }
-
     Ok(doc)
+}
+
+fn convert_plain_markdown_document(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    path: &str,
+    body: String,
+) -> Result<KnowledgeDocument, String> {
+    let normalized_path = normalize_relative_path(path)?;
+    let timestamp = now_millis();
+    let document = KnowledgeDocument {
+        id: format!("kd_{}", uuid::Uuid::new_v4()),
+        doc_type,
+        path: normalized_path.clone(),
+        title: default_document_title_from_path(&normalized_path)?,
+        inject_mode: default_document_inject_mode_for_type(doc_type),
+        inherit_inject_mode: true,
+        inject_mode_source: type_default_config_source(),
+        summary_enabled: default_summary_enabled_for_type(doc_type),
+        command_enabled: false,
+        read_only: false,
+        ai_maintained: false,
+        storage_source: KnowledgeStorageSource::Project,
+        inherit_ai_config: false,
+        ai_config_source: self_config_source(),
+        explicit_maintenance_rules: false,
+        external_source: None,
+        skill_enabled: None,
+        skill_surface: None,
+        command_trigger: None,
+        argument_hint: None,
+        tools: Vec::new(),
+        summary: None,
+        body,
+        maintenance_rules: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+    };
+
+    save_document(working_dir, document)
 }
 
 pub fn ensure_document_path(path: &str) -> Result<String, String> {
@@ -3917,7 +4558,7 @@ fn load_document_for_directory_delete(
         Err(load_error) => {
             let file_path = document_path(working_dir, doc_type, rel_path)?;
             let raw = read_raw_document(&file_path)?;
-            let mut document = parse_document(&raw, None).map_err(|parse_error| {
+            let mut document = parse_document(&raw, Some(doc_type), None).map_err(|parse_error| {
                 format!(
                     "Failed to inspect knowledge document '{}' for directory delete: {}. Fallback parse failed: {}",
                     rel_path, load_error, parse_error
@@ -4079,7 +4720,53 @@ pub fn read_document_from_file(path: &Path) -> Result<KnowledgeDocument, String>
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_string();
-    parse_document(&content, Some(&rel))
+    let doc_type = path
+        .ancestors()
+        .filter_map(|ancestor| ancestor.file_name().and_then(|name| name.to_str()))
+        .find_map(|name| {
+            KnowledgeType::all()
+                .into_iter()
+                .find(|doc_type| doc_type.as_str().eq_ignore_ascii_case(name))
+        });
+    let mut document = parse_document(&content, doc_type, Some(&rel))?;
+    apply_file_timestamps(&mut document, path);
+    Ok(document)
+}
+
+fn load_workspace_document_by_normalized_path(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    normalized_path: &str,
+) -> Result<KnowledgeDocument, String> {
+    let path = document_path(working_dir, doc_type, normalized_path)?;
+    if !path.is_file() {
+        return Err(format!(
+            "Knowledge document not found: {}/{}",
+            doc_type.as_str(),
+            normalized_path
+        ));
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "Failed to read knowledge document '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    if !has_frontmatter_opening(&content) {
+        return convert_plain_markdown_document(working_dir, doc_type, normalized_path, content);
+    }
+    let migrate_legacy_layout = !uses_raw_markdown_body_format(&content);
+    let normalize_frontmatter = frontmatter_needs_normalization(&content);
+    let mut document = parse_document(&content, Some(doc_type), Some(normalized_path))?;
+    resolve_document_inheritance(Some(working_dir), &mut document)?;
+    ensure_maintenance_rules(&mut document);
+    validate_document(&document)?;
+    if (migrate_legacy_layout || normalize_frontmatter) && !document.read_only {
+        write_document_preserving_layout(&path, &document, render_document_body(&document)?)?;
+    }
+    apply_file_timestamps(&mut document, &path);
+    Ok(document)
 }
 
 pub fn load_document_by_path(
@@ -4098,26 +4785,7 @@ pub fn load_document_by_path(
             return Ok(document);
         }
     }
-    let path = document_path(working_dir, doc_type, &normalized_path)?;
-    if !path.is_file() {
-        return Err(format!(
-            "Knowledge document not found: {}/{}",
-            doc_type.as_str(),
-            normalized_path
-        ));
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "Failed to read knowledge document '{}': {}",
-            path.display(),
-            e
-        )
-    })?;
-    let mut document = parse_document(&content, Some(&normalized_path))?;
-    resolve_document_inheritance(Some(working_dir), &mut document)?;
-    ensure_maintenance_rules(&mut document);
-    validate_document(&document)?;
-    Ok(document)
+    load_workspace_document_by_normalized_path(working_dir, doc_type, &normalized_path)
 }
 
 pub fn load_document_by_root(
@@ -4140,10 +4808,11 @@ pub fn load_document_by_root(
             e
         )
     })?;
-    let mut document = parse_document(&content, Some(rel_path))?;
+    let mut document = parse_document(&content, Some(doc_type), Some(rel_path))?;
     resolve_document_inheritance_from_root(Some(knowledge_root), &mut document)?;
     ensure_maintenance_rules(&mut document);
     validate_document(&document)?;
+    apply_file_timestamps(&mut document, &path);
     Ok(document)
 }
 
@@ -4175,6 +4844,25 @@ fn load_documents_from_root_paths(
 ) -> Vec<KnowledgeDocument> {
     let load_document = |relative_path: &String| {
         load_document_by_root(knowledge_root, doc_type, relative_path).ok()
+    };
+
+    if should_parallelize_document_load(relative_paths.len()) {
+        relative_paths
+            .par_iter()
+            .filter_map(load_document)
+            .collect()
+    } else {
+        relative_paths.iter().filter_map(load_document).collect()
+    }
+}
+
+fn load_workspace_documents_from_paths(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    relative_paths: &[String],
+) -> Vec<KnowledgeDocument> {
+    let load_document = |relative_path: &String| {
+        load_workspace_document_by_normalized_path(working_dir, doc_type, relative_path).ok()
     };
 
     if should_parallelize_document_load(relative_paths.len()) {
@@ -4479,7 +5167,7 @@ pub fn load_documents_with_app_root_excluding_prefixes(
     excluded_prefixes: &[(KnowledgeType, String)],
 ) -> Result<Vec<KnowledgeDocument>, String> {
     ensure_knowledge_roots(working_dir)?;
-    ensure_memory_builtin_documents(working_dir)?;
+    ensure_workspace_knowledge_layout(working_dir)?;
 
     let mut documents = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4494,8 +5182,6 @@ pub fn load_documents_with_app_root_excluding_prefixes(
     };
     let normalized_prefix = path_prefix.map(normalize_relative_prefix).transpose()?;
     let normalized_exclusions = normalize_excluded_prefixes(excluded_prefixes)?;
-    let workspace_knowledge_root = knowledge_root(working_dir);
-
     for ty in types {
         let root = type_root(working_dir, ty);
         if root.is_dir() {
@@ -4540,9 +5226,7 @@ pub fn load_documents_with_app_root_excluding_prefixes(
                 })
                 .collect::<Vec<_>>();
 
-            for doc in
-                load_documents_from_root_paths(&workspace_knowledge_root, ty, &relative_paths)
-            {
+            for doc in load_workspace_documents_from_paths(working_dir, ty, &relative_paths) {
                 if let Some(prefix) = normalized_prefix.as_deref() {
                     if !doc.path.starts_with(prefix) {
                         continue;
@@ -4628,6 +5312,7 @@ pub fn read_document_with_app_root(
     doc_type: KnowledgeType,
     path: &str,
     part: &str,
+    include_history: bool,
 ) -> Result<KnowledgeReadResult, String> {
     let normalized_path = normalize_relative_path(path)?;
     let document = load_document_by_path_with_app_root(
@@ -4643,9 +5328,9 @@ pub fn read_document_with_app_root(
         &normalized_path,
     )
     .ok();
-    let file_metadata = file_path
-        .as_deref()
-        .map(|value| build_document_file_metadata(Some(working_dir), value, &document));
+    let file_metadata = file_path.as_deref().map(|value| {
+        build_document_file_metadata(Some(working_dir), value, &document, include_history)
+    });
     build_read_result(document, part, file_metadata)
 }
 
@@ -4655,13 +5340,18 @@ pub fn read_directory_config_with_app_root(
     doc_type: KnowledgeType,
     path: &str,
 ) -> Result<KnowledgeDirectoryConfigRecord, String> {
-    let normalized_path = normalize_relative_directory_path(path)?;
+    let normalized_path = normalize_relative_prefix(path)?;
     if directory_exists(working_dir, doc_type, &normalized_path)? {
         return read_directory_config(working_dir, doc_type, &normalized_path);
     }
 
     if let Some(app_root) = app_knowledge_dir {
-        let app_dir = type_root_in_knowledge_root(app_root, doc_type).join(&normalized_path);
+        let app_type_root = type_root_in_knowledge_root(app_root, doc_type);
+        let app_dir = if normalized_path.is_empty() {
+            app_type_root
+        } else {
+            app_type_root.join(&normalized_path)
+        };
         if app_dir.is_dir() {
             let mut record = read_directory_config_from_root(app_root, doc_type, &normalized_path)?;
             overlay_app_directory_read_only(&mut record);
@@ -5189,6 +5879,12 @@ pub fn query_documents(
                 semantic_score: None,
                 semantic_confidence: None,
                 estimated_tokens: None,
+                physical_path: String::new(),
+                display_path: String::new(),
+                start_line: 0,
+                end_line: 0,
+                summary_start_line: None,
+                body_start_line: 0,
             });
         }
     }
@@ -5210,10 +5906,6 @@ fn write_document_file(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create knowledge document directory: {}", e))?;
     }
-    if document.created_at == 0 {
-        document.created_at = now_millis();
-    }
-    document.updated_at = now_millis();
     let rendered = render_document(&document)?;
     std::fs::write(target_path, rendered).map_err(|e| {
         format!(
@@ -5222,6 +5914,7 @@ fn write_document_file(
             e
         )
     })?;
+    apply_file_timestamps(&mut document, target_path);
     Ok(document)
 }
 
@@ -5295,143 +5988,6 @@ fn read_raw_document(path: &Path) -> Result<String, String> {
 
 fn normalize_markdown(value: &str) -> String {
     value.replace("\r\n", "\n")
-}
-
-fn find_heading(markdown: &str, heading: &str, offset: usize) -> Option<usize> {
-    let mut search_from = offset;
-    while search_from < markdown.len() {
-        let slice = &markdown[search_from..];
-        let Some(relative) = slice.find(heading) else {
-            return None;
-        };
-        let index = search_from + relative;
-        let starts_line = index == 0 || markdown.as_bytes()[index - 1] == b'\n';
-        let ends_line = markdown[index + heading.len()..]
-            .chars()
-            .next()
-            .map(|ch| ch == '\n' || ch == '\r')
-            .unwrap_or(true);
-        if starts_line && ends_line {
-            return Some(index);
-        }
-        search_from = index + heading.len();
-    }
-    None
-}
-
-fn heading_end(markdown: &str, start: usize) -> usize {
-    markdown[start..]
-        .find('\n')
-        .map(|relative| start + relative + 1)
-        .unwrap_or(markdown.len())
-}
-
-fn replace_title_heading(markdown: &str, title: &str) -> String {
-    let normalized = normalize_markdown(markdown);
-    let mut line_start = 0usize;
-    while line_start < normalized.len() {
-        let line_end = heading_end(&normalized, line_start);
-        let line = normalized[line_start..line_end].trim_end_matches('\n');
-        if line.starts_with("# ") {
-            let mut out = String::new();
-            out.push_str(&normalized[..line_start]);
-            out.push_str("# ");
-            out.push_str(title.trim());
-            out.push('\n');
-            out.push_str(&normalized[line_end..]);
-            return out;
-        }
-        line_start = line_end;
-    }
-
-    let mut out = String::new();
-    out.push_str("# ");
-    out.push_str(title.trim());
-    out.push_str("\n\n");
-    out.push_str(normalized.trim_start_matches('\n'));
-    out
-}
-
-fn replace_optional_section(
-    markdown: &str,
-    heading: &str,
-    next_headings: &[&str],
-    fallback_insert_before: &str,
-    content: Option<&str>,
-) -> String {
-    let normalized = normalize_markdown(markdown);
-    let new_content = content
-        .map(str::trim_end)
-        .filter(|value| !value.trim().is_empty());
-
-    if let Some(start) = find_heading(&normalized, heading, 0) {
-        let content_start = heading_end(&normalized, start);
-        let end = next_headings
-            .iter()
-            .filter_map(|candidate| find_heading(&normalized, candidate, content_start))
-            .min()
-            .unwrap_or(normalized.len());
-
-        let mut out = String::new();
-        let prefix = normalized[..start].trim_end_matches('\n');
-        out.push_str(prefix);
-        if let Some(value) = new_content {
-            if !prefix.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(heading);
-            out.push('\n');
-            out.push_str(value);
-            out.push_str("\n\n");
-        } else if !prefix.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(normalized[end..].trim_start_matches('\n'));
-        return out;
-    }
-
-    let Some(value) = new_content else {
-        return normalized;
-    };
-    let insert_at =
-        find_heading(&normalized, fallback_insert_before, 0).unwrap_or(normalized.len());
-    let prefix = normalized[..insert_at].trim_end_matches('\n');
-    let suffix = normalized[insert_at..].trim_start_matches('\n');
-
-    let mut out = String::new();
-    out.push_str(prefix);
-    if !prefix.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(heading);
-    out.push('\n');
-    out.push_str(value);
-    out.push_str("\n\n");
-    out.push_str(suffix);
-    out
-}
-
-fn replace_content_section(markdown: &str, content: &str) -> Result<String, String> {
-    let normalized = normalize_markdown(markdown);
-    let Some(start) = find_heading(&normalized, "## Content", 0) else {
-        return Err("Knowledge document missing ## Content section".to_string());
-    };
-
-    let prefix = normalized[..start].trim_end_matches('\n');
-    let mut out = String::new();
-    out.push_str(prefix);
-    if !prefix.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str("## Content\n");
-    out.push_str(content.trim_end());
-    out.push('\n');
-    Ok(out)
-}
-
-fn has_explicit_content_section(markdown: &str) -> bool {
-    let normalized = normalize_markdown(markdown);
-    find_heading(&normalized, "## Content", 0).is_some()
 }
 
 fn write_document_preserving_layout(
@@ -5634,6 +6190,9 @@ pub fn update_document(
             }
             if let Some(summary_enabled) = request.summary_enabled {
                 doc.summary_enabled = summary_enabled;
+                if !summary_enabled {
+                    doc.summary = None;
+                }
             }
             if let Some(skill_enabled) = request.skill_enabled {
                 doc.skill_enabled = Some(skill_enabled);
@@ -5673,6 +6232,9 @@ pub fn update_document(
             }
             if let Some(explicit_maintenance_rules) = request.explicit_maintenance_rules {
                 doc.explicit_maintenance_rules = explicit_maintenance_rules;
+                if !explicit_maintenance_rules {
+                    doc.maintenance_rules = None;
+                }
             }
             if let Some(external_source) = request.external_source {
                 doc.external_source = external_source;
@@ -5706,22 +6268,7 @@ pub fn update_document(
             validate_document(&doc)?;
 
             let path = document_path(working_dir, doc.doc_type, &doc.path)?;
-            let raw = read_raw_document(&path)?;
-            let (_, body) = split_frontmatter(&raw)?;
-            let updated_body = if doc.doc_type == KnowledgeType::Memory {
-                render_document_body(&doc)?
-            } else if has_explicit_content_section(body) {
-                let with_title = replace_title_heading(body, &doc.title);
-                replace_optional_section(
-                    &with_title,
-                    "## Summary",
-                    &["## Maintenance Rules", "## Content"],
-                    "## Content",
-                    active_summary(&doc),
-                )
-            } else {
-                render_document_body(&doc)?
-            };
+            let updated_body = render_document_body(&doc)?;
             write_document_preserving_layout(&path, &doc, updated_body)?;
             Ok(doc)
         }
@@ -5738,16 +6285,7 @@ pub fn update_document(
             validate_document(&doc)?;
 
             let path = document_path(working_dir, doc.doc_type, &doc.path)?;
-            let raw = read_raw_document(&path)?;
-            let (_, body) = split_frontmatter(&raw)?;
-            let updated_body = if doc.doc_type == KnowledgeType::Memory {
-                render_document_body(&doc)?
-            } else if has_explicit_content_section(body) {
-                let with_title = replace_title_heading(body, &doc.title);
-                replace_content_section(&with_title, &doc.body)?
-            } else {
-                render_document_body(&doc)?
-            };
+            let updated_body = render_document_body(&doc)?;
             write_document_preserving_layout(&path, &doc, updated_body)?;
             Ok(doc)
         }
@@ -5762,22 +6300,7 @@ pub fn update_document(
             validate_document(&doc)?;
 
             let path = document_path(working_dir, doc.doc_type, &doc.path)?;
-            let raw = read_raw_document(&path)?;
-            let (_, body) = split_frontmatter(&raw)?;
-            let updated_body = if doc.doc_type == KnowledgeType::Memory {
-                render_document_body(&doc)?
-            } else if has_explicit_content_section(body) {
-                let with_title = replace_title_heading(body, &doc.title);
-                replace_optional_section(
-                    &with_title,
-                    "## Maintenance Rules",
-                    &["## Content"],
-                    "## Content",
-                    active_maintenance_rules(&doc),
-                )
-            } else {
-                render_document_body(&doc)?
-            };
+            let updated_body = render_document_body(&doc)?;
             write_document_preserving_layout(&path, &doc, updated_body)?;
             Ok(doc)
         }
@@ -5795,7 +6318,7 @@ pub fn read_document(
     let file_path = document_path(working_dir, doc_type, &normalized_path).ok();
     let file_metadata = file_path
         .as_deref()
-        .map(|value| build_document_file_metadata(Some(working_dir), value, &document));
+        .map(|value| build_document_file_metadata(Some(working_dir), value, &document, true));
     build_read_result(document, part, file_metadata)
 }
 
@@ -5810,7 +6333,7 @@ pub fn read_document_from_root(
     let file_path = document_path_in_root(knowledge_root, doc_type, &normalized_path).ok();
     let file_metadata = file_path
         .as_deref()
-        .map(|value| build_document_file_metadata(None, value, &document));
+        .map(|value| build_document_file_metadata(None, value, &document, true));
     build_read_result(document, part, file_metadata)
 }
 
@@ -5905,6 +6428,7 @@ fn build_document_file_metadata(
     working_dir: Option<&str>,
     file_path: &Path,
     document: &KnowledgeDocument,
+    include_history: bool,
 ) -> KnowledgeDocumentFileMetadata {
     let rendered = render_document(document).ok();
     let byte_size = rendered
@@ -5918,9 +6442,13 @@ fn build_document_file_metadata(
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|value| value.as_millis().min(i64::MAX as u128) as i64);
-    let (last_commit_author, last_commit_at) = working_dir
-        .and_then(|value| read_last_commit_metadata(value, file_path))
-        .unwrap_or((None, None));
+    let (last_commit_author, last_commit_at) = if include_history {
+        working_dir
+            .and_then(|value| read_last_commit_metadata(value, file_path))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
 
     KnowledgeDocumentFileMetadata {
         byte_size,
@@ -6027,7 +6555,7 @@ pub fn parse_document_content(
     content: &str,
     path_hint: Option<&str>,
 ) -> Result<KnowledgeDocument, String> {
-    parse_document(content, path_hint)
+    parse_document(content, path_hint.and_then(guess_type_from_path), path_hint)
 }
 
 #[cfg(test)]
@@ -6158,6 +6686,378 @@ mod tests {
     }
 
     #[test]
+    fn unified_tree_keeps_flat_type_roots_and_creates_root_configs_once() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut design = sample_doc();
+        design.path = "combat/core-loop.md".to_string();
+        save_document(&working_dir, design).expect("save legacy design document");
+        save_document(&working_dir, sample_memory_doc()).expect("save legacy memory document");
+
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("migrate unified tree");
+
+        assert!(
+            document_path(&working_dir, KnowledgeType::Design, "combat/core-loop.md")
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            document_path(&working_dir, KnowledgeType::Memory, "user-preference.md")
+                .unwrap()
+                .is_file()
+        );
+        assert!(!type_root(&working_dir, KnowledgeType::Design)
+            .join(LEGACY_DESIGN_FOLDER)
+            .exists());
+        assert!(!type_root(&working_dir, KnowledgeType::Memory)
+            .join(LEGACY_MEMORY_FOLDER)
+            .exists());
+        let design_folder = read_directory_config(&working_dir, KnowledgeType::Design, "")
+            .expect("read Design root config");
+        let memory_folder = read_directory_config(&working_dir, KnowledgeType::Memory, "")
+            .expect("read Memory root config");
+        assert_eq!(
+            design_folder.config.maintenance_rules,
+            LEGACY_DESIGN_FOLDER_RULES
+        );
+        assert_eq!(
+            memory_folder.config.maintenance_rules,
+            LEGACY_MEMORY_FOLDER_RULES
+        );
+        assert!(memory_folder.config.ai_maintained);
+        assert!(!memory_folder.config.inherit_ai_config);
+
+        let design_root_config = directory_config_path(&working_dir, KnowledgeType::Design, "")
+            .unwrap()
+            .0;
+        std::fs::remove_file(&design_root_config).expect("remove Design root config");
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("repeat migration");
+        assert!(!design_root_config.exists());
+    }
+
+    #[test]
+    fn unified_tree_v3_flattens_v2_wrappers_and_preserves_configs() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut design = sample_doc();
+        design.path = "Design/combat/core-loop.md".to_string();
+        save_document(&working_dir, design).expect("save wrapped Design document");
+        let mut memory = sample_memory_doc();
+        memory.path = "Memory/user-preference.md".to_string();
+        save_document(&working_dir, memory).expect("save wrapped Memory document");
+
+        let mut design_config = legacy_category_directory_config(
+            "项目需求、方案、约束与阶段性设计结论",
+            LEGACY_DESIGN_FOLDER_RULES,
+            false,
+        );
+        design_config.summary = "自定义 Design 根规则".to_string();
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Design,
+            LEGACY_DESIGN_FOLDER,
+            design_config,
+        )
+        .expect("write wrapped Design config");
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            LEGACY_MEMORY_FOLDER,
+            legacy_category_directory_config(
+                "用户长期偏好、稳定背景与跨任务上下文",
+                LEGACY_MEMORY_FOLDER_RULES,
+                true,
+            ),
+        )
+        .expect("write wrapped Memory config");
+        write_unified_knowledge_tree_migration_version(&working_dir, 2).expect("v2 marker");
+
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("migrate v2 layout");
+
+        assert!(
+            document_path(&working_dir, KnowledgeType::Design, "combat/core-loop.md")
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            document_path(&working_dir, KnowledgeType::Memory, "user-preference.md")
+                .unwrap()
+                .is_file()
+        );
+        assert!(!type_root(&working_dir, KnowledgeType::Design)
+            .join(LEGACY_DESIGN_FOLDER)
+            .exists());
+        assert!(!type_root(&working_dir, KnowledgeType::Memory)
+            .join(LEGACY_MEMORY_FOLDER)
+            .exists());
+        let design_root = read_directory_config(&working_dir, KnowledgeType::Design, "")
+            .expect("read Design root config");
+        let memory_root = read_directory_config(&working_dir, KnowledgeType::Memory, "")
+            .expect("read Memory root config");
+        assert_eq!(design_root.config.summary, "自定义 Design 根规则");
+        assert!(memory_root.config.ai_maintained);
+        assert_eq!(
+            read_unified_knowledge_tree_migration_version(&working_dir),
+            UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION
+        );
+    }
+
+    #[test]
+    fn unified_tree_v3_preserves_content_and_config_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+        let memory_root = type_root(&working_dir, KnowledgeType::Memory);
+        let wrapped_root = memory_root.join(LEGACY_MEMORY_FOLDER);
+        std::fs::create_dir_all(&wrapped_root).expect("wrapped Memory root");
+        std::fs::write(memory_root.join("context.md"), "root context")
+            .expect("write root document");
+        std::fs::write(wrapped_root.join("context.md"), "wrapped context")
+            .expect("write wrapped document");
+
+        let mut root_config =
+            legacy_category_directory_config("当前根配置", LEGACY_MEMORY_FOLDER_RULES, true);
+        root_config.summary = "当前根配置".to_string();
+        update_directory_config(&working_dir, KnowledgeType::Memory, "", root_config)
+            .expect("write current root config");
+        let mut wrapped_config =
+            legacy_category_directory_config("旧包装配置", LEGACY_MEMORY_FOLDER_RULES, false);
+        wrapped_config.summary = "旧包装配置".to_string();
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            LEGACY_MEMORY_FOLDER,
+            wrapped_config,
+        )
+        .expect("write wrapped root config");
+        write_unified_knowledge_tree_migration_version(&working_dir, 2).expect("v2 marker");
+
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("migrate conflicts");
+
+        assert_eq!(
+            std::fs::read_to_string(memory_root.join("context.md")).unwrap(),
+            "root context"
+        );
+        assert_eq!(
+            std::fs::read_to_string(memory_root.join("context-migrated-2.md")).unwrap(),
+            "wrapped context"
+        );
+        let migrated_root = read_directory_config(&working_dir, KnowledgeType::Memory, "")
+            .expect("read preserved root config");
+        assert_eq!(migrated_root.config.summary, "当前根配置");
+        assert!(Path::new(&working_dir)
+            .join("Library")
+            .join("Locus")
+            .join("knowledge_migration_backups")
+            .join("memory-wrapped-root.locus-meta")
+            .is_file());
+        assert!(!wrapped_root.exists());
+    }
+
+    #[test]
+    fn unified_tree_upgrades_untouched_v1_memory_folder_to_auto_maintenance() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+        create_directory(&working_dir, KnowledgeType::Memory, LEGACY_MEMORY_FOLDER)
+            .expect("memory folder");
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            LEGACY_MEMORY_FOLDER,
+            legacy_category_directory_config(
+                "用户长期偏好、稳定背景与跨任务上下文",
+                LEGACY_MEMORY_FOLDER_RULES,
+                false,
+            ),
+        )
+        .expect("v1 memory config");
+        write_unified_knowledge_tree_migration_version(&working_dir, 1).expect("v1 marker");
+
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("upgrade v1 layout");
+
+        let memory = read_directory_config(&working_dir, KnowledgeType::Memory, "")
+            .expect("read upgraded Memory root");
+        assert!(memory.config.ai_maintained);
+        assert!(!type_root(&working_dir, KnowledgeType::Memory)
+            .join(LEGACY_MEMORY_FOLDER)
+            .exists());
+        assert_eq!(
+            read_unified_knowledge_tree_migration_version(&working_dir),
+            UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION
+        );
+    }
+
+    #[test]
+    fn unified_tree_preserves_user_modified_v1_memory_config_at_type_root() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+        create_directory(&working_dir, KnowledgeType::Memory, LEGACY_MEMORY_FOLDER)
+            .expect("memory folder");
+        let mut customized = legacy_category_directory_config(
+            "用户长期偏好、稳定背景与跨任务上下文",
+            LEGACY_MEMORY_FOLDER_RULES,
+            false,
+        );
+        customized.summary = "用户自定义 Memory 规则".to_string();
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Memory,
+            LEGACY_MEMORY_FOLDER,
+            customized,
+        )
+        .expect("custom memory config");
+        write_unified_knowledge_tree_migration_version(&working_dir, 1).expect("v1 marker");
+
+        ensure_unified_knowledge_tree_layout(&working_dir).expect("preserve custom memory");
+        let memory = read_directory_config(&working_dir, KnowledgeType::Memory, "")
+            .expect("read custom Memory root");
+        assert!(!memory.config.ai_maintained);
+        assert_eq!(memory.config.summary, "用户自定义 Memory 规则");
+        assert!(!type_root(&working_dir, KnowledgeType::Memory)
+            .join(LEGACY_MEMORY_FOLDER)
+            .exists());
+    }
+
+    #[test]
+    fn unified_tree_serializes_concurrent_migration_requests() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut design = sample_doc();
+        design.path = "systems/combat/core-loop.md".to_string();
+        save_document(&working_dir, design).expect("save legacy design document");
+        save_document(&working_dir, sample_memory_doc()).expect("save legacy memory document");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let first_dir = working_dir.clone();
+            let first_barrier = barrier.clone();
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                ensure_unified_knowledge_tree_layout(&first_dir)
+            });
+            let second_dir = working_dir.clone();
+            let second_barrier = barrier.clone();
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                ensure_unified_knowledge_tree_layout(&second_dir)
+            });
+            barrier.wait();
+            first
+                .join()
+                .expect("first migration thread")
+                .expect("first migration");
+            second
+                .join()
+                .expect("second migration thread")
+                .expect("second migration");
+        });
+
+        assert!(document_path(
+            &working_dir,
+            KnowledgeType::Design,
+            "systems/combat/core-loop.md",
+        )
+        .unwrap()
+        .is_file());
+        assert!(
+            document_path(&working_dir, KnowledgeType::Memory, "user-preference.md",)
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn workspace_scan_converts_plain_markdown_to_locus_document() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let relative_path = "gameplay/copied-notes.md";
+        let file_path = document_path(&working_dir, KnowledgeType::Design, relative_path)
+            .expect("document path");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create parent");
+        let original = "# Copied Notes\n\nThis file came from another Markdown editor.\n\n## Details\n- Keep this content.";
+        std::fs::write(&file_path, original).expect("write plain markdown");
+
+        let documents =
+            load_documents_with_app_root(&working_dir, None, Some(KnowledgeType::Design), None)
+                .expect("scan knowledge documents");
+        let converted = documents
+            .iter()
+            .find(|document| document.path == relative_path)
+            .expect("converted document");
+
+        assert_eq!(converted.doc_type, KnowledgeType::Design);
+        assert_eq!(converted.title, "copied-notes");
+        assert_eq!(converted.body, original);
+        assert!(converted.inherit_inject_mode);
+        assert!(!converted.inherit_ai_config);
+        assert!(!converted.ai_maintained);
+        assert!(!converted.explicit_maintenance_rules);
+        assert!(converted.maintenance_rules.is_none());
+        assert!(converted.id.starts_with("kd_"));
+
+        let rewritten = std::fs::read_to_string(&file_path).expect("read rewritten document");
+        assert!(rewritten.starts_with("---\n"));
+        for removed in ["type:", "path:", "bodyFormat:", "createdAt:", "updatedAt:"] {
+            assert!(!rewritten.lines().any(|line| line.starts_with(removed)));
+        }
+        assert!(rewritten.contains("injectMode: inherit\n"));
+        assert!(rewritten.ends_with(&format!("{}\n", original)));
+
+        let reread = load_document_by_path(&working_dir, KnowledgeType::Design, relative_path)
+            .expect("reread converted document");
+        assert_eq!(reread.id, converted.id);
+        assert_eq!(reread.body, original);
+    }
+
+    #[test]
+    fn plain_memory_markdown_is_registered_with_raw_body() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let relative_path = "manual-preferences.md";
+        let file_path = document_path(&working_dir, KnowledgeType::Memory, relative_path)
+            .expect("document path");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create parent");
+        let original = "- Use concise reports\n- Preserve verified context";
+        std::fs::write(&file_path, original).expect("write plain memory markdown");
+
+        let converted = load_document_by_path(&working_dir, KnowledgeType::Memory, relative_path)
+            .expect("convert memory markdown");
+        assert_eq!(converted.body, original);
+        assert!(!converted.ai_maintained);
+        assert!(!converted.explicit_maintenance_rules);
+        assert!(converted.maintenance_rules.is_none());
+
+        let rewritten = std::fs::read_to_string(&file_path).expect("read rewritten memory");
+        assert!(!rewritten
+            .lines()
+            .any(|line| line.starts_with("bodyFormat:")));
+        assert!(rewritten.ends_with(&format!("{}\n", original)));
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_left_untouched() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let relative_path = "broken.md";
+        let file_path = document_path(&working_dir, KnowledgeType::Design, relative_path)
+            .expect("document path");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create parent");
+        let original = "---\ntitle: Incomplete frontmatter\n# Existing content";
+        std::fs::write(&file_path, original).expect("write malformed markdown");
+
+        let error = load_document_by_path(&working_dir, KnowledgeType::Design, relative_path)
+            .expect_err("malformed frontmatter should fail");
+
+        assert!(error.contains("frontmatter is not terminated"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read untouched document"),
+            original
+        );
+    }
+
+    #[test]
     fn read_document_part_modes_return_expected_sections() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -6258,11 +7158,93 @@ mod tests {
     #[test]
     fn render_and_parse_round_trip() {
         let rendered = render_document(&sample_doc()).expect("render");
-        let parsed = parse_document(&rendered, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            &rendered,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
         assert_eq!(parsed.title, "core-loop");
         assert_eq!(parsed.summary.as_deref(), Some("Short summary"));
         assert!(parsed.summary_enabled);
         assert_eq!(parsed.body, "Body content");
+    }
+
+    #[test]
+    fn generic_write_generates_frontmatter_and_keeps_arbitrary_markdown_body() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+        let body = "# Notes\n\n## Summary\nThis heading is ordinary content.\n\n## Content\nSo is this one.";
+
+        let prepared = prepare_generic_knowledge_write(
+            &working_dir,
+            KnowledgeType::Design,
+            "notes/arbitrary.md",
+            body,
+        )
+        .expect("prepare generic knowledge write");
+
+        assert!(prepared.frontmatter.contains("injectMode: inherit\n"));
+        assert!(prepared.frontmatter.contains("aiMaintained: inherit\n"));
+        for redundant in [
+            "type:",
+            "path:",
+            "title:",
+            "bodyFormat:",
+            "commandEnabled:",
+            "readOnly:",
+            "createdAt:",
+            "updatedAt:",
+        ] {
+            assert!(
+                !prepared
+                    .frontmatter
+                    .lines()
+                    .any(|line| line.starts_with(redundant)),
+                "redundant field was generated: {redundant}"
+            );
+        }
+        assert_eq!(
+            prepared.content_start_line,
+            prepared.frontmatter.lines().count() + 4
+        );
+        let parsed = parse_document(
+            &prepared.content,
+            Some(KnowledgeType::Design),
+            Some("notes/arbitrary.md"),
+        )
+        .expect("parse generated knowledge");
+        assert_eq!(parsed.body, body);
+    }
+
+    #[test]
+    fn physical_location_overrides_stale_frontmatter_after_move() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+        let prepared = prepare_generic_knowledge_write(
+            &working_dir,
+            KnowledgeType::Design,
+            "old/location.md",
+            "# Moved document",
+        )
+        .expect("prepare document");
+        let old_path = document_path(&working_dir, KnowledgeType::Design, "old/location.md")
+            .expect("old path");
+        let new_path = document_path(&working_dir, KnowledgeType::Design, "new/location.md")
+            .expect("new path");
+        std::fs::create_dir_all(old_path.parent().expect("old parent")).expect("old parent");
+        std::fs::create_dir_all(new_path.parent().expect("new parent")).expect("new parent");
+        std::fs::write(&old_path, prepared.content).expect("write document");
+        std::fs::rename(&old_path, &new_path).expect("move document");
+
+        let loaded = load_document_by_path(&working_dir, KnowledgeType::Design, "new/location.md")
+            .expect("load moved document");
+
+        assert_eq!(loaded.path, "new/location.md");
+        assert_eq!(loaded.doc_type, KnowledgeType::Design);
+        assert_eq!(loaded.body, "# Moved document");
     }
 
     #[test]
@@ -6271,7 +7253,12 @@ mod tests {
         doc.body = "# 输出方式\n- 直接给结论\n\n## 细节\n- 保留实现说明".to_string();
 
         let rendered = render_document(&doc).expect("render");
-        let parsed = parse_document(&rendered, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            &rendered,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
 
         assert_eq!(
             parsed.body,
@@ -6280,12 +7267,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_document_recovers_body_when_content_heading_is_missing() {
-        let raw = render_document(&sample_doc())
-            .expect("render")
-            .replace("## Content\nBody content\n", "# 输出方式\n- 直接给结论\n");
+    fn parse_document_accepts_arbitrary_raw_markdown_body() {
+        let mut document = sample_doc();
+        document.body = "# 输出方式\n- 直接给结论".to_string();
+        let raw = render_document(&document).expect("render");
 
-        let parsed = parse_document(&raw, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            &raw,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
 
         assert_eq!(parsed.title, "core-loop");
         assert_eq!(parsed.summary.as_deref(), Some("Short summary"));
@@ -6293,18 +7285,20 @@ mod tests {
     }
 
     #[test]
-    fn render_and_parse_memory_round_trip_uses_comment_blocks() {
+    fn render_and_parse_memory_round_trip_uses_raw_markdown() {
         let rendered = render_document(&sample_memory_doc()).expect("render memory");
 
-        assert!(rendered.contains(MEMORY_MAINTAIN_RULES_START));
-        assert!(rendered.contains(MEMORY_MAINTAIN_RULES_END));
-        assert!(rendered.contains(MEMORY_BODY_START));
-        assert!(rendered.contains(MEMORY_BODY_END));
+        assert!(!rendered.lines().any(|line| line.starts_with("bodyFormat:")));
+        assert!(rendered.contains("maintenanceRules: '- 直接给结论'"));
         assert!(!rendered.contains("## Maintenance Rules"));
         assert!(!rendered.contains("## Content"));
 
-        let parsed =
-            parse_document(&rendered, Some(MEMORY_USER_PREFERENCE_PATH)).expect("parse memory");
+        let parsed = parse_document(
+            &rendered,
+            Some(KnowledgeType::Memory),
+            Some(MEMORY_USER_PREFERENCE_PATH),
+        )
+        .expect("parse memory");
         assert_eq!(parsed.doc_type, KnowledgeType::Memory);
         assert_eq!(parsed.body, "# 输出方式\n## 细节\n- 先给答案");
         assert_eq!(parsed.maintenance_rules.as_deref(), Some("- 直接给结论"));
@@ -6339,7 +7333,12 @@ updatedAt: 1
 - 先给答案
 "#;
 
-        let parsed = parse_document(raw, Some(MEMORY_USER_PREFERENCE_PATH)).expect("parse legacy");
+        let parsed = parse_document(
+            raw,
+            Some(KnowledgeType::Memory),
+            Some(MEMORY_USER_PREFERENCE_PATH),
+        )
+        .expect("parse legacy");
         assert_eq!(parsed.doc_type, KnowledgeType::Memory);
         assert_eq!(parsed.body, "# 输出方式\n## 细节\n- 先给答案");
         assert_eq!(parsed.maintenance_rules.as_deref(), Some("- 直接给结论"));
@@ -6370,9 +7369,126 @@ Short summary
 Body content
 "#;
 
-        let parsed = parse_document(rendered, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            rendered,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
         assert!(parsed.summary_enabled);
         assert_eq!(parsed.summary.as_deref(), Some("Short summary"));
+    }
+
+    #[test]
+    fn loading_writable_legacy_document_migrates_to_raw_markdown() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let path = document_path(&working_dir, KnowledgeType::Design, "gameplay/legacy.md")
+            .expect("document path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(
+            &path,
+            r#"---
+id: kd_legacy
+type: design
+path: gameplay/legacy.md
+title: Legacy
+injectMode: excerpt
+summaryEnabled: true
+commandEnabled: false
+readOnly: false
+aiMaintained: false
+createdAt: 1
+updatedAt: 2
+---
+
+# Legacy
+
+## Summary
+Legacy summary
+
+## Content
+# Arbitrary heading
+Legacy body
+"#,
+        )
+        .expect("write legacy file");
+
+        let loaded =
+            load_document_by_path(&working_dir, KnowledgeType::Design, "gameplay/legacy.md")
+                .expect("load legacy file");
+        assert_eq!(loaded.summary.as_deref(), Some("Legacy summary"));
+        assert_eq!(loaded.body, "# Arbitrary heading\nLegacy body");
+
+        let migrated = std::fs::read_to_string(path).expect("read migrated file");
+        assert!(!migrated.lines().any(|line| line.starts_with("bodyFormat:")));
+        assert!(migrated.contains("summary: Legacy summary\n"));
+        assert!(!migrated.lines().any(|line| line.starts_with("type:")));
+        assert!(!migrated.lines().any(|line| line.starts_with("path:")));
+        assert!(!migrated.contains("## Content\n"));
+        assert!(migrated.ends_with("# Arbitrary heading\nLegacy body\n"));
+    }
+
+    #[test]
+    fn loading_raw_document_removes_obsolete_frontmatter_fields() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let path = document_path(
+            &working_dir,
+            KnowledgeType::Design,
+            "gameplay/normalized.md",
+        )
+        .expect("document path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(
+            &path,
+            r#"---
+id: kd_normalized
+type: design
+path: stale/location.md
+title: Normalized
+bodyFormat: markdown
+scope: project
+summaryCache: Legacy cache
+summaryEnabled: false
+commandEnabled: false
+readOnly: false
+createdAt: 1
+updatedAt: 2
+---
+
+# Body
+"#,
+        )
+        .expect("write raw file");
+
+        let loaded = load_document_by_path(
+            &working_dir,
+            KnowledgeType::Design,
+            "gameplay/normalized.md",
+        )
+        .expect("load raw file");
+        assert_eq!(loaded.path, "gameplay/normalized.md");
+
+        let normalized = std::fs::read_to_string(path).expect("read normalized file");
+        for removed in [
+            "type:",
+            "path:",
+            "title:",
+            "bodyFormat:",
+            "scope:",
+            "summaryCache:",
+            "summaryEnabled:",
+            "commandEnabled:",
+            "createdAt:",
+            "updatedAt:",
+        ] {
+            assert!(
+                !normalized.lines().any(|line| line.starts_with(removed)),
+                "obsolete field remained: {removed}"
+            );
+        }
+        assert!(normalized.ends_with("# Body\n"));
     }
 
     #[test]
@@ -6398,7 +7514,10 @@ Body content
             skill_surface: Some(SkillSurface::Both),
             command_trigger: Some("/create-skill".to_string()),
             argument_hint: Some("<skill-name>".to_string()),
-            tools: vec!["skill_create".to_string(), "skill_reload".to_string()],
+            tools: vec![
+                "create_skill_package".to_string(),
+                "skill_reload".to_string(),
+            ],
             summary: Some("Create a new Skill.".to_string()),
             body: "## Instructions\n\n1. Do the work.".to_string(),
             maintenance_rules: None,
@@ -6407,12 +7526,17 @@ Body content
         };
 
         let rendered = render_document(&doc).expect("render");
-        let parsed = parse_document(&rendered, Some("create-skill.md")).expect("parse");
+        let parsed = parse_document(
+            &rendered,
+            Some(KnowledgeType::Skill),
+            Some("create-skill.md"),
+        )
+        .expect("parse");
         assert_eq!(parsed.skill_enabled, Some(true));
         assert_eq!(parsed.skill_surface, Some(SkillSurface::Both));
         assert_eq!(parsed.command_trigger.as_deref(), Some("/create-skill"));
         assert_eq!(parsed.argument_hint.as_deref(), Some("<skill-name>"));
-        assert_eq!(parsed.tools, vec!["skill_create", "skill_reload"]);
+        assert_eq!(parsed.tools, vec!["create_skill_package", "skill_reload"]);
         assert_eq!(parsed.summary.as_deref(), Some("Create a new Skill."));
     }
 
@@ -6430,7 +7554,12 @@ Body content
 
         let rendered = render_document(&doc).expect("render");
         assert!(!rendered.contains("\nscope:"));
-        let parsed = parse_document(&rendered, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            &rendered,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
         assert!(parsed.read_only);
     }
 
@@ -6441,9 +7570,14 @@ Body content
         let doc = sample_doc();
         let raw = render_document(&doc)
             .expect("render")
-            .replace("title: Core Loop\n", "title: Core Loop\nscope: external\n");
+            .replace("id: kd_test\n", "id: kd_test\nscope: external\n");
 
-        let parsed = parse_document(&raw, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            &raw,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
         save_document(&working_dir, parsed).expect("save legacy scope doc");
         let rewritten = std::fs::read_to_string(
             document_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
@@ -6493,6 +7627,7 @@ updatedAt: 1
 
         let parsed = parse_document(
             rendered,
+            Some(KnowledgeType::Reference),
             Some("feishu-knowledge-base/gameplay/battle-design.md"),
         )
         .expect("parse");
@@ -6537,6 +7672,7 @@ Execution order body
 
         let parsed = parse_document(
             rendered,
+            Some(KnowledgeType::Reference),
             Some("unity-official-docs/manual/ExecutionOrder.md"),
         )
         .expect("parse");
@@ -6575,7 +7711,12 @@ Short summary
 Body content
 "#;
 
-        let parsed = parse_document(rendered, Some("gameplay/core-loop.md")).expect("parse");
+        let parsed = parse_document(
+            rendered,
+            Some(KnowledgeType::Design),
+            Some("gameplay/core-loop.md"),
+        )
+        .expect("parse");
         assert!(parsed.read_only);
     }
 
@@ -6603,7 +7744,7 @@ Body content
     }
 
     #[test]
-    fn update_body_rewrites_malformed_document_with_canonical_content_section() {
+    fn update_body_writes_raw_markdown_without_structural_sections() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let raw = render_document(&sample_doc())
@@ -6629,7 +7770,8 @@ Body content
         assert_eq!(updated.body, "# 交付方式\n- 先给结论\n- 再补依据");
 
         let rewritten = std::fs::read_to_string(&path).expect("read rewritten document");
-        assert!(rewritten.contains("## Content\n# 交付方式\n- 先给结论\n- 再补依据\n"));
+        assert!(rewritten.ends_with("# 交付方式\n- 先给结论\n- 再补依据\n"));
+        assert!(!rewritten.contains("## Content\n"));
 
         let reread =
             load_document_by_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
@@ -6639,7 +7781,7 @@ Body content
     }
 
     #[test]
-    fn update_memory_body_rewrites_document_with_comment_blocks() {
+    fn update_memory_body_writes_raw_markdown() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         save_document(&working_dir, sample_memory_doc()).expect("save memory");
@@ -6667,14 +7809,12 @@ Body content
             .expect("path"),
         )
         .expect("read memory");
-        assert!(raw.contains(MEMORY_BODY_START));
-        assert!(raw.contains(MEMORY_BODY_END));
         assert!(raw.contains("# 输出方式\n## 细节\n- 结论优先"));
         assert!(!raw.contains("## Content"));
     }
 
     #[test]
-    fn save_document_preserves_disabled_summary_and_rules_in_frontmatter_cache() {
+    fn save_document_omits_disabled_summary_and_rules_from_frontmatter() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let mut doc = sample_doc();
@@ -6687,8 +7827,10 @@ Body content
             document_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md").unwrap(),
         )
         .expect("read raw");
-        assert!(raw.contains("summaryCache: Short summary"));
-        assert!(raw.contains("maintenanceRulesCache: Keep only durable notes"));
+        assert!(!raw.lines().any(|line| line.starts_with("summary:")));
+        assert!(!raw
+            .lines()
+            .any(|line| line.starts_with("maintenanceRules:")));
         assert!(!raw.contains("## Summary"));
         assert!(!raw.contains("## Maintenance Rules"));
 
@@ -6696,16 +7838,13 @@ Body content
             load_document_by_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
                 .expect("reload");
         assert!(!reread.summary_enabled);
-        assert_eq!(reread.summary.as_deref(), Some("Short summary"));
+        assert!(reread.summary.is_none());
         assert!(!reread.explicit_maintenance_rules);
-        assert_eq!(
-            reread.maintenance_rules.as_deref(),
-            Some("Keep only durable notes")
-        );
+        assert!(reread.maintenance_rules.is_none());
     }
 
     #[test]
-    fn update_meta_preserves_cached_summary_and_rules_when_switches_turn_off() {
+    fn update_meta_removes_summary_and_rules_when_values_are_disabled() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let mut doc = sample_doc();
@@ -6727,23 +7866,17 @@ Body content
         .expect("update meta");
 
         assert!(!updated.summary_enabled);
-        assert_eq!(updated.summary.as_deref(), Some("Short summary"));
+        assert!(updated.summary.is_none());
         assert!(!updated.explicit_maintenance_rules);
-        assert_eq!(
-            updated.maintenance_rules.as_deref(),
-            Some("Keep only durable notes")
-        );
+        assert!(updated.maintenance_rules.is_none());
 
         let reread =
             load_document_by_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
                 .expect("reload");
         assert!(!reread.summary_enabled);
-        assert_eq!(reread.summary.as_deref(), Some("Short summary"));
+        assert!(reread.summary.is_none());
         assert!(!reread.explicit_maintenance_rules);
-        assert_eq!(
-            reread.maintenance_rules.as_deref(),
-            Some("Keep only durable notes")
-        );
+        assert!(reread.maintenance_rules.is_none());
     }
 
     #[test]
@@ -6810,6 +7943,68 @@ Body content
         assert!(raw.contains("lexicalSearch: enabled"));
         assert!(raw.contains("vectorSearch: disabled"));
         assert!(!raw.contains("externalSources:"));
+    }
+
+    #[test]
+    fn type_root_config_uses_knowledge_root_sidecar_and_applies_to_root_children() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+
+        let mut config = sample_directory_config();
+        config.summary = "Design 根规则".to_string();
+        config.inject_mode = KnowledgeInjectMode::Path;
+        config.inherit_inject_mode = false;
+        config.ai_maintained = true;
+        config.inherit_ai_config = false;
+        config.explicit_maintenance_rules = true;
+        config.lexical_search = FolderIndexRuleSetting::Disabled;
+        config.maintenance_rules = "- 维护根目录设计".to_string();
+        let saved = update_directory_config(&working_dir, KnowledgeType::Design, "", config)
+            .expect("save type root config");
+
+        assert_eq!(saved.path, "");
+        assert_eq!(saved.config_path, "design.locus-meta");
+        assert!(knowledge_root(&working_dir)
+            .join("design.locus-meta")
+            .is_file());
+
+        std::fs::create_dir_all(type_root(&working_dir, KnowledgeType::Design).join("combat"))
+            .expect("create child directory");
+        let child = read_directory_config(&working_dir, KnowledgeType::Design, "combat")
+            .expect("read inherited child config");
+        assert_eq!(child.config.summary, "");
+        assert_eq!(child.config.inject_mode, KnowledgeInjectMode::Path);
+        assert!(child.config.ai_maintained);
+        assert_eq!(child.config.maintenance_rules, "- 维护根目录设计");
+
+        let created = update_document(
+            &working_dir,
+            KnowledgeUpdateRequest {
+                op: KnowledgeUpdateOp::Create,
+                path: "root-design.md".to_string(),
+                doc_type: Some(KnowledgeType::Design),
+                title: Some("Root Design".to_string()),
+                body: Some(Some(String::new())),
+                ..Default::default()
+            },
+        )
+        .expect("create root document");
+        assert_eq!(created.inject_mode, KnowledgeInjectMode::Path);
+        assert!(created.ai_maintained);
+        assert_eq!(
+            created.maintenance_rules.as_deref(),
+            Some("- 维护根目录设计")
+        );
+        let search_access = effective_document_search_access_with_app_root(
+            &working_dir,
+            None,
+            KnowledgeType::Design,
+            "root-design.md",
+        )
+        .expect("resolve root document search access");
+        assert!(!search_access.lexical_enabled);
+        assert!(search_access.vector_enabled);
     }
 
     #[test]
@@ -8416,6 +9611,7 @@ Body content
             KnowledgeType::Skill,
             "shared.md",
             "full",
+            true,
         )
         .expect("read app doc");
         assert_eq!(
@@ -8451,6 +9647,7 @@ Body content
             KnowledgeType::Skill,
             "shared.md",
             "full",
+            true,
         )
         .expect("read workspace override");
         assert_eq!(
