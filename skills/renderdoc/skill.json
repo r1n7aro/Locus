@@ -1,0 +1,43 @@
+{
+  "schema": "locus.skill.v1",
+  "id": "renderdoc",
+  "name": "RenderDoc Frame Capture",
+  "version": "0.1.0",
+  "injectMode": "excerpt",
+  "ignoredMarkdownFiles": ["runtime/**/LICENSE.md"],
+  "description": "Use for graphics frame debugging in Unity 6.3+ Game or Scene views: capture a pipeline-independent RenderDoc frame, inspect passes and resources with RenderDoc's embedded Python API, and export intermediate textures for analysis.",
+  "argumentHint": "<capture or frame-analysis request>",
+  "command": {
+    "enabled": true,
+    "trigger": "/renderdoc",
+    "argumentHint": "<capture or frame-analysis request>"
+  },
+  "tools": [
+    {
+      "name": "renderdoc-capture-frame",
+      "description": "Capture one RenderDoc frame from the connected Unity Editor Game or Scene view. Loads the RenderDoc runtime bundled with this Skill when needed and returns the absolute .rdc path plus the embedded-Python executable and helper script paths. This tool only captures; inspect actions, passes, resources, pipeline state, and textures through RenderDoc's Python API as documented by the Skill.",
+      "runtime": "unity",
+      "path": "unity/Editor/RenderDocCapture.cs",
+      "entryType": "Locus.Skills.RenderDocCapture",
+      "method": "CaptureFrame",
+      "requestEditorStatus": "any",
+      "timeoutMs": 120000,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target": {
+            "type": "string",
+            "enum": ["game", "scene"],
+            "description": "Unity editor view whose next rendered frame should be captured."
+          },
+          "captureName": {
+            "type": "string",
+            "description": "Optional short filename prefix. The capture is always written under Library/Locus/RenderDoc."
+          }
+        },
+        "required": ["target"]
+      }
+    }
+  ]
+}

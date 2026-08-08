@@ -10,6 +10,7 @@ const FRONTEND_LOCK_PATH = path.join(ROOT_DIR, "bun.lock");
 const RUST_MANIFEST_PATH = path.join(ROOT_DIR, "src-tauri", "Cargo.toml");
 const RUST_LOCK_PATH = path.join(ROOT_DIR, "src-tauri", "Cargo.lock");
 const GITHUB_CLI_MANIFEST_PATH = path.join(ROOT_DIR, "src-tauri", "gen", "gh-runtime", "manifest.json");
+const RENDERDOC_MANIFEST_PATH = path.join(ROOT_DIR, "skills", "renderdoc", "runtime", "manifest.json");
 const THIRD_PARTY_SOURCE_DIR = path.join(ROOT_DIR, "third_party", "redistributables");
 const THIRD_PARTY_SPDX_DIR = path.join(ROOT_DIR, "third_party", "spdx");
 const STANDARD_LICENSE_FILES = {
@@ -258,7 +259,32 @@ function generateBinaryBundle() {
 }
 
 function bundledBinaryEntries() {
-  return [...BUNDLED_BINARIES, ...githubCliBinaryEntries()];
+  return [...BUNDLED_BINARIES, ...githubCliBinaryEntries(), ...renderDocBinaryEntries()];
+}
+
+function renderDocBinaryEntries() {
+  if (!fs.existsSync(RENDERDOC_MANIFEST_PATH)) {
+    return [];
+  }
+
+  const manifest = readJson(RENDERDOC_MANIFEST_PATH);
+  const sourceDir = path.join(ROOT_DIR, "skills", "renderdoc", "runtime", manifest.runtimeDirectory);
+  return [
+    {
+      kind: "redistributable-binary",
+      name: "RenderDoc",
+      version: manifest.renderDocVersion ?? "unknown",
+      sourceUrl: manifest.sourceUrl ?? null,
+      sourceDir,
+      distributedFiles: [
+        "renderdoc.dll",
+        "qrenderdoc.exe",
+        "renderdoccmd.exe",
+        "renderdoc_app.h",
+        "LICENSE.md",
+      ],
+    },
+  ];
 }
 
 function githubCliBinaryEntries() {
