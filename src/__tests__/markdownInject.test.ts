@@ -376,6 +376,22 @@ describe("injectAssetRefs", () => {
     expect(result).not.toContain('data-asset-kind="folder"');
   });
 
+  it("renders inline-code Unity folders as folder refs without asset previews", () => {
+    const html = "<code>Assets/DevTools/AnimationPipeline</code>";
+    const result = injectAssetRefs(html, {
+      requireInlinePathStatus: true,
+      inlinePathStatus: (path) => ({ path, exists: true, entryKind: "folder" }),
+    });
+
+    expect(result).toContain("md-file-ref");
+    expect(result).toContain("md-folder-ref");
+    expect(result).toContain('data-file-path="Assets/DevTools/AnimationPipeline"');
+    expect(result).toContain('data-entry-kind="folder"');
+    expect(result).not.toContain("md-unity-asset-ref");
+    expect(result).not.toContain('data-asset-path=');
+    expect(result).not.toContain('data-md-unity-object-preview="true"');
+  });
+
   it("collects inline-code path candidates for workspace stat", () => {
     const html = [
       "<code>Assets</code>",

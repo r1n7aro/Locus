@@ -23,6 +23,7 @@ import {
 import { resolveMathSentinels } from "../composables/markdownMath";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
+import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
 import {
   armLocusFilePointerDrag,
   armUnityReferencePointerDrag,
@@ -30,7 +31,6 @@ import {
   startUnityReferenceHtmlDrag,
 } from "../composables/useUnityReferenceDragSource";
 import { resolveMarkdownImage } from "../services/markdownImage";
-import { statWorkspaceEntries, type WorkspaceEntryStat } from "../services/project";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
@@ -159,17 +159,6 @@ const parsedMarkdownHtml = computed(() => {
   return markdownEngine.parse(normalizeMarkdownForRender(props.content)) as string;
 });
 
-function markdownPathStatusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
-  const entryKind = entry.entryKind === "folder" || entry.entryKind === "file"
-    ? entry.entryKind
-    : null;
-  return {
-    path: entry.path,
-    exists: entry.exists && !!entryKind,
-    entryKind,
-  };
-}
-
 function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | undefined {
   return inlinePathStatuses.value.get(normalizeMarkdownPathStatusKey(path));
 }
@@ -187,11 +176,11 @@ async function loadInlinePathStatuses(html: string) {
   }
 
   try {
-    const entries = await statWorkspaceEntries(candidates);
+    const statuses = await loadCachedMarkdownPathStatuses(projectStore.workingDir, candidates);
     if (run !== markdownInlinePathStatusLoadRun) return;
     const next = new Map<string, MarkdownPathStatus>();
-    for (const entry of entries) {
-      next.set(normalizeMarkdownPathStatusKey(entry.path), markdownPathStatusFromEntry(entry));
+    for (const [path, status] of statuses) {
+      next.set(normalizeMarkdownPathStatusKey(path), status);
     }
     inlinePathStatuses.value = next;
   } catch {
@@ -273,6 +262,8 @@ function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
 }
 
 function markdownUnityObjectModelFromHost(host: HTMLElement): UnityObjectPreviewInput | null {
+  if (host.dataset.entryKind === "folder") return null;
+
   const refKind = host.dataset.mdUnityRefKind;
   if (refKind === "sceneObject" || host.classList.contains("md-unity-scene-object-ref")) {
     const scenePath = normalizeUnityRefDatasetPath(host.dataset.scenePath);

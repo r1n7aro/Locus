@@ -348,6 +348,10 @@ function renderUnityAssetRef(
   status?: MarkdownPathStatus | null,
 ): string {
   const normalizedPath = normalizeUnityAssetRefPath(filePath);
+  if (status?.entryKind === "folder") {
+    return renderLocalFileRef(normalizedPath, line, "folder");
+  }
+
   const escaped = escapeAttr(normalizedPath);
   const inferredFolder = isFolderFileRef(filePath, line) || !hasFileExtension(normalizedPath);
   const entryKind = status?.entryKind ?? (inferredFolder ? "folder" : "file");
