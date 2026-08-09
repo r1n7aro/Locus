@@ -16,7 +16,7 @@ mod client;
 mod unity_sync;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -773,6 +773,66 @@ fn resolve_file_path(workspace: &Path, file_path: &str) -> Result<PathBuf, Strin
     Ok(absolute)
 }
 
+fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
+}
+
+/// Whether `file_path` is a C# source owned by Unity's asset pipeline for the
+/// workspace. Roslyn can open arbitrary loose `.cs` files, but diagnostics for
+/// those files lack the Unity project compilation context and are misleading.
+pub fn is_unity_managed_csharp_file(workspace: &str, file_path: &str) -> bool {
+    let workspace = workspace.trim();
+    let file_path = file_path.trim();
+    if workspace.is_empty() || file_path.is_empty() {
+        return false;
+    }
+
+    let workspace = dunce::simplified(Path::new(workspace));
+    let candidate = Path::new(file_path);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace.join(candidate)
+    };
+    let absolute = dunce::simplified(&absolute);
+    let Some(relative) =
+        relative_to(workspace, absolute).and_then(|path| normalize_relative_path(&path))
+    else {
+        return false;
+    };
+    if !relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cs"))
+    {
+        return false;
+    }
+
+    relative
+        .components()
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(root) => root.to_str(),
+            _ => None,
+        })
+        .is_some_and(|root| {
+            root.eq_ignore_ascii_case("Assets") || root.eq_ignore_ascii_case("Packages")
+        })
+}
+
 /// Where a position-based symbol query was actually anchored after resolving
 /// the caller's (forgiving) line hint.
 #[derive(Debug, Clone, Copy)]
@@ -1378,6 +1438,11 @@ pub async fn document_diagnostics(
     workspace: &str,
     file_path: &str,
 ) -> Result<Vec<CodeDiagnostic>, String> {
+    if !is_unity_managed_csharp_file(workspace, file_path) {
+        return Err(format!(
+            "C# diagnostics only support Unity-managed source files under Assets/ or Packages/: {file_path}"
+        ));
+    }
     retry_once_on_server_exit(|| document_diagnostics_attempt(workspace, file_path)).await
 }
 
@@ -1654,5 +1719,75 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
         a == b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{document_diagnostics, is_unity_managed_csharp_file};
+
+    #[test]
+    fn unity_managed_csharp_paths_require_unity_source_roots() {
+        let workspace = tempfile::tempdir().expect("temp Unity workspace");
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let asset = workspace.path().join("Assets/Scripts/Player.cs");
+        let package = workspace
+            .path()
+            .join("Packages/com.example/Runtime/Feature.CS");
+        let generated = workspace.path().join("Library/Locus/tmp/tool/Program.cs");
+        let sibling = workspace
+            .path()
+            .parent()
+            .expect("workspace parent")
+            .join("Other/Assets/Foreign.cs");
+
+        assert!(is_unity_managed_csharp_file(
+            &workspace_path,
+            "Assets/Scripts/Player.cs"
+        ));
+        assert!(is_unity_managed_csharp_file(
+            &workspace_path,
+            &asset.to_string_lossy()
+        ));
+        assert!(is_unity_managed_csharp_file(
+            &workspace_path,
+            &package.to_string_lossy()
+        ));
+        assert!(!is_unity_managed_csharp_file(
+            &workspace_path,
+            &generated.to_string_lossy()
+        ));
+        assert!(!is_unity_managed_csharp_file(
+            &workspace_path,
+            "Assets/../Library/Locus/tmp/Program.cs"
+        ));
+        assert!(!is_unity_managed_csharp_file(
+            &workspace_path,
+            &sibling.to_string_lossy()
+        ));
+        assert!(!is_unity_managed_csharp_file(
+            &workspace_path,
+            "Assets/Data/config.json"
+        ));
+    }
+
+    #[tokio::test]
+    async fn document_diagnostics_rejects_loose_csharp_before_starting_roslyn() {
+        let workspace = tempfile::tempdir().expect("temp Unity workspace");
+        let generated = workspace.path().join("Library/Locus/tmp/tool/Program.cs");
+        std::fs::create_dir_all(generated.parent().expect("generated parent"))
+            .expect("create generated parent");
+        std::fs::write(&generated, "internal static class Program {}")
+            .expect("write generated C# file");
+
+        let error = document_diagnostics(
+            &workspace.path().to_string_lossy(),
+            &generated.to_string_lossy(),
+        )
+        .await
+        .expect_err("loose C# diagnostics must be rejected");
+
+        assert!(error.contains("Unity-managed source files"), "{error}");
+        assert!(error.contains("Library"), "{error}");
     }
 }

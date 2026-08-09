@@ -436,14 +436,6 @@ async fn append_unity_csharp_status(
 const EDIT_WRITE_DIAGNOSTIC_MAX_RESULTS: usize = 30;
 const EDIT_WRITE_PROJECT_REF_MAX_PROBLEMS: usize = 20;
 
-fn is_csharp_source_file(file_path: &str) -> bool {
-    std::path::Path::new(file_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("cs"))
-        .unwrap_or(false)
-}
-
 async fn append_unity_csharp_write_feedback(
     output: String,
     working_dir: Option<&str>,
@@ -453,7 +445,7 @@ async fn append_unity_csharp_write_feedback(
     let Some(project) = working_dir else {
         return output;
     };
-    if !is_csharp_source_file(file_path)
+    if !crate::csharp_lsp::is_unity_managed_csharp_file(project, file_path)
         || !crate::csharp_lsp::is_enabled()
         || !crate::code_tools::edit_write_diagnostics_enabled()
     {
