@@ -9,6 +9,7 @@ const props = defineProps<{
   totalLines: number;
   startLine?: number;
   focusLine?: number | null;
+  highlightLineRanges?: Array<{ startLine: number; endLine: number }>;
   language?: string;
 }>();
 
@@ -36,6 +37,12 @@ function sourceLine(index: number): number {
   return firstLine.value + index;
 }
 
+function isHighlightedLine(line: number): boolean {
+  return props.highlightLineRanges?.some(
+    (range) => line >= range.startLine && line <= range.endLine,
+  ) ?? false;
+}
+
 watch(
   () => [props.focusLine, props.startLine, props.snippet] as const,
   async () => {
@@ -61,7 +68,10 @@ function escapeHtml(source: string): string {
         v-for="(line, i) in highlightedLines"
         :key="i"
         class="atv-line"
-        :class="{ 'is-focused': sourceLine(i) === focusLine }"
+        :class="{
+          'is-focused': sourceLine(i) === focusLine,
+          'is-highlighted': isHighlightedLine(sourceLine(i)),
+        }"
         :data-line-number="sourceLine(i)"
       ><span class="atv-ln">{{ sourceLine(i) }}</span><span class="atv-text" v-html="line || ' '"></span>
 </span></code></pre>
@@ -107,6 +117,12 @@ function escapeHtml(source: string): string {
 }
 .atv-line.is-focused {
   background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+}
+.atv-line.is-highlighted {
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+.atv-line.is-highlighted.is-focused {
+  box-shadow: inset 2px 0 0 var(--accent-color);
 }
 .atv-ln {
   flex-shrink: 0;

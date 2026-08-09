@@ -89,7 +89,7 @@
     },
     {
       "path": "src/components/asset/AssetTextViewer.vue",
-      "bytes": 3463
+      "bytes": 3981
     },
     {
       "path": "src/components/diff/BinaryPreviewHost.vue",
@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 251503
+      "bytes": 253673
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 245323
+      "bytes": 247426
     },
     {
       "path": "src/services/asset.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 79215
+      "bytes": 79693
     }
   ]
 }
