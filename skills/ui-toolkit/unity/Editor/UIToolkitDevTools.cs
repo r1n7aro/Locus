@@ -12,10 +12,15 @@ using UnityEngine.UIElements;
 
 namespace Locus.Skills
 {
-    public static class UIToolkitDevTools
+    // Internal implementation used by the public UIToolkitApi facade.  Keeping
+    // the Unity-version-specific reflection and event plumbing out of the
+    // public surface lets agents compose larger operations with normal C#
+    // handles instead of constructing tool-shaped request envelopes.
+    internal static class UIToolkitDevTools
     {
         private const int MinimumUnityMajor = 6000;
         private const int MinimumUnityMinor = 3;
+        private const int CompactTextLimit = 160;
         private const string OverlayName = "__locus_ui_toolkit_overlay";
 
         public sealed class SkillContext
@@ -41,6 +46,7 @@ namespace Locus.Skills
             public bool interactiveOnly;
             public bool includeComputedStyle;
             public bool includeMatchedRules;
+            public List<string> styleProperties;
             public SkillContext __locus;
         }
 
@@ -196,10 +202,7 @@ namespace Locus.Skills
 
             return new Dictionary<string, object>
             {
-                { "unityVersion", Application.unityVersion },
-                { "playMode", EditorApplication.isPlaying },
-                { "paused", EditorApplication.isPaused },
-                { "panelCount", output.Count },
+                { "editorStatus", CurrentEditorStatus() },
                 { "panels", output }
             };
         }
@@ -212,8 +215,8 @@ namespace Locus.Skills
 
             PanelRecord record = RequirePanel(request.panelId);
             VisualElement scope = ResolveElement(record, request.elementId, request.selector, true);
-            int maxDepth = request.depth <= 0 ? 4 : Math.Min(20, request.depth);
-            int maxElements = request.maxElements <= 0 ? 250 : Math.Min(2000, request.maxElements);
+            int maxDepth = request.depth <= 0 ? 2 : Math.Min(20, request.depth);
+            int maxElements = request.maxElements <= 0 ? 80 : Math.Min(2000, request.maxElements);
             List<object> elements = new List<object>();
             List<string> warnings = new List<string>();
             bool truncated = false;
@@ -236,24 +239,26 @@ namespace Locus.Skills
                         elements.Add(ElementSnapshot(
                             record,
                             element,
-                            request.includeComputedStyle,
-                            request.includeMatchedRules,
+                            request.includeComputedStyle && ReferenceEquals(element, scope),
+                            request.includeMatchedRules && ReferenceEquals(element, scope),
+                            request.styleProperties,
                             warnings));
                     }
                     return true;
                 });
 
-            return new Dictionary<string, object>
+            Dictionary<string, object> result = new Dictionary<string, object>
             {
-                { "panel", PanelSummary(record, CountElements(record.root)) },
+                { "panelId", record.id },
                 { "documentRevision", record.revision },
                 { "scopeElementId", ElementId(record, scope) },
-                { "scopeSelector", request.selector ?? "" },
-                { "returnedElements", elements.Count },
-                { "truncated", truncated },
-                { "elements", elements },
-                { "warnings", warnings }
+                { "elements", elements }
             };
+            if (truncated)
+                result["truncated"] = true;
+            if (warnings.Count > 0)
+                result["warnings"] = warnings;
+            return result;
         }
 
         public static Dictionary<string, object> Style(StyleRequest request)
@@ -311,11 +316,9 @@ namespace Locus.Skills
             element.MarkDirtyRepaint();
             return new Dictionary<string, object>
             {
-                { "operation", operation },
                 { "previewId", preview.id },
-                { "panelId", record.id },
-                { "documentRevision", record.revision },
-                { "element", ElementSnapshot(record, element, true, false, new List<string>()) }
+                { "elementId", ElementId(record, element) },
+                { "documentRevision", record.revision }
             };
         }
 
@@ -327,7 +330,6 @@ namespace Locus.Skills
             PanelRecord record = RequirePanel(request.panelId);
             VisualElement element = RequireElement(record, request.elementId);
             string operation = (request.operation ?? "").Trim().ToLowerInvariant();
-            Dictionary<string, object> before = ElementSnapshot(record, element, true, false, new List<string>());
 
             switch (operation)
             {
@@ -370,14 +372,25 @@ namespace Locus.Skills
             }
 
             element.MarkDirtyRepaint();
-            return new Dictionary<string, object>
+            RefreshDocumentRevision(record);
+            Dictionary<string, object> result = new Dictionary<string, object>
             {
-                { "operation", operation },
-                { "panelId", record.id },
-                { "documentRevision", record.revision },
-                { "before", before },
-                { "after", ElementSnapshot(record, element, true, false, new List<string>()) }
+                { "elementId", request.elementId },
+                { "documentRevision", record.revision }
             };
+            if (operation == "setvalue" || operation == "select" || operation == "toggle" || operation == "type")
+                result["value"] = CompactValue(JsonSafeValue(ReadControlValue(element)), CompactTextLimit);
+            else if (operation == "focus")
+                result["focused"] = record.panel.focusController != null
+                    && ReferenceEquals(record.panel.focusController.focusedElement, element);
+            else if (operation == "scroll")
+            {
+                Vector2 offset = ((ScrollView)element).scrollOffset;
+                result["scrollOffset"] = new float[] { Round(offset.x), Round(offset.y) };
+            }
+            else if (operation == "drag")
+                result["targetElementId"] = request.targetElementId;
+            return result;
         }
 
         public static Task<Dictionary<string, object>> Wait(WaitRequest request)
@@ -464,9 +477,7 @@ namespace Locus.Skills
             {
                 return new Dictionary<string, object>
                 {
-                    { "operation", "clear" },
-                    { "panelId", record.id },
-                    { "highlighted", 0 }
+                    { "cleared", true }
                 };
             }
 
@@ -508,8 +519,6 @@ namespace Locus.Skills
             }
             return new Dictionary<string, object>
             {
-                { "operation", operation },
-                { "panelId", record.id },
                 { "highlighted", targets.Count },
                 { "captureTarget", record.captureTarget },
                 { "requestEditorStatus", CurrentEditorStatus() },
@@ -530,10 +539,9 @@ namespace Locus.Skills
             preview.element.MarkDirtyRepaint();
             return new Dictionary<string, object>
             {
-                { "operation", "rollback" },
-                { "previewId", preview.id },
-                { "panelId", record.id },
-                { "element", ElementSnapshot(record, preview.element, true, false, new List<string>()) }
+                { "rolledBack", preview.id },
+                { "elementId", ElementId(record, preview.element) },
+                { "documentRevision", record.revision }
             };
         }
 
@@ -609,10 +617,7 @@ namespace Locus.Skills
             {
                 if (record.root == null)
                     continue;
-                int fingerprint = StructureFingerprint(record.root);
-                if (record.fingerprint != 0 && record.fingerprint != fingerprint)
-                    record.revision++;
-                record.fingerprint = fingerprint;
+                RefreshDocumentRevision(record);
                 records.Add(record);
             }
             records.Sort(delegate(PanelRecord left, PanelRecord right)
@@ -644,7 +649,7 @@ namespace Locus.Skills
             PanelRecord record;
             if (string.IsNullOrWhiteSpace(panelId) || !Panels.TryGetValue(panelId, out record))
                 throw new InvalidOperationException(
-                    "panel_not_found: call unity_ui_list_panels and use a current panelId.");
+                    "panel_not_found: refresh UIToolkitApi.Open().Panels().");
             return record;
         }
 
@@ -680,7 +685,7 @@ namespace Locus.Skills
         private static VisualElement RequireElement(PanelRecord record, int elementId)
         {
             if (elementId <= 0)
-                throw new InvalidOperationException("A positive elementId from unity_ui_inspect is required.");
+                throw new InvalidOperationException("A positive element ID from UIPanel inspection is required.");
             return ResolveElement(record, elementId, null, true);
         }
 
@@ -709,42 +714,47 @@ namespace Locus.Skills
             return id;
         }
 
+        private static void RefreshDocumentRevision(PanelRecord record)
+        {
+            if (record == null || record.root == null)
+                return;
+            int fingerprint = StructureFingerprint(record.root);
+            if (record.fingerprint != 0 && record.fingerprint != fingerprint)
+                record.revision++;
+            record.fingerprint = fingerprint;
+        }
+
         private static Dictionary<string, object> PanelSummary(PanelRecord record, int elementCount)
         {
-            List<object> documents = new List<object>();
-            for (int i = 0; i < record.documents.Count; i++)
-            {
-                UIDocument document = record.documents[i];
-                PanelSettings settings = document == null ? null : document.panelSettings;
-                RenderTexture targetTexture = settings == null ? null : settings.targetTexture;
-                documents.Add(new Dictionary<string, object>
-                {
-                    { "name", document == null ? "" : document.name },
-                    { "gameObject", document == null || document.gameObject == null ? "" : document.gameObject.name },
-                    { "active", document != null && document.isActiveAndEnabled },
-                    { "sortingOrder", document == null ? 0f : document.sortingOrder },
-                    { "panelSettings", settings == null ? "" : AssetDatabase.GetAssetPath(settings) },
-                    { "targetTexture", targetTexture == null ? "" : targetTexture.name },
-                    { "targetTexturePath", targetTexture == null ? "" : AssetDatabase.GetAssetPath(targetTexture) }
-                });
-            }
-            return new Dictionary<string, object>
+            string ownerName = record.editorWindow == null
+                ? "UIDocument"
+                : record.editorWindow.GetType().Name;
+            Dictionary<string, object> result = new Dictionary<string, object>
             {
                 { "panelId", record.id },
                 { "kind", record.kind ?? "" },
                 { "title", record.title ?? "" },
-                { "ownerType", record.editorWindow == null ? "UIDocument" : record.editorWindow.GetType().FullName },
-                { "elementCount", elementCount },
-                { "documentRevision", record.revision },
-                { "focused", record.panel != null && record.panel.focusController != null
-                    && record.panel.focusController.focusedElement != null },
-                { "windowFocused", record.editorWindow != null
-                    && ReferenceEquals(EditorWindow.focusedWindow, record.editorWindow) },
-                { "captureTarget", record.captureTarget ?? "" },
-                { "requestEditorStatus", CurrentEditorStatus() },
-                { "windowTitle", record.windowTitle ?? "" },
-                { "documents", documents }
+                { "owner", ownerName },
+                { "elementCount", elementCount }
             };
+
+            if (record.documents.Count > 0)
+            {
+                List<string> documentNames = new List<string>();
+                for (int i = 0; i < record.documents.Count; i++)
+                {
+                    UIDocument document = record.documents[i];
+                    string name = document == null || document.gameObject == null
+                        ? ""
+                        : document.gameObject.name;
+                    if (!string.IsNullOrEmpty(name))
+                        documentNames.Add(name);
+                }
+                if (documentNames.Count > 0)
+                    result["documents"] = documentNames;
+            }
+
+            return result;
         }
 
         private static Dictionary<string, object> ElementSnapshot(
@@ -752,55 +762,72 @@ namespace Locus.Skills
             VisualElement element,
             bool includeComputedStyle,
             bool includeMatchedRules,
+            List<string> styleProperties,
             List<string> warnings)
         {
             List<string> classes = new List<string>();
             foreach (string className in element.GetClasses())
                 classes.Add(className);
-            List<int> childIds = new List<int>();
+            VisualElement parent = element.parent;
+            int childCount = 0;
             for (int i = 0; i < element.hierarchy.childCount; i++)
             {
                 VisualElement child = element.hierarchy[i];
-                if (!IsOverlay(child))
-                    childIds.Add(ElementId(record, child));
+                if (IsOverlay(child))
+                    continue;
+                childCount++;
             }
-            VisualElement parent = element.parent;
+
+            string text = ReadText(element);
+            object value = JsonSafeValue(ReadControlValue(element));
+            List<string> actions = ActionsFor(element);
+            string source = UxmlSource(element);
+            bool visible = IsVisible(element);
+            bool focused = record.panel.focusController != null
+                && ReferenceEquals(record.panel.focusController.focusedElement, element);
+            string typeName = element.GetType().Name;
+            string selectorHint = SelectorHint(element, classes);
             Dictionary<string, object> result = new Dictionary<string, object>
             {
                 { "elementId", ElementId(record, element) },
-                { "parentId", parent == null || !BelongsTo(record, parent) ? null : (object)ElementId(record, parent) },
-                { "childIds", childIds },
-                { "type", element.GetType().Name },
-                { "fullType", element.GetType().FullName },
-                { "name", element.name ?? "" },
-                { "classes", classes },
-                { "selectorHint", SelectorHint(element, classes) },
-                { "text", ReadText(element) },
-                { "value", JsonSafeValue(ReadControlValue(element)) },
-                { "tooltip", element.tooltip ?? "" },
-                { "visible", IsVisible(element) },
-                { "display", element.resolvedStyle.display.ToString() },
-                { "opacity", Round(element.resolvedStyle.opacity) },
-                { "enabled", element.enabledInHierarchy },
-                { "focusable", element.focusable },
-                { "focused", record.panel.focusController != null
-                    && ReferenceEquals(record.panel.focusController.focusedElement, element) },
-                { "pickingMode", element.pickingMode.ToString() },
-                { "layout", RectValue(element.layout) },
-                { "worldBound", RectValue(element.worldBound) },
-                { "contentRect", RectValue(element.contentRect) },
-                { "uxmlSource", UxmlSource(element) },
-                { "actions", ActionsFor(element) },
-                { "hitTest", HitTest(record, element) }
+                { "type", typeName },
+                { "rect", RectArrayValue(element.worldBound) }
             };
+            if (!string.Equals(selectorHint, typeName, StringComparison.Ordinal))
+                result["selectorHint"] = selectorHint;
+            if (parent != null && BelongsTo(record, parent))
+                result["parentId"] = ElementId(record, parent);
+            if (childCount > 0)
+                result["childCount"] = childCount;
+            if (!string.IsNullOrEmpty(text))
+                result["text"] = LimitText(text, CompactTextLimit);
+            if (value != null)
+                result["value"] = CompactValue(value, CompactTextLimit);
+            if (actions.Count > 0)
+                result["actions"] = actions;
+            if (!visible)
+                result["visible"] = false;
+            if (!element.enabledInHierarchy)
+                result["enabled"] = false;
+            if (focused)
+                result["focused"] = true;
+            if (!string.IsNullOrEmpty(source))
+                result["uxmlSource"] = source;
+
             if (includeComputedStyle)
-                result["computedStyle"] = ComputedStyle(element);
+                result["computedStyle"] = ComputedStyle(element, styleProperties);
             if (includeMatchedRules)
-                result["matchedRules"] = MatchedRules(element, warnings);
+            {
+                List<object> rules = MatchedRules(element, warnings);
+                if (rules.Count > 0)
+                    result["matchedRules"] = rules;
+            }
             return result;
         }
 
-        private static Dictionary<string, string> ComputedStyle(VisualElement element)
+        private static Dictionary<string, string> ComputedStyle(
+            VisualElement element,
+            List<string> requestedProperties)
         {
             IResolvedStyle style = element.resolvedStyle;
             Dictionary<string, string> output = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -846,7 +873,23 @@ namespace Locus.Skills
                 { "fontSize", Invariant(style.fontSize) },
                 { "whiteSpace", style.whiteSpace.ToString() }
             };
-            return output;
+            string[] defaults =
+            {
+                "position", "flexDirection", "flexGrow", "flexShrink",
+                "alignItems", "justifyContent", "color", "backgroundColor", "fontSize"
+            };
+            IEnumerable<string> selected = requestedProperties != null && requestedProperties.Count > 0
+                ? (IEnumerable<string>)requestedProperties
+                : defaults;
+            Dictionary<string, string> filtered = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string requested in selected)
+            {
+                string property = NormalizeStyleProperty(requested);
+                string value;
+                if (output.TryGetValue(property, out value))
+                    filtered[property] = value;
+            }
+            return filtered;
         }
 
         private static List<object> MatchedRules(VisualElement element, List<string> warnings)
@@ -889,14 +932,23 @@ namespace Locus.Skills
                     object matchRecord = FieldValue(ruleType, rule, "matchRecord");
                     object selector = MemberValue(matchRecord, "complexSelector");
                     object specificity = MemberValue(selector, "specificity");
-                    output.Add(new Dictionary<string, object>
-                    {
-                        { "fullPath", Convert.ToString(FieldValue(ruleType, rule, "fullPath")) ?? "" },
-                        { "displayPath", Convert.ToString(FieldValue(ruleType, rule, "displayPath")) ?? "" },
-                        { "lineNumber", Convert.ToInt32(FieldValue(ruleType, rule, "lineNumber"), CultureInfo.InvariantCulture) },
-                        { "specificity", specificity == null ? 0 : Convert.ToInt32(specificity, CultureInfo.InvariantCulture) },
-                        { "selector", SelectorDescription(selector) }
-                    });
+                    string path = Convert.ToString(FieldValue(ruleType, rule, "fullPath")) ?? "";
+                    if (string.IsNullOrEmpty(path))
+                        path = Convert.ToString(FieldValue(ruleType, rule, "displayPath")) ?? "";
+                    string selectorText = SelectorDescription(selector);
+                    if (string.IsNullOrEmpty(path) && string.IsNullOrEmpty(selectorText))
+                        continue;
+                    Dictionary<string, object> item = new Dictionary<string, object>();
+                    if (!string.IsNullOrEmpty(path))
+                        item["path"] = path;
+                    int line = Convert.ToInt32(FieldValue(ruleType, rule, "lineNumber"), CultureInfo.InvariantCulture);
+                    if (line > 0)
+                        item["line"] = line;
+                    if (specificity != null)
+                        item["specificity"] = Convert.ToInt32(specificity, CultureInfo.InvariantCulture);
+                    if (!string.IsNullOrEmpty(selectorText))
+                        item["selector"] = selectorText;
+                    output.Add(item);
                 }
             }
             catch (Exception exception)
@@ -1415,19 +1467,27 @@ namespace Locus.Skills
             int stableFrames)
         {
             EditorApplication.update -= callback;
-            source.TrySetResult(new Dictionary<string, object>
+            string condition = (request.condition ?? "").Trim().ToLowerInvariant();
+            Dictionary<string, object> result = new Dictionary<string, object>
             {
-                { "condition", request.condition },
-                { "matched", true },
-                { "elapsedMs", (int)Math.Round((EditorApplication.timeSinceStartup - started) * 1000.0) },
-                { "stableFrames", stableFrames },
-                { "elementId", element == null || record == null ? 0 : ElementId(record, element) },
-                { "text", element == null ? "" : ReadText(element) },
-                { "value", element == null ? null : JsonSafeValue(ReadControlValue(element)) },
-                { "visible", IsVisible(element) },
-                { "enabled", element != null && element.enabledInHierarchy },
-                { "worldBound", element == null ? null : (object)RectValue(element.worldBound) }
-            });
+                { "elapsedMs", (int)Math.Round((EditorApplication.timeSinceStartup - started) * 1000.0) }
+            };
+            if (element != null && record != null)
+                result["elementId"] = ElementId(record, element);
+            if (condition == "text" && element != null)
+                result["text"] = LimitText(ReadText(element), CompactTextLimit);
+            else if (condition == "value" && element != null)
+                result["value"] = CompactValue(JsonSafeValue(ReadControlValue(element)), CompactTextLimit);
+            else if ((condition == "visible" || condition == "hidden") && element != null)
+                result["visible"] = IsVisible(element);
+            else if ((condition == "enabled" || condition == "disabled") && element != null)
+                result["enabled"] = element.enabledInHierarchy;
+            else if (condition == "layoutstable" && element != null)
+            {
+                result["stableFrames"] = stableFrames;
+                result["rect"] = RectArrayValue(element.worldBound);
+            }
+            source.TrySetResult(result);
         }
 
         private static bool Approximately(Rect left, Rect right)
@@ -1658,23 +1718,6 @@ namespace Locus.Skills
             return (value ?? "").Replace("-", "").Replace("_", "").Replace(" ", "");
         }
 
-        private static string HitTest(PanelRecord record, VisualElement element)
-        {
-            if (!IsVisible(element))
-                return "outside";
-            VisualElement picked = record.panel.Pick(element.worldBound.center);
-            if (ReferenceEquals(picked, element))
-                return "direct";
-            VisualElement cursor = picked;
-            while (cursor != null)
-            {
-                if (ReferenceEquals(cursor, element))
-                    return "descendant";
-                cursor = cursor.parent;
-            }
-            return picked == null ? "outside" : "blocked";
-        }
-
         private static string UxmlSource(VisualElement element)
         {
             try
@@ -1693,15 +1736,29 @@ namespace Locus.Skills
             }
         }
 
-        private static Dictionary<string, float> RectValue(Rect rect)
+        private static float[] RectArrayValue(Rect rect)
         {
-            return new Dictionary<string, float>
+            return new float[]
             {
-                { "x", Round(rect.x) },
-                { "y", Round(rect.y) },
-                { "width", Round(rect.width) },
-                { "height", Round(rect.height) }
+                Round(rect.x),
+                Round(rect.y),
+                Round(rect.width),
+                Round(rect.height)
             };
+        }
+
+        private static string LimitText(string value, int maximum)
+        {
+            value = value ?? "";
+            if (maximum <= 3 || value.Length <= maximum)
+                return value;
+            return value.Substring(0, maximum - 3) + "...";
+        }
+
+        private static object CompactValue(object value, int maximumStringLength)
+        {
+            string text = value as string;
+            return text == null ? value : (object)LimitText(text, maximumStringLength);
         }
 
         private static object JsonSafeValue(object value)

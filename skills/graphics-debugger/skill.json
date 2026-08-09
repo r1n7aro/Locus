@@ -1,0 +1,41 @@
+{
+  "schema": "locus.skill.v1",
+  "id": "graphics-debugger",
+  "name": "Unity Graphics Debugger",
+  "version": "1.0.0",
+  "injectMode": "excerpt",
+  "ignoredMarkdownFiles": ["runtime/**/LICENSE.md"],
+  "description": "Use for Unity 6.3+ rendering diagnosis: inspect frame events and render targets with the built-in Frame Debugger, or capture and replay a GPU frame with RenderDoc for actions, passes, buffers, pipeline state, and intermediate textures.",
+  "argumentHint": "<rendering problem, capture condition, or frame-analysis request>",
+  "command": {
+    "enabled": true,
+    "trigger": "/graphics-debugger",
+    "argumentHint": "<rendering problem, capture condition, or frame-analysis request>"
+  },
+  "capabilities": {
+    "unity": [
+      {
+        "name": "frame-debugger-csharp-api",
+        "path": "unity/Editor/FrameDebuggerApi.cs",
+        "api": "unity_execute"
+      },
+      {
+        "name": "renderdoc-csharp-api",
+        "path": "unity/Editor/RenderDocCapture.cs",
+        "api": "unity_execute"
+      }
+    ],
+    "python": [
+      {
+        "name": "renderdoc-python-api",
+        "path": "scripts/locus_renderdoc.py",
+        "module": "locus_renderdoc"
+      },
+      {
+        "name": "texture-analysis-python-api",
+        "path": "scripts/locus_texture_analysis.py",
+        "module": "locus_texture_analysis"
+      }
+    ]
+  }
+}

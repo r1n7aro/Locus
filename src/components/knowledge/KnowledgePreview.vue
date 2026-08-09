@@ -9,7 +9,6 @@ import type {
   KnowledgeSearchSelectionContext,
   KnowledgeDocumentType,
   KnowledgeInjectMode,
-  SkillManifest,
   SkillUnityInstallStatus,
   SkillSurface,
 } from "../../types";
@@ -142,20 +141,6 @@ function packageIdForSkillDocument(document: KnowledgeDocument | null | undefine
   return document.externalSource.sourceId || document.path.split("/")[0] || "";
 }
 
-function skillPackageManifestForDocument(document: KnowledgeDocument | null | undefined): SkillManifest | null {
-  const packageId = packageIdForSkillDocument(document);
-  if (!packageId) return null;
-  return skillItems.value.find((item) =>
-    item.kind === "package"
-    && (item.packageId === packageId || item.dirName === packageId)
-  ) ?? null;
-}
-
-function skillPackageL1Unavailable(): boolean {
-  const manifest = skillPackageManifestForDocument(props.document);
-  return manifest?.hasL1 === false;
-}
-
 const isReadOnly = computed(() => !!props.document?.readOnly);
 const isEditModeLocked = computed(() => isKnowledgeEditModeLocked(props.document));
 const documentPath = computed(() => props.document?.path?.trim() || "");
@@ -202,9 +187,7 @@ const injectModeOptions = computed(() => [
   {
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
-    hint: skillPackageL1Unavailable()
-      ? t("knowledge.skill.l1FallbackDescription")
-      : hintForInjectMode("excerpt"),
+    hint: hintForInjectMode("excerpt"),
   },
   {
     value: "full",

@@ -23,7 +23,8 @@ describe("View sidebar settings", () => {
     expect(manifest.description).toContain("build or edit a Locus View");
     expect(manifest.command?.trigger).toBe("/view");
     expect(skill).toContain("# View");
-    expect(skill).toContain("## L1");
+    expect(skill).toContain("summary: >-");
+    expect(skill).not.toContain("## L1");
     expect(skill).not.toContain("# View Package");
   });
 
@@ -36,7 +37,7 @@ describe("View sidebar settings", () => {
     const en = read("src/language/en.json");
 
     expect(displaySettings).toContain("showViewsInSessionPanel: boolean;");
-    expect(displaySettings).toContain("showViewsInSessionPanel: true,");
+    expect(displaySettings).toContain("showViewsInSessionPanel: false,");
     expect(displayPanel).toContain(":model-value=\"display.showViewsInSessionPanel\"");
     expect(displayPanel).toContain("@update:model-value=\"setDisplay('showViewsInSessionPanel', $event)\"");
     expect(chatView).toContain(":show-views=\"displaySettings.showViewsInSessionPanel\"");

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -64,6 +64,14 @@ pub struct ResolvedPythonRuntime {
     /// Directory placed on PYTHONPATH that contains the bundled `locus`
     /// package. Available to both managed and selected system runtimes.
     pub sdk_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillPythonModuleRegistration {
+    pub package_id: String,
+    pub module: String,
+    pub import_root: PathBuf,
+    pub source_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -442,20 +450,73 @@ fn managed_package_dir(runtime: &ResolvedPythonRuntime) -> Option<&PathBuf> {
     }
 }
 
+fn active_skill_python_modules() -> &'static RwLock<BTreeMap<String, SkillPythonModuleRegistration>>
+{
+    static MODULES: OnceLock<RwLock<BTreeMap<String, SkillPythonModuleRegistration>>> =
+        OnceLock::new();
+    MODULES.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+pub fn register_skill_python_modules(
+    modules: impl IntoIterator<Item = SkillPythonModuleRegistration>,
+) -> Result<(), String> {
+    let mut registered = active_skill_python_modules()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut pending = BTreeMap::<String, SkillPythonModuleRegistration>::new();
+    for registration in modules {
+        if let Some(existing) = registered
+            .get(&registration.module)
+            .or_else(|| pending.get(&registration.module))
+        {
+            if normalize_path_key(&existing.source_path)
+                != normalize_path_key(&registration.source_path)
+            {
+                return Err(format!(
+                    "Python module '{}' from Skill package '{}' conflicts with active package '{}' ({} vs {})",
+                    registration.module,
+                    registration.package_id,
+                    existing.package_id,
+                    registration.source_path.display(),
+                    existing.source_path.display()
+                ));
+            }
+            continue;
+        }
+        pending.insert(registration.module.clone(), registration);
+    }
+    registered.extend(pending);
+    Ok(())
+}
+
 fn python_path_dirs(runtime: &ResolvedPythonRuntime) -> Vec<PathBuf> {
+    let modules = active_skill_python_modules()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for registration in modules.values() {
+        if seen.insert(normalize_path_key(&registration.import_root)) {
+            dirs.push(registration.import_root.clone());
+        }
+    }
+    drop(modules);
     if let Some(sdk_dir) = runtime.sdk_dir.as_ref() {
-        dirs.push(sdk_dir.clone());
+        if seen.insert(normalize_path_key(sdk_dir)) {
+            dirs.push(sdk_dir.clone());
+        }
     }
     if let Some(package_dir) = managed_package_dir(runtime) {
-        dirs.push(package_dir.clone());
+        if seen.insert(normalize_path_key(package_dir)) {
+            dirs.push(package_dir.clone());
+        }
     }
     dirs
 }
 
 /// `VAR='value' ` assignment prefix for sh function bodies and shim scripts.
-/// PYTHONPATH prepends the managed package dir while preserving a caller
-/// PYTHONPATH via `${PYTHONPATH:+<sep>$PYTHONPATH}`.
+/// PYTHONPATH prepends active Skill modules, the Locus SDK, and the managed
+/// package dir while preserving a caller PYTHONPATH.
 fn sh_python_env_assignments(runtime: &ResolvedPythonRuntime) -> String {
     let mut assigns = String::new();
     for (key, value) in python_invocation_env(runtime) {
@@ -471,7 +532,11 @@ fn sh_python_env_assignments(runtime: &ResolvedPythonRuntime) -> String {
             .map(|value| value.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         let quoted = shell_quote_posix(&joined);
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
         assigns.push_str(&format!(
             "PYTHONPATH={quoted}\"${{PYTHONPATH:+{sep}$PYTHONPATH}}\" "
         ));
@@ -747,11 +812,9 @@ fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
         }
     }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python"));
-    candidates.into_iter().find(|root| {
-        root.join("locus")
-            .join("__init__.py")
-            .is_file()
-    })
+    candidates
+        .into_iter()
+        .find(|root| root.join("locus").join("__init__.py").is_file())
 }
 
 fn find_managed_python_executable(roots: &[PathBuf]) -> Option<PathBuf> {

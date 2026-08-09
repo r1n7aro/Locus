@@ -1,42 +1,99 @@
 ---
+summary: >-
+  用于 Unity 6.3+ UI Toolkit 的结构、样式、布局和交互调试。Skill 激活时加载 `Locus.Skills.UIToolkitApi` 程序集；通过现有 `unity_execute` 编排一次或多步 C# 操作。覆盖 EditorWindow 与 Play Mode 中的 Runtime `UIDocument`。
 tools:
-  - unity_ui_list_panels
-  - unity_ui_inspect
-  - unity_ui_style
-  - unity_ui_action
-  - unity_ui_wait
-  - unity_ui_highlight
+  - unity_execute
   - unity_capture_viewport
   - read
   - edit
 ---
 
-# UI Toolkit DevTools
+# UI Toolkit C# DevTools
 
-## L1
+## 使用约束
 
-用于 Unity 6.3+ UI Toolkit 的结构、样式、布局和交互调试。覆盖 Unity EditorWindow UI 与 Play Mode 中的 Runtime `UIDocument`；工具直接在目标 Unity Editor 主线程读取和驱动实时 `VisualElement` 树。
+- 在 `unity_execute` 中加入 `using Locus.Skills;`，从 `UIToolkitApi.Open()` 开始。
+- 输出通过 `print(UIToolkitApi.Json(value))` 返回。投影当前判断所需字段，避免返回完整对象。
+- 元素 ID 属于当前 Unity 会话和当前面板结构。收到 `stale_element` 后重新定位。
+- selector 支持 `#name`、`.class`、`Type`、`Type#name`、`Type.class` 与 `*`。
+- `IMGUIContainer` 内部控件不属于 `VisualElement` 树。
 
-## Instructions
+## 常用 API
 
-1. 先调用 `unity_ui_list_panels`。`kind=editor_window` 对应编辑器 UI，`kind=runtime_uidocument` 对应 Runtime UI；Runtime 面板在 Play Mode 中保持实时，Game View 暂停时仍可检查当前树。
-2. 使用返回的 `panelId` 调用 `unity_ui_inspect`。初次检查采用 `depth=4`、`maxElements=250`；需要定位时用 `#name`、`.class`、`Type`、`Type#name` 或 `Type.class`。元素 ID 只在当前 Unity 会话和当前文档结构中有效；收到 `stale_element` 后重新检查。
-3. 结构检查优先读取 `text`、`value`、`actions`、`layout`、`worldBound`、`visible`、`enabled` 和 `hitTest`。需要解释布局时开启 `includeComputedStyle`；需要定位持久样式来源时开启 `includeMatchedRules`。
-4. 使用 `unity_ui_style` 做实时 inline 预览。一次请求中的 edits 原子应用，并返回 `previewId`；结论不成立时立即 `rollback`。`reset` 清除指定 inline 属性。支持常见尺寸、边距、内边距、边框、flex、对齐、定位、显示、可见性、透明度、颜色、字号、空白和 overflow 属性。
-5. 持久修改使用检查结果中的 `uxmlSource` 或 `matchedRules[].fullPath` 定位 UXML/USS，通过 `read` 和 `edit` 修改源文件。等待 Unity 导入与面板重建后重新列出/检查元素；旧 element ID 可能失效。
-6. 使用 `unity_ui_action` 驱动交互。按钮采用 `click`，输入框采用 `type` 或 `setValue`，Toggle 采用 `toggle`，DropdownField 采用 `select`，ScrollView 采用 `scroll`。事件会在实时 Editor 或 Runtime panel 中派发，回调可能修改场景、资源或项目状态。
-7. 异步 UI 使用 `unity_ui_wait`。动画和延迟布局优先等待 `layoutStable`，动态列表优先等待目标 selector 的 `exists`/`visible`，操作结果优先等待 `text` 或 `value`。
-8. 需要图像确认时先调用 `unity_ui_highlight`，再按照 panel 返回的 `captureTarget`、`requestEditorStatus` 调用 `unity_capture_viewport`。高亮会聚焦对应 EditorWindow；同名窗口存在时省略 `window_title` 以捕获当前焦点窗口，名称唯一时可传 `window_title=windowTitle`。Runtime UI 使用 `target=game`。截图后调用 `clear`，避免诊断层残留。
-9. `IMGUIContainer` 是 UI Toolkit 与 IMGUI 的边界。可以检查容器布局和可见性，内部 IMGUI 控件不属于 `VisualElement` 树。
+```csharp
+var ui = UIToolkitApi.Open();
+var panels = ui.Panels();
+var panel = ui.FindPanel("Replay Timeline");
+var root = panel.Root();
+var button = panel.Find("#play-button");
+var subtree = button.InspectSubtree(new UIQuery { Depth = 2, MaxElements = 30 });
+print(UIToolkitApi.Json(new {
+    panels = panels,
+    target = button.Info,
+    elements = subtree.Elements
+}));
+```
 
-## Result interpretation
+`UIPanel.Inspect(UIQuery)` 返回有界结构。默认 `Depth=2`、`MaxElements=80`；`InteractiveOnly=true` 只保留可交互元素。样式判断使用单元素查询：
 
-- `documentRevision` 在检测到根或结构变化时增加，用于判断两次检查是否来自同一棵树。
-- `hitTest=direct` 表示元素中心点直接命中；`descendant` 表示中心点由子元素接收；`blocked` 表示被其他元素遮挡；`outside` 表示当前布局不在 panel 可交互区域。
-- `computedStyle` 是布局完成后的 resolved 值；inline `style`、UXML 属性和 USS 级联共同决定它。
-- `matchedRules` 来自 Unity 6.3/6.5 编辑器内部诊断器。Unity 无法提供规则细节时返回 capability warning，结构、computed style 与交互工具仍可使用。
+```csharp
+var element = panel.Find(".timeline-row", new UIQuery {
+    Depth = 1,
+    MaxElements = 1,
+    IncludeComputedStyle = true,
+    IncludeMatchedRules = true,
+    StyleProperties = new [] { "display", "width", "height", "flexGrow" }
+});
+print(UIToolkitApi.Json(element.Info));
+```
+
+`UIElement` 提供 `Click`、`Focus`、`SetValue`、`Type`、`Toggle`、`Select`、`Scroll`、`Press`、`DragTo`。一个 `unity_execute` 可完成复合流程并只返回最终收据：
+
+```csharp
+var ui = UIToolkitApi.Open();
+var panel = ui.FindPanel("Settings");
+var search = panel.Find("#search");
+search.Type("render pipeline");
+await panel.WaitAsync(".search-result", UIWaitCondition.Visible, timeoutMs: 10000);
+var result = panel.Find(".search-result");
+result.Click();
+print(UIToolkitApi.Json(new { search = search.Id, clicked = result.Id }));
+```
+
+等待条件包括 `Exists`、`Missing`、`Visible`、`Hidden`、`Enabled`、`Disabled`、`Text`、`Value`、`LayoutStable`。等待使用 Editor update 回调，不阻塞 Unity 主线程。
+
+## 布局预览与持久修改
+
+`SetStyles` 原子应用 inline 样式并返回 `UIStylePreview`；验证失败时调用 `Rollback()`。`ResetStyles` 清除指定 inline 属性。
+
+```csharp
+var preview = element.SetStyles(
+    new UIStyleChange("width", "420px"),
+    new UIStyleChange("flex-grow", "1")
+);
+await element.WaitAsync(UIWaitCondition.LayoutStable, timeoutMs: 5000);
+var measured = element.Refresh(new UIQuery {
+    IncludeComputedStyle = true,
+    StyleProperties = new [] { "width", "flexGrow" }
+});
+preview.Rollback();
+print(UIToolkitApi.Json(new { measured, preview.PreviewId }));
+```
+
+持久修改使用 `UIElementInfo.UxmlSource` 或 `MatchedRules[].Path` 定位 UXML/USS，再通过 `read` 与 `edit` 修改源文件。Unity 导入并重建面板后重新定位元素。
+
+## 图像确认
+
+`element.Highlight()` 或 `panel.HighlightInteractions()` 返回 `CaptureTarget`、`RequestEditorStatus` 与 `WindowTitle`。随后调用 `unity_capture_viewport`，截图完成后调用 `panel.ClearHighlight()`。Runtime UI 使用 Game View；Editor UI 使用对应 EditorWindow。
+
+## 结果模型
+
+- `UIPanelInfo`：`Id`、`Kind`、`Title`、`Owner`、`ElementCount`、`Documents`
+- `UIElementInfo`：`Id`、`ParentId`、`Type`、`Selector`、`ChildCount`、`Rect`、非空文本/值、动作、状态、源文件、按需样式与 USS 规则
+- `Rect` 顺序为 `[x, y, width, height]`
+- Runtime `UIDocument` 只在 Play Mode 存活；Game View 暂停时仍可检查当前树
 
 ## Requirements
 
 - Unity `6000.3` 或更高版本
-- UI Toolkit Editor UI 或连接到该 Editor 的 Play Mode Runtime UI
+- UI Toolkit Editor UI，或连接到该 Editor 的 Play Mode Runtime UI

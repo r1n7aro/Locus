@@ -1,27 +1,17 @@
 ---
 id: kd_skill_ask_locus
-type: skill
-path: ask-locus.md
-title: Ask Locus
 injectMode: none
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: >-
+  Use when the user asks how Locus works, how to operate a Locus feature, how Locus connects to Unity, or where a Locus behavior is implemented. Ignore questions about the current Unity project itself.
 aiMaintained: false
 skillEnabled: true
 skillSurface: both
 commandTrigger: /ask-locus
 argumentHint: <question>
-createdAt: 1780934400000
-updatedAt: 1781049600000
 ---
 
 # Ask Locus
 
-## Summary
-Use when the user asks how Locus works, how to operate a Locus feature, how Locus connects to Unity, or where a Locus behavior is implemented. Ignore questions about the current Unity project itself.
-
-## Content
 Use this skill when the user asks how Locus works, how to operate a Locus feature, how Locus connects to Unity, how a built-in workflow behaves, or where a Locus behavior is implemented.
 
 ## When to use

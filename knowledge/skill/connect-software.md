@@ -1,12 +1,8 @@
 ---
 id: kd_skill_builtin_connect_software
-type: skill
-path: connect-software.md
-title: Connect External Software
 injectMode: excerpt
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: >-
+  Use when the user wants Locus to connect to, control, or automate external software, a service, or a web API — adding, installing, fixing, or reloading an MCP server (Blender, Figma, community `uvx`/`npx` servers, ...), setting up a CLI (`gh`, `adb`, `ffmpeg`, ...), or wiring up an HTTP API. Ignore Unity connection issues and Locus skill/plugin management.
 aiMaintained: false
 skillEnabled: true
 skillSurface: both
@@ -20,16 +16,9 @@ tools:
   - read
   - write
   - edit
-createdAt: 1784246400000
-updatedAt: 1784419200000
 ---
 
 # Connect External Software
-
-## Summary
-Use when the user wants Locus to connect to, control, or automate external software, a service, or a web API — adding, installing, fixing, or reloading an MCP server (Blender, Figma, community `uvx`/`npx` servers, ...), setting up a CLI (`gh`, `adb`, `ffmpeg`, ...), or wiring up an HTTP API. Ignore Unity connection issues and Locus skill/plugin management.
-
-## Content
 
 You can research integration options, configure the connection (MCP server, CLI, or raw HTTP), verify it end to end, and persist what you learned — all without leaving the conversation. Do not tell the user a connection is unavailable before walking the channels below.
 

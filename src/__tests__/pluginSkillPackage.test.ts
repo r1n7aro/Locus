@@ -30,7 +30,8 @@ describe("plugin Skill package", () => {
     expect(manifest.command.trigger).toBe("/plugin");
     expect(manifest.command.argumentHint).toBe("<plugin request>");
     expect(skill).toContain("plugin_search");
-    expect(skill).toContain("## L1");
+    expect(skill).toContain("summary: >-");
+    expect(skill).not.toContain("## L1");
     expect(skill).toContain("Locus app extension");
     expect(skill).toContain("plugin_install");
     expect(skill).toContain("plugin_set_enabled");

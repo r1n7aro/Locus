@@ -1,12 +1,8 @@
 ---
 id: kd_skill_dream
-type: skill
-path: dream.md
-title: Dream
 injectMode: excerpt
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: >-
+  Use when the user invokes `/dream` or explicitly asks to consolidate, clean up, or audit long-term Memory. Ignore requests that add new knowledge, answer project questions, or edit Design content.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
@@ -17,16 +13,10 @@ tools:
   - read
   - list
   - edit
-createdAt: 1783036800000
-updatedAt: 1783036800000
 ---
 
 # Dream
 
-## Summary
-Use when the user invokes `/dream` or explicitly asks to consolidate, clean up, or audit long-term Memory. Ignore requests that add new knowledge, answer project questions, or edit Design content.
-
-## Content
 ## Instructions
 
 Command arguments: `[scope]` optionally narrows the pass to one Memory document or directory (for example `memory/project-mistake-note.md`); default is every Memory document, project level and user level.

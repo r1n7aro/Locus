@@ -18,11 +18,11 @@
       },
       "summary": {
         "type": "string",
-        "description": "Required one-line package description and fallback load guidance."
+        "description": "Required one-line load guidance. Locus writes it to both `skill.json.description` and root `SKILL.md` frontmatter `summary`."
       },
       "body": {
         "type": "string",
-        "description": "Optional initial `SKILL.md` body. Omit to create the standard L1 and Instructions scaffold."
+        "description": "Optional initial `SKILL.md` content. It may include canonical frontmatter such as `tools`; Locus writes or replaces frontmatter `summary` and adds an H1 title when absent. Omit it to create an H1 title and `## Instructions`."
       },
       "argumentHint": {
         "type": ["string", "null"],

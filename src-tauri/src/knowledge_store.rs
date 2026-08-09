@@ -4166,10 +4166,11 @@ fn parse_document(
         normalize_relative_path(frontmatter.path.as_deref().unwrap_or_default())?
     };
     let title = default_document_title_from_path(&path)?;
-    let raw_markdown = frontmatter
-        .body_format
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("markdown"))
+    let raw_markdown = doc_type == KnowledgeType::Skill
+        || frontmatter
+            .body_format
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("markdown"))
         || (frontmatter.body_format.is_none()
             && frontmatter.doc_type.is_none()
             && frontmatter.path.is_none()
@@ -7538,6 +7539,37 @@ updatedAt: 2
         assert_eq!(parsed.argument_hint.as_deref(), Some("<skill-name>"));
         assert_eq!(parsed.tools, vec!["create_skill_package", "skill_reload"]);
         assert_eq!(parsed.summary.as_deref(), Some("Create a new Skill."));
+    }
+
+    #[test]
+    fn skill_summary_is_read_only_from_frontmatter() {
+        let raw = r#"---
+id: kd_skill
+type: skill
+path: old-skill.md
+title: Old Skill
+injectMode: excerpt
+aiMaintained: false
+skillEnabled: true
+skillSurface: auto
+---
+
+# Old Skill
+
+## Summary
+Legacy heading summary.
+
+## Content
+Legacy body.
+"#;
+
+        let parsed = parse_document(raw, Some(KnowledgeType::Skill), Some("old-skill.md"))
+            .expect("parse skill as raw Markdown");
+
+        assert!(parsed.summary.is_none());
+        assert!(!parsed.summary_enabled);
+        assert!(parsed.body.contains("## Summary\nLegacy heading summary."));
+        assert!(parsed.body.contains("## Content\nLegacy body."));
     }
 
     #[test]

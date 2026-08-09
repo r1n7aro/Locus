@@ -1,12 +1,8 @@
 ---
 id: kd_skill_grill
-type: skill
-path: grill.md
-title: Grill
 injectMode: excerpt
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: >-
+  Use when the user invokes `/grill` to be questioned until an implementation requirement is complete enough to build. Focus on the current conversation and repository; leave persistence and implementation to later steps.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
@@ -25,16 +21,10 @@ tools:
   - unity_yaml_list
   - unity_yaml_search
   - unity_yaml_read
-createdAt: 1786196077444
-updatedAt: 1786196077444
 ---
 
 # Grill
 
-## Summary
-Use when the user invokes `/grill` to be questioned until an implementation requirement is complete enough to build. Focus on the current conversation and repository; leave persistence and implementation to later steps.
-
-## Content
 Command arguments: `[requirement-or-idea]` optionally name what should be clarified. When omitted, use the current proposal from the conversation; ask for a target only when no proposal is available.
 
 ## Instructions

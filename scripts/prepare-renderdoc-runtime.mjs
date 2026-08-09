@@ -23,7 +23,7 @@ const ARCHIVE_SHA256 = "bd665c348a8245d10a1f513e35b83603edc1a78006277583d09ec076
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const archivePath = path.join(repoRoot, ".cache", "renderdoc-runtime", ARCHIVE_NAME);
-const runtimeParent = path.join(repoRoot, "skills", "renderdoc", "runtime");
+const runtimeParent = path.join(repoRoot, "skills", "graphics-debugger", "runtime");
 const targetDir = path.join(runtimeParent, "windows-x64");
 const manifestPath = path.join(runtimeParent, "manifest.json");
 

@@ -1,4 +1,6 @@
 ---
+summary: >-
+  Use when the user asks to build or edit a Locus View (视图/面板): a Vue UI panel, inspector, table, board, or graph editor for the connected Unity project. Ignore Unity project View classes, folders, assets, and camera/runtime views.
 tools:
   - knowledge_query
   - read
@@ -15,9 +17,6 @@ tools:
 ---
 
 # View
-
-## L1
-Use when the user asks to build or edit a Locus View (视图/面板): a Vue UI panel, inspector, table, board, or graph editor for the connected Unity project. Ignore Unity project View classes, folders, assets, and camera/runtime views.
 
 ## Instructions
 

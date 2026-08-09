@@ -50,12 +50,6 @@ pub struct SkillManifest {
     pub package_version: Option<String>,
     #[serde(default)]
     pub has_unity: bool,
-    #[serde(default)]
-    pub has_l0: bool,
-    #[serde(default)]
-    pub has_l1: bool,
-    #[serde(default)]
-    pub has_l2: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,18 +86,13 @@ pub struct SkillPackageSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillPackageCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
-    #[serde(
-        rename = "argument-hint",
-        alias = "argumentHint",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
 }
 
@@ -113,9 +102,19 @@ pub struct SkillPackageCapabilities {
     #[serde(default)]
     pub unity: Vec<SkillPackageUnityCapability>,
     #[serde(default)]
-    pub python: Vec<serde_json::Value>,
+    pub python: Vec<SkillPackagePythonCapability>,
     #[serde(default)]
     pub cli: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPackagePythonCapability {
+    #[serde(default)]
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -196,32 +195,17 @@ pub struct SkillPackageToolManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillPackageManifestFile {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: String,
-    #[serde(
-        rename = "argument-hint",
-        alias = "argumentHint",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
-    #[serde(
-        rename = "disable-model-invocation",
-        alias = "disableModelInvocation",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_model_invocation: Option<bool>,
-    #[serde(
-        rename = "user-invocable",
-        alias = "userInvocable",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_invocable: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub schema: String,
@@ -248,10 +232,12 @@ pub struct SkillPackageManifestFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SkillPackageDocumentFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tools: Vec<String>,
 }
@@ -260,7 +246,7 @@ struct SkillPackageDocumentFrontmatter {
 pub struct SkillPackageRecord {
     pub root: PathBuf,
     pub manifest: SkillPackageManifestFile,
-    pub doc_levels: SkillPackageDocLevels,
+    pub root_summary: String,
     pub updated_at: i64,
     pub source: String,
     pub plugin_id: Option<String>,
@@ -273,13 +259,6 @@ pub(crate) struct SkillPackageUnityScriptBundle {
     pub source_hash: String,
     pub script_count: usize,
     pub request: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SkillPackageDocLevels {
-    pub has_l0: bool,
-    pub has_l1: bool,
-    pub has_l2: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,7 +386,7 @@ impl From<SkillPackageCreateRequest> for SkillCreateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillReloadRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +488,9 @@ fn scan_skill_dir(
         ) else {
             continue;
         };
+        if validate_skill_document_config(&document, &dir_name).is_err() {
+            continue;
+        }
         let cfg = if source == "app" {
             lookup_skill_config_override(configs, source, &dir_name)
         } else {
@@ -661,6 +643,9 @@ fn validate_skill_document_config(
     document: &KnowledgeDocument,
     fallback: &str,
 ) -> Result<(), String> {
+    if knowledge_store::active_summary(document).is_none() {
+        return Err("Skill document requires a non-empty frontmatter summary".to_string());
+    }
     let skill_enabled = document.skill_enabled.unwrap_or(true);
     let skill_surface = document.skill_surface.unwrap_or_default();
     let trigger = document.command_trigger.as_deref().unwrap_or("");
@@ -722,9 +707,6 @@ fn build_skill_manifest(
         package_id: None,
         package_version: None,
         has_unity: false,
-        has_l0: markdown_has_l_section(&document.body, "L0"),
-        has_l1: markdown_has_l_section(&document.body, "L1"),
-        has_l2: markdown_has_l_section(&document.body, "L2"),
         plugin_id: None,
         plugin_scope: None,
         origin_path: None,
@@ -1091,6 +1073,23 @@ fn normalize_package_manifest(
     for item in &manifest.capabilities.unity {
         normalize_package_rel_path(&item.path)?;
     }
+    for item in &mut manifest.capabilities.python {
+        item.name = item.name.trim().to_string();
+        item.path = normalize_package_rel_path(&item.path)?;
+        item.module = item
+            .module
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(module) = item.module.as_deref() {
+            if !valid_python_module_name(module) {
+                return Err(format!(
+                    "Skill package Python capability '{}' has invalid module '{}'",
+                    item.name, module
+                ));
+            }
+        }
+    }
     for tool in manifest.tools.iter_mut() {
         normalize_package_tool_manifest(tool)?;
     }
@@ -1109,6 +1108,15 @@ fn normalize_package_manifest(
     }
     manifest.ignored_markdown_files = ignored_markdown_files.into_iter().collect();
     Ok(manifest)
+}
+
+fn valid_python_module_name(module: &str) -> bool {
+    module.split('.').all(|segment| {
+        !segment.is_empty()
+            && segment.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphabetic() || index > 0 && ch.is_ascii_digit()
+            })
+    })
 }
 
 fn normalize_package_tool_manifest(tool: &mut SkillPackageToolManifest) -> Result<(), String> {
@@ -1327,36 +1335,6 @@ fn normalize_package_unity_yaml_read_extension(
     Ok(())
 }
 
-fn markdown_l_heading_matches(line: &str, level: &str) -> bool {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with('#') {
-        return false;
-    }
-    let title = trimmed.trim_start_matches('#').trim_start();
-    title == level
-        || title.strip_prefix(level).is_some_and(|rest| {
-            rest.starts_with(' ') || rest.starts_with(':') || rest.starts_with('-')
-        })
-}
-
-fn markdown_has_l_section(body: &str, level: &str) -> bool {
-    body.lines()
-        .any(|line| markdown_l_heading_matches(line, level))
-}
-
-fn markdown_l_section_text(body: &str, level: &str) -> Option<String> {
-    let mut lines = body.lines();
-    lines
-        .by_ref()
-        .find(|line| markdown_l_heading_matches(line, level))?;
-    let section = lines
-        .take_while(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = section.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
 pub(crate) fn strip_utf8_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
@@ -1501,14 +1479,6 @@ fn package_document_tool_names(
     names
 }
 
-fn scan_package_document_levels(body: &str) -> SkillPackageDocLevels {
-    SkillPackageDocLevels {
-        has_l0: markdown_has_l_section(body, "L0"),
-        has_l1: markdown_has_l_section(body, "L1"),
-        has_l2: markdown_has_l_section(body, "L2"),
-    }
-}
-
 fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> {
     let manifest_path = package_manifest_path(root);
     let raw_manifest = std::fs::read_to_string(&manifest_path)
@@ -1520,13 +1490,21 @@ fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> 
     let root_doc_path = package_root_doc_path(root);
     let raw = std::fs::read_to_string(&root_doc_path)
         .map_err(|e| format!("Failed to read {}: {}", root_doc_path.display(), e))?;
-    let (_, body) = split_optional_package_frontmatter(&raw)?;
-    let doc_levels = scan_package_document_levels(&body);
+    let (frontmatter, _) = split_optional_package_frontmatter(&raw)?;
+    let root_summary = frontmatter
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "Skill package root SKILL.md requires a non-empty frontmatter summary".to_string()
+        })?;
     let updated_at = get_updated_at(&manifest_path).max(get_updated_at(&root_doc_path));
     Ok(SkillPackageRecord {
         root: root.to_path_buf(),
         updated_at,
-        doc_levels,
+        root_summary,
         manifest,
         source: "app".to_string(),
         plugin_id: None,
@@ -1973,6 +1951,9 @@ fn legacy_package_tool_api_name(package_id: &str, tool_name: &str) -> String {
 
 fn default_package_tool_reserved_names() -> BTreeSet<String> {
     let mut names = crate::tool::built_in_tool_name_keys();
+    names.insert("subagent".to_string());
+    // Keep the retired name reserved so a package cannot shadow legacy
+    // session history while `task` canonicalizes to `subagent`.
     names.insert("task".to_string());
     names
 }
@@ -2838,7 +2819,7 @@ async fn run_skill_package_dynamic_unity_tool(
     )?;
     let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
 
-    Ok(format_json_or_text(&raw))
+    Ok(format_skill_package_unity_output(&raw))
 }
 
 fn skill_package_dynamic_unity_args(
@@ -2862,15 +2843,20 @@ fn skill_package_dynamic_unity_args(
     Ok(serde_json::Value::Object(object))
 }
 
-fn format_json_or_text(raw: &str) -> String {
+fn format_skill_package_unity_output(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "(no output)".to_string();
     }
-    serde_json::from_str::<serde_json::Value>(trimmed)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| trimmed.to_string())
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    let output = value
+        .as_object()
+        .filter(|object| object.contains_key("packageId") && object.contains_key("method"))
+        .and_then(|envelope| envelope.get("result"))
+        .unwrap_or(&value);
+    serde_json::to_string_pretty(output).unwrap_or_else(|_| trimmed.to_string())
 }
 
 async fn run_skill_package_loaded_unity_tool(
@@ -2891,7 +2877,7 @@ async fn run_skill_package_loaded_unity_tool(
         .ok_or_else(|| format!("Skill package Unity tool '{}' is missing method", tool.name))?;
     let payload = skill_package_invoke_payload(package_id, None, type_name, method, args)?;
     let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
-    Ok(format_json_or_text(&raw))
+    Ok(format_skill_package_unity_output(&raw))
 }
 
 fn skill_package_invoke_payload(
@@ -3042,19 +3028,14 @@ fn configured_package_model_recall_enabled(
         && configured_package_inject_mode(manifest, override_config) != KnowledgeInjectMode::None
 }
 
-/// Summary text injected for a package root document at the excerpt (L1) level:
-/// workspace override, then the root doc `## L1` section, then the manifest description.
-fn configured_package_summary(
-    manifest: &SkillPackageManifestFile,
-    override_config: Option<&SkillConfig>,
-    root_doc_body: &str,
-) -> String {
+/// Summary text injected for a package root document at the excerpt level:
+/// workspace override, then the required root document frontmatter summary.
+fn configured_package_summary(override_config: Option<&SkillConfig>, root_summary: &str) -> String {
     override_config
         .and_then(|config| {
             (!config.description.trim().is_empty()).then(|| config.description.clone())
         })
-        .or_else(|| markdown_l_section_text(root_doc_body, "L1"))
-        .unwrap_or_else(|| manifest.description.clone())
+        .unwrap_or_else(|| root_summary.to_string())
 }
 
 fn configured_package_command_trigger(
@@ -3116,7 +3097,7 @@ fn package_to_document(
         SkillSurface::Command
     };
     let summary = if is_root {
-        configured_package_summary(manifest, override_config, &body)
+        configured_package_summary(override_config, &record.root_summary)
     } else {
         String::new()
     };
@@ -3512,6 +3493,129 @@ pub(crate) fn skill_package_unity_script_bundle_for_document_sync_for_working_di
     Ok(None)
 }
 
+pub(crate) fn skill_package_unity_script_bundle_for_package_sync_for_working_dir(
+    working_dir: &str,
+    package_id: &str,
+) -> Result<Option<SkillPackageUnityScriptBundle>, String> {
+    let normalized = package_id.trim();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    list_skill_packages_sync_for_working_dir(working_dir)
+        .into_iter()
+        .find(|record| record.manifest.id == normalized)
+        .map(|record| skill_package_unity_script_bundle_for_record(&record))
+        .unwrap_or(Ok(None))
+}
+
+pub(crate) fn skill_package_root_for_document_sync_for_working_dir(
+    working_dir: &str,
+    virtual_path: &str,
+) -> Result<Option<String>, String> {
+    for record in list_skill_packages_sync_for_working_dir(working_dir) {
+        if package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?.is_some() {
+            return Ok(Some(record.root.to_string_lossy().replace('\\', "/")));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn skill_package_root_for_package_sync_for_working_dir(
+    working_dir: &str,
+    package_id: &str,
+) -> Option<String> {
+    let normalized = package_id.trim();
+    list_skill_packages_sync_for_working_dir(working_dir)
+        .into_iter()
+        .find(|record| record.manifest.id == normalized)
+        .map(|record| record.root.to_string_lossy().replace('\\', "/"))
+}
+
+pub(crate) fn skill_package_python_modules_for_package_sync_for_working_dir(
+    working_dir: &str,
+    package_id: &str,
+) -> Result<Vec<crate::python_runtime::SkillPythonModuleRegistration>, String> {
+    let normalized = package_id.trim();
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(record) = list_skill_packages_sync_for_working_dir(working_dir)
+        .into_iter()
+        .find(|record| record.manifest.id == normalized)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut modules = Vec::new();
+    for capability in &record.manifest.capabilities.python {
+        if let Some(module) = skill_package_python_module_registration(&record, capability)? {
+            modules.push(module);
+        }
+    }
+    modules.sort_by(|left, right| left.module.cmp(&right.module));
+    Ok(modules)
+}
+
+fn skill_package_python_module_registration(
+    record: &SkillPackageRecord,
+    capability: &SkillPackagePythonCapability,
+) -> Result<Option<crate::python_runtime::SkillPythonModuleRegistration>, String> {
+    let Some(module) = capability.module.as_deref() else {
+        return Ok(None);
+    };
+    let source_path = package_file_path(&record.root, &capability.path)?;
+    if !source_path.exists() {
+        return Err(format!(
+            "Skill package Python module '{}' was not found: {}",
+            module,
+            source_path.display()
+        ));
+    }
+    let normalized_path = capability.path.replace('\\', "/");
+    let module_suffix = module.replace('.', "/");
+    let suffix = if source_path.is_dir() {
+        if !source_path.join("__init__.py").is_file() {
+            return Err(format!(
+                "Skill package Python package '{}' requires __init__.py: {}",
+                module,
+                source_path.display()
+            ));
+        }
+        module_suffix
+    } else if normalized_path.ends_with("/__init__.py") {
+        format!("{}/__init__.py", module_suffix)
+    } else {
+        format!("{}.py", module_suffix)
+    };
+    if normalized_path != suffix && !normalized_path.ends_with(&format!("/{}", suffix)) {
+        return Err(format!(
+            "Skill package Python capability path '{}' does not match module '{}'",
+            capability.path, module
+        ));
+    }
+    let import_root_rel = normalized_path
+        .strip_suffix(&suffix)
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let import_root = if import_root_rel.is_empty() {
+        record.root.clone()
+    } else {
+        package_file_path(&record.root, import_root_rel)?
+    };
+    if !import_root.is_dir() {
+        return Err(format!(
+            "Skill package Python import root not found: {}",
+            import_root.display()
+        ));
+    }
+    Ok(Some(crate::python_runtime::SkillPythonModuleRegistration {
+        package_id: record.manifest.id.clone(),
+        module: module.to_string(),
+        import_root: dunce::canonicalize(&import_root).unwrap_or(import_root),
+        source_path: dunce::canonicalize(&source_path).unwrap_or(source_path),
+    }))
+}
+
 fn skill_package_unity_script_bundle_for_record(
     record: &SkillPackageRecord,
 ) -> Result<Option<SkillPackageUnityScriptBundle>, String> {
@@ -3722,7 +3826,7 @@ fn package_to_list_item(
         .unwrap_or_default();
     let (frontmatter, body) = split_optional_package_frontmatter(&body).unwrap_or_default();
     let summary = if is_root {
-        configured_package_summary(manifest, override_config, &body)
+        configured_package_summary(override_config, &record.root_summary)
     } else {
         String::new()
     };
@@ -4072,11 +4176,8 @@ fn build_package_skill_manifest(
         .ok()
         .and_then(|raw| split_optional_package_frontmatter(&raw).ok());
     let manifest_description = manifest.description.trim().to_string();
-    let skill_description = override_config
-        .and_then(|config| {
-            (!config.description.trim().is_empty()).then(|| config.description.clone())
-        })
-        .or_else(|| (!manifest_description.is_empty()).then(|| manifest_description.clone()));
+    let effective_summary = configured_package_summary(override_config, &record.root_summary);
+    let skill_description = (!effective_summary.trim().is_empty()).then_some(effective_summary);
     let command_trigger = override_config
         .and_then(resolve_config_command_trigger)
         .unwrap_or_else(|| package_command_trigger(manifest));
@@ -4104,9 +4205,6 @@ fn build_package_skill_manifest(
         package_id: Some(package_id.to_string()),
         package_version: (!manifest.version.trim().is_empty()).then(|| manifest.version.clone()),
         has_unity: !manifest.capabilities.unity.is_empty(),
-        has_l0: record.doc_levels.has_l0,
-        has_l1: record.doc_levels.has_l1,
-        has_l2: record.doc_levels.has_l2,
         plugin_id: record.plugin_id.clone(),
         plugin_scope: record.plugin_scope.map(|scope| scope.as_str().to_string()),
         origin_path: None,
@@ -4388,25 +4486,23 @@ pub(crate) fn default_package_command_name(package_id: &str) -> String {
         .to_string()
 }
 
-fn package_skill_body(name: &str, summary: &str, body: Option<String>) -> String {
-    let body = optional_trimmed(body).unwrap_or_else(|| {
-        let summary = summary.trim();
-        if summary.is_empty() {
-            "## Instructions\n".to_string()
-        } else {
-            format!("## L1\n{}\n\n## Instructions\n", summary)
-        }
-    });
+fn package_skill_body(name: &str, summary: &str, body: Option<String>) -> Result<String, String> {
+    let raw_body = optional_trimmed(body).unwrap_or_else(|| "## Instructions\n".to_string());
+    let (mut frontmatter, body) = split_optional_package_frontmatter(&raw_body)?;
+    frontmatter.summary = optional_trimmed(Some(summary.to_string()));
     let body = if body.trim_start().starts_with("# ") {
         body
     } else {
         format!("# {}\n\n{}", name, body.trim_start())
     };
-    if body.ends_with('\n') {
+    let body = if body.ends_with('\n') {
         body
     } else {
         format!("{}\n", body)
-    }
+    };
+    let yaml = serde_yaml::to_string(&frontmatter)
+        .map_err(|error| format!("Failed to render Skill document frontmatter: {}", error))?;
+    Ok(format!("---\n{}---\n\n{}", yaml, body))
 }
 
 pub fn create_skill_document_sync(
@@ -4553,11 +4649,9 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
             .map_err(|e| format!("Failed to write {}: {}", manifest_path.display(), e))?;
 
         let root_doc_path = package_root.join(SKILL_PACKAGE_ROOT_DOC_FILE_NAME);
-        std::fs::write(
-            &root_doc_path,
-            package_skill_body(&name, &manifest.description, request.body),
-        )
-        .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
+        let root_doc = package_skill_body(&name, &manifest.description, request.body)?;
+        std::fs::write(&root_doc_path, root_doc)
+            .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
         let record = load_skill_package_record(&package_root)?;
         Ok(build_package_skill_manifest(&record, "app", None))
     })();
@@ -5629,14 +5723,29 @@ pub async fn remove_skill_unity_files(
 mod tests {
     use super::{
         is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync,
-        SkillPackageDocLevels, SkillPackageManifestFile, SkillPackageRecord,
-        SkillPackageToolManifest,
+        SkillPackageManifestFile, SkillPackageRecord, SkillPackageToolManifest,
     };
     use crate::commands::knowledge::SkillConfig;
     use crate::knowledge_store::{KnowledgeInjectMode, SkillSurface};
     use std::io::Write as _;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn skill_package_unity_output_hides_transport_metadata() {
+        let raw = r#"{
+  "packageId": "example-package",
+  "assemblyId": "__LocusSkillPackage_example_hash",
+  "typeName": "Example.Api",
+  "method": "Run",
+  "result": { "ok": true, "count": 2 }
+}"#;
+
+        assert_eq!(
+            super::format_skill_package_unity_output(raw),
+            "{\n  \"count\": 2,\n  \"ok\": true\n}"
+        );
+    }
 
     #[test]
     fn skill_scaffold_name_validation_rejects_non_kebab_case_inputs() {
@@ -5658,29 +5767,17 @@ mod tests {
 
         let raw = r#"---
 id: kd_skill_create_skill
-type: skill
-path: create-skill.md
-title: Create Skill
-scope: project
 injectMode: none
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: Create a project skill.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
 commandTrigger: /create-skill
 argumentHint: <skill-name>
-createdAt: 1
-updatedAt: 1
 ---
 
 # Create Skill
 
-## Summary
-Create a project skill.
-
-## Content
 ## When to use
 
 - Reuse a workflow.
@@ -5734,7 +5831,7 @@ Create a project skill.
         .unwrap();
         std::fs::write(
             skill_root.join("SKILL.md"),
-            "# Plugin Asset Audit\n\n## Instructions\nAudit project assets.\n",
+            "---\nsummary: Audit project assets.\n---\n\n# Plugin Asset Audit\n\n## Instructions\nAudit project assets.\n",
         )
         .unwrap();
 
@@ -5854,7 +5951,11 @@ Create a project skill.
 "#,
         )
         .unwrap();
-        std::fs::write(skill_root.join("SKILL.md"), "# Yaml Readers\n").unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nsummary: Read custom Unity YAML.\n---\n\n# Yaml Readers\n",
+        )
+        .unwrap();
 
         // A GUID match on a later document outranks a class id match on an
         // earlier one.
@@ -5942,7 +6043,7 @@ Create a project skill.
         .unwrap();
         std::fs::write(
             skill_root.join("SKILL.md"),
-            "# PSD Tools\n\n## Instructions\nUse PSD tools.\n",
+            "---\nsummary: Use PSD tools.\n---\n\n# PSD Tools\n\n## Instructions\nUse PSD tools.\n",
         )
         .unwrap();
         std::fs::write(
@@ -6068,7 +6169,11 @@ Create a project skill.
 "#,
         )
         .unwrap();
-        std::fs::write(skill_root.join("SKILL.md"), "# View\n").unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nsummary: Build a View.\n---\n\n# View\n",
+        )
+        .unwrap();
 
         assert!(super::skill_package_path_prefix_targets_package_sync(
             &working_dir,
@@ -6097,23 +6202,145 @@ Create a project skill.
     }
 
     #[test]
-    fn package_root_doc_level_detection_treats_levels_as_optional() {
-        let body = "## Instructions\nDo the work.\n";
-
-        let levels = super::scan_package_document_levels(body);
-        assert!(!levels.has_l0);
-        assert!(!levels.has_l1);
-        assert!(!levels.has_l2);
-    }
-
-    #[test]
     fn split_package_frontmatter_accepts_mixed_line_endings() {
-        let raw = "---\r\ntools:\r\n  - view_list\n---\r\n\r\n# View\r\n";
+        let raw = "---\r\nsummary: Build a View.\r\ntools:\r\n  - view_list\n---\r\n\r\n# View\r\n";
 
         let (frontmatter, body) = super::split_optional_package_frontmatter(raw).unwrap();
 
+        assert_eq!(frontmatter.summary.as_deref(), Some("Build a View."));
         assert_eq!(frontmatter.tools, vec!["view_list"]);
         assert_eq!(body, "\r\n# View\r\n");
+    }
+
+    #[test]
+    fn package_formats_reject_legacy_metadata_keys() {
+        let manifest_error = serde_json::from_str::<super::SkillPackageManifestFile>(
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "asset-audit",
+  "name": "Asset Audit",
+  "version": "0.1.0",
+  "description": "Audit assets.",
+  "argument-hint": "<scope>"
+}"#,
+        )
+        .expect_err("kebab-case manifest keys are obsolete");
+        assert!(manifest_error.to_string().contains("unknown field"));
+
+        let frontmatter_error = super::split_optional_package_frontmatter(
+            "---\ntype: skill\nsummary: Audit assets.\n---\n\n# Asset Audit\n",
+        )
+        .expect_err("legacy knowledge frontmatter keys are obsolete");
+        assert!(frontmatter_error.contains("unknown field"));
+    }
+
+    #[test]
+    fn python_capability_resolves_import_root_from_module_name() {
+        let temp = TempDir::new().unwrap();
+        let module_path = temp.path().join("scripts").join("acme").join("analysis.py");
+        std::fs::create_dir_all(module_path.parent().unwrap()).unwrap();
+        std::fs::write(&module_path, "VALUE = 7\n").unwrap();
+        let record = super::SkillPackageRecord {
+            root: temp.path().to_path_buf(),
+            manifest: super::SkillPackageManifestFile {
+                id: "acme-skill".to_string(),
+                ..Default::default()
+            },
+            root_summary: "Test summary.".to_string(),
+            updated_at: 0,
+            source: "test".to_string(),
+            plugin_id: None,
+            plugin_scope: None,
+        };
+        let capability = super::SkillPackagePythonCapability {
+            name: "analysis".to_string(),
+            path: "scripts/acme/analysis.py".to_string(),
+            module: Some("acme.analysis".to_string()),
+        };
+
+        let registration = super::skill_package_python_module_registration(&record, &capability)
+            .unwrap()
+            .expect("importable module");
+
+        assert_eq!(registration.package_id, "acme-skill");
+        assert_eq!(registration.module, "acme.analysis");
+        assert_eq!(
+            registration.import_root,
+            dunce::canonicalize(temp.path().join("scripts")).unwrap()
+        );
+        assert_eq!(
+            registration.source_path,
+            dunce::canonicalize(module_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn python_capability_rejects_module_path_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let module_path = temp.path().join("scripts").join("wrong.py");
+        std::fs::create_dir_all(module_path.parent().unwrap()).unwrap();
+        std::fs::write(&module_path, "VALUE = 7\n").unwrap();
+        let record = super::SkillPackageRecord {
+            root: temp.path().to_path_buf(),
+            manifest: super::SkillPackageManifestFile {
+                id: "acme-skill".to_string(),
+                ..Default::default()
+            },
+            root_summary: "Test summary.".to_string(),
+            updated_at: 0,
+            source: "test".to_string(),
+            plugin_id: None,
+            plugin_scope: None,
+        };
+        let capability = super::SkillPackagePythonCapability {
+            name: "analysis".to_string(),
+            path: "scripts/wrong.py".to_string(),
+            module: Some("acme.analysis".to_string()),
+        };
+
+        let error = super::skill_package_python_module_registration(&record, &capability)
+            .expect_err("mismatched path should fail");
+
+        assert!(error.contains("does not match module"));
+    }
+
+    #[test]
+    fn python_package_capability_resolves_directory_with_init_file() {
+        let temp = TempDir::new().unwrap();
+        let package_path = temp.path().join("scripts").join("acme").join("analysis");
+        std::fs::create_dir_all(&package_path).unwrap();
+        std::fs::write(package_path.join("__init__.py"), "VALUE = 7\n").unwrap();
+        let record = super::SkillPackageRecord {
+            root: temp.path().to_path_buf(),
+            manifest: super::SkillPackageManifestFile {
+                id: "acme-skill".to_string(),
+                ..Default::default()
+            },
+            root_summary: "Test summary.".to_string(),
+            updated_at: 0,
+            source: "test".to_string(),
+            plugin_id: None,
+            plugin_scope: None,
+        };
+        let capability = super::SkillPackagePythonCapability {
+            name: "analysis".to_string(),
+            path: "scripts/acme/analysis".to_string(),
+            module: Some("acme.analysis".to_string()),
+        };
+
+        let registration = super::skill_package_python_module_registration(&record, &capability)
+            .unwrap()
+            .expect("importable package");
+
+        assert_eq!(registration.module, "acme.analysis");
+        assert_eq!(
+            registration.import_root,
+            dunce::canonicalize(temp.path().join("scripts")).unwrap()
+        );
+        assert_eq!(
+            registration.source_path,
+            dunce::canonicalize(package_path).unwrap()
+        );
     }
 
     #[test]
@@ -6170,7 +6397,10 @@ Create a project skill.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            r#"
+            r#"---
+summary: Audit Unity assets and report cleanup tasks.
+---
+
 # Asset Audit
 
 ## Instructions
@@ -6220,8 +6450,6 @@ Do the work.
         );
         let item = super::package_to_list_item(&record, "SKILL.md", None);
         assert_eq!(item.inject_mode, KnowledgeInjectMode::Excerpt);
-        assert!(!record.doc_levels.has_l0);
-        assert!(!record.doc_levels.has_l2);
     }
 
     #[test]
@@ -6244,10 +6472,13 @@ Do the work.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            r#"
+            r#"---
+summary: Use Feishu safely.
+---
+
 # Feishu CLI
 
-## L0
+## Instructions
 Use Feishu safely.
 "#,
         )
@@ -6296,7 +6527,7 @@ Use Feishu safely.
             ..Default::default()
         };
 
-        // No override, no manifest value: skills default to L1 (excerpt).
+        // No override, no manifest value: skills default to summary (excerpt).
         assert_eq!(
             super::configured_package_inject_mode(&manifest_without_mode, None),
             KnowledgeInjectMode::Excerpt
@@ -6324,21 +6555,7 @@ Use Feishu safely.
     }
 
     #[test]
-    fn markdown_l_section_text_extracts_until_next_heading() {
-        let body = "# Title\n\n## L1\nLine one.\nLine two.\n\n## Instructions\nDo work.\n";
-        assert_eq!(
-            super::markdown_l_section_text(body, "L1").as_deref(),
-            Some("Line one.\nLine two.")
-        );
-        assert_eq!(super::markdown_l_section_text(body, "L0"), None);
-        assert_eq!(
-            super::markdown_l_section_text("# Title\n\n## L1\n\n## Next\n", "L1"),
-            None
-        );
-    }
-
-    #[test]
-    fn package_root_summary_prefers_l1_section_over_manifest_description() {
+    fn package_root_summary_prefers_frontmatter_over_manifest_description() {
         let temp = TempDir::new().unwrap();
         std::fs::write(
             temp.path().join("skill.json"),
@@ -6353,7 +6570,7 @@ Use Feishu safely.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            "# Asset Audit\n\n## L1\nUse when auditing project assets.\n\n## Instructions\nAudit.\n",
+            "---\nsummary: Use when auditing project assets.\n---\n\n# Asset Audit\n\n## Instructions\nAudit.\n",
         )
         .unwrap();
 
@@ -6377,16 +6594,15 @@ Use Feishu safely.
         );
 
         let manifest = super::build_package_skill_manifest(&record, "app", None);
-        assert!(manifest.has_l1);
         assert_eq!(manifest.description, "Manifest description.");
         assert_eq!(
             manifest.skill_description.as_deref(),
-            Some("Manifest description.")
+            Some("Use when auditing project assets.")
         );
     }
 
     #[test]
-    fn package_root_summary_falls_back_to_manifest_description_without_l1() {
+    fn package_root_rejects_legacy_l1_without_frontmatter_summary() {
         let temp = TempDir::new().unwrap();
         std::fs::write(
             temp.path().join("skill.json"),
@@ -6401,37 +6617,42 @@ Use Feishu safely.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            "# Asset Audit\n\n## Instructions\nAudit.\n",
+            "# Asset Audit\n\n## L1\nLegacy summary.\n\n## Instructions\nAudit.\n",
         )
         .unwrap();
 
-        let record = super::load_skill_package_record(temp.path()).unwrap();
-        let item = super::package_to_list_item(&record, "SKILL.md", None);
-        assert_eq!(item.summary.as_deref(), Some("Manifest description."));
-
-        let manifest = super::build_package_skill_manifest(&record, "app", None);
-        assert!(!manifest.has_l1);
-        assert_eq!(manifest.description, "Manifest description.");
+        let error = super::load_skill_package_record(temp.path())
+            .expect_err("legacy L1 must not supply package summary metadata");
+        assert!(error.contains("requires a non-empty frontmatter summary"));
     }
 
     #[test]
-    fn package_skill_body_seeds_l1_from_summary() {
-        let body = super::package_skill_body("Asset Audit", "Use when auditing assets.", None);
+    fn package_skill_body_seeds_frontmatter_summary() {
+        let body =
+            super::package_skill_body("Asset Audit", "Use when auditing assets.", None).unwrap();
+        let (frontmatter, markdown) = super::split_optional_package_frontmatter(&body).unwrap();
         assert_eq!(
-            body,
-            "# Asset Audit\n\n## L1\nUse when auditing assets.\n\n## Instructions\n"
-        );
-        assert_eq!(
-            super::markdown_l_section_text(&body, "L1").as_deref(),
+            frontmatter.summary.as_deref(),
             Some("Use when auditing assets.")
         );
+        assert_eq!(markdown, "\n# Asset Audit\n\n## Instructions\n");
+        assert!(!body.contains("## L1"));
 
         let custom = super::package_skill_body(
             "Asset Audit",
             "Use when auditing assets.",
             Some("## Instructions\nCustom body.".to_string()),
+        )
+        .unwrap();
+        let (frontmatter, markdown) = super::split_optional_package_frontmatter(&custom).unwrap();
+        assert_eq!(
+            frontmatter.summary.as_deref(),
+            Some("Use when auditing assets.")
         );
-        assert_eq!(custom, "# Asset Audit\n\n## Instructions\nCustom body.\n");
+        assert_eq!(
+            markdown,
+            "\n# Asset Audit\n\n## Instructions\nCustom body.\n"
+        );
     }
 
     #[test]
@@ -6552,7 +6773,7 @@ Use Feishu safely.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            "# PSD to uGUI\n\n## Instructions\nConvert PSD files.",
+            "---\nsummary: Convert PSD files.\n---\n\n# PSD to uGUI\n\n## Instructions\nConvert PSD files.",
         )
         .unwrap();
         std::fs::write(
@@ -6653,7 +6874,7 @@ Use Feishu safely.
         let record = SkillPackageRecord {
             root: PathBuf::new(),
             updated_at: 0,
-            doc_levels: SkillPackageDocLevels::default(),
+            root_summary: "Test summary.".to_string(),
             manifest: SkillPackageManifestFile {
                 id: "view".to_string(),
                 name: "View".to_string(),
@@ -6707,7 +6928,11 @@ Use Feishu safely.
 }"#,
         )
         .unwrap();
-        std::fs::write(temp.path().join("SKILL.md"), "# Example Tool\n").unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "---\nsummary: Run an example tool.\n---\n\n# Example Tool\n",
+        )
+        .unwrap();
         std::fs::write(
             temp.path().join("tools").join("Bridge.cs"),
             "public static class ExampleBridge { public static string Read() => \"ok\"; }\n",
@@ -6807,7 +7032,11 @@ Use Feishu safely.
 }"#,
         )
         .unwrap();
-        std::fs::write(temp.path().join("SKILL.md"), "# RenderDoc\n").unwrap();
+        std::fs::write(
+            temp.path().join("SKILL.md"),
+            "---\nsummary: Capture a RenderDoc frame.\n---\n\n# RenderDoc\n",
+        )
+        .unwrap();
 
         let record = super::load_skill_package_record(temp.path()).expect("load package");
         assert_eq!(
@@ -6863,6 +7092,18 @@ Use Feishu safely.
             saved.document.tools,
             vec!["create_skill_package", "skill_reload"]
         );
+        let raw = std::fs::read_to_string(
+            crate::knowledge_store::document_path(
+                &working_dir,
+                crate::knowledge_store::KnowledgeType::Skill,
+                "asset-audit.md",
+            )
+            .expect("resolve created Skill path"),
+        )
+        .expect("read created Skill file");
+        assert!(raw.contains("\nsummary: Audit Unity assets.\n"));
+        assert!(!raw.contains("\n## Summary\n"));
+        assert!(!raw.contains("\n## Content\n"));
     }
 
     #[test]
@@ -6891,7 +7132,7 @@ Use Feishu safely.
             SkillPackageRecord {
                 root: PathBuf::new(),
                 updated_at: 0,
-                doc_levels: SkillPackageDocLevels::default(),
+                root_summary: "Test summary.".to_string(),
                 manifest: SkillPackageManifestFile {
                     id: "psd-to-ugui".to_string(),
                     name: "PSD to uGUI".to_string(),
@@ -6908,7 +7149,7 @@ Use Feishu safely.
             SkillPackageRecord {
                 root: PathBuf::new(),
                 updated_at: 0,
-                doc_levels: SkillPackageDocLevels::default(),
+                root_summary: "Test summary.".to_string(),
                 manifest: SkillPackageManifestFile {
                     id: "ui-audit".to_string(),
                     name: "UI Audit".to_string(),
@@ -6925,7 +7166,7 @@ Use Feishu safely.
             SkillPackageRecord {
                 root: PathBuf::new(),
                 updated_at: 0,
-                doc_levels: SkillPackageDocLevels::default(),
+                root_summary: "Test summary.".to_string(),
                 manifest: SkillPackageManifestFile {
                     id: "capture-tools".to_string(),
                     name: "Capture Tools".to_string(),
@@ -7024,8 +7265,22 @@ Use Feishu safely.
 
         let package_root = temp.path().join("com.example.asset-audit");
         assert!(package_root.join("skill.json").is_file());
+        let raw_manifest = std::fs::read_to_string(package_root.join("skill.json")).unwrap();
+        assert!(raw_manifest.contains("\"argumentHint\""));
+        assert!(raw_manifest.contains("\"disableModelInvocation\""));
+        assert!(raw_manifest.contains("\"userInvocable\""));
+        assert!(!raw_manifest.contains("\"argument-hint\""));
+        assert!(!raw_manifest.contains("\"disable-model-invocation\""));
+        assert!(!raw_manifest.contains("\"user-invocable\""));
         let root_skill = std::fs::read_to_string(package_root.join("SKILL.md")).unwrap();
-        assert!(!root_skill.trim_start().starts_with("---"));
+        let (frontmatter, body) =
+            super::split_optional_package_frontmatter(&root_skill).expect("parse root Skill");
+        assert_eq!(
+            frontmatter.summary.as_deref(),
+            Some("Audit Unity assets and cleanup risks.")
+        );
+        assert_eq!(body, "\n# Asset Audit\n\n## Instructions\nRun the audit.\n");
+        assert!(!root_skill.contains("\n## L1\n"));
         let record = super::load_skill_package_record(&package_root).expect("load package");
         assert_eq!(record.manifest.name, "Asset Audit");
         assert_eq!(record.manifest.version, "0.1.0");
@@ -7201,7 +7456,10 @@ Use Feishu safely.
         .unwrap();
         std::fs::write(
             temp.path().join("SKILL.md"),
-            r#"
+            r#"---
+summary: Use Feishu safely.
+---
+
 # Feishu CLI
 
 ## Instructions
@@ -7226,19 +7484,12 @@ Use Feishu safely.
             skill_dir.join("bad-skill.md"),
             r#"---
 id: kd_skill_bad_skill
-type: skill
-path: bad-skill.md
-title: Bad Skill
 injectMode: none
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: Reject an invalid command trigger.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
 commandTrigger: /bad skill
-createdAt: 1
-updatedAt: 1
 ---
 
 # Bad Skill
@@ -7263,6 +7514,46 @@ Do the work.
     }
 
     #[test]
+    fn reload_skill_manifest_rejects_legacy_body_summary() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let skill_dir = temp.path().join("Locus").join("knowledge").join("skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("legacy-skill.md"),
+            r#"---
+id: kd_skill_legacy
+injectMode: excerpt
+aiMaintained: false
+skillEnabled: true
+skillSurface: auto
+---
+
+# Legacy Skill
+
+## Summary
+Legacy body summary.
+
+## Instructions
+Do the work.
+"#,
+        )
+        .unwrap();
+
+        let error = super::reload_skill_manifest_sync(
+            &working_dir,
+            None,
+            super::SkillReloadRequest {
+                name: "legacy-skill".to_string(),
+                source: None,
+            },
+        )
+        .expect_err("body heading must not supply Skill summary metadata");
+
+        assert!(error.contains("requires a non-empty frontmatter summary"));
+    }
+
+    #[test]
     fn list_skills_sync_reads_nested_app_builtin_skill() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().join("workspace");
@@ -7272,28 +7563,17 @@ Do the work.
 
         let raw = r#"---
 id: kd_skill_create_skill
-type: skill
-path: builtin/create-skill.md
-title: Create Skill
 injectMode: none
-summaryEnabled: true
-commandEnabled: true
-readOnly: true
+summary: Create a project skill.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
 commandTrigger: /create-skill
 argumentHint: <skill-name>
-createdAt: 1
-updatedAt: 1
 ---
 
 # Create Skill
 
-## Summary
-Create a project skill.
-
-## Content
 ## When to use
 
 - Reuse a workflow.
@@ -7315,7 +7595,8 @@ Create a project skill.
             Some("app"),
         )
         .expect("read legacy app builtin skill name");
-        assert!(content.contains("path: builtin/create-skill.md"));
+        assert!(content.contains("summary: Create a project skill."));
+        assert!(!content.contains("path: builtin/create-skill.md"));
     }
 
     #[test]

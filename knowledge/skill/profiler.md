@@ -1,29 +1,18 @@
 ---
 id: kd_skill_builtin_profiler
-type: skill
-path: profiler.md
-title: Unity Profiler Runtime Sampling
 injectMode: excerpt
-summaryEnabled: true
-commandEnabled: false
-readOnly: false
+summary: >-
+  Use when a runtime debugging task needs Unity performance data: frame time, GC allocation, memory, rendering, physics, script cost, spike frames, or a specific Unity Profiler marker. Ignore static code-quality questions that need no live runtime data.
 aiMaintained: false
 skillEnabled: true
-skillSurface: auto
-commandTrigger:
-argumentHint:
+skillSurface: both
+commandTrigger: /profile
 tools:
   - unity_run_states
-createdAt: 1777332556825
-updatedAt: 1784246400000
 ---
 
 # Unity Profiler Runtime Sampling
 
-## Summary
-Use when a runtime debugging task needs Unity performance data: frame time, GC allocation, memory, rendering, physics, script cost, spike frames, or a specific Unity Profiler marker. Ignore static code-quality questions that need no live runtime data.
-
-## Content
 Use this skill when a runtime debugging task asks for frame time, GC allocation, memory, rendering, physics, script update cost, spike analysis, or a specific Unity Profiler marker.
 
 ## When to use

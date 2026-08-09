@@ -1,12 +1,8 @@
 ---
 id: kd_skill_create_skill
-type: skill
-path: create-skill.md
-title: Create Skill
 injectMode: excerpt
-summaryEnabled: true
-commandEnabled: true
-readOnly: false
+summary: >-
+  Use when the user explicitly asks to create or edit a Locus Skill. Ignore Unity project skills, abilities, code, assets, and runtime concepts.
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
@@ -19,16 +15,10 @@ tools:
   - read
   - write
   - edit
-createdAt: 1775552858000
-updatedAt: 1786162679790
 ---
 
 # Create Skill
 
-## Summary
-Use when the user explicitly asks to create or edit a Locus Skill. Ignore Unity project skills, abilities, code, assets, and runtime concepts.
-
-## Content
 ## Instructions
 
 Command arguments: `<skill-name>` names the skill to create or edit; `--package` forces the package storage model. Ask for a name only when the request does not provide or imply one.
@@ -54,18 +44,30 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
    - Seed `summary` and `body` in `create_skill_package` so the package is usable immediately. Its default command trigger comes from the final package-id segment.
    - Storage locations: project skill documents live under the project knowledge root; built-in skills live at the root of `skill/` in the app knowledge root and are user-level workflows; new app packages are created under the app skill package root, `%APPDATA%/locus/skills/<package-id>/` on Windows. The package result includes `packageRoot` — use it for all later file edits.
    - For an existing Markdown skill, update its physical file with `edit`. For an existing package, edit files under its package root with filesystem tools.
-   - Run `skill_reload` after creation or content edits to validate that Locus can read the manifest. Pass `source` (`project`, `app`, `pluginApp`, `pluginProject`) when the same name exists in multiple sources.
+   - `create_skill_package` validates and reloads the new package before returning. Run `skill_reload` after later content edits, and after creating or editing a Markdown document. Use `source: project` for project documents, `source: app` for app packages, `pluginApp` or `pluginProject` for plugin packages, and `externalUser` or `externalProject` for generic external Skills.
 
 4. Author the body to match the trigger surface.
    - Declare the Locus tool names the skill needs on its first turn in frontmatter `tools`, for both Markdown documents and package `SKILL.md` files. Mentioning tool names in the body does not register them; Locus loads the declared tools when the user invokes the slash command.
-   - Skills default to `excerpt` (L1) injection: the knowledge structure carries each skill's one-line summary so the agent can decide when to load it. Write every summary as load guidance — when to load the skill and what to ignore — never as a recap of its content.
+   - Skills default to `excerpt` injection: the knowledge structure carries the frontmatter `summary` so the agent can decide when to load it. Write every summary as load guidance — when to load the skill and what to ignore — never as a recap of its content.
    - For command-only skills, the body is `## Instructions` followed by execution steps, required checks, and output requirements. The full document is injected only on invocation, but the one-line summary still surfaces at the default `excerpt` level, so keep it discriminating.
-   - For auto-recalled skills, put one or two selection sentences first — what to use the skill for and what it must ignore — then the instructions. Recall sees the one-line summary or package description, so make that line discriminating.
-   - Keep one `## L1` section right under a package root document's title: one or two load-guidance sentences telling the agent when to load this skill and what to ignore — selection guidance, not a recap of the skill's content or workflow. At the `excerpt` level Locus injects the `## L1` text as the package's line in the knowledge structure — a workspace description override wins, then `## L1`, then the manifest `description` (also the fallback when the root document lacks `## L1`). `create_skill_package` seeds `## L1` from `summary` and writes `"injectMode": "excerpt"` into `skill.json`.
-   - Keep `## L1` aligned with the manifest `description`, which plays the same role on the recall surface. Do not add a `## Summary` section to package documents. `## L0`/`## L2` headings are recorded as presence flags only and are never injected.
+   - For auto-recalled skills, keep selection guidance in frontmatter `summary`; the body begins with instructions or the first domain section. Recall uses that summary, so make it discriminating.
+   - Every package root `SKILL.md` requires a non-empty frontmatter `summary`. At the `excerpt` level a workspace override takes precedence over the root summary. `create_skill_package` seeds frontmatter `summary` and writes `"injectMode": "excerpt"` into `skill.json`.
+   - Keep root frontmatter `summary` aligned with manifest `description`. `## L1`, `## Summary`, and `## Content` are ordinary body headings and do not define Skill metadata.
    - To create or repair a command-only Markdown skill file by hand, write ordinary Markdown to its designated project Skill directory, add the summary to the generated frontmatter with `edit`, then run `skill_reload`. The `write` execution layer reports the generated metadata and first content line. Existing files retain their frontmatter when edited.
 
 ```markdown
+---
+id: kd_skill_example
+injectMode: excerpt
+summary: Use when ... Ignore ...
+aiMaintained: false
+skillEnabled: true
+skillSurface: command
+commandTrigger: /example
+tools:
+  - read
+---
+
 # <Title Case Name>
 
 ## Instructions
@@ -92,7 +94,19 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
         └── ExternalLayoutBridge.cs
 ```
 
-   - `skill.json` holds Locus package metadata; `SKILL.md` is the model-facing workflow document. `create_skill_package` seeds both, and the manifest parser accepts camelCase or kebab-case keys:
+   - `skill.json` holds Locus package metadata; `SKILL.md` is the model-facing workflow document. `create_skill_package` seeds both. Use camelCase keys in the manifest:
+
+```markdown
+---
+summary: Use when ... Ignore ...
+tools:
+  - unity_execute
+---
+
+# External Layout
+
+## Instructions
+```
 
 ```json
 {
@@ -109,14 +123,17 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
     "unity": [
       { "name": "ExternalLayoutBridge", "path": "unity/Editor/ExternalLayoutBridge.cs", "api": "unity_execute" }
     ],
-    "python": [],
+    "python": [
+      { "name": "external-layout-python", "path": "scripts/external_layout.py", "module": "external_layout" }
+    ],
     "cli": []
   },
   "tools": []
 }
 ```
 
-   - Only `capabilities.unity` drives runtime behavior (install and compile, step 7). `capabilities.python` and `capabilities.cli` are stored as informational metadata: record script and CLI dependencies there for readers and future tooling, but execution always comes from `tools[]` entries and `SKILL.md` instructions. Add optional metadata such as `source` (`type`/`url`/`reference`) and `disableModelInvocation` when relevant.
+   - `capabilities.python` entries with a `module` field are importable package APIs. Locus validates that `path` matches the dotted module name, registers its import root when the Skill is selected or read, and adds the root to every Locus-managed Python process. A single-file module uses `{ "path": "scripts/external_layout.py", "module": "external_layout" }`; a package module uses a directory containing `__init__.py`, such as `{ "path": "scripts/studio/layout", "module": "studio.layout" }`. The agent can then run `import external_layout` directly in Python without a package tool or CLI adapter. Keep the public API data-oriented and return ordinary Python types (`dict`, `list`, `bytes`, numbers, strings). Module names must remain unique across active Skill packages.
+   - `capabilities.python` entries without `module` and `capabilities.cli` entries remain informational metadata. `capabilities.unity` drives Unity install and compile behavior (step 7). Add optional metadata such as `source` (`type`/`url`/`reference`) and `disableModelInvocation` when relevant.
    - Use `ignoredMarkdownFiles` for bundled Markdown assets that should stay out of the Knowledge tree, search, and Skill read activation, such as dependency licenses. Entries are package-relative globs with `/` separators: `*` and `?` match within one path segment, while `**` matches any number of segments. Ignoring changes Knowledge visibility only; export and installation retain the files. A rule cannot match the required root `SKILL.md`.
    - `SKILL.md` contains the full execution workflow, required checks, agent-runnable validation steps, expected outputs, validation boundaries, and links to package-local docs. Inside package files, relative links like `[workflow](references/workflow.md)` are allowed; in user-facing replies, cite the full knowledge path such as `skill/external-layout/references/workflow.md`.
    - Keep `SKILL.md` as the routing root: brief, high-frequency guidance inline; longer details in `references/`, one hop away, with clear names and explicit load conditions. Example routing line: `Read [psd-tools notes](references/psd-tools.md) when the task needs layer-effect, text, mask, or blend-mode behavior beyond basic layer traversal.`
@@ -160,12 +177,13 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
    - For Unity asset or scene authoring, prefer small helpers that collect facts or perform one deterministic write; let the agent use `unity_execute` directly for project-specific creation, repair, and verification steps where inspectability matters.
 
 8. Migrate legacy skills into the current model.
-   - Map legacy frontmatter `name` to the new `path`, `title`, and default command trigger; move the legacy description into `## Summary` and the legacy body into `## Content`, normalized per step 4.
+   - Derive document paths and titles from physical location, keep stable ids, move the legacy description into frontmatter `summary`, and keep the legacy body as ordinary Markdown under the H1 title.
+   - Remove obsolete frontmatter (`type`, `path`, `title`, `summaryEnabled`, `commandEnabled`, `readOnly: false`, timestamps) and remove structural `## L1`, `## Summary`, and `## Content` wrappers.
    - Preserve useful examples and decision rules. Drop obsolete path conventions; do not recreate legacy `knowledge/Skill/<name>/SKILL.md` directories.
    - If the legacy skill has bundled files or references, migrate it into a package and link detailed docs from the root `SKILL.md`.
 
 9. Validate, then report.
-   - Run `skill_reload` and confirm it returns the manifest without errors.
+   - For a Markdown document or an edited package, run `skill_reload` and confirm it returns the manifest without errors. A newly created package is already validated by `create_skill_package`.
    - For a document: report the knowledge path, repo file path, and slash command trigger.
    - For a package: report the package id, `packageRoot`, root document path, command trigger, and any Unity C# install target.
    - Cite package child documents by full knowledge path, such as `skill/external-layout/references/workflow.md`; package-relative paths belong only inside package docs.

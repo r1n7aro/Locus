@@ -187,5 +187,31 @@ describe("parseAgentToolDefinition", () => {
     expect(tool?.parameterRows.map((row) => row.path)).not.toContain("path");
     expect(tool?.parameterRows.map((row) => row.path)).not.toContain("tools");
     expect(definition.description).toContain("app Skill package");
+    expect(definition.parameters.properties.body.description).not.toContain("L1");
+    expect(definition.parameters.properties.summary.description).toContain("frontmatter `summary`");
+  });
+
+  it("keeps skill_reload sources aligned with backend resolution", () => {
+    const definition = JSON.parse(
+      readFileSync(resolve(cwd, "tools/skill_reload.json"), "utf8"),
+    );
+
+    expect(definition.parameters.additionalProperties).toBe(false);
+    expect(definition.parameters.required).toEqual(["name"]);
+    expect(definition.parameters.properties.source.enum).toEqual([
+      "project",
+      "app",
+      "pluginApp",
+      "pluginProject",
+      "externalUser",
+      "externalProject",
+    ]);
+
+    const listDefinition = JSON.parse(
+      readFileSync(resolve(cwd, "tools/skill_list.json"), "utf8"),
+    );
+    expect(listDefinition.parameters.properties.source.enum).toEqual(
+      definition.parameters.properties.source.enum,
+    );
   });
 });

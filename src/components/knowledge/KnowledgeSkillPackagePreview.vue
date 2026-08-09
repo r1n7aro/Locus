@@ -80,9 +80,7 @@ const injectModeOptions = computed(() => [
   {
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
-    hint: manifest.value?.hasL1 === false
-      ? t("knowledge.skill.l1FallbackDescription")
-      : hintForInjectMode("excerpt"),
+    hint: hintForInjectMode("excerpt"),
   },
 ]);
 
@@ -269,9 +267,6 @@ const capabilityTags = computed(() => {
     tags.push(t("knowledge.skillPackage.auto"));
   }
   if (manifest.value?.hasUnity) tags.push(t("knowledge.skillPackage.unity"));
-  if (manifest.value?.hasL0) tags.push("L0");
-  if (manifest.value?.hasL1) tags.push("L1");
-  if (manifest.value?.hasL2) tags.push("L2");
   return tags;
 });
 

@@ -659,9 +659,6 @@ describe("useKnowledgeState", () => {
         commandTrigger: input.commandTrigger ?? `/${input.name}`,
         kind: "document",
         hasUnity: false,
-        hasL0: true,
-        hasL1: true,
-        hasL2: true,
       };
     });
     knowledgeMocks.knowledgeEdit.mockImplementation(async (input: any) => {

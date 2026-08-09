@@ -34,7 +34,7 @@ src-tauri/gen/gh-runtime/.extract/
 src-tauri/gen/gh-runtime/manifest.json
 src-tauri/gen/ort-runtime/windows-*/
 src-tauri/gen/compile-server/
-skills/renderdoc/runtime/
+skills/graphics-debugger/runtime/
 
 # Python bytecode caches
 __pycache__/

@@ -1,4 +1,6 @@
 ---
+summary: >-
+  Load when plugin or 插件 means a Locus app extension: search, install, enable, disable, uninstall, create, package, publish. Ignore Unity project plugins.
 tools:
   - plugin_list
   - plugin_search
@@ -16,9 +18,6 @@ tools:
 ---
 
 # Plugin
-
-## L1
-Load when plugin or 插件 means a Locus app extension: search, install, enable, disable, uninstall, create, package, publish. Ignore Unity project plugins.
 
 ## Instructions
 
