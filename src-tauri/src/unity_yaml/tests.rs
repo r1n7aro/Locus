@@ -1887,8 +1887,7 @@ fn test_collect_guids_ignores_multibyte_after_guid_marker() {
     // skip the junk, never panic, and still collect real guids.
     let cjk_long = format!("  value: 'guid: {}'", "中".repeat(11)); // 33 bytes after the marker
     let cjk_short = "  note: 'guid: 中文资产'";
-    let valid =
-        "  m_Script: {fileID: 11500000, guid: aabbccdd11223344aabbccdd11223344, type: 3}";
+    let valid = "  m_Script: {fileID: 11500000, guid: aabbccdd11223344aabbccdd11223344, type: 3}";
     let lines: Vec<&str> = vec![cjk_long.as_str(), cjk_short, valid];
 
     let guids = collect_guids_from_lines(&lines, 0, lines.len());
@@ -1967,7 +1966,11 @@ fn test_unbalanced_brace_in_string_does_not_poison_parser() {
     // the rest of the file.
     let yaml = b"--- !u!114 &100\nMonoBehaviour:\n  m_Text: 'HP {'\n  m_Other: 1\n--- !u!1 &200\nGameObject:\n  m_Name: Survivor\n--- !u!1 &300\nGameObject:\n  m_Name: AlsoHere\n";
     let docs = parse_yaml_docs(yaml);
-    assert_eq!(docs.len(), 3, "documents after the brace string must survive");
+    assert_eq!(
+        docs.len(),
+        3,
+        "documents after the brace string must survive"
+    );
     assert_eq!(docs[1].m_name.as_deref(), Some("Survivor"));
     assert_eq!(docs[2].m_name.as_deref(), Some("AlsoHere"));
 

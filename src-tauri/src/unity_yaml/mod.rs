@@ -16,12 +16,12 @@
 //!   in `diff::semantic`
 
 mod aggregation;
+#[cfg(test)]
+mod binding_tests;
 pub mod index;
 mod parser;
 mod prefab;
 mod references;
-#[cfg(test)]
-mod binding_tests;
 #[cfg(test)]
 mod tests;
 mod tokenizer;

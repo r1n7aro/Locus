@@ -465,10 +465,14 @@ namespace Locus
             CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
+            RegisterExtensionMessageHandler(
+                "yaml_preview_cache_selftest",
+                HandleYamlPreviewCacheSelfTest);
         }
 
         private static void OnQuitting()
         {
+            ClearYamlPreviewSceneCache();
             ReleaseAllEditSessions();
             NativeOnQuitting();
             Stop();
@@ -476,6 +480,8 @@ namespace Locus
 
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
+            ClearYamlPreviewSceneCache();
+            TickSchedulerOnPlayModeStateChanged(state);
             RefreshCachedEditorState();
             NativePublishEditorStatusNow();
         }
@@ -488,6 +494,7 @@ namespace Locus
 
         private static void OnBeforeAssemblyReload()
         {
+            ClearYamlPreviewSceneCache();
             RefreshCachedEditorState();
             // Cancel + bounded-join any in-flight in-process Roslyn compile before
             // the domain unloads, otherwise its worker thread deadlocks the reload
@@ -631,6 +638,7 @@ namespace Locus
         public static void Stop()
         {
             CancelActiveExecuteCode("bridge stopped");
+            ClearTickSchedulerNow();
 
             lock (_mainThreadQueueLock)
             {
@@ -997,6 +1005,8 @@ namespace Locus
         private static void PumpMainThreadQueue()
         {
             NativePump();
+            PruneYamlPreviewSceneCache(false);
+            PumpTickSchedulerEditorUpdate();
 
             bool desktopConnected = HasAnyDesktopConnection();
             bool hasRuntimeWork = HasMainThreadRuntimeWork();
@@ -1483,11 +1493,11 @@ namespace Locus
                         return await HandleExecuteLoaded(reqId, msg.message).ConfigureAwait(false);
 
                     case "cancel_execute_code":
-                        return HandleCancelExecuteCode(reqId);
+                        return HandleCancelExecuteCode(reqId, msg.message);
 
                     case "execute_code_progress":
-                        TouchActiveExecuteCodeClientHeartbeat();
-                        return OkResponse(reqId, GetExecuteCodeProgressJson());
+                        TouchExecuteCodeClientHeartbeat(msg.message);
+                        return OkResponse(reqId, GetExecuteCodeProgressJson(msg.message));
 
                     case "export_type_index":
                     {

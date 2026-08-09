@@ -22,7 +22,9 @@ describe("Locus Unity CLI driver", () => {
     expect(pkg).toContain("--suite connect,hot-reload-release");
     expect(pkg).toContain('"locus:test:unity:full"');
     expect(pkg).toContain("--suite all --connect-timeout-ms 60000 --timeout-ms 1200000");
-    expect(normalizedScript).toContain('"dev",\n    "--",\n    "--",\n    "--locus-driver"');
+    expect(normalizedScript).toContain(
+      '"dev",\n    "--no-watch",\n    "--",\n    "--",\n    "--locus-driver"',
+    );
     expect(script).toContain('"--locus-driver"');
     expect(script).toContain('"unity-test"');
     expect(script).toContain('"dev"');
@@ -198,6 +200,9 @@ describe("Locus Unity CLI driver", () => {
     expect(script).toContain("terminalEventSeen");
     expect(script).toContain("--output-dir");
     expect(script).toContain('mkdtempSync(join(tmpdir(), "locus-unity-test-"))');
+    expect(script).toContain('const dataDir = join(logDir, "data");');
+    expect(script).toContain("LOCUS_RUNTIME_DATA_DIR: dataDir");
+    expect(script).toContain('"--no-watch"');
     expect(script).toContain('const logPath = join(logDir, "driver.log");');
     expect(script).toContain("logStream.write(chunk)");
     expect(script).toContain("replayDriverEventsFromLog");

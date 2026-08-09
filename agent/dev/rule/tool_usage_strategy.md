@@ -10,6 +10,8 @@
 
 * Use `unity_execute` to execute code inside the Unity Editor, and use `bash` to run scripts on the system.
 
+* Inside `unity_execute`, use `UnityTestApi.ListAsync`, `Start`, `Status`, and `Cancel` for official Unity Test Framework operations. The typed Locus API preserves NUnit lifecycle and TestRunner behavior without per-call TestRunner reflection.
+
 * For Unity debugging, use `unity_execute` / `unity_run_states` with `print` / `ctx.Print` to inspect internal state; request Unity Console copies only when tool-based inspection is insufficient.
 
 * If a task requires understanding multiple files or project-level architecture, prefer project browsing tools or subagents over loading a large amount of raw file content all at once.

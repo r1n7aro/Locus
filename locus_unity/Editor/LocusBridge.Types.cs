@@ -81,6 +81,12 @@ namespace Locus
             public float progress;
             public int revision;
             public string source;
+            public string waitKind;
+            public string waitTarget;
+            public string waitCondition;
+            public int sourceLine;
+            public string sourceText;
+            public int waitedMs;
         }
 
         public sealed class ScriptGlobals

@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Reflection;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 
 using Microsoft.CodeAnalysis;
@@ -28,17 +29,13 @@ namespace Locus
         private static readonly object _executeAsyncContinuationQueueLock = new object();
         private static readonly List<ExecuteCodeWaitState> _executeAsyncContinuationQueue =
             new List<ExecuteCodeWaitState>(64);
-        private static readonly object _executeCodeProgressLock = new object();
-
         private static int _executeAsyncEditorUpdateTick;
         private static int _activeAsyncExecuteCount;
         private static bool _hasSavedRunInBackground;
         private static bool _savedRunInBackground;
         private static double _lastAsyncExecutePumpRequestSeconds;
-        private static ExecuteCodeProgressSnapshot _executeCodeProgress =
-            new ExecuteCodeProgressSnapshot { active = false, title = "", info = "", progress = 0, revision = 0 };
-        private static int _executeCodeProgressRevision;
         private static readonly bool ExecuteCodeDebugLoggingEnabled = IsExecuteCodeDebugLoggingEnabled();
+        private const string ExecuteCodeExecutionIdMarker = "//__LOCUS_EXECUTION_ID__:";
 
         private sealed class CompiledAsyncSnippet
         {
@@ -51,7 +48,7 @@ namespace Locus
             }
         }
 
-        private sealed class AsyncSnippetExecution : IDisposable
+        internal sealed class AsyncSnippetExecution : IDisposable
         {
             private long _lastActivityTimestamp;
 
@@ -101,15 +98,40 @@ namespace Locus
             }
         }
 
-        private sealed class ExecuteCodeRequestState : IDisposable
+        internal sealed class ExecuteCodeRequestState : IDisposable
         {
             private readonly object _lock = new object();
             private AsyncSnippetExecution _execution;
             private long _lastClientHeartbeatTimestamp;
             private int _clientHeartbeatCount;
             private volatile bool _disposed;
+            private ExecuteCodeProgressSnapshot _progress = new ExecuteCodeProgressSnapshot
+            {
+                active = false,
+                title = "",
+                info = "",
+                progress = 0,
+                revision = 0,
+                source = ""
+            };
+            private int _progressRevision;
+            private string _progressJsonCache;
+            private int _progressJsonCacheRevision = int.MinValue;
+            private ExecuteCodeProgressSnapshot _pendingProgressSnapshot;
+            private readonly string[] _sourceLines;
+            private long _waitStartedTimestamp;
 
+            public readonly string ExecutionId;
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
+
+            public ExecuteCodeRequestState(string executionId, string sourceCode)
+            {
+                ExecutionId = executionId;
+                string leadingUsings;
+                string bodyCode;
+                SplitLeadingUsings(sourceCode ?? "", out leadingUsings, out bodyCode);
+                _sourceLines = bodyCode.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            }
 
             public bool IsCancellationRequested
             {
@@ -216,6 +238,145 @@ namespace Locus
                 Cancellation.Token.ThrowIfCancellationRequested();
             }
 
+            public void SetStage(string info)
+            {
+                SetProgress(info, "", 0, "stage");
+            }
+
+            public void SetApiProgress(string title, string info, float progress)
+            {
+                SetProgress(title, info, progress, "api");
+            }
+
+            public void SetAwaiting(
+                string kind,
+                string target,
+                string condition,
+                int sourceLine)
+            {
+                lock (_lock)
+                {
+                    if (_progress != null && _progress.source == "api")
+                        _pendingProgressSnapshot = _progress;
+                    _waitStartedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                    _progressRevision++;
+                    _progress = new ExecuteCodeProgressSnapshot
+                    {
+                        active = true,
+                        title = "Awaiting Unity",
+                        info = "",
+                        progress = 0,
+                        revision = _progressRevision,
+                        source = "await",
+                        waitKind = kind ?? "",
+                        waitTarget = target ?? "",
+                        waitCondition = condition ?? "",
+                        sourceLine = Math.Max(0, sourceLine),
+                        sourceText = SourceLineText(sourceLine),
+                        waitedMs = 0
+                    };
+                    _progressJsonCache = null;
+                }
+            }
+
+            public void ClearAwaiting()
+            {
+                lock (_lock)
+                {
+                    if (_progress == null || _progress.source != "await")
+                        return;
+                    _waitStartedTimestamp = 0;
+                    _progressRevision++;
+                    _progress = new ExecuteCodeProgressSnapshot
+                    {
+                        active = true,
+                        title = "Executing snippet",
+                        info = "",
+                        progress = 0,
+                        revision = _progressRevision,
+                        source = "stage"
+                    };
+                    _progressJsonCache = null;
+                }
+            }
+
+            public void ResetProgress()
+            {
+                lock (_lock)
+                {
+                    _pendingProgressSnapshot = null;
+                    _progressRevision++;
+                    _progress = new ExecuteCodeProgressSnapshot
+                    {
+                        active = false,
+                        title = "",
+                        info = "",
+                        progress = 0,
+                        revision = _progressRevision,
+                        source = ""
+                    };
+                    _progressJsonCache = null;
+                }
+            }
+
+            public string GetProgressJson()
+            {
+                lock (_lock)
+                {
+                    if (_pendingProgressSnapshot != null)
+                    {
+                        ExecuteCodeProgressSnapshot pending = _pendingProgressSnapshot;
+                        _pendingProgressSnapshot = null;
+                        return JsonUtility.ToJson(pending);
+                    }
+                    if (_progress != null && _progress.source == "await" && _waitStartedTimestamp > 0)
+                    {
+                        long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - _waitStartedTimestamp;
+                        _progress.waitedMs = elapsed <= 0
+                            ? 0
+                            : (int)Math.Min(int.MaxValue,
+                                elapsed * 1000L / System.Diagnostics.Stopwatch.Frequency);
+                        _progressRevision++;
+                        _progress.revision = _progressRevision;
+                        _progressJsonCache = null;
+                    }
+                    if (_progressJsonCache == null || _progressJsonCacheRevision != _progressRevision)
+                    {
+                        _progressJsonCache = JsonUtility.ToJson(_progress);
+                        _progressJsonCacheRevision = _progressRevision;
+                    }
+                    return _progressJsonCache;
+                }
+            }
+
+            private string SourceLineText(int sourceLine)
+            {
+                int index = sourceLine - 1;
+                if (index < 0 || index >= _sourceLines.Length)
+                    return "";
+                return (_sourceLines[index] ?? "").Trim();
+            }
+
+            private void SetProgress(string title, string info, float progress, string source)
+            {
+                lock (_lock)
+                {
+                    if (source == "api")
+                        _pendingProgressSnapshot = null;
+                    _progressRevision++;
+                    _progress = new ExecuteCodeProgressSnapshot
+                    {
+                        active = true,
+                        title = string.IsNullOrEmpty(title) ? "Locus" : title,
+                        info = info ?? "",
+                        progress = Mathf.Clamp01(progress),
+                        revision = _progressRevision,
+                        source = string.IsNullOrEmpty(source) ? "api" : source
+                    };
+                    _progressJsonCache = null;
+                }
+            }
+
             public void Dispose()
             {
                 Cancel();
@@ -225,101 +386,77 @@ namespace Locus
         }
 
         private static readonly object _executeCodeRequestStateLock = new object();
-        private static ExecuteCodeRequestState _activeExecuteCodeRequest;
+        private static readonly Dictionary<string, ExecuteCodeRequestState> _executeCodeRequestStates =
+            new Dictionary<string, ExecuteCodeRequestState>(StringComparer.Ordinal);
 
-        private static ExecuteCodeRequestState ActiveExecuteCodeRequest
+        private static string NormalizeExecuteCodeExecutionId(string executionId, string requestId)
         {
-            get
+            string normalized = (executionId ?? "").Trim();
+            return string.IsNullOrEmpty(normalized) ? (requestId ?? Guid.NewGuid().ToString("N")) : normalized;
+        }
+
+        private static ExecuteCodeRequestState FindExecuteCodeRequestState(string executionId)
+        {
+            string normalized = (executionId ?? "").Trim();
+            lock (_executeCodeRequestStateLock)
             {
-                lock (_executeCodeRequestStateLock)
-                {
-                    return _activeExecuteCodeRequest;
-                }
+                ExecuteCodeRequestState state;
+                return !string.IsNullOrEmpty(normalized)
+                    && _executeCodeRequestStates.TryGetValue(normalized, out state)
+                    ? state
+                    : null;
             }
         }
 
-        private static void TouchActiveExecuteCodeClientHeartbeat()
+        private static void RegisterExecuteCodeRequestState(ExecuteCodeRequestState requestState)
         {
-            ExecuteCodeRequestState requestState = ActiveExecuteCodeRequest;
+            lock (_executeCodeRequestStateLock)
+            {
+                _executeCodeRequestStates[requestState.ExecutionId] = requestState;
+            }
+        }
+
+        private static void UnregisterExecuteCodeRequestState(ExecuteCodeRequestState requestState)
+        {
+            if (requestState == null)
+                return;
+            lock (_executeCodeRequestStateLock)
+            {
+                ExecuteCodeRequestState current;
+                if (_executeCodeRequestStates.TryGetValue(requestState.ExecutionId, out current)
+                    && ReferenceEquals(current, requestState))
+                    _executeCodeRequestStates.Remove(requestState.ExecutionId);
+            }
+        }
+
+        private static void TouchExecuteCodeClientHeartbeat(string executionId)
+        {
+            ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(executionId);
             if (requestState != null)
                 requestState.TouchClientHeartbeat();
         }
 
         private static void CancelActiveExecuteCode(string reason)
         {
-            ExecuteCodeRequestState requestState = ActiveExecuteCodeRequest;
-            if (requestState == null)
-                return;
+            ExecuteCodeRequestState[] states;
+            lock (_executeCodeRequestStateLock)
+                states = _executeCodeRequestStates.Values.ToArray();
+            for (int i = 0; i < states.Length; i++)
+                states[i].Cancel();
 
-            requestState.Cancel();
-            ResetExecuteCodeProgress();
-
-            if (!string.IsNullOrEmpty(reason))
+            if (states.Length > 0 && !string.IsNullOrEmpty(reason))
                 Debug.LogWarning("[Locus] execute_code canceled: " + reason);
         }
 
-        private static void ResetExecuteCodeProgress()
+        private static string InactiveExecuteCodeProgressJson()
         {
-            lock (_executeCodeProgressLock)
-            {
-                _executeCodeProgressRevision++;
-                _executeCodeProgress = new ExecuteCodeProgressSnapshot
-                {
-                    active = false,
-                    title = "",
-                    info = "",
-                    progress = 0,
-                    revision = _executeCodeProgressRevision,
-                    source = ""
-                };
-            }
+            return "{\"active\":false,\"title\":\"\",\"info\":\"\",\"progress\":0,\"revision\":0,\"source\":\"\"}";
         }
 
-        private static void SetExecuteCodeProgress(string title, string info, float progress)
+        private static string GetExecuteCodeProgressJson(string executionId)
         {
-            SetExecuteCodeProgressSnapshot(title, info, progress, "api");
-        }
-
-        private static void SetExecuteCodeStage(string info)
-        {
-            SetExecuteCodeProgressSnapshot(info, "", 0, "stage");
-        }
-
-        private static void SetExecuteCodeProgressSnapshot(string title, string info, float progress, string source)
-        {
-            lock (_executeCodeProgressLock)
-            {
-                _executeCodeProgressRevision++;
-                _executeCodeProgress = new ExecuteCodeProgressSnapshot
-                {
-                    active = true,
-                    title = string.IsNullOrEmpty(title) ? "Locus" : title,
-                    info = info ?? "",
-                    progress = Mathf.Clamp01(progress),
-                    revision = _executeCodeProgressRevision,
-                    source = string.IsNullOrEmpty(source) ? "api" : source
-                };
-            }
-        }
-
-        // Cache the serialized progress JSON keyed by revision so repeated
-        // front-end polls between updates reuse the same string instead of
-        // re-running JsonUtility.ToJson on every call.
-        private static string _executeCodeProgressJsonCache;
-        private static int _executeCodeProgressJsonCacheRevision = int.MinValue;
-
-        private static string GetExecuteCodeProgressJson()
-        {
-            lock (_executeCodeProgressLock)
-            {
-                if (_executeCodeProgressJsonCache == null ||
-                    _executeCodeProgressJsonCacheRevision != _executeCodeProgressRevision)
-                {
-                    _executeCodeProgressJsonCache = JsonUtility.ToJson(_executeCodeProgress);
-                    _executeCodeProgressJsonCacheRevision = _executeCodeProgressRevision;
-                }
-                return _executeCodeProgressJsonCache;
-            }
+            ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(executionId);
+            return requestState != null ? requestState.GetProgressJson() : InactiveExecuteCodeProgressJson();
         }
 
         private static void LogExecuteCodeDebug(string requestId, string message)
@@ -361,23 +498,30 @@ namespace Locus
             return stopwatch != null ? stopwatch.ElapsedMilliseconds : 0;
         }
 
-        private static PipeEnvelope HandleCancelExecuteCode(string requestId)
+        private static PipeEnvelope HandleCancelExecuteCode(string requestId, string executionId)
         {
-            ExecuteCodeRequestState requestState;
+            string normalized = (executionId ?? "").Trim();
+            if (!string.IsNullOrEmpty(normalized))
+            {
+                ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(normalized);
+                if (requestState == null)
+                    return OkResponse(requestId, "no active execute_code for " + normalized);
+                requestState.Cancel();
+                requestState.ResetProgress();
+                return OkResponse(requestId, "execute_code cancellation requested for " + normalized);
+            }
+
+            ExecuteCodeRequestState[] states;
             lock (_executeCodeRequestStateLock)
-            {
-                requestState = _activeExecuteCodeRequest;
-            }
-
-            if (requestState == null)
-            {
-                ResetExecuteCodeProgress();
+                states = _executeCodeRequestStates.Values.ToArray();
+            if (states.Length == 0)
                 return OkResponse(requestId, "no active execute_code");
+            for (int i = 0; i < states.Length; i++)
+            {
+                states[i].Cancel();
+                states[i].ResetProgress();
             }
-
-            requestState.Cancel();
-            ResetExecuteCodeProgress();
-            return OkResponse(requestId, "execute_code cancellation requested");
+            return OkResponse(requestId, "execute_code cancellation requested for " + states.Length + " executions");
         }
 
         private static async Task MonitorExecuteCodeClientHeartbeatAsync(ExecuteCodeRequestState requestState)
@@ -401,7 +545,7 @@ namespace Locus
                         continue;
 
                     requestState.Cancel();
-                    ResetExecuteCodeProgress();
+                    requestState.ResetProgress();
                     Debug.LogWarning(
                         "[Locus] execute_code canceled: client heartbeat timed out after " +
                         (ExecuteClientHeartbeatTimeoutMs / 1000) +
@@ -420,8 +564,12 @@ namespace Locus
             if (string.IsNullOrWhiteSpace(code))
                 return ErrorResponse(requestId, "empty code");
 
+            string executionId = ExtractExecuteCodeExecutionId(code, requestId);
+
             return await ExecuteSnippetRequestAsync(
                 requestId,
+                executionId,
+                code,
                 prepareCompiler: true,
                 compileStage: "Compiling snippet",
                 compile: delegate { return CompileAsyncSnippet(code); });
@@ -435,6 +583,8 @@ namespace Locus
             public string assembly_b64;
             public string assembly_path;
             public string entry_type;
+            public string execution_id;
+            public string source_code;
         }
 
         /// <summary>
@@ -498,6 +648,8 @@ namespace Locus
 
             return await ExecuteSnippetRequestAsync(
                 requestId,
+                NormalizeExecuteCodeExecutionId(request.execution_id, requestId),
+                request.source_code ?? "",
                 prepareCompiler: false,
                 compileStage: "Loading compiled snippet",
                 compile: delegate { return LoadCompiledSnippet(requestId, assemblyBytes, entryTypeName); });
@@ -602,10 +754,13 @@ namespace Locus
         /// </summary>
         private static async Task<PipeEnvelope> ExecuteSnippetRequestAsync(
             string requestId,
+            string executionId,
+            string sourceCode,
             bool prepareCompiler,
             string compileStage,
             Func<CompiledAsyncSnippet> compile)
         {
+            executionId = NormalizeExecuteCodeExecutionId(executionId, requestId);
             System.Diagnostics.Stopwatch requestStarted = ExecuteCodeDebugLoggingEnabled
                 ? System.Diagnostics.Stopwatch.StartNew()
                 : null;
@@ -615,9 +770,6 @@ namespace Locus
                     requestId,
                     "begin, prepareCompiler=" + prepareCompiler + ", acquireStage=" + compileStage);
             }
-
-            if (ActiveExecuteCodeRequest == null)
-                SetExecuteCodeStage("Waiting for Unity execute lock");
 
             bool lockTaken = false;
             try
@@ -633,8 +785,6 @@ namespace Locus
                             (ExecuteCodeLockWaitTimeoutMs / 1000) +
                             "s");
                     }
-                    if (ActiveExecuteCodeRequest == null)
-                        ResetExecuteCodeProgress();
                     return ErrorResponse(
                         requestId,
                         "execute_code lock wait timed out after " +
@@ -654,36 +804,31 @@ namespace Locus
             {
                 if (ExecuteCodeDebugLoggingEnabled)
                     LogExecuteCodeDebug(requestId, "execute lock unavailable: " + ex.Message);
-                if (ActiveExecuteCodeRequest == null)
-                    ResetExecuteCodeProgress();
                 return ErrorResponse(requestId, "execute_code lock unavailable: " + ex.Message);
             }
 
             ExecuteCodeRequestState requestState = null;
             try
             {
-                requestState = new ExecuteCodeRequestState();
-                lock (_executeCodeRequestStateLock)
-                {
-                    _activeExecuteCodeRequest = requestState;
-                }
+                requestState = new ExecuteCodeRequestState(executionId, sourceCode);
+                RegisterExecuteCodeRequestState(requestState);
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
                 LogExecuteCodeDebug(requestId, "request state registered");
 
-                ResetExecuteCodeProgress();
+                requestState.ResetProgress();
 
                 if (prepareCompiler)
                 {
-                    SetExecuteCodeStage("Checking compiler cache");
+                    requestState.SetStage("Checking compiler cache");
                     LogExecuteCodeDebug(requestId, "checking Unity compiler cache");
 
                     string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
-                        SetExecuteCodeStage,
+                        requestState.SetStage,
                         requestState.Cancellation.Token);
                     if (!string.IsNullOrEmpty(prepareError))
                     {
                         requestState.ThrowIfCancellationRequested();
-                        SetExecuteCodeStage("Compiler preparation failed");
+                        requestState.SetStage("Compiler preparation failed");
                         if (ExecuteCodeDebugLoggingEnabled)
                             LogExecuteCodeDebug(requestId, "compiler preparation failed: " + prepareError);
                         return ErrorResponse(requestId, prepareError);
@@ -701,7 +846,7 @@ namespace Locus
                 CompiledAsyncSnippet snippet;
                 try
                 {
-                    SetExecuteCodeStage(compileStage);
+                    requestState.SetStage(compileStage);
                     requestState.ThrowIfCancellationRequested();
                     if (ExecuteCodeDebugLoggingEnabled)
                         LogExecuteCodeDebug(requestId, "acquiring snippet: " + compileStage);
@@ -724,16 +869,22 @@ namespace Locus
                 }
                 catch (Exception ex)
                 {
-                    SetExecuteCodeStage("Compilation failed");
+                    requestState.SetStage("Compilation failed");
                     if (ExecuteCodeDebugLoggingEnabled)
                         LogExecuteCodeDebug(requestId, "snippet acquisition failed: " + ex.Message);
                     return ErrorResponse(requestId, "async snippet compilation exception: " + ex.Message);
                 }
 
-                SetExecuteCodeStage("Executing snippet");
+                requestState.SetStage("Executing snippet");
                 LogExecuteCodeDebug(requestId, "queueing snippet on Unity main thread");
                 long executeStartedMs = DebugElapsedMilliseconds(requestStarted);
-                string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
+                Task<string> executionTask = ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
+                if (lockTaken)
+                {
+                    _executeCodeLock.Release();
+                    lockTaken = false;
+                }
+                string resultText = await executionTask;
                 if (ExecuteCodeDebugLoggingEnabled)
                 {
                     LogExecuteCodeDebug(
@@ -747,14 +898,14 @@ namespace Locus
                 if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
                 {
                     requestState.ThrowIfCancellationRequested();
-                    SetExecuteCodeStage("Execution failed");
+                    requestState.SetStage("Execution failed");
                     if (ExecuteCodeDebugLoggingEnabled)
                         LogExecuteCodeDebug(requestId, "execution failed: " + resultText);
                     return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
                 }
 
                 requestState.ThrowIfCancellationRequested();
-                SetExecuteCodeStage("Execution complete");
+                requestState.SetStage("Execution complete");
                 if (ExecuteCodeDebugLoggingEnabled)
                 {
                     LogExecuteCodeDebug(
@@ -775,14 +926,9 @@ namespace Locus
             }
             finally
             {
-                lock (_executeCodeRequestStateLock)
-                {
-                    if (ReferenceEquals(_activeExecuteCodeRequest, requestState))
-                        _activeExecuteCodeRequest = null;
-                }
+                UnregisterExecuteCodeRequestState(requestState);
                 if (requestState != null)
                     requestState.Dispose();
-                ResetExecuteCodeProgress();
                 if (lockTaken)
                     _executeCodeLock.Release();
                 if (ExecuteCodeDebugLoggingEnabled)
@@ -958,6 +1104,17 @@ namespace Locus
             return ContainsTopLevelAwait(body);
         }
 
+        private static string ExtractExecuteCodeExecutionId(string code, string requestId)
+        {
+            int marker = (code ?? "").LastIndexOf(ExecuteCodeExecutionIdMarker, StringComparison.Ordinal);
+            if (marker < 0)
+                return NormalizeExecuteCodeExecutionId(null, requestId);
+            int start = marker + ExecuteCodeExecutionIdMarker.Length;
+            int end = code.IndexOfAny(new[] { '\r', '\n' }, start);
+            string value = end >= 0 ? code.Substring(start, end - start) : code.Substring(start);
+            return NormalizeExecuteCodeExecutionId(value, requestId);
+        }
+
         private static bool ContainsTopLevelAwait(SyntaxNode node)
         {
             if (node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax)
@@ -1001,6 +1158,7 @@ namespace Locus
             sb.AppendLine("using UnityEditor;");
             sb.AppendLine("using UnityEditor.SceneManagement;");
             sb.AppendLine("using UnityEditor.Animations;");
+            sb.AppendLine("using Locus;");
             sb.AppendLine("using static UnityEngine.Object;");
             sb.AppendLine("using Object = UnityEngine.Object;");
 
@@ -1131,14 +1289,15 @@ namespace Locus
             BeginAsyncExecuteRuntime();
 
             ExecuteCodeContext ctx = null;
+            ScriptGlobals globals = null;
 
             try
             {
                 if (requestState != null)
                     requestState.ThrowIfCancellationRequested();
 
-                var globals = new ScriptGlobals(execution.TouchActivity);
-                ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity);
+                globals = new ScriptGlobals(execution.TouchActivity);
+                ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity, requestState);
 
                 object returnValue = await snippet.Executor(globals, ctx, execution.Cancellation.Token);
 
@@ -1146,6 +1305,16 @@ namespace Locus
                     globals.print(returnValue);
 
                 execution.Completion.TrySetResult(globals.GetOutput());
+            }
+            catch (ExecuteCodeBreakpointReachedException breakpoint)
+            {
+                string output = globals != null ? globals.GetOutput() : "";
+                string result = breakpoint.Result != null
+                    ? breakpoint.Result.ToResultText()
+                    : "status: breakpoint\neditor_status: playing_paused";
+                if (!string.IsNullOrEmpty(output))
+                    result = output.TrimEnd() + "\n" + result;
+                execution.Completion.TrySetResult(result);
             }
             catch (OperationCanceledException)
             {
@@ -1223,6 +1392,7 @@ namespace Locus
             }
 
             _hasSavedRunInBackground = false;
+            RequestTickSchedulerClear();
         }
 
         private static void ScheduleExecuteContinuation(ExecuteCodeWaitState state)
@@ -1300,16 +1470,21 @@ namespace Locus
             }
         }
 
-        public sealed class ExecuteCodeContext
+        public sealed partial class ExecuteCodeContext
         {
             private readonly CancellationTokenSource _cancellation;
             private readonly Action _touchActivity;
+            private readonly ExecuteCodeRequestState _requestState;
             private Exception _waitException;
 
-            internal ExecuteCodeContext(CancellationTokenSource cancellation, Action touchActivity)
+            internal ExecuteCodeContext(
+                CancellationTokenSource cancellation,
+                Action touchActivity,
+                ExecuteCodeRequestState requestState)
             {
                 _cancellation = cancellation;
                 _touchActivity = touchActivity;
+                _requestState = requestState;
             }
 
             public CancellationToken CancellationToken
@@ -1329,31 +1504,49 @@ namespace Locus
 
             public ExecuteCodeFrameAwaitable wait
             {
-                get { return WaitFrame(); }
+                get { return new ExecuteCodeFrameAwaitable(this, 1, 0, null, "editor_update", "next EditorApplication.update", "", 0); }
             }
 
-            public ExecuteCodeFrameAwaitable WaitFrame()
+            public ExecuteCodeFrameAwaitable WaitFrame([CallerLineNumber] int sourceLine = 0)
             {
-                return new ExecuteCodeFrameAwaitable(this, 1, 0, null);
+                return new ExecuteCodeFrameAwaitable(
+                    this, 1, 0, null, "editor_update", "next EditorApplication.update", "", sourceLine);
             }
 
-            public ExecuteCodeFrameAwaitable WaitFrames(int frames)
+            public ExecuteCodeFrameAwaitable WaitFrames(
+                int frames,
+                [CallerLineNumber] int sourceLine = 0)
             {
-                return new ExecuteCodeFrameAwaitable(this, Math.Max(1, frames), 0, null);
+                int normalized = Math.Max(1, frames);
+                return new ExecuteCodeFrameAwaitable(
+                    this, normalized, 0, null, "editor_updates",
+                    normalized + " EditorApplication.update ticks", "", sourceLine);
             }
 
-            public ExecuteCodeFrameAwaitable WaitSeconds(float seconds)
+            public ExecuteCodeFrameAwaitable WaitSeconds(
+                float seconds,
+                [CallerLineNumber] int sourceLine = 0)
             {
                 double normalized = seconds < 0 ? 0 : seconds;
-                return new ExecuteCodeFrameAwaitable(this, 1, normalized, null);
+                return new ExecuteCodeFrameAwaitable(
+                    this, 1, normalized, null, "editor_time",
+                    normalized.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+                        + " seconds and a later EditorApplication.update",
+                    "", sourceLine);
             }
 
-            public ExecuteCodeFrameAwaitable WaitUntil(Func<bool> predicate)
+            public ExecuteCodeFrameAwaitable WaitUntil(
+                Func<bool> predicate,
+                string condition = null,
+                [CallerLineNumber] int sourceLine = 0)
             {
                 if (predicate == null)
                     throw new ArgumentNullException("predicate");
 
-                return new ExecuteCodeFrameAwaitable(this, 0, 0, predicate);
+                return new ExecuteCodeFrameAwaitable(
+                    this, 0, 0, predicate, "condition", "EditorApplication.update",
+                    string.IsNullOrWhiteSpace(condition) ? PredicateDescription(predicate) : condition.Trim(),
+                    sourceLine);
             }
 
             public ConsoleLogResult GetConsoleLog(string level = null, int limit = 50)
@@ -1374,7 +1567,8 @@ namespace Locus
                 string normalizedInfo = info ?? "";
                 float normalizedProgress = Mathf.Clamp01(progress);
 
-                SetExecuteCodeProgress(normalizedTitle, normalizedInfo, normalizedProgress);
+                if (_requestState != null)
+                    _requestState.SetApiProgress(normalizedTitle, normalizedInfo, normalizedProgress);
 
                 TouchActivity();
                 return _cancellation.IsCancellationRequested;
@@ -1392,7 +1586,8 @@ namespace Locus
 
             public void ClearProgress()
             {
-                ResetExecuteCodeProgress();
+                if (_requestState != null)
+                    _requestState.ResetProgress();
                 try
                 {
                     EditorUtility.ClearProgressBar();
@@ -1459,7 +1654,15 @@ namespace Locus
                 }
             }
 
-            internal void ScheduleWait(Action continuation, int frames, double seconds, Func<bool> predicate)
+            internal void ScheduleWait(
+                Action continuation,
+                int frames,
+                double seconds,
+                Func<bool> predicate,
+                string waitKind,
+                string waitTarget,
+                string waitCondition,
+                int sourceLine)
             {
                 if (continuation == null)
                     return;
@@ -1471,12 +1674,40 @@ namespace Locus
                     ? 0
                     : EditorApplication.timeSinceStartup + seconds;
 
+                SetAwaiting(waitKind, waitTarget, waitCondition, sourceLine);
+
                 ScheduleExecuteContinuation(new ExecuteCodeWaitState(
                     this,
                     continuation,
                     targetTick,
                     targetTime,
                     predicate));
+            }
+
+            internal void SetAwaiting(
+                string kind,
+                string target,
+                string condition,
+                int sourceLine)
+            {
+                if (_requestState != null)
+                    _requestState.SetAwaiting(kind, target, condition, sourceLine);
+                TouchActivity();
+            }
+
+            internal void ClearAwaiting()
+            {
+                if (_requestState != null)
+                    _requestState.ClearAwaiting();
+                TouchActivity();
+            }
+
+            internal static string PredicateDescription(Func<bool> predicate)
+            {
+                if (predicate == null || predicate.Method == null)
+                    return "predicate";
+                Type declaring = predicate.Method.DeclaringType;
+                return (declaring != null ? declaring.FullName + "." : "") + predicate.Method.Name;
             }
         }
 
@@ -1486,22 +1717,36 @@ namespace Locus
             private readonly int _frames;
             private readonly double _seconds;
             private readonly Func<bool> _predicate;
+            private readonly string _waitKind;
+            private readonly string _waitTarget;
+            private readonly string _waitCondition;
+            private readonly int _sourceLine;
 
             internal ExecuteCodeFrameAwaitable(
                 ExecuteCodeContext context,
                 int frames,
                 double seconds,
-                Func<bool> predicate)
+                Func<bool> predicate,
+                string waitKind,
+                string waitTarget,
+                string waitCondition,
+                int sourceLine)
             {
                 _context = context;
                 _frames = frames;
                 _seconds = seconds;
                 _predicate = predicate;
+                _waitKind = waitKind;
+                _waitTarget = waitTarget;
+                _waitCondition = waitCondition;
+                _sourceLine = sourceLine;
             }
 
             public Awaiter GetAwaiter()
             {
-                return new Awaiter(_context, _frames, _seconds, _predicate);
+                return new Awaiter(
+                    _context, _frames, _seconds, _predicate,
+                    _waitKind, _waitTarget, _waitCondition, _sourceLine);
             }
 
             public struct Awaiter : ICriticalNotifyCompletion
@@ -1510,17 +1755,29 @@ namespace Locus
                 private readonly int _frames;
                 private readonly double _seconds;
                 private readonly Func<bool> _predicate;
+                private readonly string _waitKind;
+                private readonly string _waitTarget;
+                private readonly string _waitCondition;
+                private readonly int _sourceLine;
 
                 internal Awaiter(
                     ExecuteCodeContext context,
                     int frames,
                     double seconds,
-                    Func<bool> predicate)
+                    Func<bool> predicate,
+                    string waitKind,
+                    string waitTarget,
+                    string waitCondition,
+                    int sourceLine)
                 {
                     _context = context;
                     _frames = frames;
                     _seconds = seconds;
                     _predicate = predicate;
+                    _waitKind = waitKind;
+                    _waitTarget = waitTarget;
+                    _waitCondition = waitCondition;
+                    _sourceLine = sourceLine;
                 }
 
                 public bool IsCompleted
@@ -1551,7 +1808,9 @@ namespace Locus
                         return;
                     }
 
-                    _context.ScheduleWait(continuation, _frames, _seconds, _predicate);
+                    _context.ScheduleWait(
+                        continuation, _frames, _seconds, _predicate,
+                        _waitKind, _waitTarget, _waitCondition, _sourceLine);
                 }
 
                 public void UnsafeOnCompleted(Action continuation)
@@ -1603,6 +1862,8 @@ namespace Locus
 
             public void InvokeContinuation()
             {
+                if (_context != null)
+                    _context.ClearAwaiting();
                 Continuation();
             }
         }

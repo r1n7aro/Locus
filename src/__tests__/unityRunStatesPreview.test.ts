@@ -153,6 +153,8 @@ describe("unityRunStatesPreview", () => {
     expect(read("knowledge/skill/profiler.md")).toContain("Unity Profiler Runtime Sampling");
     const runStatesBridge = read("locus_unity/Editor/LocusBridge.RunStates.cs");
     const profilerSkill = read("knowledge/skill/profiler.md");
+    expect(profilerSkill).toContain("skillSurface: both");
+    expect(profilerSkill).toContain("commandTrigger: /profile");
     expect(runStatesBridge).toContain("StartProfiler(string name");
     expect(runStatesBridge).toContain("TryGetProfilerLastValue");
     expect(runStatesBridge).toContain("RecordProfilerSpike");

@@ -31,6 +31,37 @@ namespace Locus
             public string path_prefix;
         }
 
+        [Serializable]
+        private struct YamlPreviewCacheSelfTestArgs
+        {
+            public int sample_count;
+            public int seed;
+        }
+
+        [Serializable]
+        private sealed class YamlPreviewCacheSelfTestCase
+        {
+            public string scene_path;
+            public string status;
+            public string message;
+        }
+
+        [Serializable]
+        private sealed class YamlPreviewCacheSelfTestReport
+        {
+            public string unity_version;
+            public string mode;
+            public bool preview_supported;
+            public int seed;
+            public int candidate_count;
+            public int sample_count;
+            public int passed;
+            public int failed;
+            public int skipped;
+            public List<YamlPreviewCacheSelfTestCase> cases =
+                new List<YamlPreviewCacheSelfTestCase>();
+        }
+
         private const string UnityYamlModeList = "list";
         private const string UnityYamlModeSearch = "search";
         private const string UnityYamlModeRead = "read";
@@ -39,6 +70,24 @@ namespace Locus
         private const int DefaultSerializedMaxArrayItems = 20;
         private const int HardSerializedFieldMaxDepth = 6;
         private const int HardSerializedMaxArrayItems = 200;
+        private const double YamlPreviewSceneCacheTtlSeconds = 90d;
+        private const double YamlPreviewSceneCacheSweepSeconds = 5d;
+        private const int YamlPreviewSceneCacheMaxEntries = 2;
+
+        private sealed class YamlPreviewSceneCacheEntry
+        {
+            public string ScenePath;
+            public string DependencyHash;
+            public UnityEngine.SceneManagement.Scene Scene;
+            public GameObject[] Roots;
+            public List<HierarchySummaryNode> SummaryRoots;
+            public List<HierarchySummaryNode> SearchRoots;
+            public double LastAccessTime;
+        }
+
+        private static readonly List<YamlPreviewSceneCacheEntry> _yamlPreviewSceneCache =
+            new List<YamlPreviewSceneCacheEntry>();
+        private static double _yamlPreviewSceneCacheNextSweepAt;
 
         /// <summary>
         /// </summary>
@@ -183,6 +232,8 @@ namespace Locus
             // YAML.
             var activeScene = EditorSceneManager.GetActiveScene();
             bool isActiveScene = activeScene.IsValid()
+                && activeScene.isLoaded
+                && !EditorSceneManager.IsPreviewScene(activeScene)
                 && string.Equals(activeScene.path, scenePath, StringComparison.OrdinalIgnoreCase);
 
             if (!isActiveScene)
@@ -192,15 +243,466 @@ namespace Locus
                     var s = EditorSceneManager.GetSceneAt(i);
                     if (s.IsValid()
                         && s.isLoaded
+                        && !EditorSceneManager.IsPreviewScene(s)
                         && string.Equals(s.path, scenePath, StringComparison.OrdinalIgnoreCase))
                     {
+                        RemoveYamlPreviewSceneCacheEntry(scenePath);
                         return ReadSceneContents(s, scenePath, objectPath, options, mode);
                     }
                 }
+
+#if UNITY_2023_1_OR_NEWER
+                bool cacheHit;
+                string previewError;
+                var previewEntry = GetOrOpenYamlPreviewScene(scenePath, out cacheHit, out previewError);
+                if (previewEntry == null)
+                    return "__ERROR__: unable to open scene through Unity preview API: " + previewError;
+
+                return ReadSceneContents(
+                    previewEntry.Scene,
+                    scenePath,
+                    objectPath,
+                    options,
+                    mode,
+                    previewEntry,
+                    cacheHit);
+#else
+                // OpenPreviewScene was added in Unity 2023.1. Older editors
+                // keep the existing disk YAML cold path; opening additively
+                // would mutate the user's multi-scene setup and can execute
+                // edit-mode scene behaviours.
                 return "__ERROR__: scene not loaded in editor, falling back to YAML parsing";
+#endif
             }
 
+            RemoveYamlPreviewSceneCacheEntry(scenePath);
             return ReadSceneContents(activeScene, scenePath, objectPath, options, mode);
+        }
+
+#if UNITY_2023_1_OR_NEWER
+        private static YamlPreviewSceneCacheEntry GetOrOpenYamlPreviewScene(
+            string scenePath,
+            out bool cacheHit,
+            out string error)
+        {
+            cacheHit = false;
+            error = null;
+
+            // Access after the TTL must reopen even when it lands between the
+            // five-second background sweep ticks.
+            PruneYamlPreviewSceneCache(true);
+            string dependencyHash = AssetDatabase.GetAssetDependencyHash(scenePath).ToString();
+            for (int i = _yamlPreviewSceneCache.Count - 1; i >= 0; i--)
+            {
+                var entry = _yamlPreviewSceneCache[i];
+                if (!string.Equals(entry.ScenePath, scenePath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (YamlPreviewSceneCacheEntryIsUsable(entry)
+                    && string.Equals(entry.DependencyHash, dependencyHash, StringComparison.Ordinal))
+                {
+                    entry.LastAccessTime = EditorApplication.timeSinceStartup;
+                    RestoreRegularActiveScene(entry.Scene);
+                    cacheHit = true;
+                    return entry;
+                }
+
+                CloseYamlPreviewSceneCacheEntry(entry);
+                _yamlPreviewSceneCache.RemoveAt(i);
+            }
+
+            while (_yamlPreviewSceneCache.Count >= YamlPreviewSceneCacheMaxEntries)
+                EvictLeastRecentlyUsedYamlPreviewScene();
+
+            var previousActiveScene = FindRegularActiveScene();
+            UnityEngine.SceneManagement.Scene previewScene = default(UnityEngine.SceneManagement.Scene);
+            try
+            {
+                previewScene = EditorSceneManager.OpenPreviewScene(scenePath);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return null;
+            }
+            finally
+            {
+                RestoreRegularActiveScene(previewScene, previousActiveScene);
+            }
+
+            if (!previewScene.IsValid() || !previewScene.isLoaded)
+            {
+                error = "OpenPreviewScene returned an invalid or unloaded scene";
+                return null;
+            }
+
+            var opened = new YamlPreviewSceneCacheEntry
+            {
+                ScenePath = scenePath,
+                DependencyHash = dependencyHash,
+                Scene = previewScene,
+                Roots = previewScene.GetRootGameObjects(),
+                LastAccessTime = EditorApplication.timeSinceStartup,
+            };
+            _yamlPreviewSceneCache.Add(opened);
+            _yamlPreviewSceneCacheNextSweepAt =
+                EditorApplication.timeSinceStartup + YamlPreviewSceneCacheSweepSeconds;
+            return opened;
+        }
+#endif
+
+        private static bool YamlPreviewSceneCacheEntryIsUsable(YamlPreviewSceneCacheEntry entry)
+        {
+            return entry != null
+                && entry.Scene.IsValid()
+                && entry.Scene.isLoaded
+                && EditorSceneManager.IsPreviewScene(entry.Scene);
+        }
+
+        private static UnityEngine.SceneManagement.Scene FindRegularActiveScene()
+        {
+            var active = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            if (active.IsValid() && active.isLoaded && !EditorSceneManager.IsPreviewScene(active))
+                return active;
+
+            for (int i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                var candidate = EditorSceneManager.GetSceneAt(i);
+                if (candidate.IsValid()
+                    && candidate.isLoaded
+                    && !EditorSceneManager.IsPreviewScene(candidate))
+                    return candidate;
+            }
+
+            return default(UnityEngine.SceneManagement.Scene);
+        }
+
+        private static void RestoreRegularActiveScene(
+            UnityEngine.SceneManagement.Scene previewScene,
+            UnityEngine.SceneManagement.Scene preferredScene = default(UnityEngine.SceneManagement.Scene))
+        {
+            var target = preferredScene;
+            if (!target.IsValid() || !target.isLoaded || EditorSceneManager.IsPreviewScene(target))
+                target = FindRegularActiveScene();
+
+            if (!target.IsValid() || !target.isLoaded || EditorSceneManager.IsPreviewScene(target))
+                return;
+
+            var active = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            if (active != target || (previewScene.IsValid() && active == previewScene))
+                UnityEngine.SceneManagement.SceneManager.SetActiveScene(target);
+        }
+
+        private static void RemoveYamlPreviewSceneCacheEntry(string scenePath)
+        {
+            for (int i = _yamlPreviewSceneCache.Count - 1; i >= 0; i--)
+            {
+                var entry = _yamlPreviewSceneCache[i];
+                if (!string.Equals(entry.ScenePath, scenePath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                CloseYamlPreviewSceneCacheEntry(entry);
+                _yamlPreviewSceneCache.RemoveAt(i);
+            }
+        }
+
+        private static void EvictLeastRecentlyUsedYamlPreviewScene()
+        {
+            if (_yamlPreviewSceneCache.Count == 0)
+                return;
+
+            int oldestIndex = 0;
+            for (int i = 1; i < _yamlPreviewSceneCache.Count; i++)
+            {
+                if (_yamlPreviewSceneCache[i].LastAccessTime
+                    < _yamlPreviewSceneCache[oldestIndex].LastAccessTime)
+                    oldestIndex = i;
+            }
+
+            CloseYamlPreviewSceneCacheEntry(_yamlPreviewSceneCache[oldestIndex]);
+            _yamlPreviewSceneCache.RemoveAt(oldestIndex);
+        }
+
+        private static void CloseYamlPreviewSceneCacheEntry(YamlPreviewSceneCacheEntry entry)
+        {
+            if (!YamlPreviewSceneCacheEntryIsUsable(entry))
+                return;
+
+            RestoreRegularActiveScene(entry.Scene);
+            try
+            {
+                EditorSceneManager.ClosePreviewScene(entry.Scene);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] Failed to close cached YAML preview scene '"
+                    + entry.ScenePath + "': " + ex.Message);
+            }
+        }
+
+        private static void PruneYamlPreviewSceneCache(bool force)
+        {
+            if (_yamlPreviewSceneCache.Count == 0)
+                return;
+
+            double now = EditorApplication.timeSinceStartup;
+            if (!force && now < _yamlPreviewSceneCacheNextSweepAt)
+                return;
+
+            _yamlPreviewSceneCacheNextSweepAt = now + YamlPreviewSceneCacheSweepSeconds;
+            for (int i = _yamlPreviewSceneCache.Count - 1; i >= 0; i--)
+            {
+                var entry = _yamlPreviewSceneCache[i];
+                bool expired = now - entry.LastAccessTime >= YamlPreviewSceneCacheTtlSeconds;
+                if (!expired && YamlPreviewSceneCacheEntryIsUsable(entry))
+                    continue;
+
+                CloseYamlPreviewSceneCacheEntry(entry);
+                _yamlPreviewSceneCache.RemoveAt(i);
+            }
+        }
+
+        private static void ClearYamlPreviewSceneCache()
+        {
+            for (int i = _yamlPreviewSceneCache.Count - 1; i >= 0; i--)
+                CloseYamlPreviewSceneCacheEntry(_yamlPreviewSceneCache[i]);
+            _yamlPreviewSceneCache.Clear();
+            _yamlPreviewSceneCacheNextSweepAt = 0d;
+        }
+
+        private static Task<string> HandleYamlPreviewCacheSelfTest(string json)
+        {
+            var args = string.IsNullOrWhiteSpace(json)
+                ? new YamlPreviewCacheSelfTestArgs()
+                : JsonUtility.FromJson<YamlPreviewCacheSelfTestArgs>(json);
+            return Task.FromResult(RunYamlPreviewCacheSelfTest(args));
+        }
+
+        private static string RunYamlPreviewCacheSelfTest(YamlPreviewCacheSelfTestArgs args)
+        {
+            int requestedSamples = args.sample_count <= 0 ? 5 : Math.Min(args.sample_count, 50);
+            int seed = args.seed != 0 ? args.seed : unchecked((int)DateTime.UtcNow.Ticks);
+            var report = new YamlPreviewCacheSelfTestReport
+            {
+                unity_version = Application.unityVersion,
+                seed = seed,
+#if UNITY_2023_1_OR_NEWER
+                mode = "preview-live-parity",
+                preview_supported = true,
+#else
+                mode = "cold-fallback-safety",
+                preview_supported = false,
+#endif
+            };
+
+            var candidates = new List<string>();
+            foreach (string guid in AssetDatabase.FindAssets("t:Scene", new[] { "Assets" }))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!string.IsNullOrEmpty(path)
+                    && path.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)
+                    && !IsRegularSceneLoaded(path))
+                    candidates.Add(path);
+            }
+
+            candidates.Sort(StringComparer.Ordinal);
+            var random = new System.Random(seed);
+            for (int i = candidates.Count - 1; i > 0; i--)
+            {
+                int swap = random.Next(i + 1);
+                string value = candidates[i];
+                candidates[i] = candidates[swap];
+                candidates[swap] = value;
+            }
+
+            report.candidate_count = candidates.Count;
+            report.sample_count = Math.Min(requestedSamples, candidates.Count);
+            if (report.sample_count == 0)
+            {
+                report.skipped = 1;
+                report.cases.Add(new YamlPreviewCacheSelfTestCase
+                {
+                    scene_path = "",
+                    status = "skipped",
+                    message = "No unloaded scene assets were found under Assets/.",
+                });
+                return JsonUtility.ToJson(report, true);
+            }
+
+            try
+            {
+                for (int i = 0; i < report.sample_count; i++)
+                    RunYamlPreviewCacheSelfTestCase(candidates[i], report);
+            }
+            finally
+            {
+                ClearYamlPreviewSceneCache();
+            }
+
+            return JsonUtility.ToJson(report, true);
+        }
+
+        private static void RunYamlPreviewCacheSelfTestCase(
+            string scenePath,
+            YamlPreviewCacheSelfTestReport report)
+        {
+            var result = new YamlPreviewCacheSelfTestCase { scene_path = scenePath };
+            report.cases.Add(result);
+            ClearYamlPreviewSceneCache();
+
+            var activeBefore = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            int regularSceneCountBefore = CountLoadedRegularScenes();
+            int previewSceneCountBefore = EditorSceneManager.previewSceneCount;
+            var readArgs = new ReadYamlArgs
+            {
+                file_path = scenePath,
+                max_nodes = 250,
+            };
+
+            try
+            {
+#if UNITY_2023_1_OR_NEWER
+                string openedOutput = ExecuteReadYaml(readArgs, UnityYamlModeList);
+                string hitOutput = ExecuteReadYaml(readArgs, UnityYamlModeList);
+                bool openedBanner = openedOutput.StartsWith(
+                    "[source: Unity Editor preview scene (saved asset, cache=opened)]",
+                    StringComparison.Ordinal);
+                bool hitBanner = hitOutput.StartsWith(
+                    "[source: Unity Editor preview scene (saved asset, cache=hit)]",
+                    StringComparison.Ordinal);
+                bool cacheBodiesMatch = string.Equals(
+                    RemoveYamlSourceBanner(openedOutput),
+                    RemoveYamlSourceBanner(hitOutput),
+                    StringComparison.Ordinal);
+                bool previewOpened = EditorSceneManager.previewSceneCount
+                    == previewSceneCountBefore + 1;
+                bool activePreserved = ActiveSceneMatches(activeBefore);
+                bool regularScenesPreserved = CountLoadedRegularScenes() == regularSceneCountBefore;
+
+                ClearYamlPreviewSceneCache();
+                bool previewClosed = EditorSceneManager.previewSceneCount == previewSceneCountBefore;
+
+                UnityEngine.SceneManagement.Scene liveScene =
+                    default(UnityEngine.SceneManagement.Scene);
+                string liveOutput = null;
+                try
+                {
+                    liveScene = EditorSceneManager.OpenScene(
+                        scenePath,
+                        OpenSceneMode.Additive);
+                    RestoreRegularActiveScene(liveScene, activeBefore);
+                    liveOutput = ExecuteReadYaml(readArgs, UnityYamlModeList);
+                }
+                finally
+                {
+                    if (liveScene.IsValid()
+                        && liveScene.isLoaded
+                        && !EditorSceneManager.IsPreviewScene(liveScene))
+                        EditorSceneManager.CloseScene(liveScene, true);
+                    RestoreRegularActiveScene(
+                        default(UnityEngine.SceneManagement.Scene),
+                        activeBefore);
+                }
+
+                bool liveBodyMatches = string.Equals(
+                    RemoveYamlSourceBanner(openedOutput),
+                    RemoveYamlSourceBanner(liveOutput),
+                    StringComparison.Ordinal);
+                bool cleanupPreserved = ActiveSceneMatches(activeBefore)
+                    && CountLoadedRegularScenes() == regularSceneCountBefore;
+
+                var failures = new List<string>();
+                if (!openedBanner) failures.Add("first cold read did not open preview cache");
+                if (!hitBanner) failures.Add("second cold read did not hit preview cache");
+                if (!cacheBodiesMatch) failures.Add("cache hit output differs from cache open output");
+                if (!previewOpened) failures.Add("preview scene count did not increase by one");
+                if (!previewClosed) failures.Add("preview scene did not close during cleanup");
+                if (!activePreserved) failures.Add("cold read changed the active scene");
+                if (!regularScenesPreserved) failures.Add("cold read changed regular loaded scenes");
+                if (!liveBodyMatches) failures.Add("preview and live hierarchy outputs differ");
+                if (!cleanupPreserved) failures.Add("live comparison did not restore scene state");
+#else
+                string coldOutput = ExecuteReadYaml(readArgs, UnityYamlModeList);
+                bool usedColdFallback = coldOutput.StartsWith(
+                    "__ERROR__: scene not loaded in editor, falling back to YAML parsing",
+                    StringComparison.Ordinal);
+                bool activePreserved = ActiveSceneMatches(activeBefore);
+                bool regularScenesPreserved = CountLoadedRegularScenes() == regularSceneCountBefore;
+                bool previewScenesPreserved = EditorSceneManager.previewSceneCount
+                    == previewSceneCountBefore;
+
+                var failures = new List<string>();
+                if (!usedColdFallback) failures.Add("unloaded scene did not use disk YAML fallback");
+                if (!activePreserved) failures.Add("cold fallback changed the active scene");
+                if (!regularScenesPreserved) failures.Add("cold fallback changed regular loaded scenes");
+                if (!previewScenesPreserved) failures.Add("cold fallback changed preview scenes");
+#endif
+
+                if (failures.Count == 0)
+                {
+                    result.status = "passed";
+                    result.message = "ok";
+                    report.passed++;
+                }
+                else
+                {
+                    result.status = "failed";
+                    result.message = string.Join("; ", failures.ToArray());
+                    report.failed++;
+                }
+            }
+            catch (Exception ex)
+            {
+                result.status = "failed";
+                result.message = ex.GetType().Name + ": " + ex.Message;
+                report.failed++;
+            }
+            finally
+            {
+                ClearYamlPreviewSceneCache();
+            }
+        }
+
+        private static bool IsRegularSceneLoaded(string scenePath)
+        {
+            for (int i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                var scene = EditorSceneManager.GetSceneAt(i);
+                if (scene.IsValid()
+                    && scene.isLoaded
+                    && !EditorSceneManager.IsPreviewScene(scene)
+                    && string.Equals(scene.path, scenePath, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private static int CountLoadedRegularScenes()
+        {
+            int count = 0;
+            for (int i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                var scene = EditorSceneManager.GetSceneAt(i);
+                if (scene.IsValid() && scene.isLoaded && !EditorSceneManager.IsPreviewScene(scene))
+                    count++;
+            }
+            return count;
+        }
+
+        private static bool ActiveSceneMatches(UnityEngine.SceneManagement.Scene expected)
+        {
+            var active = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            return active.IsValid() == expected.IsValid()
+                && (!expected.IsValid() || active.handle == expected.handle);
+        }
+
+        private static string RemoveYamlSourceBanner(string output)
+        {
+            if (string.IsNullOrEmpty(output)
+                || !output.StartsWith("[source: ", StringComparison.Ordinal))
+                return output ?? "";
+            int newline = output.IndexOf('\n');
+            return newline >= 0 ? output.Substring(newline + 1) : "";
         }
 
         /// <summary>
@@ -218,23 +720,65 @@ namespace Locus
             return "[source: live Unity Editor" + suffix + "]\n";
         }
 
+        private static string BuildPreviewSourceBanner(bool cacheHit)
+        {
+            return "[source: Unity Editor preview scene (saved asset, cache="
+                + (cacheHit ? "hit" : "opened") + ")]\n";
+        }
+
         private static string ReadSceneContents(
             UnityEngine.SceneManagement.Scene scene,
             string scenePath,
             string objectPath,
             ReadYamlOptions options,
-            string mode)
+            string mode,
+            YamlPreviewSceneCacheEntry previewEntry = null,
+            bool previewCacheHit = false)
         {
-            var roots = scene.GetRootGameObjects();
-            string banner = BuildLiveSourceBanner(scene.isDirty);
+            var roots = previewEntry != null ? previewEntry.Roots : scene.GetRootGameObjects();
+            string banner = previewEntry != null
+                ? BuildPreviewSourceBanner(previewCacheHit)
+                : BuildLiveSourceBanner(scene.isDirty);
 
             if (mode == UnityYamlModeRead)
                 return PrependBannerUnlessError(banner, ReadGameObjectDetail(roots, objectPath, scenePath, options));
 
             if (mode == UnityYamlModeSearch)
-                return PrependBannerUnlessError(banner, BuildHierarchySearchResults(roots, scenePath, options));
+            {
+                var searchRoots = previewEntry != null
+                    ? GetOrBuildPreviewHierarchySnapshot(previewEntry, false)
+                    : null;
+                return PrependBannerUnlessError(
+                    banner,
+                    BuildHierarchySearchResults(roots, scenePath, options, searchRoots));
+            }
 
-            return PrependBannerUnlessError(banner, BuildHierarchySummary(roots, scenePath, options));
+            var summaryRoots = previewEntry != null
+                ? GetOrBuildPreviewHierarchySnapshot(previewEntry, true)
+                : null;
+            return PrependBannerUnlessError(
+                banner,
+                BuildHierarchySummary(roots, scenePath, options, summaryRoots));
+        }
+
+        private static List<HierarchySummaryNode> GetOrBuildPreviewHierarchySnapshot(
+            YamlPreviewSceneCacheEntry entry,
+            bool foldBones)
+        {
+            if (foldBones)
+            {
+                if (entry.SummaryRoots == null)
+                    entry.SummaryRoots = BuildHierarchySummaryNodes(
+                        entry.Roots,
+                        CollectBoneTransforms(entry.Roots));
+                return entry.SummaryRoots;
+            }
+
+            if (entry.SearchRoots == null)
+                entry.SearchRoots = BuildHierarchySummaryNodes(
+                    entry.Roots,
+                    new HashSet<Transform>());
+            return entry.SearchRoots;
         }
 
         private static string PrependBannerUnlessError(string banner, string output)
@@ -588,7 +1132,11 @@ namespace Locus
             public List<HierarchySummaryNode> Members = new List<HierarchySummaryNode>();
         }
 
-        private static string BuildHierarchySummary(GameObject[] roots, string filePath, ReadYamlOptions options)
+        private static string BuildHierarchySummary(
+            GameObject[] roots,
+            string filePath,
+            ReadYamlOptions options,
+            List<HierarchySummaryNode> hierarchySnapshot = null)
         {
             var sb = new StringBuilder();
             bool isScene = filePath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase);
@@ -612,13 +1160,12 @@ namespace Locus
             // Bone folding applies to single-root prefabs too — a lone
             // character prefab is exactly where a 200-node bone tree drowns
             // the summary.
-            var boneTransforms = CollectBoneTransforms(roots);
-
             sb.AppendLine();
             sb.AppendLine("── Hierarchy ──");
             sb.AppendLine();
 
-            var summaryRoots = BuildHierarchySummaryNodes(roots, boneTransforms);
+            var summaryRoots = hierarchySnapshot
+                ?? BuildHierarchySummaryNodes(roots, CollectBoneTransforms(roots));
 
             summaryRoots = ApplyHierarchyOptions(summaryRoots, options);
             if (summaryRoots.Count == 0)
@@ -662,14 +1209,14 @@ namespace Locus
         private static string BuildHierarchySearchResults(
             GameObject[] roots,
             string filePath,
-            ReadYamlOptions options)
+            ReadYamlOptions options,
+            List<HierarchySummaryNode> hierarchySnapshot = null)
         {
             // No bone folding for search: a folded bone subtree has no child
             // nodes, so anything under it would be unsearchable (false
             // negatives for bone names / attachments hanging off bones).
-            var boneTransforms = new HashSet<Transform>();
-
-            var summaryRoots = BuildHierarchySummaryNodes(roots, boneTransforms);
+            var summaryRoots = hierarchySnapshot
+                ?? BuildHierarchySummaryNodes(roots, new HashSet<Transform>());
             if (!string.IsNullOrEmpty(options.PathPrefix))
                 summaryRoots = SelectPathPrefixRoots(summaryRoots, options.PathPrefix);
 

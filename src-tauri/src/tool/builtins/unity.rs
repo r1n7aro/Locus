@@ -2,6 +2,163 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{make_exec, ToolDef, ToolResult};
+use crate::tool::output::{
+    append_field, append_json_field, append_text_field, flat_json_value, push_indented_text,
+};
+
+fn format_unity_test_list(raw: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Unity Test list returned a non-object result".to_string())?;
+    let tests = object
+        .get("tests")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut output = "Unity tests:".to_string();
+    append_json_field(&mut output, "mode", object.get("mode"));
+    append_json_field(&mut output, "matched", object.get("matched"));
+    append_field(&mut output, "shown", tests.len());
+    append_field(
+        &mut output,
+        "truncated",
+        object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    );
+
+    for test in tests {
+        let Some(test) = test.as_object() else {
+            output.push_str("\n- value=");
+            output.push_str(&flat_json_value(test));
+            continue;
+        };
+        let mut line = "\n-".to_string();
+        append_json_field(
+            &mut line,
+            "test",
+            test.get("full_name").or_else(|| test.get("name")),
+        );
+        append_json_field(&mut line, "assembly", test.get("assembly"));
+        append_json_field(&mut line, "mode", test.get("mode"));
+        append_json_field(&mut line, "categories", test.get("categories"));
+        output.push_str(&line);
+    }
+    Ok(output)
+}
+
+fn append_unity_test_result(output: &mut String, label: &str, result: &serde_json::Value) {
+    let Some(result) = result.as_object() else {
+        output.push('\n');
+        output.push_str(label);
+        output.push_str(": value=");
+        output.push_str(&flat_json_value(result));
+        return;
+    };
+    let mut line = format!("\n{label}:");
+    append_json_field(&mut line, "test", result.get("full_name"));
+    append_json_field(&mut line, "state", result.get("result_state"));
+    append_json_field(&mut line, "duration_ms", result.get("duration_ms"));
+    output.push_str(&line);
+    for (field, display) in [
+        ("message", "message"),
+        ("stack_trace", "stack_trace"),
+        ("output", "output"),
+    ] {
+        if let Some(value) = result.get(field).and_then(serde_json::Value::as_str) {
+            push_indented_text(output, display, value);
+        }
+    }
+}
+
+fn format_unity_test_run(snapshot: &crate::unity_bridge::UnityTestRunSnapshot) -> String {
+    let mut output = "Unity test run:".to_string();
+    append_text_field(&mut output, "status", &snapshot.status);
+    append_text_field(&mut output, "mode", &snapshot.mode);
+    append_text_field(&mut output, "run_id", &snapshot.run_id);
+    append_field(&mut output, "total", snapshot.total);
+    append_field(&mut output, "passed", snapshot.passed);
+    append_field(&mut output, "failed", snapshot.failed);
+    append_field(&mut output, "skipped", snapshot.skipped);
+    append_field(&mut output, "inconclusive", snapshot.inconclusive);
+    append_field(&mut output, "duration_ms", snapshot.duration_ms);
+    append_text_field(&mut output, "current_test", &snapshot.current_test);
+    if !snapshot.error.trim().is_empty() {
+        push_indented_text(&mut output, "error", &snapshot.error);
+    }
+
+    if snapshot.results.is_empty() {
+        for failure in &snapshot.failures {
+            append_unity_test_result(&mut output, "Failure", failure);
+        }
+    } else {
+        for result in &snapshot.results {
+            append_unity_test_result(&mut output, "Test", result);
+        }
+    }
+    output
+}
+
+fn format_unity_console_logs(
+    value: &serde_json::Value,
+    requested_level: &str,
+) -> Result<String, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Unity Console returned a non-object result".to_string())?;
+    let entries = object
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut output = "Unity Console:".to_string();
+    append_text_field(
+        &mut output,
+        "level",
+        if requested_level.trim().is_empty() {
+            "all"
+        } else {
+            requested_level
+        },
+    );
+    append_json_field(&mut output, "matched", object.get("matchedCount"));
+    append_json_field(&mut output, "unique", object.get("uniqueCount"));
+    append_field(&mut output, "shown", entries.len());
+    append_field(
+        &mut output,
+        "truncated",
+        object
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    );
+
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            output.push_str("\n- value=");
+            output.push_str(&flat_json_value(entry));
+            continue;
+        };
+        let level = entry
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("log");
+        let count = entry
+            .get("count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1);
+        output.push_str("\n[");
+        output.push_str(level);
+        output.push_str("]");
+        append_field(&mut output, "count", count);
+        append_json_field(&mut output, "message", entry.get("message"));
+    }
+    Ok(output)
+}
 
 // ─── unity_test_list / unity_test_run ──────────────────────────────────────
 
@@ -25,9 +182,15 @@ pub(super) fn unity_test_list() -> ToolDef {
                     }
                 };
                 match crate::unity_bridge::unity_test_list(&project_path, &args).await {
-                    Ok(output) => ToolResult {
-                        output,
-                        is_error: false,
+                    Ok(output) => match format_unity_test_list(&output) {
+                        Ok(output) => ToolResult {
+                            output,
+                            is_error: false,
+                        },
+                        Err(output) => ToolResult {
+                            output,
+                            is_error: true,
+                        },
                     },
                     Err(output) => ToolResult {
                         output,
@@ -76,9 +239,7 @@ pub(super) fn unity_test_run() -> ToolDef {
                     Ok(snapshot) => {
                         let is_error = snapshot.status != "passed";
                         ToolResult {
-                            output: serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| {
-                                format!("Unity Test run {} {}", snapshot.run_id, snapshot.status)
-                            }),
+                            output: format_unity_test_run(&snapshot),
                             is_error,
                         }
                     }
@@ -527,13 +688,17 @@ pub(super) fn unity_get_console_log() -> ToolDef {
                         };
                     }
                 };
-                match serde_json::to_string_pretty(&output) {
+                let requested_level = args
+                    .get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("all");
+                match format_unity_console_logs(&output, requested_level) {
                     Ok(output) => ToolResult {
                         output,
                         is_error: false,
                     },
-                    Err(error) => ToolResult {
-                        output: format!("Failed to serialize Unity Console logs: {error}"),
+                    Err(output) => ToolResult {
+                        output,
                         is_error: true,
                     },
                 }
@@ -577,12 +742,8 @@ macro_rules! unity_yaml_tool_def {
                             };
                         }
                     };
-                    crate::agent::instance::AgentInstance::$impl_fn(
-                        app_handle,
-                        &working_dir,
-                        &args,
-                    )
-                    .await
+                    crate::agent::instance::AgentInstance::$impl_fn(app_handle, &working_dir, &args)
+                        .await
                 })
             }),
         }
@@ -759,5 +920,65 @@ pub(super) fn unity_recompile() -> ToolDef {
                 }
             })
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_logs_are_flat_and_keep_counts() {
+        let value = serde_json::json!({
+            "entries": [
+                { "level": "error", "message": "Null\nreference", "count": 3 }
+            ],
+            "matchedCount": 3,
+            "uniqueCount": 1,
+            "truncated": false
+        });
+        assert_eq!(
+            format_unity_console_logs(&value, "error").unwrap(),
+            "Unity Console: level=\"error\" matched=3 unique=1 shown=1 truncated=false\n[error] count=3 message=\"Null\\nreference\""
+        );
+    }
+
+    #[test]
+    fn test_list_is_one_test_per_line() {
+        let output = format_unity_test_list(
+            r#"{"mode":"edit","matched":1,"truncated":false,"tests":[{"full_name":"Game.Tests.Replay","assembly":"Game.Tests","mode":"edit","categories":["ui"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            "Unity tests: mode=\"edit\" matched=1 shown=1 truncated=false\n- test=\"Game.Tests.Replay\" assembly=\"Game.Tests\" mode=\"edit\" categories=[\"ui\"]"
+        );
+    }
+
+    #[test]
+    fn test_run_keeps_summary_and_failure_details() {
+        let snapshot = crate::unity_bridge::UnityTestRunSnapshot {
+            run_id: "run-1".to_string(),
+            status: "failed".to_string(),
+            mode: "edit".to_string(),
+            duration_ms: 42,
+            total: 1,
+            failed: 1,
+            failures: vec![serde_json::json!({
+                "full_name": "Game.Tests.Replay",
+                "result_state": "Failed",
+                "duration_ms": 40,
+                "message": "Expected true",
+                "stack_trace": "at ReplayTests.cs:12"
+            })],
+            ..Default::default()
+        };
+        let output = format_unity_test_run(&snapshot);
+        assert!(output.starts_with(
+            "Unity test run: status=\"failed\" mode=\"edit\" run_id=\"run-1\" total=1 passed=0 failed=1"
+        ));
+        assert!(output
+            .contains("\nFailure: test=\"Game.Tests.Replay\" state=\"Failed\" duration_ms=40"));
+        assert!(output.contains("\n  stack_trace:\n    at ReplayTests.cs:12"));
     }
 }

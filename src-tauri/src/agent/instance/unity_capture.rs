@@ -1,10 +1,54 @@
 use crate::session::models::ImageData;
+use crate::tool::output::{append_field, append_text_field, flat_text};
 use crate::tool::ToolResult;
 
 use super::{AgentInstance, ExecutedToolResult};
 
 const DEFAULT_CAPTURE_MAX_LONG_EDGE: u32 = 1280;
 const MAX_CAPTURE_MAX_LONG_EDGE: u32 = 8192;
+
+fn format_unity_capture_output(
+    capture: &crate::unity_bridge::UnityViewportCapture,
+    mime_type: &str,
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+    applied_max_long_edge: u32,
+    capture_area: &str,
+) -> String {
+    let mut output = "Captured Unity viewport:".to_string();
+    append_text_field(&mut output, "target", &capture.target);
+    append_text_field(&mut output, "title", &capture.title);
+    append_text_field(&mut output, "format", "png");
+    append_text_field(&mut output, "mime_type", mime_type);
+
+    let mut dimensions = "dimensions:".to_string();
+    append_field(
+        &mut dimensions,
+        "output",
+        format!("{output_width}x{output_height}"),
+    );
+    append_field(
+        &mut dimensions,
+        "source",
+        format!("{source_width}x{source_height}"),
+    );
+    output.push('\n');
+    output.push_str(&dimensions);
+
+    let mut capture_details = "capture:".to_string();
+    append_text_field(&mut capture_details, "area", capture_area);
+    append_field(&mut capture_details, "max_long_edge", applied_max_long_edge);
+    if let Some(pixels_per_point) = capture.pixels_per_point {
+        append_field(&mut capture_details, "pixels_per_point", pixels_per_point);
+    }
+    output.push('\n');
+    output.push_str(&capture_details);
+    output.push_str("\npath=");
+    output.push_str(&flat_text(&capture.path));
+    output
+}
 
 fn parse_capture_max_long_edge(args: &serde_json::Value) -> Result<u32, String> {
     let Some(value) = args
@@ -179,27 +223,16 @@ impl AgentInstance {
             } else {
                 "viewport"
             });
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "status": "captured",
-            "target": capture.target,
-            "title": capture.title,
-            "format": "png",
-            "mime_type": mime_type,
-            "width": output_width,
-            "height": output_height,
-            "original_width": source_width,
-            "original_height": source_height,
-            "source_width": source_width,
-            "source_height": source_height,
-            "output_width": output_width,
-            "output_height": output_height,
-            "max_long_edge": applied_max_long_edge,
-            "pixels_per_point": capture.pixels_per_point,
-            "capture_area": capture_area,
-            "path": capture.path,
-            "image": "attached"
-        }))
-        .unwrap_or_else(|_| "Unity viewport screenshot captured. PNG image attached.".to_string());
+        let output = format_unity_capture_output(
+            &capture,
+            &mime_type,
+            source_width,
+            source_height,
+            output_width,
+            output_height,
+            applied_max_long_edge,
+            capture_area,
+        );
 
         ExecutedToolResult::from_tool_result(ToolResult {
             output,
@@ -230,6 +263,40 @@ mod tests {
         assert_eq!(
             parse_capture_max_long_edge(&serde_json::json!({ "maxLongEdge": 2048 })).unwrap(),
             2048
+        );
+    }
+
+    #[test]
+    fn capture_output_is_flat_and_keeps_source_dimensions() {
+        let capture = crate::unity_bridge::UnityViewportCapture {
+            target: "game".to_string(),
+            title: "Game".to_string(),
+            path: "C:\\Temp\\game view.png".to_string(),
+            width: 1280,
+            height: 720,
+            original_width: 2560,
+            original_height: 1440,
+            source_width: Some(2560),
+            source_height: Some(1440),
+            output_width: Some(1280),
+            output_height: Some(720),
+            max_long_edge: Some(1280),
+            pixels_per_point: Some(2.0),
+            capture_area: Some("game_viewport".to_string()),
+            mime_type: "image/png".to_string(),
+        };
+        assert_eq!(
+            format_unity_capture_output(
+                &capture,
+                "image/png",
+                2560,
+                1440,
+                1280,
+                720,
+                1280,
+                "game_viewport",
+            ),
+            "Captured Unity viewport: target=\"game\" title=\"Game\" format=\"png\" mime_type=\"image/png\"\ndimensions: output=1280x720 source=2560x1440\ncapture: area=\"game_viewport\" max_long_edge=1280 pixels_per_point=2\npath=\"C:\\\\Temp\\\\game view.png\""
         );
     }
 

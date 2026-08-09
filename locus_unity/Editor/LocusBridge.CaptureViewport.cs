@@ -19,6 +19,11 @@ namespace Locus
         private const int CaptureViewportMaxAllowedLongEdge = 8192;
         private const int CaptureViewportLayoutRetryCount = 5;
 
+        private static bool s_CaptureGameViewTextureFieldInitialized;
+        private static string s_CaptureGameViewTextureFieldError;
+        private static FieldInfo s_CaptureGameViewTextureField;
+        private static bool s_CaptureGameViewFallbackWarningLogged;
+
         private static async Task<PipeEnvelope> HandleCaptureViewport(string requestId, string message)
         {
             CaptureViewportRequest request = ParseCaptureViewportRequest(message);
@@ -31,17 +36,20 @@ namespace Locus
                     string target;
                     string title;
                     EditorWindow window = ResolveCaptureWindow(request, out target, out title);
-                    window.Focus();
-                    window.Repaint();
+                    var operation = new CaptureViewportOperation
+                    {
+                        requestId = requestId,
+                        window = window,
+                        target = target,
+                        title = title,
+                        maxLongEdge = request.maxLongEdge,
+                        layoutRetriesRemaining = CaptureViewportLayoutRetryCount,
+                        useScreenCapture = target != "game",
+                        tcs = tcs
+                    };
 
-                    ScheduleCaptureViewport(
-                        requestId,
-                        window,
-                        target,
-                        title,
-                        request.maxLongEdge,
-                        CaptureViewportLayoutRetryCount,
-                        tcs);
+                    PrepareCaptureWindowForCapture(operation);
+                    ScheduleCaptureViewport(operation);
                 }
                 catch (Exception ex)
                 {
@@ -59,51 +67,109 @@ namespace Locus
             }
         }
 
-        private static void ScheduleCaptureViewport(
-            string requestId,
-            EditorWindow window,
-            string target,
-            string title,
-            int maxLongEdge,
-            int layoutRetriesRemaining,
-            TaskCompletionSource<PipeEnvelope> tcs)
+        private static void ScheduleCaptureViewport(CaptureViewportOperation operation)
         {
             EditorApplication.delayCall += delegate
             {
                 try
                 {
                     CaptureViewportResponse response = CaptureWindowPng(
-                        window,
-                        target,
-                        title,
-                        maxLongEdge,
-                        layoutRetriesRemaining <= 0);
-                    tcs.TrySetResult(OkResponse(requestId, JsonUtility.ToJson(response)));
+                        operation.window,
+                        operation.target,
+                        operation.title,
+                        operation.maxLongEdge,
+                        operation.layoutRetriesRemaining <= 0,
+                        operation.useScreenCapture);
+                    RestoreCaptureWindowSelection(operation);
+                    operation.tcs.TrySetResult(
+                        OkResponse(operation.requestId, JsonUtility.ToJson(response)));
                 }
-                catch (CaptureViewportLayoutException ex)
+                catch (CaptureViewportEngineException ex)
                 {
-                    if (layoutRetriesRemaining > 0 && window != null)
+                    if (!operation.useScreenCapture)
                     {
-                        window.Focus();
-                        window.Repaint();
-                        ScheduleCaptureViewport(
-                            requestId,
-                            window,
-                            target,
-                            title,
-                            maxLongEdge,
-                            layoutRetriesRemaining - 1,
-                            tcs);
+                        if (!s_CaptureGameViewFallbackWarningLogged)
+                        {
+                            s_CaptureGameViewFallbackWarningLogged = true;
+                            Debug.LogWarning(
+                                "[Locus] Game View render-target capture is unavailable; "
+                                + "using the native window fallback. " + ex.Message);
+                        }
+
+                        operation.useScreenCapture = true;
+                        PrepareCaptureWindowForCapture(operation);
+                        ScheduleCaptureViewport(operation);
                         return;
                     }
 
-                    tcs.TrySetResult(ErrorResponse(requestId, ex.Message));
+                    RestoreCaptureWindowSelection(operation);
+                    operation.tcs.TrySetResult(
+                        ErrorResponse(operation.requestId, ex.Message));
+                }
+                catch (CaptureViewportLayoutException ex)
+                {
+                    if (operation.layoutRetriesRemaining > 0 && operation.window != null)
+                    {
+                        operation.layoutRetriesRemaining--;
+                        PrepareCaptureWindowForCapture(operation);
+                        ScheduleCaptureViewport(operation);
+                        return;
+                    }
+
+                    RestoreCaptureWindowSelection(operation);
+                    operation.tcs.TrySetResult(
+                        ErrorResponse(operation.requestId, ex.Message));
                 }
                 catch (Exception ex)
                 {
-                    tcs.TrySetResult(ErrorResponse(requestId, ex.Message));
+                    RestoreCaptureWindowSelection(operation);
+                    operation.tcs.TrySetResult(
+                        ErrorResponse(operation.requestId, ex.Message));
                 }
             };
+        }
+
+        private sealed class CaptureViewportOperation
+        {
+            public string requestId;
+            public EditorWindow window;
+            public string target;
+            public string title;
+            public int maxLongEdge;
+            public int layoutRetriesRemaining;
+            public bool useScreenCapture;
+            public CaptureWindowSelection windowSelection;
+            public TaskCompletionSource<PipeEnvelope> tcs;
+        }
+
+        private sealed class CaptureWindowSelection
+        {
+            public object host;
+            public PropertyInfo selectedProperty;
+            public int previousIndex;
+            public bool changed;
+        }
+
+        private sealed class CapturedViewportImage
+        {
+            public Texture2D texture;
+            public int sourceWidth;
+            public int sourceHeight;
+            public float pixelsPerPoint;
+            public string captureArea;
+        }
+
+        private sealed class CaptureViewportEngineException : InvalidOperationException
+        {
+            public CaptureViewportEngineException(string message)
+                : base(message)
+            {
+            }
+
+            public CaptureViewportEngineException(string message, Exception innerException)
+                : base(message, innerException)
+            {
+            }
         }
 
         private static CaptureViewportRequest ParseCaptureViewportRequest(string message)
@@ -149,7 +215,12 @@ namespace Locus
                 Type gameViewType = typeof(EditorWindow).Assembly.GetType("UnityEditor.GameView");
                 if (gameViewType == null)
                     throw new InvalidOperationException("Unity GameView type is unavailable.");
-                EditorWindow gameView = EditorWindow.GetWindow(gameViewType);
+                EditorWindow gameView = FindExistingCaptureWindow(gameViewType);
+                if (gameView == null)
+                {
+                    throw new InvalidOperationException(
+                        "Unity Game View is not open. Open a Game View once before capturing it.");
+                }
                 title = WindowTitle(gameView);
                 return gameView;
             }
@@ -158,7 +229,12 @@ namespace Locus
             {
                 SceneView sceneView = SceneView.lastActiveSceneView;
                 if (sceneView == null)
-                    sceneView = EditorWindow.GetWindow<SceneView>();
+                    sceneView = FindExistingCaptureWindow(typeof(SceneView)) as SceneView;
+                if (sceneView == null)
+                {
+                    throw new InvalidOperationException(
+                        "Unity Scene View is not open. Open a Scene View once before capturing it.");
+                }
                 title = WindowTitle(sceneView);
                 return sceneView;
             }
@@ -179,6 +255,26 @@ namespace Locus
 
             throw new InvalidOperationException(
                 "Invalid capture target: " + normalizedTarget + ". Allowed values: game, scene, editor_window.");
+        }
+
+        private static EditorWindow FindExistingCaptureWindow(Type windowType)
+        {
+            if (windowType == null)
+                return null;
+
+            EditorWindow first = null;
+            EditorWindow[] windows = Resources.FindObjectsOfTypeAll<EditorWindow>();
+            foreach (EditorWindow window in windows)
+            {
+                if (window == null || !windowType.IsInstanceOfType(window))
+                    continue;
+
+                if (first == null)
+                    first = window;
+                if (IsCaptureWindowSelected(window))
+                    return window;
+            }
+            return first;
         }
 
         private static EditorWindow FindCaptureEditorWindow(string query)
@@ -209,6 +305,115 @@ namespace Locus
                     return window;
             }
             return null;
+        }
+
+        private static bool IsCaptureWindowSelected(EditorWindow window)
+        {
+            object host = GetCaptureHostView(window);
+            if (host == null)
+                return false;
+
+            try
+            {
+                PropertyInfo actualViewProperty = FindCaptureInstanceProperty(
+                    host.GetType(),
+                    "actualView");
+                if (actualViewProperty == null)
+                    return true;
+                return object.ReferenceEquals(
+                    actualViewProperty.GetValue(host, null),
+                    window);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void PrepareCaptureWindowForCapture(
+            CaptureViewportOperation operation)
+        {
+            if (operation == null || operation.window == null)
+                return;
+
+            if (operation.windowSelection == null)
+                operation.windowSelection = SelectCaptureWindowWithoutFocus(operation.window);
+            operation.window.Repaint();
+        }
+
+        private static CaptureWindowSelection SelectCaptureWindowWithoutFocus(EditorWindow window)
+        {
+            var selection = new CaptureWindowSelection();
+            object host = GetCaptureHostView(window);
+            if (host == null)
+                return selection;
+
+            try
+            {
+                PropertyInfo actualViewProperty = FindCaptureInstanceProperty(
+                    host.GetType(),
+                    "actualView");
+                object actualView = actualViewProperty != null
+                    ? actualViewProperty.GetValue(host, null)
+                    : null;
+                if (object.ReferenceEquals(actualView, window))
+                    return selection;
+
+                FieldInfo panesField = FindCaptureInstanceField(host.GetType(), "m_Panes");
+                var panes = panesField != null
+                    ? panesField.GetValue(host) as System.Collections.IList
+                    : null;
+                PropertyInfo selectedProperty = FindCaptureInstanceProperty(
+                    host.GetType(),
+                    "selected");
+                if (panes == null || selectedProperty == null || !selectedProperty.CanWrite)
+                    return selection;
+
+                int targetIndex = panes.IndexOf(window);
+                if (targetIndex < 0)
+                    return selection;
+
+                object previousValue = selectedProperty.GetValue(host, null);
+                int previousIndex = previousValue is int ? (int)previousValue : -1;
+                selection.host = host;
+                selection.selectedProperty = selectedProperty;
+                selection.previousIndex = previousIndex;
+                selection.changed = previousIndex >= 0 && previousIndex != targetIndex;
+                selectedProperty.SetValue(host, targetIndex, null);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    "[Locus] Failed to select the capture tab without focus: " + ex.Message);
+            }
+            return selection;
+        }
+
+        private static void RestoreCaptureWindowSelection(CaptureViewportOperation operation)
+        {
+            if (operation == null)
+                return;
+
+            CaptureWindowSelection selection = operation.windowSelection;
+            operation.windowSelection = null;
+            if (selection == null || !selection.changed
+                || selection.host == null || selection.selectedProperty == null)
+            {
+                return;
+            }
+
+            try
+            {
+                selection.selectedProperty.SetValue(
+                    selection.host,
+                    selection.previousIndex,
+                    null);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning(
+                    "[Locus] Failed to restore the previously selected Unity tab: " + ex.Message);
+            }
         }
 
         private static bool WindowMatches(EditorWindow window, string query, bool exact)
@@ -246,7 +451,8 @@ namespace Locus
             string target,
             string title,
             int maxLongEdge,
-            bool degradeToWindowOnLayoutFailure)
+            bool degradeToWindowOnLayoutFailure,
+            bool useScreenCapture)
         {
             if (window == null)
                 throw new InvalidOperationException("Editor window is unavailable.");
@@ -257,19 +463,16 @@ namespace Locus
                     + CaptureViewportMaxAllowedLongEdge + ".");
             }
 
-            CaptureViewportRegion region = ResolveCaptureViewportRegion(
-                window,
-                target,
-                degradeToWindowOnLayoutFailure);
-
-            Texture2D texture = CaptureEditorWindowTexture(region);
-            int sourceWidth = texture.width;
-            int sourceHeight = texture.height;
-            Texture2D encodedTexture = null;
+            CapturedViewportImage captured = target == "game" && !useScreenCapture
+                ? CaptureRenderedGameView(window, maxLongEdge)
+                : CaptureScreenViewport(
+                    window,
+                    target,
+                    maxLongEdge,
+                    degradeToWindowOnLayoutFailure);
             try
             {
-                encodedTexture = ResizeForCapture(texture, maxLongEdge);
-                byte[] png = encodedTexture.EncodeToPNG();
+                byte[] png = captured.texture.EncodeToPNG();
                 string dir = Path.Combine(
                     Directory.GetParent(Application.dataPath).FullName,
                     "Library",
@@ -286,25 +489,65 @@ namespace Locus
                     target = target,
                     title = title,
                     path = path,
-                    width = encodedTexture.width,
-                    height = encodedTexture.height,
-                    originalWidth = sourceWidth,
-                    originalHeight = sourceHeight,
-                    sourceWidth = sourceWidth,
-                    sourceHeight = sourceHeight,
-                    outputWidth = encodedTexture.width,
-                    outputHeight = encodedTexture.height,
+                    width = captured.texture.width,
+                    height = captured.texture.height,
+                    originalWidth = captured.sourceWidth,
+                    originalHeight = captured.sourceHeight,
+                    sourceWidth = captured.sourceWidth,
+                    sourceHeight = captured.sourceHeight,
+                    outputWidth = captured.texture.width,
+                    outputHeight = captured.texture.height,
                     maxLongEdge = maxLongEdge,
-                    pixelsPerPoint = region.pixelsPerPoint,
-                    captureArea = region.captureArea,
+                    pixelsPerPoint = captured.pixelsPerPoint,
+                    captureArea = captured.captureArea,
                     mimeType = "image/png"
                 };
             }
             finally
             {
-                if (encodedTexture != null && !object.ReferenceEquals(encodedTexture, texture))
-                    UnityEngine.Object.DestroyImmediate(encodedTexture);
-                UnityEngine.Object.DestroyImmediate(texture);
+                if (captured.texture != null)
+                    UnityEngine.Object.DestroyImmediate(captured.texture);
+            }
+        }
+
+        private static CapturedViewportImage CaptureScreenViewport(
+            EditorWindow window,
+            string target,
+            int maxLongEdge,
+            bool degradeToWindowOnLayoutFailure)
+        {
+            if (!IsCaptureWindowSelected(window))
+            {
+                throw new CaptureViewportLayoutException(
+                    "The target Unity tab could not be selected for background capture.");
+            }
+
+            CaptureViewportRegion region = ResolveCaptureViewportRegion(
+                window,
+                target,
+                degradeToWindowOnLayoutFailure);
+            Texture2D source = CaptureEditorWindowTexture(region);
+            try
+            {
+                int sourceWidth = source.width;
+                int sourceHeight = source.height;
+                Texture2D output = ResizeForCapture(source, maxLongEdge);
+                if (!object.ReferenceEquals(output, source))
+                    UnityEngine.Object.DestroyImmediate(source);
+                return new CapturedViewportImage
+                {
+                    texture = output,
+                    sourceWidth = sourceWidth,
+                    sourceHeight = sourceHeight,
+                    pixelsPerPoint = region.pixelsPerPoint,
+                    captureArea = region.captureArea
+                };
+            }
+            catch
+            {
+                if (source != null)
+                    UnityEngine.Object.DestroyImmediate(source);
+                throw;
             }
         }
 
@@ -418,6 +661,13 @@ namespace Locus
                         "worldBound",
                         out localRect))
                 {
+                    return localRect;
+                }
+
+                if (TryReadCaptureRectProperty(window, "cameraViewport", out localRect))
+                {
+                    if (hostSpace)
+                        localRect = OffsetCaptureRectByHostBorder(window, localRect);
                     return localRect;
                 }
 
@@ -553,6 +803,23 @@ namespace Locus
             return null;
         }
 
+        private static FieldInfo FindCaptureInstanceField(Type type, string fieldName)
+        {
+            while (type != null)
+            {
+                FieldInfo field = type.GetField(
+                    fieldName,
+                    BindingFlags.Instance
+                        | BindingFlags.Public
+                        | BindingFlags.NonPublic
+                        | BindingFlags.DeclaredOnly);
+                if (field != null)
+                    return field;
+                type = type.BaseType;
+            }
+            return null;
+        }
+
         private static bool IsFiniteCaptureRect(Rect rect)
         {
             return !float.IsNaN(rect.x) && !float.IsInfinity(rect.x)
@@ -665,6 +932,167 @@ namespace Locus
             int right = Mathf.RoundToInt(rect.xMax * pixelsPerPoint);
             int bottom = Mathf.RoundToInt(rect.yMax * pixelsPerPoint);
             return new RectInt(left, top, Mathf.Max(1, right - left), Mathf.Max(1, bottom - top));
+        }
+
+        private static CapturedViewportImage CaptureRenderedGameView(
+            EditorWindow gameView,
+            int maxLongEdge)
+        {
+            EnsureCaptureGameViewTextureField(gameView);
+
+            RenderTexture source = s_CaptureGameViewTextureField.GetValue(gameView)
+                as RenderTexture;
+            if (source == null || !source.IsCreated())
+            {
+                throw new CaptureViewportEngineException(
+                    "Unity Game View has not produced a render target yet.");
+            }
+
+            RenderTexture resized = null;
+            try
+            {
+                int sourceWidth = source.width;
+                int sourceHeight = source.height;
+
+                int outputWidth;
+                int outputHeight;
+                CalculateCaptureOutputSize(
+                    sourceWidth,
+                    sourceHeight,
+                    maxLongEdge,
+                    out outputWidth,
+                    out outputHeight);
+
+                bool flipVertically = SystemInfo.graphicsUVStartsAtTop;
+                // Always blit through a pooled ARGB32 target. Besides applying the
+                // requested resize before CPU readback, this resolves MSAA and
+                // normalizes custom-SRP render-target formats across graphics APIs.
+                resized = RenderTexture.GetTemporary(
+                    outputWidth,
+                    outputHeight,
+                    0,
+                    RenderTextureFormat.ARGB32,
+                    RenderTextureReadWrite.Default,
+                    1);
+                if (flipVertically)
+                {
+                    Graphics.Blit(
+                        source,
+                        resized,
+                        new Vector2(1f, -1f),
+                        new Vector2(0f, 1f));
+                }
+                else
+                {
+                    Graphics.Blit(source, resized);
+                }
+
+                return new CapturedViewportImage
+                {
+                    texture = ReadCaptureRenderTexture(
+                        resized,
+                        outputWidth,
+                        outputHeight),
+                    sourceWidth = sourceWidth,
+                    sourceHeight = sourceHeight,
+                    // Engine render targets are already addressed in physical pixels.
+                    pixelsPerPoint = 1f,
+                    captureArea = "game_viewport"
+                };
+            }
+            catch (CaptureViewportEngineException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new CaptureViewportEngineException(
+                    "Unity Game View render-target readback failed: " + ex.Message,
+                    ex);
+            }
+            finally
+            {
+                if (resized != null)
+                    RenderTexture.ReleaseTemporary(resized);
+            }
+        }
+
+        private static void EnsureCaptureGameViewTextureField(EditorWindow gameView)
+        {
+            if (!s_CaptureGameViewTextureFieldInitialized)
+            {
+                s_CaptureGameViewTextureFieldInitialized = true;
+                try
+                {
+                    s_CaptureGameViewTextureField = FindCaptureInstanceField(
+                        gameView.GetType(),
+                        "m_RenderTexture");
+                    if (s_CaptureGameViewTextureField == null
+                        || !typeof(RenderTexture).IsAssignableFrom(
+                            s_CaptureGameViewTextureField.FieldType))
+                    {
+                        s_CaptureGameViewTextureFieldError =
+                            "This Unity version does not expose the rendered Game View texture.";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    s_CaptureGameViewTextureFieldError =
+                        "Failed to inspect the rendered Unity Game View texture: "
+                        + ex.Message;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(s_CaptureGameViewTextureFieldError))
+                throw new CaptureViewportEngineException(
+                    s_CaptureGameViewTextureFieldError);
+        }
+
+        private static void CalculateCaptureOutputSize(
+            int sourceWidth,
+            int sourceHeight,
+            int maxLongEdge,
+            out int outputWidth,
+            out int outputHeight)
+        {
+            int longEdge = Mathf.Max(sourceWidth, sourceHeight);
+            if (maxLongEdge <= 0 || longEdge <= maxLongEdge)
+            {
+                outputWidth = sourceWidth;
+                outputHeight = sourceHeight;
+                return;
+            }
+
+            float scale = (float)maxLongEdge / (float)longEdge;
+            outputWidth = Mathf.Max(1, Mathf.RoundToInt(sourceWidth * scale));
+            outputHeight = Mathf.Max(1, Mathf.RoundToInt(sourceHeight * scale));
+        }
+
+        private static Texture2D ReadCaptureRenderTexture(
+            RenderTexture source,
+            int width,
+            int height)
+        {
+            RenderTexture previous = RenderTexture.active;
+            Texture2D texture = null;
+            try
+            {
+                RenderTexture.active = source;
+                texture = new Texture2D(width, height, TextureFormat.RGB24, false);
+                texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                texture.Apply(false);
+                return texture;
+            }
+            catch
+            {
+                if (texture != null)
+                    UnityEngine.Object.DestroyImmediate(texture);
+                throw;
+            }
+            finally
+            {
+                RenderTexture.active = previous;
+            }
         }
 
         private static Texture2D CaptureEditorWindowTexture(CaptureViewportRegion region)
@@ -1211,23 +1639,34 @@ namespace Locus
 
         private static Texture2D ResizeForCapture(Texture2D source, int maxLongEdge)
         {
-            int longEdge = Mathf.Max(source.width, source.height);
-            if (maxLongEdge <= 0 || longEdge <= maxLongEdge)
+            int width;
+            int height;
+            CalculateCaptureOutputSize(
+                source.width,
+                source.height,
+                maxLongEdge,
+                out width,
+                out height);
+            if (width == source.width && height == source.height)
                 return source;
 
-            float scale = (float)maxLongEdge / (float)longEdge;
-            int width = Mathf.Max(1, Mathf.RoundToInt(source.width * scale));
-            int height = Mathf.Max(1, Mathf.RoundToInt(source.height * scale));
             RenderTexture rt = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
             RenderTexture previous = RenderTexture.active;
+            Texture2D resized = null;
             try
             {
                 Graphics.Blit(source, rt);
                 RenderTexture.active = rt;
-                Texture2D resized = new Texture2D(width, height, TextureFormat.RGB24, false);
+                resized = new Texture2D(width, height, TextureFormat.RGB24, false);
                 resized.ReadPixels(new Rect(0, 0, width, height), 0, 0);
                 resized.Apply(false);
                 return resized;
+            }
+            catch
+            {
+                if (resized != null)
+                    UnityEngine.Object.DestroyImmediate(resized);
+                throw;
             }
             finally
             {

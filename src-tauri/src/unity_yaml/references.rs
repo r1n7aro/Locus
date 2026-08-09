@@ -176,7 +176,10 @@ pub fn build_refs_from_docs(
 /// target component's `m_Script` GUID and host GameObject name are recovered
 /// from `docs` the same way `build_refs_from_docs` builds its maps; anim
 /// events and unresolvable targets carry empty target fields.
-pub fn build_bindings_from_docs(docs: &[YamlDoc], raw: Vec<RawMemberBinding>) -> Vec<MemberBinding> {
+pub fn build_bindings_from_docs(
+    docs: &[YamlDoc],
+    raw: Vec<RawMemberBinding>,
+) -> Vec<MemberBinding> {
     let doc_map: HashMap<i64, &YamlDoc> = docs.iter().map(|d| (d.file_id, d)).collect();
 
     // GameObject fileID -> m_Name, and component fileID -> its GameObject id,
@@ -192,11 +195,7 @@ pub fn build_bindings_from_docs(docs: &[YamlDoc], raw: Vec<RawMemberBinding>) ->
             let (target_type_full, target_type_short_lower) = match r.target_type_name {
                 Some(ref name) => {
                     let full = name.split(',').next().unwrap_or(name).trim().to_string();
-                    let short_lower = full
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
+                    let short_lower = full.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
                     (full, short_lower)
                 }
                 None => (String::new(), String::new()),
@@ -209,9 +208,7 @@ pub fn build_bindings_from_docs(docs: &[YamlDoc], raw: Vec<RawMemberBinding>) ->
             if let Some(fid) = r.target_file_id.filter(|id| *id != 0) {
                 if let Some(doc) = doc_map.get(&fid) {
                     target_script_guid = doc.m_script_guid;
-                    if let Some(name) = doc
-                        .m_game_object_id
-                        .and_then(|go_id| go_names.get(&go_id))
+                    if let Some(name) = doc.m_game_object_id.and_then(|go_id| go_names.get(&go_id))
                     {
                         target_go_name = name.to_string();
                     }

@@ -44,6 +44,7 @@ const suiteItems: SuiteItem[] = [
   { id: "native-bridge", labelKey: "settings.testing.suite.nativeBridge", descKey: "settings.testing.suite.nativeBridgeDesc" },
   { id: "hot-reload", labelKey: "settings.testing.suite.hotReload", descKey: "settings.testing.suite.hotReloadDesc" },
   { id: "execute", labelKey: "settings.testing.suite.execute", descKey: "settings.testing.suite.executeDesc" },
+  { id: "yaml-parity", labelKey: "settings.testing.suite.yamlParity", descKey: "settings.testing.suite.yamlParityDesc" },
 ];
 
 const running = ref(false);

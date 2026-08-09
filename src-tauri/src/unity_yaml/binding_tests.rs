@@ -118,7 +118,11 @@ fn monobehaviour_functionname_field_is_not_an_anim_event() {
         "a functionName field on a MonoBehaviour must not be captured as a binding"
     );
     // … while the real AnimationClip (class 74) event is still captured.
-    assert_eq!(bindings.len(), 1, "only the AnimationClip event should bind");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "only the AnimationClip event should bind"
+    );
     assert_eq!(bindings[0].binding_kind, 1);
     assert_eq!(bindings[0].method_name, "OnFootstep");
 }

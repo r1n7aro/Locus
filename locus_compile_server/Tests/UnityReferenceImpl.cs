@@ -130,6 +130,7 @@ internal static class UnityReferenceImpl
         sb.AppendLine("using UnityEditor;");
         sb.AppendLine("using UnityEditor.SceneManagement;");
         sb.AppendLine("using UnityEditor.Animations;");
+        sb.AppendLine("using Locus;");
         sb.AppendLine("using static UnityEngine.Object;");
         sb.AppendLine("using Object = UnityEngine.Object;");
 

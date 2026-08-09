@@ -970,6 +970,18 @@ pub struct UnityExecuteProgressSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub source: String,
+    #[serde(default, rename = "waitKind")]
+    pub wait_kind: String,
+    #[serde(default, rename = "waitTarget")]
+    pub wait_target: String,
+    #[serde(default, rename = "waitCondition")]
+    pub wait_condition: String,
+    #[serde(default, rename = "sourceLine")]
+    pub source_line: u32,
+    #[serde(default, rename = "sourceText")]
+    pub source_text: String,
+    #[serde(default, rename = "waitedMs")]
+    pub waited_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2135,8 +2147,8 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 .await
                 .filter(|status| status.native_alive)
                 .map(|status| parse_unity_status_message(&status.editor_status));
-            let (editor_status, scene_path) = native_editor_state
-                .unwrap_or((UNITY_EDITOR_STATUS_DISCONNECTED, None));
+            let (editor_status, scene_path) =
+                native_editor_state.unwrap_or((UNITY_EDITOR_STATUS_DISCONNECTED, None));
             let mut status = UnityConnectionStatus {
                 // `Ok(None)` is returned only after get_or_connect succeeded and
                 // the existing connection's writer lock was observed busy. It
@@ -3436,6 +3448,31 @@ pub async fn unity_test_list(
         .map_err(|error| format!("Failed to format Unity Test list: {error}"))
 }
 
+pub async fn yaml_preview_cache_selftest(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize YAML parity request: {error}"))?;
+    let response = send_message_with_transient_retry(
+        project_path,
+        "yaml_preview_cache_selftest",
+        &payload,
+        Duration::from_secs(180),
+        "YAML preview cache self-test",
+    )
+    .await?;
+    if !response.ok {
+        return Err(response.error.unwrap_or_else(|| {
+            "YAML preview cache self-test failed. Update the Locus Unity plugin and recompile the project."
+                .to_string()
+        }));
+    }
+    Ok(response.message.unwrap_or_default())
+}
+
 pub async fn unity_test_run(
     project_path: &str,
     request: &serde_json::Value,
@@ -3702,11 +3739,18 @@ fn rust_unity_execute_progress(
         progress: 0.0,
         revision,
         source: "rust".to_string(),
+        wait_kind: String::new(),
+        wait_target: String::new(),
+        wait_condition: String::new(),
+        source_line: 0,
+        source_text: String::new(),
+        waited_ms: 0,
     }
 }
 
 async fn query_unity_execute_progress(
     project_path: &str,
+    execution_id: &str,
 ) -> Result<Option<UnityExecuteProgressSnapshot>, String> {
     let started = std::time::Instant::now();
     // Writer-free variant: this poll runs in a `select!` handler on the same
@@ -3717,7 +3761,7 @@ async fn query_unity_execute_progress(
     let resp = transport::send_message_if_writer_free(
         project_path,
         "execute_code_progress",
-        "",
+        execution_id,
         Duration::from_secs(2),
     )
     .await
@@ -3837,11 +3881,14 @@ fn append_execute_reconnect_result(reason: &str, reconnect: Result<(), String>) 
     }
 }
 
-pub async fn cancel_unity_execute_code(project_path: &str) -> Result<String, String> {
+pub async fn cancel_unity_execute_code(
+    project_path: &str,
+    execution_id: &str,
+) -> Result<String, String> {
     let resp = send_message_with_timeout(
         project_path,
         "cancel_execute_code",
-        "",
+        execution_id,
         Duration::from_secs(5),
     )
     .await?;
@@ -4318,6 +4365,39 @@ async fn prepare_unity_run_states_request_for_send(
     crate::unity_type_index::prepare_unity_run_states_request(request, index.as_deref())
 }
 
+const UNITY_EXECUTE_EXECUTION_ID_MARKER: &str = "//__LOCUS_EXECUTION_ID__:";
+
+fn unity_execute_code_with_execution_id(code: &str, execution_id: &str) -> String {
+    format!(
+        "{}\n{}{}",
+        code.trim_end(),
+        UNITY_EXECUTE_EXECUTION_ID_MARKER,
+        execution_id
+    )
+}
+
+fn unity_execute_loaded_payload_with_execution_id(
+    payload: String,
+    execution_id: &str,
+    source_code: &str,
+) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|error| format!("Failed to parse execute_loaded payload: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "execute_loaded payload is not an object".to_string())?;
+    object.insert(
+        "execution_id".to_string(),
+        serde_json::Value::String(execution_id.to_string()),
+    );
+    object.insert(
+        "source_code".to_string(),
+        serde_json::Value::String(source_code.to_string()),
+    );
+    serde_json::to_string(&value)
+        .map_err(|error| format!("Failed to serialize execute_loaded payload: {error}"))
+}
+
 pub async fn unity_execute_code_with_progress<F>(
     project_path: &str,
     code: &str,
@@ -4369,6 +4449,7 @@ async fn unity_execute_code_with_progress_mode<F>(
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
+    let execution_id = format!("exec-{}", uuid::Uuid::new_v4().simple());
     let mut rust_progress_revision = 1u64;
     on_progress(rust_unity_execute_progress(
         "Waiting for Locus Unity operation lock",
@@ -4388,9 +4469,10 @@ where
     rust_progress_revision += 1;
 
     let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
+    let prepared_code = unity_execute_code_with_execution_id(&prepared.code, &execution_id);
 
     let mut execute_msg_type = "execute_code";
-    let mut execute_payload = prepared.code.clone();
+    let mut execute_payload = prepared_code.clone();
     if crate::csharp_compile::is_enabled() {
         on_progress(rust_unity_execute_progress(
             "Compiling snippet in compile server",
@@ -4400,12 +4482,17 @@ where
         rust_progress_revision += 1;
         match sidecar_compile_for_execute(
             project_path,
-            &prepared.code,
+            &prepared_code,
             non_public_access_probe_mode,
         )
         .await
         {
             SidecarCompileAttempt::Compiled { payload } => {
+                let payload = unity_execute_loaded_payload_with_execution_id(
+                    payload,
+                    &execution_id,
+                    &prepared_code,
+                )?;
                 on_progress(rust_unity_execute_progress(
                     "Compile server returned snippet assembly",
                     format!("{} bytes execute_loaded payload", payload.len()),
@@ -4432,6 +4519,12 @@ where
     } else if require_sidecar {
         return Err("non-public access probe requires the sidecar compiler".to_string());
     }
+
+    // Compilation and request bootstrap are serialized. The async Unity
+    // execution owns its own execution id, progress, heartbeat and cancellation
+    // state, so it no longer occupies the project-wide operation lock while it
+    // waits across frames.
+    drop(_guard);
 
     let mut send_attempt = 1u32;
     let resp = loop {
@@ -4473,7 +4566,7 @@ where
             tokio::select! {
                 result = &mut execute => break result,
                 _ = progress_tick.tick() => {
-                    match query_unity_execute_progress(project_path).await {
+                    match query_unity_execute_progress(project_path, &execution_id).await {
                         Ok(Some(snapshot)) => {
                             last_progress_poll_error = None;
                             progress_unavailable_since = None;
@@ -4567,7 +4660,7 @@ where
                     "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
                 );
                 execute_msg_type = "execute_code";
-                execute_payload = prepared.code.clone();
+                execute_payload = prepared_code.clone();
             }
             Ok(resp)
                 if pipe_response_transient_broker_error(&resp)
@@ -4686,6 +4779,7 @@ where
         return Err(UNITY_EXECUTE_CANCELLED.to_string());
     }
 
+    let execution_id = format!("exec-{}", uuid::Uuid::new_v4().simple());
     let mut rust_progress_revision = 1u64;
     on_progress(rust_unity_execute_progress(
         "Waiting for Locus Unity operation lock",
@@ -4695,7 +4789,7 @@ where
     rust_progress_revision += 1;
 
     let op_lock = project_unity_op_lock(project_path).await;
-    let _guard = tokio::select! {
+    let guard = tokio::select! {
         guard = op_lock.lock() => guard,
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
@@ -4711,9 +4805,10 @@ where
         prepared = prepare_unity_execute_code_for_send(project_path, code) => prepared,
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
+    let prepared_code = unity_execute_code_with_execution_id(&prepared.code, &execution_id);
 
     let mut execute_msg_type = "execute_code";
-    let mut execute_payload = prepared.code.clone();
+    let mut execute_payload = prepared_code.clone();
     if crate::csharp_compile::is_enabled() {
         on_progress(rust_unity_execute_progress(
             "Compiling snippet in compile server",
@@ -4724,13 +4819,18 @@ where
         let attempt = tokio::select! {
             attempt = sidecar_compile_for_execute(
                 project_path,
-                &prepared.code,
+                &prepared_code,
                 non_public_access_probe_mode,
             ) => attempt,
             _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
         };
         match attempt {
             SidecarCompileAttempt::Compiled { payload } => {
+                let payload = unity_execute_loaded_payload_with_execution_id(
+                    payload,
+                    &execution_id,
+                    &prepared_code,
+                )?;
                 on_progress(rust_unity_execute_progress(
                     "Compile server returned snippet assembly",
                     format!("{} bytes execute_loaded payload", payload.len()),
@@ -4757,6 +4857,11 @@ where
     } else if require_sidecar {
         return Err("non-public access probe requires the sidecar compiler".to_string());
     }
+
+    // Only preparation and compilation are serialized. Once Unity owns a
+    // request-scoped execution id, frame-spanning awaits no longer occupy the
+    // project-wide operation lock.
+    drop(guard);
 
     let mut send_attempt = 1u32;
     let resp = loop {
@@ -4803,7 +4908,7 @@ where
                         continue;
                     }
 
-                    if let Err(error) = cancel_unity_execute_code(project_path).await {
+                    if let Err(error) = cancel_unity_execute_code(project_path, &execution_id).await {
                         eprintln!("[Locus] cancel_execute_code skipped: {}", error);
                     }
 
@@ -4826,7 +4931,7 @@ where
                                 break;
                             },
                             _ = progress_tick.tick() => {
-                                if let Ok(Some(snapshot)) = query_unity_execute_progress(project_path).await {
+                                if let Ok(Some(snapshot)) = query_unity_execute_progress(project_path, &execution_id).await {
                                     if snapshot.revision != last_progress_revision {
                                         last_progress_revision = snapshot.revision;
                                         on_progress(snapshot);
@@ -4839,7 +4944,7 @@ where
                     return Err(UNITY_EXECUTE_CANCELLED.to_string());
                 },
                 _ = progress_tick.tick() => {
-                    match query_unity_execute_progress(project_path).await {
+                    match query_unity_execute_progress(project_path, &execution_id).await {
                         Ok(Some(snapshot)) => {
                             last_progress_poll_error = None;
                             progress_unavailable_since = None;
@@ -4944,7 +5049,7 @@ where
                     "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
                 );
                 execute_msg_type = "execute_code";
-                execute_payload = prepared.code.clone();
+                execute_payload = prepared_code.clone();
             }
             Ok(resp)
                 if pipe_response_transient_broker_error(&resp)
@@ -5863,16 +5968,13 @@ mod tests {
             .join("Locus")
             .join("UnityEmbed.disabled");
 
-        super::sync_unity_embed_enabled_marker(&project_path, true)
-            .expect("keep embed enabled");
+        super::sync_unity_embed_enabled_marker(&project_path, true).expect("keep embed enabled");
         assert!(!marker.exists());
 
-        super::sync_unity_embed_enabled_marker(&project_path, false)
-            .expect("disable embed");
+        super::sync_unity_embed_enabled_marker(&project_path, false).expect("disable embed");
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "disabled\n");
 
-        super::sync_unity_embed_enabled_marker(&project_path, true)
-            .expect("enable embed");
+        super::sync_unity_embed_enabled_marker(&project_path, true).expect("enable embed");
         assert!(!marker.exists());
     }
 

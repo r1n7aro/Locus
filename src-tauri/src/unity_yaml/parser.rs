@@ -1507,10 +1507,7 @@ pub fn find_hierarchy_node_by_path<'a>(
     // Segments are matched untrimmed first (names with leading/trailing
     // spaces exist in real projects and the ⟦ ⟧ display wrapping is designed
     // to make them visible); whitespace-only segments are still skipped.
-    let parts: Vec<&str> = path
-        .split('/')
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.trim().is_empty()).collect();
     if parts.is_empty() {
         return None;
     }

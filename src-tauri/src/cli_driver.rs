@@ -27,6 +27,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_SUITE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_POLL_MS: u64 = 500;
 const DEFAULT_NO_PROGRESS_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_YAML_PARITY_SAMPLE_COUNT: u32 = 5;
 const POST_PLUGIN_INSTALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const UNITY_INTEGRATION_TEST_EVENT: &str = "unity-integration-test";
 
@@ -52,6 +53,7 @@ pub enum CliDriverSuite {
     HotReload,
     HotReloadRelease,
     Execute,
+    YamlParity,
     UnityTest,
 }
 
@@ -66,6 +68,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::Execute => "execute",
+            CliDriverSuite::YamlParity => "yaml-parity",
             CliDriverSuite::UnityTest => "unity-test",
         }
     }
@@ -81,6 +84,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
+            CliDriverSuite::YamlParity => None,
             CliDriverSuite::UnityTest => None,
         }
     }
@@ -94,6 +98,8 @@ pub struct CliDriverConfig {
     pub install_plugin: bool,
     pub force_edit_mode: bool,
     pub type_index_sample_mode: crate::unity_type_index_selftest::TypeIndexSampleMode,
+    pub yaml_parity_sample_count: u32,
+    pub yaml_parity_seed: i32,
     pub connect_timeout: Duration,
     pub suite_timeout: Duration,
     pub poll_interval: Duration,
@@ -115,6 +121,10 @@ pub struct UnityIntegrationTestRunRequest {
     pub force_edit_mode: Option<bool>,
     #[serde(default)]
     pub type_index_sample_mode: Option<String>,
+    #[serde(default)]
+    pub yaml_parity_sample_count: Option<u32>,
+    #[serde(default)]
+    pub yaml_parity_seed: Option<i32>,
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -255,6 +265,11 @@ impl UnityIntegrationTestRunRequest {
                 .map(crate::unity_type_index_selftest::TypeIndexSampleMode::parse)
                 .transpose()?
                 .unwrap_or_default(),
+            yaml_parity_sample_count: self
+                .yaml_parity_sample_count
+                .unwrap_or(DEFAULT_YAML_PARITY_SAMPLE_COUNT)
+                .clamp(1, 50),
+            yaml_parity_seed: self.yaml_parity_seed.unwrap_or(0),
             connect_timeout: Duration::from_millis(
                 self.connect_timeout_ms
                     .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
@@ -297,6 +312,8 @@ impl CliDriverConfig {
         let mut force_edit_mode = true;
         let mut type_index_sample_mode =
             crate::unity_type_index_selftest::TypeIndexSampleMode::default();
+        let mut yaml_parity_sample_count = DEFAULT_YAML_PARITY_SAMPLE_COUNT;
+        let mut yaml_parity_seed = 0i32;
         let mut connect_timeout = Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS);
         let mut suite_timeout = Duration::from_millis(DEFAULT_SUITE_TIMEOUT_MS);
         let mut poll_interval = Duration::from_millis(DEFAULT_POLL_MS);
@@ -405,6 +422,41 @@ impl CliDriverConfig {
                             Err(error) => return Some(Err(error)),
                         };
                 }
+                Some(("--yaml-parity-samples", value)) => {
+                    let value = match read_option_value(
+                        "--yaml-parity-samples",
+                        value,
+                        &args,
+                        &mut index,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    yaml_parity_sample_count = match value.parse::<u32>() {
+                        Ok(value) if (1..=50).contains(&value) => value,
+                        _ => {
+                            return Some(Err(
+                                "--yaml-parity-samples requires an integer from 1 to 50"
+                                    .to_string(),
+                            ))
+                        }
+                    };
+                }
+                Some(("--yaml-parity-seed", value)) => {
+                    let value =
+                        match read_option_value("--yaml-parity-seed", value, &args, &mut index) {
+                            Ok(value) => value,
+                            Err(error) => return Some(Err(error)),
+                        };
+                    yaml_parity_seed = match value.parse::<i32>() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Some(Err(
+                                "--yaml-parity-seed requires a signed 32-bit integer".to_string()
+                            ))
+                        }
+                    };
+                }
                 _ if arg == "--locus-unity-test" => {
                     driver_requested = true;
                 }
@@ -437,6 +489,8 @@ impl CliDriverConfig {
             install_plugin,
             force_edit_mode,
             type_index_sample_mode,
+            yaml_parity_sample_count,
+            yaml_parity_seed,
             connect_timeout,
             suite_timeout,
             poll_interval,
@@ -457,7 +511,9 @@ fn split_arg(arg: &str) -> Option<(&str, &str)> {
         | "--connect-timeout-ms"
         | "--poll-ms"
         | "--no-progress-timeout-ms"
-        | "--type-index-sample" => Some((name, value)),
+        | "--type-index-sample"
+        | "--yaml-parity-samples"
+        | "--yaml-parity-seed" => Some((name, value)),
         _ => None,
     }
 }
@@ -507,6 +563,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
                 CliDriverSuite::HotReload,
                 CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::Execute,
+                CliDriverSuite::YamlParity,
             ] {
                 if !suites.contains(&suite) {
                     suites.push(suite);
@@ -527,12 +584,15 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
+        "yaml-parity" | "yaml_parity" | "yaml-diff" | "yaml_diff" => {
+            CliDriverSuite::YamlParity
+        }
         "unity-test" | "unity_test" | "test-framework" | "test_framework" => {
             CliDriverSuite::UnityTest
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, unity-test, or all.",
+            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -645,6 +705,8 @@ async fn run_driver(
             "openUnity": config.open_unity,
             "installPlugin": config.install_plugin,
             "typeIndexSampleMode": config.type_index_sample_mode.as_str(),
+            "yamlParitySampleCount": config.yaml_parity_sample_count,
+            "yamlParitySeed": config.yaml_parity_seed,
             "connectTimeoutMs": config.connect_timeout.as_millis(),
             "suiteTimeoutMs": config.suite_timeout.as_millis(),
             "noProgressTimeoutMs": config.no_progress_timeout.as_millis(),
@@ -811,6 +873,25 @@ async fn run_driver(
                     Err(error) => Err(error),
                 }
             }
+            CliDriverSuite::YamlParity => {
+                let edit_mode_result = if config.force_edit_mode {
+                    ensure_edit_mode(
+                        &project,
+                        *suite,
+                        config.connect_timeout,
+                        config.poll_interval,
+                        &sink,
+                        &mut cancel_rx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => run_yaml_parity_suite(&project, *suite, &config, &sink).await,
+                    Err(error) => Err(error),
+                }
+            }
             CliDriverSuite::UnityTest => {
                 let edit_mode_result = if config.force_edit_mode {
                     ensure_edit_mode(
@@ -858,6 +939,95 @@ async fn run_driver(
 
     sink.emit("finished", json!({ "ok": true }));
     Ok(())
+}
+
+async fn run_yaml_parity_suite(
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": suite.as_str(),
+            "project": project,
+            "sampleCount": config.yaml_parity_sample_count,
+            "seed": config.yaml_parity_seed,
+        }),
+    );
+
+    let request = json!({
+        "sample_count": config.yaml_parity_sample_count,
+        "seed": config.yaml_parity_seed,
+    });
+    let text = unity_bridge::yaml_preview_cache_selftest(project, &request).await?;
+    let report: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("YAML parity self-test returned invalid JSON: {error}"))?;
+    let passed = report
+        .get("passed")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let failed = report
+        .get("failed")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let skipped = report
+        .get("skipped")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+
+    if let Some(cases) = report.get("cases").and_then(Value::as_array) {
+        for case in cases {
+            let status = case
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed");
+            let scene = case
+                .get("scene_path")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let message = case.get("message").and_then(Value::as_str).unwrap_or("");
+            let marker = match status {
+                "passed" => "PASS ",
+                "skipped" => "SKIP ",
+                _ => "FAIL ",
+            };
+            sink.emit(
+                "suite_event",
+                json!({
+                    "suite": suite.as_str(),
+                    "line": format!("{marker} yaml-parity: {scene} {message}"),
+                    "passed": passed,
+                    "failed": failed,
+                }),
+            );
+        }
+    }
+
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "previewSupported": report.get("preview_supported"),
+            "unityVersion": report.get("unity_version"),
+            "mode": report.get("mode"),
+            "seed": report.get("seed"),
+            "sampleCount": report.get("sample_count"),
+            "candidateCount": report.get("candidate_count"),
+        }),
+    );
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "YAML parity suite finished with {failed} failed scene check(s)"
+        ))
+    }
 }
 
 async fn run_unity_test_suite(
@@ -2170,6 +2340,97 @@ print("E7:done");"#;
         }
     }
 
+    async fn check_thread_and_tick_discovery(&mut self, project: &str) {
+        let code = r#"bool mainBefore = ctx.IsMainThread;
+await ctx.SwitchToThreadPool();
+bool pool = !ctx.IsMainThread && ctx.Thread.IsThreadPoolThread;
+await ctx.SwitchToMainThread();
+var ticks = ctx.ListTickSystems();
+print("E7T:" + mainBefore + ":" + pool + ":" + ctx.IsMainThread + ":" + ticks.Count);"#;
+        match execute_capture(project, code).await {
+            Ok(output) => {
+                let marker = output
+                    .lines()
+                    .find(|line| line.starts_with("E7T:"))
+                    .unwrap_or_default();
+                let count = marker
+                    .rsplit(':')
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_default();
+                if marker.starts_with("E7T:True:True:True:") && count > 10 {
+                    self.pass(
+                        "E7T thread/tick-discovery",
+                        format!("main -> pool -> main; discovered {count} PlayerLoop nodes"),
+                    );
+                } else {
+                    self.fail(
+                        "E7T thread/tick-discovery",
+                        format!("unexpected output '{}'", clip(&output, 180)),
+                    );
+                }
+            }
+            Err(error) => self.fail(
+                "E7T thread/tick-discovery",
+                format!("execute error: {}", clip(&error, 200)),
+            ),
+        }
+    }
+
+    async fn check_pending_await_diagnostics(&mut self, project: &str) {
+        let latest = Arc::new(std::sync::Mutex::new(None));
+        let observer = Arc::clone(&latest);
+        let code = r#"int marker = 42;
+await ctx.WaitSeconds(0.8f);
+print("E7W:" + marker);"#;
+        let result =
+            unity_bridge::unity_execute_code_with_progress(project, code, move |snapshot| {
+                if snapshot.source == "await" {
+                    if let Ok(mut value) = observer.lock() {
+                        *value = Some(snapshot);
+                    }
+                }
+            })
+            .await;
+        let observed = latest.lock().ok().and_then(|value| value.clone());
+        match (result, observed) {
+            (Ok(output), Some(snapshot))
+                if output.contains("E7W:42")
+                    && snapshot.wait_kind == "editor_time"
+                    && snapshot.source_line == 2
+                    && snapshot.source_text.contains("ctx.WaitSeconds(0.8f)")
+                    && snapshot.wait_target.contains("seconds") =>
+            {
+                self.pass(
+                    "E7W await-diagnostics",
+                    format!(
+                        "line={} waited={}ms source='{}'",
+                        snapshot.source_line, snapshot.waited_ms, snapshot.source_text
+                    ),
+                );
+            }
+            (Ok(output), Some(snapshot)) => self.fail(
+                "E7W await-diagnostics",
+                format!(
+                    "output='{}' kind={} line={} source='{}' target='{}'",
+                    clip(&output, 80),
+                    snapshot.wait_kind,
+                    snapshot.source_line,
+                    snapshot.source_text,
+                    snapshot.wait_target
+                ),
+            ),
+            (Ok(output), None) => self.fail(
+                "E7W await-diagnostics",
+                format!("no await snapshot; output='{}'", clip(&output, 100)),
+            ),
+            (Err(error), _) => self.fail(
+                "E7W await-diagnostics",
+                format!("execute error: {}", clip(&error, 200)),
+            ),
+        }
+    }
+
     /// A long-running blocking execute must abort promptly when cancelled
     /// instead of running to completion.
     async fn check_cancellation(&mut self, project: &str) {
@@ -2217,29 +2478,121 @@ print("E7:done");"#;
         }
     }
 
-    /// Two executes fired concurrently must serialize on the per-project op lock
-    /// and both complete with their own, un-corrupted output.
+    /// Two frame-spanning executes compile/bootstrap under the operation lock,
+    /// then overlap while awaiting Unity and keep request-scoped output.
     async fn check_concurrency(&mut self, project: &str) {
-        let code_a = r#"await ctx.WaitFrames(15); print("E9A:ok");"#;
-        let code_b = r#"await ctx.WaitFrames(15); print("E9B:ok");"#;
+        let code_a = r#"await ctx.WaitSeconds(1.5f); print("E9A:ok");"#;
+        let code_b = r#"await ctx.WaitSeconds(1.5f); print("E9B:ok");"#;
+        let started = Instant::now();
         let (ra, rb) = tokio::join!(
             execute_capture(project, code_a),
             execute_capture(project, code_b)
         );
+        let elapsed = started.elapsed();
         let a_ok = matches!(&ra, Ok(output) if output.contains("E9A:ok"));
         let b_ok = matches!(&rb, Ok(output) if output.contains("E9B:ok"));
-        if a_ok && b_ok {
+        if a_ok && b_ok && elapsed < Duration::from_millis(2800) {
             self.pass(
-                "E9 serialize",
-                "two concurrent executes both completed correctly",
+                "E9 concurrent-await",
+                format!(
+                    "two 1.5s waits completed independently in {}ms",
+                    elapsed.as_millis()
+                ),
             );
         } else {
             self.fail(
-                "E9 serialize",
+                "E9 concurrent-await",
                 format!(
-                    "A={}, B={}",
+                    "elapsed={}ms, A={}, B={}",
+                    elapsed.as_millis(),
                     describe_result(&ra, "E9A:ok"),
                     describe_result(&rb, "E9B:ok")
+                ),
+            );
+        }
+    }
+
+    async fn check_player_loop_debugger(&mut self, project: &str) {
+        if let Err(error) =
+            unity_bridge::set_editor_status(project, unity_bridge::UNITY_EDITOR_STATUS_PLAYING)
+                .await
+        {
+            self.fail(
+                "E9D debugger",
+                format!("could not enter Play Mode: {}", clip(&error, 180)),
+            );
+            return;
+        }
+
+        let tick_result = execute_capture(
+            project,
+            r#"var update = ctx.FindTickSystem(typeof(UnityEngine.PlayerLoop.Update.ScriptRunBehaviourUpdate).FullName);
+var stamp = await ctx.WaitAfter(update);
+print("E9D:tick:" + stamp.Boundary + ":" + stamp.FrameCount + ":" + ctx.IsMainThread);"#,
+        )
+        .await;
+        let break_result = execute_capture(
+            project,
+            r#"await ctx.BreakWhen(UnityLoopPoint.AfterUpdate, () => true, label: "e9d", condition: "true");
+print("E9D:unreachable");"#,
+        )
+        .await;
+        let (_, paused_status, _) = unity_bridge::query_unity_status(project).await;
+        let step_result = if paused_status == unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED {
+            execute_capture(
+                project,
+                r#"int before = Time.frameCount; var stamp = await ctx.StepFrame(); print("E9D:step:" + before + ":" + Time.frameCount + ":" + EditorApplication.isPaused);"#,
+            )
+            .await
+        } else {
+            Err(format!("expected playing_paused, got {paused_status}"))
+        };
+        let resume_result = execute_capture(
+            project,
+            r#"await ctx.ResumeGame(); print("E9D:resume:" + EditorApplication.isPaused);"#,
+        )
+        .await;
+
+        let run_states = json!({
+            "request_editor_status": "playing",
+            "initial_state": "tick",
+            "states": [{
+                "name": "tick",
+                "start": "ctx.SetTickPoint(UnityLoopPoint.AfterUpdate);",
+                "update": "if (ctx.TotalFrames >= 3) { print(\"E9D:run-states-tick\"); ctx.Done(); }",
+            }],
+        });
+        let run_states_result = unity_bridge::unity_run_states(project, &run_states).await;
+
+        let restore =
+            unity_bridge::set_editor_status(project, unity_bridge::UNITY_EDITOR_STATUS_EDITING)
+                .await;
+
+        let tick_ok = matches!(&tick_result, Ok(output) if output.contains("E9D:tick:After:") && output.contains(":True"));
+        let break_ok = matches!(&break_result, Ok(output) if output.contains("status: breakpoint") && output.contains("label: e9d") && !output.contains("E9D:unreachable"));
+        let step_ok = matches!(&step_result, Ok(output) if output.contains("E9D:step:") && output.contains(":True"));
+        let resume_ok = matches!(&resume_result, Ok(output) if output.contains("E9D:resume:False"));
+        let run_states_ok = matches!(&run_states_result, Ok(output) if output.contains("E9D:run-states-tick") && output.contains("status: ok"));
+        if tick_ok && break_ok && step_ok && resume_ok && run_states_ok && restore.is_ok() {
+            self.pass(
+                "E9D debugger",
+                "dynamic tick wait, breakpoint termination, paused step, resume and run-states tick passed",
+            );
+        } else {
+            self.fail(
+                "E9D debugger",
+                format!(
+                    "tick={} break={} paused={} step={} resume={} run_states={} restore={}",
+                    describe_result(&tick_result, "E9D:tick:"),
+                    describe_result(&break_result, "status: breakpoint"),
+                    paused_status,
+                    describe_result(&step_result, "E9D:step:"),
+                    describe_result(&resume_result, "E9D:resume:False"),
+                    describe_result(&run_states_result, "E9D:run-states-tick"),
+                    restore
+                        .as_ref()
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| clip(error, 100)),
                 ),
             );
         }
@@ -3170,8 +3523,11 @@ async fn run_execute_suite(
     )
     .await;
     run.check_progress(project).await;
+    run.check_thread_and_tick_discovery(project).await;
+    run.check_pending_await_diagnostics(project).await;
     run.check_cancellation(project).await;
     run.check_concurrency(project).await;
+    run.check_player_loop_debugger(project).await;
     if run_cancelled(cancel_rx) {
         return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
     }
@@ -3868,7 +4224,8 @@ mod tests {
                 CliDriverSuite::NativeBridge,
                 CliDriverSuite::HotReload,
                 CliDriverSuite::HotReloadRelease,
-                CliDriverSuite::Execute
+                CliDriverSuite::Execute,
+                CliDriverSuite::YamlParity
             ]
         );
     }
@@ -3929,5 +4286,38 @@ mod tests {
                 "alias {alias}"
             );
         }
+    }
+
+    #[test]
+    fn parse_yaml_parity_suite_and_sampling_options() {
+        for alias in ["yaml-parity", "yaml_parity", "yaml-diff"] {
+            let parsed = parse(&[
+                "--locus-unity-test",
+                "--suite",
+                alias,
+                "--yaml-parity-samples",
+                "7",
+                "--yaml-parity-seed=-42",
+            ])
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.suites, vec![CliDriverSuite::YamlParity]);
+            assert_eq!(parsed.yaml_parity_sample_count, 7);
+            assert_eq!(parsed.yaml_parity_seed, -42);
+        }
+    }
+
+    #[test]
+    fn parse_yaml_parity_rejects_out_of_range_sample_count() {
+        let error = parse(&[
+            "--locus-unity-test",
+            "--suite",
+            "yaml-parity",
+            "--yaml-parity-samples",
+            "51",
+        ])
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("1 to 50"));
     }
 }

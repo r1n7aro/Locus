@@ -277,6 +277,13 @@ namespace Locus.UnityTesting
         private static Task<string> HandleStartAsync(string json)
         {
             UnityTestRunRequest request = ParseRequest<UnityTestRunRequest>(json);
+            return Task.FromResult(JsonUtility.ToJson(Start(request), true));
+        }
+
+        internal static UnityTestRunSnapshotDto Start(UnityTestRunRequest request)
+        {
+            if (request == null)
+                request = new UnityTestRunRequest();
             TestMode mode = ParseMode(request.mode);
             string modeName = ModeName(mode);
             string resultDetail = NormalizeResultDetail(request.result_detail);
@@ -292,7 +299,7 @@ namespace Locus.UnityTesting
                 Filter filter = BuildFilter(request, mode);
                 state.unity_run_guid = Api.Execute(new ExecutionSettings(filter));
                 state.Persist();
-                return Task.FromResult(JsonUtility.ToJson(Snapshot(state), true));
+                return Snapshot(state);
             }
             catch (Exception ex)
             {
@@ -310,10 +317,15 @@ namespace Locus.UnityTesting
             UnityTestStatusRequest request = string.IsNullOrWhiteSpace(json)
                 ? new UnityTestStatusRequest()
                 : ParseRequest<UnityTestStatusRequest>(json);
+            return Task.FromResult(JsonUtility.ToJson(Status(request.run_id), true));
+        }
+
+        internal static UnityTestRunSnapshotDto Status(string runId = null)
+        {
             LocusUnityTestRunState state = LocusUnityTestRunState.instance;
-            if (!string.IsNullOrEmpty(request.run_id) && request.run_id != state.run_id)
-                throw new InvalidOperationException("Unity Test run was not found: " + request.run_id);
-            return Task.FromResult(JsonUtility.ToJson(Snapshot(state), true));
+            if (!string.IsNullOrEmpty(runId) && runId != state.run_id)
+                throw new InvalidOperationException("Unity Test run was not found: " + runId);
+            return Snapshot(state);
         }
 
         private static Task<string> HandleCancelAsync(string json)
@@ -321,11 +333,16 @@ namespace Locus.UnityTesting
             UnityTestStatusRequest request = string.IsNullOrWhiteSpace(json)
                 ? new UnityTestStatusRequest()
                 : ParseRequest<UnityTestStatusRequest>(json);
+            return Task.FromResult(JsonUtility.ToJson(Cancel(request.run_id), true));
+        }
+
+        internal static UnityTestRunSnapshotDto Cancel(string runId = null)
+        {
             LocusUnityTestRunState state = LocusUnityTestRunState.instance;
-            if (!string.IsNullOrEmpty(request.run_id) && request.run_id != state.run_id)
-                throw new InvalidOperationException("Unity Test run was not found: " + request.run_id);
+            if (!string.IsNullOrEmpty(runId) && runId != state.run_id)
+                throw new InvalidOperationException("Unity Test run was not found: " + runId);
             if (!state.active)
-                return Task.FromResult(JsonUtility.ToJson(Snapshot(state), true));
+                return Snapshot(state);
 
             string previousStatus = state.status;
             state.status = "cancelling";
@@ -349,16 +366,30 @@ namespace Locus.UnityTesting
                 state.cancellation_requested = true;
             }
             state.Persist();
-            return Task.FromResult(JsonUtility.ToJson(Snapshot(state), true));
+            return Snapshot(state);
         }
 
         private static Task<string> HandleListAsync(string json)
         {
             UnityTestFilterRequest request = ParseRequest<UnityTestFilterRequest>(json);
+            return SerializeListAsync(request);
+        }
+
+        private static async Task<string> SerializeListAsync(UnityTestFilterRequest request)
+        {
+            UnityTestListDto response = await ListAsync(request);
+            return JsonUtility.ToJson(response, true);
+        }
+
+        internal static Task<UnityTestListDto> ListAsync(UnityTestFilterRequest request)
+        {
+            if (request == null)
+                request = new UnityTestFilterRequest();
             TestMode mode = ParseMode(request.mode);
             ValidateRegexes(request.groups);
             int maxResults = request.max_results <= 0 ? 500 : Math.Min(request.max_results, 5000);
-            TaskCompletionSource<string> completion = new TaskCompletionSource<string>();
+            TaskCompletionSource<UnityTestListDto> completion =
+                new TaskCompletionSource<UnityTestListDto>();
 
             Api.RetrieveTestList(mode, delegate(ITestAdaptor root)
             {
@@ -366,7 +397,7 @@ namespace Locus.UnityTesting
                 {
                     UnityTestListDto response = new UnityTestListDto { mode = ModeName(mode) };
                     CollectTests(root, "", request, response, maxResults);
-                    completion.TrySetResult(JsonUtility.ToJson(response, true));
+                    completion.TrySetResult(response);
                 }
                 catch (Exception ex)
                 {

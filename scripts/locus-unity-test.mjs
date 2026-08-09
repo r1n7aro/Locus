@@ -57,6 +57,7 @@ const driverResult = await runUnityDriver(
     "run",
     "tauri",
     "dev",
+    "--no-watch",
     "--",
     "--",
     "--locus-driver",
@@ -95,12 +96,15 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | unity-test | all
-                              hot-reload-release runs Release first, then switches to Debug at runtime and runs again
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | yaml-parity | unity-test | all
+                               hot-reload-release runs Release first, then switches to Debug at runtime and runs again
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
+  --yaml-parity-samples <n>   Random unloaded scene sample count, 1-50, default 5
+  --yaml-parity-seed <n>      Signed 32-bit seed; 0 selects a new seed per run
   --connect-timeout-ms <ms>   Unity launch/connect timeout, default 60000
   --timeout-ms <ms>           Per-suite timeout, default 300000
   --poll-ms <ms>              Connection poll interval, default 500
@@ -158,9 +162,12 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
   return new Promise((resolve, reject) => {
     const logDir = requestedLogDir || mkdtempSync(join(tmpdir(), "locus-unity-test-"));
     mkdirSync(logDir, { recursive: true });
+    const dataDir = join(logDir, "data");
+    mkdirSync(dataDir, { recursive: true });
     const logPath = join(logDir, "driver.log");
     const logStream = createWriteStream(logPath, { flags: "w" });
     console.log(`[locus] Unity driver log: ${logPath}`);
+    console.log(`[locus] Unity driver data: ${dataDir}`);
     const state = {
       finishedOk: false,
       sawDriverEvent: false,
@@ -174,6 +181,10 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
     const child = spawn(command, commandArgs, {
       stdio: ["inherit", "pipe", "pipe"],
       shell: false,
+      env: {
+        ...process.env,
+        LOCUS_RUNTIME_DATA_DIR: dataDir,
+      },
     });
 
     child.stdout.on("data", (chunk) => {

@@ -166,7 +166,7 @@ namespace Locus
 
         // ───────────── Allocation-free switch awaiters ─────────────
 
-        internal struct SwitchToMainThreadAwaitable
+        public struct SwitchToMainThreadAwaitable
         {
             public Awaiter GetAwaiter() { return default(Awaiter); }
 
@@ -180,7 +180,7 @@ namespace Locus
             }
         }
 
-        internal struct SwitchToThreadPoolAwaitable
+        public struct SwitchToThreadPoolAwaitable
         {
             public Awaiter GetAwaiter() { return default(Awaiter); }
 

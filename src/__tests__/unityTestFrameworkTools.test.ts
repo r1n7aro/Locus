@@ -17,6 +17,33 @@ describe("Unity Test Framework tools", () => {
     expect(service).not.toContain("System.Reflection");
   });
 
+  it("exposes a typed UnityTestApi for unity_execute without reflection", () => {
+    const api = read("locus_unity/Editor/Testing/UnityTestApi.cs");
+    const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
+    const executeDefinition = JSON.parse(read("tools/unity_execute.json"));
+
+    expect(api).toContain("public static class UnityTestApi");
+    expect(api).toContain("Task<UnityTestListResult> ListAsync");
+    expect(api).toContain("UnityTestRunSnapshot Start");
+    expect(api).toContain("UnityTestRunSnapshot Status");
+    expect(api).toContain("UnityTestRunSnapshot Cancel");
+    expect(api).toContain("LocusUnityTestService.ListAsync");
+    expect(api).toContain("LocusUnityTestService.Start");
+    expect(api).not.toContain("System.Reflection");
+
+    expect(service).toContain("internal static Task<UnityTestListDto> ListAsync");
+    expect(service).toContain("internal static UnityTestRunSnapshotDto Start");
+    expect(service).toContain("internal static UnityTestRunSnapshotDto Status");
+    expect(service).toContain("internal static UnityTestRunSnapshotDto Cancel");
+    expect(executeDefinition.description).toContain("UnityTestApi.ListAsync");
+    expect(executeDefinition.description).toContain("UnityTestApi.Start");
+    expect(executeDefinition.description).toContain("Status(runId)");
+    expect(executeDefinition.description).toContain("official TestRunner directly");
+    expect(read("agent/dev/rule/tool_usage_strategy.md")).toContain(
+      "UnityTestApi.ListAsync",
+    );
+  });
+
   it("compiles the adapter only when com.unity.test-framework is installed", () => {
     const asmdef = JSON.parse(
       read("locus_unity/Editor/Testing/Locus.UnityTesting.Editor.asmdef"),

@@ -1527,6 +1527,80 @@ namespace Locus
             public int ElapsedFramesInState { get { return _session.ElapsedFramesInState; } }
             public float TotalSeconds { get { return (float)_session.TotalSeconds; } }
             public float ElapsedSecondsInState { get { return (float)_session.ElapsedSecondsInState; } }
+            public UnityThreadInfo Thread
+            {
+                get
+                {
+                    System.Threading.Thread thread = System.Threading.Thread.CurrentThread;
+                    SynchronizationContext sync = SynchronizationContext.Current;
+                    return new UnityThreadInfo
+                    {
+                        ManagedThreadId = thread.ManagedThreadId,
+                        Name = thread.Name ?? "",
+                        IsMainThread = LocusAsync.IsMainThread,
+                        IsThreadPoolThread = thread.IsThreadPoolThread,
+                        SynchronizationContext = sync != null ? sync.GetType().FullName : ""
+                    };
+                }
+            }
+            public bool IsMainThread { get { return LocusAsync.IsMainThread; } }
+
+            public UnityTickSystemSnapshot ListTickSystems()
+            {
+                if (!LocusAsync.IsMainThread)
+                    throw new InvalidOperationException("ListTickSystems requires the Unity main thread.");
+                return CurrentTickSystemSnapshot();
+            }
+
+            public UnityTickSystemInfo[] FindTickSystems(string typeName)
+            {
+                string normalized = (typeName ?? "").Trim();
+                if (string.IsNullOrEmpty(normalized))
+                    throw new ArgumentException("Tick system type name is required.", "typeName");
+                UnityTickSystemSnapshot snapshot = ListTickSystems();
+                var matches = new List<UnityTickSystemInfo>();
+                for (int i = 0; i < snapshot.Nodes.Length; i++)
+                {
+                    UnityTickSystemInfo node = snapshot.Nodes[i];
+                    if (string.Equals(node.TypeFullName, normalized, StringComparison.Ordinal)
+                        || string.Equals(node.TypeName, normalized, StringComparison.Ordinal))
+                        matches.Add(node);
+                }
+                return matches.ToArray();
+            }
+
+            public UnityTickSystemInfo FindTickSystem(string typeName, int occurrence = 0)
+            {
+                UnityTickSystemInfo[] matches = FindTickSystems(typeName);
+                if (occurrence < 0 || occurrence >= matches.Length)
+                    throw new KeyNotFoundException(
+                        "Tick system '" + typeName + "' occurrence " + occurrence
+                        + " was not found. matches=" + matches.Length);
+                return matches[occurrence];
+            }
+
+            public void SetTickSystem(UnityTickSystemInfo system, UnityTickBoundary boundary)
+            {
+                ConfigureRunStatesTickAnchor(_session, system, boundary);
+            }
+
+            public void SetTickPoint(UnityLoopPoint point)
+            {
+                if (point == UnityLoopPoint.EditorUpdate)
+                {
+                    UseEditorUpdate();
+                    return;
+                }
+                Type type;
+                UnityTickBoundary boundary;
+                ResolveLoopPoint(point, out type, out boundary);
+                SetTickSystem(FindTickSystem(type.FullName, 0), boundary);
+            }
+
+            public void UseEditorUpdate()
+            {
+                ReleaseRunStatesTickAnchor(_session);
+            }
 
             public void Print(object value)
             {
@@ -2977,10 +3051,16 @@ namespace Locus
             if (session == null)
                 return;
 
+            if (RunStatesUsesTickAnchor(session))
+                return;
+
             session.Tick();
 
             if (session == _activeRunStatesSession && session.IsCompleted)
+            {
                 _activeRunStatesSession = null;
+                ReleaseRunStatesTickAnchor(session);
+            }
         }
 
         private static void UpdateRunStatesPrompt(string token, string message, string stateName, int frame)
