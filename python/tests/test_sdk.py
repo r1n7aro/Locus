@@ -24,6 +24,124 @@ class _FakeClient:
         return Run(run_id=f"run-{len(self.calls)}", session_id=session_id, client=self)
 
 
+class _SdkSurfaceClient(locus.Client):
+    def __init__(self) -> None:
+        super().__init__(base_url="http://127.0.0.1/sdk", token="test-token")
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def rpc(self, method: str, params=None, *, timeout=None):
+        values = params or {}
+        self.calls.append((method, values))
+        if method == "models.list":
+            return [
+                {
+                    "id": "openai/gpt-test",
+                    "name": "GPT Test",
+                    "provider": "openai_codex",
+                    "available": True,
+                    "contextWindow": 128000,
+                    "supportedEfforts": ["low", "high"],
+                    "isDefault": True,
+                }
+            ]
+        if method == "tools.list":
+            return [
+                {
+                    "name": "list",
+                    "description": "List files.",
+                    "inputSchema": {"type": "object"},
+                    "source": "builtin",
+                    "mutatesWorkspace": False,
+                    "agentOnly": False,
+                }
+            ]
+        if method == "tools.call":
+            return {
+                "name": values["name"],
+                "output": "Assets/",
+                "isError": False,
+                "images": [],
+                "workspacePath": "F:/Project",
+            }
+        if method == "workspace.get":
+            return {
+                "path": "F:/Project",
+                "workspaceId": "workspace-1",
+                "unityConnected": True,
+            }
+        if method == "sessions.list":
+            return [
+                {
+                    "id": "session-1",
+                    "title": "Workflow",
+                    "agentId": "reviewer",
+                    "sessionType": "chat",
+                    "parentSessionId": None,
+                    "updatedAt": 10,
+                }
+            ]
+        if method == "sessions.get":
+            return {
+                "id": "session-1",
+                "title": "Workflow",
+                "agentId": "reviewer",
+                "lastModelId": "openai/gpt-test",
+                "lastEffort": "high",
+                "sessionType": "chat",
+                "parentSessionId": None,
+                "latestCompletedRunId": "run-1",
+                "createdAt": 1,
+                "updatedAt": 10,
+                "messages": [
+                    {"id": "message-1", "role": "assistant", "content": "done", "createdAt": 2}
+                ],
+                "pendingInputs": [],
+                "runtime": None,
+            }
+        if method == "agents.prompt":
+            return {"runId": "run-2", "sessionId": values["sessionId"]}
+        raise AssertionError(f"Unexpected RPC method: {method}")
+
+
+class _RunEventClient:
+    def __init__(self) -> None:
+        self.event_calls = 0
+
+    async def rpc(self, method: str, params=None, *, timeout=None):
+        if method == "runs.events":
+            self.event_calls += 1
+            if self.event_calls == 1:
+                return [
+                    {
+                        "sessionId": "session-1",
+                        "runId": "run-1",
+                        "seq": 1,
+                        "eventType": "textDelta",
+                        "payload": {"delta": "hello"},
+                        "createdAt": 1,
+                    }
+                ]
+            return [
+                {
+                    "sessionId": "session-1",
+                    "runId": "run-1",
+                    "seq": 2,
+                    "eventType": "done",
+                    "payload": {"fullText": "hello"},
+                    "createdAt": 2,
+                }
+            ]
+        if method == "runs.get":
+            return {
+                "runId": "run-1",
+                "sessionId": "session-1",
+                "status": "done",
+                "completed": True,
+                "text": "hello",
+            }
+        raise AssertionError(f"Unexpected RPC method: {method}")
+
+
 class ToolSchemaTests(unittest.TestCase):
     def test_decorator_builds_object_schema_from_annotations(self) -> None:
         @locus.tool(description="Select a build.")
@@ -141,6 +259,61 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["result"], {"same_loop": True, "value": 8})
         agent.close()
+
+
+class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovers_models_workspace_and_direct_tools(self) -> None:
+        client = _SdkSurfaceClient()
+
+        models = await client.list_models()
+        workspace = await client.get_workspace()
+        listing = await client.get_tool("list")
+        result = await listing.call({"path": "."}, timeout=10)
+
+        self.assertEqual(models[0].id, "openai/gpt-test")
+        self.assertEqual(models[0].supported_efforts, ("low", "high"))
+        self.assertTrue(models[0].is_default)
+        self.assertEqual(workspace.path, "F:/Project")
+        self.assertTrue(workspace.unity_connected)
+        self.assertEqual(result.output, "Assets/")
+        self.assertEqual(result.workspace_path, "F:/Project")
+        self.assertIn(("models.list", {"availableOnly": True}), client.calls)
+
+    async def test_loads_and_continues_persisted_sessions(self) -> None:
+        client = _SdkSurfaceClient()
+
+        summaries = await client.list_sessions(limit=10)
+        session = await summaries[0].load()
+        run = await session.prompt("continue")
+
+        self.assertEqual(session.messages[0].role, "assistant")
+        self.assertEqual(session.messages[0].content, "done")
+        self.assertEqual(run.session_id, "session-1")
+        prompt_call = next(call for call in client.calls if call[0] == "agents.prompt")
+        self.assertEqual(prompt_call[1]["sessionId"], "session-1")
+
+    async def test_tool_and_run_errors_are_explicit(self) -> None:
+        failed_tool = locus.ToolCallResult(name="build", output="compile failed", is_error=True)
+        with self.assertRaises(locus.LocusToolError):
+            failed_tool.raise_for_error()
+
+        failed_run = locus.RunResult(
+            run_id="run-error",
+            session_id="session-error",
+            status="error",
+            completed=True,
+            error="provider unavailable",
+        )
+        with self.assertRaises(locus.LocusRunError):
+            failed_run.raise_for_error()
+
+    async def test_event_stream_drains_terminal_events(self) -> None:
+        run = Run(run_id="run-1", session_id="session-1", client=_RunEventClient())
+
+        events = [event async for event in run.event_stream()]
+
+        self.assertEqual([event.seq for event in events], [1, 2])
+        self.assertEqual(events[-1].type, "done")
 
 
 if __name__ == "__main__":

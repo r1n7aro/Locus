@@ -6,7 +6,7 @@ import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, AsyncIterator, Iterator, TYPE_CHECKING
 
 from ._callbacks import callbacks
 from ._tools import Tool
@@ -24,20 +24,124 @@ def _agent_id(name: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelInfo:
+    id: str
+    name: str
+    provider: str
+    available: bool
+    context_window: int | None = None
+    default_effort: str | None = None
+    supported_efforts: tuple[str, ...] = ()
+    additional_speed_tiers: tuple[str, ...] = ()
+    is_default: bool = False
+    unavailable_reason: str | None = None
+    custom_provider_id: str | None = None
+    custom_provider_name: str | None = None
+    custom_model_name: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ModelInfo":
+        return cls(
+            id=payload["id"],
+            name=payload.get("name", payload["id"]),
+            provider=payload.get("provider", "unknown"),
+            available=bool(payload.get("available", True)),
+            context_window=payload.get("contextWindow"),
+            default_effort=payload.get("defaultEffort"),
+            supported_efforts=tuple(payload.get("supportedEfforts") or ()),
+            additional_speed_tiers=tuple(payload.get("additionalSpeedTiers") or ()),
+            is_default=bool(payload.get("isDefault")),
+            unavailable_reason=payload.get("unavailableReason"),
+            custom_provider_id=payload.get("customProviderId"),
+            custom_provider_name=payload.get("customProviderName"),
+            custom_model_name=payload.get("customModelName"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceInfo:
+    path: str | None
+    workspace_id: str | None
+    unity_connected: bool
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "WorkspaceInfo":
+        return cls(
+            path=payload.get("path"),
+            workspace_id=payload.get("workspaceId"),
+            unity_connected=bool(payload.get("unityConnected")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallImage:
+    data: str
+    mime_type: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ToolCallImage":
+        return cls(data=payload["data"], mime_type=payload.get("mimeType", "image/png"))
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallResult:
+    name: str
+    output: str
+    is_error: bool
+    images: tuple[ToolCallImage, ...] = ()
+    workspace_path: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ToolCallResult":
+        return cls(
+            name=payload["name"],
+            output=payload.get("output", ""),
+            is_error=bool(payload.get("isError")),
+            images=tuple(
+                ToolCallImage.from_payload(image) for image in payload.get("images") or ()
+            ),
+            workspace_path=payload.get("workspacePath"),
+        )
+
+    def raise_for_error(self) -> "ToolCallResult":
+        if self.is_error:
+            from ._client import LocusToolError
+
+            raise LocusToolError(self.name, self.output)
+        return self
+
+
+@dataclass(frozen=True, slots=True)
 class ToolInfo:
     name: str
     description: str
     input_schema: dict[str, Any]
     source: str
+    mutates_workspace: bool = False
+    agent_only: bool = False
+    client: "Client | None" = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "ToolInfo":
+    def from_payload(cls, payload: dict[str, Any], client: "Client | None" = None) -> "ToolInfo":
         return cls(
             name=payload["name"],
             description=payload.get("description", ""),
             input_schema=payload.get("inputSchema") or {},
             source=payload.get("source", "unknown"),
+            mutates_workspace=bool(payload.get("mutatesWorkspace")),
+            agent_only=bool(payload.get("agentOnly")),
+            client=client,
         )
+
+    async def call(
+        self,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> ToolCallResult:
+        if self.client is None:
+            raise RuntimeError("ToolInfo is not attached to a Locus client")
+        return await self.client.call_tool(self.name, arguments or {}, timeout=timeout)
 
 
 class Agent:
@@ -189,6 +293,140 @@ class Agent:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionMessage:
+    id: str
+    role: str
+    content: str
+    created_at: int
+    raw: dict[str, Any] = field(repr=False, compare=False)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionMessage":
+        return cls(
+            id=payload["id"],
+            role=payload["role"],
+            content=payload.get("content", ""),
+            created_at=int(payload.get("createdAt", 0)),
+            raw=payload,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    id: str
+    title: str
+    agent_id: str | None
+    session_type: str
+    parent_session_id: str | None
+    updated_at: int
+    runtime_status: str | None = None
+    client: "Client | None" = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+        client: "Client | None" = None,
+    ) -> "SessionSummary":
+        return cls(
+            id=payload["id"],
+            title=payload.get("title", ""),
+            agent_id=payload.get("agentId"),
+            session_type=payload.get("sessionType", "chat"),
+            parent_session_id=payload.get("parentSessionId"),
+            updated_at=int(payload.get("updatedAt", 0)),
+            runtime_status=payload.get("runtimeStatus"),
+            client=client,
+        )
+
+    async def load(self) -> "Session":
+        if self.client is None:
+            raise RuntimeError("SessionSummary is not attached to a Locus client")
+        return await self.client.get_session(self.id)
+
+
+@dataclass(frozen=True, slots=True)
+class RunEvent:
+    session_id: str
+    run_id: str
+    seq: int
+    type: str
+    payload: dict[str, Any]
+    created_at: int
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "RunEvent":
+        return cls(
+            session_id=payload["sessionId"],
+            run_id=payload["runId"],
+            seq=int(payload["seq"]),
+            type=payload.get("eventType", "unknown"),
+            payload=payload.get("payload") or {},
+            created_at=int(payload.get("createdAt", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    id: str
+    title: str
+    agent_id: str | None
+    last_model_id: str | None
+    last_effort: str | None
+    session_type: str
+    parent_session_id: str | None
+    latest_completed_run_id: str | None
+    created_at: int
+    updated_at: int
+    messages: tuple[SessionMessage, ...]
+    pending_inputs: tuple[dict[str, Any], ...]
+    runtime: dict[str, Any] | None
+    client: "Client" = field(repr=False, compare=False)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any], client: "Client") -> "Session":
+        return cls(
+            id=payload["id"],
+            title=payload.get("title", ""),
+            agent_id=payload.get("agentId"),
+            last_model_id=payload.get("lastModelId"),
+            last_effort=payload.get("lastEffort"),
+            session_type=payload.get("sessionType", "chat"),
+            parent_session_id=payload.get("parentSessionId"),
+            latest_completed_run_id=payload.get("latestCompletedRunId"),
+            created_at=int(payload.get("createdAt", 0)),
+            updated_at=int(payload.get("updatedAt", 0)),
+            messages=tuple(
+                SessionMessage.from_payload(message) for message in payload.get("messages") or ()
+            ),
+            pending_inputs=tuple(payload.get("pendingInputs") or ()),
+            runtime=payload.get("runtime"),
+            client=client,
+        )
+
+    async def events(self, *, after_seq: int = 0, limit: int = 500) -> list[RunEvent]:
+        payload = await self.client.rpc(
+            "sessions.events",
+            {"sessionId": self.id, "afterSeq": after_seq, "limit": limit},
+        )
+        return [RunEvent.from_payload(event) for event in payload]
+
+    async def prompt(
+        self,
+        text: str,
+        *,
+        agent: Agent | str | None = None,
+        **kwargs: Any,
+    ) -> "Run":
+        target = agent or self.agent_id
+        if target is None:
+            raise ValueError("Session has no agent; pass agent= to continue it")
+        if isinstance(target, Agent):
+            return await target.prompt(text, session_id=self.id, **kwargs)
+        return await self.client.prompt_agent(target, text, session_id=self.id, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
 class RunStatus:
     run_id: str
     session_id: str
@@ -211,6 +449,13 @@ class RunStatus:
             error=payload.get("error"),
             runtime=payload.get("runtime"),
         )
+
+    def raise_for_error(self) -> "RunStatus":
+        if self.status == "error" or self.error:
+            from ._client import LocusRunError
+
+            raise LocusRunError(self.run_id, self.error or "Locus run failed")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +509,40 @@ class Run:
             "runs.events",
             {"runId": self.run_id, "afterSeq": after_seq, "limit": limit},
         )
+
+    async def event_stream(
+        self,
+        *,
+        after_seq: int = 0,
+        limit: int = 500,
+        poll_interval: float = 0.25,
+    ) -> AsyncIterator[RunEvent]:
+        """Yield persisted run events until the run reaches a terminal state."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        cursor = after_seq
+        while True:
+            rows = await self.events(after_seq=cursor, limit=limit)
+            for row in rows:
+                event = RunEvent.from_payload(row)
+                cursor = max(cursor, event.seq)
+                yield event
+            if len(rows) >= limit:
+                continue
+            status = await self.status()
+            if status.completed:
+                while True:
+                    trailing = await self.events(after_seq=cursor, limit=limit)
+                    for row in trailing:
+                        event = RunEvent.from_payload(row)
+                        cursor = max(cursor, event.seq)
+                        yield event
+                    if len(trailing) < limit:
+                        break
+                return
+            await asyncio.sleep(poll_interval)
 
     async def cancel(self) -> RunStatus:
         payload = await self.client.rpc("runs.cancel", {"runId": self.run_id})

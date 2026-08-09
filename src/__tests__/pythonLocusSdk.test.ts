@@ -55,4 +55,31 @@ describe("Locus Python API", () => {
     expect(bridge).toContain("Python tool callback URL must target loopback");
     expect(bridge).toContain("registry.register_runtime(");
   });
+
+  it("covers model discovery, direct tools, workspace state, sessions, and run streams", () => {
+    const api = read("python/locus/__init__.py");
+    const client = read("python/locus/_client.py");
+    const models = read("python/locus/_models.py");
+    const bridge = read("src-tauri/src/sdk.rs");
+    const example = read("python/examples/custom_workflow.py");
+
+    for (const method of [
+      '"models.list"',
+      '"tools.call"',
+      '"workspace.get"',
+      '"sessions.list"',
+      '"sessions.get"',
+      '"sessions.events"',
+    ]) {
+      expect(bridge).toContain(method);
+    }
+    expect(api).toContain("async def list_models(");
+    expect(api).toContain("async def call_tool(");
+    expect(api).toContain("async def get_session(");
+    expect(client).toContain("async def get_workspace(");
+    expect(models).toContain("async def event_stream(");
+    expect(models).toContain("def raise_for_error(self)");
+    expect(example).toContain("await asyncio.gather(");
+    expect(example).toContain("project_tree = await locus.call_tool(");
+  });
 });

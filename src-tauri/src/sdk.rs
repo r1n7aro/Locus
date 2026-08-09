@@ -24,7 +24,10 @@ use tokio::net::TcpListener;
 use crate::agent::definition::{canonical_agent_id, AgentDef};
 use crate::session::models::{MessageRole, SessionEventRecord, SessionRunSummary};
 use crate::session::store::SessionStore;
-use crate::tool::{ToolDef, ToolExecuteFn, ToolLoadMode, ToolRegistry, ToolResult};
+use crate::tool::{
+    ToolDef, ToolExecuteFn, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult,
+    ToolRuntimeState,
+};
 use crate::{
     ActiveTasks, AgentDefRegistryState, ApiKeyState, AppAgentDir, ProviderKeysState, QuestionStore,
     RawContextStore, UndoManagerHandle,
@@ -33,6 +36,185 @@ use crate::{
 const SDK_PATH: &str = "/sdk";
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 120_000;
+const MAX_TOOL_TIMEOUT_MS: u64 = 3_600_000;
+
+const CLAUDE_STANDARD_EFFORTS: &[&str] = &["none", "low", "medium", "high", "max"];
+const CLAUDE_XHIGH_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_STANDARD_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+const FAST_SPEED_TIER: &[&str] = &["fast"];
+const NO_SPEED_TIERS: &[&str] = &[];
+
+#[derive(Clone, Copy)]
+struct StaticModel {
+    id: &'static str,
+    name: &'static str,
+    provider: &'static str,
+    context_window: Option<u32>,
+    default_effort: Option<&'static str>,
+    supported_efforts: &'static [&'static str],
+    additional_speed_tiers: &'static [&'static str],
+    provider_default: bool,
+}
+
+// Keep this inventory aligned with src/stores/model.ts. The SDK filters these
+// rows by the live provider login state before returning them by default.
+const STATIC_MODELS: &[StaticModel] = &[
+    StaticModel {
+        id: "openrouter/claude-fable-5",
+        name: "Claude Fable 5[1m]",
+        provider: "openrouter",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openrouter/claude-opus-4.8",
+        name: "Claude Opus 4.8[1m]",
+        provider: "openrouter",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: true,
+    },
+    StaticModel {
+        id: "openrouter/claude-sonnet-5",
+        name: "Claude Sonnet 5[1m]",
+        provider: "openrouter",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openrouter/claude-opus-4.6",
+        name: "Claude Opus 4.6[1m]",
+        provider: "openrouter",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_STANDARD_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openrouter/glm-5",
+        name: "GLM 5",
+        provider: "openrouter",
+        context_window: None,
+        default_effort: None,
+        supported_efforts: &[],
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openrouter/minimax-m2.5",
+        name: "MiniMax M2.5",
+        provider: "openrouter",
+        context_window: None,
+        default_effort: None,
+        supported_efforts: &[],
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "claude-fable-5",
+        name: "Claude Fable 5[1m]",
+        provider: "anthropic",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "claude-opus-4.8",
+        name: "Claude Opus 4.8[1m]",
+        provider: "anthropic",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: true,
+    },
+    StaticModel {
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5[1m]",
+        provider: "anthropic",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "claude-opus-4.6",
+        name: "Claude Opus 4.6[1m]",
+        provider: "anthropic",
+        context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_STANDARD_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+];
+
+const CODEX_FALLBACK_MODELS: &[StaticModel] = &[
+    StaticModel {
+        id: "openai/gpt-5.6-sol",
+        name: "GPT-5.6 Sol",
+        provider: "openai_codex",
+        context_window: Some(353_400),
+        default_effort: Some("low"),
+        supported_efforts: CODEX_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: true,
+    },
+    StaticModel {
+        id: "openai/gpt-5.6-terra",
+        name: "GPT-5.6 Terra",
+        provider: "openai_codex",
+        context_window: Some(353_400),
+        default_effort: Some("medium"),
+        supported_efforts: CODEX_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openai/gpt-5.6-luna",
+        name: "GPT-5.6 Luna",
+        provider: "openai_codex",
+        context_window: Some(353_400),
+        default_effort: Some("medium"),
+        supported_efforts: CODEX_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openai/gpt-5.5",
+        name: "GPT-5.5",
+        provider: "openai_codex",
+        context_window: None,
+        default_effort: Some("medium"),
+        supported_efforts: CODEX_STANDARD_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "openai/gpt-5.4",
+        name: "GPT-5.4",
+        provider: "openai_codex",
+        context_window: None,
+        default_effort: Some("medium"),
+        supported_efforts: CODEX_STANDARD_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: false,
+    },
+];
 
 #[derive(Default)]
 pub struct SdkServerHandle {
@@ -211,6 +393,52 @@ struct AnswerParams {
     answer: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListModelsParams {
+    #[serde(default = "default_true")]
+    available_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSessionsParams {
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionParams {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionEventsParams {
+    session_id: String,
+    #[serde(default)]
+    after_seq: Option<i64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CallToolParams {
+    name: String,
+    #[serde(default = "empty_object")]
+    arguments: Value,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
 fn validate_agent_id(value: &str) -> Result<String, String> {
     let id = value.trim();
     if id.is_empty() || id.len() > 64 {
@@ -257,6 +485,189 @@ async fn list_agents(app: &AppHandle) -> Result<Value, String> {
     Ok(Value::Array(agents))
 }
 
+fn static_model_value(
+    model: StaticModel,
+    available: bool,
+    unavailable_reason: Option<&str>,
+    default_model: Option<&str>,
+) -> Value {
+    json!({
+        "id": model.id,
+        "name": model.name,
+        "provider": model.provider,
+        "contextWindow": model.context_window,
+        "defaultEffort": model.default_effort,
+        "supportedEfforts": model.supported_efforts,
+        "additionalSpeedTiers": model.additional_speed_tiers,
+        "available": available,
+        "unavailableReason": unavailable_reason,
+        "isDefault": default_model
+            .map(|value| value == model.id)
+            .unwrap_or(model.provider_default),
+    })
+}
+
+async fn codex_model_values(
+    app: &AppHandle,
+    available: bool,
+    default_model: Option<&str>,
+) -> Vec<Value> {
+    let mut remote = Vec::new();
+    if available {
+        let credentials = {
+            let codex = app.state::<crate::commands::CodexAuthStateHandle>();
+            let mut guard = codex.lock().await;
+            match guard.access_token().await {
+                Ok(access_token) => Some((access_token, guard.account_id())),
+                Err(_) => None,
+            }
+        };
+        if let Some((access_token, account_id)) = credentials {
+            if let Ok(cache_dir) = crate::commands::persistent_config_dir() {
+                let config = app.state::<Arc<crate::config::AppConfig>>();
+                if let Ok(models) = crate::llm::codex_models::list_codex_available_models(
+                    &access_token,
+                    account_id.as_deref(),
+                    config.base_url.as_deref(),
+                    &cache_dir,
+                )
+                .await
+                {
+                    remote = models
+                        .into_iter()
+                        .map(|model| {
+                            let is_default = default_model
+                                .map(|value| value == model.id)
+                                .unwrap_or(model.is_default);
+                            json!({
+                                "id": model.id,
+                                "name": model.name,
+                                "provider": model.provider,
+                                "contextWindow": model.effective_context_window,
+                                "defaultEffort": model.default_effort,
+                                "supportedEfforts": model.supported_efforts,
+                                "additionalSpeedTiers": model.additional_speed_tiers,
+                                "available": true,
+                                "unavailableReason": Value::Null,
+                                "isDefault": is_default,
+                            })
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    if remote.is_empty() {
+        let reason = (!available).then_some("Codex login is not configured");
+        return CODEX_FALLBACK_MODELS
+            .iter()
+            .copied()
+            .map(|model| static_model_value(model, available, reason, default_model))
+            .collect();
+    }
+    remote
+}
+
+async fn list_models(app: &AppHandle, params: ListModelsParams) -> Result<Value, String> {
+    let defaults = crate::commands::get_model_defaults(app.clone())
+        .await
+        .unwrap_or_default();
+    let last_model = crate::commands::get_last_model(app.clone())
+        .await
+        .ok()
+        .and_then(|model| nonempty(Some(model)));
+    let default_model = nonempty(Some(defaults.main_model)).or(last_model);
+
+    let openrouter_available = !app.state::<ApiKeyState>().read().await.trim().is_empty();
+    let anthropic_available = app
+        .state::<Arc<tokio::sync::Mutex<crate::auth::AuthState>>>()
+        .lock()
+        .await
+        .is_authenticated();
+    let codex_available = app
+        .state::<crate::commands::CodexAuthStateHandle>()
+        .lock()
+        .await
+        .is_authenticated();
+
+    let mut models = STATIC_MODELS
+        .iter()
+        .copied()
+        .map(|model| {
+            let (available, reason) = match model.provider {
+                "openrouter" => (
+                    openrouter_available,
+                    (!openrouter_available).then_some("OpenRouter API key is not configured"),
+                ),
+                "anthropic" => (
+                    anthropic_available,
+                    (!anthropic_available).then_some("Anthropic login is not configured"),
+                ),
+                _ => (false, Some("Model provider is unavailable")),
+            };
+            static_model_value(model, available, reason, default_model.as_deref())
+        })
+        .collect::<Vec<_>>();
+    models.extend(
+        codex_model_values(app, codex_available, default_model.as_deref())
+            .await
+            .into_iter(),
+    );
+
+    for provider in crate::commands::load_custom_providers()? {
+        let multiple_models = provider.models.len() > 1;
+        for model in provider.models {
+            let id = format!("custom/{}/{}", provider.id, model.id);
+            let is_default = default_model.as_deref() == Some(id.as_str());
+            let name = if multiple_models {
+                format!("{} / {}", provider.name, model.name)
+            } else {
+                provider.name.clone()
+            };
+            let supported_efforts = if matches!(
+                model.reasoning_param_format.as_ref(),
+                Some(crate::commands::CustomReasoningParamFormat::None)
+            ) {
+                Vec::new()
+            } else {
+                model.supported_reasoning_efforts
+            };
+            models.push(json!({
+                "id": id,
+                "name": name,
+                "provider": "custom",
+                "contextWindow": model.context_length,
+                "defaultEffort": Value::Null,
+                "supportedEfforts": supported_efforts,
+                "additionalSpeedTiers": [],
+                "available": true,
+                "unavailableReason": Value::Null,
+                "isDefault": is_default,
+                "customProviderId": provider.id,
+                "customProviderName": provider.name,
+                "customModelName": model.name,
+            }));
+        }
+    }
+
+    if params.available_only {
+        models.retain(|model| model["available"].as_bool() == Some(true));
+    }
+    Ok(Value::Array(models))
+}
+
+fn is_agent_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "subagent"
+            | "ask_user_question"
+            | "todowrite"
+            | "exit_plan_mode"
+            | "tool_load"
+            | "tool_call"
+    )
+}
+
 async fn list_tools(app: &AppHandle) -> Result<Value, String> {
     crate::mcp::manager::ensure_fresh().await;
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
@@ -284,6 +695,8 @@ async fn list_tools(app: &AppHandle) -> Result<Value, String> {
                 "description": description,
                 "inputSchema": input_schema,
                 "source": source,
+                "mutatesWorkspace": registry.mutates_workspace(&name),
+                "agentOnly": is_agent_only_tool(&name),
             }))
         })
         .collect::<Vec<_>>();
@@ -665,6 +1078,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
     let launch = crate::commands::chat(
         nonempty(params.session_id),
         prompt.to_string(),
+        None,
         nonempty(params.title),
         Some(agent_id),
         agent_spec,
@@ -834,11 +1248,333 @@ async fn answer_run(app: &AppHandle, params: AnswerParams) -> Result<Value, Stri
     Ok(json!({ "answered": true }))
 }
 
+async fn current_workspace(app: &AppHandle) -> (Option<String>, Option<String>) {
+    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
+    let path = workspace.path.read().await.trim().to_string();
+    if path.is_empty() {
+        return (None, None);
+    }
+    let workspace_id = workspace.workspace_id.read().await.clone();
+    (Some(path), workspace_id)
+}
+
+async fn workspace_snapshot(app: &AppHandle) -> Result<Value, String> {
+    let (path, workspace_id) = current_workspace(app).await;
+    let unity_connected = match path.as_deref() {
+        Some(path) => crate::unity_bridge::is_unity_connected(path).await,
+        None => false,
+    };
+    Ok(json!({
+        "path": path,
+        "workspaceId": workspace_id,
+        "unityConnected": unity_connected,
+    }))
+}
+
+async fn list_sdk_sessions(app: &AppHandle, params: ListSessionsParams) -> Result<Value, String> {
+    let (_, workspace_id) = current_workspace(app).await;
+    let store = app.state::<Arc<SessionStore>>();
+    let mut sessions = if params.archived {
+        store.list_archived_sessions(workspace_id.as_deref())?
+    } else {
+        store.list_sessions(workspace_id.as_deref())?
+    };
+    if let Some(limit) = params.limit {
+        sessions.truncate(limit.clamp(1, 1_000) as usize);
+    }
+    serde_json::to_value(sessions).map_err(|error| error.to_string())
+}
+
+fn get_sdk_session(app: &AppHandle, params: SessionParams) -> Result<Value, String> {
+    let session_id = params.session_id.trim();
+    if session_id.is_empty() {
+        return Err("sessionId cannot be empty".to_string());
+    }
+    let store = app.state::<Arc<SessionStore>>();
+    let mut detail = store.load_session(session_id)?;
+    detail.runtime = store.runtime_snapshot_for_session(session_id);
+    serde_json::to_value(detail).map_err(|error| error.to_string())
+}
+
+fn list_sdk_session_events(app: &AppHandle, params: SessionEventsParams) -> Result<Value, String> {
+    let session_id = params.session_id.trim();
+    if session_id.is_empty() {
+        return Err("sessionId cannot be empty".to_string());
+    }
+    let store = app.state::<Arc<SessionStore>>();
+    serde_json::to_value(store.list_session_events(
+        session_id,
+        params.after_seq,
+        params.limit.map(|value| value.clamp(1, 2_000)),
+    )?)
+    .map_err(|error| error.to_string())
+}
+
+fn direct_tool_result(
+    name: &str,
+    output: String,
+    is_error: bool,
+    images: Value,
+    workspace_path: Option<String>,
+) -> Value {
+    json!({
+        "name": name,
+        "output": output,
+        "isError": is_error,
+        "images": images,
+        "workspacePath": workspace_path,
+    })
+}
+
+async fn call_knowledge_query(app: &AppHandle, arguments: &Value) -> ToolResult {
+    let string_arg = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, 20) as usize);
+    match crate::commands::knowledge_query(
+        None,
+        string_arg("lexicalQuery"),
+        string_arg("semanticQuery"),
+        limit,
+        None,
+        string_arg("pathPrefix"),
+        Some(false),
+        app.state::<Arc<crate::workspace::Workspace>>(),
+        app.state::<crate::commands::AppKnowledgeDir>(),
+        app.state::<Arc<crate::knowledge_index::KnowledgeIndexState>>(),
+    )
+    .await
+    {
+        Ok(hits) => ToolResult {
+            output: serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".to_string()),
+            is_error: false,
+        },
+        Err(error) => ToolResult {
+            output: error.to_string(),
+            is_error: true,
+        },
+    }
+}
+
+fn call_config_query(app: &AppHandle, arguments: &Value) -> ToolResult {
+    let category = arguments
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let entries = match category {
+        Some(category) => crate::config_registry::collect_by_category(app, category),
+        None => crate::config_registry::collect_all(app),
+    };
+    match entries {
+        Ok(entries) => ToolResult {
+            output: serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()),
+            is_error: false,
+        },
+        Err(error) => ToolResult {
+            output: error.to_string(),
+            is_error: true,
+        },
+    }
+}
+
+async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, String> {
+    if !params.arguments.is_object() {
+        return Err("arguments must be an object".to_string());
+    }
+    let name = params.name.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    let canonical = canonical_tool_names(app, vec![name.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "name cannot be empty".to_string())?;
+    if is_agent_only_tool(&canonical) {
+        return Err(format!(
+            "Tool '{canonical}' requires an active Agent run and cannot be called directly"
+        ));
+    }
+    let timeout_ms = params
+        .timeout_ms
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
+        .clamp(1_000, MAX_TOOL_TIMEOUT_MS);
+
+    if canonical.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX) {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            crate::mcp::manager::call_tool(&canonical, params.arguments, None),
+        )
+        .await;
+        return match outcome {
+            Ok(Ok(outcome)) => Ok(direct_tool_result(
+                &canonical,
+                outcome.text,
+                false,
+                serde_json::to_value(outcome.images).map_err(|error| error.to_string())?,
+                None,
+            )),
+            Ok(Err(error)) => Ok(direct_tool_result(
+                &canonical,
+                error,
+                true,
+                Value::Array(Vec::new()),
+                None,
+            )),
+            Err(_) => Ok(direct_tool_result(
+                &canonical,
+                format!("Tool '{canonical}' timed out after {}s", timeout_ms / 1_000),
+                true,
+                Value::Array(Vec::new()),
+                None,
+            )),
+        };
+    }
+
+    if crate::mcp::server::tools::EXPOSED_TOOLS.contains(&canonical.as_str()) {
+        let outcome = crate::mcp::server::tools::execute_tool(
+            app.clone(),
+            canonical.clone(),
+            params.arguments,
+            timeout_ms,
+            Arc::new(ToolRuntimeState::default()),
+        )
+        .await;
+        let images = outcome
+            .images
+            .into_iter()
+            .map(|(data, mime_type)| json!({ "data": data, "mimeType": mime_type }))
+            .collect::<Vec<_>>();
+        return Ok(direct_tool_result(
+            &canonical,
+            outcome.output,
+            outcome.is_error,
+            Value::Array(images),
+            outcome.workspace_path,
+        ));
+    }
+
+    let (working_dir, _) = current_workspace(app).await;
+    if canonical == "knowledge_query" {
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            call_knowledge_query(app, &params.arguments),
+        )
+        .await
+        .unwrap_or_else(|_| ToolResult {
+            output: format!("Tool '{canonical}' timed out after {}s", timeout_ms / 1_000),
+            is_error: true,
+        });
+        return Ok(direct_tool_result(
+            &canonical,
+            result.output,
+            result.is_error,
+            Value::Array(Vec::new()),
+            working_dir,
+        ));
+    }
+    if canonical == "config_query" {
+        let result = call_config_query(app, &params.arguments);
+        return Ok(direct_tool_result(
+            &canonical,
+            result.output,
+            result.is_error,
+            Value::Array(Vec::new()),
+            working_dir,
+        ));
+    }
+    let unity_connected = if canonical == "read"
+        && params
+            .arguments
+            .get("filePath")
+            .and_then(Value::as_str)
+            .is_some_and(crate::tool::is_unity_yaml_candidate_path)
+    {
+        match working_dir.as_deref() {
+            Some(path) => Some(crate::unity_bridge::is_unity_connected(path).await),
+            None => Some(false),
+        }
+    } else {
+        None
+    };
+    let context = ToolExecutionContext {
+        app_handle: Some(app.clone()),
+        working_dir: working_dir.clone(),
+        unity_connected,
+        runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+        cancel_rx: None,
+        progress: None,
+    };
+    let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+    let lock_mode = if registry.mutates_workspace(&canonical) {
+        crate::agent::workspace_execution_lock::WorkspaceExecutionLockMode::Write
+    } else {
+        crate::agent::workspace_execution_lock::WorkspaceExecutionLockMode::Read
+    };
+    let owner = crate::agent::workspace_execution_lock::WorkspaceExecutionLockOwner {
+        session_id: "python-sdk".to_string(),
+        run_id: format!("sdk-tool-{}", uuid::Uuid::new_v4()),
+        iteration: 0,
+        workspace: working_dir.clone().unwrap_or_default(),
+        tools: vec![canonical.clone()],
+    };
+    let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
+    let execute = async {
+        let guard = match crate::agent::workspace_execution_lock::process_workspace_execution_lock()
+            .acquire(lock_mode, owner, lock_cancel_rx)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                return ToolResult {
+                    output: format!(
+                        "Tool '{canonical}' was cancelled while waiting for the workspace lock"
+                    ),
+                    is_error: true,
+                }
+            }
+        };
+        let result = registry
+            .execute_with_context(&canonical, &params.arguments, context)
+            .await;
+        drop(guard);
+        result
+    };
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), execute)
+        .await
+        .unwrap_or_else(|_| ToolResult {
+            output: format!("Tool '{canonical}' timed out after {}s", timeout_ms / 1_000),
+            is_error: true,
+        });
+    Ok(direct_tool_result(
+        &canonical,
+        result.output,
+        result.is_error,
+        Value::Array(Vec::new()),
+        working_dir,
+    ))
+}
+
 async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value, String> {
     match method {
         "agents.list" => list_agents(app).await,
         "agents.prompt" => prompt_agent(app, parse_params(params)?).await,
+        "models.list" => list_models(app, parse_params(params)?).await,
         "tools.list" => list_tools(app).await,
+        "tools.call" => call_tool(app, parse_params(params)?).await,
+        "workspace.get" => workspace_snapshot(app).await,
+        "sessions.list" => list_sdk_sessions(app, parse_params(params)?).await,
+        "sessions.get" => get_sdk_session(app, parse_params(params)?),
+        "sessions.events" => list_sdk_session_events(app, parse_params(params)?),
         "runs.get" => {
             let params: RunParams = parse_params(params)?;
             run_snapshot(app, &params.run_id)
@@ -982,7 +1718,10 @@ pub async fn start(app: AppHandle) -> Result<SocketAddr, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_allowed, token_matches, validate_agent_id};
+    use super::{
+        host_allowed, is_agent_only_tool, token_matches, validate_agent_id, ListModelsParams,
+        CODEX_FALLBACK_MODELS, STATIC_MODELS,
+    };
 
     #[test]
     fn validates_runtime_agent_ids() {
@@ -1000,5 +1739,31 @@ mod tests {
         assert!(host_allowed(Some("127.0.0.1:1234")));
         assert!(host_allowed(Some("localhost:1234")));
         assert!(!host_allowed(Some("example.com:1234")));
+    }
+
+    #[test]
+    fn sdk_model_inventory_has_unique_wire_ids() {
+        let mut ids = std::collections::HashSet::new();
+        for model in STATIC_MODELS.iter().chain(CODEX_FALLBACK_MODELS) {
+            assert!(ids.insert(model.id), "duplicate SDK model id {}", model.id);
+        }
+        assert!(ids.contains("openai/gpt-5.6-sol"));
+        assert!(ids.contains("claude-opus-4.8"));
+        assert!(ids.contains("openrouter/claude-opus-4.8"));
+    }
+
+    #[test]
+    fn model_listing_defaults_to_available_rows() {
+        let params: ListModelsParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(params.available_only);
+    }
+
+    #[test]
+    fn stateful_agent_tools_are_not_directly_callable() {
+        assert!(is_agent_only_tool("subagent"));
+        assert!(is_agent_only_tool("ask_user_question"));
+        assert!(!is_agent_only_tool("read"));
+        assert!(!is_agent_only_tool("config_query"));
+        assert!(!is_agent_only_tool("unity_execute"));
     }
 }

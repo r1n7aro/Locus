@@ -8,6 +8,8 @@ import urllib.request
 import uuid
 from typing import Any
 
+_DEFAULT_TOOL_TIMEOUT = 120.0
+
 
 class LocusSdkError(RuntimeError):
     """Base error raised by the Locus Python SDK."""
@@ -23,6 +25,22 @@ class LocusRpcError(LocusSdkError):
     def __init__(self, message: str, *, code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class LocusToolError(LocusSdkError):
+    """A directly invoked Locus tool returned an error result."""
+
+    def __init__(self, tool_name: str, message: str) -> None:
+        super().__init__(f"Tool '{tool_name}' failed: {message}")
+        self.tool_name = tool_name
+
+
+class LocusRunError(LocusSdkError):
+    """A Locus Agent run reached the error state."""
+
+    def __init__(self, run_id: str, message: str) -> None:
+        super().__init__(f"Run '{run_id}' failed: {message}")
+        self.run_id = run_id
 
 
 class Client:
@@ -116,11 +134,80 @@ class Client:
         rows = await self.rpc("agents.list")
         return [Agent.from_payload(row, self) for row in rows]
 
+    async def list_models(self, *, available_only: bool = True) -> list["ModelInfo"]:
+        from ._models import ModelInfo
+
+        rows = await self.rpc("models.list", {"availableOnly": available_only})
+        return [ModelInfo.from_payload(row) for row in rows]
+
     async def list_tools(self) -> list["ToolInfo"]:
         from ._models import ToolInfo
 
         rows = await self.rpc("tools.list")
-        return [ToolInfo.from_payload(row) for row in rows]
+        return [ToolInfo.from_payload(row, self) for row in rows]
+
+    async def get_model(self, model_id: str, *, include_unavailable: bool = True) -> "ModelInfo":
+        for model in await self.list_models(available_only=not include_unavailable):
+            if model.id == model_id:
+                return model
+        raise LocusRpcError(f"Unknown model '{model_id}'")
+
+    async def get_tool(self, name: str) -> "ToolInfo":
+        for tool in await self.list_tools():
+            if tool.name == name:
+                return tool
+        raise LocusRpcError(f"Unknown tool '{name}'")
+
+    async def call_tool(
+        self,
+        tool: str | "ToolInfo",
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> "ToolCallResult":
+        from ._models import ToolCallResult, ToolInfo
+
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        name = tool.name if isinstance(tool, ToolInfo) else str(tool).strip()
+        if not name:
+            raise ValueError("tool name cannot be empty")
+        effective_timeout = _DEFAULT_TOOL_TIMEOUT if timeout is None else timeout
+        payload = await self.rpc(
+            "tools.call",
+            {
+                "name": name,
+                "arguments": arguments or {},
+                "timeoutMs": None if timeout is None else max(1, int(timeout * 1000)),
+            },
+            timeout=effective_timeout + 5.0,
+        )
+        return ToolCallResult.from_payload(payload)
+
+    async def get_workspace(self) -> "WorkspaceInfo":
+        from ._models import WorkspaceInfo
+
+        payload = await self.rpc("workspace.get")
+        return WorkspaceInfo.from_payload(payload)
+
+    async def list_sessions(
+        self,
+        *,
+        archived: bool = False,
+        limit: int | None = None,
+    ) -> list["SessionSummary"]:
+        from ._models import SessionSummary
+
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be positive")
+        rows = await self.rpc("sessions.list", {"archived": archived, "limit": limit})
+        return [SessionSummary.from_payload(row, self) for row in rows]
+
+    async def get_session(self, session_id: str) -> "Session":
+        from ._models import Session
+
+        payload = await self.rpc("sessions.get", {"sessionId": session_id})
+        return Session.from_payload(payload, self)
 
     def define_agent(
         self,
@@ -199,5 +286,14 @@ class Client:
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._models import Agent, Run, ToolInfo
+    from ._models import (
+        Agent,
+        ModelInfo,
+        Run,
+        Session,
+        SessionSummary,
+        ToolCallResult,
+        ToolInfo,
+        WorkspaceInfo,
+    )
     from ._tools import Tool
