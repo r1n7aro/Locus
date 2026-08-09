@@ -1,16 +1,22 @@
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::models::{
     AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole,
-    PlanModeState, SessionDetail, SessionEventRecord, SessionRunSummary, SessionRuntimeSnapshot,
-    SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
+    PlanModeState, SessionContextAttempt, SessionDetail, SessionEventRecord, SessionMessagePage,
+    SessionRunSummary, SessionRuntimeSnapshot, SessionSummary, SessionTurnPreview,
+    SessionViewSnapshot, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use super::runtime::SessionRuntimeRegistry;
 use crate::commands::{ModelUsageGroup, ModelUsageMetrics, ModelUsageReport, TokenUsage};
@@ -19,9 +25,11 @@ use crate::compact;
 #[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
+    db_path: PathBuf,
     tool_results_root: PathBuf,
     event_writer: Arc<SessionEventWriter>,
     runtime: Arc<SessionRuntimeRegistry>,
+    export_snapshot_created_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -83,12 +91,18 @@ struct QueuedSessionEvent {
     status_updates: Vec<SessionRunStatusUpdate>,
 }
 
+enum SessionEventWriterCommand {
+    Append(QueuedSessionEvent),
+    Flush(mpsc::SyncSender<Result<(), String>>),
+}
+
 struct SessionEventWriter {
-    sender: mpsc::Sender<QueuedSessionEvent>,
+    sender: mpsc::Sender<SessionEventWriterCommand>,
 }
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 2_000;
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
+const DEFERRED_TOOL_IMAGE_DATA_PREFIX: &str = "locus-deferred-message:";
 const LARGE_RESULT_TAG_OPEN: &str = "<persisted-output>";
 const LARGE_RESULT_TAG_CLOSE: &str = "</persisted-output>";
 const DELETED_RESULT_TAG_OPEN: &str = "<persisted-output-deleted>";
@@ -112,7 +126,7 @@ impl SessionEventWriter {
     const MAX_BATCH_SIZE: usize = 128;
 
     fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        let (sender, receiver) = mpsc::channel::<QueuedSessionEvent>();
+        let (sender, receiver) = mpsc::channel::<SessionEventWriterCommand>();
         thread::Builder::new()
             .name("locus-session-event-writer".to_string())
             .spawn(move || Self::run(conn, receiver))
@@ -122,47 +136,111 @@ impl SessionEventWriter {
 
     fn enqueue(&self, event: QueuedSessionEvent) -> Result<(), String> {
         self.sender
-            .send(event)
+            .send(SessionEventWriterCommand::Append(event))
             .map_err(|e| format!("Failed to queue session event: {}", e))
     }
 
-    fn run(conn: Arc<Mutex<Connection>>, receiver: mpsc::Receiver<QueuedSessionEvent>) {
+    fn flush(&self) -> Result<(), String> {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        self.sender
+            .send(SessionEventWriterCommand::Flush(sender))
+            .map_err(|e| format!("Failed to queue session event flush: {}", e))?;
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("Timed out waiting for session event flush: {}", e))?
+    }
+
+    fn run(conn: Arc<Mutex<Connection>>, receiver: mpsc::Receiver<SessionEventWriterCommand>) {
         let mut batch = Vec::with_capacity(Self::MAX_BATCH_SIZE);
-        while let Ok(first) = receiver.recv() {
+        let mut unreported_error: Option<String> = None;
+        while let Ok(command) = receiver.recv() {
+            let first = match command {
+                SessionEventWriterCommand::Append(event) => event,
+                SessionEventWriterCommand::Flush(sender) => {
+                    let result = unreported_error.take().map_or(Ok(()), Err);
+                    let _ = sender.send(result);
+                    continue;
+                }
+            };
             batch.clear();
             batch.push(first);
+            let mut flush_waiters = Vec::new();
+            let mut disconnected = false;
 
             while batch.len() < Self::MAX_BATCH_SIZE {
                 match receiver.recv_timeout(Self::FLUSH_INTERVAL) {
-                    Ok(event) => batch.push(event),
+                    Ok(SessionEventWriterCommand::Append(event)) => batch.push(event),
+                    Ok(SessionEventWriterCommand::Flush(sender)) => {
+                        flush_waiters.push(sender);
+                        break;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
 
-            let coalesced = Self::coalesce_batch(&batch);
-            let events = coalesced
-                .iter()
-                .map(|item| item.event.clone())
-                .collect::<Vec<_>>();
-
-            if let Err(error) = SessionStore::append_session_events_batch_on_conn(&conn, &events) {
-                eprintln!("[Locus] failed to flush session event batch: {}", error);
-            }
-
-            for status in coalesced.iter().flat_map(|item| item.status_updates.iter()) {
-                if let Err(error) = SessionStore::update_run_status_on_conn(
-                    &conn,
-                    &status.run_id,
-                    &status.status,
-                    status.error_message.as_deref(),
-                ) {
-                    eprintln!(
-                        "[Locus] failed to flush session run status {} for run {}: {}",
-                        status.status, status.run_id, error
-                    );
+            let batch_result = Self::persist_batch(&conn, &batch);
+            if flush_waiters.is_empty() {
+                if let Err(error) = batch_result {
+                    unreported_error = Some(match unreported_error.take() {
+                        Some(previous) => format!("{}; {}", previous, error),
+                        None => error,
+                    });
+                }
+            } else {
+                let result = match (unreported_error.take(), batch_result) {
+                    (None, result) => result,
+                    (Some(previous), Ok(())) => Err(previous),
+                    (Some(previous), Err(error)) => Err(format!("{}; {}", previous, error)),
+                };
+                for waiter in flush_waiters {
+                    let _ = waiter.send(result.clone());
                 }
             }
+            if disconnected {
+                break;
+            }
+        }
+    }
+
+    fn persist_batch(
+        conn: &Arc<Mutex<Connection>>,
+        batch: &[QueuedSessionEvent],
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let coalesced = Self::coalesce_batch(batch);
+        let events = coalesced
+            .iter()
+            .map(|item| item.event.clone())
+            .collect::<Vec<_>>();
+
+        if let Err(error) = SessionStore::append_session_events_batch_on_conn(conn, &events) {
+            eprintln!("[Locus] failed to flush session event batch: {}", error);
+            errors.push(error);
+        }
+
+        for status in coalesced.iter().flat_map(|item| item.status_updates.iter()) {
+            if let Err(error) = SessionStore::update_run_status_on_conn(
+                conn,
+                &status.run_id,
+                &status.status,
+                status.error_message.as_deref(),
+            ) {
+                eprintln!(
+                    "[Locus] failed to flush session run status {} for run {}: {}",
+                    status.status, status.run_id, error
+                );
+                errors.push(error);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
@@ -247,6 +325,25 @@ fn persisted_output_path(content: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn compress_context_attempt_text(value: &str) -> Result<Vec<u8>, String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder
+        .write_all(value.as_bytes())
+        .map_err(|e| format!("Failed to compress context attempt: {}", e))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("Failed to finish context attempt compression: {}", e))
+}
+
+fn decompress_context_attempt_text(value: &[u8]) -> Result<String, String> {
+    let mut decoder = GzDecoder::new(value);
+    let mut output = String::new();
+    decoder
+        .read_to_string(&mut output)
+        .map_err(|e| format!("Failed to decompress context attempt: {}", e))?;
+    Ok(output)
+}
+
 fn build_deleted_tool_result_message(path: &Path) -> String {
     format!(
         "{DELETED_RESULT_TAG_OPEN}\nFull output file deleted: {}\n{DELETED_RESULT_TAG_CLOSE}",
@@ -266,10 +363,7 @@ fn estimate_preview(content: &str, max_chars: usize) -> (String, bool) {
     let head_chars = max_chars / 2;
     let tail_chars = max_chars - head_chars;
     let head: String = content.chars().take(head_chars).collect();
-    let tail: String = content
-        .chars()
-        .skip(total - tail_chars)
-        .collect();
+    let tail: String = content.chars().skip(total - tail_chars).collect();
     let preview = format!(
         "{}\n\n... [{} chars omitted, see full output file] ...\n\n{}",
         head,
@@ -344,6 +438,105 @@ struct MessageMetadata {
     compacted_context: Option<CompactedContextSnapshot>,
 }
 
+struct StoredChatMessageRow {
+    id: String,
+    role: String,
+    content: String,
+    created_at: i64,
+    prompt_prefix: Option<String>,
+    prompt_suffix: Option<String>,
+    tool_calls_json: Option<String>,
+    tool_call_id: Option<String>,
+    images_json: Option<String>,
+    asset_refs_json: Option<String>,
+    thinking_content: Option<String>,
+    thinking_duration: Option<i64>,
+    thinking_signature: Option<String>,
+    metadata_json: Option<String>,
+}
+
+impl StoredChatMessageRow {
+    fn from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(offset)?,
+            role: row.get(offset + 1)?,
+            content: row.get(offset + 2)?,
+            created_at: row.get(offset + 3)?,
+            prompt_prefix: row.get(offset + 4)?,
+            prompt_suffix: row.get(offset + 5)?,
+            tool_calls_json: row.get(offset + 6)?,
+            tool_call_id: row.get(offset + 7)?,
+            images_json: row.get(offset + 8)?,
+            asset_refs_json: row.get(offset + 9)?,
+            thinking_content: row.get(offset + 10)?,
+            thinking_duration: row.get(offset + 11)?,
+            thinking_signature: row.get(offset + 12)?,
+            metadata_json: row.get(offset + 13)?,
+        })
+    }
+
+    fn into_message(self) -> Result<ChatMessage, String> {
+        let role = MessageRole::from_str(&self.role)?;
+        let tool_calls: Option<Vec<ToolCallInfo>> = self
+            .tool_calls_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse tool_calls: {}", e))?;
+        let images: Option<Vec<super::models::ImageData>> = self
+            .images_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse images: {}", e))?;
+        let asset_refs: Option<Vec<super::models::AssetRefData>> = self
+            .asset_refs_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse asset refs: {}", e))?;
+        let metadata: Option<MessageMetadata> = self
+            .metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse message metadata: {}", e))?;
+        let (knowledge_proposal, response_id, content_order, thinking_order, render_parts) =
+            metadata
+                .map(|value| {
+                    (
+                        value.knowledge_proposal,
+                        value.response_id,
+                        value.content_order,
+                        value.thinking_order,
+                        value.render_parts,
+                    )
+                })
+                .unwrap_or((None, None, None, None, None));
+
+        Ok(ChatMessage {
+            id: self.id,
+            role,
+            content: self.content,
+            created_at: self.created_at,
+            prompt_prefix: self.prompt_prefix,
+            prompt_suffix: self.prompt_suffix,
+            response_id,
+            content_order,
+            thinking_order,
+            tool_calls,
+            tool_call_id: self.tool_call_id,
+            images,
+            asset_refs,
+            thinking_content: self.thinking_content,
+            thinking_duration: self.thinking_duration.map(|duration| duration as u32),
+            thinking_signature: self.thinking_signature,
+            knowledge_proposal,
+            render_parts,
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactedContextSnapshot {
@@ -364,7 +557,6 @@ struct CompactedContextSnapshotEntry {
 fn message_metadata_json(
     knowledge_proposal: Option<&KnowledgeProposal>,
     response_id: Option<&str>,
-    response_request: Option<&serde_json::Value>,
     content_order: Option<u32>,
     thinking_order: Option<u32>,
     render_parts: Option<&[AssistantRenderPart]>,
@@ -373,12 +565,16 @@ fn message_metadata_json(
         knowledge_proposal: knowledge_proposal.cloned(),
         response_id: response_id.map(|value| value.to_string()),
         cli_session_ids: None,
-        response_request: response_request.cloned(),
+        response_request: None,
         content_order,
         thinking_order,
         render_parts: render_parts.map(|value| value.to_vec()),
         compacted_context: None,
     };
+    serialize_message_metadata(&metadata)
+}
+
+fn serialize_message_metadata(metadata: &MessageMetadata) -> Result<Option<String>, String> {
     if metadata.knowledge_proposal.is_none()
         && metadata.response_id.is_none()
         && metadata.cli_session_ids.is_none()
@@ -393,6 +589,19 @@ fn message_metadata_json(
     serde_json::to_string(&metadata)
         .map(Some)
         .map_err(|e| format!("Failed to serialize message metadata: {}", e))
+}
+
+fn response_request_payload(
+    response_request: &serde_json::Value,
+) -> Result<(String, String), String> {
+    let payload_json = serde_json::to_string(response_request)
+        .map_err(|e| format!("Failed to serialize response request metadata: {}", e))?;
+    let digest = Sha256::digest(payload_json.as_bytes());
+    let id = digest
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>();
+    Ok((id, payload_json))
 }
 
 fn merge_prompt_prefixes(carried: &str, existing: Option<&str>) -> String {
@@ -415,6 +624,21 @@ fn merge_prompt_prefixes(carried: &str, existing: Option<&str>) -> String {
 
 fn is_context_handoff_message(message: &ChatMessage) -> bool {
     message.role == MessageRole::Assistant && message.content.starts_with(CONTEXT_HANDOFF_MARKER)
+}
+
+fn is_internal_system_reminder_message(message: &ChatMessage) -> bool {
+    message.role == MessageRole::User
+        && message.content.trim().is_empty()
+        && message.images.as_ref().map_or(true, Vec::is_empty)
+        && message.asset_refs.as_ref().map_or(true, Vec::is_empty)
+        && message
+            .prompt_suffix
+            .as_deref()
+            .is_some_and(|suffix| suffix.trim_start().starts_with("<system-reminder>"))
+}
+
+fn remove_internal_system_reminders_from_display(messages: &mut Vec<ChatMessage>) {
+    messages.retain(|message| !is_internal_system_reminder_message(message));
 }
 
 fn redact_context_handoff_for_display(message: &mut ChatMessage) {
@@ -560,7 +784,15 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 24;
+    const SCHEMA_VERSION: i32 = 26;
+
+    pub const fn schema_version() -> i32 {
+        Self::SCHEMA_VERSION
+    }
+
+    pub fn export_snapshot_created_at(&self) -> Option<i64> {
+        self.export_snapshot_created_at
+    }
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::new_with_tool_results_root(data_dir, data_dir.join("temp").join("tool-results"))
@@ -623,9 +855,47 @@ impl SessionStore {
 
         Ok(SessionStore {
             conn,
+            db_path,
             tool_results_root,
             event_writer,
             runtime: Arc::new(SessionRuntimeRegistry::default()),
+            export_snapshot_created_at: None,
+        })
+    }
+
+    pub fn create_export_snapshot(&self) -> Result<Self, String> {
+        self.event_writer.flush()?;
+
+        let source = Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("Failed to open session database for export snapshot: {}", e))?;
+        source
+            .busy_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("Failed to configure export snapshot timeout: {}", e))?;
+        let mut destination = Connection::open_in_memory()
+            .map_err(|e| format!("Failed to create in-memory export snapshot: {}", e))?;
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+                .map_err(|e| format!("Failed to initialize session export snapshot: {}", e))?;
+            backup
+                .run_to_completion(128, Duration::from_millis(2), None)
+                .map_err(|e| format!("Failed to copy session database for export: {}", e))?;
+        }
+        destination
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| format!("Failed to configure session export snapshot: {}", e))?;
+
+        let conn = Arc::new(Mutex::new(destination));
+        let event_writer = Arc::new(SessionEventWriter::new(conn.clone()));
+        Ok(Self {
+            conn,
+            db_path: PathBuf::new(),
+            tool_results_root: self.tool_results_root.clone(),
+            event_writer,
+            runtime: Arc::new(SessionRuntimeRegistry::default()),
+            export_snapshot_created_at: Some(Self::now_ts()),
         })
     }
 
@@ -832,8 +1102,113 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 24, "add a new migration block above");
+        if current < 25 {
+            Self::migrate(
+                conn,
+                25,
+                "deduplicate response request metadata",
+                Self::migrate_response_request_metadata,
+            )?;
+        }
+
+        if current < 26 {
+            Self::migrate(conn, 26, "persist session context attempts", |conn| {
+                Self::create_context_attempt_schema(conn)?;
+                conn.execute_batch(
+                    "INSERT OR IGNORE INTO session_context_capture_gaps (session_id)
+                     SELECT id FROM sessions;",
+                )
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 26, "add a new migration block above");
         Ok(())
+    }
+
+    fn migrate_response_request_metadata(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS response_request_payloads (
+                id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+             );",
+        )?;
+        if !Self::table_has_column(conn, "messages", "response_request_id")? {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN response_request_id TEXT REFERENCES response_request_payloads(id);",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_response_request
+             ON messages(response_request_id);",
+        )?;
+
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata_json
+                 FROM messages
+                 WHERE metadata_json IS NOT NULL
+                   AND response_request_id IS NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for (message_id, metadata_json) in rows {
+            let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&metadata_json) else {
+                continue;
+            };
+            let Some(response_request) = metadata
+                .as_object_mut()
+                .and_then(|object| object.remove("responseRequest"))
+            else {
+                continue;
+            };
+            let (response_request_id, payload_json) = response_request_payload(&response_request)
+                .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+            })?;
+            let display_metadata_json =
+                if metadata.as_object().is_some_and(serde_json::Map::is_empty) {
+                    None
+                } else {
+                    Some(serde_json::to_string(&metadata).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?)
+                };
+            conn.execute(
+                "INSERT OR IGNORE INTO response_request_payloads (id, payload_json)
+                 VALUES (?1, ?2)",
+                params![response_request_id, payload_json],
+            )?;
+            conn.execute(
+                "UPDATE messages
+                 SET metadata_json = ?1, response_request_id = ?2
+                 WHERE id = ?3",
+                params![display_metadata_json, response_request_id, message_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn persist_response_request_with_conn(
+        conn: &Connection,
+        response_request: Option<&serde_json::Value>,
+    ) -> Result<Option<String>, String> {
+        let Some(response_request) = response_request else {
+            return Ok(None);
+        };
+        let (response_request_id, payload_json) = response_request_payload(response_request)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO response_request_payloads (id, payload_json)
+             VALUES (?1, ?2)",
+            params![response_request_id, payload_json],
+        )
+        .map_err(|e| format!("Failed to persist response request metadata: {}", e))?;
+        Ok(Some(response_request_id))
     }
 
     fn create_latest_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -858,6 +1233,11 @@ impl SessionStore {
             CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);
 
+            CREATE TABLE IF NOT EXISTS response_request_payloads (
+                id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -874,9 +1254,11 @@ impl SessionStore {
                 thinking_duration INTEGER,
                 thinking_signature TEXT,
                 metadata_json TEXT,
+                response_request_id TEXT REFERENCES response_request_payloads(id),
                 include_in_prompt INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_response_request ON messages(response_request_id);
 
             CREATE TABLE IF NOT EXISTS token_usage (
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -901,7 +1283,36 @@ impl SessionStore {
             CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);",
         )
         .and_then(|_| Self::create_session_sync_schema(conn))
+        .and_then(|_| Self::create_context_attempt_schema(conn))
         .and_then(|_| Self::create_model_usage_schema(conn))
+    }
+
+    fn create_context_attempt_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_context_attempts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL,
+                iteration INTEGER NOT NULL,
+                attempt INTEGER NOT NULL,
+                attempt_kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                effort TEXT,
+                request_gzip BLOB NOT NULL,
+                response_gzip BLOB NOT NULL,
+                error_message TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_context_attempts_session
+                ON session_context_attempts(session_id, created_at, iteration, attempt);
+            CREATE INDEX IF NOT EXISTS idx_session_context_attempts_run
+                ON session_context_attempts(run_id, iteration, attempt);
+            CREATE TABLE IF NOT EXISTS session_context_capture_gaps (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
+            );",
+        )
     }
 
     fn create_model_usage_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -1084,9 +1495,7 @@ impl SessionStore {
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()
-                .map_err(|error| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                })?
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
                 .unwrap_or_default();
             if metadata.compacted_context.is_some() {
                 continue;
@@ -1348,7 +1757,8 @@ impl SessionStore {
     }
 
     pub fn fork_session(&self, source_id: &str, title: Option<&str>) -> Result<String, String> {
-        self.fork_session_with_cutoff(source_id, title, None)
+        let snapshot = self.create_export_snapshot()?;
+        self.fork_session_from_export_snapshot(&snapshot, source_id, title)
     }
 
     pub fn fork_session_from_message(
@@ -1381,6 +1791,7 @@ impl SessionStore {
             thinking_duration: Option<i64>,
             thinking_signature: Option<String>,
             metadata_json: Option<String>,
+            response_request_id: Option<String>,
             include_in_prompt: i64,
         }
 
@@ -1499,7 +1910,7 @@ impl SessionStore {
             let message_rows = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, include_in_prompt
+                        "SELECT role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id, include_in_prompt
                          FROM messages
                          WHERE session_id = ?1
                            AND (?2 IS NULL OR rowid <= ?2)
@@ -1522,7 +1933,8 @@ impl SessionStore {
                             thinking_duration: row.get(10)?,
                             thinking_signature: row.get(11)?,
                             metadata_json: row.get(12)?,
-                            include_in_prompt: row.get(13)?,
+                            response_request_id: row.get(13)?,
+                            include_in_prompt: row.get(14)?,
                         })
                     })
                     .map_err(|e| format!("Failed to query messages for fork: {}", e))?;
@@ -1555,9 +1967,10 @@ impl SessionStore {
                         thinking_duration,
                         thinking_signature,
                         metadata_json,
+                        response_request_id,
                         include_in_prompt
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                     params![
                         message_id,
                         new_id,
@@ -1574,6 +1987,7 @@ impl SessionStore {
                         row.thinking_duration,
                         row.thinking_signature,
                         row.metadata_json,
+                        row.response_request_id,
                         row.include_in_prompt,
                     ],
                 )
@@ -1631,6 +2045,291 @@ impl SessionStore {
                     return Err(format!("Failed to commit session fork: {}", e));
                 }
                 Ok(id)
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                if target_tool_dir.is_dir() {
+                    let _ = std::fs::remove_dir_all(&target_tool_dir);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Creates a fork in this store from an immutable online-backup snapshot.
+    /// The source may keep receiving messages while the copied history remains
+    /// pinned to the snapshot boundary.
+    pub fn fork_session_from_export_snapshot(
+        &self,
+        snapshot: &SessionStore,
+        source_id: &str,
+        title: Option<&str>,
+    ) -> Result<String, String> {
+        #[derive(Debug)]
+        struct SnapshotMessageRow {
+            role: String,
+            content: String,
+            created_at: i64,
+            prompt_prefix: Option<String>,
+            prompt_suffix: Option<String>,
+            tool_calls: Option<String>,
+            tool_call_id: Option<String>,
+            images: Option<String>,
+            asset_refs: Option<String>,
+            thinking_content: Option<String>,
+            thinking_duration: Option<i64>,
+            thinking_signature: Option<String>,
+            metadata_json: Option<String>,
+            response_request_id: Option<String>,
+            include_in_prompt: i64,
+        }
+
+        type SnapshotSessionRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        type SnapshotUsageRow = (i64, i64, i64, i64, f64, i64, i64, i64);
+        type SnapshotTodoRow = (i64, String, String, String);
+
+        let (session, messages, usage, todos) = {
+            let conn = snapshot.conn.lock().map_err(|e| e.to_string())?;
+            let session = conn
+                .query_row(
+                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, latest_completed_run_id, latest_todo_run_id
+                     FROM sessions WHERE id = ?1",
+                    params![source_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    },
+                )
+                .map_err(|e| format!("Session not found in fork snapshot: {}", e))?;
+
+            let mut message_stmt = conn
+                .prepare(
+                    "SELECT role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id, include_in_prompt
+                     FROM messages
+                     WHERE session_id = ?1
+                     ORDER BY rowid ASC",
+                )
+                .map_err(|e| format!("Failed to prepare fork snapshot messages: {}", e))?;
+            let messages = message_stmt
+                .query_map(params![source_id], |row| {
+                    Ok(SnapshotMessageRow {
+                        role: row.get(0)?,
+                        content: row.get(1)?,
+                        created_at: row.get(2)?,
+                        prompt_prefix: row.get(3)?,
+                        prompt_suffix: row.get(4)?,
+                        tool_calls: row.get(5)?,
+                        tool_call_id: row.get(6)?,
+                        images: row.get(7)?,
+                        asset_refs: row.get(8)?,
+                        thinking_content: row.get(9)?,
+                        thinking_duration: row.get(10)?,
+                        thinking_signature: row.get(11)?,
+                        metadata_json: row.get(12)?,
+                        response_request_id: row.get(13)?,
+                        include_in_prompt: row.get(14)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query fork snapshot messages: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read fork snapshot message: {}", e))?;
+            drop(message_stmt);
+
+            let usage = conn
+                .query_row(
+                    "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, total_cost_usd, priced_rounds, last_context_tokens, last_context_limit
+                     FROM token_usage WHERE session_id = ?1",
+                    params![source_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("Failed to read fork snapshot usage: {}", e))?;
+
+            let mut todo_stmt = conn
+                .prepare(
+                    "SELECT position, content, status, priority
+                     FROM todos WHERE session_id = ?1 ORDER BY position ASC",
+                )
+                .map_err(|e| format!("Failed to prepare fork snapshot todos: {}", e))?;
+            let todos = todo_stmt
+                .query_map(params![source_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(|e| format!("Failed to query fork snapshot todos: {}", e))?
+                .collect::<Result<Vec<SnapshotTodoRow>, _>>()
+                .map_err(|e| format!("Failed to read fork snapshot todo: {}", e))?;
+            (session, messages, usage, todos)
+        };
+
+        let session: SnapshotSessionRow = session;
+        if session
+            .1
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(CHILD_SESSION_FORK_ERROR.to_string());
+        }
+
+        let new_id = Uuid::new_v4().to_string();
+        let now = Self::now_ts();
+        let source_tool_dir = snapshot.session_tool_results_dir(source_id);
+        let target_tool_dir = self.session_tool_results_dir(&new_id);
+        let staging_tool_dir = target_tool_dir.with_file_name(format!(
+            ".{}.copying-{}",
+            new_id,
+            Uuid::new_v4()
+        ));
+        let copied_tool_results = source_tool_dir.is_dir();
+        if copied_tool_results {
+            copy_dir_recursively(&source_tool_dir, &staging_tool_dir)?;
+            if let Some(parent) = target_tool_dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create fork tool result parent: {}", e)
+                })?;
+            }
+            if let Err(error) = std::fs::rename(&staging_tool_dir, &target_tool_dir) {
+                let _ = std::fs::remove_dir_all(&staging_tool_dir);
+                return Err(format!("Failed to publish copied fork tool results: {}", error));
+            }
+        }
+
+        let resolved_title = title
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} (fork)", session.0));
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("Failed to begin snapshot fork transaction: {}", e))?;
+
+        let result = (|| -> Result<(), String> {
+            conn.execute(
+                "INSERT INTO sessions (
+                    id, title, parent_session_id, workspace_id, session_type, agent_id,
+                    last_model_id, last_effort, archived_at, latest_completed_run_id,
+                    latest_todo_run_id, created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
+                params![
+                    new_id,
+                    resolved_title,
+                    session.2,
+                    session.3,
+                    session.4,
+                    session.5,
+                    session.6,
+                    session.7,
+                    session.8,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to create snapshot fork session: {}", e))?;
+
+            for message in messages {
+                let content = if copied_tool_results {
+                    rewrite_tool_result_references(
+                        &message.content,
+                        &source_tool_dir,
+                        &target_tool_dir,
+                    )
+                } else {
+                    message.content
+                };
+                conn.execute(
+                    "INSERT INTO messages (
+                        id, session_id, role, content, created_at, prompt_prefix, prompt_suffix,
+                        tool_calls, tool_call_id, images, asset_refs, thinking_content,
+                        thinking_duration, thinking_signature, metadata_json,
+                        response_request_id, include_in_prompt
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        new_id,
+                        message.role,
+                        content,
+                        message.created_at,
+                        message.prompt_prefix,
+                        message.prompt_suffix,
+                        message.tool_calls,
+                        message.tool_call_id,
+                        message.images,
+                        message.asset_refs,
+                        message.thinking_content,
+                        message.thinking_duration,
+                        message.thinking_signature,
+                        message.metadata_json,
+                        message.response_request_id,
+                        message.include_in_prompt,
+                    ],
+                )
+                .map_err(|e| format!("Failed to copy snapshot message into fork: {}", e))?;
+            }
+
+            if let Some(usage) = usage {
+                let usage: SnapshotUsageRow = usage;
+                conn.execute(
+                    "INSERT INTO token_usage (
+                        session_id, total_input_tokens, total_output_tokens,
+                        total_cache_read_tokens, total_cache_write_tokens, total_cost_usd,
+                        priced_rounds, last_context_tokens, last_context_limit
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        new_id, usage.0, usage.1, usage.2, usage.3, usage.4, usage.5, usage.6,
+                        usage.7,
+                    ],
+                )
+                .map_err(|e| format!("Failed to copy snapshot token usage into fork: {}", e))?;
+            }
+            for todo in todos {
+                conn.execute(
+                    "INSERT INTO todos (session_id, position, content, status, priority)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![new_id, todo.0, todo.1, todo.2, todo.3],
+                )
+                .map_err(|e| format!("Failed to copy snapshot todo into fork: {}", e))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(error) = conn.execute("COMMIT", []) {
+                    if target_tool_dir.is_dir() {
+                        let _ = std::fs::remove_dir_all(&target_tool_dir);
+                    }
+                    return Err(format!("Failed to commit snapshot session fork: {}", error));
+                }
+                Ok(new_id)
             }
             Err(error) => {
                 let _ = conn.execute("ROLLBACK", []);
@@ -1803,6 +2502,78 @@ impl SessionStore {
         )
         .optional()
         .map_err(|e| format!("Failed to query session run: {}", e))
+    }
+
+    fn latest_run_record_with_conn(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, String> {
+        conn.query_row(
+            "SELECT run_id, status, error_message
+             FROM session_runs
+             WHERE session_id = ?1
+             ORDER BY updated_at DESC, started_at DESC, rowid DESC
+             LIMIT 1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query latest session run: {}", e))
+    }
+
+    /// Whether the latest run ended in a state that accepts an empty resume
+    /// turn. This is intentionally broader than the UI predicate so a resume
+    /// click received before the async event writer flushes is still valid.
+    pub fn latest_run_is_interrupted(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let Some((_, status, _)) = Self::latest_run_record_with_conn(&conn, session_id)? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            status.as_str(),
+            RUN_STATUS_CANCELLED | RUN_STATUS_ERROR
+        ))
+    }
+
+    /// Returns the persisted composer resume state for a session. Failed or
+    /// cancelled runs become resumable once their user turn has been persisted.
+    /// Runs recovered after an application restart carry an explicit error and
+    /// remain resumable even when the final stream event was not flushed.
+    pub fn session_resume_available(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let Some((run_id, status, error_message)) =
+            Self::latest_run_record_with_conn(&conn, session_id)?
+        else {
+            return Ok(false);
+        };
+
+        let has_persisted_user_turn = || {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM session_events
+                    WHERE run_id = ?1 AND event_type = 'userMessage'
+                )",
+                params![run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(|e| format!("Failed to inspect interrupted user turn: {}", e))
+        };
+
+        match status.as_str() {
+            RUN_STATUS_ERROR => has_persisted_user_turn(),
+            RUN_STATUS_CANCELLED => {
+                if error_message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+                {
+                    return Ok(true);
+                }
+                has_persisted_user_turn()
+            }
+            _ => Ok(false),
+        }
     }
 
     pub fn active_descendant_runs(
@@ -2046,6 +2817,174 @@ impl SessionStore {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_context_attempt(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        iteration: usize,
+        attempt: u32,
+        attempt_kind: &str,
+        status: &str,
+        backend: &str,
+        model_id: &str,
+        effort: Option<&str>,
+        request: &serde_json::Value,
+        response: &str,
+        error_message: Option<&str>,
+    ) -> Result<String, String> {
+        let id = Uuid::new_v4().to_string();
+        let request_json = serde_json::to_string(request)
+            .map_err(|e| format!("Failed to serialize context attempt request: {}", e))?;
+        let request_gzip = compress_context_attempt_text(&request_json)?;
+        let response_gzip = compress_context_attempt_text(response)?;
+        let created_at = Self::now_ts();
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO session_context_attempts (
+                id, session_id, run_id, iteration, attempt, attempt_kind, status,
+                backend, model_id, effort, request_gzip, response_gzip, error_message, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                id,
+                session_id,
+                run_id,
+                iteration as i64,
+                i64::from(attempt),
+                attempt_kind,
+                status,
+                backend,
+                model_id,
+                effort,
+                request_gzip,
+                response_gzip,
+                error_message,
+                created_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist context attempt: {}", e))?;
+        Ok(id)
+    }
+
+    pub fn list_context_attempts(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionContextAttempt>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, run_id, iteration, attempt, attempt_kind, status,
+                        backend, model_id, effort, request_gzip, response_gzip, error_message,
+                        created_at
+                 FROM session_context_attempts
+                 WHERE session_id = ?1
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare context attempt query: {}", e))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query context attempts: {}", e))?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (
+                id,
+                session_id,
+                run_id,
+                iteration,
+                attempt,
+                attempt_kind,
+                status,
+                backend,
+                model_id,
+                effort,
+                request_gzip,
+                response_gzip,
+                error_message,
+                created_at,
+            ) = row.map_err(|e| format!("Failed to read context attempt row: {}", e))?;
+            let request_json = decompress_context_attempt_text(&request_gzip)?;
+            let response = decompress_context_attempt_text(&response_gzip)?;
+            let request = serde_json::from_str(&request_json)
+                .map_err(|e| format!("Failed to parse context attempt request: {}", e))?;
+            attempts.push(SessionContextAttempt {
+                id,
+                session_id,
+                run_id,
+                iteration: u32::try_from(iteration).unwrap_or_default(),
+                attempt: u32::try_from(attempt).unwrap_or_default(),
+                attempt_kind,
+                status,
+                backend,
+                model_id,
+                effort,
+                request,
+                response,
+                error_message,
+                created_at,
+            });
+        }
+        Ok(attempts)
+    }
+
+    pub fn session_has_context_capture_gap(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM session_context_capture_gaps WHERE session_id = ?1
+             )",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|e| format!("Failed to query context capture coverage: {}", e))
+    }
+
+    pub fn session_tree_ids(&self, root_session_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE session_tree(id, depth) AS (
+                    SELECT id, 0 FROM sessions WHERE id = ?1
+                    UNION ALL
+                    SELECT sessions.id, session_tree.depth + 1
+                    FROM sessions
+                    JOIN session_tree ON sessions.parent_session_id = session_tree.id
+                 )
+                 SELECT id FROM session_tree ORDER BY depth ASC, id ASC",
+            )
+            .map_err(|e| format!("Failed to prepare session tree query: {}", e))?;
+        let rows = stmt
+            .query_map(params![root_session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query session tree: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read session tree: {}", e))
+    }
+
+    pub fn expand_persisted_tool_output_for_export(&self, content: &str) -> String {
+        let Some(path) = persisted_output_path(content) else {
+            return content.to_string();
+        };
+        std::fs::read_to_string(&path).unwrap_or_else(|_| content.to_string())
+    }
+
     pub fn list_run_events(
         &self,
         run_id: &str,
@@ -2081,12 +3020,13 @@ impl SessionStore {
         for row in rows {
             let (session_id, run_id, seq, event_type, payload_json, created_at) =
                 row.map_err(|e| format!("Failed to read run event row: {}", e))?;
-            let payload = serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|e| {
-                format!(
-                    "Failed to parse run event payload for run {} seq {}: {}",
-                    run_id, seq, e
-                )
-            })?;
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|e| {
+                    format!(
+                        "Failed to parse run event payload for run {} seq {}: {}",
+                        run_id, seq, e
+                    )
+                })?;
             events.push(SessionEventRecord {
                 session_id,
                 run_id,
@@ -2269,7 +3209,12 @@ impl SessionStore {
             .map_err(|e| format!("Session not found: {}", e))?;
 
         let raw_messages = self.get_messages_with_conn(&conn, id)?;
+        // History normalization clones and enriches tool calls. Release the
+        // single SQLite connection first so unrelated lightweight reads do not
+        // wait behind that CPU work.
+        drop(conn);
         let mut messages = crate::session::history::normalize_tool_round_history(&raw_messages);
+        remove_internal_system_reminders_from_display(&mut messages);
         Self::mark_missing_persisted_outputs_for_display(&mut messages);
 
         Ok(SessionDetail {
@@ -2287,6 +3232,185 @@ impl SessionStore {
             pending_inputs: Vec::new(),
             runtime: None,
         })
+    }
+
+    pub fn load_session_view(
+        &self,
+        id: &str,
+        message_limit: u32,
+    ) -> Result<SessionViewSnapshot, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (
+            title,
+            agent_id,
+            last_model_id,
+            last_effort,
+            session_type,
+            parent_session_id,
+            latest_completed_run_id,
+            created_at,
+            updated_at,
+        ) = conn
+            .query_row(
+                "SELECT title, agent_id, last_model_id, last_effort, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Session not found: {}", e))?;
+
+        let raw_page = Self::get_message_page_with_conn(&conn, id, None, message_limit)?;
+        let user_message_ids = Self::get_session_user_message_ids_with_conn(&conn, id)?;
+        drop(conn);
+
+        let mut messages =
+            crate::session::history::normalize_tool_round_history(&raw_page.messages);
+        remove_internal_system_reminders_from_display(&mut messages);
+        Self::mark_missing_persisted_outputs_for_display(&mut messages);
+        Self::defer_tool_result_images_for_display(&mut messages);
+
+        Ok(SessionViewSnapshot {
+            session: SessionDetail {
+                id: id.to_string(),
+                title,
+                agent_id,
+                last_model_id,
+                last_effort,
+                session_type,
+                parent_session_id,
+                latest_completed_run_id,
+                created_at,
+                updated_at,
+                messages,
+                pending_inputs: Vec::new(),
+                runtime: None,
+            },
+            user_message_ids,
+            oldest_message_row_id: raw_page.oldest_message_row_id,
+            has_more_history: raw_page.has_more_history,
+        })
+    }
+
+    pub fn load_session_turn_preview(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<SessionTurnPreview, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (message_row_id, prompt) = conn
+            .query_row(
+                "SELECT rowid, content
+                 FROM messages
+                 WHERE session_id = ?1 AND id = ?2 AND role = 'user'",
+                params![session_id, message_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| format!("User message not found: {}", e))?;
+        let next_user_row_id = conn
+            .query_row(
+                "SELECT MIN(rowid)
+                 FROM messages
+                 WHERE session_id = ?1 AND role = 'user' AND rowid > ?2",
+                params![session_id, message_row_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| format!("Failed to locate the next user turn: {}", e))?;
+        let response = conn
+            .query_row(
+                "SELECT content
+                 FROM messages
+                 WHERE session_id = ?1
+                   AND role = 'assistant'
+                   AND rowid > ?2
+                   AND (?3 IS NULL OR rowid < ?3)
+                   AND TRIM(content) <> ''
+                 ORDER BY rowid ASC
+                 LIMIT 1",
+                params![session_id, message_row_id, next_user_row_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load the user turn response: {}", e))?
+            .unwrap_or_default();
+
+        Ok(SessionTurnPreview {
+            message_id: message_id.to_string(),
+            prompt,
+            response,
+        })
+    }
+
+    pub fn load_session_message_page(
+        &self,
+        id: &str,
+        before_row_id: i64,
+        message_limit: u32,
+    ) -> Result<SessionMessagePage, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let raw_page =
+            Self::get_message_page_with_conn(&conn, id, Some(before_row_id), message_limit)?;
+        drop(conn);
+
+        let mut messages =
+            crate::session::history::normalize_tool_round_history(&raw_page.messages);
+        remove_internal_system_reminders_from_display(&mut messages);
+        Self::mark_missing_persisted_outputs_for_display(&mut messages);
+        Self::defer_tool_result_images_for_display(&mut messages);
+        Ok(SessionMessagePage {
+            messages,
+            oldest_message_row_id: raw_page.oldest_message_row_id,
+            has_more_history: raw_page.has_more_history,
+        })
+    }
+
+    fn defer_tool_result_images_for_display(messages: &mut [ChatMessage]) {
+        for message in messages {
+            if message.role != MessageRole::Tool {
+                continue;
+            }
+            let Some(images) = message.images.as_mut() else {
+                continue;
+            };
+            let deferred_marker = format!("{DEFERRED_TOOL_IMAGE_DATA_PREFIX}{}", message.id);
+            for image in images {
+                if !image.data.is_empty() {
+                    image.data.clone_from(&deferred_marker);
+                }
+            }
+        }
+    }
+
+    pub fn load_session_message_images(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<super::models::ImageData>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let images_json = conn
+            .query_row(
+                "SELECT images FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load session message images: {}", e))?
+            .flatten();
+        images_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map(|images| images.unwrap_or_default())
+            .map_err(|e| format!("Failed to parse session message images: {}", e))
     }
 
     pub fn set_session_last_model_id(
@@ -2316,9 +3440,7 @@ impl SessionStore {
         session_id: &str,
         effort: Option<&str>,
     ) -> Result<(), String> {
-        let effort = effort
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let effort = effort.map(str::trim).filter(|value| !value.is_empty());
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let updated = conn
             .execute(
@@ -3010,13 +4132,16 @@ impl SessionStore {
             .transpose()
             .map_err(|e| format!("Failed to parse message metadata: {}", e))?
             .unwrap_or_default();
-        metadata.response_request = Some(response_request.clone());
-        let metadata_json = serde_json::to_string(&metadata)
-            .map_err(|e| format!("Failed to serialize message metadata: {}", e))?;
+        metadata.response_request = None;
+        let metadata_json = serialize_message_metadata(&metadata)?;
+        let response_request_id =
+            Self::persist_response_request_with_conn(&conn, Some(response_request))?;
         let updated = conn
             .execute(
-                "UPDATE messages SET metadata_json = ?1 WHERE session_id = ?2 AND id = ?3",
-                params![metadata_json, session_id, message_id],
+                "UPDATE messages
+                 SET metadata_json = ?1, response_request_id = ?2
+                 WHERE session_id = ?3 AND id = ?4",
+                params![metadata_json, response_request_id, session_id, message_id],
             )
             .map_err(|e| {
                 format!(
@@ -3476,17 +4601,18 @@ impl SessionStore {
         let metadata_json = message_metadata_json(
             knowledge_proposal,
             response_id,
-            response_request,
             content_order,
             thinking_order,
             render_parts,
         )?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let response_request_id =
+            Self::persist_response_request_with_conn(&conn, response_request)?;
 
         conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![id, session_id, role.as_str(), content, now, prompt_prefix, prompt_suffix, tool_calls_json, tool_call_id, images_json, asset_refs_json, thinking_content, thinking_duration.map(|d| d as i64), thinking_signature, metadata_json],
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![id, session_id, role.as_str(), content, now, prompt_prefix, prompt_suffix, tool_calls_json, tool_call_id, images_json, asset_refs_json, thinking_content, thinking_duration.map(|d| d as i64), thinking_signature, metadata_json, response_request_id],
         )
         .map_err(|e| format!("Failed to add message: {}", e))?;
 
@@ -3539,8 +4665,11 @@ impl SessionStore {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let row = conn
             .query_row(
-                "SELECT role, content, metadata_json, include_in_prompt, rowid
-                 FROM messages WHERE session_id = ?1 AND id = ?2",
+                "SELECT m.role, m.content, m.metadata_json, m.include_in_prompt, m.rowid,
+                        r.payload_json
+                 FROM messages m
+                 LEFT JOIN response_request_payloads r ON r.id = m.response_request_id
+                 WHERE m.session_id = ?1 AND m.id = ?2",
                 params![session_id, message_id],
                 |row| {
                     Ok((
@@ -3549,13 +4678,21 @@ impl SessionStore {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| format!("Failed to query compacted context output: {}", e))?;
 
-        let Some((role, handoff_content, metadata_json, include_in_prompt, handoff_rowid)) = row
+        let Some((
+            role,
+            handoff_content,
+            metadata_json,
+            include_in_prompt,
+            handoff_rowid,
+            response_request_json,
+        )) = row
         else {
             return Ok(None);
         };
@@ -3565,12 +4702,18 @@ impl SessionStore {
             return Ok(None);
         }
 
-        let metadata: MessageMetadata = metadata_json
+        let mut metadata: MessageMetadata = metadata_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
             .map_err(|e| format!("Failed to parse compacted context metadata: {}", e))?
             .unwrap_or_default();
+        if let Some(response_request_json) = response_request_json {
+            metadata.response_request = Some(
+                serde_json::from_str(&response_request_json)
+                    .map_err(|e| format!("Failed to parse compacted response request: {}", e))?,
+            );
+        }
 
         let (mut snapshot_status, entries) = match metadata
             .compacted_context
@@ -3620,14 +4763,11 @@ impl SessionStore {
             ),
         };
 
-        let mut messages_by_id = Self::get_messages_with_conn_filtered_static(
-            &conn,
-            session_id,
-            false,
-        )?
-        .into_iter()
-        .map(|message| (message.id.clone(), message))
-        .collect::<HashMap<_, _>>();
+        let mut messages_by_id =
+            Self::get_messages_with_conn_filtered_static(&conn, session_id, false)?
+                .into_iter()
+                .map(|message| (message.id.clone(), message))
+                .collect::<HashMap<_, _>>();
         if let Some(handoff) = messages_by_id.get_mut(message_id) {
             handoff.content = handoff_content;
         }
@@ -3677,6 +4817,40 @@ impl SessionStore {
         }))
     }
 
+    pub fn list_compacted_context_outputs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CompactedContextOutput>, String> {
+        let message_ids = {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id
+                     FROM messages
+                     WHERE session_id = ?1
+                       AND role = 'assistant'
+                       AND substr(content, 1, length(?2)) = ?2
+                     ORDER BY rowid ASC",
+                )
+                .map_err(|e| format!("Failed to prepare compacted context list: {}", e))?;
+            let rows = stmt
+                .query_map(params![session_id, CONTEXT_HANDOFF_MARKER], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| format!("Failed to query compacted context list: {}", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read compacted context list: {}", e))?
+        };
+
+        let mut outputs = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            if let Some(output) = self.get_compacted_context_output(session_id, &message_id)? {
+                outputs.push(output);
+            }
+        }
+        Ok(outputs)
+    }
+
     pub fn get_response_request_metadata(
         &self,
         session_id: &str,
@@ -3684,22 +4858,35 @@ impl SessionStore {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, metadata_json FROM messages
-                 WHERE session_id = ?1 AND metadata_json IS NOT NULL
-                 ORDER BY created_at ASC, rowid ASC",
+                "SELECT m.id, m.metadata_json, r.payload_json
+                 FROM messages m
+                 LEFT JOIN response_request_payloads r ON r.id = m.response_request_id
+                 WHERE m.session_id = ?1
+                   AND (m.metadata_json IS NOT NULL OR r.payload_json IS NOT NULL)
+                 ORDER BY m.created_at ASC, m.rowid ASC",
             )
             .map_err(|e| format!("Failed to prepare response request query: {}", e))?;
 
         let rows = stmt
             .query_map(params![session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|e| format!("Failed to query response request metadata: {}", e))?;
 
         let mut metadata_map = HashMap::new();
         for row in rows {
-            let (message_id, metadata_json) =
+            let (message_id, metadata_json, response_request_json) =
                 row.map_err(|e| format!("Failed to read response request row: {}", e))?;
+            if let Some(response_request_json) = response_request_json {
+                let response_request = serde_json::from_str(&response_request_json)
+                    .map_err(|e| format!("Failed to parse response request payload: {}", e))?;
+                metadata_map.insert(message_id, response_request);
+                continue;
+            }
             let Some(metadata_json) = metadata_json else {
                 continue;
             };
@@ -4483,6 +5670,146 @@ impl SessionStore {
         Self::get_messages_with_conn_filtered_static(conn, session_id, prompt_only)
     }
 
+    fn get_message_page_with_conn(
+        conn: &Connection,
+        session_id: &str,
+        before_row_id: Option<i64>,
+        message_limit: u32,
+    ) -> Result<SessionMessagePage, String> {
+        let limit = message_limit.clamp(1, 1_000) as i64;
+        let candidate_boundary = conn
+            .query_row(
+                "SELECT rowid
+                 FROM messages
+                 WHERE session_id = ?1
+                   AND (?2 IS NULL OR rowid < ?2)
+                 ORDER BY rowid DESC
+                 LIMIT 1 OFFSET ?3",
+                params![session_id, before_row_id, limit - 1],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to locate session history page: {}", e))?;
+
+        let oldest_message_row_id = match candidate_boundary {
+            Some(candidate) => conn
+                .query_row(
+                    "SELECT rowid
+                     FROM messages
+                     WHERE session_id = ?1
+                       AND rowid <= ?2
+                       AND role <> 'tool'
+                     ORDER BY rowid DESC
+                     LIMIT 1",
+                    params![session_id, candidate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to align session history page: {}", e))?
+                .or(Some(candidate)),
+            None => conn
+                .query_row(
+                    "SELECT MIN(rowid)
+                     FROM messages
+                     WHERE session_id = ?1
+                       AND (?2 IS NULL OR rowid < ?2)",
+                    params![session_id, before_row_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(|e| format!("Failed to locate session history start: {}", e))?,
+        };
+
+        let Some(oldest_message_row_id) = oldest_message_row_id else {
+            return Ok(SessionMessagePage {
+                messages: Vec::new(),
+                oldest_message_row_id: None,
+                has_more_history: false,
+            });
+        };
+
+        let asset_refs_select = if Self::table_has_column(conn, "messages", "asset_refs")
+            .map_err(|e| format!("Failed to inspect messages.asset_refs: {}", e))?
+        {
+            "asset_refs"
+        } else {
+            "NULL AS asset_refs"
+        };
+        // responseRequest is transport-resume metadata. The transcript never
+        // consumes it, and stripping it here prevents repeated 40+ KiB request
+        // envelopes from being deserialized for every assistant message.
+        let query = format!(
+            "SELECT rowid, id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, {asset_refs_select}, thinking_content, thinking_duration, thinking_signature,
+                    CASE WHEN metadata_json IS NULL THEN NULL ELSE json_remove(metadata_json, '$.responseRequest') END
+             FROM messages
+             WHERE session_id = ?1
+               AND rowid >= ?2
+               AND (?3 IS NULL OR rowid < ?3)
+             ORDER BY rowid ASC"
+        );
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| format!("Failed to prepare session history page: {}", e))?;
+        let rows = stmt
+            .query_map(
+                params![session_id, oldest_message_row_id, before_row_id],
+                |row| StoredChatMessageRow::from_row(row, 1),
+            )
+            .map_err(|e| format!("Failed to query session history page: {}", e))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(
+                row.map_err(|e| format!("Failed to read session history row: {}", e))?
+                    .into_message()?,
+            );
+        }
+
+        let has_more_history = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages WHERE session_id = ?1 AND rowid < ?2
+                 )",
+                params![session_id, oldest_message_row_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(|e| format!("Failed to inspect older session history: {}", e))?;
+
+        Ok(SessionMessagePage {
+            messages,
+            oldest_message_row_id: Some(oldest_message_row_id),
+            has_more_history,
+        })
+    }
+
+    fn get_session_user_message_ids_with_conn(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id
+                 FROM messages
+                 WHERE session_id = ?1
+                   AND role = 'user'
+                   AND NOT (
+                       TRIM(content) = ''
+                       AND COALESCE(images, '') = ''
+                       AND COALESCE(asset_refs, '') = ''
+                       AND LTRIM(COALESCE(prompt_suffix, '')) LIKE '<system-reminder>%'
+                   )
+                 ORDER BY rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare user turn index: {}", e))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query user turn index: {}", e))?;
+        let mut message_ids = Vec::new();
+        for row in rows {
+            message_ids.push(row.map_err(|e| format!("Failed to read user turn index: {}", e))?);
+        }
+        Ok(message_ids)
+    }
+
     fn get_messages_with_conn_filtered_static(
         conn: &Connection,
         session_id: &str,
@@ -4517,101 +5844,16 @@ impl SessionStore {
 
         let rows = stmt
             .query_map(params![session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<i64>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                ))
+                StoredChatMessageRow::from_row(row, 0)
             })
             .map_err(|e| format!("Failed to query messages: {}", e))?;
 
         let mut messages = Vec::new();
         for row in rows {
-            let (
-                id,
-                role_str,
-                content,
-                created_at,
-                prompt_prefix,
-                prompt_suffix,
-                tool_calls_json,
-                tool_call_id,
-                images_json,
-                asset_refs_json,
-                thinking_content,
-                thinking_duration_raw,
-                thinking_signature,
-                metadata_json,
-            ) = row.map_err(|e| format!("Failed to read row: {}", e))?;
-            let role = MessageRole::from_str(&role_str)?;
-
-            let tool_calls: Option<Vec<ToolCallInfo>> = tool_calls_json
-                .as_deref()
-                .map(|json| serde_json::from_str(json))
-                .transpose()
-                .map_err(|e| format!("Failed to parse tool_calls: {}", e))?;
-
-            let images: Option<Vec<super::models::ImageData>> = images_json
-                .as_deref()
-                .map(|json| serde_json::from_str(json))
-                .transpose()
-                .map_err(|e| format!("Failed to parse images: {}", e))?;
-
-            let asset_refs: Option<Vec<super::models::AssetRefData>> = asset_refs_json
-                .as_deref()
-                .map(|json| serde_json::from_str(json))
-                .transpose()
-                .map_err(|e| format!("Failed to parse asset refs: {}", e))?;
-
-            let metadata: Option<MessageMetadata> = metadata_json
-                .as_deref()
-                .map(|json| serde_json::from_str(json))
-                .transpose()
-                .map_err(|e| format!("Failed to parse message metadata: {}", e))?;
-            let (knowledge_proposal, response_id, content_order, thinking_order, render_parts) =
-                metadata
-                    .map(|value| {
-                        (
-                            value.knowledge_proposal,
-                            value.response_id,
-                            value.content_order,
-                            value.thinking_order,
-                            value.render_parts,
-                        )
-                    })
-                    .unwrap_or((None, None, None, None, None));
-
-            messages.push(ChatMessage {
-                id,
-                role,
-                content,
-                created_at,
-                prompt_prefix,
-                prompt_suffix,
-                response_id,
-                content_order,
-                thinking_order,
-                tool_calls,
-                tool_call_id,
-                images,
-                asset_refs,
-                thinking_content,
-                thinking_duration: thinking_duration_raw.map(|d| d as u32),
-                thinking_signature,
-                knowledge_proposal,
-                render_parts,
-            });
+            messages.push(
+                row.map_err(|e| format!("Failed to read row: {}", e))?
+                    .into_message()?,
+            );
         }
         if !prompt_only {
             for message in &mut messages {
@@ -4835,12 +6077,13 @@ impl SessionStore {
 mod tests {
     use super::{
         build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionStore,
-        CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER, RUN_STATUS_CANCELLING,
-        RUN_STATUS_DONE,
+        SessionEventAppend, CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
+        DEFERRED_TOOL_IMAGE_DATA_PREFIX, RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING,
+        RUN_STATUS_DONE, RUN_STATUS_ERROR,
     };
     use crate::compact;
     use crate::session::models::{
-        ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
+        ChatMessage, ImageData, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use std::fs;
@@ -4923,10 +6166,12 @@ mod tests {
         store
             .set_plan_mode_active(&session_id, true)
             .expect("re-enter plan mode");
-        assert!(!store
-            .get_plan_mode_state(&session_id)
-            .expect("read state")
-            .exited_pending_notice);
+        assert!(
+            !store
+                .get_plan_mode_state(&session_id)
+                .expect("read state")
+                .exited_pending_notice
+        );
 
         store
             .set_plan_mode_active(&session_id, false)
@@ -5050,6 +6295,7 @@ mod tests {
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "asset_refs").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "messages", "response_request_id").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "include_in_prompt").unwrap());
         assert!(
             SessionStore::table_has_column(&conn, "token_usage", "last_context_tokens").unwrap()
@@ -5060,6 +6306,9 @@ mod tests {
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
         assert!(table_exists(&conn, "model_usage_events"));
+        assert!(table_exists(&conn, "response_request_payloads"));
+        assert!(table_exists(&conn, "session_context_attempts"));
+        assert!(table_exists(&conn, "session_context_capture_gaps"));
     }
 
     #[test]
@@ -5166,6 +6415,394 @@ mod tests {
     }
 
     #[test]
+    fn v24_database_deduplicates_response_requests_and_keeps_them_readable() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v24 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "DROP INDEX idx_messages_response_request;
+             ALTER TABLE messages DROP COLUMN response_request_id;
+             DROP TABLE response_request_payloads;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-1', 'Migrated response request', 'chat', 100, 100);
+             PRAGMA user_version = 24;",
+        )
+        .expect("create v24 session schema");
+
+        let response_request = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "shared-payload"
+        });
+        for (message_id, response_id) in [("message-1", "response-1"), ("message-2", "response-2")]
+        {
+            let metadata = serde_json::json!({
+                "responseId": response_id,
+                "responseRequest": response_request,
+            });
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at, metadata_json)
+                 VALUES (?1, 'session-1', 'assistant', ?2, 100, ?3)",
+                params![message_id, message_id, metadata.to_string()],
+            )
+            .expect("insert v24 message");
+        }
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v24 store");
+        let detail = store
+            .load_session("session-1")
+            .expect("load migrated session");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(
+            detail.messages[0].response_id.as_deref(),
+            Some("response-1")
+        );
+        assert_eq!(
+            detail.messages[1].response_id.as_deref(),
+            Some("response-2")
+        );
+
+        let restored = store
+            .get_response_request_metadata("session-1")
+            .expect("load response requests");
+        assert_eq!(restored.get("message-1"), Some(&response_request));
+        assert_eq!(restored.get("message-2"), Some(&response_request));
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        let payload_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM response_request_payloads",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count deduplicated payloads");
+        assert_eq!(payload_count, 1);
+        let request_ref_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT response_request_id) FROM messages",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count response request references");
+        assert_eq!(request_ref_count, 1);
+        let embedded_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE json_type(metadata_json, '$.responseRequest') IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count embedded response requests");
+        assert_eq!(embedded_count, 0);
+    }
+
+    #[test]
+    fn v25_database_migrates_context_attempts_and_old_session_exports_with_explicit_empty() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v25 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema");
+        conn.execute_batch(
+            "DROP TABLE session_context_attempts;
+             DROP TABLE session_context_capture_gaps;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-v25', 'Migrated context export', 'chat', 100, 100);
+             INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('message-v25', 'session-v25', 'user', 'Review the old session', 100);
+             PRAGMA user_version = 25;",
+        )
+        .expect("create v25 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v25 store");
+        assert!(store
+            .list_context_attempts("session-v25")
+            .expect("list migrated attempts")
+            .is_empty());
+
+        let output = dir.path().join("migrated-v25-context.yaml");
+        let result = crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-v25",
+            "",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated session");
+        assert_eq!(result.capture_quality, "reconstructed");
+        let raw = std::fs::read_to_string(output).expect("read export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse export");
+        assert_eq!(
+            yaml["export"]["missing_fields"][0]["value"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["context_attempts"].as_str(),
+            Some("empty")
+        );
+
+        store
+            .record_context_attempt(
+                "session-v25",
+                "run-after-migration",
+                1,
+                1,
+                "normal",
+                "completed",
+                "custom",
+                "test-model",
+                None,
+                &serde_json::json!({"model": "test-model"}),
+                r#"{"status":"ok"}"#,
+                None,
+            )
+            .expect("record post-migration attempt");
+        let partial_output = dir.path().join("migrated-v25-partial-context.yaml");
+        let partial = crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-v25",
+            "",
+            None,
+            None,
+            &partial_output,
+        )
+        .expect("export partially captured migrated session");
+        assert_eq!(partial.capture_quality, "partial");
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(table_exists(&conn, "session_context_attempts"));
+        assert!(table_exists(&conn, "session_context_capture_gaps"));
+        assert!(store
+            .session_has_context_capture_gap("session-v25")
+            .expect("query migrated capture gap"));
+        let (request_type, response_type): (String, String) = conn
+            .query_row(
+                "SELECT typeof(request_gzip), typeof(response_gzip)
+                 FROM session_context_attempts
+                 WHERE session_id = 'session-v25'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("inspect compressed context attempt payloads");
+        assert_eq!(request_type, "blob");
+        assert_eq!(response_type, "blob");
+    }
+
+    #[test]
+    fn session_view_pages_reconstruct_history_without_duplicates() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("paged", None, None, "chat", None)
+            .expect("create session");
+        let mut expected_ids = Vec::new();
+        for index in 0..10 {
+            expected_ids.push(
+                store
+                    .add_message(
+                        &session_id,
+                        if index % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        &format!("message-{index}"),
+                    )
+                    .expect("add message"),
+            );
+        }
+
+        let snapshot = store
+            .load_session_view(&session_id, 3)
+            .expect("load initial page");
+        assert!(snapshot.has_more_history);
+        let mut messages = snapshot.session.messages;
+        let mut before = snapshot.oldest_message_row_id;
+        let mut has_more = snapshot.has_more_history;
+        while has_more {
+            let page = store
+                .load_session_message_page(&session_id, before.expect("history cursor"), 3)
+                .expect("load older page");
+            before = page.oldest_message_row_id;
+            has_more = page.has_more_history;
+            messages.splice(0..0, page.messages);
+        }
+
+        let actual_ids = messages
+            .into_iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn session_view_indexes_all_user_turns_and_loads_preview_on_demand() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("turn index", None, None, "chat", None)
+            .expect("create session");
+        let first_user_id = store
+            .add_message(&session_id, MessageRole::User, "first prompt")
+            .expect("add first user");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "first response")
+            .expect("add first assistant");
+        let second_user_id = store
+            .add_message(&session_id, MessageRole::User, "second prompt")
+            .expect("add second user");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "second response")
+            .expect("add second assistant");
+
+        let snapshot = store
+            .load_session_view(&session_id, 2)
+            .expect("load bounded view");
+        assert_eq!(
+            snapshot.user_message_ids,
+            vec![first_user_id.clone(), second_user_id]
+        );
+        assert!(snapshot
+            .session
+            .messages
+            .iter()
+            .all(|message| message.id != first_user_id));
+
+        let preview = store
+            .load_session_turn_preview(&session_id, &first_user_id)
+            .expect("load first turn preview");
+        assert_eq!(preview.message_id, first_user_id);
+        assert_eq!(preview.prompt, "first prompt");
+        assert_eq!(preview.response, "first response");
+    }
+
+    #[test]
+    fn session_view_page_keeps_assistant_tool_round_together() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("tool page", None, None, "chat", None)
+            .expect("create session");
+        let tool_call = |id: &str| ToolCallInfo {
+            id: id.to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        };
+
+        store
+            .add_message(&session_id, MessageRole::User, "first")
+            .expect("add first user");
+        store
+            .add_assistant_with_tool_calls(&session_id, "", &[tool_call("tool-1")])
+            .expect("add first assistant");
+        store
+            .add_tool_result(&session_id, "tool-1", "first result")
+            .expect("add first tool result");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "first done")
+            .expect("add first result");
+        store
+            .add_message(&session_id, MessageRole::User, "second")
+            .expect("add second user");
+        let assistant_id = store
+            .add_assistant_with_tool_calls(&session_id, "", &[tool_call("tool-2")])
+            .expect("add second assistant");
+        let tool_result_id = store
+            .add_tool_result(&session_id, "tool-2", "second result")
+            .expect("add second tool result");
+        let final_id = store
+            .add_message(&session_id, MessageRole::Assistant, "second done")
+            .expect("add final result");
+
+        let conn = store.conn.lock().expect("lock store");
+        let page = SessionStore::get_message_page_with_conn(&conn, &session_id, None, 2)
+            .expect("load raw page");
+        let ids = page
+            .messages
+            .into_iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![assistant_id, tool_result_id, final_id]);
+        assert!(page.has_more_history);
+    }
+
+    #[test]
+    fn session_view_defers_tool_images_without_changing_full_history() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("tool images", None, None, "chat", None)
+            .expect("create session");
+        let tool_call = ToolCallInfo {
+            id: "tool-image".to_string(),
+            name: "unity_capture_viewport".to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        };
+        store
+            .add_assistant_with_tool_calls(&session_id, "", &[tool_call])
+            .expect("add assistant");
+        let images = vec![ImageData {
+            data: "large-base64-payload".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let tool_message_id = store
+            .add_tool_result_with_images(&session_id, "tool-image", "captured", Some(&images))
+            .expect("add tool images");
+
+        let snapshot = store
+            .load_session_view(&session_id, 10)
+            .expect("load session view");
+        let deferred = snapshot
+            .session
+            .messages
+            .iter()
+            .find(|message| message.id == tool_message_id)
+            .and_then(|message| message.images.as_ref())
+            .expect("deferred images");
+        assert_eq!(
+            deferred[0].data,
+            format!("{DEFERRED_TOOL_IMAGE_DATA_PREFIX}{tool_message_id}")
+        );
+        assert_eq!(
+            store
+                .load_session_message_images(&tool_message_id)
+                .expect("load deferred images"),
+            images
+        );
+
+        let full = store.load_session(&session_id).expect("load full history");
+        assert_eq!(
+            full.messages
+                .iter()
+                .find(|message| message.id == tool_message_id)
+                .and_then(|message| message.images.as_ref()),
+            Some(&images)
+        );
+    }
+
+    #[test]
     fn v20_database_marks_legacy_compactions_and_keeps_them_readable() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("locus.db");
@@ -5188,7 +6825,9 @@ mod tests {
         drop(conn);
 
         let store = SessionStore::new(dir.path()).expect("migrate v20 store");
-        let detail = store.load_session("session-1").expect("load migrated session");
+        let detail = store
+            .load_session("session-1")
+            .expect("load migrated session");
         assert_eq!(detail.messages[0].content, CONTEXT_COMPACTED_DISPLAY_MARKER);
 
         let output = store
@@ -5594,6 +7233,67 @@ mod tests {
         assert_eq!(todos.latest_run_id.as_deref(), Some("run-1"));
         assert_eq!(todos.items.len(), 1);
         assert_eq!(todos.items[0].content, "Review copied session");
+    }
+
+    #[test]
+    fn export_snapshot_flushes_queued_events_and_stays_immutable_for_fork() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("create store");
+        let session_id = store
+            .create_session("Running snapshot", None, Some("workspace"), "chat", Some("dev"))
+            .expect("create session");
+        store
+            .add_message(&session_id, MessageRole::User, "before snapshot")
+            .expect("add message");
+        store
+            .try_start_run(&session_id, "run-snapshot")
+            .expect("start run");
+        store
+            .enqueue_session_event(
+                SessionEventAppend {
+                    session_id: session_id.clone(),
+                    run_id: "run-snapshot".to_string(),
+                    event_type: "textDelta".to_string(),
+                    payload_json: serde_json::json!({"delta": "queued"}).to_string(),
+                },
+                None,
+                None,
+            )
+            .expect("queue event");
+
+        let snapshot = store.create_export_snapshot().expect("create snapshot");
+        assert_eq!(
+            snapshot
+                .list_session_events(&session_id, None, None)
+                .expect("snapshot events")
+                .len(),
+            1
+        );
+
+        store
+            .add_message(&session_id, MessageRole::Assistant, "after snapshot")
+            .expect("add live message");
+        let fork_id = store
+            .fork_session_from_export_snapshot(&snapshot, &session_id, Some("Frozen fork"))
+            .expect("fork snapshot");
+        let fork = store.load_session(&fork_id).expect("load fork");
+        assert_eq!(fork.title, "Frozen fork");
+        assert_eq!(fork.messages.len(), 1);
+        assert_eq!(fork.messages[0].content, "before snapshot");
+        assert_eq!(
+            snapshot
+                .get_messages(&session_id)
+                .expect("snapshot messages")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_messages(&session_id)
+                .expect("live messages")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -7094,6 +8794,11 @@ mod tests {
         assert!(compacted_context.messages[1]
             .content
             .contains("继续完成压缩上下文查看功能"));
+        let compacted_contexts = store
+            .list_compacted_context_outputs(&session_id)
+            .expect("list compact outputs");
+        assert_eq!(compacted_contexts.len(), 1);
+        assert_eq!(compacted_contexts[0].message_id, "handoff-1");
         assert_eq!(
             store
                 .get_compacted_context_output(&session_id, old_assistant_id)
@@ -7256,7 +8961,12 @@ mod tests {
         let small_window_budget = compact::compact_user_message_token_budget(32_000);
         assert_eq!(small_window_budget, 8_000);
         store
-            .compact_messages(&session_id, &summary_msg, "assistant-2", small_window_budget)
+            .compact_messages(
+                &session_id,
+                &summary_msg,
+                "assistant-2",
+                small_window_budget,
+            )
             .expect("compact messages");
 
         let prompt_ids = store
@@ -7678,5 +9388,139 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn interrupted_latest_run_controls_resume_availability() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+
+        let error_session = store
+            .create_session("Error", None, None, "chat", None)
+            .expect("create error session");
+        store
+            .try_start_run(&error_session, "run-error")
+            .expect("start error run");
+        store
+            .update_run_status("run-error", RUN_STATUS_ERROR, Some("provider disconnected"))
+            .expect("finish error run");
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            conn.execute(
+                "INSERT INTO session_events
+                    (session_id, run_id, seq, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, 1, 'userMessage', ?3, 1)",
+                params![
+                    error_session,
+                    "run-error",
+                    r#"{"type":"userMessage","sessionId":"error"}"#
+                ],
+            )
+            .expect("insert persisted user event");
+        }
+        assert!(store
+            .session_resume_available(&error_session)
+            .expect("read error resume state"));
+
+        let pre_user_error_session = store
+            .create_session("Pre-user error", None, None, "chat", None)
+            .expect("create pre-user error session");
+        store
+            .try_start_run(&pre_user_error_session, "run-pre-user-error")
+            .expect("start pre-user error run");
+        store
+            .update_run_status(
+                "run-pre-user-error",
+                RUN_STATUS_ERROR,
+                Some("failed during preparation"),
+            )
+            .expect("finish pre-user error run");
+        assert!(!store
+            .session_resume_available(&pre_user_error_session)
+            .expect("read pre-user error resume state"));
+
+        let completed_session = store
+            .create_session("Completed", None, None, "chat", None)
+            .expect("create completed session");
+        store
+            .try_start_run(&completed_session, "run-completed")
+            .expect("start completed run");
+        store
+            .update_run_status("run-completed", RUN_STATUS_DONE, None)
+            .expect("finish completed run");
+        assert!(!store
+            .session_resume_available(&completed_session)
+            .expect("read completed resume state"));
+
+        let restart_session = store
+            .create_session("Restart", None, None, "chat", None)
+            .expect("create restart session");
+        store
+            .try_start_run(&restart_session, "run-restart")
+            .expect("start restart run");
+        store
+            .update_run_status(
+                "run-restart",
+                RUN_STATUS_CANCELLED,
+                Some("Interrupted by application restart"),
+            )
+            .expect("interrupt restart run");
+        assert!(store
+            .session_resume_available(&restart_session)
+            .expect("read restart resume state"));
+
+        let empty_cancel_session = store
+            .create_session("Empty cancel", None, None, "chat", None)
+            .expect("create empty cancel session");
+        store
+            .try_start_run(&empty_cancel_session, "run-empty-cancel")
+            .expect("start empty cancel run");
+        store
+            .update_run_status("run-empty-cancel", RUN_STATUS_CANCELLED, None)
+            .expect("cancel empty run");
+        assert!(!store
+            .session_resume_available(&empty_cancel_session)
+            .expect("read empty cancel resume state"));
+
+        let partial_session = store
+            .create_session("Partial", None, None, "chat", None)
+            .expect("create partial session");
+        store
+            .try_start_run(&partial_session, "run-partial")
+            .expect("start partial run");
+        store
+            .update_run_status("run-partial", RUN_STATUS_CANCELLED, None)
+            .expect("cancel partial run");
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            conn.execute(
+                "INSERT INTO session_events
+                    (session_id, run_id, seq, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, 1, 'userMessage', ?3, 1)",
+                params![
+                    partial_session,
+                    "run-partial",
+                    r#"{"type":"userMessage","sessionId":"partial"}"#
+                ],
+            )
+            .expect("insert persisted user event");
+            conn.execute(
+                "INSERT INTO session_events
+                    (session_id, run_id, seq, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, 2, 'cancelled', ?3, 2)",
+                params![
+                    partial_session,
+                    "run-partial",
+                    r#"{"type":"cancelled","sessionId":"partial"}"#
+                ],
+            )
+            .expect("insert cancelled event without output summary");
+        }
+        assert!(store
+            .session_resume_available(&partial_session)
+            .expect("read partial resume state"));
+        assert!(store
+            .latest_run_is_interrupted(&partial_session)
+            .expect("read interrupted run state"));
     }
 }

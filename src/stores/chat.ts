@@ -39,6 +39,7 @@ import type {
   TodoSnapshot,
   TodoPanelMode,
   SessionRunSummary,
+  SessionTurnPreview,
   AssistantRenderPart,
   PendingSessionInput,
   EffortLevel,
@@ -56,6 +57,38 @@ function emptyTokenUsage(): TokenUsage {
 
 function hydrateMessages(messages: ChatMessage[]): ChatMessage[] {
   return hydrateChatMessagesIntent(messages);
+}
+
+function preserveLocalSessionMessageState(
+  snapshotMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+): ChatMessage[] {
+  const currentById = new Map(currentMessages.map((message) => [message.id, message]));
+  const merged = snapshotMessages.map((message) => {
+    const current = currentById.get(message.id);
+    if (!current?.knowledgeProposal || !message.knowledgeProposal) return message;
+    return {
+      ...message,
+      knowledgeProposal: {
+        ...message.knowledgeProposal,
+        status: current.knowledgeProposal.status,
+        updatedAt: Math.max(
+          message.knowledgeProposal.updatedAt,
+          current.knowledgeProposal.updatedAt,
+        ),
+      },
+    };
+  });
+
+  for (const message of currentMessages) {
+    if (!isLocalPendingUserMessage(message) && !message.knowledgeProposal) continue;
+    if (merged.some((candidate) => (
+      candidate.id === message.id
+      || (isLocalPendingUserMessage(message) && isMatchingPendingUserMessage(message, candidate))
+    ))) continue;
+    merged.push(message);
+  }
+  return merged;
 }
 
 function replaceMessageById(list: ChatMessage[], message: ChatMessage): ChatMessage[] {
@@ -299,6 +332,7 @@ export const useChatStore = defineStore("chat", () => {
   // -- State --
   const sessions = ref<SessionSummary[]>([]);
   const activeSessionId = ref<string | null>(null);
+  const pendingSelectionSessionId = ref<string | null>(null);
   const activeSessionType = ref<string | null>(null);
   const messages = ref<ChatMessage[]>([]);
   const streamingText = ref("");
@@ -341,6 +375,7 @@ export const useChatStore = defineStore("chat", () => {
   const todoMode = ref<TodoPanelMode>("current");
   const sessionLatestTodoRunIds = ref(new Map<string, string | null>());
   const sessionLatestCompletedRunIds = ref(new Map<string, string | null>());
+  const sessionResumeAvailable = ref(new Map<string, boolean>());
   const pendingQuestion = ref<PendingQuestion | null>(null);
   const pendingToolConfirms = ref<PendingToolConfirm[]>([]);
   const streamingSessionIds = ref(new Set<string>());
@@ -352,10 +387,30 @@ export const useChatStore = defineStore("chat", () => {
   const localPendingInputGroups = new Set<string>();
   const localFallbackPendingInputGroups = new Set<string>();
   const sessionScrollStates = ref(new Map<string, SessionScrollState>());
+  const sessionHistoryHasMore = ref(false);
+  const sessionHistoryOldestRowId = ref<number | null>(null);
+  const sessionHistoryLoading = ref(false);
+  const sessionUserMessageIds = ref<string[]>([]);
   const sessionAgentId = ref<string | null>(null);
   const sessionEffort = ref<EffortLevel | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
   const sessionAgentLocked = computed(() => !!activeSessionId.value && !!sessionAgentId.value);
+  const canResumeInterrupted = computed(() => {
+    const sessionId = activeSessionId.value;
+    return !!sessionId
+      && !isStreaming.value
+      && (sessionResumeAvailable.value.get(sessionId) ?? false);
+  });
+
+  function setSessionResumeAvailable(sessionId: string, available: boolean) {
+    const next = new Map(sessionResumeAvailable.value);
+    if (available) {
+      next.set(sessionId, true);
+    } else {
+      next.delete(sessionId);
+    }
+    sessionResumeAvailable.value = next;
+  }
   const todoRunBoundaryId = computed(() => {
     const sessionId = activeSessionId.value;
     if (!sessionId) return null;
@@ -517,10 +572,20 @@ export const useChatStore = defineStore("chat", () => {
     };
   }
 
-  async function loadSessionStatePreservingFailedUserDraft(sessionId: string) {
+  async function loadSessionStatePreservingFailedUserDraft(
+    sessionId: string,
+    pendingUserMessageOverride?: ChatMessage,
+  ) {
     const pendingUserMessages = messages.value.filter(isLocalPendingUserMessage);
-    const pendingUserMessage = pendingUserMessages[pendingUserMessages.length - 1];
-    await loadSessionState(sessionId);
+    const pendingUserMessage = pendingUserMessageOverride
+      ?? pendingUserMessages[pendingUserMessages.length - 1];
+    if (pendingUserMessage) {
+      messages.value = messages.value.filter((message) => (
+        !isLocalPendingUserMessage(message)
+        || !isMatchingPendingUserMessage(pendingUserMessage, message)
+      ));
+    }
+    await loadSessionState(sessionId, { preserveLocalMessages: false });
     if (!pendingUserMessage) return;
     if (activeSessionId.value !== sessionId) return;
     if (messages.value.some((message) => isMatchingPendingUserMessage(pendingUserMessage, message))) {
@@ -553,10 +618,6 @@ export const useChatStore = defineStore("chat", () => {
     options: { persist?: boolean } = {},
   ) {
     activeSessionId.value = sessionId;
-    if (sessionId) {
-      // Sticky plan mode badge follows the backend session store.
-      void refreshSessionPlanState(sessionId);
-    }
     if (options.persist ?? activeSessionSelectionPersistenceEnabled) {
       persistActiveSessionSelection(sessionId);
     }
@@ -602,10 +663,10 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     if (activeSessionId.value) return;
-    setActiveSessionSelection(normalizedSessionId, { persist: false });
-    activeSessionType.value = restoredSession.sessionType ?? null;
-    currentRunId.value = sessionRunIds.value.get(normalizedSessionId) ?? null;
-    await loadSessionState(normalizedSessionId);
+    await loadSessionState(normalizedSessionId, {
+      commitSelection: true,
+      persist: false,
+    });
   }
 
   function ensureLivePartStream(partId: string): StreamingTextChunks {
@@ -639,21 +700,11 @@ export const useChatStore = defineStore("chat", () => {
     pendingToolConfirms.value = [];
   }
 
-  function applySessionData(
-    detail: SessionDetail,
-    usage: TokenUsage,
-    sessionTodos: TodoSnapshot,
-    undoEntries: Array<{ assistantMessageId: string }>,
-  ) {
+  function applySessionPrimaryData(detail: SessionDetail) {
     clearDeferredUserMessagesForSession(detail.id);
     messages.value = hydrateMessages(detail.messages);
     setSessionPendingInputs(detail.id, detail.pendingInputs ?? []);
-    tokenUsage.value = usage;
-    todos.value = sessionTodos.items;
-    sessionLatestTodoRunIds.value.set(detail.id, sessionTodos.latestRunId);
     sessionLatestCompletedRunIds.value.set(detail.id, detail.latestCompletedRunId ?? null);
-    restoreTodoPanelState(detail.id, sessionTodos.items.length > 0);
-    undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
     sessionAgentId.value = detail.agentId ?? null;
     activeSessionType.value = detail.sessionType;
     const modelStore = useModelStore();
@@ -662,28 +713,32 @@ export const useChatStore = defineStore("chat", () => {
     modelStore.applyContextEffort(sessionEffort.value);
     if (detail.agentId) {
       useAgentStore().selectAgent(detail.agentId);
+    } else {
+      useAgentStore().resetToDefault();
     }
     applySessionRuntimeSnapshot(detail);
   }
 
-  function clearLoadedSessionState() {
-    if (activeSessionId.value) {
-      clearDeferredUserMessagesForSession(activeSessionId.value);
-      setSessionPendingInputs(activeSessionId.value, []);
-    }
-    messages.value = [];
+  function clearSessionAuxiliaryDataForSwitch() {
     tokenUsage.value = emptyTokenUsage();
     todos.value = [];
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
     todoMode.value = "current";
     undoableMessageIds.value = new Set();
-    sessionAgentId.value = null;
-    sessionEffort.value = null;
-    activeSessionType.value = null;
-    pendingQuestion.value = null;
-    pendingToolConfirms.value = [];
-    isCompacting.value = false;
+  }
+
+  function applySessionAuxiliaryData(
+    sessionId: string,
+    usage: TokenUsage,
+    sessionTodos: TodoSnapshot,
+    undoEntries: Array<{ assistantMessageId: string }>,
+  ) {
+    tokenUsage.value = usage;
+    todos.value = sessionTodos.items;
+    sessionLatestTodoRunIds.value.set(sessionId, sessionTodos.latestRunId);
+    restoreTodoPanelState(sessionId, sessionTodos.items.length > 0);
+    undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
   }
 
   function trackActiveRun(sessionId: string, runId: string) {
@@ -991,35 +1046,174 @@ export const useChatStore = defineStore("chat", () => {
     }));
   }
 
-  async function loadSessionState(id: string) {
-    const loadSeq = ++sessionLoadSeq;
-    isStreaming.value = streamingSessionIds.value.has(id);
+  async function loadSessionAuxiliaryState(id: string, loadSeq: number) {
+    const [usage, sessionTodos, undoEntries] = await Promise.all([
+      sessionService.getSessionUsage(id).catch((error) => {
+        console.warn("get_session_usage failed:", error);
+        return emptyTokenUsage();
+      }),
+      sessionService.getTodos(id).catch((error) => {
+        console.warn("get_todos failed:", error);
+        return { items: [], latestRunId: null } satisfies TodoSnapshot;
+      }),
+      useChatChangesStore().loadChanges(id, { allowAutoOpen: false }).catch((error) => {
+        console.warn("load_session_changes failed:", error);
+        return [];
+      }),
+    ]);
+    if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
+    applySessionAuxiliaryData(id, usage, sessionTodos, undoEntries);
+    void refreshSessionPlanState(id);
+  }
 
-    const undoEntriesPromise = useChatChangesStore().loadChanges(id, { allowAutoOpen: false });
+  async function loadSessionState(
+    id: string,
+    options: {
+      commitSelection?: boolean;
+      persist?: boolean;
+      preserveLocalMessages?: boolean;
+    } = {},
+  ): Promise<boolean> {
+    const loadSeq = ++sessionLoadSeq;
+    const commitSelection = options.commitSelection === true;
+    if (commitSelection) {
+      pendingSelectionSessionId.value = id;
+    }
 
     try {
-      const [detail, usage, sessionTodos, undoEntries] = await Promise.all([
-        sessionService.loadSession(id),
-        sessionService.getSessionUsage(id),
-        sessionService.getTodos(id),
-        undoEntriesPromise,
+      const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
+      const [snapshot, resumeAvailable] = await Promise.all([
+        sessionService.loadSessionView(id, messageLimit),
+        sessionService.getSessionResumeAvailable(id).catch((error) => {
+          console.warn("get_session_resume_available failed:", error);
+          return false;
+        }),
       ]);
-
-      if (!detail.lastEffort) {
-        await useModelStore().loadLastEffort();
+      if (loadSeq !== sessionLoadSeq) return false;
+      if (commitSelection) {
+        if (pendingSelectionSessionId.value !== id) return false;
+        persistTodoPanelState();
+        setActiveSessionSelection(id, { persist: options.persist });
+      } else if (activeSessionId.value !== id) {
+        return false;
       }
 
-      if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
+      resetStreamRuntimeState();
+      currentRunId.value = sessionRunIds.value.get(id) ?? null;
+      showThinkingPanel.value = false;
+      thinkingPanelContent.value = "";
+      if (commitSelection) {
+        clearSessionAuxiliaryDataForSwitch();
+      }
+      sessionHistoryOldestRowId.value = snapshot.oldestMessageRowId ?? null;
+      sessionHistoryHasMore.value = snapshot.hasMoreHistory;
+      sessionHistoryLoading.value = false;
+      sessionUserMessageIds.value = snapshot.userMessageIds
+        ?? snapshot.session.messages
+          .filter((message) => message.role === "user")
+          .map((message) => message.id);
+      const detail = !commitSelection
+        && options.preserveLocalMessages !== false
+        && activeSessionId.value === id
+        ? {
+          ...snapshot.session,
+          messages: preserveLocalSessionMessageState(snapshot.session.messages, messages.value),
+        }
+        : snapshot.session;
       useChatChangesStore().setLatestCompletedRunId(
         detail.id,
         detail.latestCompletedRunId ?? null,
       );
-      applySessionData(detail, usage, sessionTodos, undoEntries);
+      setSessionResumeAvailable(detail.id, resumeAvailable);
+      applySessionPrimaryData(detail);
+      if (!detail.lastEffort) {
+        void useModelStore().loadLastEffort();
+      }
+      if (commitSelection && pendingSelectionSessionId.value === id) {
+        pendingSelectionSessionId.value = null;
+      }
+      const auxiliaryLoad = loadSessionAuxiliaryState(id, loadSeq);
+      if (commitSelection) {
+        await auxiliaryLoad;
+      } else {
+        void auxiliaryLoad;
+      }
+      return true;
     } catch (e) {
-      if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
-      console.error("load_session failed:", e);
-      clearLoadedSessionState();
-      isStreaming.value = streamingSessionIds.value.has(id);
+      if (loadSeq !== sessionLoadSeq) return false;
+      console.error("load_session_view failed:", e);
+      if (commitSelection && pendingSelectionSessionId.value === id) {
+        pendingSelectionSessionId.value = null;
+      }
+      return false;
+    }
+  }
+
+  async function loadOlderSessionHistory(): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    const beforeRowId = sessionHistoryOldestRowId.value;
+    if (
+      !sessionId
+      || !sessionHistoryHasMore.value
+      || sessionHistoryLoading.value
+      || beforeRowId === null
+    ) {
+      return false;
+    }
+
+    sessionHistoryLoading.value = true;
+    try {
+      const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
+      const page = await sessionService.loadSessionMessagePage(sessionId, beforeRowId, messageLimit);
+      if (
+        activeSessionId.value !== sessionId
+        || sessionHistoryOldestRowId.value !== beforeRowId
+      ) {
+        return false;
+      }
+      const existingIds = new Set(messages.value.map((message) => message.id));
+      const olderMessages = hydrateMessages(page.messages)
+        .filter((message) => !existingIds.has(message.id));
+      if (olderMessages.length > 0) {
+        messages.value = [...olderMessages, ...messages.value];
+      }
+      sessionHistoryOldestRowId.value = page.oldestMessageRowId ?? null;
+      sessionHistoryHasMore.value = page.hasMoreHistory;
+      return olderMessages.length > 0;
+    } catch (error) {
+      console.warn("load_session_message_page failed:", error);
+      return false;
+    } finally {
+      if (activeSessionId.value === sessionId) {
+        sessionHistoryLoading.value = false;
+      }
+    }
+  }
+
+  async function loadSessionHistoryThroughMessage(messageId: string): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return false;
+    while (
+      activeSessionId.value === sessionId
+      && !messages.value.some((message) => message.id === messageId)
+      && sessionHistoryHasMore.value
+    ) {
+      const loaded = await loadOlderSessionHistory();
+      if (!loaded) break;
+    }
+    return activeSessionId.value === sessionId
+      && messages.value.some((message) => message.id === messageId);
+  }
+
+  async function loadSessionTurnPreview(messageId: string): Promise<SessionTurnPreview | null> {
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return null;
+    try {
+      const preview = await sessionService.loadSessionTurnPreview(sessionId, messageId);
+      return activeSessionId.value === sessionId ? preview : null;
+    } catch (error) {
+      console.warn("load_session_turn_preview failed:", error);
+      return null;
     }
   }
 
@@ -1572,6 +1766,12 @@ export const useChatStore = defineStore("chat", () => {
         displayTextPreview: previewTraceText(input.displayText || input.text, 48),
       })),
     }));
+    const pendingUserMessagesAtTerminal = event.type === "error" || event.type === "cancelled"
+      ? messages.value.filter(isLocalPendingUserMessage)
+      : [];
+    const terminalPendingUserMessage = pendingUserMessagesAtTerminal[
+      pendingUserMessagesAtTerminal.length - 1
+    ];
 
     if (event.type === "runStart") {
       const closedRunId = closedRunIds.get(event.sessionId);
@@ -1596,6 +1796,7 @@ export const useChatStore = defineStore("chat", () => {
 
       closedRunIds.delete(event.sessionId);
       cancelRequestedRunIds.delete(event.sessionId);
+      setSessionResumeAvailable(event.sessionId, false);
       streamingSessionIds.value.add(event.sessionId);
       sessionRunIds.value.set(event.sessionId, event.runId);
       useChatChangesStore().setActiveRunId(event.sessionId, event.runId);
@@ -1720,6 +1921,17 @@ export const useChatStore = defineStore("chat", () => {
       return true;
     }
 
+    if (event.type === "done") {
+      setSessionResumeAvailable(event.sessionId, false);
+    } else if (event.type === "error") {
+      setSessionResumeAvailable(event.sessionId, !terminalPendingUserMessage);
+    } else if (event.type === "cancelled") {
+      setSessionResumeAvailable(
+        event.sessionId,
+        !event.removedUserMessage && !terminalPendingUserMessage,
+      );
+    }
+
     if (event.type === "done" || event.type === "error" || event.type === "cancelled") {
       const trackedRunId = sessionRunIds.value.get(event.sessionId) ?? null;
       const wasStreaming = streamingSessionIds.value.has(event.sessionId);
@@ -1787,7 +1999,17 @@ export const useChatStore = defineStore("chat", () => {
           void useChatChangesStore().refresh(activeSessionId.value, { allowAutoOpen: false });
         }
         if (event.type === "error" || event.type === "cancelled") {
-          void loadSessionStatePreservingFailedUserDraft(event.sessionId);
+          const resumeAfterReload = event.type === "error"
+            ? !terminalPendingUserMessage
+            : !event.removedUserMessage && !terminalPendingUserMessage;
+          void loadSessionStatePreservingFailedUserDraft(
+            event.sessionId,
+            terminalPendingUserMessage,
+          ).finally(() => {
+            if (resumeAfterReload) {
+              setSessionResumeAvailable(event.sessionId, true);
+            }
+          });
         } else {
           void loadSessionState(event.sessionId);
         }
@@ -1886,7 +2108,14 @@ export const useChatStore = defineStore("chat", () => {
         code: event.error.code,
         operation: "chat",
       });
-      void loadSessionStatePreservingFailedUserDraft(event.sessionId);
+      void loadSessionStatePreservingFailedUserDraft(
+        event.sessionId,
+        terminalPendingUserMessage,
+      ).finally(() => {
+        if (!terminalPendingUserMessage) {
+          setSessionResumeAvailable(event.sessionId, true);
+        }
+      });
     }
 
     if (event.type === "done" || event.type === "cancelled") {
@@ -1931,7 +2160,18 @@ export const useChatStore = defineStore("chat", () => {
       // A still-local pending id after a cancel means the run ended before the
       // backend confirmed the user message; reload and hand the text back to the
       // composer instead of leaving an orphaned message in the transcript.
-      void loadSessionStatePreservingFailedUserDraft(event.sessionId);
+      const resumeAfterReload = !!event.messageId
+        || !!event.fullText?.trim()
+        || !!event.thinkingContent?.trim()
+        || (event.renderParts?.length ?? 0) > 0;
+      void loadSessionStatePreservingFailedUserDraft(
+        event.sessionId,
+        terminalPendingUserMessage,
+      ).finally(() => {
+        if (resumeAfterReload) {
+          setSessionResumeAvailable(event.sessionId, true);
+        }
+      });
     }
 
     return true;
@@ -1952,18 +2192,18 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   async function selectSession(id: string, options: { persist?: boolean } = {}) {
-    if (id === activeSessionId.value) return;
-    persistTodoPanelState();
-    setActiveSessionSelection(id, { persist: options.persist });
-    activeSessionType.value = sessions.value.find((session) => session.id === id)?.sessionType ?? null;
-    currentRunId.value = sessionRunIds.value.get(id) ?? null;
-    resetStreamRuntimeState();
-    showThinkingPanel.value = false;
-    thinkingPanelContent.value = "";
-    todoWriteVersion.value = 0;
-    showTodoPanel.value = false;
-    todoMode.value = "current";
-    await loadSessionState(id);
+    if (id === pendingSelectionSessionId.value) return;
+    if (id === activeSessionId.value) {
+      if (pendingSelectionSessionId.value) {
+        sessionLoadSeq += 1;
+        pendingSelectionSessionId.value = null;
+      }
+      return;
+    }
+    await loadSessionState(id, {
+      commitSelection: true,
+      persist: options.persist,
+    });
   }
 
   async function syncActiveSessionSelection(sessionId: string | null | undefined) {
@@ -1990,6 +2230,8 @@ export const useChatStore = defineStore("chat", () => {
     persistSelection?: boolean;
     resetRestoreAttempt?: boolean;
   } = {}) {
+    sessionLoadSeq += 1;
+    pendingSelectionSessionId.value = null;
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
     setActiveSessionSelection(null, { persist: options.persistSelection });
@@ -2021,6 +2263,10 @@ export const useChatStore = defineStore("chat", () => {
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
     sessionEffort.value = null;
+    sessionHistoryHasMore.value = false;
+    sessionHistoryOldestRowId.value = null;
+    sessionHistoryLoading.value = false;
+    sessionUserMessageIds.value = [];
     useAgentStore().resetToDefault();
     useModelStore().resolveSelectedModel(true);
 
@@ -2029,6 +2275,8 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function resetWorkspaceScope() {
+    sessionLoadSeq += 1;
+    pendingSelectionSessionId.value = null;
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
     setActiveSessionSelection(null);
@@ -2053,6 +2301,10 @@ export const useChatStore = defineStore("chat", () => {
     undoableMessageIds.value = new Set();
     sessionRunIds.value = new Map();
     sessionScrollStates.value = new Map();
+    sessionHistoryHasMore.value = false;
+    sessionHistoryOldestRowId.value = null;
+    sessionHistoryLoading.value = false;
+    sessionUserMessageIds.value = [];
     tokenUsage.value = emptyTokenUsage();
     todos.value = [];
     todoWriteVersion.value = 0;
@@ -2061,6 +2313,7 @@ export const useChatStore = defineStore("chat", () => {
     todoMode.value = "current";
     sessionLatestTodoRunIds.value = new Map();
     sessionLatestCompletedRunIds.value = new Map();
+    sessionResumeAvailable.value = new Map();
     showThinkingPanel.value = false;
     thinkingPanelContent.value = "";
     sessionAgentId.value = null;
@@ -2103,6 +2356,7 @@ export const useChatStore = defineStore("chat", () => {
       closedRunIds.delete(id);
       clearSessionScrollState(id);
       setSessionPendingInputs(id, []);
+      setSessionResumeAvailable(id, false);
       if (activeSessionId.value === id) {
         newChat();
       }
@@ -2125,6 +2379,7 @@ export const useChatStore = defineStore("chat", () => {
       closedRunIds.delete(id);
       clearSessionScrollState(id);
       setSessionPendingInputs(id, []);
+      setSessionResumeAvailable(id, false);
       if (activeSessionId.value === id) {
         newChat();
       }
@@ -2475,6 +2730,87 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  async function resumeInterrupted() {
+    const sessionId = activeSessionId.value;
+    if (!sessionId || !canResumeInterrupted.value) return;
+
+    const modelStore = useModelStore();
+    const agentStore = useAgentStore();
+    const { state: knowledgeAccessState } = useKnowledgeAccessMode();
+    const { state: displaySettings } = useDisplaySettings();
+    if (displaySettings.changesAutoClose) {
+      useChatChangesStore().closePanel();
+    }
+
+    pendingLaunchCancelRequested.value = false;
+    resetStreamRuntimeState();
+    isStreaming.value = true;
+    pendingManagedSessionId = sessionId;
+    pendingManagedUnboundSession = false;
+    managedStreamingSessionIds.add(sessionId);
+
+    const model = modelStore.selectedModelId || null;
+    logChatStreamDebug("resume interrupted request start", {
+      sessionId,
+      model,
+      agentId: agentStore.selectedAgentId || null,
+    });
+
+    try {
+      const { sessionId: sid, runId } = await sessionService.chat({
+        sessionId,
+        text: "",
+        resume: true,
+        agentId: agentStore.selectedAgentId || null,
+        model,
+        effort: modelStore.effortSupported ? modelStore.effort : null,
+        fastMode: model ? modelStore.codexFastModeForModel(model) : false,
+        images: null,
+        assetRefs: null,
+        mode: "build",
+        userIntent: null,
+        subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0
+          ? modelStore.modelDefaults.subagentModels
+          : null,
+        knowledgeMode: knowledgeAccessState.mode,
+      });
+      modelStore.applySessionModel(model);
+      setSessionResumeAvailable(sid, false);
+      streamingSessionIds.value.add(sid);
+      sessionRunIds.value.set(sid, runId);
+      useChatChangesStore().setActiveRunId(sid, runId);
+      closedRunIds.delete(sid);
+      cancelRequestedRunIds.delete(sid);
+      pendingManagedSessionId = sid;
+      managedStreamingSessionIds.add(sid);
+      if (activeSessionId.value === sid) {
+        currentRunId.value = runId;
+        sessionAgentId.value = agentStore.selectedAgentId || null;
+        sessionEffort.value = modelStore.effort;
+      }
+      await refreshSessions();
+      if (pendingLaunchCancelRequested.value) {
+        pendingLaunchCancelRequested.value = false;
+        void cancelSession(sid);
+      }
+    } catch (e) {
+      console.error("resume interrupted chat failed:", e);
+      pendingLaunchCancelRequested.value = false;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+        code: err.code,
+        operation: "chat",
+        skipConsoleLog: true,
+      });
+      isStreaming.value = false;
+      resetStreamRuntimeState();
+      managedStreamingSessionIds.delete(sessionId);
+      pendingManagedSessionId = null;
+      pendingManagedUnboundSession = false;
+      setSessionResumeAvailable(sessionId, true);
+    }
+  }
+
   async function compactSession() {
     if (!activeSessionId.value || isStreaming.value) return;
 
@@ -2573,7 +2909,7 @@ export const useChatStore = defineStore("chat", () => {
 
   async function forkSession() {
     const sourceSessionId = activeSessionId.value;
-    if (!sourceSessionId || isStreaming.value) return;
+    if (!sourceSessionId) return;
 
     const sourceSession = sessions.value.find((session) => session.id === sourceSessionId);
     if (sourceSession?.parentSessionId) {
@@ -2764,7 +3100,7 @@ export const useChatStore = defineStore("chat", () => {
     await refreshSessions();
     if (activeSessionId.value !== sessionId) return;
     useChatChangesStore().closeInlineDiff();
-    await loadSessionState(sessionId);
+    await loadSessionState(sessionId, { preserveLocalMessages: false });
   }
 
   function applySessionTitleUpdate(sessionId: string, title: string): void {
@@ -2927,6 +3263,7 @@ export const useChatStore = defineStore("chat", () => {
   return {
     sessions,
     activeSessionId,
+    pendingSelectionSessionId,
     messages,
     streamingText,
     displayedStreamingText,
@@ -2942,6 +3279,7 @@ export const useChatStore = defineStore("chat", () => {
     thinkingOrder,
     liveRenderParts,
     isStreaming,
+    canResumeInterrupted,
     isCompacting,
     currentRunId,
     isCancelling,
@@ -2976,6 +3314,12 @@ export const useChatStore = defineStore("chat", () => {
     rememberSessionScrollState,
     getSessionScrollState,
     clearSessionScrollState,
+    sessionHistoryHasMore,
+    sessionHistoryLoading,
+    loadOlderSessionHistory,
+    sessionUserMessageIds,
+    loadSessionHistoryThroughMessage,
+    loadSessionTurnPreview,
     sessionAgentId,
     sessionEffort,
     toolPermissionMode,
@@ -3000,6 +3344,7 @@ export const useChatStore = defineStore("chat", () => {
     archiveSession,
     deleteSession,
     sendMessage,
+    resumeInterrupted,
     compactSession,
     forkSession,
     forkSessionFromMessage,

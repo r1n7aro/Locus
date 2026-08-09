@@ -5,6 +5,7 @@ import type { ChatMessage } from "../types";
 import {
   buildChatTurnNavigationItems,
   findActiveChatTurnIds,
+  normalizeChatTurnPreview,
 } from "../components/chat/chatTurnNavigation";
 
 function message(
@@ -46,6 +47,27 @@ describe("chat turn navigation", () => {
     expect(findActiveChatTurnIds(anchors, 340, 400, 400)).toEqual(["u3"]);
   });
 
+  it("keeps the complete user turn index while deferring unloaded previews", () => {
+    const items = buildChatTurnNavigationItems(
+      [
+        message("u3", "user", "Third prompt"),
+        message("a3", "assistant", "Third response"),
+      ],
+      ["u1", "u2", "u3"],
+    );
+
+    expect(items).toEqual([
+      { id: "u1", prompt: "", response: "", deferred: true },
+      { id: "u2", prompt: "", response: "", deferred: true },
+      { id: "u3", prompt: "Third prompt", response: "Third response" },
+    ]);
+    expect(normalizeChatTurnPreview({
+      messageId: "u1",
+      prompt: "<system-reminder>hidden</system-reminder>\nFirst prompt",
+      response: "First response",
+    })).toEqual({ id: "u1", prompt: "First prompt", response: "First response" });
+  });
+
   it("integrates a default-on setting and preserves the Codex rail interactions", () => {
     const rail = readFileSync(
       resolve(process.cwd(), "src/components/chat/ChatTurnNavigationRail.vue"),
@@ -65,7 +87,14 @@ describe("chat turn navigation", () => {
     expect(displayView).toContain("display.showTurnNavigationRail");
     expect(chatView).toContain('v-if="displaySettings.showTurnNavigationRail"');
     expect(chatView).toContain(":scroll-element=\"transcriptScrollElement\"");
+    expect(chatView).toContain(":user-message-ids=\"chatStore.sessionUserMessageIds\"");
+    expect(chatView).toContain(":load-preview=\"chatStore.loadSessionTurnPreview\"");
+    expect(chatView).toContain(":load-turn=\"chatStore.loadSessionHistoryThroughMessage\"");
+    expect(chatView).toContain('@reveal-state="handleTurnNavigationRevealState"');
+    expect(chatView).toContain("if (turnNavigationRevealActive.value) return;");
     expect(rail).toContain("visibleItems.value.length > 0");
+    expect(rail).toContain("buildChatTurnNavigationItems(props.messages, props.userMessageIds)");
+    expect(rail).toContain("ensurePreviewLoaded(item)");
     expect(rail).toContain("const MIN_LEFT_GUTTER = 48");
     expect(rail).toContain("target.scrollIntoView");
     expect(rail).toContain("PREVIEW_OPEN_DELAY_MS = 150");

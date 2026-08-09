@@ -18,6 +18,18 @@ export type AssetRefClickAction =
   | "locusInspectorEmbedded"
   | "locusInspectorWindow";
 
+export const DEFAULT_SESSION_MESSAGE_PAGE_SIZE = 120;
+export const SESSION_MESSAGE_PAGE_SIZE_OPTIONS = [80, 120, 160, 240, 400] as const;
+
+export function normalizeSessionMessagePageSize(value: unknown): number {
+  const parsed = Number(value);
+  return SESSION_MESSAGE_PAGE_SIZE_OPTIONS.includes(
+    parsed as (typeof SESSION_MESSAGE_PAGE_SIZE_OPTIONS)[number],
+  )
+    ? parsed
+    : DEFAULT_SESSION_MESSAGE_PAGE_SIZE;
+}
+
 export interface DisplaySettings {
   /** Show the welcome subtitle above the chat input */
   showWelcomeSubtitle: boolean;
@@ -57,6 +69,8 @@ export interface DisplaySettings {
   rightAlignUserMessages: boolean;
   /** Show the user-turn navigation rail when the transcript has enough left gutter */
   showTurnNavigationRail: boolean;
+  /** Number of messages requested for initial session history and each older page */
+  sessionMessagePageSize: number;
   /** Collapse completed tool call batches in chat transcript */
   compactToolCalls: boolean;
   /** Hide completed thinking blocks in chat transcript */
@@ -137,9 +151,10 @@ const defaults: DisplaySettings = {
   unityEmbedAssetRefClickAction: "unityInspector",
   rightAlignUserMessages: true,
   showTurnNavigationRail: true,
+  sessionMessagePageSize: DEFAULT_SESSION_MESSAGE_PAGE_SIZE,
   compactToolCalls: true,
   hideThinkingBlocks: true,
-  showViewsInSessionPanel: true,
+  showViewsInSessionPanel: false,
   showViewLogBar: false,
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
@@ -167,7 +182,12 @@ function load(): DisplaySettings {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...defaults, ...parsed, fonts: { ...defaultFonts, ...parsed.fonts } };
+      return {
+        ...defaults,
+        ...parsed,
+        sessionMessagePageSize: normalizeSessionMessagePageSize(parsed.sessionMessagePageSize),
+        fonts: { ...defaultFonts, ...parsed.fonts },
+      };
     }
   } catch { /* ignore */ }
   return { ...defaults, fonts: { ...defaultFonts } };
@@ -195,7 +215,11 @@ if (typeof window !== "undefined") {
 
 export function useDisplaySettings() {
   function set<K extends keyof DisplaySettings>(key: K, value: DisplaySettings[K]) {
-    state[key] = value;
+    state[key] = (
+      key === "sessionMessagePageSize"
+        ? normalizeSessionMessagePageSize(value)
+        : value
+    ) as DisplaySettings[K];
     save({ ...state });
   }
 

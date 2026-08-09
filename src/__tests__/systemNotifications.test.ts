@@ -42,6 +42,7 @@ function createDisplayState(): DisplaySettings {
     unityEmbedAssetRefClickAction: "unityInspector",
     rightAlignUserMessages: false,
     showTurnNavigationRail: true,
+    sessionMessagePageSize: 120,
     compactToolCalls: true,
     hideThinkingBlocks: true,
     showViewsInSessionPanel: false,

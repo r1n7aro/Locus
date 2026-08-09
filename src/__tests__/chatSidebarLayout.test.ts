@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -39,11 +39,11 @@ describe("chat sidebar layout", () => {
     expect(en).toContain("\"chat.changes.undoing\": \"Undoing\"");
   });
 
-  it("uses a single right sidebar that stacks todos above file changes", () => {
+  it("uses a resizable right sidebar for file changes", () => {
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
-    const todoPanel = read("src/components/TodoPanel.vue");
     const changesPanel = read("src/components/ChatChangesPanel.vue");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const settingsState = read("src/composables/useSettingsState.ts");
 
     expect(workspace).toContain(":css=\"false\"");
@@ -54,19 +54,22 @@ describe("chat sidebar layout", () => {
     expect(workspace).toContain("@leave=\"leaveSidebarPanel\"");
     expect(workspace).toContain("SIDEBAR_ENTER_TRANSITION_MS");
     expect(workspace).toContain("<ChatSidebarPanel");
+    expect(workspace).toContain("props.active && chatChangesStore.currentPanelVisible");
     expect(workspace).toContain(":layout=\"isVerticalLayout ? 'bottom' : 'side'\"");
     expect(workspace).toContain("shell.style.width = \"0px\";");
     expect(workspace).toContain("shell.style.minWidth = \"0px\";");
     expect(workspace).toContain('shell.style.transform = "translateX(100%)";');
-    expect(sidebar).toContain("<TodoPanel");
     expect(sidebar).toContain("<ChatChangesPanel");
-    expect(sidebar).toContain("class=\"chat-sidebar-panel\"");
+    expect(sidebar).toContain("class=\"chat-sidebar-panel changes-only\"");
     expect(sidebar).toContain("class=\"chat-sidebar-shell\"");
     expect(sidebar).toContain("chat-sidebar-resize-handle");
-    expect(sidebar).toContain("chat-sidebar-section-todo");
     expect(sidebar).toContain("chat-sidebar-section-changes");
     expect(sidebar).toContain("chat-sidebar-close");
-    expect(sidebar).toContain("has-both-sections");
+    expect(sidebar).not.toContain("TodoPanel");
+    expect(sidebar).not.toContain("chat-sidebar-section-todo");
+    expect(workspace).not.toContain(":todos=\"chatStore.visibleTodos\"");
+    expect(displayPanel).not.toContain("display.todoAutoOpen");
+    expect(existsSync(resolve(cwd, "src/components/TodoPanel.vue"))).toBe(false);
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_WIDTH = \"locus:chatSidebarWidth\"");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_HEIGHT = \"locus:chatSidebarHeight\"");
     expect(sidebar).toContain("storageScope?: string;");
@@ -77,9 +80,6 @@ describe("chat sidebar layout", () => {
     expect(sidebar).toContain("localStorage.setItem(sidebarWidthStorageKey.value");
     expect(sidebar).toContain("localStorage.setItem(sidebarHeightStorageKey.value");
     expect(sidebar).toContain("layout-bottom");
-    expect(sidebar).toContain(".todo-panel.embedded.chat-sidebar-section-todo.closing");
-    expect(todoPanel).toContain("embedded?: boolean;");
-    expect(todoPanel).toContain("props.embedded ? \"max-height\" : \"width\"");
     expect(changesPanel).toContain("embedded?: boolean;");
     expect(changesPanel).toContain(":class=\"{ embedded: props.embedded }\"");
     expect(settingsState).toContain("localStorage.removeItem(\"locus:chatSidebarWidth\")");
@@ -93,7 +93,6 @@ describe("chat sidebar layout", () => {
     const chatView = read("src/components/ChatView.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
-    const todoPanel = read("src/components/TodoPanel.vue");
     const changesPanel = read("src/components/ChatChangesPanel.vue");
     const toolCollection = read("src/components/ToolCallCollection.vue");
 
@@ -126,7 +125,6 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.waiting-placeholder {");
     expect(chatView).toContain("background: var(--msg-assistant-bg);");
     expect(sidebar).toContain("background: var(--msg-assistant-bg);");
-    expect(todoPanel).toContain("background: var(--msg-assistant-bg);");
     expect(changesPanel).toContain("background: var(--msg-assistant-bg);");
     expect(toolCollection).toContain("var(--msg-assistant-bg)");
   });

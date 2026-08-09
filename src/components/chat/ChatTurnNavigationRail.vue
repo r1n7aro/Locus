@@ -6,47 +6,64 @@ import {
   ref,
   watch,
 } from "vue";
-import type { ChatMessage } from "../../types";
+import type { ChatMessage, SessionTurnPreview } from "../../types";
 import { t } from "../../i18n";
 import {
   buildChatTurnNavigationItems,
   findActiveChatTurnIds,
+  normalizeChatTurnPreview,
   type ChatTurnNavigationAnchor,
   type ChatTurnNavigationItem,
 } from "./chatTurnNavigation";
 
 const props = defineProps<{
   messages: ChatMessage[];
+  sessionId: string | null;
+  userMessageIds: string[];
   scrollElement: HTMLElement | null;
+  loadPreview?: (messageId: string) => Promise<SessionTurnPreview | null>;
+  loadTurn?: (messageId: string) => Promise<boolean>;
 }>();
 
 const emit = defineEmits<{
   (event: "navigate"): void;
+  (event: "revealState", active: boolean, messageId: string): void;
 }>();
 
 const MIN_LEFT_GUTTER = 48;
 const VIEWPORT_TOP_OFFSET = 16;
 const PREVIEW_OPEN_DELAY_MS = 150;
 const PREVIEW_CLOSE_DELAY_MS = 80;
+const TARGET_REVEAL_MAX_SETTLE_FRAMES = 30;
+const TARGET_REVEAL_STABLE_FRAMES = 6;
 
 const railListRef = ref<HTMLElement | null>(null);
 const tooltipRef = ref<HTMLElement | null>(null);
 const hasLeftGutter = ref(false);
 const listOverflows = ref(false);
-const availableIds = ref(new Set<string>());
 const activeIds = ref(new Set<string>());
 const previewItemId = ref<string | null>(null);
 const scrubTargetId = ref<string | null>(null);
 const isScrubbing = ref(false);
 const previewOpen = ref(false);
 const tooltipStyle = ref<Record<string, string>>({ visibility: "hidden" });
+const loadedPreviews = ref(new Map<string, ChatTurnNavigationItem>());
+const loadingPreviewIds = ref(new Set<string>());
+const failedPreviewIds = ref(new Set<string>());
 
-const items = computed(() => buildChatTurnNavigationItems(props.messages));
+const items = computed(() => buildChatTurnNavigationItems(props.messages, props.userMessageIds));
 const itemKey = computed(() => items.value.map((item) => item.id).join("\u241e"));
-const visibleItems = computed(() =>
-  items.value.filter((item) => availableIds.value.has(item.id)));
-const previewItem = computed(() =>
-  visibleItems.value.find((item) => item.id === previewItemId.value) ?? null);
+const visibleItems = computed(() => items.value);
+const previewItem = computed(() => {
+  const item = visibleItems.value.find((candidate) => candidate.id === previewItemId.value) ?? null;
+  return item ? loadedPreviews.value.get(item.id) ?? item : null;
+});
+const previewLoading = computed(() => (
+  !!previewItemId.value && loadingPreviewIds.value.has(previewItemId.value)
+));
+const previewFailed = computed(() => (
+  !!previewItemId.value && failedPreviewIds.value.has(previewItemId.value)
+));
 const canShow = computed(() =>
   hasLeftGutter.value && visibleItems.value.length > 0);
 
@@ -123,7 +140,6 @@ function measureLayout() {
   if (!scrollElement) {
     targetElements = new Map();
     anchorPositions = [];
-    availableIds.value = new Set();
     hasLeftGutter.value = false;
     listOverflows.value = false;
     return;
@@ -131,7 +147,6 @@ function measureLayout() {
 
   const scrollRect = scrollElement.getBoundingClientRect();
   const nextTargets = new Map<string, HTMLElement>();
-  const nextAvailableIds = new Set<string>();
   const nextAnchors: ChatTurnNavigationAnchor[] = [];
 
   for (const item of items.value) {
@@ -139,7 +154,6 @@ function measureLayout() {
     if (!target) continue;
     const targetRect = target.getBoundingClientRect();
     nextTargets.set(item.id, target);
-    nextAvailableIds.add(item.id);
     nextAnchors.push({
       id: item.id,
       start: scrollElement.scrollTop + targetRect.top - scrollRect.top,
@@ -148,12 +162,12 @@ function measureLayout() {
 
   const firstTarget = nextTargets.values().next().value as HTMLElement | undefined;
   const contentColumn = firstTarget?.closest<HTMLElement>(".chat-transcript-message-content")
+    ?? scrollElement.querySelector<HTMLElement>(".chat-transcript-message-content")
     ?? firstTarget;
   const contentLeft = contentColumn?.getBoundingClientRect().left ?? scrollRect.left;
 
   targetElements = nextTargets;
   anchorPositions = nextAnchors;
-  availableIds.value = nextAvailableIds;
   hasLeftGutter.value = contentLeft - scrollRect.left >= MIN_LEFT_GUTTER;
   updateActiveItems();
   scheduleTooltipPosition();
@@ -238,6 +252,39 @@ function showPreview(item: ChatTurnNavigationItem, button: HTMLButtonElement) {
   previewOpen.value = true;
   tooltipStyle.value = { visibility: "hidden" };
   void nextTick(scheduleTooltipPosition);
+  if (!scrubState || !scrubState.moved) {
+    void ensurePreviewLoaded(item);
+  }
+}
+
+async function ensurePreviewLoaded(item: ChatTurnNavigationItem) {
+  if (!item.deferred || loadedPreviews.value.has(item.id) || loadingPreviewIds.value.has(item.id)) {
+    return;
+  }
+  if (!props.loadPreview) return;
+  loadingPreviewIds.value = new Set(loadingPreviewIds.value).add(item.id);
+  const nextFailed = new Set(failedPreviewIds.value);
+  nextFailed.delete(item.id);
+  failedPreviewIds.value = nextFailed;
+  try {
+    const preview = await props.loadPreview(item.id);
+    if (!preview || preview.messageId !== item.id) {
+      failedPreviewIds.value = new Set(failedPreviewIds.value).add(item.id);
+      return;
+    }
+    const nextPreviews = new Map(loadedPreviews.value);
+    nextPreviews.set(item.id, normalizeChatTurnPreview(preview));
+    loadedPreviews.value = nextPreviews;
+    if (previewItemId.value === item.id) {
+      void nextTick(scheduleTooltipPosition);
+    }
+  } catch {
+    failedPreviewIds.value = new Set(failedPreviewIds.value).add(item.id);
+  } finally {
+    const nextLoading = new Set(loadingPreviewIds.value);
+    nextLoading.delete(item.id);
+    loadingPreviewIds.value = nextLoading;
+  }
 }
 
 function schedulePreview(item: ChatTurnNavigationItem, button: HTMLButtonElement) {
@@ -276,19 +323,61 @@ function flashTarget(target: HTMLElement) {
   );
 }
 
-function revealItem(item: ChatTurnNavigationItem, behavior: ScrollBehavior) {
+async function revealItem(
+  item: ChatTurnNavigationItem,
+  behavior: ScrollBehavior,
+  loadMissing = true,
+) {
   const scrollElement = connectedScrollElement;
-  const target = targetElements.get(item.id)
+  const revealGuardActive = loadMissing;
+  let target = targetElements.get(item.id)
     ?? (scrollElement ? findTarget(scrollElement, item.id) : null);
-  if (!target) return;
+  if (revealGuardActive) {
+    emit("revealState", true, item.id);
+  }
+  try {
+    if (!target && loadMissing && props.loadTurn) {
+      emit("navigate");
+      const loaded = await props.loadTurn(item.id);
+      if (!loaded) return;
+      await nextTick();
+      measureLayout();
+      target = targetElements.get(item.id)
+        ?? (scrollElement ? findTarget(scrollElement, item.id) : null);
+    }
+    if (!target) return;
 
-  emit("navigate");
-  target.scrollIntoView({
-    behavior: prefersReducedMotion() ? "auto" : behavior,
-    block: "start",
-    inline: "nearest",
-  });
-  flashTarget(target);
+    emit("navigate");
+    if (revealGuardActive) {
+      await revealTargetSettled(target);
+    } else {
+      target.scrollIntoView({
+        behavior: prefersReducedMotion() ? "auto" : behavior,
+        block: "start",
+        inline: "nearest",
+      });
+    }
+    flashTarget(target);
+  } finally {
+    if (revealGuardActive) emit("revealState", false, item.id);
+  }
+}
+
+async function revealTargetSettled(target: HTMLElement) {
+  const scrollElement = connectedScrollElement;
+  if (!scrollElement) return;
+  let stableFrames = 0;
+  for (let frame = 0; frame < TARGET_REVEAL_MAX_SETTLE_FRAMES; frame += 1) {
+    target.scrollIntoView({ behavior: "auto", block: "start", inline: "nearest" });
+    await new Promise<void>((resolve) => requestFrame(() => resolve()));
+    const offset = target.getBoundingClientRect().top - scrollElement.getBoundingClientRect().top;
+    const maxScrollTop = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+    const settled = Math.abs(offset) <= 1 || (
+      Math.abs(scrollElement.scrollTop - maxScrollTop) <= 1 && offset >= -1
+    );
+    stableFrames = settled ? stableFrames + 1 : 0;
+    if (stableFrames >= TARGET_REVEAL_STABLE_FRAMES) break;
+  }
 }
 
 function itemForButton(button: Element | null) {
@@ -349,7 +438,7 @@ function handleButtonClick(item: ChatTurnNavigationItem) {
     suppressNextClick = false;
     return;
   }
-  revealItem(item, "smooth");
+  void revealItem(item, "smooth");
 }
 
 function handleRailPointerEnter() {
@@ -398,7 +487,7 @@ function handlePointerMove(event: PointerEvent) {
   state.moved = true;
   scrubTargetId.value = target.item.id;
   showPreview(target.item, target.button);
-  revealItem(target.item, "auto");
+  void revealItem(target.item, "auto", false);
 }
 
 function handlePointerEnd(event: PointerEvent) {
@@ -406,7 +495,7 @@ function handlePointerEnd(event: PointerEvent) {
   if (!state || state.pointerId !== event.pointerId) return;
   const list = railListRef.value;
   const finalItem = visibleItems.value.find((item) => item.id === state.itemId);
-  if (!state.moved && finalItem) revealItem(finalItem, "smooth");
+  if (finalItem) void revealItem(finalItem, state.moved ? "auto" : "smooth");
   suppressNextClick = true;
   window.setTimeout(() => {
     suppressNextClick = false;
@@ -414,6 +503,7 @@ function handlePointerEnd(event: PointerEvent) {
   scrubState = null;
   isScrubbing.value = false;
   scrubTargetId.value = null;
+  if (finalItem) void ensurePreviewLoaded(finalItem);
   if (list?.hasPointerCapture?.(event.pointerId)) {
     list.releasePointerCapture?.(event.pointerId);
   }
@@ -487,6 +577,16 @@ watch(
   { immediate: true, flush: "post" },
 );
 
+watch(
+  () => props.sessionId,
+  () => {
+    loadedPreviews.value = new Map();
+    loadingPreviewIds.value = new Set();
+    failedPreviewIds.value = new Set();
+    closePreview();
+  },
+);
+
 watch(canShow, (show) => {
   if (!show) {
     listOverflows.value = false;
@@ -555,10 +655,14 @@ onBeforeUnmount(() => {
           @pointerenter="handleTooltipPointerEnter"
           @pointerleave="handleTooltipPointerLeave"
         >
-          <div class="chat-turn-navigation-prompt">
-            {{ previewItem.prompt || t("chat.turnNavigation.noContent") }}
+          <div class="chat-turn-navigation-prompt" :class="{ 'is-status': previewLoading || previewFailed }">
+            {{ previewLoading
+              ? t("chat.turnNavigation.loading")
+              : previewFailed
+                ? t("chat.turnNavigation.loadFailed")
+                : previewItem.prompt || t("chat.turnNavigation.noContent") }}
           </div>
-          <div v-if="previewItem.response" class="chat-turn-navigation-response">
+          <div v-if="!previewLoading && !previewFailed && previewItem.response" class="chat-turn-navigation-response">
             {{ previewItem.response }}
           </div>
         </div>
@@ -716,6 +820,11 @@ onBeforeUnmount(() => {
   color: var(--text-color);
   font-weight: 600;
   -webkit-line-clamp: 3;
+}
+
+.chat-turn-navigation-prompt.is-status {
+  color: var(--text-secondary);
+  font-weight: 400;
 }
 
 .chat-turn-navigation-response {

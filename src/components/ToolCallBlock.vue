@@ -6,6 +6,7 @@ import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
 import ToolResultImages from "./ToolResultImages.vue";
 import ToolSearchOutput from "./ToolSearchOutput.vue";
+import TodoList from "./TodoList.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import hljs, { langFromPath } from "../hljs";
@@ -22,6 +23,7 @@ import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
 import { parseToolSearchOutput } from "./toolSearchOutput";
+import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "../composables/todoWrite";
 import { resolveToolFilePreviewPayload } from "./toolFilePreviewActions";
 import { normalizeAppError } from "../services/errors";
 import { openToolFilePreviewWindow } from "../services/toolFilePreviewWindow";
@@ -40,7 +42,7 @@ const emit = defineEmits<{
 }>();
 
 function isSubagentToolName(name: string) {
-  return name === "explore" || name === "task";
+  return name === "explore" || name === "subagent" || name === "task";
 }
 
 function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
@@ -195,18 +197,34 @@ const statusIcon = computed(() => {
 });
 
 const displayName = computed(() => {
-  if (props.toolCall.name === "task") {
+  if (props.toolCall.name === "subagent" || props.toolCall.name === "task") {
     try {
       const args = JSON.parse(props.toolCall.arguments);
-      return args.subagent_type || "task";
+      return args.subagent_type || props.toolCall.name;
     } catch {
-      return "task";
+      return props.toolCall.name;
     }
   }
   return toolCallDisplayName(props.toolCall.name);
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
+const isTodoWriteTool = computed(() => props.toolCall.name === "todowrite");
+const todoWriteItems = computed(() => (
+  isTodoWriteTool.value
+    ? parseTodoWriteArguments(props.toolCall.arguments)
+      ?? parseLegacyTodoWriteOutput(props.toolCall.output ?? "")
+      ?? []
+    : []
+));
+const todoWriteRemainingCount = computed(() => todoWriteItems.value.filter(
+  (todo) => todo.status !== "completed" && todo.status !== "cancelled",
+).length);
+const todoWriteHeaderSummary = computed(() => (
+  todoWriteItems.value.length > 0
+    ? t("todo.remaining", String(todoWriteRemainingCount.value))
+    : ""
+));
 const toolFilePreviewPayload = computed(() => resolveToolFilePreviewPayload({
   name: props.toolCall.name,
   arguments: props.toolCall.arguments,
@@ -340,11 +358,11 @@ const parsedArgs = computed(() => {
   try {
     const args = JSON.parse(props.toolCall.arguments);
     if (typeof args !== "object" || args === null) return [];
-    const isTask = props.toolCall.name === "task";
+    const isSubagent = props.toolCall.name === "subagent" || props.toolCall.name === "task";
     const isEdit = props.toolCall.name === "edit";
     const editDiffKeys = ["oldString", "old_string", "newString", "new_string", "edits"];
     return Object.entries(args)
-      .filter(([key]) => !isTask || key === "prompt")
+      .filter(([key]) => !isSubagent || key === "prompt")
       .filter(([key]) => !isEdit || !editDiffKeys.includes(key))
       .map(([key, value]) => ({
         key,
@@ -464,6 +482,7 @@ const toolSearchOutput = computed(() => {
   return parseToolSearchOutput(displayOutput.value);
 });
 const headerSummary = computed(() => {
+  if (isTodoWriteTool.value) return todoWriteHeaderSummary.value;
   if (!toolSearchOutput.value) return argsSummary.value;
   const resultCount = t("tool.toolSearch.summary", toolSearchOutput.value.tools.length);
   return [argsSummary.value, resultCount].filter(Boolean).join(" · ");
@@ -571,7 +590,13 @@ const highlightedOutput = computed(() => {
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
     </div>
     <div v-if="expanded" class="tool-call-detail">
-      <div class="tool-call-section">
+      <TodoList
+        v-if="isTodoWriteTool"
+        :todos="todoWriteItems"
+        :empty-text="t('todo.empty')"
+        compact
+      />
+      <div v-else class="tool-call-section">
         <div class="tool-call-section-label">{{ t("tool.section.args") }}</div>
         <template v-if="isEditTool && editDiffData">
           <div v-if="parsedArgs.length > 0" class="tool-args-table" style="margin-bottom: 6px;">
@@ -617,7 +642,7 @@ const highlightedOutput = computed(() => {
         </div>
         <pre v-else-if="rawArgsFallback" class="tool-call-pre ui-select-text">{{ rawArgsFallback }}</pre>
       </div>
-      <div v-if="toolCall.output !== undefined || toolCall.status === 'running'" class="tool-call-section">
+      <div v-if="!isTodoWriteTool && (toolCall.output !== undefined || toolCall.status === 'running')" class="tool-call-section">
         <div class="tool-call-section-label">
           {{ t("tool.section.output") }}
           <span v-if="toolCall.status === 'running' && displayedToolOutput" class="output-streaming-indicator"></span>

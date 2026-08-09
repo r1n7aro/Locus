@@ -405,6 +405,25 @@ export interface SessionDetail {
   runtime?: SessionRuntimeSnapshot | null;
 }
 
+export interface SessionViewSnapshot {
+  session: SessionDetail;
+  userMessageIds?: string[];
+  oldestMessageRowId?: number | null;
+  hasMoreHistory: boolean;
+}
+
+export interface SessionTurnPreview {
+  messageId: string;
+  prompt: string;
+  response: string;
+}
+
+export interface SessionMessagePage {
+  messages: ChatMessage[];
+  oldestMessageRowId?: number | null;
+  hasMoreHistory: boolean;
+}
+
 export interface CompactedContextOutput {
   messageId: string;
   snapshotStatus: "complete" | "reconstructed" | "partial" | string;
@@ -489,9 +508,15 @@ export interface SessionTitleUpdatedEvent {
   title: string;
 }
 
-export interface SaveRawContextRequest {
+export interface SessionContextExportRequest {
   sessionId: string;
-  includeSystemPrompt: boolean;
+}
+
+export interface ContextExportResult {
+  filePath: string;
+  captureQuality: "full" | "partial" | "reconstructed" | string;
+  sessionCount: number;
+  attemptCount: number;
 }
 
 export interface AgentInfo {
@@ -1218,9 +1243,6 @@ export interface SkillManifest {
   packageId?: string | null;
   packageVersion?: string | null;
   hasUnity?: boolean;
-  hasL0?: boolean;
-  hasL1?: boolean;
-  hasL2?: boolean;
   pluginId?: string | null;
   pluginScope?: "app" | "project" | string | null;
   /** Absolute on-disk directory of an external (generic-format) skill. */

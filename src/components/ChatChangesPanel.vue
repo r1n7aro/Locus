@@ -634,7 +634,7 @@ function ctxRevertFile(ev: MouseEvent) {
           @click="hideMeta = !hideMeta"
           :title="t('common.hideMeta')"
         >.meta</button>
-        <button v-if="props.showClose ?? true" type="button" class="close-btn" @click="emit('close')" :title="t('todo.close')">&times;</button>
+        <button v-if="props.showClose ?? true" type="button" class="close-btn" @click="emit('close')" :title="t('common.close')">&times;</button>
       </div>
     </div>
     <div class="file-list" :class="{ 'changes-tree-list': fileViewMode === 'tree' }">

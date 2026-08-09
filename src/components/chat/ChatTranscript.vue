@@ -2659,6 +2659,12 @@ function emitPointerScrollIntent(event: PointerEvent) {
   }
 }
 
+function emitPointerMoveScrollIntent(event: PointerEvent) {
+  if (event.buttons !== 0 && event.target === scrollRef.value) {
+    emit("userScrollIntent", event);
+  }
+}
+
 function emitKeyboardScrollIntent(event: KeyboardEvent) {
   if (SCROLL_INTENT_KEYS.has(event.key)) {
     emit("userScrollIntent", event);
@@ -2696,6 +2702,7 @@ function openImage(src: string) {
     @wheel.passive="emitUserScrollIntent"
     @touchstart.passive="emitUserScrollIntent"
     @pointerdown="emitPointerScrollIntent"
+    @pointermove.passive="emitPointerMoveScrollIntent"
     @keydown="emitKeyboardScrollIntent"
     @click="emitContentClick"
     @contextmenu="emitContentContextmenu"
@@ -2888,7 +2895,7 @@ function openImage(src: string) {
                   'is-context-selected': isContextSelectedAssistantGroup(group),
                 },
               ]"
-              :data-scroll-anchor-id="group.items[0]?.id"
+              :data-scroll-anchor-id="group.items[group.items.length - 1]?.id"
               :data-chat-message-id="group.items[0]?.id"
               data-chat-message-role="assistant"
             >
@@ -3216,10 +3223,6 @@ function openImage(src: string) {
      tail, and viewport-adjacent messages gain nothing from being skippable
      (-n+3 covers history+transient coexistence and the pending-user swap). */
   .chat-transcript-content > .chat-transcript-message.is-session:nth-last-child(-n+3 of .chat-transcript-message) {
-    content-visibility: visible;
-  }
-
-  .chat-transcript-scroll.is-session.is-session-restore-stabilizing .chat-transcript-message.is-session {
     content-visibility: visible;
   }
 

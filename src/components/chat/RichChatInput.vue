@@ -34,6 +34,7 @@ import {
   type ActiveOperator,
   type CommandDef,
   type ComposerIntentState,
+  type IntentCommandType,
 } from "../../composables/chatInputIntents";
 import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
 import {
@@ -150,8 +151,10 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   isStreaming?: boolean;
   cancelling?: boolean;
+  canResume?: boolean;
   sendLabel?: string;
   cancelLabel?: string;
+  resumeLabel?: string;
   allowImages?: boolean;
   maxImages?: number;
   showTopPlanBadge?: boolean;
@@ -166,8 +169,10 @@ const props = withDefaults(defineProps<{
   disabled: false,
   isStreaming: false,
   cancelling: false,
+  canResume: false,
   sendLabel: "",
   cancelLabel: "",
+  resumeLabel: "",
   allowImages: true,
   maxImages: 5,
   showTopPlanBadge: true,
@@ -182,10 +187,13 @@ const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
   (e: "send", payload: ChatComposerSendPayload): void;
   (e: "cancel"): void;
+  (e: "resume"): void;
   (e: "clear"): void;
   (e: "compact"): void;
   (e: "fork"): void;
   (e: "undo"): void;
+  (e: "exportContext"): void;
+  (e: "reviewContext"): void;
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
@@ -316,16 +324,28 @@ const commandToken = computed(() =>
   activeOperator.value?.kind === "slash" ? activeOperator.value.token : "",
 );
 
+const RUNTIME_SAFE_ACTION_COMMANDS: readonly IntentCommandType[] = [
+  "fork",
+  "export-context",
+  "review-context",
+];
+
 const allowActionCommands = computed(() =>
-  !props.isStreaming
-  && !!activeOperator.value
+  !!activeOperator.value
   && activeOperator.value.kind === "slash"
   && props.modelValue.trim() === activeOperator.value.token.trim(),
 );
 
+const actionCommandFilterOptions = computed(() => ({
+  includeActions: allowActionCommands.value && !props.isStreaming,
+  allowedActionTypes: allowActionCommands.value && props.isStreaming
+    ? RUNTIME_SAFE_ACTION_COMMANDS
+    : undefined,
+}));
+
 const filteredCommands = computed(() =>
   commandToken.value
-    ? getFilteredCommands(commandToken.value, { includeActions: allowActionCommands.value })
+    ? getFilteredCommands(commandToken.value, actionCommandFilterOptions.value)
     : [],
 );
 
@@ -821,7 +841,7 @@ function syncOperatorState() {
   }
 
   if (operator.kind === "slash") {
-    const matches = getFilteredCommands(operator.token, { includeActions: allowActionCommands.value });
+    const matches = getFilteredCommands(operator.token, actionCommandFilterOptions.value);
     showCommandPopup.value = matches.length > 0;
     const sameSlashToken =
       previousOperator?.kind === "slash"
@@ -1750,6 +1770,10 @@ function canExecuteActionCommand(): boolean {
 
 function executeActionCommand(command: CommandDef): boolean {
   if (command.commandKind !== "action" || !canExecuteActionCommand()) return false;
+  if (
+    props.isStreaming
+    && !RUNTIME_SAFE_ACTION_COMMANDS.includes(command.commandType)
+  ) return false;
 
   if (command.commandType === "clear") {
     resetDraft();
@@ -1772,6 +1796,18 @@ function executeActionCommand(command: CommandDef): boolean {
   if (command.commandType === "undo") {
     resetDraft();
     emit("undo");
+    return true;
+  }
+
+  if (command.commandType === "export-context") {
+    resetDraft();
+    emit("exportContext");
+    return true;
+  }
+
+  if (command.commandType === "review-context") {
+    resetDraft();
+    emit("reviewContext");
     return true;
   }
 
@@ -1803,7 +1839,7 @@ function handleSend() {
     return;
   }
 
-  if (!props.isStreaming && tryHandleExactActionCommand()) {
+  if (tryHandleExactActionCommand()) {
     return;
   }
 
@@ -2603,8 +2639,10 @@ defineExpose({
       :is-streaming="isStreaming"
       :cancelling="cancelling"
       :can-send="canSend"
+      :can-resume="canResume"
       :send-label="sendLabel"
       :cancel-label="cancelLabel"
+      :resume-label="resumeLabel"
       :submit-mode="chatInputSettings.submitMode"
       :compact="compact"
       :show-action="showAction"
@@ -2625,6 +2663,7 @@ defineExpose({
       @focus="handleTextareaInteraction"
       @send="handleSend"
       @cancel="emit('cancel')"
+      @resume="emit('resume')"
     >
       <template #overlay>
         <div v-if="hasTopAttachments" class="composer-attachment-list">

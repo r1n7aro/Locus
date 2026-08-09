@@ -75,7 +75,8 @@ describe("chat responsive layout", () => {
     expect(workspace).toContain("uiStore.beginAssistantSidebarTransition()");
     expect(workspace).toContain("uiStore.endAssistantSidebarTransition()");
     expect(workspace).not.toContain("scheduleWorkspaceWidthUpdate");
-    expect(workspace).toContain("saveRawContext");
+    expect(workspace).toContain("exportSessionContext");
+    expect(workspace).toContain("reviewSessionContext");
     expect(sidebar).toContain("layout?: \"side\" | \"bottom\"");
     expect(sidebar).toContain("maxSideWidth?: number;");
     expect(sidebar).toContain("effectiveSidebarWidth");
@@ -103,6 +104,32 @@ describe("chat responsive layout", () => {
     expect(sessionPanel).not.toContain("nodeHasActiveDescendant");
     expect(onRowClick).toContain('if (row.node.kind === "folder") {');
     expect(onRowClick).not.toContain("toggleNode(row)");
+  });
+
+  it("makes running session titles brighter and visibly animated", () => {
+    const sessionPanel = read("src/components/chat/SessionPanel.vue");
+    const compactPicker = read("src/components/chat/SessionCompactPicker.vue");
+    const appGlobal = read("src/styles/app-global.css");
+
+    expect(sessionPanel).toContain("function isSessionTitleRunning(node: SessionTreeNode): boolean");
+    expect(sessionPanel).toContain("props.streamingSessionIds?.has(node.sessionId)");
+    expect(sessionPanel).toContain(`:class="{ 'is-running': isSessionTitleRunning(row.node) }"`);
+    expect(sessionPanel).toContain(`:data-title="isSessionTitleRunning(row.node) ? rowLabel(row.node) : undefined"`);
+    expect(sessionPanel).toContain(".sp-session-title.is-running::after {");
+    expect(sessionPanel).toContain("color-mix(in srgb, var(--text-color) 62%, var(--text-secondary) 38%)");
+    expect(sessionPanel).toContain("mask-image: linear-gradient(90deg, transparent 40%, currentColor 50%, transparent 60%);");
+    expect(sessionPanel).toContain("animation: sp-session-title-scan 2s ease-in-out infinite;");
+    expect(sessionPanel).toContain("@keyframes sp-session-title-scan");
+    expect(sessionPanel).not.toContain("-webkit-background-clip: text;");
+    expect(appGlobal).toContain(".sp-session-title.is-running::after");
+
+    const chatView = read("src/components/ChatView.vue");
+    expect(chatView).toContain(".sp-session-item.active .sp-session-title:not(.is-running)");
+    expect(sessionPanel).not.toContain(".sp-session-dot.is-loading");
+    expect(sessionPanel).not.toContain(".sp-expand-btn.is-loading");
+    expect(compactPicker).not.toContain("session-compact-pending");
+    expect(compactPicker).not.toContain(".session-compact-option.pending .session-compact-option-dot");
+    expect(compactPicker).toContain(':aria-busy="session.id === pendingSessionId"');
   });
 
   it("pins chat resize to parent width instead of intrinsic child width", () => {

@@ -7,8 +7,22 @@ import {
   type SkillSurface,
 } from "../types";
 
-export const BUILTIN_COMMAND_NAMES = ["/clear", "/compact", "/plan"] as const;
+export const BUILTIN_COMMAND_NAMES = [
+  "/clear",
+  "/compact",
+  "/fork",
+  "/undo",
+  "/export-context",
+  "/review-context",
+  "/unity-console",
+  "/console-error",
+  "/plan",
+] as const;
 export const SKILL_COMMAND_NOTICE_OPERATION = "knowledgeSkillCommandTrigger";
+
+const ACTION_BACKED_SKILL_COMMANDS: Readonly<Record<string, string>> = {
+  "/review-context": "review-context",
+};
 
 const COMMAND_BOUNDARY_RE = /[\s,，。！？!?:：;；()[\]{}<>《》「」『』"“”'‘’]/;
 
@@ -52,6 +66,9 @@ export function findSkillCommandConflict(
   const normalizedLower = normalized.toLowerCase();
 
   if (BUILTIN_COMMAND_NAMES.some((name) => name.toLowerCase() === normalizedLower)) {
+    if (currentSkill?.dirName === ACTION_BACKED_SKILL_COMMANDS[normalizedLower]) {
+      return null;
+    }
     return {
       type: "builtin",
       command: normalized,
@@ -86,7 +103,7 @@ export function buildSkillConfigForCommandToggle(
   const allowsAuto = skillSurfaceAllowsAuto(skill.skillSurface);
 
   // description is intentionally omitted: sending the effective summary here
-  // would pin it as a workspace override and shadow later `## L1` updates.
+  // would pin it as a workspace override and shadow later frontmatter summary updates.
   return {
     enabled: commandEnabled ? true : allowsAuto ? skill.skillEnabled !== false : false,
     surface: commandEnabled ? (allowsAuto ? "both" : "command") : allowsAuto ? "auto" : "command",

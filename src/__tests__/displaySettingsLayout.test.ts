@@ -9,6 +9,34 @@ function read(relPath: string) {
 }
 
 describe("display settings transcript alignment", () => {
+  it("configures session history page size with a larger default", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const chatStore = read("src/stores/chat.ts");
+    const sessionCommands = read("src-tauri/src/commands/session.rs");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("export const DEFAULT_SESSION_MESSAGE_PAGE_SIZE = 120;");
+    expect(displaySettings).toContain("export const SESSION_MESSAGE_PAGE_SIZE_OPTIONS = [80, 120, 160, 240, 400] as const;");
+    expect(displaySettings).toContain("sessionMessagePageSize: DEFAULT_SESSION_MESSAGE_PAGE_SIZE,");
+    expect(displaySettings).toContain("normalizeSessionMessagePageSize(parsed.sessionMessagePageSize)");
+
+    expect(displayPanel).toContain("settings.display.sessionHistoryTitle");
+    expect(displayPanel).toContain(':model-value="String(display.sessionMessagePageSize)"');
+    expect(displayPanel).toContain(":options=\"sessionMessagePageSizeOptions\"");
+    expect(displayPanel).toContain("setDisplay('sessionMessagePageSize', Number($event))");
+
+    expect(chatStore).toContain("loadSessionView(id, messageLimit)");
+    expect(chatStore).toContain("loadSessionMessagePage(sessionId, beforeRowId, messageLimit)");
+    expect(sessionCommands).toContain("const DEFAULT_SESSION_VIEW_MESSAGE_LIMIT: u32 = 120;");
+
+    expect(zh).toContain('"settings.display.sessionHistoryTitle": "会话历史"');
+    expect(zh).toContain('"settings.display.sessionMessagePageSizeOption": "{0} 条"');
+    expect(en).toContain('"settings.display.sessionHistoryTitle": "Session History"');
+    expect(en).toContain('"settings.display.sessionMessagePageSizeOption": "{0} messages"');
+  });
+
   it("keeps main and Unity embed color styles separately configurable", () => {
     const theme = read("src/composables/useTheme.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

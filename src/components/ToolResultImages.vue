@@ -1,13 +1,40 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
+import {
+  deferredSessionMessageImageId,
+  resolveToolResultImages,
+} from "../composables/toolResultImages";
+import { loadSessionMessageImages } from "../services/session";
 import type { ImageAttachment } from "../types";
 
 const props = defineProps<{
   images: ImageAttachment[];
 }>();
 
+const resolvedImages = ref<ImageAttachment[]>([]);
+
+watch(
+  () => props.images,
+  async (images, _previous, onCleanup) => {
+    let cancelled = false;
+    onCleanup(() => {
+      cancelled = true;
+    });
+    try {
+      const resolved = await resolveToolResultImages(images, loadSessionMessageImages);
+      if (!cancelled) resolvedImages.value = resolved;
+    } catch (error) {
+      console.warn("load_session_message_images failed:", error);
+      if (!cancelled) {
+        resolvedImages.value = images.filter((image) => !deferredSessionMessageImageId(image));
+      }
+    }
+  },
+  { immediate: true },
+);
+
 const validImages = computed(() =>
-  props.images.filter((image) => image.data && image.mimeType),
+  resolvedImages.value.filter((image) => image.data && image.mimeType),
 );
 
 function imageDataUrl(image: ImageAttachment) {

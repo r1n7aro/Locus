@@ -62,6 +62,21 @@ describe("skillCommands", () => {
     });
   });
 
+  it("allows the review-context skill to own the prompt behind its builtin action", () => {
+    expect(
+      findSkillCommandConflict("/review-context", [], {
+        source: "app",
+        dirName: "review-context",
+      }),
+    ).toBeNull();
+    expect(
+      findSkillCommandConflict("/review-context", [], {
+        source: "project",
+        dirName: "another-skill",
+      }),
+    ).toMatchObject({ type: "builtin", command: "/review-context" });
+  });
+
   it("treats auto-only skills as unregistered in the command list", () => {
     expect(
       skillHasCommandEnabled(makeSkill({ skillSurface: "auto" })),

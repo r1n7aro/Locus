@@ -241,7 +241,8 @@ body.is-dragging-select-lock * {
   .workspace-switch-spinner,
   .chat-transcript-thinking-spinner,
   .sp-session-dot.is-running,
-  .sp-expand-btn.is-running svg
+  .sp-expand-btn.is-running svg,
+  .sp-session-title.is-running::after
 ) {
   animation-duration: 0s !important;
   animation-delay: 0s !important;

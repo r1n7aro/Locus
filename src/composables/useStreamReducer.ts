@@ -1,6 +1,7 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
 import { resolveToolCallDisplayShape } from "./toolCallBatches";
+import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
@@ -551,14 +552,13 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
         id: event.toolCallId,
         updates,
       });
-      // Parse todowrite output
+      // The tool result is intentionally compact; the full list already lives in the arguments.
       if (event.toolName === "todowrite" && event.outcome === "done") {
-        const jsonStart = event.output.indexOf("[");
-        if (jsonStart >= 0) {
-          try {
-            const parsed = JSON.parse(event.output.slice(jsonStart)) as TodoItem[];
-            mutations.push({ type: "setTodos", runId: event.runId, todos: parsed });
-          } catch { /* ignore */ }
+        const toolCall = state.activeToolCalls.find((item) => item.id === event.toolCallId);
+        const parsed = parseTodoWriteArguments(toolCall?.arguments ?? "")
+          ?? parseLegacyTodoWriteOutput(event.output);
+        if (parsed !== null) {
+          mutations.push({ type: "setTodos", runId: event.runId, todos: parsed });
         }
       }
       break;

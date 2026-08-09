@@ -1,18 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../i18n";
-import type { TodoItem } from "../types";
-import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
-import TodoPanel from "./TodoPanel.vue";
 import ChatChangesPanel from "./ChatChangesPanel.vue";
 
 const props = withDefaults(defineProps<{
-  todos: TodoItem[];
-  isStreaming: boolean;
-  todoWriteVersion: number;
-  celebrationEnabled: boolean;
   layout?: "side" | "bottom";
   maxSideWidth?: number;
   storageScope?: string;
@@ -21,12 +14,7 @@ const props = withDefaults(defineProps<{
   storageScope: "",
 });
 
-const chatStore = useChatStore();
 const changesStore = useChatChangesStore();
-
-const showTodoSection = computed(() => chatStore.showTodoPanel);
-const showChangesSection = computed(() => changesStore.currentPanelVisible);
-const hasBothSections = computed(() => showTodoSection.value && showChangesSection.value);
 
 const STORAGE_KEY_SIDEBAR_WIDTH = "locus:chatSidebarWidth";
 const STORAGE_KEY_SIDEBAR_HEIGHT = "locus:chatSidebarHeight";
@@ -93,7 +81,6 @@ function clampSidebarHeight(next: number) {
 }
 
 function closeSidebar() {
-  chatStore.closeTodoPanel();
   changesStore.closePanel();
 }
 
@@ -183,32 +170,12 @@ onUnmounted(() => {
     <div class="chat-sidebar-resize-handle" @mousedown="onSidebarResizeMouseDown"></div>
 
     <aside
-      class="chat-sidebar-panel"
-      :class="{
-        'has-both-sections': hasBothSections,
-        'todo-only': showTodoSection && !showChangesSection,
-        'changes-only': showChangesSection && !showTodoSection,
-      }"
+      class="chat-sidebar-panel changes-only"
       :style="sidebarStyle"
     >
-      <button class="chat-sidebar-close" :title="t('todo.close')" @click="closeSidebar">&times;</button>
-
-      <TodoPanel
-        v-if="showTodoSection"
-        class="chat-sidebar-section chat-sidebar-section-todo"
-        :todos="props.todos"
-        :is-streaming="props.isStreaming"
-        :todo-write-version="props.todoWriteVersion"
-        :celebration-enabled="props.celebrationEnabled"
-        embedded
-        :show-close="false"
-        @close="chatStore.closeTodoPanel()"
-      />
-
-      <div v-if="hasBothSections" class="chat-sidebar-divider"></div>
+      <button class="chat-sidebar-close" :title="t('common.close')" @click="closeSidebar">&times;</button>
 
       <ChatChangesPanel
-        v-if="showChangesSection"
         class="chat-sidebar-section chat-sidebar-section-changes"
         embedded
         :show-close="false"
@@ -273,35 +240,10 @@ onUnmounted(() => {
 }
 
 .chat-sidebar-section {
+  flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
-}
-
-.chat-sidebar-panel.has-both-sections .chat-sidebar-section-todo {
-  flex: 0 1 40%;
-  min-height: 168px;
-}
-
-.chat-sidebar-panel.has-both-sections .chat-sidebar-section-changes {
-  flex: 1 1 0;
-  min-height: 220px;
-}
-
-.chat-sidebar-panel.todo-only .chat-sidebar-section,
-.chat-sidebar-panel.changes-only .chat-sidebar-section {
-  flex: 1 1 auto;
-}
-
-.chat-sidebar-divider {
-  height: 1px;
-  flex-shrink: 0;
-  background: var(--border-color);
-}
-
-:deep(.todo-panel.embedded.chat-sidebar-section-todo.closing) {
-  min-height: 0 !important;
-  flex: 0 0 auto !important;
 }
 
 .chat-sidebar-close {
@@ -329,13 +271,11 @@ onUnmounted(() => {
   color: var(--text-color);
 }
 
-:deep(.todo-panel.embedded),
 :deep(.changes-panel.embedded) {
   flex: 1;
   min-height: 0;
 }
 
-:deep(.todo-panel.embedded .panel-header),
 :deep(.changes-panel.embedded .panel-header) {
   padding-right: 48px;
 }

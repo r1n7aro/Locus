@@ -1,10 +1,11 @@
-import type { ChatMessage } from "../../types";
+import type { ChatMessage, SessionTurnPreview } from "../../types";
 import { displayUserMessageContent } from "../../composables/chatUserMessageDisplay";
 
 export interface ChatTurnNavigationItem {
   id: string;
   prompt: string;
   response: string;
+  deferred?: boolean;
 }
 
 export interface ChatTurnNavigationAnchor {
@@ -20,8 +21,9 @@ function previewText(value: string | null | undefined) {
  * assistant message supplies the secondary preview shown in the tooltip. */
 export function buildChatTurnNavigationItems(
   messages: readonly ChatMessage[],
+  indexedUserMessageIds: readonly string[] = [],
 ): ChatTurnNavigationItem[] {
-  const items: ChatTurnNavigationItem[] = [];
+  const loadedItems: ChatTurnNavigationItem[] = [];
 
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
@@ -38,14 +40,37 @@ export function buildChatTurnNavigationItems(
       }
     }
 
-    items.push({
+    loadedItems.push({
       id: message.id,
       prompt: previewText(displayUserMessageContent(message.content)),
       response,
     });
   }
 
-  return items;
+  if (indexedUserMessageIds.length === 0) return loadedItems;
+
+  const loadedById = new Map(loadedItems.map((item) => [item.id, item]));
+  const orderedIds = [...indexedUserMessageIds];
+  const indexedIds = new Set(orderedIds);
+  for (const item of loadedItems) {
+    if (indexedIds.has(item.id)) continue;
+    indexedIds.add(item.id);
+    orderedIds.push(item.id);
+  }
+  return orderedIds.map((id) => loadedById.get(id) ?? {
+    id,
+    prompt: "",
+    response: "",
+    deferred: true,
+  });
+}
+
+export function normalizeChatTurnPreview(preview: SessionTurnPreview): ChatTurnNavigationItem {
+  return {
+    id: preview.messageId,
+    prompt: previewText(displayUserMessageContent(preview.prompt)),
+    response: previewText(preview.response),
+  };
 }
 
 /** Return every turn range intersecting the viewport. Keeping all intersecting

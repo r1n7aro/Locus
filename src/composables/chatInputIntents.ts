@@ -9,6 +9,8 @@ export type IntentCommandType =
   | "clear"
   | "fork"
   | "undo"
+  | "export-context"
+  | "review-context"
   | "unity-console"
   | "unity-console-error";
 

@@ -4,6 +4,7 @@ import { t } from "../../i18n";
 import { useTheme, type ThemePreference } from "../../composables/useTheme";
 import {
   useDisplaySettings,
+  SESSION_MESSAGE_PAGE_SIZE_OPTIONS,
   type AssetRefClickAction,
   type DiffReviewTarget,
   type FontSlot,
@@ -43,6 +44,13 @@ const themeOptions = computed(() =>
   options.map((opt) => ({
     value: opt.value,
     label: t(opt.labelKey),
+  })),
+);
+
+const sessionMessagePageSizeOptions = computed<DropdownOption[]>(() =>
+  SESSION_MESSAGE_PAGE_SIZE_OPTIONS.map((value) => ({
+    value: String(value),
+    label: t("settings.display.sessionMessagePageSizeOption", value),
   })),
 );
 
@@ -233,6 +241,24 @@ async function updateViewWindowsAboveMain(value: boolean) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.sessionHistoryTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.sessionHistoryDesc") }}</p>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.sessionMessagePageSize") }}</span>
+      <BaseDropdown
+        class="history-page-size-dropdown"
+        :model-value="String(display.sessionMessagePageSize)"
+        :options="sessionMessagePageSizeOptions"
+        :aria-label="t('settings.display.sessionMessagePageSize')"
+        size="sm"
+        menu-align="start"
+        @update:model-value="setDisplay('sessionMessagePageSize', Number($event))"
+      />
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.display.mainChromeTitle") }}</div>
     <p class="section-desc">{{ t("settings.display.mainChromeDesc") }}</p>
 
@@ -258,15 +284,6 @@ async function updateViewWindowsAboveMain(value: boolean) {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.display.panelBehaviorTitle") }}</div>
     <p class="section-desc">{{ t("settings.display.panelBehaviorDesc") }}</p>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.todoAutoOpen"
-        :aria-label="t('settings.display.todoAutoOpen')"
-        @update:model-value="setDisplay('todoAutoOpen', $event)"
-      />
-      <span>{{ t("settings.display.todoAutoOpen") }}</span>
-    </div>
 
     <div class="toggle-row">
       <BaseSwitch
@@ -553,6 +570,11 @@ async function updateViewWindowsAboveMain(value: boolean) {
   width: fit-content;
   min-width: 220px;
   max-width: 100%;
+}
+
+.history-page-size-dropdown {
+  justify-self: start;
+  width: 96px;
 }
 
 .toggle-row {

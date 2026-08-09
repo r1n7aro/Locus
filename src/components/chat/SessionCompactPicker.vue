@@ -26,6 +26,7 @@ const VIEW_TREE_INDENT_STEP_PX = 18;
 const props = defineProps<{
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  pendingSessionId?: string | null;
   streamingSessionIds?: Set<string>;
   showExpandPanelButton?: boolean;
   workingDir?: string;
@@ -470,6 +471,7 @@ onUnmounted(() => {
                 active: session.id === activeSessionId,
                 running: streamingSessionIds?.has(session.id),
               }"
+              :aria-busy="session.id === pendingSessionId"
               @click="selectSession(session.id)"
             >
               <span class="session-compact-option-dot"></span>
