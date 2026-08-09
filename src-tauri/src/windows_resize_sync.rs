@@ -114,19 +114,18 @@ fn apply_webview_client_bounds(
         })
         .map_err(|error| format!("failed to access WebView2 during {phase}: {error}"))?;
 
-    webview
-        .set_auto_resize(true)
-        .map_err(|error| format!("failed to enable main webview auto-resize during {phase}: {error}"))
+    webview.set_auto_resize(true).map_err(|error| {
+        format!("failed to enable main webview auto-resize during {phase}: {error}")
+    })
 }
 
 pub fn sync_after_page_load(webview: &tauri::Webview) -> Result<(), String> {
     if webview.label() != MAIN_WINDOW_LABEL {
         return Ok(());
     }
-    let client_size = webview
-        .window()
-        .inner_size()
-        .map_err(|error| format!("failed to read main window client size after page load: {error}"))?;
+    let client_size = webview.window().inner_size().map_err(|error| {
+        format!("failed to read main window client size after page load: {error}")
+    })?;
     apply_webview_client_bounds(webview, client_size, "page load")
 }
 

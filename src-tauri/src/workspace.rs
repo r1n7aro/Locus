@@ -229,11 +229,7 @@ pub fn unity_test_pending_source_snapshot(project_path: &str) -> (u64, Vec<Strin
                 .map(|state| {
                     (
                         state.edit_seq,
-                        state
-                            .paths
-                            .values()
-                            .map(|(path, _)| path.clone())
-                            .collect(),
+                        state.paths.values().map(|(path, _)| path.clone()).collect(),
                     )
                 })
         })
@@ -361,10 +357,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        clear_unity_test_pending_sources_through, generated_workspace_id,
-        load_or_create_workspace, note_unity_test_source_written, read_workspace_config,
-        set_unity_test_tools_enabled, unity_test_pending_source_snapshot,
-        unity_test_sources_pending, unity_test_tools_workspace_status, Workspace, WorkspaceConfig,
+        clear_unity_test_pending_sources_through, generated_workspace_id, load_or_create_workspace,
+        note_unity_test_source_written, read_workspace_config, set_unity_test_tools_enabled,
+        unity_test_pending_source_snapshot, unity_test_sources_pending,
+        unity_test_tools_workspace_status, Workspace, WorkspaceConfig,
     };
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {

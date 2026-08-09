@@ -3879,7 +3879,11 @@ mod tests {
                 },
             );
         }
-        assert_eq!(unapplied_in_project(&project).await, 0, "hot-applied text is settled");
+        assert_eq!(
+            unapplied_in_project(&project).await,
+            0,
+            "hot-applied text is settled"
+        );
 
         // Reverting the DISK to the baseline does not undo the live detour —
         // the Editor still runs v1 — so the file must count as unapplied
@@ -3895,7 +3899,11 @@ mod tests {
         {
             let mut projects = projects().lock().await;
             let state = projects.entry(project_key(&project)).or_default();
-            state.pending.get_mut(&file_key(&file_path)).unwrap().applied_text = None;
+            state
+                .pending
+                .get_mut(&file_key(&file_path))
+                .unwrap()
+                .applied_text = None;
         }
         assert_eq!(
             unapplied_in_project(&project).await,

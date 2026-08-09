@@ -238,7 +238,10 @@ pub(super) fn grep() -> ToolDef {
                             max_line_length,
                             capped: false,
                         };
-                        if searcher.search_path(&*matcher_ref, path, &mut sink).is_err() {
+                        if searcher
+                            .search_path(&*matcher_ref, path, &mut sink)
+                            .is_err()
+                        {
                             return ignore::WalkState::Continue;
                         }
                         if sink.lines.is_empty() {

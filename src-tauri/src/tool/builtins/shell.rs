@@ -798,7 +798,9 @@ mod tests {
     fn decode_console_bytes_keeps_mostly_utf8_streams_lossy() {
         // A UTF-8 stream with one stray invalid byte must not be
         // reinterpreted as ANSI text wholesale.
-        let mut bytes = "long valid utf-8 text with 中文 and more text".as_bytes().to_vec();
+        let mut bytes = "long valid utf-8 text with 中文 and more text"
+            .as_bytes()
+            .to_vec();
         bytes.push(0xFF);
         let decoded = decode_console_bytes(&bytes);
         assert!(decoded.contains("long valid utf-8 text"));

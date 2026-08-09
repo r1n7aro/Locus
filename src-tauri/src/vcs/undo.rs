@@ -882,9 +882,7 @@ impl UndoManager {
                 .iter()
                 .find(|e| !e.consumed && e.assistant_message_id == assistant_message_id)
                 .ok_or_else(|| {
-                    UndoRevertFileError::Other(
-                        "undo entry not found for this message".to_string(),
-                    )
+                    UndoRevertFileError::Other("undo entry not found for this message".to_string())
                 })?;
             if !target.working_dir.is_empty()
                 && normalize_path_key(&target.working_dir) != normalize_path_key(working_dir)
@@ -1686,7 +1684,14 @@ mod tests {
             .expect("checkpoint");
         mutate(repo);
         assert!(manager
-            .after_round(session_id, message_id, Some(message_id), round, false, repo_str)
+            .after_round(
+                session_id,
+                message_id,
+                Some(message_id),
+                round,
+                false,
+                repo_str
+            )
             .await
             .expect("after_round"));
     }
@@ -1865,8 +1870,14 @@ mod tests {
                 .replace("\r\n", "\n"),
             "base\n",
         );
-        assert!(!repo.join("mid.txt").exists(), "intermediate name stays gone");
-        assert!(!repo.join("final.txt").exists(), "final name should be removed");
+        assert!(
+            !repo.join("mid.txt").exists(),
+            "intermediate name stays gone"
+        );
+        assert!(
+            !repo.join("final.txt").exists(),
+            "final name should be removed"
+        );
 
         std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
     }
@@ -1996,7 +2007,13 @@ mod tests {
         .await;
 
         let err = manager
-            .revert_file("s", "missing", &repo_a_str, &changed("M", "tracked.txt"), false)
+            .revert_file(
+                "s",
+                "missing",
+                &repo_a_str,
+                &changed("M", "tracked.txt"),
+                false,
+            )
             .await
             .expect_err("unknown message must fail");
         match err {

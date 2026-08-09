@@ -119,8 +119,7 @@ fn parse_embedded_snapshot() -> Result<ModelCatalog, String> {
     decoder
         .read_to_string(&mut json)
         .map_err(|e| format!("Failed to decompress embedded model catalog: {e}"))?;
-    serde_json::from_str(&json)
-        .map_err(|e| format!("Failed to parse embedded model catalog: {e}"))
+    serde_json::from_str(&json).map_err(|e| format!("Failed to parse embedded model catalog: {e}"))
 }
 
 fn load_cached_catalog() -> Option<ModelCatalog> {
@@ -193,9 +192,18 @@ fn slim_model(id: &str, raw: &Value) -> CatalogModel {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         },
-        reasoning: raw.get("reasoning").and_then(Value::as_bool).unwrap_or(false),
-        tool_call: raw.get("tool_call").and_then(Value::as_bool).unwrap_or(false),
-        attachment: raw.get("attachment").and_then(Value::as_bool).unwrap_or(false),
+        reasoning: raw
+            .get("reasoning")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        tool_call: raw
+            .get("tool_call")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        attachment: raw
+            .get("attachment")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         temperature: raw
             .get("temperature")
             .and_then(Value::as_bool)
@@ -390,7 +398,10 @@ mod tests {
             .get("deepseek")
             .expect("deepseek provider present");
         assert_eq!(deepseek.npm.as_deref(), Some("@ai-sdk/openai-compatible"));
-        assert!(deepseek.api.as_deref().is_some_and(|a| a.contains("deepseek")));
+        assert!(deepseek
+            .api
+            .as_deref()
+            .is_some_and(|a| a.contains("deepseek")));
         let (_, model) = deepseek
             .models
             .iter()

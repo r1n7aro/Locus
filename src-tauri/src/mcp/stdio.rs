@@ -161,7 +161,8 @@ impl StdioMcpClient {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, String> {
-        self.request_cancellable(method, params, timeout, None).await
+        self.request_cancellable(method, params, timeout, None)
+            .await
     }
 
     /// Sends one request; an optional cancel watcher aborts the wait, posts
