@@ -70,6 +70,22 @@ bun tauri dev
 
 This command starts the Vite development server and opens the Tauri desktop app.
 
+### Isolated Test Instance
+
+```powershell
+bun run locus:test:app
+```
+
+This enables WebView2 debugging and Codex MCP, then creates isolated database, configuration, logs, workspace, WebView2 profile, and process-temp directories under the system temp directory. Startup prints `LOCUS_RUNTIME_JSON` so the complete test environment can be located reliably.
+
+Each directory can also be selected explicitly:
+
+```powershell
+bun run locus:test:app -- --workspace F:\TestProject --database-dir F:\LocusTest\database --config-dir F:\LocusTest\config --log-dir F:\LocusTest\logs
+```
+
+The equivalent Tauri entry is `bun tauri dev-mcp --isolated`. Run `bun run locus:test:app -- --help` for all options.
+
 ### Build
 
 ```powershell

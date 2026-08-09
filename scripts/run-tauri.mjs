@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +14,12 @@ const LEGACY_CODEX_MCP_SERVER_NAMES = ["locus-webview2-devtools"];
 const CODEX_CLI_ENV_KEY = "LOCUS_CODEX_CLI";
 const CODEX_NODE_ENV_KEY = "LOCUS_CODEX_NODE";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
+const DEV_ISOLATED_COMMAND = "dev-isolated";
+const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";
+const ISOLATED_DEV_COMMANDS = new Set([
+  DEV_ISOLATED_COMMAND,
+  DEV_WITH_MCP_ISOLATED_COMMAND,
+]);
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const srcTauriDir = path.join(repoRoot, "src-tauri");
@@ -39,8 +46,26 @@ const TAURI_TOP_LEVEL_COMMANDS = new Set([
 ]);
 
 const args = process.argv.slice(2);
-const shouldRunDevWithMcp = args[0] === DEV_WITH_MCP_COMMAND;
-let tauriArgs = shouldRunDevWithMcp ? ["dev", ...args.slice(1)] : args;
+const requestedCommand = args[0] ?? "";
+const supportsIsolatedRuntime = new Set([
+  "dev",
+  DEV_WITH_MCP_COMMAND,
+  DEV_ISOLATED_COMMAND,
+  DEV_WITH_MCP_ISOLATED_COMMAND,
+]).has(requestedCommand);
+const shouldRunDevWithMcp =
+  requestedCommand === DEV_WITH_MCP_COMMAND ||
+  requestedCommand === DEV_WITH_MCP_ISOLATED_COMMAND;
+const isolatedRuntime = supportsIsolatedRuntime
+  ? parseIsolatedRuntimeArgs(args.slice(1), ISOLATED_DEV_COMMANDS.has(requestedCommand))
+  : { enabled: false, paths: {}, remainingArgs: args.slice(1) };
+const isCustomDevCommand =
+  requestedCommand === "dev" ||
+  requestedCommand === DEV_WITH_MCP_COMMAND ||
+  ISOLATED_DEV_COMMANDS.has(requestedCommand);
+let tauriArgs = isCustomDevCommand
+  ? ["dev", ...isolatedRuntime.remainingArgs]
+  : args;
 const env = { ...process.env };
 
 const isHelpOrVersionCommand =
@@ -50,6 +75,116 @@ const isHelpOrVersionCommand =
   tauriArgs.includes("-V");
 const shouldExposeWebView2DebugPort =
   process.platform === "win32" && shouldRunDevWithMcp && !isHelpOrVersionCommand;
+
+if (isolatedRuntime.enabled && isHelpOrVersionCommand) {
+  printIsolatedDevHelp();
+  process.exit(0);
+}
+
+if (isolatedRuntime.enabled) {
+  const manifest = prepareIsolatedRuntime(isolatedRuntime.paths);
+  env.LOCUS_RUNTIME_ROOT = manifest.runtimeRoot;
+  env.LOCUS_RUNTIME_DATA_DIR = manifest.databaseDir;
+  env.LOCUS_RUNTIME_CONFIG_DIR = manifest.configDir;
+  env.LOCUS_RUNTIME_LOG_DIR = manifest.logDir;
+  env.LOCUS_RUNTIME_WORKSPACE_DIR = manifest.workspace;
+  env.WEBVIEW2_USER_DATA_FOLDER = manifest.webviewDataDir;
+  env.TEMP = manifest.systemTempDir;
+  env.TMP = manifest.systemTempDir;
+  console.log(`LOCUS_RUNTIME_JSON ${JSON.stringify(manifest)}`);
+}
+
+function parseIsolatedRuntimeArgs(values, enabledByCommand) {
+  const paths = {};
+  const remainingArgs = [];
+  let enabled = enabledByCommand;
+
+  for (let index = 0; index < values.length; index += 1) {
+    const arg = values[index];
+    if (arg === "--isolated") {
+      enabled = true;
+      continue;
+    }
+
+    const [name, inlineValue = ""] = arg.split(/=(.*)/s, 2);
+    const key = {
+      "--runtime-root": "runtimeRoot",
+      "--database-dir": "databaseDir",
+      "--data-dir": "databaseDir",
+      "--config-dir": "configDir",
+      "--log-dir": "logDir",
+      "--workspace": "workspace",
+      "--webview-data-dir": "webviewDataDir",
+    }[name];
+    if (!key) {
+      remainingArgs.push(arg);
+      continue;
+    }
+
+    enabled = true;
+    const value = inlineValue || values[index + 1];
+    if (!value || (!inlineValue && value.startsWith("--"))) {
+      console.error(`[locus] ${name} requires a directory.`);
+      process.exit(2);
+    }
+    paths[key] = path.resolve(value);
+    if (!inlineValue) index += 1;
+  }
+
+  return { enabled, paths, remainingArgs };
+}
+
+function prepareIsolatedRuntime(requestedPaths) {
+  const runtimeRoot = requestedPaths.runtimeRoot
+    ? path.resolve(requestedPaths.runtimeRoot)
+    : mkdtempSync(path.join(tmpdir(), "locus-app-test-"));
+  const manifest = {
+    runtimeRoot,
+    databaseDir:
+      requestedPaths.databaseDir ?? path.join(runtimeRoot, "database"),
+    databaseFile: "",
+    configDir: requestedPaths.configDir ?? path.join(runtimeRoot, "config"),
+    logDir: requestedPaths.logDir ?? path.join(runtimeRoot, "logs"),
+    logFile: "",
+    workspace: requestedPaths.workspace ?? path.join(runtimeRoot, "workspace"),
+    webviewDataDir:
+      requestedPaths.webviewDataDir ?? path.join(runtimeRoot, "webview"),
+    systemTempDir: path.join(runtimeRoot, "system-temp"),
+  };
+  manifest.databaseFile = path.join(manifest.databaseDir, "locus.db");
+  manifest.logFile = path.join(manifest.logDir, "locus.log");
+
+  for (const directory of [
+    manifest.runtimeRoot,
+    manifest.databaseDir,
+    manifest.configDir,
+    manifest.logDir,
+    manifest.workspace,
+    manifest.webviewDataDir,
+    manifest.systemTempDir,
+  ]) {
+    mkdirSync(directory, { recursive: true });
+  }
+  return manifest;
+}
+
+function printIsolatedDevHelp() {
+  console.log(`Usage:
+  bun tauri dev-mcp --isolated [options]
+  bun tauri dev-mcp-isolated [options]
+  bun run locus:test:app -- [options]
+
+Options:
+  --runtime-root <dir>       Root used for every unspecified isolated directory
+  --database-dir <dir>      Directory containing locus.db (alias: --data-dir)
+  --config-dir <dir>        Persistent application configuration directory
+  --log-dir <dir>           Directory containing locus.log
+  --workspace <dir>         Initial Locus workspace; created when missing
+  --webview-data-dir <dir>  Isolated WebView2 profile and local storage
+
+When no directory is supplied, Locus creates a complete environment under
+the system temporary directory and prints it as LOCUS_RUNTIME_JSON.`);
+}
 
 function hasConfigArg(currentArgs) {
   for (let index = 0; index < currentArgs.length; index += 1) {

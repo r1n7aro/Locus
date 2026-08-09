@@ -8,6 +8,7 @@ use crate::error::AppError;
 const STORAGE_OVERRIDE_FILE: &str = "storage_dir_override.json";
 const STORAGE_MIGRATION_PLAN_FILE: &str = "storage_dir_migration.json";
 const STORAGE_LAST_DEFAULT_FILE: &str = "storage_last_default.json";
+pub(crate) const RUNTIME_STORAGE_DIR_ENV: &str = "LOCUS_RUNTIME_DATA_DIR";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,24 @@ fn ensure_storage_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(path)
         .map_err(|e| format!("Failed to create {} '{}': {}", label, path.display(), e))?;
     Ok(dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+pub(crate) fn runtime_storage_dir_from_env() -> Result<Option<PathBuf>, String> {
+    let Some(raw) = std::env::var_os(RUNTIME_STORAGE_DIR_ENV) else {
+        return Ok(None);
+    };
+    let trimmed = raw.to_string_lossy().trim().to_string();
+    if trimmed.is_empty() {
+        return Err(format!("{RUNTIME_STORAGE_DIR_ENV} cannot be empty"));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{RUNTIME_STORAGE_DIR_ENV} must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    ensure_storage_dir(&path, "runtime storage dir").map(Some)
 }
 
 fn legacy_app_storage_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -503,6 +522,9 @@ fn build_temp_info(app_handle: &AppHandle) -> Result<AppTempInfo, String> {
 }
 
 pub(crate) fn resolve_runtime_storage_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(runtime) = runtime_storage_dir_from_env()? {
+        return Ok(runtime);
+    }
     let default = default_app_storage_dir(app_handle)?;
     if let Some(custom) = read_storage_override()? {
         return Ok(custom);
@@ -511,6 +533,9 @@ pub(crate) fn resolve_runtime_storage_dir(app_handle: &AppHandle) -> Result<Path
 }
 
 pub(crate) fn prepare_runtime_storage_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(runtime) = runtime_storage_dir_from_env()? {
+        return Ok(runtime);
+    }
     let default = default_app_storage_dir(app_handle)?;
     if let Some(plan) = read_migration_plan()? {
         let source = PathBuf::from(plan.source_path.trim());

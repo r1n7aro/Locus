@@ -36,6 +36,7 @@
     "view-runtime:export": "bun run scripts/export-view-runtime-sources.mjs",
     "preview": "vite preview",
     "tauri": "bun run scripts/run-tauri.mjs",
+    "locus:test:app": "bun run tauri dev-mcp-isolated",
     "locus:test:unity": "bun run scripts/locus-unity-test.mjs",
     "locus:test:unity:matrix": "bun run scripts/locus-unity-test-matrix.mjs --prepare-native --install-plugin",
     "locus:test:unity:matrix:smoke": "bun run scripts/locus-unity-test-matrix.mjs --prepare-native --install-plugin --suite connect,native-bridge,state-probe --connect-timeout-ms 60000 --timeout-ms 300000 --poll-ms 500 --no-progress-timeout-ms 60000",

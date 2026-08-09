@@ -196,8 +196,16 @@ impl FileLogSink {
     }
 
     /// Default location: `%APPDATA%/locus/logs/locus.log` (persistent config dir).
+    /// Isolated runtimes can select an explicit log directory or inherit the
+    /// runtime database directory.
     pub fn init_default() -> Result<Arc<Self>, String> {
-        let dir = crate::commands::persistent_config_dir()?.join("logs");
+        let dir = match crate::runtime_paths::runtime_log_dir_from_env()? {
+            Some(log_dir) => log_dir,
+            None => match crate::commands::runtime_storage_dir_from_env()? {
+                Some(data_dir) => data_dir.join("logs"),
+                None => crate::commands::persistent_config_dir()?.join("logs"),
+            },
+        };
         Self::init(&dir)
     }
 
