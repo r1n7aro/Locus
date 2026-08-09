@@ -5,15 +5,21 @@ use crate::commands::CodexTransportMode;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
 use futures::{SinkExt, StreamExt};
 use http::Uri;
-use hyper_util::client::legacy::connect::proxy::{SocksV4, SocksV5, Tunnel};
+use hyper_util::client::legacy::connect::proxy::SocksV4;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::proxy::matcher::Intercept;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use tokio_tungstenite::client_async;
+use tokio_tungstenite::proxy::connect_via_proxy;
+use tokio_tungstenite::tungstenite::proxy::{
+    ProxyAuth as TungsteniteProxyAuth, ProxyConfig as TungsteniteProxyConfig,
+    ProxyScheme as TungsteniteProxyScheme,
+};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tower_service::Service;
@@ -25,9 +31,14 @@ const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=20
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
+const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
+    "Previous response was not found. Retrying the full request.";
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
 const MAX_SAFE_STREAM_RECOVERY_RETRIES: u32 = 2;
 const SAFE_STREAM_RECOVERY_DELAY_MS: u64 = 1200;
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 trait CodexAsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
@@ -35,6 +46,108 @@ impl<T> CodexAsyncIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite
 
 type BoxedCodexIo = Box<dyn CodexAsyncIo>;
 type CodexWebSocket = tokio_tungstenite::WebSocketStream<BoxedCodexIo>;
+
+struct CodexWebsocketStream {
+    tx_command: mpsc::Sender<CodexWebsocketCommand>,
+    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
+    pump_task: tokio::task::JoinHandle<()>,
+}
+
+enum CodexWebsocketCommand {
+    Send {
+        message: Message,
+        tx_result: oneshot::Sender<Result<(), WsError>>,
+    },
+}
+
+impl CodexWebsocketStream {
+    fn new(inner: CodexWebSocket) -> Self {
+        let (tx_command, mut rx_command) = mpsc::channel::<CodexWebsocketCommand>(32);
+        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+
+        let pump_task = tokio::spawn(async move {
+            let mut inner = inner;
+            loop {
+                tokio::select! {
+                    command = rx_command.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        match command {
+                            CodexWebsocketCommand::Send { message, tx_result } => {
+                                let result = inner.send(message).await;
+                                let should_break = result.is_err();
+                                let _ = tx_result.send(result);
+                                if should_break {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    message = inner.next() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        match message {
+                            Ok(Message::Ping(payload)) => {
+                                if let Err(error) = inner.send(Message::Pong(payload)).await {
+                                    let _ = tx_message.send(Err(error));
+                                    break;
+                                }
+                            }
+                            Ok(Message::Pong(_)) => {}
+                            Ok(message @ (Message::Text(_)
+                            | Message::Binary(_)
+                            | Message::Close(_)
+                            | Message::Frame(_))) => {
+                                let is_close = matches!(message, Message::Close(_));
+                                if tx_message.send(Ok(message)).is_err() {
+                                    break;
+                                }
+                                if is_close {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx_message.send(Err(error));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            tx_command,
+            rx_message,
+            pump_task,
+        }
+    }
+
+    async fn send(&self, message: Message) -> Result<(), WsError> {
+        let (tx_result, rx_result) = oneshot::channel();
+        if self
+            .tx_command
+            .send(CodexWebsocketCommand::Send { message, tx_result })
+            .await
+            .is_err()
+        {
+            return Err(WsError::ConnectionClosed);
+        }
+        rx_result.await.unwrap_or(Err(WsError::ConnectionClosed))
+    }
+
+    async fn next(&mut self) -> Option<Result<Message, WsError>> {
+        self.rx_message.recv().await
+    }
+}
+
+impl Drop for CodexWebsocketStream {
+    fn drop(&mut self) {
+        self.pump_task.abort();
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct TurnState {
@@ -104,7 +217,7 @@ struct LastWebsocketResponse {
 
 #[derive(Default)]
 struct CachedWebsocketSession {
-    connection: Option<CodexWebSocket>,
+    connection: Option<CodexWebsocketStream>,
     last_response: Option<LastWebsocketResponse>,
     disable_websockets: bool,
     connection_key: Option<String>,
@@ -961,7 +1074,7 @@ async fn take_cached_websocket_session_state(
     connection_key: &str,
 ) -> (
     SharedCachedWebsocketSession,
-    Option<CodexWebSocket>,
+    Option<CodexWebsocketStream>,
     Option<LastWebsocketResponse>,
     bool,
 ) {
@@ -989,7 +1102,7 @@ async fn take_cached_websocket_session_state(
 async fn store_cached_websocket_session_state(
     shared: &SharedCachedWebsocketSession,
     connection_key: &str,
-    socket: CodexWebSocket,
+    socket: CodexWebsocketStream,
     last_response: LastWebsocketResponse,
 ) {
     let mut state = shared.lock().await;
@@ -1009,6 +1122,40 @@ async fn clear_cached_websocket_session_state(
     state.last_response = None;
     state.disable_websockets = disable_websockets;
     state.connection_key = Some(connection_key.to_string());
+}
+
+async fn cached_websocket_http_fallback_enabled(
+    session_id: Option<&str>,
+    base_url: Option<&str>,
+    account_id: Option<&str>,
+) -> bool {
+    let Some(session_id) = session_id else {
+        return false;
+    };
+    let Some(shared) = existing_cached_websocket_session(session_id) else {
+        return false;
+    };
+    let connection_key = websocket_connection_key(base_url, account_id);
+    let state = shared.lock().await;
+    state.connection_key.as_deref() == Some(connection_key.as_str()) && state.disable_websockets
+}
+
+async fn enable_cached_websocket_http_fallback(
+    session_id: Option<&str>,
+    base_url: Option<&str>,
+    account_id: Option<&str>,
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let connection_key = websocket_connection_key(base_url, account_id);
+    let shared = cached_websocket_session(session_id);
+    clear_cached_websocket_session_state(
+        &shared,
+        &connection_key,
+        /*disable_websockets*/ true,
+    )
+    .await;
 }
 
 fn websocket_proxy_match_uri(uri: &Uri) -> Result<Uri, String> {
@@ -1133,55 +1280,23 @@ async fn connect_tcp_stream(uri: &Uri) -> Result<tokio::net::TcpStream, String> 
     Ok(connection.into_inner())
 }
 
-async fn establish_http_connect_tunnel<S>(
-    mut stream: S,
-    host: &str,
-    port: u16,
-    proxy_auth: Option<&http::HeaderValue>,
-) -> Result<S, String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut request = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
-    if let Some(auth) = proxy_auth {
-        request.push_str("Proxy-Authorization: ");
-        request.push_str(auth.to_str().unwrap_or_default());
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-
-    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to send proxy CONNECT request: {}", e))?;
-
-    let mut response = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
-        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut chunk)
-            .await
-            .map_err(|e| format!("Failed to read proxy CONNECT response: {}", e))?;
-        if n == 0 {
-            return Err("Proxy CONNECT response ended unexpectedly".to_string());
-        }
-        response.extend_from_slice(&chunk[..n]);
-        if response.len() > 8192 {
-            return Err("Proxy CONNECT response headers exceeded 8 KiB".to_string());
-        }
-    }
-
-    if response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200") {
-        return Ok(stream);
-    }
-    if response.starts_with(b"HTTP/1.1 407") || response.starts_with(b"HTTP/1.0 407") {
-        return Err("Proxy requires authentication for websocket CONNECT".to_string());
-    }
-
-    let status_line = response
-        .split(|byte| *byte == b'\n')
-        .next()
-        .map(|line| String::from_utf8_lossy(line).trim().to_string())
-        .unwrap_or_else(|| "unknown proxy response".to_string());
-    Err(format!("Proxy CONNECT failed: {}", status_line))
+fn tungstenite_proxy_config(
+    proxy: &Intercept,
+    scheme: TungsteniteProxyScheme,
+) -> Result<TungsteniteProxyConfig, String> {
+    let (host, port) = uri_host_port(proxy.uri())?;
+    let auth = proxy
+        .raw_auth()
+        .map(|(username, password)| TungsteniteProxyAuth {
+            username: username.to_string(),
+            password: password.to_string(),
+        });
+    Ok(TungsteniteProxyConfig {
+        scheme,
+        host,
+        port,
+        auth,
+    })
 }
 
 async fn connect_via_http_proxy(
@@ -1194,15 +1309,13 @@ async fn connect_via_http_proxy(
         proxy_display_uri(&proxy_uri)
     );
 
-    let mut tunnel = Tunnel::new(proxy_uri, build_tcp_connector());
-    if let Some(auth) = proxy.basic_auth().cloned() {
-        tunnel = tunnel.with_auth(auth);
-    }
-    let connection = tunnel
-        .call(target_uri.clone())
+    let (target_host, target_port) = uri_host_port(target_uri)?;
+    let proxy_config = tungstenite_proxy_config(proxy, TungsteniteProxyScheme::Http)?;
+    let tcp = connect_tcp_stream(&proxy_uri).await?;
+    let tunneled = connect_via_proxy(tcp, &proxy_config, &target_host, target_port)
         .await
         .map_err(|e| format!("Failed to establish HTTP proxy tunnel: {}", e))?;
-    Ok(Box::new(connection.into_inner()))
+    Ok(Box::new(tunneled))
 }
 
 async fn connect_via_https_proxy(
@@ -1217,15 +1330,16 @@ async fn connect_via_https_proxy(
 
     let (proxy_host, _) = uri_host_port(&proxy_uri)?;
     let (target_host, target_port) = uri_host_port(target_uri)?;
+    let proxy_config = tungstenite_proxy_config(proxy, TungsteniteProxyScheme::Http)?;
 
     let tcp = connect_tcp_stream(&proxy_uri).await?;
     let proxy_tls = tls_connector()?
         .connect(&proxy_host, tcp)
         .await
         .map_err(|e| format!("Failed to establish TLS to HTTPS proxy: {}", e))?;
-    let tunneled =
-        establish_http_connect_tunnel(proxy_tls, &target_host, target_port, proxy.basic_auth())
-            .await?;
+    let tunneled = connect_via_proxy(proxy_tls, &proxy_config, &target_host, target_port)
+        .await
+        .map_err(|e| format!("Failed to establish HTTPS proxy tunnel: {}", e))?;
 
     Ok(Box::new(tunneled))
 }
@@ -1261,18 +1375,17 @@ async fn connect_via_socks5_proxy(
         proxy_display_uri(&proxy_uri)
     );
 
-    let mut socks = SocksV5::new(proxy_uri, build_tcp_connector());
-    if proxy.uri().scheme_str() == Some("socks5") {
-        socks = socks.local_dns(true);
-    }
-    if let Some((user, pass)) = proxy.raw_auth() {
-        socks = socks.with_auth(user.to_string(), pass.to_string());
-    }
-    let connection = socks
-        .call(target_uri.clone())
+    let scheme = match proxy.uri().scheme_str() {
+        Some("socks5h") => TungsteniteProxyScheme::Socks5h,
+        _ => TungsteniteProxyScheme::Socks5,
+    };
+    let (target_host, target_port) = uri_host_port(target_uri)?;
+    let proxy_config = tungstenite_proxy_config(proxy, scheme)?;
+    let tcp = connect_tcp_stream(&proxy_uri).await?;
+    let tunneled = connect_via_proxy(tcp, &proxy_config, &target_host, target_port)
         .await
         .map_err(|e| format!("Failed to establish SOCKS5 proxy tunnel: {}", e))?;
-    Ok(Box::new(connection.into_inner()))
+    Ok(Box::new(tunneled))
 }
 
 async fn connect_websocket_transport(request: &http::Request<()>) -> Result<BoxedCodexIo, String> {
@@ -1325,7 +1438,7 @@ enum WebsocketConnectOutcome<S> {
 async fn connect_codex_websocket(
     request: http::Request<()>,
     turn_state: &mut TurnState,
-) -> Result<WebsocketConnectOutcome<CodexWebSocket>, String> {
+) -> Result<WebsocketConnectOutcome<CodexWebsocketStream>, String> {
     let connect = async move {
         let transport = connect_websocket_transport(&request)
             .await
@@ -1336,7 +1449,7 @@ async fn connect_codex_websocket(
         client_async(request, transport).await
     };
 
-    match tokio::time::timeout(Duration::from_secs(30), connect).await {
+    match tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect).await {
         Ok(Ok((socket, response))) => {
             turn_state.store_header(
                 response
@@ -1354,7 +1467,9 @@ async fn connect_codex_websocket(
                 ));
             }
 
-            Ok(WebsocketConnectOutcome::Connected(socket))
+            Ok(WebsocketConnectOutcome::Connected(
+                CodexWebsocketStream::new(socket),
+            ))
         }
         Ok(Err(WsError::Http(response)))
             if response.status() == http::StatusCode::UPGRADE_REQUIRED =>
@@ -1383,6 +1498,9 @@ fn websocket_event_error_message(payload: &str) -> Option<String> {
         });
     if code == Some(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) {
         return Some(WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE.to_string());
+    }
+    if code == Some(PREVIOUS_RESPONSE_NOT_FOUND_CODE) {
+        return Some(PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE.to_string());
     }
 
     let status = event.get("status").and_then(|value| value.as_u64());
@@ -2082,7 +2200,18 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
         return true;
     }
 
-    if lower.contains("previous response with id") && lower.contains("not found") {
+    if lower.contains("previous response was not found")
+        || (lower.contains("previous response with id") && lower.contains("not found"))
+    {
+        return true;
+    }
+
+    if lower.contains("codex websocket connect failed")
+        || lower.contains("codex websocket connect timed out")
+        || lower.contains("failed to send websocket request")
+        || lower.starts_with("websocket read error:")
+        || lower == "websocket read timed out"
+    {
         return true;
     }
 
@@ -2105,6 +2234,30 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
         && (lower.contains("stream ended without response.completed")
             || lower.contains("stream ended before the response finalized")
             || lower.contains("response completed with"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafeStreamRecoveryAction {
+    Retry,
+    FallbackToHttp,
+    Fail,
+}
+
+fn safe_stream_recovery_action(
+    transport: CodexTransportMode,
+    retries: u32,
+    error: &str,
+) -> SafeStreamRecoveryAction {
+    if !should_retry_safe_codex_error(error) {
+        return SafeStreamRecoveryAction::Fail;
+    }
+    if retries < MAX_SAFE_STREAM_RECOVERY_RETRIES {
+        return SafeStreamRecoveryAction::Retry;
+    }
+    if transport == CodexTransportMode::Websocket {
+        return SafeStreamRecoveryAction::FallbackToHttp;
+    }
+    SafeStreamRecoveryAction::Fail
 }
 
 enum CodexWebsocketAttempt {
@@ -2185,13 +2338,23 @@ where
     G: Fn(String) + Send + Sync + 'static,
     H: Fn(String, String) + Send + Sync,
 {
-    let mut last_error = String::new();
+    let transport_session_id = options
+        .use_session_continuation
+        .then_some(session_id)
+        .flatten();
+    let mut active_transport = transport;
+    if active_transport == CodexTransportMode::Websocket
+        && cached_websocket_http_fallback_enabled(transport_session_id, base_url, account_id).await
+    {
+        active_transport = CodexTransportMode::Http;
+    }
+    let mut retries = 0u32;
 
-    for attempt in 0..=MAX_SAFE_STREAM_RECOVERY_RETRIES {
+    loop {
         match stream_chat_once(
             access_token,
             account_id,
-            transport,
+            active_transport,
             base_url,
             model,
             system_prompt,
@@ -2212,27 +2375,51 @@ where
         {
             Ok(resp) => return Ok(resp),
             Err(err) => {
-                last_error = err;
-                if should_retry_safe_codex_error(&last_error)
-                    && attempt < MAX_SAFE_STREAM_RECOVERY_RETRIES
+                if active_transport == CodexTransportMode::Websocket
+                    && cached_websocket_http_fallback_enabled(
+                        transport_session_id,
+                        base_url,
+                        account_id,
+                    )
+                    .await
                 {
-                    let delay = SAFE_STREAM_RECOVERY_DELAY_MS * (attempt as u64 + 1);
-                    eprintln!(
-                        "[OpenAI Codex] retrying safe stream interruption (attempt {}/{}, retrying in {}ms): {}",
-                        attempt + 1,
-                        MAX_SAFE_STREAM_RECOVERY_RETRIES + 1,
-                        delay,
-                        last_error
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    active_transport = CodexTransportMode::Http;
+                    retries = 0;
                     continue;
                 }
-                return Err(last_error);
+
+                match safe_stream_recovery_action(active_transport, retries, &err) {
+                    SafeStreamRecoveryAction::Retry => {
+                        retries += 1;
+                        let delay = SAFE_STREAM_RECOVERY_DELAY_MS * retries as u64;
+                        eprintln!(
+                            "[OpenAI Codex] retrying safe stream interruption ({}/{}, retrying in {}ms): {}",
+                            retries,
+                            MAX_SAFE_STREAM_RECOVERY_RETRIES,
+                            delay,
+                            err
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    SafeStreamRecoveryAction::FallbackToHttp => {
+                        enable_cached_websocket_http_fallback(
+                            transport_session_id,
+                            base_url,
+                            account_id,
+                        )
+                        .await;
+                        eprintln!(
+                            "[OpenAI Codex] websocket recovery exhausted; falling back to HTTPS for this session: {}",
+                            err
+                        );
+                        active_transport = CodexTransportMode::Http;
+                        retries = 0;
+                    }
+                    SafeStreamRecoveryAction::Fail => return Err(err),
+                }
             }
         }
     }
-
-    Err(last_error)
 }
 
 async fn stream_chat_once<F, G, H>(
@@ -2846,7 +3033,8 @@ where
     const MAX_WEBSOCKET_ERRORS: u32 = 3;
 
     loop {
-        let message = match tokio::time::timeout(Duration::from_secs(90), socket.next()).await {
+        let message = match tokio::time::timeout(WEBSOCKET_STREAM_IDLE_TIMEOUT, socket.next()).await
+        {
             Ok(Some(Ok(message))) => {
                 consecutive_errors = 0;
                 message
@@ -3124,20 +3312,30 @@ mod tests {
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
         build_request_body, build_request_body_with_tool_search, build_websocket_transport_request,
-        codex_websocket_url, collect_complete_tool_calls, drain_sse_buffer,
-        establish_http_connect_tunnel, extract_compaction_encrypted_content,
-        process_sse_event_block, request_without_input, uri_host_port,
-        websocket_event_error_message, websocket_proxy_match_uri, CodexStreamOptions,
-        CodexStreamState, LastWebsocketResponse, PartialToolCall, CODEX_ORIGINATOR_HEADER_VALUE,
-        RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE, TOOL_SEARCH_HISTORY_TOOL_NAME,
-        X_CODEX_TURN_STATE_HEADER,
+        cached_websocket_http_fallback_enabled, codex_websocket_url, collect_complete_tool_calls,
+        drain_sse_buffer, enable_cached_websocket_http_fallback,
+        extract_compaction_encrypted_content, process_sse_event_block, request_without_input,
+        safe_stream_recovery_action, uri_host_port, websocket_event_error_message,
+        websocket_proxy_match_uri, BoxedCodexIo, CodexStreamOptions, CodexStreamState,
+        CodexWebsocketStream, LastWebsocketResponse, PartialToolCall, SafeStreamRecoveryAction,
+        CODEX_ORIGINATOR_HEADER_VALUE, MAX_SAFE_STREAM_RECOVERY_RETRIES,
+        PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
+        TOOL_SEARCH_HISTORY_TOOL_NAME, X_CODEX_TURN_STATE_HEADER,
     };
+    use crate::commands::CodexTransportMode;
     use crate::llm::CODEX_CLIENT_VERSION;
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
     };
+    use futures::{SinkExt, StreamExt};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use tokio_tungstenite::proxy::connect_via_proxy;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::proxy::{
+        ProxyConfig as TungsteniteProxyConfig, ProxyScheme as TungsteniteProxyScheme,
+    };
+    use tokio_tungstenite::tungstenite::Message;
 
     fn ignore_text(_: String) {}
     fn ignore_thinking(_: String) {}
@@ -4301,6 +4499,118 @@ mod tests {
     }
 
     #[test]
+    fn websocket_event_error_message_recovers_missing_previous_response() {
+        let message = websocket_event_error_message(
+            r#"{"type":"error","status":400,"error":{"code":"previous_response_not_found","message":"Previous response with id 'resp_old' not found."}}"#,
+        );
+
+        assert_eq!(
+            message.as_deref(),
+            Some(PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn websocket_recovery_falls_back_only_after_safe_retries() {
+        let keepalive_timeout = concat!(
+            "WebSocket closed by server: keepalive ping timeout. ",
+            "OpenAI Codex websocket ended before the response finalized ",
+            "(text_len=0, complete_tool_calls=0, incomplete_tool_calls=0)."
+        );
+
+        assert_eq!(
+            safe_stream_recovery_action(CodexTransportMode::Websocket, 0, keepalive_timeout),
+            SafeStreamRecoveryAction::Retry
+        );
+        assert_eq!(
+            safe_stream_recovery_action(
+                CodexTransportMode::Websocket,
+                MAX_SAFE_STREAM_RECOVERY_RETRIES,
+                keepalive_timeout,
+            ),
+            SafeStreamRecoveryAction::FallbackToHttp
+        );
+        assert_eq!(
+            safe_stream_recovery_action(
+                CodexTransportMode::Http,
+                MAX_SAFE_STREAM_RECOVERY_RETRIES,
+                keepalive_timeout,
+            ),
+            SafeStreamRecoveryAction::Fail
+        );
+
+        let partial_response = concat!(
+            "WebSocket closed by server. OpenAI Codex websocket ended before the response ",
+            "finalized (text_len=3, complete_tool_calls=0, incomplete_tool_calls=1)."
+        );
+        assert_eq!(
+            safe_stream_recovery_action(
+                CodexTransportMode::Websocket,
+                MAX_SAFE_STREAM_RECOVERY_RETRIES,
+                partial_response,
+            ),
+            SafeStreamRecoveryAction::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_pump_answers_ping_while_connection_is_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket test server");
+        let address = listener.local_addr().expect("websocket server address");
+        let expected_payload = vec![1, 2, 3, 4];
+        let server_payload = expected_payload.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept websocket client");
+            let mut socket = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("accept websocket handshake");
+            socket
+                .send(Message::Ping(server_payload.clone().into()))
+                .await
+                .expect("send server ping");
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for pong")
+                .expect("websocket closed before pong")
+                .expect("failed reading pong");
+            assert_eq!(reply, Message::Pong(server_payload.into()));
+        });
+
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect websocket test client");
+        let request = format!("ws://{address}/responses")
+            .into_client_request()
+            .expect("build websocket test request");
+        let transport: BoxedCodexIo = Box::new(tcp);
+        let (socket, _) = tokio_tungstenite::client_async(request, transport)
+            .await
+            .expect("connect websocket test client");
+        let _idle_stream = CodexWebsocketStream::new(socket);
+
+        server.await.expect("websocket test server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_http_fallback_is_sticky_for_session() {
+        let session_id = format!("fallback-test-{}", uuid::Uuid::new_v4());
+        enable_cached_websocket_http_fallback(Some(&session_id), None, Some("account-1")).await;
+
+        assert!(
+            cached_websocket_http_fallback_enabled(Some(&session_id), None, Some("account-1"))
+                .await
+        );
+        assert!(
+            !cached_websocket_http_fallback_enabled(Some(&session_id), None, Some("account-2"))
+                .await
+        );
+
+        super::invalidate_cached_session(&session_id);
+    }
+
+    #[test]
     fn history_transport_request_uses_previous_response_id_when_request_signature_matches() {
         let body = serde_json::json!({
             "model": "gpt-5.4",
@@ -4617,8 +4927,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn establish_http_connect_tunnel_accepts_success_response() {
+    async fn native_proxy_connector_accepts_success_response() {
         let (client, mut server) = tokio::io::duplex(512);
+        let proxy = TungsteniteProxyConfig {
+            scheme: TungsteniteProxyScheme::Http,
+            host: "127.0.0.1".to_string(),
+            port: 7897,
+            auth: None,
+        };
 
         let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 256];
@@ -4632,9 +4948,9 @@ mod tests {
                 .expect("write connect response");
         });
 
-        establish_http_connect_tunnel(client, "api.openai.com", 443, None)
+        connect_via_proxy(client, &proxy, "api.openai.com", 443)
             .await
-            .expect("connect tunnel should succeed");
+            .expect("native proxy connector should succeed");
 
         server_task.await.expect("server task");
     }
