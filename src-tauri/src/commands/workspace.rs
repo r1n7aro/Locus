@@ -24,6 +24,9 @@ const ENDPOINT_TEST_HTML_RESPONSE_CODE: &str = "endpoint_test.html_response";
 /// under the app-data tree while staying outside Tauri's bundle-specific
 /// `app_data_dir` that may be cleared during reinstall.
 pub(crate) fn persistent_config_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = crate::runtime_paths::runtime_config_dir_from_env()? {
+        return Ok(dir);
+    }
     let config_dir =
         dirs::config_dir().ok_or_else(|| "Failed to get config directory".to_string())?;
     let dir = config_dir.join("locus");
@@ -1757,6 +1760,24 @@ pub async fn set_debug_mode(
 }
 
 #[tauri::command]
+pub async fn get_tool_failure_log_enabled(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.tool_failure_log_enabled())
+}
+
+#[tauri::command]
+pub async fn set_tool_failure_log_enabled(
+    value: bool,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<(), AppError> {
+    config
+        .set_tool_failure_log_enabled(value)
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_llm_retry_max_attempts(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<u32, AppError> {
@@ -1784,7 +1805,7 @@ pub async fn get_subagent_max_depth(
     Ok(config.subagent_max_depth())
 }
 
-/// Persist the `task` subagent nesting-depth cap (clamped to 1..=8; 1 means
+/// Persist the `subagent` nesting-depth cap (clamped to 1..=8; 1 means
 /// subagents cannot spawn further subagents).
 #[tauri::command]
 pub async fn set_subagent_max_depth(
@@ -1804,7 +1825,7 @@ pub async fn get_subagent_max_concurrent(
     Ok(config.subagent_max_concurrent())
 }
 
-/// Persist the concurrent `task` subagent cap per top-level agent tree
+/// Persist the concurrent `subagent` cap per top-level agent tree
 /// (clamped to 1..=16).
 #[tauri::command]
 pub async fn set_subagent_max_concurrent(
@@ -1915,13 +1936,19 @@ pub async fn save_tool_permissions(
     perms: State<'_, crate::ToolPermissions>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let normalized: std::collections::HashMap<String, String> = value
+    let mut normalized: std::collections::HashMap<String, String> = value
         .into_iter()
         .map(|(k, v)| {
             let mode = normalize_tool_permission_mode_request(Some(v.as_str()), None).to_string();
             (k, mode)
         })
         .collect();
+    if !normalized.contains_key("subagent") {
+        if let Some(mode) = normalized.get("task").cloned() {
+            normalized.insert("subagent".to_string(), mode);
+        }
+    }
+    normalized.remove("task");
     *perms.0.write().await = normalized.clone();
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get data dir: {}", e))?;

@@ -17,7 +17,7 @@ The Agent reads and modifies your project through tool calls. Settings > Tool Pe
 ## How the layers stack
 
 - **Global mode**: `Auto` lets every tool call through; the rules below only apply in `Ask` mode.
-- **Per-tool permissions**: in `Ask` mode, each tool can be set to `Auto` or `Ask` individually. Without an override, defaults apply: read-type tools (`read`, `grep`, searches and queries) run automatically, while modifying and executing tools (`write`, `edit`, `bash`, `web_fetch`, `unity_execute`, `unity_run_states`, `task`) require confirmation.
+- **Per-tool permissions**: in `Ask` mode, each tool can be set to `Auto` or `Ask` individually. Without an override, defaults apply: read-type tools (`read`, `grep`, searches and queries) run automatically, while modifying and executing tools (`write`, `edit`, `bash`, `web_fetch`, `unity_execute`, `unity_run_states`, `subagent`) require confirmation.
 - **Behavior approvals**: extra gates that work independently of the global mode, described below.
 
 ## Approval cards

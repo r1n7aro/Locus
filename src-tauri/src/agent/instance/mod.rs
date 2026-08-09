@@ -240,20 +240,20 @@ pub struct AgentInstance {
     raw_store: RawContextStore,
     workspace_id: Option<String>,
     parent_tool_call: Option<ParentToolCall>,
-    /// Nesting depth in the `task` subagent tree: 0 for a top-level agent,
+    /// Nesting depth in the `subagent` tree: 0 for a top-level agent,
     /// parent depth + 1 for each spawned subagent. Checked against the
-    /// configured `subagent_max_depth` before a `task` call may spawn.
+    /// configured `subagent_max_depth` before a `subagent` call may spawn.
     subagent_depth: u32,
-    /// Live count of `task` subagents running anywhere in this agent tree.
+    /// Live count of subagents running anywhere in this agent tree.
     /// The top-level instance creates the counter and every descendant shares
     /// it, so the configured concurrency cap applies tree-wide.
     subagent_active: Arc<AtomicU32>,
     /// True when this instance was spawned at the configured maximum subagent
-    /// nesting depth: `task` is removed from its tool surface entirely
+    /// nesting depth: `subagent` is removed from its tool surface entirely
     /// (request tool list, lazy manifest, tool_load/tool_call) instead of
-    /// erroring only at call time. Spawn-time snapshot; `execute_task` keeps
+    /// erroring only at call time. Spawn-time snapshot; `execute_subagent` keeps
     /// the live-config depth check as backstop.
-    task_tool_suppressed: bool,
+    subagent_tool_suppressed: bool,
     effort: Option<String>,
     codex_fast_mode: bool,
     async_tasks_enabled: bool,
@@ -266,6 +266,10 @@ pub struct AgentInstance {
     tool_runtime_state: Arc<ToolRuntimeState>,
     loaded_tool_names: Mutex<HashSet<String>>,
     document_skill_tool_names: Mutex<HashSet<String>>,
+    /// Skill package runtimes activated by explicit Skill selection or by
+    /// reading a package document. Revalidated before every unity_execute so
+    /// Unity domain reloads transparently restore their assemblies.
+    active_skill_package_ids: Mutex<HashSet<String>>,
     /// Lazy-tool renderer resolved at run start (config mode × backend ×
     /// model). Cached so deep call paths without an `AppHandle` (system
     /// prompt assembly, tool handlers) can branch on it; `ToolLoadFallback`
@@ -437,7 +441,7 @@ struct ParentToolCall {
 }
 
 /// RAII slot in the tree-wide subagent concurrency budget: acquired before a
-/// `task` subagent starts and released on drop, so cancel and error unwinds
+/// `subagent` call starts and released on drop, so cancel and error unwinds
 /// cannot leak a slot.
 struct SubagentSlotGuard {
     counter: Arc<AtomicU32>,
@@ -445,7 +449,7 @@ struct SubagentSlotGuard {
 
 impl SubagentSlotGuard {
     /// Atomically claims a slot unless `limit` subagents are already running.
-    /// Compare-exchange (not fetch_add) so concurrent `task` calls racing for
+    /// Compare-exchange (not fetch_add) so concurrent `subagent` calls racing for
     /// the last slot cannot overshoot the limit.
     fn try_acquire(counter: &Arc<AtomicU32>, limit: u32) -> Option<Self> {
         let mut current = counter.load(Ordering::Relaxed);
@@ -3081,7 +3085,7 @@ fn injected_item_prompt_sort_key(env_template: &str, item_id: &str) -> (u8, usiz
     }
 }
 
-struct SubagentTaskResult {
+struct SubagentRunResult {
     output: String,
     tool_calls: Vec<ToolCallInfo>,
     is_error: bool,
@@ -3516,7 +3520,7 @@ impl AgentInstance {
             parent_tool_call: None,
             subagent_depth: 0,
             subagent_active: Arc::new(AtomicU32::new(0)),
-            task_tool_suppressed: false,
+            subagent_tool_suppressed: false,
             effort: effective_effort,
             codex_fast_mode: false,
             async_tasks_enabled: false,
@@ -3529,6 +3533,7 @@ impl AgentInstance {
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
             loaded_tool_names: Mutex::new(HashSet::new()),
             document_skill_tool_names: Mutex::new(HashSet::new()),
+            active_skill_package_ids: Mutex::new(HashSet::new()),
             lazy_tool_renderer: Mutex::new(LazyToolRenderer::default()),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
@@ -3705,8 +3710,8 @@ impl AgentInstance {
             PlanRuntime::Main { plan_file } => match tool_name {
                 // Network reads don't mutate the system; planning may need docs.
                 "web_fetch" => None,
-                // Subagents inherit read-only enforcement (see run_subagent_task).
-                "task" => None,
+                // Subagents inherit read-only enforcement (see run_subagent).
+                "subagent" => None,
                 // Intercepted before enforcement; listed for completeness.
                 "exit_plan_mode" => None,
                 "write" | "edit" => {
@@ -4040,11 +4045,11 @@ impl AgentInstance {
             .into_iter()
             .filter(|name| self.is_tool_enabled(name, &enabled_overrides))
             .collect();
-        // Depth-capped subagents lose `task` entirely: the request tool
+        // Depth-capped subagents lose `subagent` entirely: the request tool
         // list, lazy manifest, tool_load and tool_call all derive from this
         // set, so the model is never offered a tool it cannot use.
-        if self.task_tool_suppressed {
-            allowed.remove("task");
+        if self.subagent_tool_suppressed {
+            allowed.remove("subagent");
         }
         allowed
     }
@@ -4801,15 +4806,15 @@ impl AgentInstance {
         description: String,
         mut parameters: serde_json::Value,
     ) -> (String, serde_json::Value) {
-        let contextualized = if name == "task" {
-            let subagents = self.registry.list_task_agent_descriptions();
+        let contextualized = if name == "subagent" {
+            let subagents = self.registry.list_subagent_descriptions();
             let agent_list = subagents
                 .iter()
                 .map(|(id, desc)| format!("- {}: {}", id, desc))
                 .collect::<Vec<_>>()
                 .join("\n");
             (
-                crate::prompt::tools::TASK.replace("{agent_list}", &agent_list),
+                crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list),
                 parameters,
             )
         } else if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
@@ -4839,8 +4844,8 @@ impl AgentInstance {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if name == "task" {
-            let subagents = self.registry.list_task_agent_descriptions();
+        if name == "subagent" {
+            let subagents = self.registry.list_subagent_descriptions();
             let agent_list = subagents
                 .iter()
                 .map(|(id, desc)| format!("- {}: {}", id, desc))
@@ -4853,7 +4858,7 @@ impl AgentInstance {
                 function.insert(
                     "description".to_string(),
                     serde_json::json!(
-                        crate::prompt::tools::TASK.replace("{agent_list}", &agent_list)
+                        crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list)
                     ),
                 );
             }
@@ -7314,41 +7319,37 @@ impl AgentInstance {
         }
     }
 
-    async fn record_raw_attempt(
+    fn context_attempt_backend(&self) -> &'static str {
+        match &self.backend {
+            LlmBackend::OpenRouter { .. } => "openrouter",
+            LlmBackend::Anthropic { .. } => "anthropic",
+            LlmBackend::ClaudeCodeCli => "claude_code_cli",
+            LlmBackend::OpenAiCodex { .. } => "openai_codex",
+            LlmBackend::Custom { .. } => "custom",
+        }
+    }
+
+    async fn record_captured_attempt(
         &self,
+        store: &SessionStore,
+        run_id: &str,
         kind: &str,
         iteration: usize,
         attempt: u32,
-        system_parts: &[&str],
-        messages: &[crate::session::models::ChatMessage],
-        api_tools: &[serde_json::Value],
-        estimated_tokens: u32,
-        completed: bool,
-        response_or_error: &str,
-        used_previous_response_id: Option<bool>,
+        status: &str,
+        request: serde_json::Value,
+        response: &str,
+        error_message: Option<&str>,
     ) {
-        let request = serde_json::json!({
-            "_locusAttempt": {
-                "kind": kind,
-                "attempt": attempt,
-                "completed": completed,
-                "estimatedTokens": estimated_tokens,
-                "usedPreviousResponseId": used_previous_response_id,
-                "responseOrError": response_or_error,
-            },
-            "model": self.effective_model.clone(),
-            "system": system_parts,
-            "messages": messages,
-            "tools": api_tools,
-        });
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let round = RawRound {
             round: iteration,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            request,
-            response: response_or_error.to_string(),
+            timestamp,
+            request: request.clone(),
+            response: response.to_string(),
         };
         self.raw_store
             .lock()
@@ -7356,6 +7357,77 @@ impl AgentInstance {
             .entry(self.session_id.clone())
             .or_insert_with(Vec::new)
             .push(round);
+        if let Err(error) = store.record_context_attempt(
+            &self.session_id,
+            run_id,
+            iteration,
+            attempt,
+            kind,
+            status,
+            self.context_attempt_backend(),
+            &self.effective_model,
+            self.effort.as_deref(),
+            &request,
+            response,
+            error_message,
+        ) {
+            eprintln!(
+                "[Agent {}] failed to persist context attempt: session={} run={} iteration={} attempt={} error={}",
+                self.id, self.session_id, run_id, iteration, attempt, error
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_raw_attempt(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        kind: &str,
+        iteration: usize,
+        attempt: u32,
+        system_parts: &[&str],
+        messages: &[crate::session::models::ChatMessage],
+        api_tools: &[serde_json::Value],
+        estimated_tokens: u32,
+        status: &str,
+        raw_request: Option<&str>,
+        provider_response: &str,
+        error_message: Option<&str>,
+        used_previous_response_id: Option<bool>,
+    ) {
+        let completed = status == "completed";
+        let request = raw_request
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "_locusAttempt": {
+                        "kind": kind,
+                        "attempt": attempt,
+                        "completed": completed,
+                        "status": status,
+                        "estimatedTokens": estimated_tokens,
+                        "usedPreviousResponseId": used_previous_response_id,
+                        "responseOrError": error_message.unwrap_or(provider_response),
+                    },
+                    "model": self.effective_model.clone(),
+                    "system": system_parts,
+                    "messages": messages,
+                    "tools": api_tools,
+                })
+            });
+        self.record_captured_attempt(
+            store,
+            run_id,
+            kind,
+            iteration,
+            attempt,
+            status,
+            request,
+            provider_response,
+            error_message,
+        )
+        .await;
     }
 
     async fn call_compact_llm(
@@ -7643,6 +7715,8 @@ impl AgentInstance {
         let outcome = match compact_result {
             Ok(outcome) => {
                 self.record_raw_attempt(
+                    store,
+                    run_id,
                     attempt_kind,
                     iteration,
                     1,
@@ -7650,8 +7724,10 @@ impl AgentInstance {
                     &prepared,
                     &api_tools,
                     context_tokens,
-                    true,
+                    "completed",
+                    Some(&outcome.raw_request),
                     &outcome.raw_response,
+                    None,
                     Some(false),
                 )
                 .await;
@@ -7659,6 +7735,8 @@ impl AgentInstance {
             }
             Err(error) => {
                 self.record_raw_attempt(
+                    store,
+                    run_id,
                     attempt_kind,
                     iteration,
                     1,
@@ -7666,8 +7744,10 @@ impl AgentInstance {
                     &prepared,
                     &api_tools,
                     context_tokens,
-                    false,
-                    &error,
+                    "failed",
+                    None,
+                    "",
+                    Some(&error),
                     Some(false),
                 )
                 .await;
@@ -7959,6 +8039,8 @@ impl AgentInstance {
         match &summary_result {
             Ok(resp) => {
                 self.record_raw_attempt(
+                    store,
+                    run_id,
                     attempt_kind,
                     iteration,
                     1,
@@ -7966,14 +8048,18 @@ impl AgentInstance {
                     &compact_plan.messages,
                     &[],
                     compact_plan.estimated_tokens,
-                    true,
+                    "completed",
+                    Some(&resp.raw_request),
                     &resp.raw_response,
+                    None,
                     Some(false),
                 )
                 .await;
             }
             Err(e) => {
                 self.record_raw_attempt(
+                    store,
+                    run_id,
                     attempt_kind,
                     iteration,
                     1,
@@ -7981,8 +8067,10 @@ impl AgentInstance {
                     &compact_plan.messages,
                     &[],
                     compact_plan.estimated_tokens,
-                    false,
-                    e,
+                    "failed",
+                    None,
+                    "",
+                    Some(e),
                     Some(false),
                 )
                 .await;
@@ -8289,7 +8377,16 @@ impl AgentInstance {
             // on disk outside the workspace; the model reaches them through
             // this absolute root, not through knowledge paths.
             let origin_root = manifest
-                .and_then(|manifest| manifest.origin_path.as_deref())
+                .and_then(|manifest| {
+                    manifest.origin_path.clone().or_else(|| {
+                        manifest.package_id.as_deref().and_then(|package_id| {
+                            crate::commands::skill_package_root_for_package_sync_for_working_dir(
+                                &self.working_dir,
+                                package_id,
+                            )
+                        })
+                    })
+                })
                 .map(|origin| {
                     format!(
                         "\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
@@ -8431,6 +8528,104 @@ impl AgentInstance {
         }
 
         names
+    }
+
+    fn selected_skill_package_ids(
+        &self,
+        user_intent: Option<&crate::session::models::UserIntentPayload>,
+    ) -> Vec<String> {
+        let Some(intent) = user_intent else {
+            return Vec::new();
+        };
+        let skills = crate::commands::list_skills_sync(
+            &self.working_dir,
+            self.app_knowledge_dir.as_ref().as_ref(),
+        );
+        let mut package_ids = intent
+            .skills
+            .iter()
+            .filter_map(|skill| Self::find_selected_skill_manifest(&skills, skill))
+            .filter_map(|manifest| manifest.package_id.clone())
+            .collect::<Vec<_>>();
+        package_ids.sort();
+        package_ids.dedup();
+        package_ids
+    }
+
+    fn activate_skill_package_runtime(&self, package_id: &str) {
+        let package_id = package_id.trim();
+        if package_id.is_empty() {
+            return;
+        }
+        if let Ok(mut package_ids) = self.active_skill_package_ids.lock() {
+            package_ids.insert(package_id.to_string());
+        }
+        match crate::commands::skill_package_python_modules_for_package_sync_for_working_dir(
+            &self.working_dir,
+            package_id,
+        ) {
+            Ok(modules) => {
+                if let Err(error) = crate::python_runtime::register_skill_python_modules(modules) {
+                    eprintln!(
+                        "[Agent {}] failed to register Skill Python modules for '{}': {}",
+                        self.id, package_id, error
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "[Agent {}] failed to register Skill Python modules for '{}': {}",
+                self.id, package_id, error
+            ),
+        }
+    }
+
+    fn active_skill_package_runtime_ids(&self) -> Vec<String> {
+        let mut package_ids = self
+            .active_skill_package_ids
+            .lock()
+            .map(|values| values.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        package_ids.sort();
+        package_ids
+    }
+
+    fn seed_active_skill_package_runtimes_from_history(
+        &self,
+        messages: &[crate::session::models::ChatMessage],
+    ) {
+        let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+            &self.working_dir,
+            self.app_knowledge_dir.as_ref().as_ref(),
+        );
+        for tool_call in crate::session::history::collect_assistant_tool_calls(messages) {
+            if tool_call.name != "knowledge_read" && tool_call.name != "read" {
+                continue;
+            }
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+            else {
+                continue;
+            };
+            let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let logical_path = if tool_call.name == "knowledge_read" {
+                path.to_string()
+            } else {
+                let Some(target) = registry.classify_path_string(path) else {
+                    continue;
+                };
+                if target.doc_type != crate::knowledge_store::KnowledgeType::Skill {
+                    continue;
+                }
+                target.logical_path
+            };
+            if let Some(package_id) = crate::commands::skill_package_owning_virtual_path_sync(
+                &self.working_dir,
+                &logical_path,
+            ) {
+                self.activate_skill_package_runtime(&package_id);
+            }
+        }
     }
 
     fn clear_document_skill_tool_names(&self) {
@@ -8961,12 +9156,25 @@ impl AgentInstance {
         // declaration disappears would dangle), so the per-run reset is
         // replaced by a deterministic rebuild from history.
         self.clear_document_skill_tool_names();
+        let runtime_history = store.get_messages_for_prompt(&self.session_id)?;
+        self.seed_active_skill_package_runtimes_from_history(&runtime_history);
         if lazy_tool_renderer.is_native() {
-            let messages = store.get_messages_for_prompt(&self.session_id)?;
-            self.seed_native_skill_activations_from_history(lazy_tool_renderer, &messages)
+            self.seed_native_skill_activations_from_history(
+                lazy_tool_renderer,
+                &runtime_history,
+            )
                 .await;
         }
         let selected_skill_tool_names = self.selected_skill_tool_names(user_intent.as_ref());
+        let selected_skill_package_ids = self.selected_skill_package_ids(user_intent.as_ref());
+        for package_id in &selected_skill_package_ids {
+            self.activate_skill_package_runtime(package_id);
+        }
+        // Selecting a Skill injects its complete workflow into this request.
+        // Load its C# runtime before the model sees that API, so the first
+        // unity_execute call can compile against its public types.
+        self.prepare_active_skill_package_unity_runtimes_if_connected()
+            .await;
         if !selected_skill_tool_names.is_empty() {
             eprintln!(
                 "[Agent {}] selected Skill tools ready: session={} run={} count={}",
@@ -9721,6 +9929,23 @@ impl AgentInstance {
                             LLM_RETRIES + 1,
                             llm_call_started_at.elapsed().as_millis()
                         );
+                        self.record_raw_attempt(
+                            store,
+                            &run_id,
+                            "normal",
+                            iteration,
+                            attempt_number,
+                            &system_parts,
+                            &prepared_messages,
+                            &api_tools,
+                            estimated_input_tokens,
+                            "cancelled",
+                            None,
+                            "",
+                            Some("cancelled before provider completion"),
+                            None,
+                        )
+                        .await;
                         self.clear_pending_knowledge_proposal(app_handle).await;
                         self.emit_cancelled(
                             app_handle,
@@ -9745,6 +9970,23 @@ impl AgentInstance {
                                 llm_call_started_at.elapsed().as_millis(),
                                 e
                             );
+                            self.record_raw_attempt(
+                                store,
+                                &run_id,
+                                "normal",
+                                iteration,
+                                attempt_number,
+                                &system_parts,
+                                &prepared_messages,
+                                &api_tools,
+                                estimated_input_tokens,
+                                "invalid",
+                                Some(&resp.raw_request),
+                                &resp.raw_response,
+                                Some(&e),
+                                None,
+                            )
+                            .await;
                             last_llm_error = e.clone();
                             if !attempt_had_output && llm_attempt < LLM_RETRIES {
                                 let delay = 2000 * (llm_attempt as u64 + 1);
@@ -9768,6 +10010,23 @@ impl AgentInstance {
                             }
                             continue;
                         }
+                        self.record_raw_attempt(
+                            store,
+                            &run_id,
+                            "normal",
+                            iteration,
+                            attempt_number,
+                            &system_parts,
+                            &prepared_messages,
+                            &api_tools,
+                            estimated_input_tokens,
+                            "completed",
+                            Some(&resp.raw_request),
+                            &resp.raw_response,
+                            None,
+                            None,
+                        )
+                        .await;
                         eprintln!(
                             "[Agent {}] LLM attempt success: session={} run={} iteration={} attempt={}/{} elapsed_ms={} text_len={} thinking_len={} tool_calls={} finish_reason={}",
                             self.id,
@@ -9827,6 +10086,8 @@ impl AgentInstance {
                             e
                         );
                         self.record_raw_attempt(
+                            store,
+                            &run_id,
                             "normal",
                             iteration,
                             attempt_number,
@@ -9834,8 +10095,10 @@ impl AgentInstance {
                             &prepared_messages,
                             &api_tools,
                             estimated_input_tokens,
-                            false,
-                            &e,
+                            "failed",
+                            None,
+                            "",
+                            Some(&e),
                             None,
                         )
                         .await;
@@ -9947,23 +10210,6 @@ impl AgentInstance {
             // The provider accepted the prompt, so the last compact (if any)
             // demonstrably made the history fit again.
             compact_unverified_since_send = false;
-
-            {
-                let round = RawRound {
-                    round: iteration,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
-                    request: serde_json::from_str(&response.raw_request)
-                        .unwrap_or_else(|_| serde_json::Value::String(response.raw_request.clone())),
-                    response: response.raw_response.clone(),
-                };
-                self.raw_store.lock().await
-                    .entry(self.session_id.clone())
-                    .or_insert_with(Vec::new)
-                    .push(round);
-            }
 
             if !response.text.is_empty() && response_text_part.is_none() {
                 response_text_part = render_order_tracker.lock().ok().map(|mut tracker| {
@@ -10243,20 +10489,20 @@ impl AgentInstance {
                 let has_ask = prepared
                     .iter()
                     .any(|(tc, _)| effective_name(tc) == "ask_user_question");
-                let has_task = prepared
+                let has_subagent = prepared
                     .iter()
-                    .any(|(tc, _)| effective_name(tc) == "task");
+                    .any(|(tc, _)| effective_name(tc) == "subagent");
                 let has_external_mcp = prepared.iter().any(|(tc, _)| {
                     effective_name(tc).starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
                 });
                 let mixed_round_reason = if has_ask && prepared.len() > 1 {
                     Some(("ask_user_question", "user-input tools must run alone"))
-                } else if has_task
+                } else if has_subagent
                     && prepared
                         .iter()
-                        .any(|(tc, _)| effective_name(tc) != "task")
+                        .any(|(tc, _)| effective_name(tc) != "subagent")
                 {
-                    Some(("task", "sub-agent calls must run without local sibling tools"))
+                    Some(("subagent", "sub-agent calls must run without local sibling tools"))
                 } else if has_external_mcp
                     && prepared.iter().any(|(tc, _)| {
                         !effective_name(tc).starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
@@ -10274,7 +10520,7 @@ impl AgentInstance {
                         let name = effective_name(tc);
                         let allowed = match allowed_kind {
                             "ask_user_question" => name == "ask_user_question",
-                            "task" => name == "task",
+                            "subagent" => name == "subagent",
                             _ => name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
                         };
                         if allowed {
@@ -10306,7 +10552,7 @@ impl AgentInstance {
                         .filter(|(tc, _)| !blocked_results.contains_key(&tc.id))
                         .all(|(tc, _)| {
                             let name = effective_name(tc);
-                            name != "task"
+                            name != "subagent"
                                 && name != "ask_user_question"
                                 && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
                         });
@@ -10374,7 +10620,7 @@ impl AgentInstance {
                             return false;
                         }
                         let name = effective_name(tc);
-                        name != "task"
+                        name != "subagent"
                             && name != "ask_user_question"
                             && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
                     })
@@ -10553,6 +10799,18 @@ impl AgentInstance {
                         ) {
                             return Ok(String::new());
                         }
+                        let resolved_tool_name = effective_name(tc);
+                        self.record_failed_tool_call(
+                            app_handle,
+                            &run_id,
+                            &assistant_msg_id,
+                            tc,
+                            &resolved_tool_name,
+                            args,
+                            &result,
+                            "foreground",
+                        )
+                        .await;
                         let stored_output = self.stream_completed_tool_result(
                             app_handle,
                             store,
@@ -10620,6 +10878,19 @@ impl AgentInstance {
                         ) {
                             return Ok(String::new());
                         }
+                        let (_, args) = &prepared[index];
+                        let resolved_tool_name = effective_name(tc);
+                        self.record_failed_tool_call(
+                            app_handle,
+                            &run_id,
+                            &assistant_msg_id,
+                            tc,
+                            &resolved_tool_name,
+                            args,
+                            &result,
+                            "foreground",
+                        )
+                        .await;
                         let stored_output = self.stream_completed_tool_result(
                             app_handle,
                             store,
@@ -11501,6 +11772,18 @@ impl AgentInstance {
             "editorapplication.ispaused=true",
             crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
         );
+        add_intent(
+            "ctx.breakwhen(",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+        );
+        add_intent(
+            "ctx.stepframe(",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+        );
+        add_intent(
+            "ctx.resumegame(",
+            crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+        );
         if crate::unity_bridge::normalize_editor_status(current_status)
             == crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED
         {
@@ -12102,7 +12385,7 @@ impl AgentInstance {
         instance.parent_tool_call = self.parent_tool_call.clone();
         instance.subagent_depth = self.subagent_depth;
         instance.subagent_active = self.subagent_active.clone();
-        instance.task_tool_suppressed = self.task_tool_suppressed;
+        instance.subagent_tool_suppressed = self.subagent_tool_suppressed;
         instance.codex_fast_mode = self.codex_fast_mode;
         instance.async_tasks_enabled = self.async_tasks_enabled;
         instance.knowledge_focus = self.knowledge_focus.clone();
@@ -12165,6 +12448,7 @@ impl AgentInstance {
         let task_id = started.task_id.clone();
         let app_handle = app_handle.clone();
         let store = store.clone();
+        let tool_call = tc.clone();
         let tool_name = tc.name.clone();
         let tool_call_id = tc.id.clone();
         let args = crate::async_tasks::remove_async_mode(args);
@@ -12186,7 +12470,7 @@ impl AgentInstance {
                 tools: vec![tool_name.clone()],
             };
             let mut cancel_rx = started.cancel_rx.clone();
-            let _workspace_guard = if tool_name == "task" {
+            let _workspace_guard = if matches!(tool_name.as_str(), "subagent" | "unity_execute") {
                 None
             } else {
                 let mode = if mutates_workspace {
@@ -12225,11 +12509,21 @@ impl AgentInstance {
             let progress: crate::async_tasks::TaskProgressReporter = Arc::new(move |text| {
                 progress_manager.report_progress(&progress_task_id, text);
             });
-            let result = if tool_name == "task" {
+            let result = if tool_name == "subagent" {
                 tokio::select! {
-                    result = executor.execute_task(&app_handle, &store, &args, &tool_call_id, &run_id) => result,
+                    result = executor.execute_subagent(&app_handle, &store, &args, &tool_call_id, &run_id) => result,
                     _ = cancel_rx.changed() => AgentInstance::interrupted_tool_result(),
                 }
+            } else if tool_name == "unity_execute" {
+                executor
+                    .execute_unity_execute_with_task_progress(
+                        &app_handle,
+                        &tool_call_id,
+                        &args,
+                        &run_id,
+                        Some(progress.clone()),
+                    )
+                    .await
             } else {
                 let mut context = executor
                     .build_tool_execution_context(&app_handle, &tool_name, &args)
@@ -12245,11 +12539,8 @@ impl AgentInstance {
             };
 
             let cancellation_failed = tool_name == "unity_test_run"
-                && result
-                    .output
-                    .contains("Unity Test cancellation ")
-                && (result.output.contains("unavailable:")
-                    || result.output.contains("failed:"));
+                && result.output.contains("Unity Test cancellation ")
+                && (result.output.contains("unavailable:") || result.output.contains("failed:"));
             let was_cancelled = result.outcome == ToolRunOutcome::Interrupted
                 || (*cancel_rx.borrow() && !cancellation_failed);
 
@@ -12275,12 +12566,69 @@ impl AgentInstance {
                 return;
             }
 
+            executor
+                .record_failed_tool_call(
+                    &app_handle,
+                    &run_id,
+                    &assistant_message_id,
+                    &tool_call,
+                    &tool_name,
+                    &args,
+                    &result,
+                    "background",
+                )
+                .await;
             let result = result.into_tool_result();
             manager.finish(&task_id, &result);
             run_guard.complete();
         });
 
         ExecutedToolResult::from_tool_result(immediate)
+    }
+
+    async fn record_failed_tool_call(
+        &self,
+        app_handle: &AppHandle,
+        run_id: &str,
+        assistant_message_id: &str,
+        tool_call: &ToolCallInfo,
+        resolved_tool_name: &str,
+        arguments: &serde_json::Value,
+        result: &ExecutedToolResult,
+        execution_mode: &str,
+    ) {
+        let enabled = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .is_some_and(|config| config.tool_failure_log_enabled());
+        if result.outcome != ToolRunOutcome::Error || !enabled {
+            return;
+        }
+
+        crate::tool::failure_log::record(crate::tool::failure_log::FailureInput {
+            agent_id: self.id.clone(),
+            working_directory: self.working_dir.clone(),
+            execution_mode: execution_mode.to_string(),
+            declared_tool_name: tool_call.name.clone(),
+            tool_name: resolved_tool_name.to_string(),
+            raw_arguments: tool_call.arguments.clone(),
+            arguments: arguments.clone(),
+            error_output: result.output.clone(),
+            location: crate::tool::failure_log::FailureLocationInput {
+                session_id: self.session_id.clone(),
+                run_id: run_id.to_string(),
+                assistant_message_id: assistant_message_id.to_string(),
+                tool_call_id: tool_call.id.clone(),
+                tool_call_order: tool_call.order,
+            },
+            parent_location: self.parent_tool_call.as_ref().map(|parent| {
+                crate::tool::failure_log::ParentLocationInput {
+                    session_id: parent.session_id.clone(),
+                    run_id: parent.run_id.clone(),
+                    tool_call_id: parent.tool_call_id.clone(),
+                }
+            }),
+        })
+        .await;
     }
 
     fn stream_completed_tool_result(
@@ -12430,8 +12778,8 @@ impl AgentInstance {
                     .is_allowed_tool_for_active_skills(&canonical, active_skill_tool_names)
                     .await
             {
-                if canonical == "task" && self.task_tool_suppressed {
-                    return self.suppressed_task_tool_result();
+                if canonical == "subagent" && self.subagent_tool_suppressed {
+                    return self.suppressed_subagent_tool_result();
                 }
                 return ExecutedToolResult::from_tool_result(ToolResult {
                     output: format!(
@@ -12476,12 +12824,12 @@ impl AgentInstance {
                 .await;
         }
 
-        // Depth-capped subagents have `task` filtered from their tool
+        // Depth-capped subagents have `subagent` filtered from their tool
         // surface; a call that slips through anyway (hallucinated or from
         // history) gets the specific depth explanation, not the generic
         // not-allowed text below.
-        if tc.name == "task" && self.task_tool_suppressed {
-            return self.suppressed_task_tool_result();
+        if tc.name == "subagent" && self.subagent_tool_suppressed {
+            return self.suppressed_subagent_tool_result();
         }
 
         if !self
@@ -12641,9 +12989,9 @@ impl AgentInstance {
         } else if tc.name == "read" {
             self.await_executed_tool_result(self.execute_read(app_handle, args, &tc.id, run_id))
                 .await
-        } else if tc.name == "task" {
+        } else if tc.name == "subagent" {
             self.await_executed_tool_result(
-                self.execute_task(app_handle, store, args, &tc.id, run_id),
+                self.execute_subagent(app_handle, store, args, &tc.id, run_id),
             )
             .await
         } else if tc.name == "ask_user_question" {
@@ -13209,14 +13557,11 @@ impl AgentInstance {
                     .iter()
                     .filter(|t| t.status != "completed" && t.status != "cancelled")
                     .count();
-                let output =
-                    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string());
                 ToolResult {
                     output: format!(
-                        "{} todos ({} remaining)\n{}",
+                        "Todos updated ({} total, {} remaining).",
                         items.len(),
-                        pending_count,
-                        output
+                        pending_count
                     ),
                     is_error: false,
                 }
@@ -13728,6 +14073,16 @@ impl AgentInstance {
                         "\n\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
                         origin_root
                     ));
+                } else if let Ok(Some(package_root)) =
+                    crate::commands::skill_package_root_for_document_sync_for_working_dir(
+                        &self.working_dir,
+                        &parsed.path,
+                    )
+                {
+                    output.push_str(&format!(
+                        "\n\nRoot: {} (read-only; resolve relative references and scripts against this directory)",
+                        package_root
+                    ));
                 }
                 let include_runtime_annotations = sanitized.part == "full";
 
@@ -13804,6 +14159,12 @@ impl AgentInstance {
         run_id: &str,
         knowledge_path: &str,
     ) -> Result<Option<String>, String> {
+        if let Some(package_id) = crate::commands::skill_package_owning_virtual_path_sync(
+            &self.working_dir,
+            knowledge_path,
+        ) {
+            self.activate_skill_package_runtime(&package_id);
+        }
         let Some(bundle) =
             crate::commands::skill_package_unity_script_bundle_for_document_sync_for_working_dir(
                 &self.working_dir,
@@ -13812,6 +14173,7 @@ impl AgentInstance {
         else {
             return Ok(None);
         };
+        self.activate_skill_package_runtime(&bundle.package_id);
 
         emit_tool_progress(
             app_handle,
@@ -13851,6 +14213,37 @@ impl AgentInstance {
             "running",
         );
 
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Updating Unity type index",
+            &bundle.package_id,
+            Some(0.75),
+            "running",
+        );
+
+        let note = self.compile_skill_package_unity_bundle(&bundle).await?;
+
+        emit_tool_progress(
+            app_handle,
+            run_id,
+            &self.session_id,
+            tool_call_id,
+            "Skill C# scripts ready",
+            &bundle.package_id,
+            Some(1.0),
+            "running",
+        );
+
+        Ok(Some(note))
+    }
+
+    async fn compile_skill_package_unity_bundle(
+        &self,
+        bundle: &crate::commands::SkillPackageUnityScriptBundle,
+    ) -> Result<String, String> {
         let compile_raw =
             crate::unity_bridge::compile_skill_package(&self.working_dir, &bundle.request).await?;
         let compile_json = serde_json::from_str::<serde_json::Value>(&compile_raw)
@@ -13867,43 +14260,19 @@ impl AgentInstance {
             .get("publicTypeCount")
             .and_then(|value| value.as_i64())
             .unwrap_or(0);
-
-        emit_tool_progress(
-            app_handle,
-            run_id,
-            &self.session_id,
-            tool_call_id,
-            "Updating Unity type index",
-            &bundle.package_id,
-            Some(0.75),
-            "running",
-        );
-
         let type_index_update =
             crate::unity_bridge::update_unity_type_index_after_skill_package_compile(
                 &self.working_dir,
                 &compile_json,
             )
             .await?;
-
-        emit_tool_progress(
-            app_handle,
-            run_id,
-            &self.session_id,
-            tool_call_id,
-            "Skill C# scripts ready",
-            &bundle.package_id,
-            Some(1.0),
-            "running",
-        );
-
         let cache_text = if cache_hit { "cache hit" } else { "compiled" };
         let assembly_text = if assembly_id.trim().is_empty() {
             bundle.source_hash.chars().take(12).collect::<String>()
         } else {
             assembly_id.to_string()
         };
-        Ok(Some(format!(
+        Ok(format!(
             "Locus Skill runtime: Unity C# scripts {} for `{}` (scripts: {}, public types: {}, assembly: `{}`, type index: {}).",
             cache_text,
             bundle.package_id,
@@ -13911,7 +14280,43 @@ impl AgentInstance {
             public_type_count,
             assembly_text,
             type_index_update.mode
-        )))
+        ))
+    }
+
+    async fn ensure_active_skill_package_unity_runtimes(&self) -> Result<Vec<String>, String> {
+        let mut notes = Vec::new();
+        for package_id in self.active_skill_package_runtime_ids() {
+            let Some(bundle) = crate::commands::skill_package_unity_script_bundle_for_package_sync_for_working_dir(
+                &self.working_dir,
+                &package_id,
+            )? else {
+                continue;
+            };
+            notes.push(self.compile_skill_package_unity_bundle(&bundle).await?);
+        }
+        Ok(notes)
+    }
+
+    async fn prepare_active_skill_package_unity_runtimes_if_connected(&self) {
+        if !self.has_selected_working_dir() || self.active_skill_package_runtime_ids().is_empty() {
+            return;
+        }
+        let (connected, _status, _scene) =
+            crate::unity_bridge::query_unity_status(&self.working_dir).await;
+        if !connected {
+            return;
+        }
+        match self.ensure_active_skill_package_unity_runtimes().await {
+            Ok(notes) => {
+                for note in notes {
+                    eprintln!("[Agent {}] {}", self.id, note);
+                }
+            }
+            Err(error) => eprintln!(
+                "[Agent {}] failed to prepare active Skill C# runtime: {}",
+                self.id, error
+            ),
+        }
     }
 
     async fn reconcile_knowledge_workspace_with_source(
@@ -14572,6 +14977,18 @@ impl AgentInstance {
         args: &serde_json::Value,
         run_id: &str,
     ) -> ExecutedToolResult {
+        self.execute_unity_execute_with_task_progress(app_handle, tool_call_id, args, run_id, None)
+            .await
+    }
+
+    async fn execute_unity_execute_with_task_progress(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+        task_progress: Option<crate::async_tasks::TaskProgressReporter>,
+    ) -> ExecutedToolResult {
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
         }
@@ -14636,6 +15053,13 @@ impl AgentInstance {
         if !connected {
             return ExecutedToolResult::from_tool_result(ToolResult {
                 output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            });
+        }
+
+        if let Err(error) = self.ensure_active_skill_package_unity_runtimes().await {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!("Failed to restore active Skill C# runtime: {}", error),
                 is_error: true,
             });
         }
@@ -14750,6 +15174,7 @@ impl AgentInstance {
         let result_tool_call_id = tool_call_id.clone();
         let progress_run_id = run_id.to_string();
         let result_run_id = progress_run_id.clone();
+        let background_progress = task_progress.clone();
 
         let cancel_rx = self.cancel_waiter();
         match crate::unity_bridge::unity_execute_code_with_progress_cancellable_non_public_access(
@@ -14760,6 +15185,9 @@ impl AgentInstance {
             move |snapshot| {
                 if !snapshot.active {
                     return;
+                }
+                if let Some(report) = background_progress.as_ref() {
+                    report(Self::format_unity_execute_task_progress(&snapshot));
                 }
                 let progress = if snapshot.source == "api" {
                     Some(snapshot.progress)
@@ -14818,6 +15246,45 @@ impl AgentInstance {
                     is_error: true,
                 })
             }
+        }
+    }
+
+    fn format_unity_execute_task_progress(
+        snapshot: &crate::unity_bridge::UnityExecuteProgressSnapshot,
+    ) -> String {
+        if snapshot.source == "await" {
+            let mut output = format!(
+                "Awaiting Unity: kind={} waited_ms={} source_line={}",
+                crate::tool::output::flat_text(&snapshot.wait_kind),
+                snapshot.waited_ms,
+                snapshot.source_line
+            );
+            if !snapshot.source_text.trim().is_empty() {
+                output.push_str("\nsource: ");
+                output.push_str(snapshot.source_text.trim());
+            }
+            if !snapshot.wait_target.trim().is_empty() {
+                output.push_str("\ntarget: ");
+                output.push_str(snapshot.wait_target.trim());
+            }
+            if !snapshot.wait_condition.trim().is_empty() {
+                output.push_str("\ncondition: ");
+                output.push_str(snapshot.wait_condition.trim());
+            }
+            return output;
+        }
+
+        let mut output = snapshot.title.trim().to_string();
+        if !snapshot.info.trim().is_empty() {
+            if !output.is_empty() {
+                output.push_str(": ");
+            }
+            output.push_str(snapshot.info.trim());
+        }
+        if output.is_empty() {
+            "Running unity_execute".to_string()
+        } else {
+            output
         }
     }
 
@@ -14950,6 +15417,13 @@ impl AgentInstance {
         if !connected {
             return ToolResult {
                 output: "Unity Editor not connected".to_string(),
+                is_error: true,
+            };
+        }
+
+        if let Err(error) = self.ensure_active_skill_package_unity_runtimes().await {
+            return ToolResult {
+                output: format!("Failed to restore active Skill C# runtime: {}", error),
                 is_error: true,
             };
         }
@@ -17150,7 +17624,7 @@ impl AgentInstance {
         }
     }
 
-    async fn run_subagent_task(
+    async fn run_subagent(
         &self,
         app_handle: &AppHandle,
         store: &SessionStore,
@@ -17159,7 +17633,7 @@ impl AgentInstance {
         subagent_type: &str,
         tool_call_id: &str,
         run_id: &str,
-    ) -> Result<SubagentTaskResult, String> {
+    ) -> Result<SubagentRunResult, String> {
         let agent_def = match self.registry.get(subagent_type) {
             Some(def) => def.clone(),
             None => {
@@ -17216,16 +17690,16 @@ impl AgentInstance {
         ));
         child.subagent_depth = self.subagent_depth + 1;
         child.subagent_active = self.subagent_active.clone();
-        // A child spawned at the depth cap never sees `task` in its tool
+        // A child spawned at the depth cap never sees `subagent` in its tool
         // surface at all, instead of discovering the limit by erroring.
         let max_depth = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.subagent_max_depth())
             .unwrap_or(crate::config::DEFAULT_SUBAGENT_MAX_DEPTH);
-        child.task_tool_suppressed = child.subagent_depth >= max_depth;
+        child.subagent_tool_suppressed = child.subagent_depth >= max_depth;
         // Plan mode propagates to children: a subagent spawned while the
         // parent plans runs strictly read-only (no plan file, no
-        // exit_plan_mode) so `task` cannot become a plan-mode bypass.
+        // exit_plan_mode) so `subagent` cannot become a plan-mode bypass.
         if self.plan_runtime_snapshot().is_some() {
             child.mark_plan_readonly_subagent();
         }
@@ -17323,7 +17797,7 @@ impl AgentInstance {
                         crate::session::history::collect_assistant_tool_calls(&detail.messages)
                     })
                     .unwrap_or_default();
-                Ok(SubagentTaskResult {
+                Ok(SubagentRunResult {
                     output: result_text,
                     tool_calls,
                     is_error: false,
@@ -17394,7 +17868,7 @@ impl AgentInstance {
                         crate::session::history::collect_assistant_tool_calls(&detail.messages)
                     })
                     .unwrap_or_default();
-                Ok(SubagentTaskResult {
+                Ok(SubagentRunResult {
                     output: format!("Subagent error: {}", e),
                     tool_calls,
                     is_error: true,
@@ -17403,21 +17877,21 @@ impl AgentInstance {
         }
     }
 
-    /// Error result for a `task` call from a subagent whose tool surface had
-    /// `task` removed at spawn time (it sits at the configured maximum
+    /// Error result for a `subagent` call from a child whose tool surface had
+    /// `subagent` removed at spawn time (it sits at the configured maximum
     /// nesting depth). Names the reason and the setting instead of the
     /// generic not-allowed text.
-    fn suppressed_task_tool_result(&self) -> ExecutedToolResult {
+    fn suppressed_subagent_tool_result(&self) -> ExecutedToolResult {
         ExecutedToolResult::from_tool_result(ToolResult {
             output: format!(
-                "Error: the task tool is not available to this agent. It was spawned at subagent depth {}, the configured maximum nesting depth, so it cannot spawn further subagents. Do the work directly with your other tools. (The user can raise 'Subagent max depth' in Locus Settings > General.)",
+                "Error: the subagent tool is not available to this agent. It was spawned at subagent depth {}, the configured maximum nesting depth, so it cannot spawn further subagents. Do the work directly with your other tools. (The user can raise 'Subagent max depth' in Locus Settings > General.)",
                 self.subagent_depth
             ),
             is_error: true,
         })
     }
 
-    async fn execute_task(
+    async fn execute_subagent(
         &self,
         app_handle: &AppHandle,
         store: &SessionStore,
@@ -17425,12 +17899,13 @@ impl AgentInstance {
         tool_call_id: &str,
         run_id: &str,
     ) -> ExecutedToolResult {
-        let description = args["description"].as_str().unwrap_or("unknown task");
+        let description = args["description"].as_str().unwrap_or("subagent work");
         let prompt = match args["prompt"].as_str() {
             Some(p) if !p.is_empty() => p,
             _ => {
                 return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Error: task tool requires a non-empty 'prompt' parameter".to_string(),
+                    output: "Error: subagent tool requires a non-empty 'prompt' parameter"
+                        .to_string(),
                     is_error: true,
                 });
             }
@@ -17439,7 +17914,7 @@ impl AgentInstance {
             Some(t) => t,
             None => {
                 return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Error: task tool requires 'subagent_type' parameter".to_string(),
+                    output: "Error: subagent tool requires 'subagent_type' parameter".to_string(),
                     is_error: true,
                 });
             }
@@ -17464,7 +17939,7 @@ impl AgentInstance {
         if self.subagent_depth >= max_depth {
             return ExecutedToolResult::from_tool_result(ToolResult {
                 output: format!(
-                    "Error: subagent nesting depth limit reached. This agent is itself a subagent running at depth {} and the maximum nesting depth is {}, so it cannot spawn further subagents with the task tool. Do the work directly with your other tools instead. (The user can change this limit via \"Subagent max depth\" in Locus Settings > General.)",
+                    "Error: subagent nesting depth limit reached. This agent is itself a subagent running at depth {} and the maximum nesting depth is {}, so it cannot spawn further subagents with the subagent tool. Do the work directly with your other tools instead. (The user can change this limit via \"Subagent max depth\" in Locus Settings > General.)",
                     self.subagent_depth, max_depth
                 ),
                 is_error: true,
@@ -17481,7 +17956,7 @@ impl AgentInstance {
                 let running = self.subagent_active.load(Ordering::Relaxed);
                 return ExecutedToolResult::from_tool_result(ToolResult {
                         output: format!(
-                            "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this task call was rejected. Issue at most {} task calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
+                            "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this subagent call was rejected. Issue at most {} subagent calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
                             running, max_concurrent, max_concurrent
                         ),
                         is_error: true,
@@ -17490,7 +17965,7 @@ impl AgentInstance {
         };
 
         match self
-            .run_subagent_task(
+            .run_subagent(
                 app_handle,
                 store,
                 description,
@@ -17726,7 +18201,7 @@ mod tests {
     fn finalize_tool_call_record_preserves_nested_subagent_history() {
         let tool_call = ToolCallInfo {
             id: "task-1".to_string(),
-            name: "task".to_string(),
+            name: "subagent".to_string(),
             arguments: "{}".to_string(),
             order: None,
             server_tool: None,
@@ -18557,8 +19032,7 @@ PrefabInstance:
             .find(|item| item.title == "bash")
             .expect("bash should appear in Agent preview");
         assert_eq!(
-            bash.meta.as_ref().unwrap()["function"]["parameters"]["properties"]["async"]
-                ["enum"],
+            bash.meta.as_ref().unwrap()["function"]["parameters"]["properties"]["async"]["enum"],
             serde_json::json!(["sync", "async", "notify"])
         );
     }
@@ -20789,6 +21263,52 @@ Search, install, audit, and export a plugin.
             ),
             None
         );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "await ctx.BreakWhen(UnityLoopPoint.AfterUpdate, () => player.health <= 0);",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "await ctx.ResumeGame();",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING)
+        );
+        assert_eq!(
+            AgentInstance::unity_execute_editor_status_intent(
+                "await ctx.StepFrame();",
+                crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED,
+            ),
+            Some(crate::unity_bridge::UNITY_EDITOR_STATUS_PLAYING_PAUSED)
+        );
+    }
+
+    #[test]
+    fn unity_execute_background_progress_explains_pending_await() {
+        let progress = crate::unity_bridge::UnityExecuteProgressSnapshot {
+            active: true,
+            title: "Awaiting Unity".to_string(),
+            info: String::new(),
+            progress: 0.0,
+            revision: 4,
+            source: "await".to_string(),
+            wait_kind: "breakpoint_condition".to_string(),
+            wait_target: "After Game.CombatTickSystem[0]".to_string(),
+            wait_condition: "player.Health <= 0".to_string(),
+            source_line: 7,
+            source_text: "await ctx.BreakWhen(...);".to_string(),
+            waited_ms: 1250,
+        };
+
+        let output = AgentInstance::format_unity_execute_task_progress(&progress);
+        assert!(output.contains("kind=breakpoint_condition"));
+        assert!(output.contains("waited_ms=1250"));
+        assert!(output.contains("source_line=7"));
+        assert!(output.contains("await ctx.BreakWhen(...);"));
+        assert!(output.contains("player.Health <= 0"));
     }
 
     #[test]
@@ -22059,7 +22579,11 @@ Search, install, audit, and export a plugin.
 "#,
         )
         .expect("write skill manifest");
-        std::fs::write(skill_root.join("SKILL.md"), "# View\n").expect("write skill root");
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nsummary: Use explicit Locus View UI package requests.\n---\n\n# View\n",
+        )
+        .expect("write skill root");
         std::fs::write(skill_root.join("debug.md"), "# Debug\n").expect("write debug doc");
         std::fs::write(skill_root.join("runtime-api.md"), "# Runtime API\n")
             .expect("write runtime doc");
@@ -22189,7 +22713,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn plan_mode_main_allows_readonly_planfile_webfetch_and_task() {
+    fn plan_mode_main_allows_readonly_planfile_webfetch_and_subagent() {
         let instance = test_agent_instance("C:/Project".to_string());
         let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
 
@@ -22201,7 +22725,7 @@ Search, install, audit, and export a plugin.
             "unity_recompile",
             "todowrite",
             "web_fetch",
-            "task",
+            "subagent",
             "exit_plan_mode",
         ] {
             assert!(
@@ -22255,7 +22779,7 @@ Search, install, audit, and export a plugin.
             "write",
             "edit",
             "bash",
-            "task",
+            "subagent",
             "web_fetch",
             "exit_plan_mode",
         ] {
@@ -22328,12 +22852,14 @@ Search, install, audit, and export a plugin.
     }
 
     #[tokio::test]
-    async fn task_tool_filtered_out_for_depth_capped_subagents() {
-        // `with_builtins()` does not register `task` (the real app registers
+    async fn subagent_tool_filtered_out_for_depth_capped_subagents() {
+        // `with_builtins()` does not register `subagent` (the real app registers
         // it with the live agent list), so the fixture registers it here.
         let mut tool_registry = ToolRegistry::with_builtins();
-        tool_registry
-            .register_task_tool(&[("explorer".to_string(), "codebase exploration".to_string())]);
+        tool_registry.register_subagent_tool(&[(
+            "explorer".to_string(),
+            "codebase exploration".to_string(),
+        )]);
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         let mut instance = AgentInstance::new(
             Arc::new(AgentDef {
@@ -22342,7 +22868,7 @@ Search, install, audit, and export a plugin.
                 description: String::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
-                tools: vec!["read".to_string(), "task".to_string()],
+                tools: vec!["read".to_string(), "subagent".to_string()],
                 sub_agents: Vec::new(),
                 default: false,
                 default_effort: None,
@@ -22369,25 +22895,25 @@ Search, install, audit, and export a plugin.
 
         let names = instance.build_request_tool_names().await;
         assert!(
-            names.iter().any(|name| name == "task"),
-            "fixture must offer task before suppression"
+            names.iter().any(|name| name == "subagent"),
+            "fixture must offer subagent before suppression"
         );
 
         instance.subagent_depth = 1;
-        instance.task_tool_suppressed = true;
+        instance.subagent_tool_suppressed = true;
 
         let names = instance.build_request_tool_names().await;
         assert!(
-            !names.iter().any(|name| name == "task"),
-            "task must disappear from the request tool list at the depth cap"
+            !names.iter().any(|name| name == "subagent"),
+            "subagent must disappear from the request tool list at the depth cap"
         );
-        assert!(!instance.allowed_tool_set().await.contains("task"));
+        assert!(!instance.allowed_tool_set().await.contains("subagent"));
         // Other tools stay untouched.
         assert!(names.iter().any(|name| name == "read"));
 
         // A call that slips through anyway gets the specific depth error,
         // which names the setting, rather than the generic not-allowed text.
-        let result = instance.suppressed_task_tool_result();
+        let result = instance.suppressed_subagent_tool_result();
         assert!(result.is_error);
         assert!(result.output.contains("subagent depth 1"));
         assert!(result.output.contains("Subagent max depth"));

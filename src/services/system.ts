@@ -78,6 +78,14 @@ export function setAsyncTasksEnabled(value: boolean): Promise<void> {
   return ipcInvoke<void>("set_async_tasks_enabled", { value });
 }
 
+export function getToolFailureLogEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_tool_failure_log_enabled");
+}
+
+export function setToolFailureLogEnabled(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_tool_failure_log_enabled", { value });
+}
+
 export function getLlmRetryMaxAttempts(): Promise<number> {
   return ipcInvoke<number>("get_llm_retry_max_attempts");
 }

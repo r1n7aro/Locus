@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::tool::output::{append_field, append_text_field};
 use crate::tool::ToolResult;
 
 pub const ASYNC_MODE_PARAMETER: &str = "async";
@@ -67,7 +68,10 @@ pub fn remove_async_mode(args: &serde_json::Value) -> serde_json::Value {
 }
 
 pub fn supports_async_mode(tool_name: &str) -> bool {
-    matches!(tool_name, "bash" | "unity_test_run" | "task")
+    matches!(
+        tool_name,
+        "bash" | "unity_execute" | "unity_test_run" | "subagent"
+    )
 }
 
 pub fn augment_tool_schema(tool_name: &str, tool: &mut serde_json::Value) {
@@ -113,6 +117,17 @@ impl AsyncTaskStatus {
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +156,46 @@ impl AsyncTaskSnapshot {
             .unwrap_or_else(now_millis)
             .saturating_sub(self.created_at)
     }
+}
+
+fn format_task_snapshot(snapshot: &AsyncTaskSnapshot, include_output: bool) -> String {
+    let mut output = "Async task:".to_string();
+    append_text_field(&mut output, "id", &snapshot.task_id);
+    append_text_field(&mut output, "tool", &snapshot.tool_name);
+    append_field(&mut output, "status", snapshot.status.as_str());
+    append_field(&mut output, "elapsed_ms", snapshot.elapsed_ms());
+    append_field(&mut output, "notify", snapshot.notify);
+
+    let mut timing = "timing:".to_string();
+    append_field(&mut timing, "created_at_ms", snapshot.created_at);
+    append_field(&mut timing, "updated_at_ms", snapshot.updated_at);
+    if let Some(finished_at) = snapshot.finished_at {
+        append_field(&mut timing, "finished_at_ms", finished_at);
+    }
+    output.push('\n');
+    output.push_str(&timing);
+
+    if let Some(progress) = snapshot
+        .progress
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        output.push_str("\nprogress: ");
+        output.push_str(progress);
+    }
+    if include_output {
+        if let Some(result) = snapshot.output.as_deref() {
+            output.push_str("\nresult:");
+            if result.is_empty() {
+                output.push_str(" (no output)");
+            } else {
+                output.push('\n');
+                output.push_str(result);
+            }
+        }
+    }
+    output
 }
 
 struct AsyncTaskEntry {
@@ -324,30 +379,20 @@ impl AsyncTaskManager {
 
     pub fn start_result(&self, task_id: &str) -> ToolResult {
         ToolResult {
-            output: serde_json::json!({
-                "taskId": task_id,
-                "status": "queued",
-                "message": "Task started. Use get_task_status with this task id for progress and the final result; use cancel_task to stop it."
-            })
-            .to_string(),
+            output: format!(
+                "Async task: id={} status=queued\nUse get_task_status with this id for progress and the final result; use cancel_task to stop it.",
+                crate::tool::output::flat_text(task_id)
+            ),
             is_error: false,
         }
     }
 
     pub fn status_result(&self, task_id: &str) -> ToolResult {
         match self.snapshot(task_id) {
-            Some(snapshot) => {
-                let elapsed_ms = snapshot.elapsed_ms();
-                let value = serde_json::json!({
-                    "task": snapshot,
-                    "elapsedMs": elapsed_ms,
-                });
-                ToolResult {
-                    output: serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|_| value.to_string()),
-                    is_error: false,
-                }
-            }
+            Some(snapshot) => ToolResult {
+                output: format_task_snapshot(&snapshot, true),
+                is_error: false,
+            },
             None => ToolResult {
                 output: format!("Async task '{task_id}' was not found."),
                 is_error: true,
@@ -358,8 +403,7 @@ impl AsyncTaskManager {
     pub fn cancel_result(&self, task_id: &str) -> ToolResult {
         match self.cancel(task_id) {
             Ok(snapshot) => ToolResult {
-                output: serde_json::to_string_pretty(&snapshot)
-                    .unwrap_or_else(|_| format!("Task {task_id}: cancellation requested")),
+                output: format_task_snapshot(&snapshot, snapshot.status.is_terminal()),
                 is_error: false,
             },
             Err(output) => ToolResult {
@@ -498,6 +542,25 @@ mod tests {
     }
 
     #[test]
+    fn unity_execute_supports_background_task_status() {
+        assert!(supports_async_mode("unity_execute"));
+        let mut tool = serde_json::json!({
+            "function": {
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        });
+        augment_tool_schema("unity_execute", &mut tool);
+        assert_eq!(
+            tool.pointer("/function/parameters/properties/async/type")
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+    }
+
+    #[test]
     fn cancellation_is_idempotent_for_terminal_tasks() {
         let manager = AsyncTaskManager::default();
         let started = manager.create_task("session", "bash", false);
@@ -539,5 +602,38 @@ mod tests {
         let snapshot = manager.snapshot(&started.task_id).unwrap();
         assert_eq!(snapshot.status, AsyncTaskStatus::Failed);
         assert!(!manager.take_notifications("session").is_empty());
+    }
+
+    #[test]
+    fn task_results_are_flat_and_terminal_status_includes_output() {
+        let manager = AsyncTaskManager::default();
+        let started = manager.create_task("session", "bash", false);
+        assert_eq!(
+            manager.start_result(&started.task_id).output,
+            format!(
+                "Async task: id=\"{}\" status=queued\nUse get_task_status with this id for progress and the final result; use cancel_task to stop it.",
+                started.task_id
+            )
+        );
+
+        manager.mark_running(&started.task_id, "Running command");
+        let running = manager.status_result(&started.task_id).output;
+        assert!(running.starts_with(&format!(
+            "Async task: id=\"{}\" tool=\"bash\" status=running",
+            started.task_id
+        )));
+        assert!(running.contains("\nprogress: Running command"));
+        assert!(!running.contains("{\n"));
+
+        manager.finish(
+            &started.task_id,
+            &ToolResult {
+                output: "Exit code: 0\ndone".to_string(),
+                is_error: false,
+            },
+        );
+        let completed = manager.status_result(&started.task_id).output;
+        assert!(completed.contains(" status=completed "));
+        assert!(completed.ends_with("\nresult:\nExit code: 0\ndone"));
     }
 }

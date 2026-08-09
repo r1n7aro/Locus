@@ -340,14 +340,14 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
 
         let has_ask = tools.iter().any(|name| name == "ask_user_question");
-        let has_task = tools.iter().any(|name| name == "task");
+        let has_subagent = tools.iter().any(|name| name == "subagent");
         let has_external_mcp = tools
             .iter()
             .any(|name| name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX));
         let allowed_kind = if has_ask && tools.len() > 1 {
             Some("ask_user_question")
-        } else if has_task && tools.iter().any(|name| name != "task") {
-            Some("task")
+        } else if has_subagent && tools.iter().any(|name| name != "subagent") {
+            Some("subagent")
         } else if has_external_mcp
             && tools
                 .iter()
@@ -360,7 +360,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         if let Some(allowed_kind) = allowed_kind {
             let current_allowed = match allowed_kind {
                 "ask_user_question" => current_tool_name == "ask_user_question",
-                "task" => current_tool_name == "task",
+                "subagent" => current_tool_name == "subagent",
                 _ => current_tool_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
             };
             if !current_allowed {
@@ -371,7 +371,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             }
             return Ok(None);
         }
-        if has_ask || has_task || has_external_mcp {
+        if has_ask || has_subagent || has_external_mcp {
             return Ok(None);
         }
 
@@ -1216,14 +1216,60 @@ impl AgentInstance {
             tools,
             debug: self.debug,
         };
+        let fallback_request = serde_json::json!({
+            "backend": "claude_code_cli",
+            "session_id": self.session_id,
+            "model": self.effective_model,
+            "effort": self.effort,
+            "system": system_prompt,
+            "messages": [{
+                "role": "user",
+                "content": prompt_text,
+            }],
+            "tools": api_tools,
+            "raw_stdin": user_message,
+        });
         let mut cancel_rx = self.cancel_waiter();
-        let turn = tokio::select! {
-            result = claude_code_cli::run_turn(options, user_message, &mut host) => result?,
+        let turn_result = tokio::select! {
+            result = claude_code_cli::run_turn(options, user_message, &mut host) => Some(result),
             _ = cancel_rx.changed() => {
                 eprintln!(
                     "[Agent {}] Claude Code CLI turn cancelled before completion: session={} run={}",
                     self.id, self.session_id, run_id
                 );
+                None
+            }
+        };
+        let turn = match turn_result {
+            Some(Ok(turn)) => turn,
+            Some(Err(error)) => {
+                self.record_captured_attempt(
+                    store,
+                    run_id,
+                    "normal",
+                    1,
+                    1,
+                    "failed",
+                    fallback_request,
+                    "",
+                    Some(&error),
+                )
+                .await;
+                return Err(error);
+            }
+            None => {
+                self.record_captured_attempt(
+                    store,
+                    run_id,
+                    "normal",
+                    1,
+                    1,
+                    "cancelled",
+                    fallback_request,
+                    "",
+                    Some("cancelled before provider completion"),
+                )
+                .await;
                 self.clear_pending_knowledge_proposal(app_handle).await;
                 self.emit_cancelled(app_handle, store, run_id, None);
                 return Ok(String::new());
@@ -1288,28 +1334,31 @@ impl AgentInstance {
             }
         }
 
-        {
-            let round = super::RawRound {
-                round: 1,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                request: serde_json::json!({
-                    "backend": "claude_code_cli",
-                    "session_id": self.session_id,
-                    "claude_session_id": turn.claude_session_id,
-                    "raw_stdin": turn.raw_request,
-                }),
-                response: turn.raw_response.clone(),
-            };
-            self.raw_store
-                .lock()
-                .await
-                .entry(self.session_id.clone())
-                .or_insert_with(Vec::new)
-                .push(round);
-        }
+        self.record_captured_attempt(
+            store,
+            run_id,
+            "normal",
+            1,
+            1,
+            "completed",
+            serde_json::json!({
+                "backend": "claude_code_cli",
+                "session_id": self.session_id,
+                "claude_session_id": turn.claude_session_id,
+                "model": self.effective_model,
+                "effort": self.effort,
+                "system": system_prompt,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt_text,
+                }],
+                "tools": api_tools,
+                "raw_stdin": turn.raw_request,
+            }),
+            &turn.raw_response,
+            None,
+        )
+        .await;
 
         if !self.run_is_current_for_session(store, run_id, "claude_code_turn_done", None) {
             return Ok(String::new());

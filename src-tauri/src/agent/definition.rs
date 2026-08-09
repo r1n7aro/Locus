@@ -334,6 +334,7 @@ impl AgentDefRegistry {
     fn normalize_agent_tools(agent_id: &str, tools: &mut Vec<String>) {
         for tool in tools.iter_mut() {
             let normalized = match tool.as_str() {
+                "task" => "subagent",
                 "view_binding_read" => "view_property_read",
                 "view_binding_discover" => "view_property_discover",
                 "view_binding_write" => "view_property_write",
@@ -398,7 +399,7 @@ impl AgentDefRegistry {
         self.defs.keys().map(|s| s.as_str()).collect()
     }
 
-    pub fn list_task_agent_descriptions(&self) -> Vec<(String, String)> {
+    pub fn list_subagent_descriptions(&self) -> Vec<(String, String)> {
         let mut defs: Vec<&AgentDef> = self
             .defs
             .values()
@@ -579,9 +580,9 @@ mod tests {
     }
 
     #[test]
-    fn task_agent_descriptions_hide_legacy_aliases() {
+    fn subagent_descriptions_hide_legacy_aliases() {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
-        let descriptions = registry.list_task_agent_descriptions();
+        let descriptions = registry.list_subagent_descriptions();
 
         assert!(descriptions
             .iter()

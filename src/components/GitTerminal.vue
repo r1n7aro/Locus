@@ -133,7 +133,7 @@ function extractToolSummary(name: string, argsJson: string): string {
       if (pat) return `/${pat}/`;
       return "";
     }
-    if (name === "task" || name === "explore") return args.description || "";
+    if (name === "subagent" || name === "task" || name === "explore") return args.description || "";
     for (const v of Object.values(args)) {
       if (typeof v === "string" && v.length > 0) {
         return v.length <= 80 ? v : v.slice(0, 77) + "...";

@@ -533,17 +533,23 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
 
 fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
     // Read tool_permissions.json from the active app storage directory.
-    let perms: HashMap<String, String> = crate::commands::resolve_runtime_storage_dir(app_handle)
-        .ok()
-        .and_then(|dir| std::fs::read_to_string(dir.join("tool_permissions.json")).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut perms: HashMap<String, String> =
+        crate::commands::resolve_runtime_storage_dir(app_handle)
+            .ok()
+            .and_then(|dir| std::fs::read_to_string(dir.join("tool_permissions.json")).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    if !perms.contains_key("subagent") {
+        if let Some(mode) = perms.get("task").cloned() {
+            perms.insert("subagent".to_string(), mode);
+        }
+    }
 
     let tool_list = [
         ("read", "File reading"),
         ("grep", "Content search"),
         ("list", "Directory listing"),
-        ("task", "Sub-agent delegation"),
+        ("subagent", "Sub-agent delegation"),
         ("todowrite", "TODO list management"),
         ("ask_user_question", "Ask user a question"),
         ("write", "File creation (new files only)"),
@@ -580,7 +586,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
     for (name, desc) in tool_list {
         let default_mode = match name {
             "write" | "edit" | "bash" | "web_fetch" | "unity_execute" | "unity_run_states"
-            | "unity_test_run" => "ask",
+            | "unity_test_run" | "subagent" => "ask",
             _ => "auto",
         };
         let current = perms.get(name).map(|s| s.as_str()).unwrap_or(default_mode);

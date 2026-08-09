@@ -5,5 +5,5 @@ Before carrying out any engineering implementation, you should make sure that yo
 You can analyze the project's current implementation through the following steps:
 
 * Use `knowledge_query` when the injected context does not already cover the task. Read only the returned physical line range with `read`.
-* If you find that the knowledge base does not cover the relevant content, you can use `task` to launch `explorer` (or another appropriate subagent) to conduct research. Try not to analyze large numbers of files directly in the main context.
+* If you find that the knowledge base does not cover the relevant content, you can use `subagent` to launch `explorer` (or another appropriate subagent) to conduct research. Try not to analyze large numbers of files directly in the main context.
 * After completing the task, record durable findings only when the knowledge maintenance rules call for it. Use `write` for a new knowledge Markdown document and `edit` for an existing one.

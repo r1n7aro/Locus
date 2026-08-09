@@ -883,7 +883,7 @@ fn ensure_parent_tool_call<'a>(
     let order = Some(next_order(tool_calls));
     tool_calls.push(new_tool_call(
         parent_id,
-        "task",
+        "subagent",
         "{}",
         ToolCallDisplayStatus::Running,
         order,
@@ -978,7 +978,7 @@ mod tests {
             &StreamEvent::ToolCallStart {
                 session_id: "s1".to_string(),
                 tool_call_id: "task-1".to_string(),
-                tool_name: "task".to_string(),
+                tool_name: "subagent".to_string(),
                 arguments: "{\"prompt\":\"inspect\"}".to_string(),
                 order: Some(1),
                 part_id: None,

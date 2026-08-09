@@ -10,7 +10,7 @@ Build your plan incrementally by writing to and editing this file with the write
 ## Available Capabilities
 - Read-only exploration is fully available: read, grep, list, the code_* language tools, unity_code_usages, unity_asset_search, unity_ref_search, unity_yaml_*, knowledge_*, and web_fetch.
 - unity_recompile is allowed: it validates feasibility via compile diagnostics without modifying sources.
-- Parallel exploration: launch explorer subagents with the task tool — in plan mode they are forced read-only. Use them to fan out codebase searches without filling your context; give each a focused goal. Max 3 in parallel; usually 1 is enough.
+- Parallel exploration: launch explorer subagents with the subagent tool — in plan mode they are forced read-only. Use them to fan out codebase searches without filling your context; give each a focused goal. Max 3 in parallel; usually 1 is enough.
 - ask_user_question for decisions only the user can make.
 - bash is NOT available in plan mode.
 

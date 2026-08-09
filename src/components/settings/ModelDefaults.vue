@@ -53,7 +53,7 @@ function selectedModelLabel(id: string): string {
   return model ? optionDisplayName(model) : id;
 }
 
-/** Every agent the task tool can spawn gets a model override slot: top-level
+/** Every agent the subagent tool can spawn gets a model override slot: top-level
  *  agents (default first) plus the subagent-only definitions. */
 const spawnableAgents = computed<AgentInfo[]>(() => [...props.agents, ...props.subagents]);
 

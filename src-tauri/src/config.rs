@@ -43,11 +43,11 @@ fn default_llm_strip_inline_think_tags() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
 
-/// Default `task` subagent nesting depth: the top-level agent may spawn
+/// Default `subagent` nesting depth: the top-level agent may spawn
 /// subagents, but those subagents may not spawn further subagents.
 pub const DEFAULT_SUBAGENT_MAX_DEPTH: u32 = 1;
 pub const SUBAGENT_MAX_DEPTH_LIMIT: u32 = 8;
-/// Default cap on `task` subagents running at the same time within one
+/// Default cap on `subagent` calls running at the same time within one
 /// top-level agent tree.
 pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: u32 = 3;
 pub const SUBAGENT_MAX_CONCURRENT_LIMIT: u32 = 16;
@@ -109,6 +109,10 @@ fn default_unity_in_process_compile_fallback() -> Arc<AtomicBool> {
 }
 
 fn default_unity_hot_reload() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+fn default_tool_failure_log_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
@@ -300,6 +304,14 @@ pub struct AppConfig {
     pub base_url: Option<String>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub debug: Arc<AtomicBool>,
+    /// Persist a bounded corpus of failed agent tool calls for later tool
+    /// quality analysis. Default off because entries include call arguments,
+    /// error output and session-position identifiers.
+    #[serde(
+        default = "default_tool_failure_log_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub tool_failure_log_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub file_tool_workspace_boundary: Arc<AtomicBool>,
     /// Experimental background execution for selected long-running tools.
@@ -447,13 +459,13 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub llm_strip_inline_think_tags: Arc<AtomicBool>,
-    /// Maximum `task` subagent nesting depth. 1 (default) lets the top-level
-    /// agent spawn subagents while subagents themselves cannot; a `task` call
+    /// Maximum `subagent` nesting depth. 1 (default) lets the top-level agent
+    /// spawn subagents while subagents themselves cannot; a `subagent` call
     /// past the cap fails with an error tool result. Clamped to
     /// 1..=SUBAGENT_MAX_DEPTH_LIMIT on read and write.
     #[serde(default = "default_subagent_max_depth", with = "serde_atomic_u32")]
     pub subagent_max_depth: Arc<AtomicU32>,
-    /// Maximum `task` subagents running at once within one top-level agent
+    /// Maximum `subagent` calls running at once within one top-level agent
     /// tree (default 3). Excess calls fail with an error tool result instead
     /// of queueing. Clamped to 1..=SUBAGENT_MAX_CONCURRENT_LIMIT on read and
     /// write.
@@ -494,6 +506,7 @@ impl AppConfig {
             model,
             base_url,
             debug: Arc::new(AtomicBool::new(debug)),
+            tool_failure_log_enabled: default_tool_failure_log_enabled(),
             file_tool_workspace_boundary: default_debug_flag(),
             async_tasks_enabled: default_async_tasks_enabled(),
             close_behavior: default_close_behavior(),
@@ -625,6 +638,16 @@ impl AppConfig {
 
     pub fn set_debug_enabled(&self, value: bool) -> Result<(), String> {
         self.debug.store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn tool_failure_log_enabled(&self) -> bool {
+        self.tool_failure_log_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tool_failure_log_enabled(&self, value: bool) -> Result<(), String> {
+        self.tool_failure_log_enabled
+            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -1264,6 +1287,22 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert!(!config.unity_hot_reload_enabled());
+    }
+
+    #[test]
+    fn tool_failure_log_defaults_to_disabled_and_persists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(&config_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(!config.tool_failure_log_enabled());
+
+        config
+            .set_tool_failure_log_enabled(true)
+            .expect("persist tool failure log setting");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(reloaded.tool_failure_log_enabled());
     }
 
     #[test]

@@ -254,7 +254,7 @@ export function buildToolCallArgsSummary(
       return member;
     }
 
-    if (toolName === "task") {
+    if (toolName === "subagent" || toolName === "task") {
       const desc = getStringArg(args, ["description"]);
       if (desc.length <= 60) return desc;
       return desc.slice(0, 57) + "...";

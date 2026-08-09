@@ -518,7 +518,7 @@ mod tests {
             "assistant-1",
             vec![ToolCallInfo {
                 id: "tc-1".to_string(),
-                name: "task".to_string(),
+                name: "subagent".to_string(),
                 arguments: "{}".to_string(),
                 order: None,
                 server_tool: None,

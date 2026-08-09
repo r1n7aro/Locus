@@ -9,8 +9,7 @@ pub mod plan {
     pub const PLAN_REMINDER: &str = include_str!("../../prompt/plan-reminder.md");
     /// Read-only reminder for subagents spawned while the parent session is
     /// in plan mode (no plan file, no exit_plan_mode).
-    pub const PLAN_REMINDER_SUBAGENT: &str =
-        include_str!("../../prompt/plan-reminder-subagent.md");
+    pub const PLAN_REMINDER_SUBAGENT: &str = include_str!("../../prompt/plan-reminder-subagent.md");
     /// One-shot notice injected on the first user message after leaving plan
     /// mode. `{plan_file_block}` carries the plan file reference when one
     /// exists.
@@ -19,7 +18,7 @@ pub mod plan {
 
 /// Tool definition JSON（description + parameters schema）
 pub mod tools {
-    pub const TASK: &str = include_str!("../../tools/task.md");
+    pub const SUBAGENT: &str = include_str!("../../tools/subagent.md");
 
     pub const READ: &str = include_str!("../../tools/read.json");
     pub const WRITE: &str = include_str!("../../tools/write.json");
@@ -35,8 +34,7 @@ pub mod tools {
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
         include_str!("../../tools/unity_capture_viewport.json");
-    pub const UNITY_GET_CONSOLE_LOG: &str =
-        include_str!("../../tools/unity_get_console_log.json");
+    pub const UNITY_GET_CONSOLE_LOG: &str = include_str!("../../tools/unity_get_console_log.json");
     pub const UNITY_TEST_LIST: &str = include_str!("../../tools/unity_test_list.json");
     pub const UNITY_TEST_RUN: &str = include_str!("../../tools/unity_test_run.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
@@ -214,6 +212,25 @@ mod tests {
     }
 
     #[test]
+    fn unity_debugger_skill_is_available_for_l1_injection() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("knowledge")
+            .join("skill")
+            .join("debugger.md");
+        assert!(
+            path.is_file(),
+            "built-in debugger skill is missing at {:?}",
+            path
+        );
+        let source = std::fs::read_to_string(&path).expect("read debugger skill");
+        assert!(source.contains("injectMode: excerpt"));
+        assert!(source.contains("## Summary"));
+        assert!(source.contains("ctx.BreakWhen"));
+        assert!(source.contains("ctx.SwitchToMainThread"));
+    }
+
+    #[test]
     fn unity_execution_tools_expose_default_on_non_public_access() {
         for (name, source) in [
             ("unity_execute", tools::UNITY_EXECUTE),
@@ -229,8 +246,14 @@ mod tests {
                 .get("properties")
                 .and_then(|value| value.get("enable_non_public_access"))
                 .unwrap_or_else(|| panic!("{name} missing enable_non_public_access"));
-            assert_eq!(property.get("type").and_then(|value| value.as_str()), Some("boolean"));
-            assert_eq!(property.get("default").and_then(|value| value.as_bool()), Some(true));
+            assert_eq!(
+                property.get("type").and_then(|value| value.as_str()),
+                Some("boolean")
+            );
+            assert_eq!(
+                property.get("default").and_then(|value| value.as_bool()),
+                Some(true)
+            );
         }
     }
 }

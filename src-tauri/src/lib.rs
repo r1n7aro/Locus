@@ -53,8 +53,10 @@ pub mod plugin;
 pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
-mod session;
+mod runtime_data_lock;
+mod runtime_paths;
 mod sdk;
+mod session;
 mod sqlite_maint;
 mod tool;
 pub mod unity_bridge;
@@ -224,7 +226,6 @@ impl AgentDefRegistryState {
     pub async fn snapshot(&self) -> Arc<AgentDefRegistry> {
         Arc::new(self.0.read().await.clone())
     }
-
 }
 
 use asset_db::watcher::AssetDbWatcher;
@@ -306,6 +307,14 @@ mod state_type_tests {
 pub fn run() {
     let startup_trace = StartupTrace::new();
     std::eprintln!("[startup] phase=run_enter total=0ms delta=0ms");
+    let runtime_launch_options =
+        match runtime_paths::RuntimeLaunchOptions::configure_from_env_args() {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("[Locus CLI] {error}");
+                std::process::exit(2);
+            }
+        };
     let external_script_open_request = unity_bridge::external_script_open_request_from_env_args();
     let cli_driver_config = match cli_driver::CliDriverConfig::from_env_args() {
         Some(Ok(config)) => Some(config),
@@ -341,6 +350,7 @@ pub fn run() {
     let startup_for_setup = startup_trace.clone();
     let cli_driver_for_setup = cli_driver_config.clone();
     let external_script_open_for_setup = external_script_open_request.clone();
+    let runtime_workspace_for_setup = runtime_launch_options.workspace_dir.clone();
 
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
@@ -433,6 +443,13 @@ pub fn run() {
             }
             let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
                 .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
+            let runtime_data_lock = runtime_data_lock::RuntimeDataDirLock::acquire(&data_dir)
+                .map_err(|e| format!("Failed to acquire app storage lock: {}", e))?;
+            println!(
+                "[Locus] runtime data lock acquired: {}",
+                runtime_data_lock.path().display()
+            );
+            app.manage(runtime_data_lock);
             if let Ok(resource_dir) = app.path().resource_dir() {
                 process_util::set_managed_git_resource_dir(resource_dir.clone());
                 process_util::set_managed_github_cli_resource_dir(resource_dir);
@@ -502,7 +519,7 @@ pub fn run() {
             store.clone().spawn_vacuum_if_fragmented();
 
             let working_dir_file = data_dir.join("working_dir.txt");
-            let requested_working_dir = cli_driver_for_setup
+            let driver_working_dir = cli_driver_for_setup
                 .as_ref()
                 .and_then(|driver| driver.project_path.as_ref())
                 .map(|path| path.trim().to_string())
@@ -520,6 +537,10 @@ pub fn run() {
                         .map(|value| value.display().to_string())
                         .unwrap_or(path)
                 });
+            let requested_working_dir = runtime_workspace_for_setup
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .or(driver_working_dir);
             let initial_working_dir = requested_working_dir.unwrap_or_else(|| {
                 std::fs::read_to_string(&working_dir_file)
                     .ok()
@@ -625,7 +646,7 @@ pub fn run() {
                 project_agent_opt,
                 &crate::plugin::installed_agent_sources(&initial_working_dir_copy),
             );
-            let initial_subagents = initial_registry.list_task_agent_descriptions();
+            let initial_subagents = initial_registry.list_subagent_descriptions();
             let registry = AgentDefRegistryState(Arc::new(tokio::sync::RwLock::new(initial_registry)));
             startup_for_setup.mark("setup_agents_ready");
 
@@ -671,9 +692,9 @@ pub fn run() {
             }
             let subagents = initial_subagents;
             if !subagents.is_empty() {
-                tool_registry.register_task_tool(&subagents);
+                tool_registry.register_subagent_tool(&subagents);
                 println!(
-                    "[Locus] task tool registered with {} subagent(s): {}",
+                    "[Locus] subagent tool registered with {} subagent(s): {}",
                     subagents.len(),
                     subagents
                         .iter()
@@ -731,7 +752,7 @@ pub fn run() {
                 ToolPermissionMode(Arc::new(tokio::sync::RwLock::new(initial_tool_mode)));
 
             let tool_perm_path = data_dir.join("tool_permissions.json");
-            let initial_tool_perms: HashMap<String, String> =
+            let mut initial_tool_perms: HashMap<String, String> =
                 std::fs::read_to_string(&tool_perm_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
@@ -748,6 +769,12 @@ pub fn run() {
                             .collect()
                     })
                     .unwrap_or_default();
+            if !initial_tool_perms.contains_key("subagent") {
+                if let Some(mode) = initial_tool_perms.get("task").cloned() {
+                    initial_tool_perms.insert("subagent".to_string(), mode);
+                }
+            }
+            initial_tool_perms.remove("task");
             println!("[Locus] tool_permissions: {:?}", initial_tool_perms);
             let tool_permissions: ToolPermissions =
                 ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
@@ -1180,6 +1207,10 @@ pub fn run() {
             commands::set_agent_tool_direct_load,
             commands::set_agent_tool_enabled,
             commands::load_session,
+            commands::load_session_view,
+            commands::load_session_message_page,
+            commands::load_session_message_images,
+            commands::load_session_turn_preview,
             commands::get_compacted_context_output,
             commands::list_sessions,
             commands::list_archived_sessions,
@@ -1192,6 +1223,7 @@ pub fn run() {
             commands::get_session_usage,
             commands::get_model_usage_stats,
             commands::get_session_active_run,
+            commands::get_session_resume_available,
             commands::list_session_events,
             commands::get_auth_status,
             commands::get_auth_url,
@@ -1241,7 +1273,7 @@ pub fn run() {
             commands::list_dir_entries_page,
             commands::search_workspace_entries,
             commands::stat_workspace_entries,
-            commands::save_raw_context,
+            commands::export_session_context,
             commands::get_todos,
             commands::cancel_chat,
             commands::stale_knowledge_proposals,
@@ -1472,6 +1504,8 @@ pub fn run() {
             commands::undo_check_dirty,
             commands::get_debug_mode,
             commands::set_debug_mode,
+            commands::get_tool_failure_log_enabled,
+            commands::set_tool_failure_log_enabled,
             commands::get_llm_retry_max_attempts,
             commands::set_llm_retry_max_attempts,
             commands::get_subagent_max_depth,

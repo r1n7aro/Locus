@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use super::{make_exec, ToolDef, ToolResult};
+use crate::tool::output::{append_field, append_json_field, append_text_field, flat_json_value};
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -231,17 +232,206 @@ fn tool_error(message: impl Into<String>) -> ToolResult {
     }
 }
 
-fn json_output<T: Serialize>(tool_name: &str, value: &T) -> ToolResult {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => ToolResult {
-            output,
-            is_error: false,
-        },
-        Err(error) => tool_error(format!(
-            "Failed to serialize {} result: {}",
-            tool_name, error
-        )),
+fn flat_output(output: String) -> ToolResult {
+    ToolResult {
+        output,
+        is_error: false,
     }
+}
+
+fn append_plugin_components(output: &mut String, plugin: &crate::plugin::InstalledPluginSummary) {
+    for (kind, components) in [
+        ("agent", plugin.agents.as_slice()),
+        ("rule", plugin.rules.as_slice()),
+        ("skill", plugin.skills.as_slice()),
+        ("view", plugin.views.as_slice()),
+        ("drawer", plugin.drawers.as_slice()),
+    ] {
+        for component in components {
+            let mut line = "\n  component:".to_string();
+            append_field(&mut line, "kind", kind);
+            if let Some(id) = component.id.as_deref() {
+                append_text_field(&mut line, "id", id);
+            }
+            append_text_field(&mut line, "path", &component.path);
+            append_text_field(&mut line, "root", &component.root);
+            output.push_str(&line);
+        }
+    }
+}
+
+fn append_installed_plugin(
+    output: &mut String,
+    prefix: &str,
+    plugin: &crate::plugin::InstalledPluginSummary,
+) {
+    let mut line = prefix.to_string();
+    append_text_field(&mut line, "id", &plugin.id);
+    append_text_field(&mut line, "name", &plugin.name);
+    append_text_field(&mut line, "version", &plugin.version);
+    append_field(&mut line, "scope", plugin.scope.as_str());
+    append_field(&mut line, "enabled", plugin.enabled);
+    append_text_field(&mut line, "root", &plugin.root);
+    append_field(&mut line, "agents", plugin.agents.len());
+    append_field(&mut line, "rules", plugin.rules.len());
+    append_field(&mut line, "skills", plugin.skills.len());
+    append_field(&mut line, "views", plugin.views.len());
+    append_field(&mut line, "drawers", plugin.drawers.len());
+    if let Some(project_independent) = plugin.compatibility.project_independent {
+        append_field(&mut line, "project_independent", project_independent);
+    }
+    append_field(
+        &mut line,
+        "project_dependencies",
+        plugin.dependencies.project.len(),
+    );
+    output.push_str(&line);
+    append_plugin_components(output, plugin);
+    for dependency in &plugin.dependencies.project {
+        let mut dependency_line = "\n  dependency:".to_string();
+        append_text_field(&mut dependency_line, "kind", &dependency.kind);
+        append_text_field(&mut dependency_line, "name", &dependency.name);
+        if let Some(version) = dependency.version.as_deref() {
+            append_text_field(&mut dependency_line, "version", version);
+        }
+        if let Some(notes) = dependency.notes.as_deref() {
+            append_text_field(&mut dependency_line, "notes", notes);
+        }
+        output.push_str(&dependency_line);
+    }
+}
+
+fn format_plugin_list_output(value: &PluginListToolOutput) -> String {
+    let mut output = "Plugins:".to_string();
+    append_field(&mut output, "count", value.count);
+    append_text_field(&mut output, "working_dir", &value.working_dir);
+    for plugin in &value.plugins {
+        output.push('\n');
+        append_installed_plugin(&mut output, "-", plugin);
+    }
+    output
+}
+
+fn format_plugin_search_output(value: &PluginSearchToolOutput) -> String {
+    let mut output = "Plugin search:".to_string();
+    append_text_field(&mut output, "query", &value.query);
+    append_field(&mut output, "results", value.result_count);
+    append_field(&mut output, "registries", value.registries.len());
+
+    for registry in &value.registries {
+        let mut line = "\nRegistry:".to_string();
+        append_text_field(&mut line, "name", &registry.name);
+        append_text_field(&mut line, "base_url", &registry.base_url);
+        append_field(&mut line, "version", registry.registry_version);
+        append_text_field(&mut line, "updated_at", &registry.updated_at);
+        append_field(&mut line, "scanned_buckets", registry.scanned_buckets);
+        append_field(&mut line, "search_index", registry.search_index_used);
+        append_field(&mut line, "results", registry.result_count);
+        append_field(&mut line, "failed_buckets", registry.failed_buckets.len());
+        if let Some(error) = registry.error.as_deref() {
+            append_text_field(&mut line, "error", error);
+        }
+        output.push_str(&line);
+        for failure in &registry.failed_buckets {
+            let mut failure_line = "\n  bucket_error:".to_string();
+            append_text_field(&mut failure_line, "bucket", &failure.bucket);
+            append_text_field(&mut failure_line, "error", &failure.error);
+            output.push_str(&failure_line);
+        }
+    }
+
+    for result in &value.results {
+        let summary = &result.summary;
+        let mut line = "\n-".to_string();
+        append_text_field(&mut line, "id", &summary.id);
+        append_text_field(&mut line, "name", &summary.name);
+        append_text_field(&mut line, "version", &summary.latest_version);
+        append_text_field(&mut line, "author", &summary.author);
+        append_text_field(&mut line, "updated_at", &summary.updated_at);
+        append_text_field(&mut line, "registry", &result.registry_name);
+        append_text_field(&mut line, "registry_url", &result.registry_base_url);
+        if !summary.tags.is_empty() {
+            append_field(
+                &mut line,
+                "tags",
+                flat_json_value(&serde_json::json!(summary.tags)),
+            );
+        }
+        if let Some(version) = summary.compatibility.min_locus_version.as_deref() {
+            append_text_field(&mut line, "min_locus_version", version);
+        }
+        if let Some(project_independent) = summary.compatibility.project_independent {
+            append_field(&mut line, "project_independent", project_independent);
+        }
+        output.push_str(&line);
+        if !summary.summary.trim().is_empty() {
+            output.push_str("\n  summary=");
+            output.push_str(&crate::tool::output::flat_text(&summary.summary));
+        }
+        for stat in &summary.stats {
+            let mut stat_line = "\n  stat:".to_string();
+            append_text_field(&mut stat_line, "id", &stat.id);
+            append_text_field(&mut stat_line, "label", &stat.label);
+            append_json_field(&mut stat_line, "value", Some(&stat.value));
+            output.push_str(&stat_line);
+        }
+    }
+    output
+}
+
+fn format_plugin_install_output(value: &PluginInstallToolOutput) -> String {
+    let mut output = "Plugin installed:".to_string();
+    append_text_field(&mut output, "source", &value.source);
+    if let Some(registry_base_url) = value.registry_base_url.as_deref() {
+        append_text_field(&mut output, "registry_url", registry_base_url);
+    }
+    output.push('\n');
+    append_installed_plugin(&mut output, "plugin:", &value.installed);
+    output
+}
+
+fn format_plugin_set_enabled_output(value: &PluginSetEnabledToolOutput) -> String {
+    let mut output = "Plugin state changed:".to_string();
+    append_text_field(&mut output, "id", &value.plugin_id);
+    append_field(&mut output, "scope", value.scope.as_str());
+    append_field(&mut output, "enabled", value.enabled);
+    append_text_field(&mut output, "working_dir", &value.working_dir);
+    output.push('\n');
+    append_installed_plugin(&mut output, "plugin:", &value.plugin);
+    output
+}
+
+fn format_plugin_uninstall_output(value: &PluginUninstallToolOutput) -> String {
+    let mut output = "Plugin uninstalled:".to_string();
+    append_text_field(&mut output, "id", &value.plugin_id);
+    append_field(&mut output, "scope", value.scope.as_str());
+    append_text_field(&mut output, "removed", &value.removed);
+    append_text_field(&mut output, "working_dir", &value.working_dir);
+    output
+}
+
+fn format_plugin_export_output(value: &crate::commands::PluginExportResult) -> String {
+    let mut output = "Plugin exported:".to_string();
+    append_text_field(&mut output, "id", &value.id);
+    append_text_field(&mut output, "path", &value.path);
+    append_field(&mut output, "files", value.file_count);
+    append_field(&mut output, "bytes", value.byte_size);
+    append_field(&mut output, "skills", value.skill_count);
+    append_field(&mut output, "views", value.view_count);
+    append_field(&mut output, "rules", value.rule_count);
+    if let Some(plugin) = value.installed_plugin.as_ref() {
+        output.push('\n');
+        append_installed_plugin(&mut output, "installed:", plugin);
+    }
+    for component in &value.transferred_components {
+        let mut line = "\nTransferred:".to_string();
+        append_text_field(&mut line, "kind", &component.kind);
+        append_text_field(&mut line, "id", &component.id);
+        append_text_field(&mut line, "source_root", &component.source_root);
+        append_text_field(&mut line, "plugin_id", &component.plugin_id);
+        output.push_str(&line);
+    }
+    output
 }
 
 fn context_working_dir(
@@ -568,14 +758,12 @@ pub(super) fn plugin_list() -> ToolDef {
                 };
                 let working_dir = context_working_dir(&ctx, parsed.working_dir);
                 let plugins = crate::plugin::list_installed_plugin_summaries(&working_dir);
-                json_output(
-                    "plugin_list",
-                    &PluginListToolOutput {
-                        working_dir,
-                        count: plugins.len(),
-                        plugins,
-                    },
-                )
+                let value = PluginListToolOutput {
+                    working_dir,
+                    count: plugins.len(),
+                    plugins,
+                };
+                flat_output(format_plugin_list_output(&value))
             })
         }),
     }
@@ -667,15 +855,13 @@ pub(super) fn plugin_search() -> ToolDef {
                 });
                 results.truncate(limit);
 
-                json_output(
-                    "plugin_search",
-                    &PluginSearchToolOutput {
-                        query,
-                        registries: reports,
-                        result_count: results.len(),
-                        results,
-                    },
-                )
+                let value = PluginSearchToolOutput {
+                    query,
+                    registries: reports,
+                    result_count: results.len(),
+                    results,
+                };
+                flat_output(format_plugin_search_output(&value))
             })
         }),
     }
@@ -816,14 +1002,12 @@ pub(super) fn plugin_install() -> ToolDef {
                     return result;
                 }
 
-                json_output(
-                    "plugin_install",
-                    &PluginInstallToolOutput {
-                        source: source_label,
-                        registry_base_url,
-                        installed,
-                    },
-                )
+                let value = PluginInstallToolOutput {
+                    source: source_label,
+                    registry_base_url,
+                    installed,
+                };
+                flat_output(format_plugin_install_output(&value))
             })
         }),
     }
@@ -895,16 +1079,14 @@ pub(super) fn plugin_set_enabled() -> ToolDef {
                     return result;
                 }
 
-                json_output(
-                    "plugin_set_enabled",
-                    &PluginSetEnabledToolOutput {
-                        working_dir,
-                        plugin_id,
-                        scope,
-                        enabled: parsed.enabled,
-                        plugin,
-                    },
-                )
+                let value = PluginSetEnabledToolOutput {
+                    working_dir,
+                    plugin_id,
+                    scope,
+                    enabled: parsed.enabled,
+                    plugin,
+                };
+                flat_output(format_plugin_set_enabled_output(&value))
             })
         }),
     }
@@ -968,15 +1150,13 @@ pub(super) fn plugin_uninstall() -> ToolDef {
                     return result;
                 }
 
-                json_output(
-                    "plugin_uninstall",
-                    &PluginUninstallToolOutput {
-                        working_dir,
-                        plugin_id,
-                        scope,
-                        removed,
-                    },
-                )
+                let value = PluginUninstallToolOutput {
+                    working_dir,
+                    plugin_id,
+                    scope,
+                    removed,
+                };
+                flat_output(format_plugin_uninstall_output(&value))
             })
         }),
     }
@@ -1011,32 +1191,23 @@ pub(super) fn plugin_export() -> ToolDef {
                 };
                 let working_dir = ctx.working_dir.clone().unwrap_or_default();
                 match crate::commands::export_plugin_archive_sync(&working_dir, request) {
-                    Ok(result) => match serde_json::to_string_pretty(&result) {
-                        Ok(output) => {
-                            if result.installed_plugin.is_some()
-                                || !result.transferred_components.is_empty()
+                    Ok(result) => {
+                        if result.installed_plugin.is_some()
+                            || !result.transferred_components.is_empty()
+                        {
+                            if let Err(refresh_result) = reload_plugin_registries_after_install(
+                                &ctx,
+                                &working_dir,
+                                "plugin_export",
+                                "plugin_export",
+                            )
+                            .await
                             {
-                                if let Err(refresh_result) = reload_plugin_registries_after_install(
-                                    &ctx,
-                                    &working_dir,
-                                    "plugin_export",
-                                    "plugin_export",
-                                )
-                                .await
-                                {
-                                    return refresh_result;
-                                }
-                            }
-                            ToolResult {
-                                output,
-                                is_error: false,
+                                return refresh_result;
                             }
                         }
-                        Err(error) => ToolResult {
-                            output: format!("Failed to serialize plugin_export result: {}", error),
-                            is_error: true,
-                        },
-                    },
+                        flat_output(format_plugin_export_output(&result))
+                    }
                     Err(error) => ToolResult {
                         output: error,
                         is_error: true,
@@ -1051,6 +1222,79 @@ pub(super) fn plugin_export() -> ToolDef {
 mod tests {
     use super::*;
     use crate::tool::{ToolExecutionContext, ToolRegistry};
+
+    fn installed_plugin_summary() -> crate::plugin::InstalledPluginSummary {
+        crate::plugin::InstalledPluginSummary {
+            id: "replay-tools".to_string(),
+            name: "Replay Tools".to_string(),
+            version: "1.2.0".to_string(),
+            scope: crate::plugin::PluginInstallScope::Project,
+            enabled: true,
+            root: "F:\\Game\\Locus\\plugins\\replay-tools".to_string(),
+            compatibility: crate::plugin::LocusPluginCompatibility {
+                project_independent: Some(false),
+            },
+            dependencies: crate::plugin::LocusPluginDependencies {
+                project: vec![crate::plugin::LocusPluginProjectDependency {
+                    kind: "unity-package".to_string(),
+                    name: "com.unity.test-framework".to_string(),
+                    version: Some("1.4.5".to_string()),
+                    notes: None,
+                }],
+            },
+            agents: Vec::new(),
+            rules: Vec::new(),
+            skills: vec![crate::plugin::PluginComponentSummary {
+                id: Some("replay".to_string()),
+                path: "skills/replay".to_string(),
+                root: "F:\\Game\\Locus\\plugins\\replay-tools\\skills\\replay".to_string(),
+            }],
+            views: Vec::new(),
+            drawers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn plugin_list_output_is_flat_and_keeps_component_paths() {
+        let output = format_plugin_list_output(&PluginListToolOutput {
+            working_dir: "F:\\Game".to_string(),
+            count: 1,
+            plugins: vec![installed_plugin_summary()],
+        });
+        assert!(output.starts_with("Plugins: count=1 working_dir=\"F:\\\\Game\""));
+        assert!(output.contains(
+            "\n- id=\"replay-tools\" name=\"Replay Tools\" version=\"1.2.0\" scope=project enabled=true"
+        ));
+        assert!(output.contains("\n  component: kind=skill id=\"replay\" path=\"skills/replay\""));
+        assert!(output.contains(
+            "\n  dependency: kind=\"unity-package\" name=\"com.unity.test-framework\" version=\"1.4.5\""
+        ));
+        assert!(!output.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn plugin_operation_outputs_are_single_records() {
+        let installed = installed_plugin_summary();
+        let install = format_plugin_install_output(&PluginInstallToolOutput {
+            source: "registry:replay-tools".to_string(),
+            registry_base_url: Some("https://plugins.example.test".to_string()),
+            installed,
+        });
+        assert!(install.starts_with(
+            "Plugin installed: source=\"registry:replay-tools\" registry_url=\"https://plugins.example.test\""
+        ));
+
+        let uninstall = format_plugin_uninstall_output(&PluginUninstallToolOutput {
+            working_dir: "F:\\Game".to_string(),
+            plugin_id: "replay-tools".to_string(),
+            scope: crate::plugin::PluginInstallScope::Project,
+            removed: "F:\\Game\\Locus\\plugins\\replay-tools".to_string(),
+        });
+        assert_eq!(
+            uninstall,
+            "Plugin uninstalled: id=\"replay-tools\" scope=project removed=\"F:\\\\Game\\\\Locus\\\\plugins\\\\replay-tools\" working_dir=\"F:\\\\Game\""
+        );
+    }
 
     fn write_plugin_manifest(root: &std::path::Path, id: &str) {
         std::fs::create_dir_all(root).expect("create plugin root");

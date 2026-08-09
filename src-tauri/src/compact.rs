@@ -2559,7 +2559,7 @@ mod tests {
             r#"{"description":"scan","prompt":"inspect project","subagent_type":"explorer"}"#;
         let task_call = ToolCallInfo {
             id: "task-1".to_string(),
-            name: "task".to_string(),
+            name: "subagent".to_string(),
             arguments: task_arguments.to_string(),
             order: None,
             server_tool: None,

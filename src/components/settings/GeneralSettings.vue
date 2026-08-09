@@ -13,6 +13,7 @@ import {
   getPythonRuntimeState,
   getSubagentMaxConcurrent,
   getSubagentMaxDepth,
+  getToolFailureLogEnabled,
   getUnityBackgroundHookEnabled,
   getUnityBackgroundHookStatus,
   savePythonRuntimeSelection,
@@ -20,6 +21,7 @@ import {
   setLlmRetryMaxAttempts,
   setSubagentMaxConcurrent,
   setSubagentMaxDepth,
+  setToolFailureLogEnabled,
   setUnityBackgroundHookEnabled,
   type AppCloseBehavior,
 } from "../../services/system";
@@ -62,6 +64,9 @@ const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
 const debugBusy = ref(false);
+const toolFailureLogEnabled = ref(false);
+const toolFailureLogReady = ref(false);
+const toolFailureLogBusy = ref(false);
 const closeBehavior = ref<AppCloseBehavior>("exit");
 const closeBehaviorReady = ref(false);
 const closeBehaviorBusy = ref(false);
@@ -118,6 +123,11 @@ const debugStatusLabel = computed(() => {
   return debugEnabled.value
     ? t("settings.general.debugModeOn")
     : t("settings.general.debugModeOff");
+});
+
+const toolFailureLogStatusLabel = computed(() => {
+  if (!toolFailureLogReady.value) return t("common.loading");
+  return toolFailureLogEnabled.value ? t("common.enabled") : t("common.disabled");
 });
 
 const llmRetryStatusLabel = computed(() => {
@@ -200,6 +210,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 
 onMounted(() => {
   void refreshDebugMode();
+  void refreshToolFailureLogEnabled();
   void refreshLlmRetryMaxAttempts();
   void refreshSubagentLimits();
   void refreshUnityBackgroundHook();
@@ -239,6 +250,40 @@ async function toggleDebug() {
     });
   } finally {
     debugBusy.value = false;
+  }
+}
+
+async function refreshToolFailureLogEnabled() {
+  try {
+    toolFailureLogEnabled.value = await getToolFailureLogEnabled();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadToolFailureLog",
+    });
+  } finally {
+    toolFailureLogReady.value = true;
+  }
+}
+
+async function toggleToolFailureLog() {
+  if (!toolFailureLogReady.value || toolFailureLogBusy.value) return;
+  const previous = toolFailureLogEnabled.value;
+  const next = !previous;
+  toolFailureLogEnabled.value = next;
+  toolFailureLogBusy.value = true;
+  try {
+    await setToolFailureLogEnabled(next);
+  } catch (e) {
+    toolFailureLogEnabled.value = previous;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleToolFailureLog",
+    });
+  } finally {
+    toolFailureLogBusy.value = false;
   }
 }
 
@@ -795,6 +840,22 @@ async function selectPythonRuntime(selectedId: string) {
       />
       <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
       <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
+    </label>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.toolFailureLog") }}</div>
+    <p class="section-desc">{{ t("settings.general.toolFailureLogDesc") }}</p>
+    <label class="debug-toggle" :aria-busy="!toolFailureLogReady">
+      <BaseSwitch
+        v-if="toolFailureLogReady"
+        :model-value="toolFailureLogEnabled"
+        :disabled="toolFailureLogBusy"
+        :aria-label="t('settings.general.toolFailureLog')"
+        @update:model-value="toggleToolFailureLog"
+      />
+      <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
+      <span class="debug-toggle-label">{{ toolFailureLogStatusLabel }}</span>
     </label>
   </div>
 

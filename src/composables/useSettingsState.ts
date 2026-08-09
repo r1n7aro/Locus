@@ -1113,7 +1113,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "read",               label: "read",               desc: t("tool.desc.read"),               defaultMode: "auto" as const },
     { name: "grep",               label: "grep",               desc: t("tool.desc.grep"),               defaultMode: "auto" as const },
     { name: "list",               label: "list",               desc: t("tool.desc.list"),               defaultMode: "auto" as const },
-    { name: "task",               label: "task",               desc: t("tool.desc.task"),               defaultMode: "ask"  as const },
+    { name: "subagent",           label: "subagent",           desc: t("tool.desc.subagent"),           defaultMode: "ask"  as const },
     { name: "todowrite",          label: "todowrite",          desc: t("tool.desc.todowrite"),          defaultMode: "auto" as const },
     { name: "ask_user_question",  label: "ask_user_question",  desc: t("tool.desc.ask_user_question"),  defaultMode: "auto" as const },
     { name: "write",              label: "write",              desc: t("tool.desc.write"),              defaultMode: "ask"  as const },
@@ -1176,6 +1176,10 @@ export function useSettingsState(emit: SettingsEmit) {
       for (const [k, v] of Object.entries(perms)) {
         normalized[k] = v === "ask" ? "ask" : "auto";
       }
+      if (normalized.subagent === undefined && normalized.task !== undefined) {
+        normalized.subagent = normalized.task;
+      }
+      delete normalized.task;
       toolPermissions.value = normalized;
     } catch { /* use defaults */ }
   }

@@ -490,7 +490,7 @@ pub(super) struct LlmCallResult {
     pub continuation_request: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RawRound {
     pub round: usize,
     pub timestamp: i64,

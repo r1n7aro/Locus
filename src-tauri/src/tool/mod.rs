@@ -1,4 +1,6 @@
 pub mod builtins;
+pub(crate) mod failure_log;
+pub(crate) mod output;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -177,7 +179,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "cancel_task",
     // Planning, delegation & user interaction.
     "todowrite",
-    "task",
+    "subagent",
     "ask_user_question",
     "exit_plan_mode",
     // Unity editor actions.
@@ -303,7 +305,13 @@ impl ToolRegistry {
     }
 
     pub fn canonical_name(&self, name: &str) -> Option<String> {
-        self.get(name)
+        let normalized = normalize_tool_name_key(name);
+        let lookup_name = if normalized == "task" && self.get("subagent").is_some() {
+            "subagent"
+        } else {
+            normalized.as_str()
+        };
+        self.get(lookup_name)
             .map(|def| def.name.clone())
             .or_else(|| crate::commands::canonical_skill_package_tool_name(name))
     }
@@ -420,29 +428,29 @@ impl ToolRegistry {
         registry
     }
 
-    pub fn register_task_tool(&mut self, subagents: &[(String, String)]) {
+    pub fn register_subagent_tool(&mut self, subagents: &[(String, String)]) {
         let agent_list: String = subagents
             .iter()
             .map(|(id, desc)| format!("- {}: {}", id, desc))
             .collect::<Vec<_>>()
             .join("\n");
 
-        let description = crate::prompt::tools::TASK.replace("{agent_list}", &agent_list);
+        let description = crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list);
 
         let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
             Box::pin(async {
                 ToolResult {
-                    output: "Error: task tool should be intercepted by agent loop, not executed directly".to_string(),
+                    output: "Error: subagent tool should be intercepted by agent loop, not executed directly".to_string(),
                     is_error: true,
                 }
             })
         });
 
         self.register_builtin(ToolDef {
-            name: "task".to_string(),
+            name: "subagent".to_string(),
             description,
             // Subagents run their own tracked rounds via the shared
-            // UndoManager; tracking the parent `task` round as well would
+            // UndoManager; tracking the parent `subagent` round as well would
             // double-record the same changes.
             mutates_workspace: false,
             parameters: serde_json::json!({
@@ -505,7 +513,7 @@ mod tests {
     #[test]
     fn every_builtin_tool_has_an_explicit_priority_rank() {
         let mut registry = ToolRegistry::with_builtins();
-        registry.register_task_tool(&[]);
+        registry.register_subagent_tool(&[]);
         for key in &registry.built_in_tools {
             assert!(
                 tool_priority_rank(key) < TOOL_PRIORITY_ORDER.len(),
@@ -631,6 +639,18 @@ mod tests {
         assert_eq!(
             registry.default_load_mode("unity_capture_viewport"),
             ToolLoadMode::Lazy
+        );
+    }
+
+    #[test]
+    fn registry_maps_legacy_task_name_to_subagent() {
+        let mut registry = ToolRegistry::with_builtins();
+        registry.register_subagent_tool(&[]);
+
+        assert_eq!(registry.canonical_name("task").as_deref(), Some("subagent"));
+        assert_eq!(
+            registry.canonical_name("subagent").as_deref(),
+            Some("subagent")
         );
     }
 

@@ -17,7 +17,7 @@ Agent 通过调用工具来读取和修改项目。「设置 → 工具权限」
 ## 权限的层级
 
 - **全局模式**：`Auto` 直接放行全部工具调用；`Ask` 时才逐项检查下方规则。
-- **单项工具权限**：`Ask` 模式下，每个工具可以单独设为 `Auto` 或 `Ask`。未单独设置时使用默认值：读取类工具（`read`、`grep`、各类查询与搜索）默认自动执行；修改与执行类工具（`write`、`edit`、`bash`、`web_fetch`、`unity_execute`、`unity_run_states`、`task`）默认需要确认。
+- **单项工具权限**：`Ask` 模式下，每个工具可以单独设为 `Auto` 或 `Ask`。未单独设置时使用默认值：读取类工具（`read`、`grep`、各类查询与搜索）默认自动执行；修改与执行类工具（`write`、`edit`、`bash`、`web_fetch`、`unity_execute`、`unity_run_states`、`subagent`）默认需要确认。
 - **行为确认**：独立于全局模式的额外确认闸门，见下文。
 
 ## 审批卡片

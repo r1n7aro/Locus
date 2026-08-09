@@ -8,7 +8,7 @@
     "bash",
     "list",
     "grep",
-    "task",
+    "subagent",
     "todowrite",
     "ask_user_question",
     "web_fetch",

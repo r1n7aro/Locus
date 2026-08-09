@@ -116,7 +116,7 @@
             "**按文件撤回。** 变更面板、diff 审查窗口及新增的行右键菜单支持把单个文件恢复到本轮修改前的快照，不影响撤销栈；若该文件之后还有编辑，会先询问再回滚。(#100)",
             "**模型请求自动重试。** 连接错误、超时、HTTP 5xx 与 429 限流自动重试，429 遵循 `Retry-After`；仅在尚未流式产出任何内容前重试；次数可在通用设置调整（默认 3，设 0 关闭）。(#101)",
             "**内联 `<think>` 标签转入思考通道。** chat-completions 与 OpenRouter 路径上，流式正文中的 `<think>…</think>` 片段会从消息正文剥离并作为思考过程展示（默认开启）。",
-            "**子代理限制。** 通用设置新增 `task` 子代理最大嵌套深度与单会话最大并发（默认深度 1）；超限调用会返回错误并说明当前限制。",
+            "**子代理限制。** 通用设置提供 `subagent` 最大嵌套深度与单会话最大并发（默认深度 1）；超限调用会返回错误并说明当前限制。",
             "**`/dream` 记忆整理技能。** 内置技能：合并重复记忆、修正过期事实、精简记忆索引。"
           ]
         },
@@ -323,7 +323,7 @@
             "**Per-file revert.** The changes panel, the diff review window, and a new row context menu can restore a single file to its snapshot from before the current round, without popping the undo stack. If the file has later edits, Locus asks before rolling them back. (#100)",
             "**Automatic retry for model requests.** Connection errors, timeouts, HTTP 5xx, and 429 rate limits retry automatically, honoring `Retry-After` on 429. Retries only happen before any output has streamed; the attempt cap is adjustable in General settings (default 3, 0 disables). (#101)",
             "**Inline `<think>` tags routed to the thinking channel.** On the chat-completions and OpenRouter paths, inline `<think>…</think>` segments in streamed replies are stripped from the message body and shown as thinking instead (enabled by default).",
-            "**Subagent limits.** General settings now cap `task` subagent nesting depth and per-session concurrency (default depth 1). Calls over the limit return an error explaining the current caps.",
+            "**Subagent limits.** General settings cap `subagent` nesting depth and per-session concurrency (default depth 1). Calls over the limit return an error explaining the current caps.",
             "**`/dream` memory consolidation skill.** A built-in skill that merges duplicate memories, fixes stale facts, and prunes the Memory index."
           ]
         },
