@@ -1,6 +1,6 @@
 import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -8,11 +8,45 @@ const logPath = resolve(scriptDir, "..", ".tmp", "chrome-devtools-mcp-wrapper.lo
 mkdirSync(dirname(logPath), { recursive: true });
 const log = createWriteStream(logPath, { flags: "a" });
 
-const bunPath = process.env.BUN_EXE || "C:\\Users\\ExampleUser\\.bun\\bin\\bun.exe";
+const bunPath = findBunExecutable();
 const chromeDevtoolsMcpVersion = "0.23.0";
 const packageName = "chrome-devtools-mcp";
 const packageBin = join("build", "src", "bin", "chrome-devtools-mcp.js");
 const mcpArgs = process.argv.slice(2);
+
+function findBunExecutable() {
+  const configured = process.env.BUN_EXE?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  const executableName = process.platform === "win32" ? "bun.exe" : "bun";
+  const bunInstall = process.env.BUN_INSTALL?.trim();
+  if (bunInstall) {
+    const installed = join(bunInstall, "bin", executableName);
+    if (existsSync(installed)) {
+      return installed;
+    }
+  }
+
+  const pathEntries = process.env.PATH?.split(delimiter).filter(Boolean) ?? [];
+  for (const pathEntry of pathEntries) {
+    const candidate = join(pathEntry, executableName);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  const home = process.env.USERPROFILE || process.env.HOME;
+  if (home) {
+    const userInstall = join(home, ".bun", "bin", executableName);
+    if (existsSync(userInstall)) {
+      return userInstall;
+    }
+  }
+
+  return "bun";
+}
 
 function parseVersion(version) {
   return version.split(".").map((part) => Number.parseInt(part, 10) || 0);

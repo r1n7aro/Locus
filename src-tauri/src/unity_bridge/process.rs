@@ -1133,30 +1133,30 @@ mod tests {
     #[test]
     fn parses_locus_project_path_argument() {
         let args = split_windows_command_line(
-            r#""C:\Program Files\Unity\Editor\Unity.exe" -projectPath C:\Projects\Game -batchmode"#,
+            r#""C:\Program Files\Unity\Editor\Unity.exe" -projectPath D:\Projects\Game -batchmode"#,
         );
 
-        assert_eq!(project_path_from_args(&args), Some(r#"C:\Projects\Game"#));
+        assert_eq!(project_path_from_args(&args), Some(r#"D:\Projects\Game"#));
     }
 
     #[test]
     fn parses_project_path_equals_form() {
         let args =
-            split_windows_command_line(r#"Unity.exe -projectPath="C:\Projects\Game With Spaces""#);
+            split_windows_command_line(r#"Unity.exe -projectPath="D:\Projects\Game With Spaces""#);
 
         assert_eq!(
             project_path_from_args(&args),
-            Some(r#"C:\Projects\Game With Spaces"#)
+            Some(r#"D:\Projects\Game With Spaces"#)
         );
     }
 
     #[test]
     fn detects_unity_asset_import_worker_processes() {
         let worker_args = split_windows_command_line(
-            r#""E:\2022.3.47f1\Editor\Unity.exe" "-adb2" "-batchMode" "-noUpm" "-name" "AssetImportWorker1" "-projectPath" "C:/Projects/Game""#,
+            r#""C:\Unity\2022.3.47f1\Editor\Unity.exe" "-adb2" "-batchMode" "-noUpm" "-name" "AssetImportWorker1" "-projectPath" "D:/Projects/Game""#,
         );
         let editor_args = split_windows_command_line(
-            r#"E:\2022.3.47f1\Editor\Unity.exe -projectpath "C:\Projects\Game" -useHub -hubIPC"#,
+            r#"C:\Unity\2022.3.47f1\Editor\Unity.exe -projectpath "D:\Projects\Game" -useHub -hubIPC"#,
         );
 
         assert!(unity_process_args_are_worker(&worker_args));
@@ -1165,13 +1165,13 @@ mod tests {
 
     #[test]
     fn normalizes_extended_path_prefixes() {
-        let normalized = normalize_project_identity(r#"\\?\C:\Projects\Game\"#).unwrap();
+        let normalized = normalize_project_identity(r#"\\?\D:\Projects\Game\"#).unwrap();
 
         #[cfg(windows)]
-        assert_eq!(normalized, r#"c:\projects\game"#);
+        assert_eq!(normalized, r#"d:\projects\game"#);
 
         #[cfg(not(windows))]
-        assert_eq!(normalized, r#"C:\Projects\Game"#);
+        assert_eq!(normalized, r#"D:\Projects\Game"#);
     }
 
     #[cfg(windows)]

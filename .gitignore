@@ -1,4 +1,39 @@
-# Logs
+# Developer-local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+.direnv/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.local
+*.local.*
+.locus-dev.local.json
+.mcp.json
+.npmrc
+.pypirc
+.netrc
+.docker/config.json
+.aws/
+.azure/
+.kube/
+.config/gcloud/
+credentials/
+credentials.*
+!credentials.example.*
+secrets/
+secrets.*
+!secrets.example.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Logs, diagnostics, and data snapshots
 logs
 *.log
 npm-debug.log*
@@ -6,11 +41,28 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+*.dmp
+*.stackdump
+*.heapsnapshot
+*.har
+*.network-request
+*.network-response
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
 
 # Local workspace caches and artifacts
 .cache/
 .codex/
+.codex-logs/
 .tmp/
+.locus-hr-out/
 codex-artifacts/
 tmp/
 debug/
@@ -19,7 +71,6 @@ target-check/
 node_modules
 dist
 dist-ssr
-*.local
 site/
 .venv/
 .venv-docs/
@@ -49,6 +100,12 @@ locus_unity/Editor/Roslyn/Locus.Roslyn.dll
 
 # Editor directories and files
 .vscode/
+.vs/
+.cursor/
+.windsurf/
+.continue/
+.history/
+.aider*
 .idea
 .DS_Store
 *.suo

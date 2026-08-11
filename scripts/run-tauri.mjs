@@ -1,5 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,6 +20,8 @@ const CODEX_MCP_SERVER_NAME = "locus_webview2_devtools";
 const LEGACY_CODEX_MCP_SERVER_NAMES = ["locus-webview2-devtools"];
 const CODEX_CLI_ENV_KEY = "LOCUS_CODEX_CLI";
 const CODEX_NODE_ENV_KEY = "LOCUS_CODEX_NODE";
+const ISOLATED_RUNTIME_BASE_ENV_KEY = "LOCUS_ISOLATED_RUNTIME_BASE";
+const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
 const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";
@@ -82,7 +91,13 @@ if (isolatedRuntime.enabled && isHelpOrVersionCommand) {
 }
 
 if (isolatedRuntime.enabled) {
-  const manifest = prepareIsolatedRuntime(isolatedRuntime.paths);
+  let manifest;
+  try {
+    manifest = prepareIsolatedRuntime(isolatedRuntime.paths);
+  } catch (error) {
+    console.error(`[locus] ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(2);
+  }
   env.LOCUS_RUNTIME_ROOT = manifest.runtimeRoot;
   env.LOCUS_RUNTIME_DATA_DIR = manifest.databaseDir;
   env.LOCUS_RUNTIME_CONFIG_DIR = manifest.configDir;
@@ -109,6 +124,7 @@ function parseIsolatedRuntimeArgs(values, enabledByCommand) {
     const [name, inlineValue = ""] = arg.split(/=(.*)/s, 2);
     const key = {
       "--runtime-root": "runtimeRoot",
+      "--runtime-base": "runtimeBase",
       "--database-dir": "databaseDir",
       "--data-dir": "databaseDir",
       "--config-dir": "configDir",
@@ -137,7 +153,7 @@ function parseIsolatedRuntimeArgs(values, enabledByCommand) {
 function prepareIsolatedRuntime(requestedPaths) {
   const runtimeRoot = requestedPaths.runtimeRoot
     ? path.resolve(requestedPaths.runtimeRoot)
-    : mkdtempSync(path.join(tmpdir(), "locus-app-test-"));
+    : createGeneratedRuntimeRoot(requestedPaths.runtimeBase);
   const manifest = {
     runtimeRoot,
     databaseDir:
@@ -168,6 +184,46 @@ function prepareIsolatedRuntime(requestedPaths) {
   return manifest;
 }
 
+function createGeneratedRuntimeRoot(requestedBase) {
+  const base = resolveIsolatedRuntimeBase(requestedBase);
+  mkdirSync(base, { recursive: true });
+  return mkdtempSync(path.join(base, "locus-app-test-"));
+}
+
+function resolveIsolatedRuntimeBase(requestedBase) {
+  if (requestedBase) {
+    return path.resolve(requestedBase);
+  }
+
+  const environmentBase = process.env[ISOLATED_RUNTIME_BASE_ENV_KEY]?.trim();
+  if (environmentBase) {
+    return path.resolve(environmentBase);
+  }
+
+  const localConfigPath = path.join(repoRoot, LOCAL_DEV_CONFIG_FILE);
+  if (!existsSync(localConfigPath)) {
+    return tmpdir();
+  }
+
+  let localConfig;
+  try {
+    localConfig = JSON.parse(readFileSync(localConfigPath, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Failed to read ${LOCAL_DEV_CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const localBase = localConfig?.isolatedRuntimeBase;
+  if (localBase == null || localBase === "") {
+    return tmpdir();
+  }
+  if (typeof localBase !== "string" || !path.isAbsolute(localBase)) {
+    throw new Error(`${LOCAL_DEV_CONFIG_FILE} isolatedRuntimeBase must be an absolute path.`);
+  }
+  return path.normalize(localBase);
+}
+
 function printIsolatedDevHelp() {
   console.log(`Usage:
   bun tauri dev-mcp --isolated [options]
@@ -176,14 +232,16 @@ function printIsolatedDevHelp() {
 
 Options:
   --runtime-root <dir>       Root used for every unspecified isolated directory
+  --runtime-base <dir>       Parent for an automatically named isolated runtime
   --database-dir <dir>      Directory containing locus.db (alias: --data-dir)
   --config-dir <dir>        Persistent application configuration directory
   --log-dir <dir>           Directory containing locus.log
   --workspace <dir>         Initial Locus workspace; created when missing
   --webview-data-dir <dir>  Isolated WebView2 profile and local storage
 
-When no directory is supplied, Locus creates a complete environment under
-the system temporary directory and prints it as LOCUS_RUNTIME_JSON.`);
+Generated runtime root precedence: --runtime-base,
+${ISOLATED_RUNTIME_BASE_ENV_KEY}, ${LOCAL_DEV_CONFIG_FILE}, then the system
+temporary directory. Locus prints the result as LOCUS_RUNTIME_JSON.`);
 }
 
 function hasConfigArg(currentArgs) {

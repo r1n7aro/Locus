@@ -30,6 +30,9 @@ describe("runtime data isolation", () => {
       'RUNTIME_DATA_DIR_ENV: &str = "LOCUS_RUNTIME_DATA_DIR"',
     );
     expect(runtimePaths).toContain(
+      'ISOLATED_RUNTIME_BASE_ENV: &str = "LOCUS_ISOLATED_RUNTIME_BASE"',
+    );
+    expect(runtimePaths).toContain(
       'RUNTIME_CONFIG_DIR_ENV: &str = "LOCUS_RUNTIME_CONFIG_DIR"',
     );
     expect(runtimePaths).toContain(
@@ -51,9 +54,10 @@ describe("runtime data isolation", () => {
     expect(lib).toContain("runtime_workspace_for_setup");
   });
 
-  it("provides a bun dev-mcp entry that creates temporary directories by default", () => {
+  it("provides a portable bun dev-mcp entry with local runtime-base configuration", () => {
     const packageJson = read("package.json");
     const launcher = read("scripts/run-tauri.mjs");
+    const gitignore = read(".gitignore");
 
     expect(packageJson).toContain(
       '"locus:test:app": "bun run tauri dev-mcp-isolated"',
@@ -62,8 +66,16 @@ describe("runtime data isolation", () => {
       'const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";',
     );
     expect(launcher).toContain(
-      'mkdtempSync(path.join(tmpdir(), "locus-app-test-"))',
+      'mkdtempSync(path.join(base, "locus-app-test-"))',
     );
+    expect(launcher).toContain(
+      'const ISOLATED_RUNTIME_BASE_ENV_KEY = "LOCUS_ISOLATED_RUNTIME_BASE"',
+    );
+    expect(launcher).toContain(
+      'const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json"',
+    );
+    expect(launcher).toContain('"--runtime-base": "runtimeBase"');
+    expect(gitignore).toContain(".locus-dev.local.json");
     expect(launcher).toContain(
       "env.LOCUS_RUNTIME_DATA_DIR = manifest.databaseDir",
     );
@@ -78,6 +90,15 @@ describe("runtime data isolation", () => {
       "env.WEBVIEW2_USER_DATA_FOLDER = manifest.webviewDataDir",
     );
     expect(launcher).toContain("LOCUS_RUNTIME_JSON");
+  });
+
+  it("discovers Bun without embedding a developer profile path", () => {
+    const wrapper = read("scripts/chrome-devtools-mcp-wrapper.mjs");
+
+    expect(wrapper).toContain("const bunPath = findBunExecutable()");
+    expect(wrapper).toContain("process.env.BUN_EXE");
+    expect(wrapper).toContain("process.env.BUN_INSTALL");
+    expect(wrapper).not.toMatch(/[A-Za-z]:\\\\Users\\\\[^<]/);
   });
 
   it("locks the resolved data directory before opening the session store", () => {

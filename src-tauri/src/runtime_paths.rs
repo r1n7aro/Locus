@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const RUNTIME_ROOT_ENV: &str = "LOCUS_RUNTIME_ROOT";
+pub(crate) const ISOLATED_RUNTIME_BASE_ENV: &str = "LOCUS_ISOLATED_RUNTIME_BASE";
 pub(crate) const RUNTIME_DATA_DIR_ENV: &str = "LOCUS_RUNTIME_DATA_DIR";
 pub(crate) const RUNTIME_CONFIG_DIR_ENV: &str = "LOCUS_RUNTIME_CONFIG_DIR";
 pub(crate) const RUNTIME_LOG_DIR_ENV: &str = "LOCUS_RUNTIME_LOG_DIR";
@@ -24,6 +25,7 @@ struct ParsedRuntimeArgs {
     help: bool,
     isolated: bool,
     runtime_root: Option<PathBuf>,
+    runtime_base: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     config_dir: Option<PathBuf>,
     log_dir: Option<PathBuf>,
@@ -89,6 +91,10 @@ impl ParsedRuntimeArgs {
                 "--locus-runtime-root" => {
                     parsed.runtime_root = Some(read_path_value(name, inline, &args, &mut index)?)
                 }
+                "--locus-runtime-base" => {
+                    parsed.runtime_base = Some(read_path_value(name, inline, &args, &mut index)?);
+                    parsed.isolated = true;
+                }
                 "--locus-data-dir" | "--locus-database-dir" => {
                     parsed.data_dir = Some(read_path_value(name, inline, &args, &mut index)?)
                 }
@@ -118,7 +124,11 @@ impl ParsedRuntimeArgs {
             std::process::exit(0);
         }
         if self.isolated && self.runtime_root.is_none() {
-            self.runtime_root = Some(create_unique_runtime_root()?);
+            let runtime_base = match self.runtime_base.as_ref() {
+                Some(base) => Some(ensure_directory(base, "isolated runtime base")?),
+                None => directory_from_env(ISOLATED_RUNTIME_BASE_ENV, "isolated runtime base")?,
+            };
+            self.runtime_root = Some(create_unique_runtime_root(runtime_base.as_deref())?);
         }
 
         if let Some(root) = self.runtime_root.as_ref() {
@@ -151,8 +161,9 @@ impl ParsedRuntimeArgs {
 fn print_runtime_help() {
     eprintln!(
         "Locus isolated runtime options:\n\
-  --locus-isolated                 Create a complete runtime under the system temp directory\n\
+  --locus-isolated                 Create a complete generated runtime\n\
   --locus-runtime-root <dir>       Root for unspecified isolated directories\n\
+  --locus-runtime-base <dir>       Parent for an automatically named isolated runtime\n\
   --locus-database-dir <dir>       Directory containing locus.db\n\
   --locus-config-dir <dir>         Persistent application configuration directory\n\
   --locus-log-dir <dir>            Directory containing locus.log\n\
@@ -230,12 +241,14 @@ fn read_path_value(
     Ok(path)
 }
 
-fn create_unique_runtime_root() -> Result<PathBuf, String> {
+fn create_unique_runtime_root(runtime_base: Option<&Path>) -> Result<PathBuf, String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let base = std::env::temp_dir();
+    let base = runtime_base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
     for suffix in 0..100u32 {
         let name = if suffix == 0 {
             format!("locus-runtime-{}-{timestamp}", std::process::id())
@@ -299,5 +312,18 @@ mod tests {
         let error = ParsedRuntimeArgs::parse(args(&["--locus-data-dir", "relative/db"]))
             .expect_err("relative path should fail");
         assert!(error.contains("requires an absolute path"));
+    }
+
+    #[test]
+    fn runtime_base_enables_isolation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let parsed = ParsedRuntimeArgs::parse(args(&[
+            "--locus-runtime-base",
+            root.path().to_str().unwrap(),
+        ]))
+        .expect("parse");
+
+        assert!(parsed.isolated);
+        assert_eq!(parsed.runtime_base.as_deref(), Some(root.path()));
     }
 }
