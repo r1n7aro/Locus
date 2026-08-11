@@ -7605,9 +7605,9 @@ impl AgentInstance {
 
     /// Default compaction path for the OpenAI Codex subscription backend,
     /// aligned with codex-rs: a unary `POST /responses/compact` call whose
-    /// response carries an encrypted compaction item. The item is stored on the
-    /// handoff message and replayed to the Codex API by the payload builders;
-    /// the handoff text itself is only a local fallback for other backends.
+    /// complete canonical output window is stored on the handoff message and
+    /// replayed to the Codex API by the payload builders. The handoff text
+    /// itself remains a local fallback for other backends.
     async fn execute_codex_remote_compact(
         &self,
         app_handle: &AppHandle,
@@ -7686,7 +7686,7 @@ impl AgentInstance {
         .await
         {
             Ok(outcome) => Ok(outcome),
-            Err(error) if is_codex_unauthorized_error(&error) => {
+            Err(error) if is_codex_unauthorized_error(&error.message) => {
                 eprintln!(
                     "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
                 );
@@ -7734,6 +7734,7 @@ impl AgentInstance {
                 outcome
             }
             Err(error) => {
+                let error_message = error.to_string();
                 self.record_raw_attempt(
                     store,
                     run_id,
@@ -7745,30 +7746,34 @@ impl AgentInstance {
                     &api_tools,
                     context_tokens,
                     "failed",
-                    None,
-                    "",
-                    Some(&error),
+                    Some(&error.raw_request),
+                    &error.raw_response,
+                    Some(&error_message),
                     Some(false),
                 )
                 .await;
-                return Err(error);
+                return Err(error_message);
             }
         };
 
         eprintln!(
             "[Agent {}] codex remote compact returned {} output item(s), encrypted summary {} chars",
             self.id,
-            outcome.output_item_count,
-            outcome.encrypted_content.len()
+            outcome.output.len(),
+            outcome
+                .encrypted_content
+                .as_deref()
+                .map(str::len)
+                .unwrap_or(0)
         );
 
-        // The authoritative summary is encrypted for the Codex API only; keep a
-        // deterministic local digest so other backends and the UI retain usable
-        // handoff context if the session later switches models.
+        // The canonical provider window is opaque to Locus; keep a deterministic
+        // local digest so other backends and the UI retain usable handoff context
+        // if the session later switches models.
         let summary = compact::build_emergency_compact_summary(
             &messages,
             boundary_idx,
-            "the Codex remote compaction summary is an encrypted item that only the Codex API can read",
+            "the Codex remote compaction window contains opaque provider state that only the Codex API can read",
         );
         let keep_from_msg = &messages[boundary_idx];
         let restored_files_section = compact::build_post_compact_restored_files_section(
@@ -7781,22 +7786,21 @@ impl AgentInstance {
             &summary,
             &restored_files_section,
             keep_from_msg.created_at,
-            compact::will_retain_user_messages(&messages, context_limit),
+            false,
             transcript.as_ref(),
         );
-
-        let (count_before, count_after) = store.compact_messages(
+        let compaction_request = serde_json::json!({
+            "codex_compaction": {
+                "output": outcome.output,
+                "encrypted_content": outcome.encrypted_content,
+            }
+        });
+        let (count_before, count_after) = store.compact_messages_with_response_request(
             &self.session_id,
             &summary_msg,
             &keep_from_msg.id,
-            compact::compact_user_message_token_budget(context_limit),
-        )?;
-        store.set_message_response_request_metadata(
-            &self.session_id,
-            &summary_msg.id,
-            &serde_json::json!({
-                "codex_compaction": { "encrypted_content": outcome.encrypted_content }
-            }),
+            0,
+            Some(&compaction_request),
         )?;
         crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         let compacted_context_tokens = self

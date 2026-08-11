@@ -45,6 +45,7 @@ grep-regex = "0.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks"], default-features = false }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["native-tls", "proxy"] }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate", "proxy"] }
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
 # MCP server (expose unity tools to external harnesses): hyper serves the
 # localhost Streamable HTTP endpoint; toml_edit rewrites Codex's config.toml

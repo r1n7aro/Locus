@@ -1603,6 +1603,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3199,6 +3200,7 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-c-sharp",
+ "tungstenite",
  "ureq",
  "url",
  "uuid",
@@ -6893,6 +6895,7 @@ source = "git+https://github.com/openai-oss-forks/tungstenite-rs?rev=4fffad30fe3
 dependencies = [
  "bytes",
  "data-encoding",
+ "flate2",
  "headers",
  "http",
  "httparse",
@@ -8388,6 +8391,12 @@ dependencies = [
  "thiserror 2.0.18",
  "zopfli",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

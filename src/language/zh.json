@@ -962,7 +962,7 @@
   "chat.compactedContext.promptPrefixPlaceholder": "[前置系统注入]",
   "chat.compactedContext.promptSuffixPlaceholder": "[后置系统注入]",
   "chat.compactedContext.codexEncrypted": "Codex 加密压缩项",
-  "chat.compactedContext.codexEncryptedDetail": "Codex 服务端仅返回加密项（{0} 字符），Locus 无法读取其中正文。",
+  "chat.compactedContext.codexEncryptedDetail": "Codex 服务端返回规范压缩窗口，其中加密上下文为 {0} 字符；窗口内保留项会原样用于后续请求。",
   "chat.compactedContext.localFallback": "查看 Locus 本地回退交接（未发送给 Codex）",
   "chat.compactedContext.imageAlt": "上下文图片 {0}",
   "chat.transcript.reactiveCompactNotice": "上一请求超出模型上下文窗口，已自动压缩对话历史",

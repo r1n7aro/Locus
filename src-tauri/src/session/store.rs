@@ -55,7 +55,7 @@ pub struct CompactedContextOutput {
     /// itself remains provable.
     pub snapshot_status: String,
     /// readable for prompt-based/local compaction; codexEncrypted when the
-    /// actual Codex handoff is an opaque server compaction item.
+    /// actual Codex handoff is a canonical server compaction window.
     pub compaction_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_content_chars: Option<usize>,
@@ -866,11 +866,11 @@ impl SessionStore {
     pub fn create_export_snapshot(&self) -> Result<Self, String> {
         self.event_writer.flush()?;
 
-        let source = Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|e| format!("Failed to open session database for export snapshot: {}", e))?;
+        let source =
+            Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| {
+                    format!("Failed to open session database for export snapshot: {}", e)
+                })?;
         source
             .busy_timeout(Duration::from_secs(10))
             .map_err(|e| format!("Failed to configure export snapshot timeout: {}", e))?;
@@ -2205,22 +2205,21 @@ impl SessionStore {
         let now = Self::now_ts();
         let source_tool_dir = snapshot.session_tool_results_dir(source_id);
         let target_tool_dir = self.session_tool_results_dir(&new_id);
-        let staging_tool_dir = target_tool_dir.with_file_name(format!(
-            ".{}.copying-{}",
-            new_id,
-            Uuid::new_v4()
-        ));
+        let staging_tool_dir =
+            target_tool_dir.with_file_name(format!(".{}.copying-{}", new_id, Uuid::new_v4()));
         let copied_tool_results = source_tool_dir.is_dir();
         if copied_tool_results {
             copy_dir_recursively(&source_tool_dir, &staging_tool_dir)?;
             if let Some(parent) = target_tool_dir.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create fork tool result parent: {}", e)
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create fork tool result parent: {}", e))?;
             }
             if let Err(error) = std::fs::rename(&staging_tool_dir, &target_tool_dir) {
                 let _ = std::fs::remove_dir_all(&staging_tool_dir);
-                return Err(format!("Failed to publish copied fork tool results: {}", error));
+                return Err(format!(
+                    "Failed to publish copied fork tool results: {}",
+                    error
+                ));
             }
         }
 
@@ -4107,9 +4106,9 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Attaches a response-request metadata value to a message, e.g. the
-    /// encrypted Codex compaction item stored on a context-handoff message so
-    /// payload builders can replay it to the Codex API.
+    /// Attaches a response-request metadata value to a message, e.g. a canonical
+    /// Codex compaction window stored on a context-handoff message so payload
+    /// builders can replay it to the Codex API.
     pub fn set_message_response_request_metadata(
         &self,
         session_id: &str,
@@ -4803,11 +4802,18 @@ impl SessionStore {
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
             .map(str::len);
+        let has_codex_compaction_output = metadata
+            .response_request
+            .as_ref()
+            .and_then(|value| value.get("codex_compaction"))
+            .and_then(|value| value.get("output"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|output| !output.is_empty());
 
         Ok(Some(CompactedContextOutput {
             message_id: message_id.to_string(),
             snapshot_status,
-            compaction_kind: if encrypted_content_chars.is_some() {
+            compaction_kind: if encrypted_content_chars.is_some() || has_codex_compaction_output {
                 "codexEncrypted".to_string()
             } else {
                 "readable".to_string()
@@ -5495,6 +5501,27 @@ impl SessionStore {
         keep_from_message_id: &str,
         retained_user_budget_tokens: u32,
     ) -> Result<(u32, u32), String> {
+        self.compact_messages_with_response_request(
+            session_id,
+            summary_msg,
+            keep_from_message_id,
+            retained_user_budget_tokens,
+            None,
+        )
+    }
+
+    /// Installs a compacted handoff and its canonical provider request payload
+    /// in the same transaction. This prevents a successful remote compaction
+    /// from leaving a handoff that has already hidden the old prompt but cannot
+    /// replay the server-provided replacement window.
+    pub fn compact_messages_with_response_request(
+        &self,
+        session_id: &str,
+        summary_msg: &ChatMessage,
+        keep_from_message_id: &str,
+        retained_user_budget_tokens: u32,
+        response_request: Option<&serde_json::Value>,
+    ) -> Result<(u32, u32), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         let count_before: u32 = conn
@@ -5507,6 +5534,12 @@ impl SessionStore {
 
         conn.execute("BEGIN", [])
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        let response_request_id = Self::persist_response_request_with_conn(&conn, response_request)
+            .map_err(|error| {
+                let _ = conn.execute("ROLLBACK", []);
+                error
+            })?;
 
         let prompt_messages = Self::get_messages_with_conn_filtered_static(&conn, session_id, true)
             .map_err(|e| {
@@ -5574,14 +5607,15 @@ impl SessionStore {
         }
 
         conn.execute(
-            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?6)",
             params![
                 summary_msg.id,
                 session_id,
                 summary_msg.role.as_str(),
                 summary_msg.content,
-                summary_msg.created_at
+                summary_msg.created_at,
+                response_request_id,
             ],
         )
         .map_err(|e| {
@@ -6076,8 +6110,8 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionStore,
-        SessionEventAppend, CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
+        build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionEventAppend,
+        SessionStore, CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
         DEFERRED_TOOL_IMAGE_DATA_PREFIX, RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING,
         RUN_STATUS_DONE, RUN_STATUS_ERROR,
     };
@@ -7240,7 +7274,13 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
-            .create_session("Running snapshot", None, Some("workspace"), "chat", Some("dev"))
+            .create_session(
+                "Running snapshot",
+                None,
+                Some("workspace"),
+                "chat",
+                Some("dev"),
+            )
             .expect("create session");
         store
             .add_message(&session_id, MessageRole::User, "before snapshot")
@@ -8820,6 +8860,71 @@ mod tests {
                 .expect("first prompt user"),
             Some(old_user_id.to_string())
         );
+    }
+
+    #[test]
+    fn canonical_codex_compaction_replaces_prompt_atomically_without_local_tail() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Canonical Compact", None, None, "chat", None)
+            .expect("create session");
+        let first_message_id = store
+            .add_message(&session_id, MessageRole::User, "旧需求")
+            .expect("insert user");
+        store
+            .add_message(&session_id, MessageRole::Assistant, "旧回答")
+            .expect("insert assistant");
+
+        let mut handoff = compact::build_post_compact_message(
+            "1. Primary Request and Intent\n本地回退摘要。",
+            "",
+            100,
+            false,
+            None,
+        );
+        handoff.id = "canonical-handoff".to_string();
+        let response_request = serde_json::json!({
+            "codex_compaction": {
+                "output": [
+                    { "type": "compaction_summary", "encrypted_content": "opaque" },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "retained" }]
+                    }
+                ],
+                "encrypted_content": "opaque"
+            }
+        });
+
+        let (count_before, count_after) = store
+            .compact_messages_with_response_request(
+                &session_id,
+                &handoff,
+                &first_message_id,
+                0,
+                Some(&response_request),
+            )
+            .expect("install canonical compact window");
+
+        assert_eq!(count_before, 2);
+        assert_eq!(count_after, 1);
+        let prompt = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt");
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].id, "canonical-handoff");
+        let requests = store
+            .get_response_request_metadata(&session_id)
+            .expect("load response request");
+        assert_eq!(requests.get("canonical-handoff"), Some(&response_request));
+        let output = store
+            .get_compacted_context_output(&session_id, "canonical-handoff")
+            .expect("load compacted context")
+            .expect("compacted context exists");
+        assert_eq!(output.compaction_kind, "codexEncrypted");
+        assert_eq!(output.encrypted_content_chars, Some(6));
     }
 
     #[test]

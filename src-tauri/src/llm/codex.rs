@@ -8,14 +8,18 @@ use http::Uri;
 use hyper_util::client::legacy::connect::proxy::SocksV4;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::proxy::matcher::Intercept;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
-use tokio_tungstenite::client_async;
+use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::proxy::{
     ProxyAuth as TungsteniteProxyAuth, ProxyConfig as TungsteniteProxyConfig,
     ProxyScheme as TungsteniteProxyScheme,
@@ -28,6 +32,7 @@ use url::Url;
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.";
@@ -299,10 +304,21 @@ fn authority_host(host: &str) -> String {
     }
 }
 
-/// Extracts the opaque remote-compaction payload stored on a context-handoff
-/// message. The Codex `/responses/compact` endpoint returns the summary as an
-/// encrypted compaction item that must be replayed verbatim to the API; it is
-/// stashed in the handoff message's response-request metadata.
+/// Extracts the canonical replacement window stored on a context-handoff
+/// message. Standalone `/responses/compact` output must be replayed as-is; it
+/// generally includes retained response items in addition to the opaque
+/// compaction item.
+fn codex_compaction_output(metadata: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    metadata
+        .get("codex_compaction")?
+        .get("output")?
+        .as_array()
+        .filter(|output| !output.is_empty())
+        .map(Vec::as_slice)
+}
+
+/// Reads the legacy single-item representation and the optional diagnostic
+/// copy retained alongside canonical replacement windows.
 fn codex_compaction_encrypted_content(metadata: &serde_json::Value) -> Option<&str> {
     metadata
         .get("codex_compaction")?
@@ -374,6 +390,13 @@ fn build_input_with_metadata(
 
     let mut input = Vec::new();
     for msg in history {
+        if let Some(output) = response_request_metadata
+            .and_then(|metadata| metadata.get(&msg.id))
+            .and_then(codex_compaction_output)
+        {
+            input.extend(output.iter().cloned());
+            continue;
+        }
         if let Some(encrypted_content) = response_request_metadata
             .and_then(|metadata| metadata.get(&msg.id))
             .and_then(codex_compaction_encrypted_content)
@@ -658,6 +681,87 @@ fn request_without_input(body: &serde_json::Value) -> serde_json::Value {
     request
 }
 
+// Keep websocket reuse checks aligned with codex-rs: input is compared item by
+// item, while every request property that affects the response remains part of
+// the signature. Transport-only metadata does not invalidate a continuation.
+fn websocket_request_signature(body: &serde_json::Value) -> serde_json::Value {
+    let mut request = body.clone();
+    if let Some(map) = request.as_object_mut() {
+        map.remove("input");
+        map.remove("previous_response_id");
+        map.remove("type");
+        map.remove("client_metadata");
+        map.remove("stream_options");
+    }
+    request
+}
+
+fn clear_internal_response_item_metadata(item: &mut serde_json::Value) {
+    if let Some(map) = item.as_object_mut() {
+        map.remove("internal_chat_message_metadata_passthrough");
+    }
+}
+
+fn response_items_equal_ignoring_internal_metadata(
+    previous: &serde_json::Value,
+    current: &serde_json::Value,
+) -> bool {
+    if previous == current {
+        return true;
+    }
+
+    let mut previous = previous.clone();
+    clear_internal_response_item_metadata(&mut previous);
+    let mut current = current.clone();
+    clear_internal_response_item_metadata(&mut current);
+    previous == current
+}
+
+// Locus persists assistant text and tool calls in ChatMessage rather than the
+// raw Responses output item. Project server output back to the request shape
+// produced by build_input_with_metadata before comparing the next full input.
+fn cached_response_item_for_request(
+    response_item: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let item_type = response_item.get("type").and_then(|value| value.as_str());
+    if item_type == Some("reasoning") {
+        // The active websocket keeps reasoning in the previous-response state;
+        // Locus does not replay it in its reconstructed ChatMessage history.
+        return None;
+    }
+
+    let mut item = response_item.clone();
+    clear_internal_response_item_metadata(&mut item);
+    let Some(map) = item.as_object_mut() else {
+        return Some(item);
+    };
+
+    map.remove("id");
+    match item_type {
+        Some("message") => {
+            map.remove("type");
+            map.remove("status");
+            map.remove("phase");
+            if let Some(content) = map
+                .get_mut("content")
+                .and_then(|value| value.as_array_mut())
+            {
+                for part in content {
+                    if let Some(part) = part.as_object_mut() {
+                        part.remove("annotations");
+                        part.remove("logprobs");
+                    }
+                }
+            }
+        }
+        Some("function_call") => {
+            map.remove("status");
+        }
+        _ => {}
+    }
+    Some(item)
+}
+
 struct ContinuationRequestInput {
     input: Vec<serde_json::Value>,
     previous_response_id: Option<String>,
@@ -722,7 +826,7 @@ fn build_cached_websocket_request_input(
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    let current_request = request_without_input(body);
+    let current_request = websocket_request_signature(body);
 
     if let Some(last_response) = last_response {
         if last_response.request_signature == current_request {
@@ -732,11 +836,32 @@ fn build_cached_websocket_request_input(
                     previous_response_id: None,
                 };
             }
-            let mut baseline = last_response.input.clone();
-            baseline.extend(last_response.items_added.clone());
-            if full_input.starts_with(&baseline) {
+            let previous_input_matches = last_response.input.len() <= full_input.len()
+                && last_response
+                    .input
+                    .iter()
+                    .zip(&full_input)
+                    .all(|(previous, current)| {
+                        response_items_equal_ignoring_internal_metadata(previous, current)
+                    });
+            let mut incremental_start = last_response.input.len();
+            let response_items_match = previous_input_matches
+                && last_response.items_added.iter().all(|response_item| {
+                    let Some(previous) = cached_response_item_for_request(response_item) else {
+                        return true;
+                    };
+                    let Some(current) = full_input.get(incremental_start) else {
+                        return false;
+                    };
+                    if !response_items_equal_ignoring_internal_metadata(&previous, current) {
+                        return false;
+                    }
+                    incremental_start += 1;
+                    true
+                });
+            if response_items_match {
                 return ContinuationRequestInput {
-                    input: full_input[baseline.len()..].to_vec(),
+                    input: full_input[incremental_start..].to_vec(),
                     previous_response_id: Some(last_response.response_id.clone()),
                 };
             }
@@ -833,11 +958,40 @@ fn codex_compact_endpoint(base_url: Option<&str>) -> String {
 const COMPACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct CodexRemoteCompactOutcome {
-    pub encrypted_content: String,
-    pub output_item_count: usize,
+    pub output: Vec<serde_json::Value>,
+    pub encrypted_content: Option<String>,
     pub raw_request: String,
     pub raw_response: String,
 }
+
+#[derive(Debug)]
+pub struct CodexRemoteCompactError {
+    pub message: String,
+    pub raw_request: String,
+    pub raw_response: String,
+}
+
+impl CodexRemoteCompactError {
+    fn new(
+        message: impl Into<String>,
+        raw_request: impl Into<String>,
+        raw_response: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            raw_request: raw_request.into(),
+            raw_response: raw_response.into(),
+        }
+    }
+}
+
+impl fmt::Display for CodexRemoteCompactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodexRemoteCompactError {}
 
 /// Mirrors codex-rs `ApiCompactionInput`: the same shape as a normal Responses
 /// request minus `stream`/`store`, sent to the unary compact endpoint.
@@ -867,6 +1021,7 @@ fn build_compact_request_body(
         body["prompt_cache_key"] = serde_json::json!(sid);
     }
     apply_reasoning_effort(&mut body, model, thinking_level);
+    apply_text_verbosity_default(&mut body, model);
     if fast_mode {
         body["service_tier"] = serde_json::json!("priority");
     }
@@ -877,17 +1032,78 @@ fn extract_compaction_encrypted_content(output: &[serde_json::Value]) -> Option<
     output
         .iter()
         .rev()
-        .find(|item| item.get("type").and_then(|value| value.as_str()) == Some("compaction"))
+        .find(|item| {
+            matches!(
+                item.get("type").and_then(|value| value.as_str()),
+                Some("compaction" | "compaction_summary" | "context_compaction")
+            )
+        })
         .and_then(|item| item.get("encrypted_content"))
         .and_then(|value| value.as_str())
         .filter(|content| !content.is_empty())
         .map(|content| content.to_string())
 }
 
+fn compact_output_type_summary(output: &[serde_json::Value]) -> String {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for item in output {
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<missing>");
+        *counts.entry(item_type).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(item_type, count)| format!("{}={}", item_type, count))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn codex_routing_hint(model: &str, fast_mode: bool) -> String {
+    if fast_mode {
+        format!("model={model};tier=priority")
+    } else {
+        format!("model={model}")
+    }
+}
+
+fn parse_compact_response(
+    raw_request: String,
+    response_text: String,
+) -> Result<CodexRemoteCompactOutcome, CodexRemoteCompactError> {
+    let parsed: serde_json::Value = serde_json::from_str(&response_text).map_err(|error| {
+        CodexRemoteCompactError::new(
+            format!("Codex compact response was not valid JSON: {}", error),
+            raw_request.clone(),
+            response_text.clone(),
+        )
+    })?;
+    let output = parsed
+        .get("output")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if output.is_empty() {
+        return Err(CodexRemoteCompactError::new(
+            "Codex compact response contained an empty canonical output window",
+            raw_request,
+            response_text,
+        ));
+    }
+    let encrypted_content = extract_compaction_encrypted_content(&output);
+    Ok(CodexRemoteCompactOutcome {
+        output,
+        encrypted_content,
+        raw_request,
+        raw_response: response_text,
+    })
+}
+
 /// Runs remote conversation compaction against the dedicated Codex
 /// `POST /responses/compact` endpoint (the default codex-rs strategy for
-/// ChatGPT subscription providers). Returns the encrypted compaction item that
-/// must be replayed to the API in subsequent requests.
+/// ChatGPT subscription providers). Returns the complete canonical replacement
+/// window that must be replayed to the API in subsequent requests.
 pub async fn compact_conversation_history(
     access_token: &str,
     account_id: Option<&str>,
@@ -901,7 +1117,7 @@ pub async fn compact_conversation_history(
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     debug: bool,
-) -> Result<CodexRemoteCompactOutcome, String> {
+) -> Result<CodexRemoteCompactOutcome, CodexRemoteCompactError> {
     let body = build_compact_request_body(
         model,
         system_prompt,
@@ -914,6 +1130,7 @@ pub async fn compact_conversation_history(
     );
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_default();
     let api_url = codex_compact_endpoint(base_url);
+    let routing_hint = codex_routing_hint(model, fast_mode);
 
     eprintln!(
         "[OpenAI Codex][compact] POST model={} messages={} tools={}",
@@ -931,7 +1148,12 @@ pub async fn compact_conversation_history(
             ("Content-Type", "application/json"),
             ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
             ("version", CODEX_CLIENT_VERSION),
+            (X_CODEX_ROUTING_HINT_HEADER, routing_hint.as_str()),
         ];
+        if let Some(sid) = session_id {
+            headers.push(("session-id", sid));
+            headers.push(("thread-id", sid));
+        }
         if let Some(aid) = account_id {
             headers.push(("ChatGPT-Account-ID", aid));
         }
@@ -942,7 +1164,8 @@ pub async fn compact_conversation_history(
         crate::network::ReqwestClientOptions::new()
             .tcp_keepalive(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(30)),
-    )?;
+    )
+    .map_err(|error| CodexRemoteCompactError::new(error, raw_request.clone(), ""))?;
     let mut req = client
         .post(&api_url)
         .timeout(COMPACT_REQUEST_TIMEOUT)
@@ -950,46 +1173,44 @@ pub async fn compact_conversation_history(
         .header("Content-Type", "application/json")
         .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
         .header("version", CODEX_CLIENT_VERSION)
+        .header(X_CODEX_ROUTING_HINT_HEADER, &routing_hint)
         .json(&body);
+    if let Some(sid) = session_id {
+        req = req.header("session-id", sid).header("thread-id", sid);
+    }
     if let Some(aid) = account_id {
         req = req.header("ChatGPT-Account-ID", aid);
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("Codex compact request failed: {}", e))?;
+    let resp = req.send().await.map_err(|error| {
+        CodexRemoteCompactError::new(
+            format!("Codex compact request failed: {}", error),
+            raw_request.clone(),
+            "",
+        )
+    })?;
     let status = resp.status();
     let response_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "OpenAI Codex API error ({} {}): {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            response_text
+        return Err(CodexRemoteCompactError::new(
+            format!(
+                "OpenAI Codex API error ({} {}): {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                response_text
+            ),
+            raw_request,
+            response_text,
         ));
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Codex compact response was not valid JSON: {}", e))?;
-    let output = parsed
-        .get("output")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let Some(encrypted_content) = extract_compaction_encrypted_content(&output) else {
-        return Err(format!(
-            "Codex compact response contained no compaction item ({} output items)",
-            output.len()
-        ));
-    };
-
-    Ok(CodexRemoteCompactOutcome {
-        encrypted_content,
-        output_item_count: output.len(),
-        raw_request,
-        raw_response: response_text,
-    })
+    let outcome = parse_compact_response(raw_request, response_text)?;
+    eprintln!(
+        "[OpenAI Codex][compact] canonical output items={} types={}",
+        outcome.output.len(),
+        compact_output_type_summary(&outcome.output)
+    );
+    Ok(outcome)
 }
 
 fn codex_websocket_url(base_url: Option<&str>) -> Result<Url, String> {
@@ -1446,7 +1667,7 @@ async fn connect_codex_websocket(
         let transport = wrap_websocket_transport_tls(&request, transport)
             .await
             .map_err(ws_io_error)?;
-        client_async(request, transport).await
+        client_async_with_config(request, transport, Some(websocket_config())).await
     };
 
     match tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect).await {
@@ -1479,6 +1700,15 @@ async fn connect_codex_websocket(
         Ok(Err(err)) => Err(format!("Codex websocket connect failed: {}", err)),
         Err(_) => Err("Codex websocket connect timed out".to_string()),
     }
+}
+
+fn websocket_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
 }
 
 fn websocket_event_error_message(payload: &str) -> Option<String> {
@@ -2233,6 +2463,7 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
     no_visible_output
         && (lower.contains("stream ended without response.completed")
             || lower.contains("stream ended before the response finalized")
+            || lower.contains("websocket ended before the response finalized")
             || lower.contains("response completed with"))
 }
 
@@ -3166,18 +3397,9 @@ where
                     break;
                 }
             }
-            Message::Ping(payload) => {
-                if let Err(e) = socket.send(Message::Pong(payload)).await {
-                    clear_cached_websocket_session_state(
-                        &shared_session,
-                        &connection_key,
-                        /*disable_websockets*/ false,
-                    )
-                    .await;
-                    return Err(format!("Failed to respond to websocket ping: {}", e));
-                }
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
+            // The dedicated websocket pump consumes Ping/Pong and sends Pong
+            // immediately, so response processing only observes data frames.
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(frame) => {
                 if !stream_state.got_terminal_event {
                     terminal_stream_error = Some(match frame {
@@ -3256,7 +3478,7 @@ where
         &connection_key,
         socket,
         LastWebsocketResponse {
-            request_signature: request_without_input(&body),
+            request_signature: websocket_request_signature(&body),
             input: body
                 .get("input")
                 .and_then(|value| value.as_array())
@@ -3312,12 +3534,13 @@ mod tests {
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
         build_request_body, build_request_body_with_tool_search, build_websocket_transport_request,
-        cached_websocket_http_fallback_enabled, codex_websocket_url, collect_complete_tool_calls,
-        drain_sse_buffer, enable_cached_websocket_http_fallback,
-        extract_compaction_encrypted_content, process_sse_event_block, request_without_input,
-        safe_stream_recovery_action, uri_host_port, websocket_event_error_message,
-        websocket_proxy_match_uri, BoxedCodexIo, CodexStreamOptions, CodexStreamState,
-        CodexWebsocketStream, LastWebsocketResponse, PartialToolCall, SafeStreamRecoveryAction,
+        cached_websocket_http_fallback_enabled, codex_routing_hint, codex_websocket_url,
+        collect_complete_tool_calls, drain_sse_buffer, enable_cached_websocket_http_fallback,
+        extract_compaction_encrypted_content, parse_compact_response, process_sse_event_block,
+        request_without_input, safe_stream_recovery_action, uri_host_port, websocket_config,
+        websocket_event_error_message, websocket_proxy_match_uri, websocket_request_signature,
+        BoxedCodexIo, CodexStreamOptions, CodexStreamState, CodexWebsocketStream,
+        LastWebsocketResponse, PartialToolCall, SafeStreamRecoveryAction,
         CODEX_ORIGINATOR_HEADER_VALUE, MAX_SAFE_STREAM_RECOVERY_RETRIES,
         PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
         TOOL_SEARCH_HISTORY_TOOL_NAME, X_CODEX_TURN_STATE_HEADER,
@@ -3462,7 +3685,7 @@ mod tests {
         items_added: &[serde_json::Value],
     ) -> LastWebsocketResponse {
         LastWebsocketResponse {
-            request_signature: request_without_input(body),
+            request_signature: websocket_request_signature(body),
             input: body
                 .get("input")
                 .and_then(|value| value.as_array())
@@ -4233,6 +4456,41 @@ mod tests {
     }
 
     #[test]
+    fn build_input_replays_canonical_compact_window_as_is() {
+        let handoff = assistant_message("handoff-1", "## Context Handoff\n\nlocal digest", None);
+        let next_user = user_message_with_images("继续", vec![]);
+        let canonical_output = serde_json::json!([
+            {
+                "type": "compaction_summary",
+                "encrypted_content": "opaque-blob"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "retained request" }]
+            }
+        ]);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "handoff-1".to_string(),
+            serde_json::json!({
+                "codex_compaction": {
+                    "output": canonical_output,
+                    "encrypted_content": "opaque-blob"
+                }
+            }),
+        );
+
+        let input = build_input_with_metadata(&[handoff, next_user], Some(&metadata));
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0], canonical_output[0]);
+        assert_eq!(input[1], canonical_output[1]);
+        assert_eq!(input[2]["role"].as_str(), Some("user"));
+        assert_eq!(input[2]["content"][0]["text"].as_str(), Some("继续"));
+    }
+
+    #[test]
     fn compact_request_body_matches_codex_compaction_input_shape() {
         let body = build_compact_request_body(
             "gpt-5.5",
@@ -4294,6 +4552,58 @@ mod tests {
             None
         );
         assert_eq!(extract_compaction_encrypted_content(&[]), None);
+    }
+
+    #[test]
+    fn extract_compaction_encrypted_content_accepts_codex_aliases() {
+        assert_eq!(
+            extract_compaction_encrypted_content(&[serde_json::json!({
+                "type": "compaction_summary",
+                "encrypted_content": "summary"
+            })])
+            .as_deref(),
+            Some("summary")
+        );
+        assert_eq!(
+            extract_compaction_encrypted_content(&[serde_json::json!({
+                "type": "context_compaction",
+                "encrypted_content": "context"
+            })])
+            .as_deref(),
+            Some("context")
+        );
+    }
+
+    #[test]
+    fn compact_response_accepts_nonempty_canonical_window_without_exact_compaction_type() {
+        let response = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "retained" }]
+            }]
+        })
+        .to_string();
+
+        let outcome = parse_compact_response("request".to_string(), response.clone())
+            .expect("accept canonical output");
+
+        assert_eq!(outcome.output.len(), 1);
+        assert_eq!(outcome.encrypted_content, None);
+        assert_eq!(outcome.raw_request, "request");
+        assert_eq!(outcome.raw_response, response);
+    }
+
+    #[test]
+    fn fast_compact_routing_hint_matches_codex() {
+        assert_eq!(
+            codex_routing_hint("gpt-5.6-sol", true),
+            "model=gpt-5.6-sol;tier=priority"
+        );
+        assert_eq!(
+            codex_routing_hint("gpt-5.6-sol", false),
+            "model=gpt-5.6-sol"
+        );
     }
 
     #[test]
@@ -4395,6 +4705,12 @@ mod tests {
             request.get("model").and_then(|value| value.as_str()),
             Some("gpt-5.4")
         );
+    }
+
+    #[test]
+    fn websocket_config_enables_permessage_deflate() {
+        let config = websocket_config();
+        assert!(config.extensions.permessage_deflate.is_some());
     }
 
     #[test]
@@ -4852,6 +5168,142 @@ mod tests {
                 .map(|items| items.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn websocket_transport_request_ignores_server_metadata_and_reasoning_for_incremental_input() {
+        let previous_body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hello" }]
+            }],
+            "stream": true,
+            "store": false,
+            "instructions": "You are Codex",
+            "tools": [{
+                "type": "function",
+                "name": "read",
+                "description": "Read a file",
+                "parameters": { "type": "object" }
+            }],
+            "tool_choice": "auto",
+        });
+        let response_items = serde_json::json!([
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "content": [],
+                "encrypted_content": "encrypted",
+                "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "status": "completed",
+                "phase": "commentary",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "checking",
+                    "annotations": [],
+                    "logprobs": []
+                }],
+                "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{\"path\":\"a.rs\"}",
+                "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+            }
+        ]);
+        let current_body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [
+                previous_body["input"][0].clone(),
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "checking" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"path\":\"a.rs\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents"
+                }
+            ],
+            "stream": true,
+            "store": false,
+            "instructions": "You are Codex",
+            "tools": previous_body["tools"].clone(),
+            "tool_choice": "auto",
+        });
+
+        let request = build_websocket_transport_request(
+            &current_body,
+            Some(&websocket_last_response(
+                &previous_body,
+                "resp_prev",
+                response_items.as_array().expect("response items"),
+            )),
+            /*include_type_field*/ true,
+        );
+
+        assert_eq!(
+            request
+                .get("previous_response_id")
+                .and_then(|value| value.as_str()),
+            Some("resp_prev")
+        );
+        assert_eq!(
+            request.get("input").and_then(|value| value.as_array()),
+            Some(
+                serde_json::json!([{
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents"
+                }])
+                .as_array()
+                .expect("incremental input")
+            )
+        );
+    }
+
+    #[test]
+    fn websocket_transport_request_replays_full_input_when_tools_change() {
+        let previous_body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [],
+            "stream": true,
+            "store": false,
+            "tools": [{ "type": "function", "name": "read" }],
+            "tool_choice": "auto",
+        });
+        let current_body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "go" }] }],
+            "stream": true,
+            "store": false,
+            "tools": [{ "type": "function", "name": "write" }],
+            "tool_choice": "auto",
+        });
+        let request = build_websocket_transport_request(
+            &current_body,
+            Some(&websocket_last_response(&previous_body, "resp_prev", &[])),
+            /*include_type_field*/ true,
+        );
+
+        assert!(request.get("previous_response_id").is_none());
+        assert_eq!(request["input"], current_body["input"]);
     }
 
     #[test]

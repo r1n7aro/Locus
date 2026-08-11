@@ -962,7 +962,7 @@
   "chat.compactedContext.promptPrefixPlaceholder": "[System injection before message]",
   "chat.compactedContext.promptSuffixPlaceholder": "[System injection after message]",
   "chat.compactedContext.codexEncrypted": "Encrypted Codex compaction item",
-  "chat.compactedContext.codexEncryptedDetail": "The Codex server returned only an encrypted item ({0} characters); Locus cannot read its body.",
+  "chat.compactedContext.codexEncryptedDetail": "Codex returned a canonical compacted window with {0} characters of encrypted context; retained items are replayed as-is.",
   "chat.compactedContext.localFallback": "View Locus local fallback handoff (not sent to Codex)",
   "chat.compactedContext.imageAlt": "Context image {0}",
   "chat.transcript.reactiveCompactNotice": "The last request exceeded the model's context window; the conversation was compacted automatically",
