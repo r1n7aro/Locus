@@ -355,8 +355,9 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
     fn optional_json<T: Serialize>(value: Option<T>) -> Result<Value, String> {
         value
             .map(|value| {
-                serde_json::to_value(value)
-                    .map_err(|error| format!("Failed to serialize exported message field: {}", error))
+                serde_json::to_value(value).map_err(|error| {
+                    format!("Failed to serialize exported message field: {}", error)
+                })
             })
             .transpose()
             .map(|value| value.unwrap_or_else(empty_value))
@@ -499,12 +500,13 @@ fn collect_tool_result_context(
         }
         Value::Object(object) => {
             let role_is_tool = object.get("role").and_then(Value::as_str) == Some("tool");
-            let type_is_tool_result = object
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| {
-                    matches!(kind, "tool_result" | "function_call_output" | "tool_output")
-                });
+            let type_is_tool_result =
+                object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(kind, "tool_result" | "function_call_output" | "tool_output")
+                    });
             if role_is_tool || type_is_tool_result {
                 let tool_call_id = ["tool_call_id", "tool_use_id", "call_id", "id"]
                     .iter()
@@ -844,15 +846,9 @@ mod tests {
             .expect("add message");
         let output = dir.path().join("context.yaml");
 
-        let result = export_session_context_yaml(
-            &store,
-            &session_id,
-            "F:/Project",
-            None,
-            None,
-            &output,
-        )
-        .expect("export context");
+        let result =
+            export_session_context_yaml(&store, &session_id, "F:/Project", None, None, &output)
+                .expect("export context");
 
         assert_eq!(result.capture_quality, "full");
         let raw = std::fs::read_to_string(output).expect("read export");
@@ -919,7 +915,9 @@ mod tests {
         store
             .add_message(&session_id, MessageRole::User, "before snapshot")
             .expect("add snapshot message");
-        let snapshot = store.create_export_snapshot().expect("create online backup");
+        let snapshot = store
+            .create_export_snapshot()
+            .expect("create online backup");
         store
             .add_message(&session_id, MessageRole::Assistant, "after snapshot")
             .expect("add live-only message");
@@ -958,15 +956,8 @@ mod tests {
             )]),
         };
         let output = dir.path().join("runtime.yaml");
-        export_session_context_yaml(
-            &snapshot,
-            &session_id,
-            "",
-            None,
-            Some(&live),
-            &output,
-        )
-        .expect("export runtime context");
+        export_session_context_yaml(&snapshot, &session_id, "", None, Some(&live), &output)
+            .expect("export runtime context");
 
         let raw = std::fs::read_to_string(output).expect("read runtime export");
         let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse runtime export");

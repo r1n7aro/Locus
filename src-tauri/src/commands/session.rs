@@ -11,8 +11,8 @@ use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
 use crate::agent::definition::{canonical_agent_id, is_hidden_legacy_agent_id};
 use crate::agent::instance::{
-    AgentInstance, AgentSystemPromptStats, AssistantStreamSnapshot, KnowledgeAccessMode, LlmBackend,
-    RawContextStore,
+    AgentInstance, AgentSystemPromptStats, AssistantStreamSnapshot, KnowledgeAccessMode,
+    LlmBackend, RawContextStore,
 };
 use crate::auth::AuthState;
 use crate::config::AppConfig;
@@ -334,16 +334,13 @@ async fn capture_context_export_live_snapshot(
     let sessions = session_ids
         .iter()
         .map(|session_id| {
-            let runtime = active.get(session_id).map(|active| {
-                runtime_snapshot_with_partial_assistant(store, session_id, active)
-            });
+            let runtime = active
+                .get(session_id)
+                .map(|active| runtime_snapshot_with_partial_assistant(store, session_id, active));
             (
                 session_id.clone(),
                 crate::session::context_export::ContextExportLiveSession {
-                    pending_inputs: pending_inputs
-                        .get(session_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    pending_inputs: pending_inputs.get(session_id).cloned().unwrap_or_default(),
                     runtime,
                 },
             )
@@ -891,12 +888,10 @@ pub async fn fork_session(
             .operation("forkSession")
         })??;
 
-    let active = capture_active_session_copy_states(
-        std::slice::from_ref(&session_id),
-        active_tasks.inner(),
-    )
-    .await
-    .remove(&session_id);
+    let active =
+        capture_active_session_copy_states(std::slice::from_ref(&session_id), active_tasks.inner())
+            .await
+            .remove(&session_id);
     let runtime = active.as_ref().map(|active| {
         runtime_snapshot_with_partial_assistant(store.inner().as_ref(), &session_id, active)
     });
