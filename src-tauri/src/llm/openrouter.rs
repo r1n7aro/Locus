@@ -117,6 +117,7 @@ pub async fn stream_chat<F, G, H>(
     provider_tag: Option<&str>,
     extra_headers: &[(&str, &str)],
     reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u32>,
     debug: bool,
     on_text_delta: F,
     on_thinking_delta: G,
@@ -136,7 +137,7 @@ where
 
     let messages = build_api_messages(system_prompt, history);
 
-    let body = build_request_body(model, messages, tools, reasoning_effort);
+    let body = build_request_body(model, messages, tools, reasoning_effort, max_output_tokens);
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
 
@@ -522,6 +523,7 @@ fn build_request_body(
     messages: Vec<serde_json::Value>,
     tools: &[serde_json::Value],
     reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u32>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -541,6 +543,10 @@ fn build_request_body(
         .filter(|value| !value.is_empty())
     {
         body["reasoning_effort"] = serde_json::json!(effort);
+    }
+
+    if let Some(max_output_tokens) = max_output_tokens.filter(|value| *value > 0) {
+        body["max_tokens"] = serde_json::json!(max_output_tokens);
     }
 
     body
@@ -993,7 +999,7 @@ mod tests {
 
     #[test]
     fn chat_completion_requests_enable_stream_usage() {
-        let body = build_request_body("model-x", Vec::new(), &[], None);
+        let body = build_request_body("model-x", Vec::new(), &[], None, None);
 
         assert_eq!(body["stream"], serde_json::json!(true));
         assert_eq!(
@@ -1004,9 +1010,16 @@ mod tests {
 
     #[test]
     fn chat_completion_requests_include_custom_reasoning_effort() {
-        let body = build_request_body("model-x", Vec::new(), &[], Some("max"));
+        let body = build_request_body("model-x", Vec::new(), &[], Some("max"), None);
 
         assert_eq!(body["reasoning_effort"], serde_json::json!("max"));
+    }
+
+    #[test]
+    fn chat_completion_requests_apply_compaction_output_limit() {
+        let body = build_request_body("model-x", Vec::new(), &[], None, Some(8_192));
+
+        assert_eq!(body["max_tokens"], serde_json::json!(8_192));
     }
 
     #[test]

@@ -54,11 +54,14 @@ pub struct CompactedContextOutput {
     /// handoff recovered from current prompt flags; partial: only the handoff
     /// itself remains provable.
     pub snapshot_status: String,
-    /// readable for prompt-based/local compaction; codexEncrypted when the
-    /// actual Codex handoff is a canonical server compaction window.
+    /// checkpoint for OpenCode V2-style summary/recent state; readable for
+    /// legacy local handoffs; codexEncrypted for canonical server compaction.
     pub compaction_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_content_chars: Option<usize>,
+    /// Structured OpenCode V2 checkpoint payload. Legacy and Codex server
+    /// compactions export the explicit string `empty`.
+    pub checkpoint: serde_json::Value,
     pub messages: Vec<CompactedContextMessageOutput>,
 }
 
@@ -118,7 +121,7 @@ const RUN_STATUS_CANCELLING: &str = "cancelling";
 const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_ERROR: &str = "error";
-use crate::compact::CONTEXT_HANDOFF_MARKER;
+use crate::compact::{CONTEXT_HANDOFF_MARKER, CONVERSATION_CHECKPOINT_MARKER};
 const CONTEXT_COMPACTED_DISPLAY_MARKER: &str = "## Context Handoff\n\nContext compacted.";
 
 impl SessionEventWriter {
@@ -436,6 +439,8 @@ struct MessageMetadata {
     render_parts: Option<Vec<AssistantRenderPart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compacted_context: Option<CompactedContextSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_checkpoint: Option<compact::ConversationCheckpoint>,
 }
 
 struct StoredChatMessageRow {
@@ -570,6 +575,7 @@ fn message_metadata_json(
         thinking_order,
         render_parts: render_parts.map(|value| value.to_vec()),
         compacted_context: None,
+        conversation_checkpoint: None,
     };
     serialize_message_metadata(&metadata)
 }
@@ -583,6 +589,7 @@ fn serialize_message_metadata(metadata: &MessageMetadata) -> Result<Option<Strin
         && metadata.thinking_order.is_none()
         && metadata.render_parts.is_none()
         && metadata.compacted_context.is_none()
+        && metadata.conversation_checkpoint.is_none()
     {
         return Ok(None);
     }
@@ -623,7 +630,9 @@ fn merge_prompt_prefixes(carried: &str, existing: Option<&str>) -> String {
 }
 
 fn is_context_handoff_message(message: &ChatMessage) -> bool {
-    message.role == MessageRole::Assistant && message.content.starts_with(CONTEXT_HANDOFF_MARKER)
+    (message.role == MessageRole::Assistant && message.content.starts_with(CONTEXT_HANDOFF_MARKER))
+        || (message.role == MessageRole::User
+            && compact::is_conversation_checkpoint_content(&message.content))
 }
 
 fn is_internal_system_reminder_message(message: &ChatMessage) -> bool {
@@ -784,7 +793,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 26;
+    const SCHEMA_VERSION: i32 = 27;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1121,7 +1130,16 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 26, "add a new migration block above");
+        if current < 27 {
+            Self::migrate(
+                conn,
+                27,
+                "persist structured conversation checkpoints",
+                Self::migrate_conversation_checkpoints,
+            )?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 27, "add a new migration block above");
         Ok(())
     }
 
@@ -1504,6 +1522,47 @@ impl SessionStore {
                 version: 1,
                 entries: None,
             });
+            let serialized = serde_json::to_string(&metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            conn.execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2",
+                params![serialized, message_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_conversation_checkpoints(conn: &Connection) -> rusqlite::Result<()> {
+        let marker_len = CONVERSATION_CHECKPOINT_MARKER.len() as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, content, metadata_json FROM messages
+             WHERE role = 'user' AND substr(content, 1, ?1) = ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![marker_len, CONVERSATION_CHECKPOINT_MARKER], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for (message_id, content, metadata_json) in rows {
+            let Some(checkpoint) = compact::parse_conversation_checkpoint(&content) else {
+                continue;
+            };
+            let mut metadata: MessageMetadata = metadata_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+                .unwrap_or_default();
+            if metadata.conversation_checkpoint.as_ref() == Some(&checkpoint) {
+                continue;
+            }
+            metadata.conversation_checkpoint = Some(checkpoint);
             let serialized = serde_json::to_string(&metadata)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             conn.execute(
@@ -4695,11 +4754,16 @@ impl SessionStore {
         else {
             return Ok(None);
         };
-        if role != MessageRole::Assistant.as_str()
-            || !handoff_content.starts_with(CONTEXT_HANDOFF_MARKER)
-        {
+        let is_legacy_handoff = role == MessageRole::Assistant.as_str()
+            && handoff_content.starts_with(CONTEXT_HANDOFF_MARKER);
+        let is_checkpoint = role == MessageRole::User.as_str()
+            && compact::is_conversation_checkpoint_content(&handoff_content);
+        if !is_legacy_handoff && !is_checkpoint {
             return Ok(None);
         }
+        let parsed_checkpoint = is_checkpoint
+            .then(|| compact::parse_conversation_checkpoint(&handoff_content))
+            .flatten();
 
         let mut metadata: MessageMetadata = metadata_json
             .as_deref()
@@ -4809,16 +4873,30 @@ impl SessionStore {
             .and_then(|value| value.get("output"))
             .and_then(|value| value.as_array())
             .is_some_and(|output| !output.is_empty());
+        let checkpoint = metadata
+            .conversation_checkpoint
+            .clone()
+            .or(parsed_checkpoint);
+        let checkpoint = checkpoint
+            .map(|checkpoint| {
+                serde_json::to_value(checkpoint)
+                    .map_err(|e| format!("Failed to serialize conversation checkpoint: {}", e))
+            })
+            .transpose()?
+            .unwrap_or_else(|| serde_json::Value::String("empty".to_string()));
 
         Ok(Some(CompactedContextOutput {
             message_id: message_id.to_string(),
             snapshot_status,
             compaction_kind: if encrypted_content_chars.is_some() || has_codex_compaction_output {
                 "codexEncrypted".to_string()
+            } else if is_checkpoint {
+                "checkpoint".to_string()
             } else {
                 "readable".to_string()
             },
             encrypted_content_chars,
+            checkpoint,
             messages,
         }))
     }
@@ -4834,15 +4912,22 @@ impl SessionStore {
                     "SELECT id
                      FROM messages
                      WHERE session_id = ?1
-                       AND role = 'assistant'
-                       AND substr(content, 1, length(?2)) = ?2
+                       AND (
+                           (role = 'assistant' AND substr(content, 1, length(?2)) = ?2)
+                           OR (role = 'user' AND substr(content, 1, length(?3)) = ?3)
+                       )
                      ORDER BY rowid ASC",
                 )
                 .map_err(|e| format!("Failed to prepare compacted context list: {}", e))?;
             let rows = stmt
-                .query_map(params![session_id, CONTEXT_HANDOFF_MARKER], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_map(
+                    params![
+                        session_id,
+                        CONTEXT_HANDOFF_MARKER,
+                        CONVERSATION_CHECKPOINT_MARKER
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
                 .map_err(|e| format!("Failed to query compacted context list: {}", e))?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to read compacted context list: {}", e))?
@@ -5606,15 +5691,30 @@ impl SessionStore {
             })?;
         }
 
+        let checkpoint_metadata_json = compact::parse_conversation_checkpoint(&summary_msg.content)
+            .map(|checkpoint| {
+                serialize_message_metadata(&MessageMetadata {
+                    conversation_checkpoint: Some(checkpoint),
+                    ..MessageMetadata::default()
+                })
+            })
+            .transpose()
+            .map_err(|error| {
+                let _ = conn.execute("ROLLBACK", []);
+                error
+            })?
+            .flatten();
+
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?6, ?7)",
             params![
                 summary_msg.id,
                 session_id,
                 summary_msg.role.as_str(),
                 summary_msg.content,
                 summary_msg.created_at,
+                checkpoint_metadata_json,
                 response_request_id,
             ],
         )
@@ -6630,6 +6730,102 @@ mod tests {
             .expect("inspect compressed context attempt payloads");
         assert_eq!(request_type, "blob");
         assert_eq!(response_type, "blob");
+    }
+
+    #[test]
+    fn v26_database_migrates_structured_checkpoints_and_exports_legacy_empty() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v26 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema");
+        let checkpoint_content = compact::build_conversation_checkpoint_content(
+            "## Objective\n- 迁移 checkpoint",
+            "[User]: 继续处理",
+        );
+        conn.execute_batch(
+            "INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-v26', 'Migrated checkpoint', 'chat', 100, 100);",
+        )
+        .expect("insert v26 session");
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, metadata_json)
+             VALUES ('checkpoint-v26', 'session-v26', 'user', ?1, 100, NULL)",
+            params![checkpoint_content],
+        )
+        .expect("insert v26 checkpoint");
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at, metadata_json)
+             VALUES ('legacy-handoff-v26', 'session-v26', 'assistant', ?1, 101, NULL)",
+            params![format!(
+                "{}\n\n### Earlier Conversation Summary\n\n旧交接摘要",
+                compact::CONTEXT_HANDOFF_MARKER
+            )],
+        )
+        .expect("insert legacy handoff");
+        conn.pragma_update(None, "user_version", 26)
+            .expect("set v26 schema version");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v26 store");
+        let checkpoint = store
+            .get_compacted_context_output("session-v26", "checkpoint-v26")
+            .expect("load migrated checkpoint")
+            .expect("migrated checkpoint exists");
+        assert_eq!(checkpoint.compaction_kind, "checkpoint");
+        assert_eq!(
+            checkpoint.checkpoint["summary"].as_str(),
+            Some("## Objective\n- 迁移 checkpoint")
+        );
+        assert_eq!(
+            checkpoint.checkpoint["recent"].as_str(),
+            Some("[User]: 继续处理")
+        );
+
+        let legacy = store
+            .get_compacted_context_output("session-v26", "legacy-handoff-v26")
+            .expect("load legacy handoff")
+            .expect("legacy handoff exists");
+        assert_eq!(legacy.checkpoint.as_str(), Some("empty"));
+
+        let output = dir.path().join("migrated-v26-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-v26",
+            "",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated checkpoint session");
+        let raw = std::fs::read_to_string(output).expect("read migrated export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse migrated export");
+        let compactions = yaml["sessions"][0]["compactions"]
+            .as_sequence()
+            .expect("exported compactions");
+        assert_eq!(
+            compactions[0]["checkpoint"]["recent"].as_str(),
+            Some("[User]: 继续处理")
+        );
+        assert_eq!(compactions[1]["checkpoint"].as_str(), Some("empty"));
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE id = 'checkpoint-v26'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read checkpoint metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).expect("parse checkpoint metadata");
+        assert_eq!(
+            metadata["conversationCheckpoint"]["summary"].as_str(),
+            Some("## Objective\n- 迁移 checkpoint")
+        );
     }
 
     #[test]
@@ -8859,6 +9055,83 @@ mod tests {
                 .first_user_message_id(&session_id)
                 .expect("first prompt user"),
             Some(old_user_id.to_string())
+        );
+    }
+
+    #[test]
+    fn checkpoint_compaction_replays_one_user_role_summary_recent_window() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Checkpoint Compact", None, None, "chat", None)
+            .expect("create session");
+        let first_message_id = store
+            .add_message(&session_id, MessageRole::User, "旧需求")
+            .expect("insert user");
+        store
+            .update_message_prompt_prefix(
+                &session_id,
+                &first_message_id,
+                Some("<system-reminder>env</system-reminder>"),
+            )
+            .expect("attach prompt prefix");
+        let assistant_id = store
+            .add_message(&session_id, MessageRole::Assistant, "旧回答")
+            .expect("insert assistant");
+
+        let mut checkpoint = compact::build_conversation_checkpoint_message(
+            "## Objective\n- 继续修复",
+            "[User]: 最新需求\n\n[Assistant]: 当前进度",
+            101,
+        );
+        checkpoint.id = "checkpoint-1".to_string();
+        let (count_before, count_after) = store
+            .compact_messages(&session_id, &checkpoint, &assistant_id, 0)
+            .expect("install checkpoint");
+
+        assert_eq!(count_before, 2);
+        assert_eq!(count_after, 1);
+        let prompt = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt");
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].id, "checkpoint-1");
+        assert_eq!(prompt[0].role, MessageRole::User);
+        assert!(prompt[0]
+            .content
+            .starts_with(compact::CONVERSATION_CHECKPOINT_MARKER));
+        assert_eq!(
+            prompt[0].prompt_prefix.as_deref(),
+            Some("<system-reminder>env</system-reminder>")
+        );
+
+        let display = store
+            .get_messages(&session_id)
+            .expect("load display messages");
+        let display_checkpoint = display
+            .iter()
+            .find(|message| message.id == "checkpoint-1")
+            .expect("display checkpoint");
+        assert_eq!(display_checkpoint.role, MessageRole::User);
+        assert_eq!(display_checkpoint.content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+
+        let output = store
+            .get_compacted_context_output(&session_id, "checkpoint-1")
+            .expect("load checkpoint output")
+            .expect("checkpoint output exists");
+        assert_eq!(output.snapshot_status, "complete");
+        assert_eq!(output.compaction_kind, "checkpoint");
+        assert_eq!(output.messages.len(), 1);
+        let parsed = compact::parse_conversation_checkpoint(&output.messages[0].content)
+            .expect("parse output checkpoint");
+        assert!(parsed.summary.contains("继续修复"));
+        assert!(parsed.recent.contains("当前进度"));
+        assert_eq!(
+            store
+                .list_compacted_context_outputs(&session_id)
+                .expect("list checkpoint outputs")
+                .len(),
+            1
         );
     }
 

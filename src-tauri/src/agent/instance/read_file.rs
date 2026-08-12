@@ -227,6 +227,12 @@ impl AgentInstance {
         let Ok(response) = response else {
             return;
         };
+        let skill_runtime_context = response.document.as_ref().and_then(|document| {
+            crate::skill_runtime_context::for_knowledge_document(
+                &document.document,
+                crate::skill_runtime_context::SkillRuntimeContextTrigger::Read,
+            )
+        });
         let tool_names = response
             .document
             .as_ref()
@@ -263,6 +269,11 @@ impl AgentInstance {
                     "\n\nLocus Skill runtime: Unity C# scripts are not ready.\n{error}"
                 ));
             }
+        }
+
+        if let Some(runtime_context) = skill_runtime_context {
+            result.output.push_str("\n\n");
+            result.output.push_str(&runtime_context);
         }
 
         if !activated_tools.is_empty() {

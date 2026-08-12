@@ -2108,20 +2108,44 @@ async fn queue_inlined_method_files(
     }
 }
 
-pub async fn pending_paths(project_path: &str) -> Vec<String> {
+pub async fn pending_paths_filtered(
+    project_path: &str,
+    path_filter: Option<&[String]>,
+) -> Vec<String> {
+    let filter: Option<BTreeSet<String>> = path_filter.map(|paths| {
+        paths
+            .iter()
+            .map(|path| {
+                if std::path::Path::new(path).is_absolute() {
+                    file_key(path)
+                } else {
+                    file_key(&format!(
+                        "{}/{}",
+                        project_path.trim_end_matches(['/', '\\']),
+                        path
+                    ))
+                }
+            })
+            .collect()
+    });
     let projects = projects().lock().await;
     match projects.get(&project_key(project_path)) {
         Some(state) => {
             let mut paths: Vec<String> = state
                 .pending
-                .values()
-                .map(|edit| edit.absolute_path.clone())
+                .iter()
+                .filter(|(key, _)| filter.as_ref().map_or(true, |paths| paths.contains(*key)))
+                .map(|(_, edit)| edit.absolute_path.clone())
                 .collect();
             paths.sort();
             paths
         }
         None => Vec::new(),
     }
+}
+
+pub async fn pending_paths(project_path: &str) -> Vec<String> {
+    pending_paths_filtered(project_path, None).await
 }
 
 /// Locate the plugin's Locus.HotReload.Runtime.dll (field-store runtime,

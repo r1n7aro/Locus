@@ -2,7 +2,7 @@
 id: kd_skill_builtin_debugger
 injectMode: excerpt
 summary: >-
-  Use when a live Unity logic bug needs precise PlayerLoop positioning, a project-defined Tick System, cross-frame conditions, thread switching, cooperative pause, frame stepping, or inspection while Play Mode is paused. Read this skill before writing advanced `unity_execute` or `unity_run_states` debugger code.
+  Use when a live Unity logic bug needs precise PlayerLoop positioning, a project-defined Tick System, cross-frame conditions, thread switching, cooperative pause, frame stepping, paused inspection, or native Windows thread stacks from an installed CDB or WinDbg debugger. Read this skill before writing advanced debugger code.
 aiMaintained: false
 skillEnabled: true
 skillSurface: both
@@ -10,11 +10,12 @@ commandTrigger: /debug
 tools:
   - unity_execute
   - unity_run_states
+  - bash
 ---
 
 # Unity PlayerLoop Debugger
 
-This skill describes Locus's cooperative runtime debugger. It can list the effective `PlayerLoop`, await before or after any anchorable node, pause when a condition matches, inspect the paused game in a later `unity_execute`, step one frame, and resume. It works through the existing `unity_execute` and `unity_run_states` tools.
+This skill describes Locus's cooperative runtime debugger. It can list the effective `PlayerLoop`, await before or after any anchorable node, pause when a condition matches, inspect the paused game in a later `unity_execute`, step one frame, and resume. It works through the existing `unity_execute` and `unity_run_states` tools. When a Windows-native thread stack is required, use `bash` to discover and invoke an available CDB or WinDbg command-line debugger.
 
 ## Debugging model
 
@@ -22,6 +23,26 @@ This skill describes Locus's cooperative runtime debugger. It can list the effec
 - When `await ctx.BreakWhen(...)` matches, Locus requests `EditorApplication.isPaused = true`, confirms the paused state on an Editor update, returns `status: breakpoint`, and ends that `unity_execute` invocation. Statements after `BreakWhen` in the same invocation do not run.
 - Inspect, step, and resume with later independent `unity_execute` calls. Use `request_editor_status: "playing_paused"` while inspecting or stepping, and `request_editor_status: "playing"` when the call must begin with a running game.
 - This protocol targets runtime state and PlayerLoop positions. Managed source-line breakpoints, call stacks, local-variable scopes, and arbitrary instruction stepping require an external Mono/DAP debugger.
+
+## Native Windows thread stacks
+
+Escalate to a native debugger when cooperative inspection cannot explain a Unity main-thread hang, render-thread or worker-thread wait, native plug-in failure, access violation, or engine-level deadlock.
+
+- Confirm that the host is Windows and resolve the Unity process from the current project. Verify the PID still belongs to that project immediately before attaching; never select a process by executable name alone.
+- Read the injected `windows-native-debuggers` runtime context first. It reports the `cdb`, `windbg`, and `windbgx` executables Locus found in PATH, Windows Kits, or WinDbg app execution aliases. Refresh after `refreshAfterSeconds`, treat `signatureStatus: not_checked` as unverified provenance, and revalidate the selected executable with `bash` immediately before use.
+- When the runtime context is absent or stale, use `bash` to probe `cdb`, `windbg`, and `windbgx`. Never assume an executable path, version, architecture, symbol path, or installation state, and never embed machine-specific discovery results in this Skill.
+- Prefer CDB for bounded, non-interactive stack capture because its command output can be returned to the Agent. Use WinDbg when an available installation supports the required command-line or interactive workflow.
+- Use a non-invasive attach for inspection. For CDB, keep the target alive with `-pd`, use `-pv` when a coherent snapshot is required, finish the command script with `qd`, and apply a bounded timeout. Tell the user that `-pv` briefly suspends the target threads while the snapshot is collected.
+- Capture only the threads and frame depth needed to answer the question. Treat ordinary debugger output as a native stack; Mono-managed frames may still require a Mono/DAP debugger or mixed-stack resolver.
+- If none of the supported debuggers is available and native stacks are necessary, explain the diagnostic need and recommend installing Microsoft WinDbg or Debugging Tools for Windows. Leave installation to the user and continue only after their direction.
+
+Revalidate PATH commands without assuming a local path:
+
+```powershell
+Get-Command cdb, windbg, windbgx -ErrorAction SilentlyContinue
+```
+
+Build the debugger invocation from the executable returned by that probe and the verified Unity PID. Keep every debugger command read-only and always detach while leaving Unity running.
 
 ## Thread APIs
 

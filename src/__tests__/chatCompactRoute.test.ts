@@ -61,6 +61,24 @@ describe("chat compact route", () => {
     expect(streamEvents).toContain("context_limit: u32");
   });
 
+  it("uses the OpenCode V2 checkpoint path for prompt-based compaction", () => {
+    const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
+    const compact = read("src-tauri/src/compact.rs");
+
+    expect(agentInstance).toContain("build_checkpoint_compact_request");
+    expect(agentInstance).toContain("CHECKPOINT_COMPACTION_SYSTEM_PROMPT");
+    expect(agentInstance).toContain("build_conversation_checkpoint_message");
+    expect(agentInstance).toContain("original prompt remains active");
+    expect(compact).toContain("const CHECKPOINT_KEEP_TOKENS: u32 = 8_000;");
+    expect(compact).toContain("CHECKPOINT_SUMMARY_OUTPUT_TOKENS_MIN: u32 = 8_192");
+    expect(compact).toContain("CHECKPOINT_SUMMARY_OUTPUT_TOKENS_MAX: u32 = 32_768");
+    expect(compact).toContain("context_limit / CHECKPOINT_SUMMARY_CONTEXT_DIVISOR");
+    expect(agentInstance).toContain("next_checkpoint_summary_output_tokens");
+    expect(agentInstance).toContain("checkpoint_finish_reason_reached_output_limit");
+    expect(compact).toContain("<previous-summary>");
+    expect(compact).toContain("<recent-context>");
+  });
+
   it("warns with a banner when compaction reacts to a server context overflow", () => {
     const chatStore = read("src/stores/chat.ts");
     const streamEvents = read("src-tauri/src/commands/mod.rs");

@@ -831,6 +831,7 @@ fn context_export_title_fragment(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compact;
     use crate::session::models::{MessageRole, SessionRunSummary, SessionRuntimeSnapshot};
     use tempfile::tempdir;
 
@@ -860,6 +861,54 @@ mod tests {
             Some(EMPTY)
         );
         assert_eq!(yaml["sessions"][0]["compactions"].as_str(), Some(EMPTY));
+    }
+
+    #[test]
+    fn exports_checkpoint_summary_and_recent_context_after_compaction() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("create store");
+        let session_id = store
+            .create_session("Checkpoint", None, None, "chat", Some("dev"))
+            .expect("create session");
+        let user_id = store
+            .add_message(&session_id, MessageRole::User, "旧需求")
+            .expect("add user");
+        let assistant_id = store
+            .add_message(&session_id, MessageRole::Assistant, "旧回答")
+            .expect("add assistant");
+        assert_ne!(user_id, assistant_id);
+        let checkpoint = compact::build_conversation_checkpoint_message(
+            "## Objective\n- 完成修复",
+            "[User]: 继续\n\n[Assistant]: 当前状态",
+            100,
+        );
+        store
+            .compact_messages(&session_id, &checkpoint, &assistant_id, 0)
+            .expect("compact messages");
+
+        let output = dir.path().join("checkpoint.yaml");
+        export_session_context_yaml(&store, &session_id, "", None, None, &output)
+            .expect("export checkpoint context");
+        let raw = std::fs::read_to_string(output).expect("read checkpoint export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse checkpoint export");
+        let compactions = yaml["sessions"][0]["compactions"]
+            .as_sequence()
+            .expect("checkpoint compactions");
+        assert_eq!(compactions.len(), 1);
+        assert_eq!(
+            compactions[0]["compactionKind"].as_str(),
+            Some("checkpoint")
+        );
+        assert_eq!(
+            compactions[0]["checkpoint"]["recent"].as_str(),
+            Some("[User]: 继续\n\n[Assistant]: 当前状态")
+        );
+        let content = compactions[0]["messages"][0]["content"]
+            .as_str()
+            .expect("checkpoint content");
+        assert!(content.contains(compact::CONVERSATION_CHECKPOINT_MARKER));
+        assert!(content.contains("完成修复"));
+        assert!(content.contains("当前状态"));
     }
 
     #[test]

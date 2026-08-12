@@ -57,6 +57,7 @@ mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
 mod session;
+mod skill_runtime_context;
 mod sqlite_maint;
 mod tool;
 pub mod unity_bridge;

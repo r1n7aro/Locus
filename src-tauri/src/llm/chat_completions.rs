@@ -22,8 +22,12 @@ enum ChatCompletionsFlavor {
 pub enum ThinkingToggle {
     /// DashScope/Qwen style: `"enable_thinking": true`.
     EnableThinking,
+    /// DashScope/Qwen style: `"enable_thinking": false`.
+    DisableThinking,
     /// Zhipu GLM style: `"thinking": {"type": "enabled"}`.
     ThinkingType,
+    /// Zhipu GLM style: `"thinking": {"type": "disabled"}`.
+    ThinkingDisabled,
 }
 
 /// Reasoning knobs for a custom OpenAI-chat endpoint.
@@ -36,6 +40,7 @@ pub struct CustomChatTuning<'a> {
     /// None keeps the legacy model-name flavor detection.
     pub reasoning_replay_field: Option<crate::commands::ReasoningReplayField>,
     pub thinking_toggle: Option<ThinkingToggle>,
+    pub max_output_tokens: Option<u32>,
 }
 
 pub async fn stream_chat<F, G, H>(
@@ -402,10 +407,20 @@ fn build_request_body(
         Some(ThinkingToggle::EnableThinking) => {
             body["enable_thinking"] = serde_json::json!(true);
         }
+        Some(ThinkingToggle::DisableThinking) => {
+            body["enable_thinking"] = serde_json::json!(false);
+        }
         Some(ThinkingToggle::ThinkingType) => {
             body["thinking"] = serde_json::json!({ "type": "enabled" });
         }
+        Some(ThinkingToggle::ThinkingDisabled) => {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
+        }
         None => {}
+    }
+
+    if let Some(max_output_tokens) = tuning.max_output_tokens.filter(|value| *value > 0) {
+        body["max_tokens"] = serde_json::json!(max_output_tokens);
     }
 
     body
@@ -1976,6 +1991,20 @@ mod tests {
             serde_json::json!({ "type": "enabled" })
         );
         assert!(thinking_type.get("enable_thinking").is_none());
+
+        let compact = build_request_body(
+            "qwen3.7-plus",
+            Vec::new(),
+            &[],
+            ChatCompletionsFlavor::Generic,
+            CustomChatTuning {
+                thinking_toggle: Some(ThinkingToggle::DisableThinking),
+                max_output_tokens: Some(8_192),
+                ..Default::default()
+            },
+        );
+        assert_eq!(compact["enable_thinking"], serde_json::json!(false));
+        assert_eq!(compact["max_tokens"], serde_json::json!(8_192));
     }
 
     #[test]

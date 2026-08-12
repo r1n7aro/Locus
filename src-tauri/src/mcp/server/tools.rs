@@ -338,7 +338,7 @@ async fn run_unity_recompile(working_dir: &str) -> ToolResult {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    match crate::unity_bridge::recompile_and_wait(working_dir).await {
+    match crate::code_tools::recompile_with_semantic_warnings(working_dir).await {
         Ok(msg) => ok(&msg),
         Err(e) => err(&format!("Compilation failed:\n{e}")),
     }

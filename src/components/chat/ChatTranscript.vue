@@ -273,7 +273,7 @@ function localFileEntryKey(entry: UserLocalFileEntryDisplay, index: number) {
 }
 
 function isCompactHandoffMessage(msg: ChatMessage) {
-  return msg.role === "assistant" && msg.content.startsWith("## Context Handoff");
+  return msg.content.startsWith("## Context Handoff");
 }
 
 function hasKnowledgeMutationToolCall(msg: ChatMessage) {

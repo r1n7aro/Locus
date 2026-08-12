@@ -359,6 +359,7 @@ pub async fn stream_chat<F, G, H>(
     base_url: Option<&str>,
     request_session_id: Option<&str>,
     thinking_level: Option<&str>,
+    max_output_tokens: Option<u32>,
     on_text_delta: F,
     on_thinking_delta: G,
     on_tool_call_start: H,
@@ -397,7 +398,7 @@ where
     let system_blocks = build_oauth_system_blocks(system_parts);
     let (thinking_field, output_config, standard_max_tokens) =
         build_thinking_params(&effective_model, thinking_level);
-    let max_tokens = u64::from(standard_max_tokens);
+    let max_tokens = u64::from(max_output_tokens.unwrap_or(standard_max_tokens));
     let context_management = Some(serde_json::json!({
         "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }]
     }));
@@ -669,6 +670,7 @@ pub async fn stream_chat_native<F, G, H>(
     request_session_id: Option<&str>,
     tag: &str,
     debug: bool,
+    max_output_tokens: Option<u32>,
     on_text_delta: F,
     on_thinking_delta: G,
     on_tool_call_start: H,
@@ -709,7 +711,7 @@ where
         build_thinking_params(model, thinking_level);
     let body = NativeChatRequest {
         model,
-        max_tokens: standard_max_tokens,
+        max_tokens: max_output_tokens.unwrap_or(standard_max_tokens),
         system: [NativeSystemBlock {
             block_type: "text",
             text: system_prompt,

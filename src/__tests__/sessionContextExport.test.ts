@@ -6,17 +6,21 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v26 with an explicit migration and historical coverage marker", () => {
+  it("uses schema v27 with explicit attempt and checkpoint migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 26;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 27;");
     expect(store).toContain('Self::migrate(conn, 26, "persist session context attempts"');
+    expect(store).toContain('27,\n                "persist structured conversation checkpoints"');
+    expect(store).toContain("migrate_conversation_checkpoints");
+    expect(store).toContain("conversation_checkpoint: Option<compact::ConversationCheckpoint>");
     expect(store).toContain("CREATE TABLE IF NOT EXISTS session_context_attempts");
     expect(store).toContain("request_gzip BLOB NOT NULL");
     expect(store).toContain("response_gzip BLOB NOT NULL");
     expect(store).toContain("CREATE TABLE IF NOT EXISTS session_context_capture_gaps");
     expect(store).toContain("INSERT OR IGNORE INTO session_context_capture_gaps");
     expect(store).toContain("v25_database_migrates_context_attempts_and_old_session_exports_with_explicit_empty");
+    expect(store).toContain("v26_database_migrates_structured_checkpoints_and_exports_legacy_empty");
   });
 
   it("exports one versioned YAML audit document and removes the Markdown exporter", () => {

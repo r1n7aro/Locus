@@ -433,39 +433,6 @@ async fn append_unity_csharp_status(
     }
 }
 
-const EDIT_WRITE_DIAGNOSTIC_MAX_RESULTS: usize = 30;
-const EDIT_WRITE_PROJECT_REF_MAX_PROBLEMS: usize = 20;
-
-async fn append_unity_csharp_write_feedback(
-    output: String,
-    working_dir: Option<&str>,
-    file_path: &str,
-) -> String {
-    let output = append_unity_csharp_status(output, working_dir, file_path).await;
-    let Some(project) = working_dir else {
-        return output;
-    };
-    if !crate::csharp_lsp::is_unity_managed_csharp_file(project, file_path)
-        || !crate::csharp_lsp::is_enabled()
-        || !crate::code_tools::edit_write_diagnostics_enabled()
-    {
-        return output;
-    }
-
-    match super::code::file_diagnostics_output(
-        project,
-        file_path,
-        2,
-        EDIT_WRITE_DIAGNOSTIC_MAX_RESULTS,
-        EDIT_WRITE_PROJECT_REF_MAX_PROBLEMS,
-    )
-    .await
-    {
-        Ok(diagnostics) => format!("{output}\n\nC# diagnostics:\n{diagnostics}"),
-        Err(error) => format!("{output}\n\nC# diagnostics unavailable: {error}"),
-    }
-}
-
 async fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), std::io::Error> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -739,7 +706,7 @@ pub(super) fn write() -> ToolDef {
                             base_output.push('\n');
                             base_output.push_str(&sync_status);
                         }
-                        let output = append_unity_csharp_write_feedback(
+                        let output = append_unity_csharp_status(
                             base_output,
                             ctx.working_dir.as_deref(),
                             &file_path,
@@ -862,9 +829,9 @@ pub(super) fn edit() -> ToolDef {
                     replace_all: bool,
                 }
 
-                // Legacy compatibility for persisted tool calls created while the
-                // public schema exposed an `edits` array. New calls only expose the
-                // top-level single-edit fields in tools/edit.json.
+                // Persisted calls may still carry the former public batch shape.
+                // The agent scheduler also uses it internally to coalesce multiple
+                // same-file edit calls into one read/modify/atomic-write cycle.
                 let ops: Vec<EditOp> =
                     if let Some(edits_arr) = args.get("edits").and_then(|v| v.as_array()) {
                         let mut ops = Vec::with_capacity(edits_arr.len());
@@ -956,78 +923,10 @@ pub(super) fn edit() -> ToolDef {
                     }
 
                     if op.old_string.is_empty() {
-                        let prepared_knowledge = match prepare_missing_knowledge_frontmatter(
-                            &ctx,
-                            knowledge_target.as_ref(),
-                            &op.new_string,
-                        ) {
-                            Ok(prepared) => prepared,
-                            Err(error) => {
-                                return ToolResult {
-                                    output: format!(
-                                        "Failed to generate knowledge frontmatter for '{}': {}",
-                                        file_path, error
-                                    ),
-                                    is_error: true,
-                                };
-                            }
-                        };
-                        let final_content = prepared_knowledge
-                            .as_ref()
-                            .map(|prepared| prepared.content.as_str())
-                            .unwrap_or(op.new_string.as_str());
-                        let rewritten = apply_line_ending(final_content, file_eol);
-                        match replace_file_atomically(
-                            &file_path,
-                            rewritten.as_bytes(),
-                            Some(&content),
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if let Some(project) = ctx.working_dir.as_deref() {
-                                    crate::unity_hotreload::coordinator::note_cs_written(
-                                        project,
-                                        &file_path,
-                                        content.clone(),
-                                    )
-                                    .await;
-                                    crate::workspace::note_unity_test_source_written(
-                                        project, &file_path,
-                                    );
-                                }
-                                let mut base_output = format!("Edited {} [lines:1]", file_path);
-                                if let (Some(target), Some(prepared)) =
-                                    (knowledge_target.as_ref(), prepared_knowledge.as_ref())
-                                {
-                                    base_output.push_str(&format_generated_knowledge_frontmatter(
-                                        target, prepared,
-                                    ));
-                                }
-                                if let Some(sync_status) =
-                                    sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
-                                {
-                                    base_output.push('\n');
-                                    base_output.push_str(&sync_status);
-                                }
-                                let output = append_unity_csharp_write_feedback(
-                                    base_output,
-                                    ctx.working_dir.as_deref(),
-                                    &file_path,
-                                )
-                                .await;
-                                return ToolResult {
-                                    output,
-                                    is_error: false,
-                                };
-                            }
-                            Err(e) => {
-                                return ToolResult {
-                                    output: format!("Failed to write file '{}': {}", file_path, e),
-                                    is_error: true,
-                                };
-                            }
-                        }
+                        current_content = op.new_string.clone();
+                        start_lines.push(1);
+                        applied_count += 1;
+                        continue;
                     }
 
                     match do_replace(
@@ -1121,7 +1020,7 @@ pub(super) fn edit() -> ToolDef {
                             output.push('\n');
                             output.push_str(&sync_status);
                         }
-                        let output = append_unity_csharp_write_feedback(
+                        let output = append_unity_csharp_status(
                             output,
                             ctx.working_dir.as_deref(),
                             &file_path,
@@ -1970,6 +1869,36 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("read edited file"),
             "ALPHA BETA\n"
+        );
+    }
+
+    #[test]
+    fn edit_batch_applies_full_replacement_and_followup_before_one_commit() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("batched.txt");
+        std::fs::write(&target, "before\n").expect("seed file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "edits": [
+                            { "oldString": "", "newString": "alpha beta\n" },
+                            { "oldString": "beta", "newString": "BETA" }
+                        ]
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("2 edits applied"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read edited file"),
+            "alpha BETA\n"
         );
     }
 

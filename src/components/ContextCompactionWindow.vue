@@ -94,6 +94,20 @@ function contextMarkdown(content: string) {
     .join("\n");
 }
 
+function conversationCheckpoint(content: string, messageId?: string) {
+  if (
+    messageId
+    && output.value?.messageId === messageId
+    && output.value.checkpoint !== "empty"
+  ) {
+    return output.value.checkpoint;
+  }
+  const match = content.trim().match(
+    /^<conversation-checkpoint>[\s\S]*?<summary>\s*([\s\S]*?)\s*<\/summary>\s*<recent-context>\s*([\s\S]*?)\s*<\/recent-context>\s*<\/conversation-checkpoint>$/,
+  );
+  return match ? { summary: match[1], recent: match[2] } : null;
+}
+
 function imageDataUrl(image: { mimeType: string; data: string }) {
   return `data:${image.mimeType};base64,${image.data}`;
 }
@@ -204,6 +218,22 @@ onUnmounted(() => {
                   enable-file-refs
                 />
               </details>
+            </template>
+            <template v-else-if="output.compactionKind === 'checkpoint' && message.id === output.messageId">
+              <div class="compacted-context-checkpoint-heading">
+                {{ t("chat.compactedContext.checkpointSummary") }}
+              </div>
+              <MarkdownRenderer
+                class="compacted-context-markdown"
+                :content="conversationCheckpoint(message.content, message.id)?.summary || message.content"
+                enable-file-refs
+              />
+              <template v-if="conversationCheckpoint(message.content, message.id)?.recent">
+                <div class="compacted-context-checkpoint-heading is-recent">
+                  {{ t("chat.compactedContext.checkpointRecent") }}
+                </div>
+                <pre class="compacted-context-checkpoint-recent">{{ conversationCheckpoint(message.content, message.id)?.recent }}</pre>
+              </template>
             </template>
             <MarkdownRenderer
               v-else
@@ -371,6 +401,36 @@ onUnmounted(() => {
   margin: 0;
   font-size: 13px;
   line-height: 1.68;
+}
+
+.compacted-context-checkpoint-heading {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.compacted-context-checkpoint-heading.is-recent {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-color);
+}
+
+.compacted-context-checkpoint-recent {
+  max-width: 920px;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sidebar-bg) 58%, transparent);
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .compacted-context-encrypted {

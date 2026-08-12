@@ -164,6 +164,7 @@ pub struct CodexStreamOptions {
     pub include_web_search: bool,
     pub use_session_continuation: bool,
     pub fast_mode: bool,
+    pub max_output_tokens: Option<u32>,
     structured_output: Option<CodexStructuredOutput>,
 }
 
@@ -179,6 +180,7 @@ impl Default for CodexStreamOptions {
             include_web_search: true,
             use_session_continuation: true,
             fast_mode: false,
+            max_output_tokens: None,
             structured_output: None,
         }
     }
@@ -190,12 +192,18 @@ impl CodexStreamOptions {
             include_web_search: false,
             use_session_continuation: false,
             fast_mode: false,
+            max_output_tokens: None,
             structured_output: None,
         }
     }
 
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = (max_output_tokens > 0).then_some(max_output_tokens);
         self
     }
 
@@ -594,6 +602,9 @@ fn build_request_body(
     }
     if options.fast_mode {
         body["service_tier"] = serde_json::json!("priority");
+    }
+    if let Some(max_output_tokens) = options.max_output_tokens {
+        body["max_output_tokens"] = serde_json::json!(max_output_tokens);
     }
 
     if !responses_tools.is_empty() {
@@ -4420,10 +4431,13 @@ mod tests {
             Some("low"),
             None,
             None,
-            CodexStreamOptions::default().with_fast_mode(true),
+            CodexStreamOptions::default()
+                .with_fast_mode(true)
+                .with_max_output_tokens(8_192),
         );
 
         assert_eq!(body["service_tier"].as_str(), Some("priority"));
+        assert_eq!(body["max_output_tokens"], serde_json::json!(8_192));
     }
 
     #[test]

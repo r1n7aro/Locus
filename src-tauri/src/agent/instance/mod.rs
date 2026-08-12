@@ -71,21 +71,34 @@ struct RuntimeContextLimits {
     codex_auto_compact_token_limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LlmRequestOptions {
+    max_output_tokens: Option<u32>,
+    disable_reasoning: bool,
+}
+
+impl LlmRequestOptions {
+    fn checkpoint_compaction(max_output_tokens: u32) -> Self {
+        Self {
+            max_output_tokens: Some(max_output_tokens),
+            disable_reasoning: true,
+        }
+    }
+
+    fn thinking_level<'a>(self, configured: Option<&'a str>) -> Option<&'a str> {
+        if self.disable_reasoning {
+            Some("none")
+        } else {
+            configured
+        }
+    }
+}
+
 fn is_codex_unauthorized_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("401 unauthorized")
         || lower.contains("http error: 401")
         || lower.contains("api error (401")
-}
-
-fn is_recoverable_compact_llm_error(error: &str) -> bool {
-    is_prompt_too_long_error(error) || is_tool_call_output_reference_error(error)
-}
-
-fn is_tool_call_output_reference_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("no tool call found for function call output")
-        || (lower.contains("no tool call found") && lower.contains("function_call_output"))
 }
 
 fn messages_have_images(messages: &[ChatMessage]) -> bool {
@@ -780,6 +793,12 @@ pub(crate) struct ExecutedToolResult {
 struct CompletedToolResult {
     executed: ExecutedToolResult,
     stored_output: String,
+}
+
+#[derive(Debug)]
+struct ParallelEditBatch {
+    member_indices: Vec<usize>,
+    arguments: serde_json::Value,
 }
 
 impl ToolRunOutcome {
@@ -5516,6 +5535,99 @@ impl AgentInstance {
             .to_ascii_lowercase()
     }
 
+    fn edit_operations_for_batch(args: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+        if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
+            if edits.is_empty()
+                || edits.iter().any(|edit| {
+                    !edit
+                        .get("oldString")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                        || !edit
+                            .get("newString")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                        || edit
+                            .get("replaceAll")
+                            .is_some_and(|value| !value.is_boolean())
+                })
+            {
+                return None;
+            }
+            return Some(edits.clone());
+        }
+
+        let old_string = args.get("oldString")?.as_str()?;
+        let new_string = args.get("newString")?.as_str()?;
+        if args
+            .get("replaceAll")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return None;
+        }
+
+        let mut operation = serde_json::json!({
+            "oldString": old_string,
+            "newString": new_string,
+        });
+        if let Some(replace_all) = args.get("replaceAll") {
+            operation["replaceAll"] = replace_all.clone();
+        }
+        Some(vec![operation])
+    }
+
+    fn plan_parallel_edit_batches(
+        prepared: &[(ToolCallInfo, serde_json::Value)],
+        blocked_tool_call_ids: &HashSet<String>,
+    ) -> Option<Vec<ParallelEditBatch>> {
+        let active_indices: Vec<usize> = prepared
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (tool_call, _))| {
+                (!blocked_tool_call_ids.contains(&tool_call.id)).then_some(index)
+            })
+            .collect();
+        if active_indices.len() < 2
+            || active_indices
+                .iter()
+                .any(|index| prepared[*index].0.name != "edit")
+        {
+            return None;
+        }
+
+        let mut batches: Vec<ParallelEditBatch> = Vec::new();
+        let mut batch_indices_by_path: HashMap<String, usize> = HashMap::new();
+        for index in active_indices {
+            let (_, args) = &prepared[index];
+            let file_path = args.get("filePath")?.as_str()?;
+            let operations = Self::edit_operations_for_batch(args)?;
+            let normalized_path = Self::normalize_path_lexically(std::path::Path::new(file_path));
+            let path_key = Self::normalize_path_for_compare(&normalized_path);
+
+            if let Some(batch_index) = batch_indices_by_path.get(&path_key).copied() {
+                let batch = &mut batches[batch_index];
+                batch.member_indices.push(index);
+                batch
+                    .arguments
+                    .get_mut("edits")
+                    .and_then(serde_json::Value::as_array_mut)?
+                    .extend(operations);
+                continue;
+            }
+
+            batch_indices_by_path.insert(path_key, batches.len());
+            batches.push(ParallelEditBatch {
+                member_indices: vec![index],
+                arguments: serde_json::json!({
+                    "filePath": file_path,
+                    "edits": operations,
+                }),
+            });
+        }
+
+        Some(batches)
+    }
+
     fn path_is_within_root(path: &std::path::Path, root: &std::path::Path) -> bool {
         let path_norm = Self::normalize_path_for_compare(path);
         let root_norm = Self::normalize_path_for_compare(root);
@@ -6970,6 +7082,7 @@ impl AgentInstance {
         &self,
         store: &SessionStore,
         codex_turn_state: Option<&mut codex::TurnState>,
+        request_options: LlmRequestOptions,
         system_parts: &[&str],
         messages: &[crate::session::models::ChatMessage],
         api_tools: &[serde_json::Value],
@@ -6993,6 +7106,7 @@ impl AgentInstance {
                     None, // provider_tag
                     &[],  // extra_headers
                     None, // reasoning_effort
+                    request_options.max_output_tokens,
                     self.debug,
                     on_text_delta,
                     on_thinking_delta,
@@ -7031,7 +7145,8 @@ impl AgentInstance {
                     api_tools,
                     base_url.as_deref(),
                     Some(&self.session_id),
-                    self.effort.as_deref(),
+                    request_options.thinking_level(self.effort.as_deref()),
+                    request_options.max_output_tokens,
                     on_text_delta,
                     on_thinking_delta,
                     on_tool_call_start,
@@ -7083,7 +7198,7 @@ impl AgentInstance {
                     messages,
                     api_tools,
                     tool_search_description,
-                    self.effort.as_deref(),
+                    request_options.thinking_level(self.effort.as_deref()),
                     self.codex_fast_mode,
                     self.debug,
                     Some(&self.session_id),
@@ -7113,7 +7228,7 @@ impl AgentInstance {
                             messages,
                             api_tools,
                             tool_search_description,
-                            self.effort.as_deref(),
+                            request_options.thinking_level(self.effort.as_deref()),
                             self.codex_fast_mode,
                             self.debug,
                             Some(&self.session_id),
@@ -7163,7 +7278,7 @@ impl AgentInstance {
                     return Err(no_vision_endpoint_error());
                 }
                 let custom_reasoning_effort = crate::llm::openai_reasoning::custom_reasoning_effort(
-                    self.effort.as_deref(),
+                    request_options.thinking_level(self.effort.as_deref()),
                     supported_reasoning_efforts,
                 );
                 match api_format {
@@ -7179,14 +7294,22 @@ impl AgentInstance {
                             reasoning_param_format,
                             CustomReasoningParamFormat::OpenaiChatReasoningEffort
                         )
-                        .then_some(self.effort.as_deref())
+                        .then_some(request_options.thinking_level(self.effort.as_deref()))
                         .flatten();
                         let thinking_toggle = match reasoning_param_format {
                             CustomReasoningParamFormat::OpenaiChatEnableThinking => {
-                                Some(chat_completions::ThinkingToggle::EnableThinking)
+                                Some(if request_options.disable_reasoning {
+                                    chat_completions::ThinkingToggle::DisableThinking
+                                } else {
+                                    chat_completions::ThinkingToggle::EnableThinking
+                                })
                             }
                             CustomReasoningParamFormat::OpenaiChatThinkingType => {
-                                Some(chat_completions::ThinkingToggle::ThinkingType)
+                                Some(if request_options.disable_reasoning {
+                                    chat_completions::ThinkingToggle::ThinkingDisabled
+                                } else {
+                                    chat_completions::ThinkingToggle::ThinkingType
+                                })
                             }
                             _ => None,
                         };
@@ -7203,6 +7326,7 @@ impl AgentInstance {
                                 replay_reasoning_content: *replay_reasoning_content,
                                 reasoning_replay_field: *reasoning_replay_field,
                                 thinking_toggle,
+                                max_output_tokens: request_options.max_output_tokens,
                             },
                             self.debug,
                             on_text_delta,
@@ -7243,8 +7367,9 @@ impl AgentInstance {
                             messages,
                             api_tools,
                             endpoint.as_str(),
-                            self.effort.as_deref(),
+                            request_options.thinking_level(self.effort.as_deref()),
                             reasoning_effort,
+                            request_options.max_output_tokens,
                             self.debug,
                             Some(&self.session_id),
                             on_text_delta,
@@ -7276,7 +7401,9 @@ impl AgentInstance {
                             reasoning_param_format,
                             CustomReasoningParamFormat::AnthropicThinking
                         )
-                        .then_some(custom_reasoning_effort.as_deref())
+                        .then_some(
+                            request_options.thinking_level(custom_reasoning_effort.as_deref()),
+                        )
                         .flatten();
                         let resp = anthropic::stream_chat_native(
                             api_key,
@@ -7291,6 +7418,7 @@ impl AgentInstance {
                             Some(&self.session_id),
                             "Custom(Anthropic)",
                             self.debug,
+                            request_options.max_output_tokens,
                             on_text_delta,
                             on_thinking_delta,
                             on_tool_call_start,
@@ -7435,6 +7563,7 @@ impl AgentInstance {
         store: &SessionStore,
         system_parts: &[&str],
         messages: &[crate::session::models::ChatMessage],
+        max_output_tokens: u32,
     ) -> Result<LlmCallResult, String> {
         if let LlmBackend::OpenAiCodex {
             auth,
@@ -7459,12 +7588,14 @@ impl AgentInstance {
                 messages,
                 &[],
                 None,
-                self.effort.as_deref(),
+                None,
                 self.debug,
                 None,
                 None,
                 &mut compact_turn_state,
-                codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
+                codex::CodexStreamOptions::compact()
+                    .with_fast_mode(self.codex_fast_mode)
+                    .with_max_output_tokens(max_output_tokens),
                 &|_| {},
                 &|_| {},
                 &|_, _| {},
@@ -7490,12 +7621,14 @@ impl AgentInstance {
                         messages,
                         &[],
                         None,
-                        self.effort.as_deref(),
+                        None,
                         self.debug,
                         None,
                         None,
                         &mut compact_turn_state,
-                        codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
+                        codex::CodexStreamOptions::compact()
+                            .with_fast_mode(self.codex_fast_mode)
+                            .with_max_output_tokens(max_output_tokens),
                         &|_| {},
                         &|_| {},
                         &|_, _| {},
@@ -7526,6 +7659,7 @@ impl AgentInstance {
         self.call_llm(
             store,
             None,
+            LlmRequestOptions::checkpoint_compaction(max_output_tokens),
             system_parts,
             messages,
             &[],
@@ -7535,6 +7669,88 @@ impl AgentInstance {
             |_, _| {},
         )
         .await
+    }
+
+    fn record_compaction_model_usage(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        response: &LlmCallResult,
+        context_limit: u32,
+    ) {
+        if response.input_tokens == 0
+            && response.output_tokens == 0
+            && response.cache_read_tokens == 0
+            && response.cache_write_tokens == 0
+        {
+            return;
+        }
+
+        let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. }) {
+            1
+        } else {
+            0
+        };
+        let provider = self.model_usage_provider();
+        match store.record_model_usage(
+            &self.session_id,
+            &self.effective_model,
+            &provider,
+            "compaction",
+            response.input_tokens as u64,
+            response.output_tokens as u64,
+            response.cache_read_tokens as u64,
+            response.cache_write_tokens as u64,
+            response.cost_usd,
+            priced_rounds,
+            None,
+            None,
+        ) {
+            Ok(totals) => {
+                eprintln!(
+                    "[Agent {}] compact tokens: +{}in/+{}out/+{}cache_r/+{}cache_w, cost=${:.6}, total: {}in/{}out/{}cache_r/{}cache_w/${:.6}",
+                    self.id,
+                    response.input_tokens,
+                    response.output_tokens,
+                    response.cache_read_tokens,
+                    response.cache_write_tokens,
+                    response.cost_usd,
+                    totals.total_input_tokens,
+                    totals.total_output_tokens,
+                    totals.total_cache_read_tokens,
+                    totals.total_cache_write_tokens,
+                    totals.total_cost_usd,
+                );
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::UsageUpdate {
+                        session_id: self.session_id.clone(),
+                        input_tokens: response.input_tokens,
+                        output_tokens: response.output_tokens,
+                        cache_read_tokens: response.cache_read_tokens,
+                        cache_write_tokens: response.cache_write_tokens,
+                        total_input_tokens: totals.total_input_tokens,
+                        total_output_tokens: totals.total_output_tokens,
+                        total_cache_read_tokens: totals.total_cache_read_tokens,
+                        total_cache_write_tokens: totals.total_cache_write_tokens,
+                        total_cost_usd: totals.total_cost_usd,
+                        priced_rounds: totals.priced_rounds,
+                        // Compact is an internal summarization call; keep the
+                        // visible live context estimate on the agent request.
+                        context_tokens: 0,
+                        context_limit,
+                    },
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] failed to record compact token usage: {}",
+                    self.id, error
+                );
+            }
+        }
     }
 
     async fn estimate_current_context_tokens(
@@ -7870,7 +8086,7 @@ impl AgentInstance {
         }
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
-        if messages.len() < 2 {
+        if messages.is_empty() {
             return Ok(None);
         }
 
@@ -7890,141 +8106,30 @@ impl AgentInstance {
             messages.len()
         );
 
-        let mut compact_plan = match compact::build_compact_request_with_budget(
+        let compact_plan = match compact::build_checkpoint_compact_request(
             &messages,
-            system_parts,
             context_limit,
-        ) {
-            Ok(plan) => plan,
-            Err(e) => {
+        )? {
+            Some(plan) => plan,
+            None => {
                 eprintln!(
-                    "[Agent {}] budgeted compact request unavailable, using emergency compact: {}",
-                    self.id, e
+                    "[Agent {}] {} skipped: the history has no head older than the checkpoint recent window",
+                    self.id, compact_label
                 );
-                let mut boundary_idx = compact::find_compact_boundary_by_budget(
-                    &messages,
-                    compact::compact_recent_tail_token_budget(context_limit),
-                );
-                if force_compact
-                    && !compact::has_compactable_messages_before_boundary(
-                        &messages,
-                        boundary_idx,
-                        context_limit,
-                    )
-                {
-                    boundary_idx = messages.len().saturating_sub(1);
-                    while boundary_idx > 0 && messages[boundary_idx].role == MessageRole::Tool {
-                        boundary_idx -= 1;
-                    }
-                }
-                if !compact::has_compactable_messages_before_boundary(
-                    &messages,
-                    boundary_idx,
-                    context_limit,
-                ) {
-                    eprintln!(
-                        "[Agent {}] emergency {} skipped: no compactable messages before boundary {}",
-                        self.id, compact_label, boundary_idx
-                    );
-                    return Ok(None);
-                }
-                emit_stream(
-                    app_handle,
-                    run_id,
-                    StreamEvent::CompactStart {
-                        session_id: self.session_id.clone(),
-                        context_tokens,
-                        context_limit,
-                        trigger: Some(trigger),
-                    },
-                );
-                let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
-                let keep_from_msg = &messages[boundary_idx];
-                let restored_files_section = compact::build_post_compact_restored_files_section(
-                    &messages,
-                    &self.working_dir,
-                    context_limit,
-                );
-                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
-                let summary_msg = compact::build_post_compact_message(
-                    &summary,
-                    &restored_files_section,
-                    keep_from_msg.created_at,
-                    compact::will_retain_user_messages(&messages, context_limit),
-                    transcript.as_ref(),
-                );
-                let (count_before, count_after) = store.compact_messages(
-                    &self.session_id,
-                    &summary_msg,
-                    &keep_from_msg.id,
-                    compact::compact_user_message_token_budget(context_limit),
-                )?;
-                if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
-                    crate::llm::codex::reset_cached_session_window(&self.session_id).await;
-                }
-                let compacted_context_tokens = self
-                    .persist_compacted_context_usage(store, system_parts, context_limit)
-                    .await;
-                let compacted_messages = store.get_messages(&self.session_id)?;
-                eprintln!(
-                    "[Agent {}] emergency {} done: {} → {} messages, summary len={}",
-                    self.id,
-                    compact_label,
-                    count_before,
-                    count_after,
-                    summary.len()
-                );
-                emit_stream(
-                    app_handle,
-                    run_id,
-                    StreamEvent::CompactDone {
-                        session_id: self.session_id.clone(),
-                        messages_before,
-                        messages_after: count_after,
-                        context_tokens: compacted_context_tokens,
-                        context_limit,
-                        messages: compacted_messages,
-                    },
-                );
-                return Ok(Some(compacted_context_tokens));
+                return Ok(None);
             }
         };
 
-        if force_compact
-            && !compact::has_compactable_messages_before_boundary(
-                &messages,
-                compact_plan.boundary_idx,
-                context_limit,
-            )
-        {
-            compact_plan.boundary_idx = messages.len().saturating_sub(1);
-            while compact_plan.boundary_idx > 0
-                && messages[compact_plan.boundary_idx].role == MessageRole::Tool
-            {
-                compact_plan.boundary_idx -= 1;
-            }
-        }
-
         eprintln!(
-            "[Agent {}] compact request budget: estimated_tokens={}, budget={}, boundary_idx={}, truncated={}",
+            "[Agent {}] checkpoint request budget: estimated_tokens={}, budget={}, summary_output_tokens={}, head_tokens={}, recent_tokens={}, previous_checkpoint={}",
             self.id,
             compact_plan.estimated_tokens,
             compact_plan.budget_tokens,
-            compact_plan.boundary_idx,
-            compact_plan.truncated
+            compact_plan.summary_output_tokens,
+            compact_plan.head_tokens,
+            compact_plan.recent_tokens,
+            compact_plan.had_previous_checkpoint
         );
-
-        if !compact::has_compactable_messages_before_boundary(
-            &messages,
-            compact_plan.boundary_idx,
-            context_limit,
-        ) {
-            eprintln!(
-                "[Agent {}] {} skipped: no compactable messages before boundary {}",
-                self.id, compact_label, compact_plan.boundary_idx
-            );
-            return Ok(None);
-        }
 
         emit_stream(
             app_handle,
@@ -8037,230 +8142,129 @@ impl AgentInstance {
             },
         );
 
-        let summary_result = self
-            .call_compact_llm(store, system_parts, &compact_plan.messages)
-            .await;
-        match &summary_result {
-            Ok(resp) => {
-                self.record_raw_attempt(
-                    store,
-                    run_id,
-                    attempt_kind,
-                    iteration,
-                    1,
-                    system_parts,
-                    &compact_plan.messages,
-                    &[],
-                    compact_plan.estimated_tokens,
-                    "completed",
-                    Some(&resp.raw_request),
-                    &resp.raw_response,
-                    None,
-                    Some(false),
-                )
-                .await;
+        let compact_system_parts = [compact::CHECKPOINT_COMPACTION_SYSTEM_PROMPT];
+        let mut summary_output_tokens = compact_plan.summary_output_tokens;
+        let mut summary_attempt = 1u32;
+        let summary_response = loop {
+            let request_budget =
+                compact::checkpoint_compact_request_budget(context_limit, summary_output_tokens);
+            if compact_plan.estimated_tokens > request_budget {
+                return Err(format!(
+                    "Checkpoint retry cannot fit the endpoint context window; original prompt remains active: estimated_tokens={}, budget_tokens={}, summary_output_tokens={}",
+                    compact_plan.estimated_tokens, request_budget, summary_output_tokens
+                ));
             }
-            Err(e) => {
-                self.record_raw_attempt(
-                    store,
-                    run_id,
-                    attempt_kind,
-                    iteration,
-                    1,
-                    system_parts,
-                    &compact_plan.messages,
-                    &[],
-                    compact_plan.estimated_tokens,
-                    "failed",
-                    None,
-                    "",
-                    Some(e),
-                    Some(false),
-                )
-                .await;
-            }
-        }
 
-        let summary_response = match summary_result {
-            Ok(resp) => resp,
-            Err(e) if is_recoverable_compact_llm_error(&e) => {
-                eprintln!(
-                    "[Agent {}] compact LLM call could not be safely sent, using emergency compact: {}",
-                    self.id, e
-                );
-                let boundary_idx = compact_plan.boundary_idx;
-                if !compact::has_compactable_messages_before_boundary(
-                    &messages,
-                    boundary_idx,
-                    context_limit,
-                ) {
-                    eprintln!(
-                        "[Agent {}] emergency auto-compact skipped after compact error: no compactable messages before boundary {}",
-                        self.id, boundary_idx
-                    );
-                    return Ok(None);
-                }
-                let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
-                let keep_from_msg = &messages[boundary_idx];
-                let restored_files_section = compact::build_post_compact_restored_files_section(
-                    &messages,
-                    &self.working_dir,
-                    context_limit,
-                );
-                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
-                let summary_msg = compact::build_post_compact_message(
-                    &summary,
-                    &restored_files_section,
-                    keep_from_msg.created_at,
-                    compact::will_retain_user_messages(&messages, context_limit),
-                    transcript.as_ref(),
-                );
-                let (count_before, count_after) = store.compact_messages(
-                    &self.session_id,
-                    &summary_msg,
-                    &keep_from_msg.id,
-                    compact::compact_user_message_token_budget(context_limit),
-                )?;
-                if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
-                    crate::llm::codex::reset_cached_session_window(&self.session_id).await;
-                }
-                let compacted_context_tokens = self
-                    .persist_compacted_context_usage(store, system_parts, context_limit)
+            eprintln!(
+                "[Agent {}] checkpoint summary attempt {}: max_output_tokens={}",
+                self.id, summary_attempt, summary_output_tokens
+            );
+            let summary_result = self
+                .call_compact_llm(
+                    store,
+                    &compact_system_parts,
+                    &compact_plan.messages,
+                    summary_output_tokens,
+                )
+                .await;
+            match &summary_result {
+                Ok(response) => {
+                    self.record_raw_attempt(
+                        store,
+                        run_id,
+                        attempt_kind,
+                        iteration,
+                        summary_attempt,
+                        &compact_system_parts,
+                        &compact_plan.messages,
+                        &[],
+                        compact_plan.estimated_tokens,
+                        "completed",
+                        Some(&response.raw_request),
+                        &response.raw_response,
+                        None,
+                        Some(false),
+                    )
                     .await;
-                let compacted_messages = store.get_messages(&self.session_id)?;
+                }
+                Err(error) => {
+                    self.record_raw_attempt(
+                        store,
+                        run_id,
+                        attempt_kind,
+                        iteration,
+                        summary_attempt,
+                        &compact_system_parts,
+                        &compact_plan.messages,
+                        &[],
+                        compact_plan.estimated_tokens,
+                        "failed",
+                        None,
+                        "",
+                        Some(error),
+                        Some(false),
+                    )
+                    .await;
+                }
+            }
+
+            let response = match summary_result {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] checkpoint LLM call failed; original prompt remains active: {}",
+                        self.id, error
+                    );
+                    return Err(error);
+                }
+            };
+            self.record_compaction_model_usage(app_handle, store, run_id, &response, context_limit);
+
+            if compact::checkpoint_finish_reason_reached_output_limit(&response.finish_reason) {
+                let Some(next_output_tokens) =
+                    compact::next_checkpoint_summary_output_tokens(summary_output_tokens)
+                else {
+                    return Err(format!(
+                        "Checkpoint summary reached the {} token output limit; original prompt remains active",
+                        summary_output_tokens
+                    ));
+                };
                 eprintln!(
-                    "[Agent {}] emergency auto-compact done after compact error: {} → {} messages, summary len={}",
-                    self.id,
-                    count_before,
-                    count_after,
-                    summary.len()
+                    "[Agent {}] checkpoint summary was truncated (finish_reason={}); retrying with max_output_tokens={}",
+                    self.id, response.finish_reason, next_output_tokens
                 );
-                emit_stream(
-                    app_handle,
-                    run_id,
-                    StreamEvent::CompactDone {
-                        session_id: self.session_id.clone(),
-                        messages_before,
-                        messages_after: count_after,
-                        context_tokens: compacted_context_tokens,
-                        context_limit,
-                        messages: compacted_messages,
-                    },
-                );
-                return Ok(Some(compacted_context_tokens));
+                summary_output_tokens = next_output_tokens;
+                summary_attempt = summary_attempt.saturating_add(1);
+                continue;
             }
-            Err(e) => {
-                eprintln!("[Agent {}] compact LLM call failed: {}", self.id, e);
-                return Err(e);
-            }
+
+            break response;
         };
 
-        if summary_response.input_tokens > 0
-            || summary_response.output_tokens > 0
-            || summary_response.cache_read_tokens > 0
-            || summary_response.cache_write_tokens > 0
-        {
-            let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. }) {
-                1
-            } else {
-                0
-            };
-            let provider = self.model_usage_provider();
-            match store.record_model_usage(
-                &self.session_id,
-                &self.effective_model,
-                &provider,
-                "compaction",
-                summary_response.input_tokens as u64,
-                summary_response.output_tokens as u64,
-                summary_response.cache_read_tokens as u64,
-                summary_response.cache_write_tokens as u64,
-                summary_response.cost_usd,
-                priced_rounds,
-                None,
-                None,
-            ) {
-                Ok(totals) => {
-                    eprintln!(
-                        "[Agent {}] compact tokens: +{}in/+{}out/+{}cache_r/+{}cache_w, cost=${:.6}, total: {}in/{}out/{}cache_r/{}cache_w/${:.6}",
-                        self.id,
-                        summary_response.input_tokens,
-                        summary_response.output_tokens,
-                        summary_response.cache_read_tokens,
-                        summary_response.cache_write_tokens,
-                        summary_response.cost_usd,
-                        totals.total_input_tokens,
-                        totals.total_output_tokens,
-                        totals.total_cache_read_tokens,
-                        totals.total_cache_write_tokens,
-                        totals.total_cost_usd,
-                    );
-                    emit_stream(
-                        app_handle,
-                        run_id,
-                        StreamEvent::UsageUpdate {
-                            session_id: self.session_id.clone(),
-                            input_tokens: summary_response.input_tokens,
-                            output_tokens: summary_response.output_tokens,
-                            cache_read_tokens: summary_response.cache_read_tokens,
-                            cache_write_tokens: summary_response.cache_write_tokens,
-                            total_input_tokens: totals.total_input_tokens,
-                            total_output_tokens: totals.total_output_tokens,
-                            total_cache_read_tokens: totals.total_cache_read_tokens,
-                            total_cache_write_tokens: totals.total_cache_write_tokens,
-                            total_cost_usd: totals.total_cost_usd,
-                            priced_rounds: totals.priced_rounds,
-                            // Compact is an internal summarization call; do not replace the
-                            // visible live context estimate with the compact-request context.
-                            context_tokens: 0,
-                            context_limit,
-                        },
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[Agent {}] failed to record compact token usage: {}",
-                        self.id, e
-                    );
-                }
-            }
-        }
-
-        let boundary_idx = compact_plan.boundary_idx;
-        let mut summary = compact::extract_summary(&summary_response.text);
-        if !compact::is_valid_compact_summary(&summary) {
+        let summary = compact::extract_summary(&summary_response.text);
+        if !compact::is_valid_checkpoint_summary(&summary) {
             eprintln!(
-                "[Agent {}] compact returned invalid summary, using emergency compact: summary_len={}",
+                "[Agent {}] checkpoint returned an invalid anchored summary; original prompt remains active: summary_len={}",
                 self.id,
                 summary.len()
             );
-            summary = compact::build_emergency_compact_summary(
-                &messages,
-                boundary_idx,
-                "compact LLM returned an invalid summary",
+            return Err(
+                "Checkpoint compaction returned an invalid anchored summary; the original context was preserved"
+                    .to_string(),
             );
         }
 
-        let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section = compact::build_post_compact_restored_files_section(
-            &messages,
-            &self.working_dir,
-            context_limit,
-        );
-        let transcript = compact::export_compact_transcript(&self.session_id, &messages);
-        let summary_msg = compact::build_post_compact_message(
+        let checkpoint_message = compact::build_conversation_checkpoint_message(
             &summary,
-            &restored_files_section,
-            keep_from_msg.created_at,
-            compact::will_retain_user_messages(&messages, context_limit),
-            transcript.as_ref(),
+            &compact_plan.recent,
+            compact_plan.checkpoint_created_at,
         );
 
         let (count_before, count_after) = store.compact_messages(
             &self.session_id,
-            &summary_msg,
-            &keep_from_msg.id,
-            compact::compact_user_message_token_budget(context_limit),
+            &checkpoint_message,
+            &compact_plan.keep_from_message_id,
+            0,
         )?;
         if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
@@ -8271,11 +8275,12 @@ impl AgentInstance {
         let compacted_messages = store.get_messages(&self.session_id)?;
 
         eprintln!(
-            "[Agent {}] auto-compact done: {} → {} messages, summary len={}",
+            "[Agent {}] checkpoint compact done: {} → {} messages, summary_len={}, recent_tokens={}",
             self.id,
             count_before,
             count_after,
-            summary.len()
+            summary.len(),
+            compact_plan.recent_tokens
         );
 
         emit_stream(
@@ -8417,18 +8422,28 @@ impl AgentInstance {
 
             match content_result {
                 Ok(content) => {
+                    let runtime_context =
+                        crate::skill_runtime_context::for_selected_skill_source(
+                            source,
+                            &rel_path,
+                            &content,
+                            crate::skill_runtime_context::SkillRuntimeContextTrigger::Command,
+                        )
+                        .map(|context| format!("\n\n{}", context))
+                        .unwrap_or_default();
                     let content = if is_external {
                         Self::substitute_skill_argument_placeholders(&content, user_text)
                     } else {
                         content
                     };
                     blocks.push(format!(
-                    "<selected-skill>\nName: {}\nSource: {}\nPath: {}{}\n\n{}\n</selected-skill>",
+                    "<selected-skill>\nName: {}\nSource: {}\nPath: {}{}\n\n{}{}\n</selected-skill>",
                     escaped_name,
                     escaped_source,
                     escaped_path,
                     origin_root,
-                    content.trim()
+                    content.trim(),
+                    runtime_context
                     ))
                 }
                 Err(error) => blocks.push(format!(
@@ -9797,6 +9812,7 @@ impl AgentInstance {
                     result = self.call_llm(
                         store,
                         codex_turn_state.as_mut(),
+                        LlmRequestOptions::default(),
                         &system_parts,
                         &prepared_messages,
                         &api_tools,
@@ -10487,8 +10503,9 @@ impl AgentInstance {
 
                 // Calls that can wait for user input, run child agents, or re-enter
                 // through an external MCP server never share a round-level workspace
-                // lock with local tools. Blocking the mixed siblings gives the model
-                // a deterministic retry path and prevents parent/child lock cycles.
+                // lock with local mutating tools. Deterministic query/bookkeeping tools
+                // may finish in a parallel pre-ask phase; the lock is released before
+                // the first user-input tool starts waiting.
                 let mut blocked_results: HashMap<String, ExecutedToolResult> = HashMap::new();
                 let has_ask = prepared
                     .iter()
@@ -10499,8 +10516,17 @@ impl AgentInstance {
                 let has_external_mcp = prepared.iter().any(|(tc, _)| {
                     effective_name(tc).starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
                 });
-                let mixed_round_reason = if has_ask && prepared.len() > 1 {
-                    Some(("ask_user_question", "user-input tools must run alone"))
+                let has_deferred_ask_sibling = has_ask
+                    && prepared.iter().any(|(tc, _)| {
+                        let name = effective_name(tc);
+                        name != "ask_user_question"
+                            && !Self::is_deterministic_pre_ask_tool(&name)
+                    });
+                let mixed_round_reason = if has_deferred_ask_sibling {
+                    Some((
+                        "ask_user_question",
+                        "user-input rounds only allow deterministic pre-ask tools",
+                    ))
                 } else if has_subagent
                     && prepared
                         .iter()
@@ -10523,7 +10549,10 @@ impl AgentInstance {
                     for (tc, _) in &prepared {
                         let name = effective_name(tc);
                         let allowed = match allowed_kind {
-                            "ask_user_question" => name == "ask_user_question",
+                            "ask_user_question" => {
+                                name == "ask_user_question"
+                                    || Self::is_deterministic_pre_ask_tool(&name)
+                            }
                             "subagent" => name == "subagent",
                             _ => name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
                         };
@@ -10548,18 +10577,22 @@ impl AgentInstance {
                     }
                 }
 
-                let is_local_active_round = prepared
+                let is_local_active_round = prepared.iter().any(|(tc, _)| {
+                    if blocked_results.contains_key(&tc.id) {
+                        return false;
+                    }
+                    let name = effective_name(tc);
+                    name != "subagent"
+                        && name != "ask_user_question"
+                        && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                }) && prepared
                     .iter()
-                    .any(|(tc, _)| !blocked_results.contains_key(&tc.id))
-                    && prepared
-                        .iter()
-                        .filter(|(tc, _)| !blocked_results.contains_key(&tc.id))
-                        .all(|(tc, _)| {
-                            let name = effective_name(tc);
-                            name != "subagent"
-                                && name != "ask_user_question"
-                                && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
-                        });
+                    .filter(|(tc, _)| !blocked_results.contains_key(&tc.id))
+                    .all(|(tc, _)| {
+                        let name = effective_name(tc);
+                        name != "subagent"
+                            && !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
+                    });
 
                 // Confirm every local call before taking the process-wide lock.
                 // A confirmation dialog can remain open indefinitely; holding a
@@ -10574,7 +10607,10 @@ impl AgentInstance {
                         }
                         if matches!(
                             effective_name(tc).as_str(),
-                            "tool_load" | CODEX_TOOL_SEARCH_TOOL_NAME | "exit_plan_mode"
+                            "ask_user_question"
+                                | "tool_load"
+                                | CODEX_TOOL_SEARCH_TOOL_NAME
+                                | "exit_plan_mode"
                         ) {
                             continue;
                         }
@@ -10639,13 +10675,26 @@ impl AgentInstance {
                 let execute_sequentially = workspace_lock_mode
                     == Some(WorkspaceExecutionLockMode::Write)
                     || has_ask;
+                let blocked_tool_call_ids: HashSet<String> =
+                    blocked_results.keys().cloned().collect();
+                let parallel_edit_batches = if execute_sequentially && !has_ask {
+                    Self::plan_parallel_edit_batches(&prepared, &blocked_tool_call_ids)
+                } else {
+                    None
+                };
                 eprintln!(
                     "[Agent {}] tool round policy session={} run={} iteration={} strategy={} workspace_lock={} active={} blocked={} tools=[{}]",
                     self.id,
                     self.session_id,
                     run_id,
                     iteration,
-                    if execute_sequentially { "sequential" } else { "parallel" },
+                    if parallel_edit_batches.is_some() {
+                        "parallel-edit-batches"
+                    } else if execute_sequentially {
+                        "sequential"
+                    } else {
+                        "parallel"
+                    },
                     workspace_lock_mode
                         .map(|mode| match mode {
                             WorkspaceExecutionLockMode::Read => "read",
@@ -10742,7 +10791,291 @@ impl AgentInstance {
                     }
                 }
 
-                let completed_results = if execute_sequentially {
+                let has_deterministic_pre_ask_tools = has_ask
+                    && prepared.iter().any(|(tc, _)| {
+                        is_active(tc)
+                            && Self::is_deterministic_pre_ask_tool(&effective_name(tc))
+                    });
+                let completed_results = if has_deterministic_pre_ask_tools {
+                    eprintln!(
+                        "[Agent {}] executing deterministic pre-ask tools in parallel session={} run={}",
+                        self.id, self.session_id, run_id
+                    );
+                    let mode_ref = mode.as_str();
+                    let run_id_ref = run_id.as_str();
+                    let assistant_msg_id_ref = assistant_msg_id.as_str();
+                    let active_skill_tool_names_ref = &active_skill_tool_names;
+                    let agent = &*self;
+                    let mut pending = futures::stream::FuturesUnordered::new();
+                    for (index, (tc, args)) in prepared.iter().enumerate() {
+                        if !is_active(tc)
+                            || !Self::is_deterministic_pre_ask_tool(&effective_name(tc))
+                        {
+                            continue;
+                        }
+                        let confirmation_preapproved =
+                            confirmation_preapproved.contains(&tc.id);
+                        pending.push(async move {
+                            let result = agent
+                                .execute_single_tool(
+                                    app_handle,
+                                    store,
+                                    tc,
+                                    args,
+                                    run_id_ref,
+                                    assistant_msg_id_ref,
+                                    mode_ref,
+                                    active_skill_tool_names_ref,
+                                    confirmation_preapproved,
+                                )
+                                .await;
+                            (index, result)
+                        });
+                    }
+
+                    let mut results_by_index: Vec<Option<CompletedToolResult>> =
+                        std::iter::repeat_with(|| None)
+                            .take(prepared.len())
+                            .collect();
+                    while let Some((index, result)) = pending.next().await {
+                        let (tc, args) = &prepared[index];
+                        if !self.run_is_current_for_session(
+                            store,
+                            &run_id,
+                            "pre_ask_tool_result_completed",
+                            Some(&tc.id),
+                        ) {
+                            return Ok(String::new());
+                        }
+                        let resolved_tool_name = effective_name(tc);
+                        self.record_failed_tool_call(
+                            app_handle,
+                            &run_id,
+                            &assistant_msg_id,
+                            tc,
+                            &resolved_tool_name,
+                            args,
+                            &result,
+                            "foreground_pre_ask",
+                        )
+                        .await;
+                        let stored_output = self.stream_completed_tool_result(
+                            app_handle,
+                            store,
+                            &run_id,
+                            tc,
+                            &result,
+                        );
+                        results_by_index[index] = Some(CompletedToolResult {
+                            executed: result,
+                            stored_output,
+                        });
+                    }
+
+                    // The deterministic phase is complete. Never hold its shared
+                    // workspace lock while waiting for a user answer.
+                    drop(workspace_round_guard.take());
+
+                    eprintln!(
+                        "[Agent {}] executing user-input phase sequentially session={} run={}",
+                        self.id, self.session_id, run_id
+                    );
+                    for (index, (tc, args)) in prepared.iter().enumerate() {
+                        if results_by_index[index].is_some() {
+                            continue;
+                        }
+                        let result = if let Some(result) = blocked_results.get(&tc.id) {
+                            result.clone()
+                        } else {
+                            self.execute_single_tool(
+                                app_handle,
+                                store,
+                                tc,
+                                args,
+                                &run_id,
+                                &assistant_msg_id,
+                                &mode,
+                                &active_skill_tool_names,
+                                confirmation_preapproved.contains(&tc.id),
+                            )
+                            .await
+                        };
+                        if !self.run_is_current_for_session(
+                            store,
+                            &run_id,
+                            "ask_phase_tool_result_completed",
+                            Some(&tc.id),
+                        ) {
+                            return Ok(String::new());
+                        }
+                        let resolved_tool_name = effective_name(tc);
+                        self.record_failed_tool_call(
+                            app_handle,
+                            &run_id,
+                            &assistant_msg_id,
+                            tc,
+                            &resolved_tool_name,
+                            args,
+                            &result,
+                            "foreground_ask_phase",
+                        )
+                        .await;
+                        let stored_output = self.stream_completed_tool_result(
+                            app_handle,
+                            store,
+                            &run_id,
+                            tc,
+                            &result,
+                        );
+                        results_by_index[index] = Some(CompletedToolResult {
+                            executed: result,
+                            stored_output,
+                        });
+                    }
+
+                    let Some(results) = results_by_index.into_iter().collect::<Option<Vec<_>>>()
+                    else {
+                        eprintln!(
+                            "[Agent {}] pre-ask tool round ended without every result: session={} run={}",
+                            self.id, self.session_id, run_id
+                        );
+                        return Ok(String::new());
+                    };
+                    results
+                } else if let Some(edit_batches) = parallel_edit_batches {
+                    eprintln!(
+                        "[Agent {}] executing edit-only round in {} parallel file batches session={} run={} calls={}",
+                        self.id,
+                        edit_batches.len(),
+                        self.session_id,
+                        run_id,
+                        prepared.len().saturating_sub(blocked_results.len())
+                    );
+                    let mode_ref = mode.as_str();
+                    let run_id_ref = run_id.as_str();
+                    let assistant_msg_id_ref = assistant_msg_id.as_str();
+                    let active_skill_tool_names_ref = &active_skill_tool_names;
+                    let agent = &*self;
+                    let mut pending = futures::stream::FuturesUnordered::new();
+                    for batch in edit_batches {
+                        let representative_index = batch.member_indices[0];
+                        let (tool_call, _) = &prepared[representative_index];
+                        pending.push(async move {
+                            let result = agent
+                                .execute_single_tool(
+                                    app_handle,
+                                    store,
+                                    tool_call,
+                                    &batch.arguments,
+                                    run_id_ref,
+                                    assistant_msg_id_ref,
+                                    mode_ref,
+                                    active_skill_tool_names_ref,
+                                    true,
+                                )
+                                .await;
+                            (batch.member_indices, result)
+                        });
+                    }
+
+                    let mut results_by_index: Vec<Option<CompletedToolResult>> =
+                        std::iter::repeat_with(|| None)
+                            .take(prepared.len())
+                            .collect();
+                    for (index, (tool_call, args)) in prepared.iter().enumerate() {
+                        let Some(result) = blocked_results.get(&tool_call.id).cloned() else {
+                            continue;
+                        };
+                        let resolved_tool_name = effective_name(tool_call);
+                        self.record_failed_tool_call(
+                            app_handle,
+                            &run_id,
+                            &assistant_msg_id,
+                            tool_call,
+                            &resolved_tool_name,
+                            args,
+                            &result,
+                            "foreground_parallel_edit",
+                        )
+                        .await;
+                        let stored_output = self.stream_completed_tool_result(
+                            app_handle,
+                            store,
+                            &run_id,
+                            tool_call,
+                            &result,
+                        );
+                        results_by_index[index] = Some(CompletedToolResult {
+                            executed: result,
+                            stored_output,
+                        });
+                    }
+
+                    while let Some((member_indices, result)) = pending.next().await {
+                        for index in member_indices {
+                            let (tool_call, args) = &prepared[index];
+                            if !self.run_is_current_for_session(
+                                store,
+                                &run_id,
+                                "parallel_edit_result_completed",
+                                Some(&tool_call.id),
+                            ) {
+                                return Ok(String::new());
+                            }
+                            let resolved_tool_name = effective_name(tool_call);
+                            self.record_failed_tool_call(
+                                app_handle,
+                                &run_id,
+                                &assistant_msg_id,
+                                tool_call,
+                                &resolved_tool_name,
+                                args,
+                                &result,
+                                "foreground_parallel_edit",
+                            )
+                            .await;
+                            let stored_output = self.stream_completed_tool_result(
+                                app_handle,
+                                store,
+                                &run_id,
+                                tool_call,
+                                &result,
+                            );
+                            results_by_index[index] = Some(CompletedToolResult {
+                                executed: result.clone(),
+                                stored_output,
+                            });
+                        }
+                    }
+
+                    let Some(results) = results_by_index.into_iter().collect::<Option<Vec<_>>>()
+                    else {
+                        eprintln!(
+                            "[Agent {}] parallel edit round ended without every result: session={} run={}",
+                            self.id, self.session_id, run_id
+                        );
+                        return Ok(String::new());
+                    };
+                    let mut queued_asset_paths = Vec::new();
+                    let mut seen_asset_paths = HashSet::new();
+                    for ((tool_call, args), completed) in prepared.iter().zip(results.iter()) {
+                        let Some(asset_path) =
+                            self.unity_asset_relative_path(tool_call, args, &completed.executed)
+                        else {
+                            continue;
+                        };
+                        if seen_asset_paths.insert(asset_path.clone()) {
+                            queued_asset_paths.push(asset_path);
+                        }
+                    }
+                    if !queued_asset_paths.is_empty() {
+                        crate::unity_bridge::import_assets_fire_and_forget(
+                            &self.working_dir,
+                            queued_asset_paths,
+                        );
+                    }
+                    results
+                } else if execute_sequentially {
                     eprintln!(
                         "[Agent {}] executing tool round sequentially session={} run={} mutation={} unity_barrier={}",
                         self.id, self.session_id, run_id, needs_undo, has_unity_execution_barrier
@@ -11444,6 +11777,34 @@ impl AgentInstance {
                 | "skill_reload"
                 | "config_query"
                 | "tool_load"
+        )
+    }
+
+    /// Tools whose inputs and effects are independent of a same-round user
+    /// answer. These may run concurrently before `ask_user_question` starts
+    /// waiting. Keep this narrower than `is_readonly_tool`: live Unity/view
+    /// operations and reload-style tools can re-enter another runtime or alter
+    /// process state even when they do not write workspace files.
+    fn is_deterministic_pre_ask_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "todowrite"
+                | "read"
+                | "grep"
+                | "list"
+                | "config_query"
+                | "tool_load"
+                | "get_task_status"
+                | "code_find_references"
+                | "code_goto_definition"
+                | "code_symbol_search"
+                | "code_diagnostics"
+                | "code_hover"
+                | "unity_code_usages"
+                | "knowledge_list"
+                | "knowledge_query"
+                | "knowledge_read"
+                | "skill_list"
         )
     }
 
@@ -14052,6 +14413,16 @@ impl AgentInstance {
                     }
                     names
                 };
+                let skill_runtime_context = result.document.as_ref().and_then(|document| {
+                    (document.part == "full")
+                        .then(|| {
+                            crate::skill_runtime_context::for_knowledge_document(
+                                &document.document,
+                                crate::skill_runtime_context::SkillRuntimeContextTrigger::KnowledgeRead,
+                            )
+                        })
+                        .flatten()
+                });
                 Self::prefix_knowledge_read_response_paths(&mut result);
                 let sanitized = match Self::sanitize_knowledge_read_response(result) {
                     Ok(value) => value,
@@ -14121,6 +14492,10 @@ impl AgentInstance {
                     if let Some(note) = compile_note {
                         output.push_str("\n\n");
                         output.push_str(&note);
+                    }
+                    if let Some(runtime_context) = skill_runtime_context {
+                        output.push_str("\n\n");
+                        output.push_str(&runtime_context);
                     }
                     if !activated_tools.is_empty() {
                         output.push_str("\n\n");
@@ -15351,7 +15726,7 @@ impl AgentInstance {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
-        match crate::unity_bridge::recompile_and_wait(&self.working_dir).await {
+        match crate::code_tools::recompile_with_semantic_warnings(&self.working_dir).await {
             Ok(msg) => ToolResult {
                 output: msg,
                 is_error: false,
@@ -18050,6 +18425,92 @@ mod tests {
         );
     }
 
+    fn test_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCallInfo {
+        ToolCallInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+            order: None,
+        }
+    }
+
+    #[test]
+    fn plans_parallel_edit_batches_by_normalized_file_path() {
+        let root = tempdir().expect("temp dir");
+        let first_path = root.path().join("first.txt");
+        let first_alias = root.path().join("nested").join("..").join("first.txt");
+        let second_path = root.path().join("second.txt");
+        let prepared = vec![
+            (
+                test_tool_call("edit-1", "edit", json!({})),
+                json!({
+                    "filePath": first_path,
+                    "oldString": "alpha",
+                    "newString": "ALPHA"
+                }),
+            ),
+            (
+                test_tool_call("edit-2", "edit", json!({})),
+                json!({
+                    "filePath": second_path,
+                    "oldString": "beta",
+                    "newString": "BETA"
+                }),
+            ),
+            (
+                test_tool_call("edit-3", "edit", json!({})),
+                json!({
+                    "filePath": first_alias,
+                    "oldString": "gamma",
+                    "newString": "GAMMA",
+                    "replaceAll": true
+                }),
+            ),
+        ];
+
+        let batches = AgentInstance::plan_parallel_edit_batches(&prepared, &HashSet::new())
+            .expect("parallel edit plan");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].member_indices, vec![0, 2]);
+        assert_eq!(batches[1].member_indices, vec![1]);
+        assert_eq!(
+            batches[0].arguments["edits"]
+                .as_array()
+                .expect("batched edits")
+                .len(),
+            2
+        );
+        assert_eq!(batches[0].arguments["edits"][1]["oldString"], "gamma");
+        assert_eq!(batches[0].arguments["edits"][1]["replaceAll"], true);
+    }
+
+    #[test]
+    fn parallel_edit_plan_requires_multiple_direct_edit_calls() {
+        let path = tempdir().expect("temp dir").path().join("file.txt");
+        let single = vec![(
+            test_tool_call("edit-1", "edit", json!({})),
+            json!({
+                "filePath": path,
+                "oldString": "alpha",
+                "newString": "ALPHA"
+            }),
+        )];
+        assert!(AgentInstance::plan_parallel_edit_batches(&single, &HashSet::new()).is_none());
+
+        let mut mixed = single;
+        mixed.push((
+            test_tool_call("write-1", "write", json!({})),
+            json!({"filePath": "new.txt", "content": "new"}),
+        ));
+        assert!(AgentInstance::plan_parallel_edit_batches(&mixed, &HashSet::new()).is_none());
+    }
+
     #[test]
     fn compact_start_event_serializes_trigger_for_frontend() {
         let event = StreamEvent::CompactStart {
@@ -18284,6 +18745,45 @@ mod tests {
                 !registry.mutates_workspace(tool),
                 "{} should not declare mutates_workspace",
                 tool
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_pre_ask_tools_are_queries_or_session_bookkeeping() {
+        for tool in [
+            "todowrite",
+            "read",
+            "grep",
+            "list",
+            "config_query",
+            "tool_load",
+            "get_task_status",
+            "code_diagnostics",
+            "knowledge_query",
+            "skill_list",
+        ] {
+            assert!(
+                AgentInstance::is_deterministic_pre_ask_tool(tool),
+                "{tool} should run before ask_user_question"
+            );
+        }
+
+        for tool in [
+            "ask_user_question",
+            "write",
+            "edit",
+            "bash",
+            "subagent",
+            "web_fetch",
+            "unity_execute",
+            "unity_get_console_log",
+            "view_snapshot",
+            "skill_reload",
+        ] {
+            assert!(
+                !AgentInstance::is_deterministic_pre_ask_tool(tool),
+                "{tool} should wait for the next tool round"
             );
         }
     }
@@ -20265,7 +20765,7 @@ PrefabInstance:
         let root = tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         let app_knowledge_dir = root.path().join("app-knowledge");
-        let skill_dir = app_knowledge_dir.join("skill").join("builtin");
+        let skill_dir = app_knowledge_dir.join("skill");
         std::fs::create_dir_all(&workspace).expect("create workspace");
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
@@ -20340,6 +20840,69 @@ Use profiler helpers.
             "{}",
             reminder_with_args
         );
+    }
+
+    #[test]
+    fn selected_debugger_skill_reminder_injects_runtime_debugger_context() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let app_knowledge_dir = root.path().join("app-knowledge");
+        let skill_dir = app_knowledge_dir.join("skill");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("debugger.md"),
+            r#"---
+id: kd_skill_builtin_debugger
+injectMode: excerpt
+summary: Debug Unity runtime behavior.
+aiMaintained: false
+skillEnabled: true
+skillSurface: both
+commandTrigger: /debug
+tools:
+  - bash
+---
+
+# Unity PlayerLoop Debugger
+
+Inspect the runtime.
+"#,
+        )
+        .expect("write debugger skill");
+
+        let agent = test_agent_instance_with_prompts_and_app_knowledge_dir(
+            workspace.to_string_lossy().to_string(),
+            "",
+            "",
+            Some(app_knowledge_dir),
+        );
+        let intent = UserIntentPayload {
+            kind: "user_intent_v1".to_string(),
+            mode: "build".to_string(),
+            skills: vec![UserIntentSkill {
+                dir_name: "debugger".to_string(),
+                source: "app".to_string(),
+                name: "Unity PlayerLoop Debugger".to_string(),
+            }],
+            client_message_id: None,
+        };
+
+        let reminder = agent.build_selected_skill_reminder(&intent, "inspect the hang");
+
+        assert!(
+            reminder.contains("<locus-skill-runtime-context>"),
+            "{}",
+            reminder
+        );
+        assert!(
+            reminder.contains("\"provider\": \"windows-native-debuggers\""),
+            "{}",
+            reminder
+        );
+        assert!(reminder.contains("\"trigger\": \"command\""));
+        assert!(reminder.contains("\"snapshot\": true"));
+        assert!(reminder.contains("\"signatureStatus\": \"not_checked\""));
     }
 
     #[test]

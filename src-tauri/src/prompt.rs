@@ -225,9 +225,15 @@ mod tests {
         );
         let source = std::fs::read_to_string(&path).expect("read debugger skill");
         assert!(source.contains("injectMode: excerpt"));
-        assert!(source.contains("## Summary"));
+        assert!(!source.contains("## Summary"));
         assert!(source.contains("ctx.BreakWhen"));
         assert!(source.contains("ctx.SwitchToMainThread"));
+        assert!(source.contains("  - bash"));
+        assert!(source.contains("Get-Command cdb, windbg, windbgx"));
+        assert!(source.contains("injected `windows-native-debuggers` runtime context"));
+        assert!(source.contains("signatureStatus: not_checked"));
+        assert!(source.contains("Microsoft WinDbg or Debugging Tools for Windows"));
+        assert!(!source.contains("Program Files (x86)\\Windows Kits"));
     }
 
     #[test]

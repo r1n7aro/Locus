@@ -18,6 +18,7 @@ pub async fn stream_chat<F, G, H>(
     base_url: &str,
     thinking_level: Option<&str>,
     explicit_reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u32>,
     debug: bool,
     session_id: Option<&str>,
     on_text_delta: F,
@@ -42,6 +43,7 @@ where
         tools,
         thinking_level,
         explicit_reasoning_effort,
+        max_output_tokens,
         session_id,
         supports_previous_response_id(base_url),
     );
@@ -227,6 +229,7 @@ fn build_request_body(
     tools: &[serde_json::Value],
     thinking_level: Option<&str>,
     explicit_reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u32>,
     session_id: Option<&str>,
     use_previous_response_id: bool,
 ) -> serde_json::Value {
@@ -256,6 +259,9 @@ fn build_request_body(
         apply_reasoning_effort(&mut body, model, thinking_level);
     }
     apply_text_verbosity_default(&mut body, model);
+    if let Some(max_output_tokens) = max_output_tokens.filter(|value| *value > 0) {
+        body["max_output_tokens"] = serde_json::json!(max_output_tokens);
+    }
 
     if !tools.is_empty() {
         let converted: Vec<serde_json::Value> = tools
@@ -1168,11 +1174,13 @@ mod tests {
             &[],
             None,
             None,
+            Some(8_192),
             None,
             true,
         );
 
         assert_eq!(body["text"]["verbosity"].as_str(), Some("low"));
+        assert_eq!(body["max_output_tokens"], serde_json::json!(8_192));
     }
 
     #[test]
@@ -1184,6 +1192,7 @@ mod tests {
             &[],
             Some("high"),
             Some("max"),
+            None,
             None,
             true,
         );

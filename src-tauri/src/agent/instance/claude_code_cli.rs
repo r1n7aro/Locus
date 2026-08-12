@@ -344,9 +344,23 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         let has_external_mcp = tools
             .iter()
             .any(|name| name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX));
-        let allowed_kind = if has_ask && tools.len() > 1 {
-            Some("ask_user_question")
-        } else if has_subagent && tools.iter().any(|name| name != "subagent") {
+        if has_ask {
+            if current_tool_name == "ask_user_question" {
+                return Ok(None);
+            }
+            if AgentInstance::is_deterministic_pre_ask_tool(current_tool_name) {
+                return Ok(Some((
+                    WorkspaceExecutionLockMode::Read,
+                    vec![current_tool_name.to_string()],
+                )));
+            }
+            return Err(format!(
+                "Tool '{}' was skipped by the Claude Code tool-round scheduler: user-input rounds only allow deterministic pre-ask tools. Retry it in the next tool round.",
+                current_tool_name
+            ));
+        }
+
+        let allowed_kind = if has_subagent && tools.iter().any(|name| name != "subagent") {
             Some("subagent")
         } else if has_external_mcp
             && tools
@@ -359,7 +373,6 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         };
         if let Some(allowed_kind) = allowed_kind {
             let current_allowed = match allowed_kind {
-                "ask_user_question" => current_tool_name == "ask_user_question",
                 "subagent" => current_tool_name == "subagent",
                 _ => current_tool_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
             };
@@ -371,7 +384,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             }
             return Ok(None);
         }
-        if has_ask || has_subagent || has_external_mcp {
+        if has_subagent || has_external_mcp {
             return Ok(None);
         }
 
@@ -398,6 +411,14 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         // concurrently, and the flag prevents accidental repeated prompts.
         round.confirmations_prepared = true;
         let tool_calls = round.tool_calls.clone();
+        let round_has_ask = tool_calls.iter().any(|tool_call| {
+            let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            normalize_tool_args(&mut args);
+            self.agent
+                .effective_tool_name_for_round(&tool_call.name, &args)
+                == "ask_user_question"
+        });
         let mut approved = HashSet::new();
         let mut rejected = HashMap::new();
 
@@ -410,6 +431,11 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             let effective_name = self
                 .agent
                 .effective_tool_name_for_round(&tool_call.name, &args);
+            if effective_name == "ask_user_question"
+                || (round_has_ask && !AgentInstance::is_deterministic_pre_ask_tool(&effective_name))
+            {
+                continue;
+            }
             if matches!(
                 effective_name.as_str(),
                 "tool_load" | super::CODEX_TOOL_SEARCH_TOOL_NAME | "exit_plan_mode"
@@ -869,6 +895,21 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
 
             let workspace_policy = self.cli_round_workspace_policy(&tool_call.name);
+            let is_deterministic_pre_ask_call =
+                AgentInstance::is_deterministic_pre_ask_tool(&tool_call.name)
+                    && self.pending_round.as_ref().is_some_and(|round| {
+                        round.tool_calls.iter().any(|pending_tool_call| {
+                            let mut pending_args = serde_json::from_str::<serde_json::Value>(
+                                &pending_tool_call.arguments,
+                            )
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                            normalize_tool_args(&mut pending_args);
+                            self.agent.effective_tool_name_for_round(
+                                &pending_tool_call.name,
+                                &pending_args,
+                            ) == "ask_user_question"
+                        })
+                    });
             let mut confirmation_preapproved = false;
             let mut result_override = match workspace_policy.as_ref() {
                 Err(error) => {
@@ -931,10 +972,11 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             let mut _single_tool_workspace_guard: Option<WorkspaceExecutionGuard> = None;
             if result_override.is_none() {
                 if let Ok(Some((lock_mode, tools))) = workspace_policy.as_ref() {
-                    let already_locked = self
-                        .pending_round
-                        .as_ref()
-                        .is_some_and(|round| round.workspace_guard.is_some());
+                    let already_locked = !is_deterministic_pre_ask_call
+                        && self
+                            .pending_round
+                            .as_ref()
+                            .is_some_and(|round| round.workspace_guard.is_some());
                     if !already_locked {
                         eprintln!(
                             "[Agent {}] Claude Code tool round acquiring workspace lock mode={:?} session={} run={} tools=[{}]",
@@ -956,7 +998,9 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                             .await
                         {
                             Ok(guard) => {
-                                if let Some(round) = self.pending_round.as_mut() {
+                                if is_deterministic_pre_ask_call {
+                                    _single_tool_workspace_guard = Some(guard);
+                                } else if let Some(round) = self.pending_round.as_mut() {
                                     round.workspace_guard = Some(guard);
                                 } else {
                                     _single_tool_workspace_guard = Some(guard);

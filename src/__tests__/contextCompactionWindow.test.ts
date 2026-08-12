@@ -108,6 +108,8 @@ describe("contextCompactionWindow", () => {
     expect(viewer).toContain('chat.compactedContext.systemPlaceholder');
     expect(viewer).toContain("promptPrefixPlaceholder");
     expect(viewer).toContain("codexEncrypted");
+    expect(viewer).toContain("conversationCheckpoint");
+    expect(viewer).toContain("checkpointRecent");
     expect(viewer).toContain("enable-file-refs");
     expect(capabilities).toContain('"context-compaction"');
     expect(backend).toContain("persist_compacted_context_snapshot");
