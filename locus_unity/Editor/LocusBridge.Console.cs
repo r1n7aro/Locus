@@ -54,6 +54,7 @@ namespace Locus
         private sealed class ConsoleLogRequest
         {
             public string level;
+            public string[] levels;
             public int limit = DefaultConsoleLogLimit;
         }
 
@@ -82,12 +83,17 @@ namespace Locus
                 : JsonUtility.FromJson<ConsoleLogRequest>(requestJson);
             if (request == null)
                 request = new ConsoleLogRequest();
-            return JsonUtility.ToJson(BuildConsoleLogResult(request.level, request.limit));
+            return JsonUtility.ToJson(BuildConsoleLogResult(request.level, request.levels, request.limit));
         }
 
         private static ConsoleLogResult BuildConsoleLogResult(string level, int limit)
         {
-            string levelFilter = NormalizeConsoleLogFilter(level);
+            return BuildConsoleLogResult(level, null, limit);
+        }
+
+        private static ConsoleLogResult BuildConsoleLogResult(string level, string[] levels, int limit)
+        {
+            HashSet<string> levelFilters = NormalizeConsoleLogFilters(level, levels);
             int normalizedLimit = limit <= 0
                 ? DefaultConsoleLogLimit
                 : Math.Min(MaxConsoleEntriesToSend, limit);
@@ -103,7 +109,7 @@ namespace Locus
                     continue;
 
                 string normalizedLevel = NormalizeConsoleLogLevel(sourceEntry.level);
-                if (levelFilter != null && !string.Equals(levelFilter, normalizedLevel, StringComparison.Ordinal))
+                if (levelFilters != null && !levelFilters.Contains(normalizedLevel))
                     continue;
 
                 string message = (sourceEntry.text ?? "")
@@ -154,6 +160,25 @@ namespace Locus
                 uniqueCount = uniqueCount,
                 truncated = uniqueCount > normalizedLimit
             };
+        }
+
+        private static HashSet<string> NormalizeConsoleLogFilters(string level, string[] levels)
+        {
+            HashSet<string> filters = new HashSet<string>(StringComparer.Ordinal);
+            AddConsoleLogFilter(filters, level);
+            if (levels != null)
+            {
+                for (int i = 0; i < levels.Length; i++)
+                    AddConsoleLogFilter(filters, levels[i]);
+            }
+            return filters.Count == 0 ? null : filters;
+        }
+
+        private static void AddConsoleLogFilter(HashSet<string> filters, string level)
+        {
+            string normalized = NormalizeConsoleLogFilter(level);
+            if (normalized != null)
+                filters.Add(normalized);
         }
 
         private static string NormalizeConsoleLogFilter(string level)

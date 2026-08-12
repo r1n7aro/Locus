@@ -6,16 +6,23 @@ const root = resolve(import.meta.dirname, "../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 describe("Unity Console log tool", () => {
-  it("declares level filtering and a bounded result limit", () => {
+  it("declares single-level and OR multi-level filtering with a bounded result limit", () => {
     const definition = JSON.parse(read("tools/unity_get_console_log.json"));
 
     expect(definition.parameters.properties.level.enum).toEqual(["error", "warn", "info"]);
+    expect(definition.parameters.properties.levels).toMatchObject({
+      type: "array",
+      minItems: 1,
+      uniqueItems: true,
+      items: { type: "string", enum: ["error", "warn", "info"] },
+    });
     expect(definition.parameters.properties.limit).toMatchObject({
       minimum: 1,
       maximum: 200,
       default: 50,
     });
     expect(definition.description).toContain("ctx.GetConsoleLog(level, limit)");
+    expect(definition.description).toContain("OR semantics");
   });
 
   it("uses one Unity-side reader for the Agent tool and unity_execute context", () => {
@@ -25,17 +32,27 @@ describe("Unity Console log tool", () => {
       "locus_unity/Editor/ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs",
     );
     const builtin = read("src-tauri/src/tool/builtins/unity.rs");
+    const executeDefinition = JSON.parse(read("tools/unity_execute.json"));
 
     expect(consoleBridge).toContain("BuildConsoleLogResult");
     expect(consoleBridge).toContain("GetEntryCount");
     expect(consoleBridge).toContain("group.entry.count += occurrences");
     expect(consoleBridge).toContain("NormalizeConsoleLogLevel");
+    expect(consoleBridge).toContain("public string[] levels");
+    expect(consoleBridge).toContain("levelFilters.Contains(normalizedLevel)");
     expect(bridge).toContain('case "unity_get_console_log"');
     expect(bridge).toContain("BuildConsoleLogPayloadJson(requestJson)");
     expect(executeContext).toContain(
       "public ConsoleLogResult GetConsoleLog(string level = null, int limit = 50)",
     );
+    expect(executeContext).toContain(
+      "public ConsoleLogResult GetConsoleLog(string[] levels, int limit = 50)",
+    );
     expect(executeContext).toContain("BuildConsoleLogResult(level, limit)");
+    expect(executeContext).toContain("BuildConsoleLogResult(null, levels, limit)");
+    expect(executeDefinition.description).toContain(
+      'ctx.GetConsoleLog(new[] { "warn", "error" }, 50)',
+    );
     expect(builtin).toContain('name: "unity_get_console_log".to_string()');
     expect(builtin).toContain('"unity_get_console_log"');
 

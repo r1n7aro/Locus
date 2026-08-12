@@ -105,7 +105,7 @@ fn format_unity_test_run(snapshot: &crate::unity_bridge::UnityTestRunSnapshot) -
 
 fn format_unity_console_logs(
     value: &serde_json::Value,
-    requested_level: &str,
+    requested_levels: &[String],
 ) -> Result<String, String> {
     let object = value
         .as_object()
@@ -116,15 +116,20 @@ fn format_unity_console_logs(
         .map(Vec::as_slice)
         .unwrap_or_default();
     let mut output = "Unity Console:".to_string();
-    append_text_field(
-        &mut output,
-        "level",
-        if requested_level.trim().is_empty() {
-            "all"
-        } else {
-            requested_level
-        },
-    );
+    match requested_levels {
+        [] => append_text_field(&mut output, "level", "all"),
+        [level] => append_text_field(&mut output, "level", level),
+        levels => {
+            let levels = serde_json::Value::Array(
+                levels
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+            append_json_field(&mut output, "levels", Some(&levels));
+        }
+    }
     append_json_field(&mut output, "matched", object.get("matchedCount"));
     append_json_field(&mut output, "unique", object.get("uniqueCount"));
     append_field(&mut output, "shown", entries.len());
@@ -158,6 +163,21 @@ fn format_unity_console_logs(
         append_json_field(&mut output, "message", entry.get("message"));
     }
     Ok(output)
+}
+
+fn requested_console_levels(args: &serde_json::Value) -> Vec<String> {
+    let mut requested = Vec::new();
+    if let Some(level) = args.get("level").and_then(serde_json::Value::as_str) {
+        requested.push(level.to_string());
+    }
+    if let Some(levels) = args.get("levels").and_then(serde_json::Value::as_array) {
+        for level in levels.iter().filter_map(serde_json::Value::as_str) {
+            if !requested.iter().any(|existing| existing == level) {
+                requested.push(level.to_string());
+            }
+        }
+    }
+    requested
 }
 
 // ─── unity_test_list / unity_test_run ──────────────────────────────────────
@@ -688,11 +708,8 @@ pub(super) fn unity_get_console_log() -> ToolDef {
                         };
                     }
                 };
-                let requested_level = args
-                    .get("level")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("all");
-                match format_unity_console_logs(&output, requested_level) {
+                let requested_levels = requested_console_levels(&args);
+                match format_unity_console_logs(&output, &requested_levels) {
                     Ok(output) => ToolResult {
                         output,
                         is_error: false,
@@ -817,7 +834,9 @@ pub(super) fn unity_hot_reload() -> ToolDef {
                             .collect::<Vec<_>>()
                     });
 
-                match crate::unity_hotreload::coordinator::hot_reload(&project_path, paths).await {
+                match crate::code_tools::hot_reload_with_semantic_warnings(&project_path, paths)
+                    .await
+                {
                     Ok(output) => ToolResult {
                         output,
                         is_error: false,
@@ -908,7 +927,7 @@ pub(super) fn unity_recompile() -> ToolDef {
                     };
                 }
 
-                match crate::unity_bridge::recompile_and_wait(&project_path).await {
+                match crate::code_tools::recompile_with_semantic_warnings(&project_path).await {
                     Ok(msg) => ToolResult {
                         output: msg,
                         is_error: false,
@@ -938,8 +957,29 @@ mod tests {
             "truncated": false
         });
         assert_eq!(
-            format_unity_console_logs(&value, "error").unwrap(),
+            format_unity_console_logs(&value, &["error".to_string()]).unwrap(),
             "Unity Console: level=\"error\" matched=3 unique=1 shown=1 truncated=false\n[error] count=3 message=\"Null\\nreference\""
+        );
+    }
+
+    #[test]
+    fn console_logs_report_or_level_filters() {
+        let value = serde_json::json!({
+            "entries": [],
+            "matchedCount": 0,
+            "uniqueCount": 0,
+            "truncated": false
+        });
+        assert_eq!(
+            format_unity_console_logs(&value, &["warn".to_string(), "error".to_string()]).unwrap(),
+            "Unity Console: levels=[\"warn\",\"error\"] matched=0 unique=0 shown=0 truncated=false"
+        );
+        assert_eq!(
+            requested_console_levels(&serde_json::json!({
+                "level": "warn",
+                "levels": ["warn", "error"]
+            })),
+            vec!["warn".to_string(), "error".to_string()]
         );
     }
 

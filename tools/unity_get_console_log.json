@@ -1,5 +1,5 @@
 {
-  "description": "Read recent entries from the connected Unity Editor Console. Use this tool to inspect runtime, script compilation, and Editor diagnostics without asking the user to copy Console output. Entries are returned in chronological order. Repeated entries with the same level and message are merged and include a `count`. The same result is available inside `unity_execute` through `ctx.GetConsoleLog(level, limit)`.\n\n`level` filters the normalized Unity Console level: `error` includes errors, assertions, exceptions, and fatal logs; `warn` includes warnings; `info` includes regular Unity logs. Omit `level` to return all three levels.\n\n`limit` controls the maximum number of merged entries returned. It defaults to 50 and is capped at 200. Filtering and duplicate merging happen before the limit is applied, so the result contains the most recent matching groups.",
+  "description": "Read recent entries from the connected Unity Editor Console. Use this tool to inspect runtime, script compilation, and Editor diagnostics without asking the user to copy Console output. Entries are returned in chronological order. Repeated entries with the same level and message are merged and include a `count`. The same result is available inside `unity_execute` through `ctx.GetConsoleLog(level, limit)` for one level or `ctx.GetConsoleLog(levels, limit)` for multiple levels.\n\n`level` filters one normalized Unity Console level. `levels` accepts multiple normalized levels and matches them with OR semantics, such as `[\"warn\", \"error\"]`. If both fields are present, their values are combined with OR semantics. `error` includes errors, assertions, exceptions, and fatal logs; `warn` includes warnings; `info` includes regular Unity logs. Omit both fields to return all three levels.\n\n`limit` controls the maximum number of merged entries returned. It defaults to 50 and is capped at 200. Filtering and duplicate merging happen before the limit is applied, so the result contains the most recent matching groups.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -7,7 +7,17 @@
       "level": {
         "type": "string",
         "enum": ["error", "warn", "info"],
-        "description": "Optional normalized Unity Console level to return. Omit to return all levels."
+        "description": "Optional single normalized Unity Console level to return."
+      },
+      "levels": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": ["error", "warn", "info"]
+        },
+        "minItems": 1,
+        "uniqueItems": true,
+        "description": "Optional normalized Unity Console levels to return with OR semantics, for example [\"warn\", \"error\"]."
       },
       "limit": {
         "type": "integer",
