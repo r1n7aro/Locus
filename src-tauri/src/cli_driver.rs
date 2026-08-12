@@ -52,6 +52,7 @@ pub enum CliDriverSuite {
     NativeBridge,
     HotReload,
     HotReloadRelease,
+    ParallelEditRefresh,
     Execute,
     YamlParity,
     UnityTest,
@@ -67,6 +68,7 @@ impl CliDriverSuite {
             CliDriverSuite::NativeBridge => "native-bridge",
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
+            CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh",
             CliDriverSuite::Execute => "execute",
             CliDriverSuite::YamlParity => "yaml-parity",
             CliDriverSuite::UnityTest => "unity-test",
@@ -82,6 +84,7 @@ impl CliDriverSuite {
             CliDriverSuite::NativeBridge => Some("unity-native-bridge-selftest"),
             CliDriverSuite::HotReload => Some("unity-hotreload-selftest"),
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
+            CliDriverSuite::ParallelEditRefresh => None,
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
             CliDriverSuite::YamlParity => None,
@@ -562,6 +565,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
                 CliDriverSuite::NativeBridge,
                 CliDriverSuite::HotReload,
                 CliDriverSuite::HotReloadRelease,
+                CliDriverSuite::ParallelEditRefresh,
                 CliDriverSuite::Execute,
                 CliDriverSuite::YamlParity,
             ] {
@@ -582,6 +586,10 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         | "hot_release" | "release-hot-reload" | "release_hot_reload" => {
             CliDriverSuite::HotReloadRelease
         }
+        "parallel-edit-refresh" | "parallel_edit_refresh" | "parallel-refresh"
+        | "parallel_refresh" | "edit-refresh" | "edit_refresh" => {
+            CliDriverSuite::ParallelEditRefresh
+        }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
         "yaml-parity" | "yaml_parity" | "yaml-diff" | "yaml_diff" => {
@@ -592,7 +600,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, execute, yaml-parity, unity-test, or all.",
+            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, execute, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -846,6 +854,34 @@ async fn run_driver(
                     matches!(*suite, CliDriverSuite::HotReloadRelease),
                 )
                 .await
+            }
+            CliDriverSuite::ParallelEditRefresh => {
+                let edit_mode_result = if config.force_edit_mode {
+                    ensure_edit_mode(
+                        &project,
+                        *suite,
+                        config.connect_timeout,
+                        config.poll_interval,
+                        &sink,
+                        &mut cancel_rx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => {
+                        run_parallel_edit_refresh_suite(
+                            &project,
+                            *suite,
+                            &config,
+                            &sink,
+                            &mut cancel_rx,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
             CliDriverSuite::Execute => {
                 // The execute suite drives the real unity_execute / unity_run_states
@@ -1135,11 +1171,12 @@ fn prepare_suite_environment(
     config: &CliDriverConfig,
     sink: &DriverEventSink,
 ) -> Result<(), String> {
-    if config
-        .suites
-        .iter()
-        .any(|suite| matches!(suite, CliDriverSuite::NativeBridge))
-    {
+    if config.suites.iter().any(|suite| {
+        matches!(
+            suite,
+            CliDriverSuite::NativeBridge | CliDriverSuite::ParallelEditRefresh
+        )
+    }) {
         unity_bridge::set_native_bridge_enabled(true);
         unity_bridge::sync_native_bridge_marker(project, true)?;
         sink.emit(
@@ -3410,6 +3447,329 @@ print("E9D:unreachable");"#,
     }
 }
 
+fn parse_active_edit_session_count(message: &str) -> Result<usize, String> {
+    message
+        .trim()
+        .strip_prefix("active_edit_sessions:")
+        .ok_or_else(|| format!("unexpected edit-session response: {}", clip(message, 120)))?
+        .parse::<usize>()
+        .map_err(|error| {
+            format!(
+                "invalid edit-session count '{}': {error}",
+                clip(message, 120)
+            )
+        })
+}
+
+async fn probe_asset_guid(project: &str, asset_path: &str) -> Result<Option<String>, String> {
+    let code = format!(
+        r#"string guid = AssetDatabase.AssetPathToGUID("{asset_path}"); print("LPR_GUID:" + (string.IsNullOrEmpty(guid) ? "missing" : "present:" + guid));"#
+    );
+    let output = execute_capture(project, &code).await?;
+    if output.contains("LPR_GUID:missing") {
+        return Ok(None);
+    }
+    let Some(index) = output.find("LPR_GUID:present:") else {
+        return Err(format!(
+            "asset GUID probe returned no marker: {}",
+            clip(&output, 180)
+        ));
+    };
+    let guid = output[index + "LPR_GUID:present:".len()..]
+        .split(|ch: char| ch.is_whitespace() || ch == ']' || ch == '<')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['\"', '\''])
+        .to_string();
+    if guid.is_empty() {
+        Err(format!(
+            "asset GUID probe returned an empty GUID: {}",
+            clip(&output, 180)
+        ))
+    } else {
+        Ok(Some(guid))
+    }
+}
+
+async fn stabilize_parallel_edit_refresh_execution(
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let timeout = recompile_wait(config);
+    loop {
+        wait_for_semantic_ready(
+            project,
+            suite,
+            "parallel_edit_refresh_execute_preflight",
+            SemanticReadyRequirement::UnityApi,
+            remaining_or_timeout(started, timeout, "parallel refresh execute preflight")?,
+            config.poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
+
+        match execute_capture(project, r#"print("LPR_WARMUP:ready");"#).await {
+            Ok(output) if output.contains("LPR_WARMUP:ready") => return Ok(()),
+            Ok(output) => {
+                return Err(format!(
+                    "parallel refresh execute preflight returned no marker: {}",
+                    clip(&output, 160)
+                ));
+            }
+            Err(error) if unity_reload_boundary_error(&error) && started.elapsed() < timeout => {
+                sink.emit(
+                    "suite_event",
+                    json!({
+                        "suite": suite.as_str(),
+                        "line": "WAIT  parallel-edit-refresh: Unity reloaded during execute preflight; retrying after readiness",
+                        "passed": 0,
+                        "failed": 0,
+                    }),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn end_edit_session_for_cleanup(project: &str, owner: &str) -> Result<String, String> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(20);
+    loop {
+        match unity_bridge::end_edit_session(project, owner).await {
+            Ok(message) => return Ok(message),
+            Err(error) if unity_reload_boundary_error(&error) && started.elapsed() < timeout => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn cleanup_parallel_edit_refresh_fixture(
+    project: &str,
+    owner_a: &str,
+    owner_b: &str,
+    fixture_asset_dir: &str,
+    fixture_dir: &Path,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = end_edit_session_for_cleanup(project, owner_a).await {
+        errors.push(format!("end owner A: {error}"));
+    }
+    if let Err(error) = end_edit_session_for_cleanup(project, owner_b).await {
+        errors.push(format!("end owner B: {error}"));
+    }
+
+    let cleanup_code = format!(
+        r#"AssetDatabase.DeleteAsset("{fixture_asset_dir}"); AssetDatabase.Refresh(); print("LPR_CLEANUP:done");"#
+    );
+    if let Err(error) = execute_capture(project, &cleanup_code).await {
+        errors.push(format!("AssetDatabase cleanup: {}", clip(&error, 160)));
+    }
+
+    let project_assets = Path::new(project).join("Assets");
+    let fixture_name_is_safe = fixture_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("LocusParallelEditRefreshSelfTest_"));
+    if fixture_dir.starts_with(&project_assets) && fixture_name_is_safe {
+        match tokio::fs::remove_dir_all(fixture_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("filesystem fixture cleanup: {error}")),
+        }
+        let fixture_meta = fixture_dir.with_extension("meta");
+        match tokio::fs::remove_file(&fixture_meta).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("filesystem meta cleanup: {error}")),
+        }
+    } else {
+        errors.push(format!(
+            "refused unsafe fixture cleanup path: {}",
+            fixture_dir.display()
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Reproduces the parallel-agent refresh boundary against a real Unity
+/// AssetDatabase. Two independent edit-session owners overlap, a unique asset
+/// is written to disk and queued, then owner A exits while owner B remains.
+/// The completed asset must be imported at A's boundary; otherwise a long
+/// sibling run can hold finished work invisible indefinitely.
+async fn run_parallel_edit_refresh_suite(
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": suite.as_str(),
+            "project": project,
+        }),
+    );
+
+    crate::csharp_compile::set_enabled(true).await;
+    crate::csharp_compile::warm_up_in_background();
+    stabilize_parallel_edit_refresh_execution(project, suite, config, sink, cancel_rx).await?;
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let owner_a = format!("parallel-refresh-a-{token}");
+    let owner_b = format!("parallel-refresh-b-{token}");
+    let fixture_asset_dir = format!("Assets/LocusParallelEditRefreshSelfTest_{token}");
+    let fixture_asset_path = format!("{fixture_asset_dir}/probe.txt");
+    let fixture_dir = Path::new(project)
+        .join("Assets")
+        .join(format!("LocusParallelEditRefreshSelfTest_{token}"));
+    let fixture_file = fixture_dir.join("probe.txt");
+
+    let test_result: Result<(usize, usize, usize, String), String> = async {
+        tokio::fs::create_dir_all(&fixture_dir)
+            .await
+            .map_err(|error| format!("failed to create isolated fixture directory: {error}"))?;
+
+        let count_a = parse_active_edit_session_count(
+            &unity_bridge::begin_edit_session(project, &owner_a).await?,
+        )?;
+        let count_b = parse_active_edit_session_count(
+            &unity_bridge::begin_edit_session(project, &owner_b).await?,
+        )?;
+        if count_b != count_a.saturating_add(1) {
+            return Err(format!(
+                "second edit-session owner did not increment the active count: {count_a} -> {count_b}"
+            ));
+        }
+
+        tokio::fs::write(
+            &fixture_file,
+            format!("Locus parallel edit refresh integration fixture {token}\n"),
+        )
+        .await
+        .map_err(|error| format!("failed to write isolated fixture: {error}"))?;
+        unity_bridge::import_assets(project, std::slice::from_ref(&fixture_asset_path)).await?;
+
+        match probe_asset_guid(project, &fixture_asset_path).await? {
+            None => {}
+            Some(guid) => {
+                return Err(format!(
+                    "fixture imported before either edit-session owner ended (guid={guid})"
+                ))
+            }
+        }
+
+        sink.emit(
+            "suite_event",
+            json!({
+                "suite": suite.as_str(),
+                "line": format!(
+                    "PASS  parallel-edit-refresh: queued fixture while two owners were active ({count_a} -> {count_b})"
+                ),
+                "passed": 2,
+                "failed": 0,
+            }),
+        );
+
+        let count_after_a = parse_active_edit_session_count(
+            &unity_bridge::end_edit_session(project, &owner_a).await?,
+        )?;
+        if count_after_a != count_a {
+            return Err(format!(
+                "ending owner A did not preserve the other active owner: expected {count_a}, got {count_after_a}"
+            ));
+        }
+
+        let wait_budget = config.suite_timeout.min(Duration::from_secs(20));
+        let started = Instant::now();
+        loop {
+            if run_cancelled(cancel_rx) {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+            if let Some(guid) = probe_asset_guid(project, &fixture_asset_path).await? {
+                break Ok((count_a, count_b, count_after_a, guid));
+            }
+            if started.elapsed() >= wait_budget {
+                break Err(format!(
+                    "completed asset stayed outside the AssetDatabase for {}ms after owner A ended while owner B remained active",
+                    wait_budget.as_millis()
+                ));
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(config.poll_interval.min(Duration::from_secs(1))) => {}
+                _ = cancel_rx.changed() => {
+                    return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+                }
+            }
+        }
+    }
+    .await;
+
+    let cleanup_result = cleanup_parallel_edit_refresh_fixture(
+        project,
+        &owner_a,
+        &owner_b,
+        &fixture_asset_dir,
+        &fixture_dir,
+    )
+    .await;
+
+    match (test_result, cleanup_result) {
+        (Ok((count_a, count_b, count_after_a, guid)), Ok(())) => {
+            sink.emit(
+                "suite_event",
+                json!({
+                    "suite": suite.as_str(),
+                    "line": format!(
+                        "PASS  parallel-edit-refresh: owner A imported the completed asset while owner B remained active (counts {count_a} -> {count_b} -> {count_after_a}, guid={guid})"
+                    ),
+                    "passed": 4,
+                    "failed": 0,
+                }),
+            );
+            sink.emit(
+                "suite_result",
+                json!({
+                    "suite": suite.as_str(),
+                    "passed": 4,
+                    "failed": 0,
+                    "activeOwnersAfterFirstEnd": count_after_a,
+                    "assetGuid": guid,
+                    "fixtureCleaned": true,
+                }),
+            );
+            Ok(())
+        }
+        (Err(error), Ok(())) => {
+            emit_suite_failure(sink, suite, &error);
+            Err(error)
+        }
+        (Ok(_), Err(cleanup_error)) => {
+            let error = format!("parallel refresh checks passed, cleanup failed: {cleanup_error}");
+            emit_suite_failure(sink, suite, &error);
+            Err(error)
+        }
+        (Err(error), Err(cleanup_error)) => {
+            let error = format!("{error}; cleanup failed: {cleanup_error}");
+            emit_suite_failure(sink, suite, &error);
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct ProgressStats {
     total: u32,
@@ -4160,7 +4520,7 @@ fn emit_json<T: Serialize>(event: &str, payload: &T) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliDriverConfig, CliDriverSuite};
+    use super::{parse_active_edit_session_count, CliDriverConfig, CliDriverSuite};
     use crate::unity_bridge::UnityLaunchCodeOptimization;
 
     fn parse(args: &[&str]) -> Option<Result<CliDriverConfig, String>> {
@@ -4224,6 +4584,7 @@ mod tests {
                 CliDriverSuite::NativeBridge,
                 CliDriverSuite::HotReload,
                 CliDriverSuite::HotReloadRelease,
+                CliDriverSuite::ParallelEditRefresh,
                 CliDriverSuite::Execute,
                 CliDriverSuite::YamlParity
             ]
@@ -4272,6 +4633,29 @@ mod tests {
                 "alias {alias}"
             );
         }
+    }
+
+    #[test]
+    fn parse_parallel_edit_refresh_suite_aliases() {
+        for alias in ["parallel-edit-refresh", "parallel_refresh", "edit-refresh"] {
+            let parsed = parse(&["--locus-unity-test", "--suite", alias])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::ParallelEditRefresh],
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_active_edit_session_responses() {
+        assert_eq!(
+            parse_active_edit_session_count("active_edit_sessions:2").unwrap(),
+            2
+        );
+        assert!(parse_active_edit_session_count("owners:2").is_err());
     }
 
     #[test]

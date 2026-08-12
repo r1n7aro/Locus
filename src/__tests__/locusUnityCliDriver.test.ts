@@ -57,6 +57,10 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("--type-index-sample");
     expect(driver).toContain("run_sidecar_suite");
     expect(driver).toContain("run_type_index_suite");
+    expect(driver).toContain("CliDriverSuite::ParallelEditRefresh");
+    expect(driver).toContain("run_parallel_edit_refresh_suite");
+    expect(driver).toContain("LocusParallelEditRefreshSelfTest_");
+    expect(driver).toContain("activeOwnersAfterFirstEnd");
     expect(driver).toContain("CliDriverSuite::Execute");
     expect(driver).toContain("run_execute_suite");
     expect(driver).toContain("unity_bridge::unity_run_states");
@@ -122,6 +126,27 @@ describe("Locus Unity CLI driver", () => {
     expect(selftest).toContain("impl Drop for SelfTestRunningGuard");
     expect(selftest).toContain("test.run().await;");
     expect(selftest).not.toContain("tauri::async_runtime::spawn(async move");
+  });
+
+  it("flushes completed assets when one parallel edit-session owner exits", () => {
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+    const driver = read("src-tauri/src/cli_driver.rs");
+    const script = read("scripts/locus-unity-test.mjs");
+
+    expect(bridge).toContain("int importedCount = FlushQueuedAssetImports();");
+    expect(bridge).toContain("active owners={_activeEditSessionOwners.Count}, imported={importedCount}");
+    expect(driver).toContain('CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh"');
+    expect(driver).toMatch(
+      /CliDriverSuite::NativeBridge\s*\|\s*CliDriverSuite::ParallelEditRefresh/,
+    );
+    expect(driver).toContain("begin_edit_session(project, &owner_a)");
+    expect(driver).toContain("begin_edit_session(project, &owner_b)");
+    expect(driver).toContain("end_edit_session(project, &owner_a)");
+    expect(driver).toContain("stabilize_parallel_edit_refresh_execution");
+    expect(driver).toContain("end_edit_session_for_cleanup");
+    expect(driver).toContain("probe_asset_guid(project, &fixture_asset_path)");
+    expect(driver).toContain("completed asset stayed outside the AssetDatabase");
+    expect(script).toContain("--suite parallel-edit-refresh --install-plugin");
   });
 
   it("guards the Type Index suite against transient Unity reload windows", () => {
@@ -200,8 +225,14 @@ describe("Locus Unity CLI driver", () => {
     expect(script).toContain("terminalEventSeen");
     expect(script).toContain("--output-dir");
     expect(script).toContain('mkdtempSync(join(tmpdir(), "locus-unity-test-"))');
-    expect(script).toContain('const dataDir = join(logDir, "data");');
-    expect(script).toContain("LOCUS_RUNTIME_DATA_DIR: dataDir");
+    expect(script).toContain('const runtimeRoot = join(logDir, "runtime");');
+    expect(script).toContain("LOCUS_RUNTIME_JSON");
+    expect(script).toContain("LOCUS_RUNTIME_DATA_DIR: runtime.databaseDir");
+    expect(script).toContain("LOCUS_RUNTIME_CONFIG_DIR: runtime.configDir");
+    expect(script).toContain("LOCUS_RUNTIME_LOG_DIR: runtime.logDir");
+    expect(script).toContain("LOCUS_RUNTIME_WORKSPACE_DIR: runtime.workspace");
+    expect(script).toContain("WEBVIEW2_USER_DATA_FOLDER: runtime.webviewDataDir");
+    expect(script).toContain("TEMP: runtime.systemTempDir");
     expect(script).toContain('"--no-watch"');
     expect(script).toContain('const logPath = join(logDir, "driver.log");');
     expect(script).toContain("logStream.write(chunk)");

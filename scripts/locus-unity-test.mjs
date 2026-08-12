@@ -95,11 +95,12 @@ Examples:
   bun run locus:test:unity:release -- --project F:\\Game
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite parallel-edit-refresh --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | yaml-parity | unity-test | all
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | execute | yaml-parity | unity-test | all
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
@@ -162,12 +163,33 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
   return new Promise((resolve, reject) => {
     const logDir = requestedLogDir || mkdtempSync(join(tmpdir(), "locus-unity-test-"));
     mkdirSync(logDir, { recursive: true });
-    const dataDir = join(logDir, "data");
-    mkdirSync(dataDir, { recursive: true });
+    const runtimeRoot = join(logDir, "runtime");
+    const runtime = {
+      runtimeRoot,
+      databaseDir: join(runtimeRoot, "database"),
+      databaseFile: join(runtimeRoot, "database", "locus.db"),
+      configDir: join(runtimeRoot, "config"),
+      logDir: join(runtimeRoot, "logs"),
+      logFile: join(runtimeRoot, "logs", "locus.log"),
+      workspace: join(runtimeRoot, "workspace"),
+      webviewDataDir: join(runtimeRoot, "webview"),
+      systemTempDir: join(runtimeRoot, "system-temp"),
+    };
+    for (const directory of [
+      runtime.runtimeRoot,
+      runtime.databaseDir,
+      runtime.configDir,
+      runtime.logDir,
+      runtime.workspace,
+      runtime.webviewDataDir,
+      runtime.systemTempDir,
+    ]) {
+      mkdirSync(directory, { recursive: true });
+    }
     const logPath = join(logDir, "driver.log");
     const logStream = createWriteStream(logPath, { flags: "w" });
     console.log(`[locus] Unity driver log: ${logPath}`);
-    console.log(`[locus] Unity driver data: ${dataDir}`);
+    console.log(`LOCUS_RUNTIME_JSON ${JSON.stringify(runtime)}`);
     const state = {
       finishedOk: false,
       sawDriverEvent: false,
@@ -183,7 +205,14 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
       shell: false,
       env: {
         ...process.env,
-        LOCUS_RUNTIME_DATA_DIR: dataDir,
+        LOCUS_RUNTIME_ROOT: runtime.runtimeRoot,
+        LOCUS_RUNTIME_DATA_DIR: runtime.databaseDir,
+        LOCUS_RUNTIME_CONFIG_DIR: runtime.configDir,
+        LOCUS_RUNTIME_LOG_DIR: runtime.logDir,
+        LOCUS_RUNTIME_WORKSPACE_DIR: runtime.workspace,
+        WEBVIEW2_USER_DATA_FOLDER: runtime.webviewDataDir,
+        TEMP: runtime.systemTempDir,
+        TMP: runtime.systemTempDir,
       },
     });
 

@@ -970,7 +970,13 @@ namespace Locus
                     _autoRefreshSuppressionCount--;
                 }
 
-                Debug.Log($"[Locus] Edit session ended by '{normalizedOwner}', active owners={_activeEditSessionOwners.Count}");
+                // Every queued path is added only after its filesystem mutation
+                // completes. Import those completed paths when any owner exits,
+                // even while another agent run is still active. This keeps one
+                // long-running parallel session from holding finished work from
+                // sibling sessions outside the AssetDatabase indefinitely.
+                int importedCount = FlushQueuedAssetImports();
+                Debug.Log($"[Locus] Edit session ended by '{normalizedOwner}', active owners={_activeEditSessionOwners.Count}, imported={importedCount}");
             }
 
             return "active_edit_sessions:" + _activeEditSessionOwners.Count;
@@ -988,7 +994,8 @@ namespace Locus
                 _autoRefreshSuppressionCount--;
             }
 
-            Debug.Log("[Locus] Released all edit sessions.");
+            int importedCount = FlushQueuedAssetImports();
+            Debug.Log($"[Locus] Released all edit sessions, imported={importedCount}.");
         }
 
         private static void PostToMainThread(Action action)
