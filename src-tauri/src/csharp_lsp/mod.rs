@@ -585,7 +585,7 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
         }
         return Err(
             "The connected Unity editor did not produce .sln/.csproj. Update the Locus Unity \
-             plugin and ensure a Unity IDE project-generator package is installed, then retry."
+             plugin, wait for script compilation to finish, then retry."
                 .to_string(),
         );
     }

@@ -15,10 +15,10 @@
 //!    entries on the next project open, and rewriting that file here would
 //!    scramble its key order for a purely cosmetic win, so it is left alone.)
 //!
-//! Both channels share the same C# fallback chain: the configured external
-//! code editor first (`CodeEditor.SyncAll`), then the known IDE packages'
-//! `ProjectGeneration` via reflection (works even when no external editor is
-//! configured), then the legacy `UnityEditor.SyncVS`.
+//! Both channels share the same C# fallback chain: a current Locus plugin's
+//! direct generator first, then a configured non-Locus external editor, then
+//! known IDE packages' `ProjectGeneration`, and finally the legacy
+//! `UnityEditor.SyncVS` when selecting it cannot re-enter Locus.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -44,6 +44,34 @@ const LOG_TAIL_BYTES: usize = 16 * 1024;
 const SYNC_CHAIN_STATEMENTS: &str = r#"
 var __locusSyncLog = new System.Text.StringBuilder();
 bool __locusSynced = false;
+bool __locusEditorSelected = false;
+
+bool __LocusTryPluginGenerator()
+{
+    var projectFilesType = System.Type.GetType("Locus.LocusProjectFiles, Locus.Editor", false);
+    if (projectFilesType == null)
+        return false;
+    var versionField = projectFilesType.GetField(
+        "GeneratorVersion",
+        System.Reflection.BindingFlags.Static
+            | System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic);
+    if (versionField == null)
+    {
+        __locusSyncLog.AppendLine("Locus generator: installed plugin is too old");
+        return false;
+    }
+    var syncMethod = projectFilesType.GetMethod(
+        "SyncAll",
+        System.Reflection.BindingFlags.Static
+            | System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic);
+    if (syncMethod == null)
+        return false;
+    var result = syncMethod.Invoke(null, null);
+    __locusSyncLog.AppendLine("Locus generator: " + (result ?? "ok"));
+    return true;
+}
 
 bool __LocusTrySyncAll()
 {
@@ -54,6 +82,14 @@ bool __LocusTrySyncAll()
         return false;
     }
     var editorName = editor.GetType().Name;
+    var editorFullName = editor.GetType().FullName ?? editorName;
+    __locusEditorSelected = editorFullName == "Locus.LocusExternalCodeEditor"
+        || editorName == "LocusExternalCodeEditor";
+    if (__locusEditorSelected)
+    {
+        __locusSyncLog.AppendLine("CodeEditor: skipped Locus editor to prevent recursive sync");
+        return false;
+    }
     if (editorName == "DefaultExternalCodeEditor")
     {
         __locusSyncLog.AppendLine("CodeEditor: default editor has no project generator");
@@ -108,6 +144,11 @@ bool __LocusTryPackageGenerators()
 
 bool __LocusTrySyncVs()
 {
+    if (__locusEditorSelected)
+    {
+        __locusSyncLog.AppendLine("UnityEditor.SyncVS: skipped because Locus is selected");
+        return false;
+    }
     var syncVsType = System.Type.GetType("UnityEditor.SyncVS,UnityEditor", false);
     if (syncVsType == null)
     {
@@ -129,8 +170,13 @@ bool __LocusTrySyncVs()
     return true;
 }
 
-try { __locusSynced = __LocusTrySyncAll(); }
-catch (System.Exception e) { __locusSyncLog.AppendLine("CodeEditor.SyncAll: " + e.Message); }
+try { __locusSynced = __LocusTryPluginGenerator(); }
+catch (System.Exception e) { __locusSyncLog.AppendLine("Locus generator: " + e.Message); }
+if (!__locusSynced)
+{
+    try { __locusSynced = __LocusTrySyncAll(); }
+    catch (System.Exception e) { __locusSyncLog.AppendLine("CodeEditor.SyncAll: " + e.Message); }
+}
 if (!__locusSynced)
 {
     try { __locusSynced = __LocusTryPackageGenerators(); }
@@ -347,7 +393,7 @@ fn batch_failure_message(exit_code: Option<i32>, tail: &str) -> String {
     }
     let mut message = String::from(
         "Unity batch mode ran but produced no .sln/.csproj. Open the project in Unity once \
-         with an external script editor configured (Edit > Preferences > External Tools), \
+         with the current Locus Unity plugin installed, \
          then retry.",
     );
     if let Some(code) = exit_code {
@@ -507,6 +553,8 @@ mod tests {
     fn snippet_and_batch_source_share_the_generator_chain() {
         let snippet = editor_sync_snippet();
         assert!(snippet.contains("SyncAll"));
+        assert!(snippet.contains("__LocusTryPluginGenerator"));
+        assert!(snippet.contains("skipped Locus editor to prevent recursive sync"));
         assert!(snippet.contains("ProjectGeneration"));
         assert!(snippet.contains("SyncVS"));
         assert!(snippet.trim_end().ends_with("print(__locusSyncReport);"));

@@ -34,12 +34,22 @@ describe("Locus Unity external editor integration", () => {
 
   it("generates Unity project files through the Locus plugin", () => {
     const projectFiles = read("locus_unity/Editor/LocusProjectFiles.cs");
+    const generator = read("locus_unity/Editor/LocusProjectFileGenerator.cs");
     const bridge = read("locus_unity/Editor/LocusBridge.cs");
     const lsp = read("src-tauri/src/csharp_lsp/mod.rs");
 
     expect(projectFiles).toContain("LocusProjectFilesAssetPostprocessor");
     expect(projectFiles).toContain("ProjectGeneration");
-    expect(projectFiles).toContain("UnityEditor.SyncVS");
+    expect(projectFiles).toContain("_syncInProgress");
+    expect(projectFiles).toContain("GeneratorVersion = 1");
+    expect(projectFiles).toContain("LocusProjectFileGenerator.Generate()");
+    expect(projectFiles).toContain("LocusProjectFileGeneratorCommand");
+    expect(projectFiles).not.toContain("UnityEditor.SyncVS");
+    expect(generator).toContain("CompilationPipeline");
+    expect(generator).toContain("AssembliesType.Editor");
+    expect(generator).toContain("OnGeneratedCSProject");
+    expect(generator).toContain("OnGeneratedSlnSolution");
+    expect(generator).toContain("WriteIfChanged");
     expect(bridge).toContain('case "sync_project_files"');
     expect(lsp).toContain("sync_project_files(&workspace)");
   });

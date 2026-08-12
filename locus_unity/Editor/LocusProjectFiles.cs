@@ -10,6 +10,9 @@ namespace Locus
 {
     internal static class LocusProjectFiles
     {
+        internal const int GeneratorVersion = 1;
+        private static bool _syncInProgress;
+
         private static readonly string[] GeneratorTypeNames =
         {
             "Microsoft.Unity.VisualStudio.Editor.ProjectGeneration, Unity.VisualStudio.Editor",
@@ -24,63 +27,64 @@ namespace Locus
 
         internal static string SyncAll()
         {
+            if (_syncInProgress)
+                return "sync_skipped: already in progress";
+
+            _syncInProgress = true;
             var report = new StringBuilder();
-            foreach (string typeName in GeneratorTypeNames)
+            try
             {
+                foreach (string typeName in GeneratorTypeNames)
+                {
+                    try
+                    {
+                        Type type = Type.GetType(typeName, false);
+                        if (type == null)
+                            continue;
+
+                        object generator = Activator.CreateInstance(type, true);
+                        MethodInfo sync = type.GetMethod(
+                            "Sync",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                            null,
+                            Type.EmptyTypes,
+                            null);
+                        if (sync == null)
+                        {
+                            report.AppendLine(typeName + ": Sync() not found");
+                            continue;
+                        }
+
+                        sync.Invoke(generator, null);
+                        report.AppendLine(typeName + ": ok");
+                        return "synced\n" + report;
+                    }
+                    catch (Exception ex)
+                    {
+                        Exception cause = ex.InnerException ?? ex;
+                        report.AppendLine(typeName + ": " + cause.Message);
+                    }
+                }
+
                 try
                 {
-                    Type type = Type.GetType(typeName, false);
-                    if (type == null)
-                        continue;
-
-                    object generator = Activator.CreateInstance(type, true);
-                    MethodInfo sync = type.GetMethod(
-                        "Sync",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                        null,
-                        Type.EmptyTypes,
-                        null);
-                    if (sync == null)
-                    {
-                        report.AppendLine(typeName + ": Sync() not found");
-                        continue;
-                    }
-
-                    sync.Invoke(generator, null);
-                    report.AppendLine(typeName + ": ok");
+                    LocusProjectFileGenerator.Generate();
+                    report.AppendLine("Locus project generator: ok");
                     return "synced\n" + report;
                 }
                 catch (Exception ex)
                 {
                     Exception cause = ex.InnerException ?? ex;
-                    report.AppendLine(typeName + ": " + cause.Message);
+                    report.AppendLine("Locus project generator: " + cause.Message);
                 }
-            }
 
-            try
-            {
-                Type syncVsType = Type.GetType("UnityEditor.SyncVS,UnityEditor", false);
-                MethodInfo syncSolution = syncVsType != null
-                    ? syncVsType.GetMethod(
-                        "SyncSolution",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                    : null;
-                if (syncSolution != null)
-                {
-                    syncSolution.Invoke(null, null);
-                    report.AppendLine("UnityEditor.SyncVS: ok");
-                    return "synced\n" + report;
-                }
-                report.AppendLine("UnityEditor.SyncVS: unavailable");
+                throw new InvalidOperationException(
+                    "No Unity project-file generator succeeded.\n" + report);
             }
-            catch (Exception ex)
+            finally
             {
-                Exception cause = ex.InnerException ?? ex;
-                report.AppendLine("UnityEditor.SyncVS: " + cause.Message);
+                _syncInProgress = false;
             }
-
-            throw new InvalidOperationException(
-                "No Unity project-file generator succeeded.\n" + report);
         }
 
         internal static void SyncIfNeeded(params string[][] pathGroups)
@@ -187,6 +191,16 @@ namespace Locus
                 }
             }
             return false;
+        }
+    }
+
+    /// Stable batch-mode entry point for validating or repairing a workspace
+    /// without relying on the selected external editor.
+    public static class LocusProjectFileGeneratorCommand
+    {
+        public static void Generate()
+        {
+            UnityEngine.Debug.Log("[LocusProjectSync] " + LocusProjectFiles.SyncAll());
         }
     }
 }
