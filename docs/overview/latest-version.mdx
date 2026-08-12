@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.6.0 (2026-07-17)"
+description: "Locus v0.7.0 (2026-08-12)"
 sidebarTitle: "当前版本"
-version: "0.6.0"
-releasedAt: "2026-07-17"
+version: "0.7.0"
+releasedAt: "2026-08-12"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,38 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.7.0（新增）
+
+- **Python Agent SDK。** 内置仅依赖标准库的 `locus` 包，覆盖模型、Agent、工具、工作区、会话、自定义 Python 回调、异步运行、事件、取消、问答及可复用 workflow 编排。
+- **Unity 自动化扩展。** 新增运行态切换、Console 多级筛选、Unity Test Framework 测试发现与执行、外部脚本编辑器接入、更完整的 YAML 检查、视口捕获及 CLI 一致性测试。
+- **图形与 UI 调试工作流。** 新增 RenderDoc、Unity Frame Debugger、纹理分析，以及用于检查、查询、交互和序列化实时面板的 UI Toolkit API。
+- **运行时调试。** 新增 PlayerLoop 协作调试，可跨帧等待条件、暂停、逐帧执行和检查状态；同时支持发现 CDB、WinDbg 等 Windows 原生调试器。
+- **会话与工作区导航。** 页面和会话可在独立窗口打开。新增用户轮次导航、分页历史、中断续接、上下文导出与回顾、压缩上下文查看、文件预览和模型调用统计。
+- **Agent 执行控制。** 新增带工作区锁的并行工具调度、同文件编辑合并、标准化 `subagent`、可选后台任务及状态/取消接口、会话内 Todo 和本地工具失败日志。
+- **文件驱动的知识工作流。** Design、Memory、Reference、Skill 统一采用文件驱动的 Markdown 操作，并加入统一知识面板、Markdown 预览、规范化 Skill Package、`/grill` 与 `/review-context`。
+- **Codex 与供应商控制。** 新增 Codex 扩展上下文、可选 GPT-5.6 会话标题生成、兼容供应商的原生延迟工具加载，以及按供应商生效的压缩输出限制。
+- **Checkpoint 上下文压缩。** 长会话压缩为锚定摘要与近期完整上下文，迁移和导出保留结构化数据，压缩查看器可直接展示 checkpoint 内容。
+
+### v0.7.0（修复）
+
+- 强化 Codex WebSocket 恢复、代理连接、压缩与续帧处理、失效请求清理、会话续接状态和上下文压缩同步。
+- Unity 执行请求可在 Native Bridge 断线或域重载后重新附着，并通过幂等执行避免已接受请求重复运行。
+- 改进 Unity YAML 解析、序列化值还原、Prefab 与引用处理、视口捕获和冷路径检查安全性。
+- C# 诊断限定为 Unity 托管源码，并在 hot reload 或 recompile 结果中追加当前编辑批次的语义警告。
+- Markdown 文件引用缓存路径状态，正确处理文件夹，并减少渲染期间的重复文件系统查询。
+- UI Toolkit 面板快照支持显式刷新并拒绝失效面板；JSON 序列化限制深度、成员、集合、字符串及总输出长度。
+- 原生选择器统一迁移到公共下拉控件，新手引导复用供应商配置流程。
+
+### v0.7.0（移除）
+
+- 移除旧 Agent Graph、`graph_view` 与 `sheet` 工作流。Agent 委托统一使用 `subagent`，自定义交互输出由 View 和 Skill Package 承载。
+- 移除独立 `knowledge_*` CRUD 工具和旧 Todo 面板。知识修改统一走文件驱动操作，Todo 直接显示在会话中。
 
 ### v0.6.0（新增）
 

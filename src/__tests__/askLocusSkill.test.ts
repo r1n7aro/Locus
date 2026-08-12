@@ -14,15 +14,13 @@ function frontmatter(markdown: string): string {
 }
 
 describe("Ask Locus builtin skill", () => {
-  it("uses a natural command name without declaring built-in tool dependencies", () => {
+  it("uses canonical command metadata without declaring built-in tool dependencies", () => {
     const skill = read("knowledge/skill/ask-locus.md");
     const meta = frontmatter(skill);
 
-    expect(meta).toContain("title: Ask Locus");
-    expect(meta).toContain("path: ask-locus.md");
     expect(meta).toContain("skillSurface: both");
-    expect(meta).toContain("commandEnabled: true");
     expect(meta).toContain("commandTrigger: /ask-locus");
+    expect(meta).not.toMatch(/^(?:title|path|commandEnabled):/m);
     expect(meta).not.toContain("tools:");
     expect(meta.toLowerCase()).not.toContain("usage");
   });

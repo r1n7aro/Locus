@@ -22,7 +22,10 @@ describe("Unity bridge status handling", () => {
     expect(bridge).toContain("NativeOnBeforeReload();");
     expect(bridge).toContain("NativePublishEditorStatusNow();");
     expect(bridge).toContain("private static PipeEnvelope HandleStatus(string requestId)");
-    expect(bridge).toContain("case \"bridge_capabilities\":\n                        return OkResponse(reqId, \"managed_executor_v1,status_cached,set_editor_status_async\");");
+    expect(bridge).toContain('case "bridge_capabilities":');
+    expect(bridge).toContain(
+      '"managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1"',
+    );
     expect(bridge).toContain("return OkStatusResponse(requestId);");
     expect(bridge).not.toContain("case \"status\":\n                        return await HandleStatus(reqId);");
     expect(bridge).toContain("case \"set_editor_status\":\n                        return HandleSetEditorStatus(reqId, msg.message);");

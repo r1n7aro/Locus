@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.6.0 (2026-07-17)"
+description: "Locus v0.7.0 (2026-08-12)"
 sidebarTitle: "Latest Version"
-version: "0.6.0"
-releasedAt: "2026-07-17"
+version: "0.7.0"
+releasedAt: "2026-08-12"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,38 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.6.0/locus_0.6.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.7.0 (Added)
+
+- **Python Agent SDK.** The bundled standard-library-only `locus` package exposes models, agents, tools, workspaces, sessions, custom Python callbacks, asynchronous runs, events, cancellation, input handling, and reusable workflow orchestration.
+- **Expanded Unity automation.** Added dedicated Play/Edit Mode control, multi-level Console queries, Unity Test Framework discovery and execution, external script-editor integration, richer YAML inspection, improved viewport capture, and broader CLI parity testing.
+- **Graphics and UI debugging workflows.** Added RenderDoc and Unity Frame Debugger capture, texture analysis, and a UI Toolkit API for inspecting, querying, interacting with, and serializing live panels.
+- **Runtime debugging.** Added cooperative PlayerLoop debugging with cross-frame conditions, pause, frame stepping, inspection, and native Windows debugger discovery for CDB and WinDbg workflows.
+- **Session and workspace navigation.** Pages and sessions can open in standalone windows. Added user-turn navigation, paginated history, interrupted-run resume, context export/review, compacted-context inspection, file previews, and model usage statistics.
+- **Agent execution controls.** Added parallel tool scheduling with workspace locks, same-file edit batching, standardized `subagent` execution, optional background tasks with status/cancellation, inline todos, and local tool-failure logs.
+- **File-driven knowledge workflows.** Design, Memory, Reference, and Skill now use file-driven Markdown operations, with a unified knowledge panel, Markdown previews, canonical Skill packages, `/grill`, and `/review-context`.
+- **Codex and provider controls.** Added extended Codex context settings, optional GPT-5.6 session-title generation, native deferred tool loading for compatible custom providers, and provider-specific compaction output limits.
+- **Checkpoint compaction.** Long sessions now compact into an anchored summary plus recent verbatim context, retain structured migration/export data, and expose the checkpoint contents in the compaction viewer.
+
+### v0.7.0 (Fixed)
+
+- Hardened Codex WebSocket recovery, proxy handling, compressed and continued frames, stale request cleanup, continuation state, and compaction synchronization.
+- Unity execute requests can reattach after native bridge disconnects or domain reloads without running accepted requests twice.
+- Improved Unity YAML parsing, serialized-value fidelity, prefab/reference handling, viewport capture, and cold-path inspection safety.
+- C# diagnostics now target Unity-managed source files and append semantic warnings to hot-reload or recompile results for the current edit batch.
+- Markdown file references cache path status, handle folders correctly, and avoid repeated filesystem probes during rendering.
+- UI Toolkit panel snapshots refresh explicitly, stale panels are rejected, and JSON serialization has bounded depth, members, collections, strings, and total output.
+- Replaced native select controls with the shared dropdown implementation and reused the provider configuration flow during onboarding.
+
+### v0.7.0 (Removed)
+
+- Removed the legacy Agent Graph, `graph_view`, and `sheet` workflows. Agent delegation now uses `subagent`, and custom interactive output uses View and Skill packages.
+- Removed dedicated `knowledge_*` CRUD tools and the old standalone Todo panel. Knowledge changes use unified file-driven operations, while todos render directly in the session.
 
 ### v0.6.0 (Added)
 

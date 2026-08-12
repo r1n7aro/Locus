@@ -40,7 +40,7 @@ describe("mcp settings page", () => {
     // Dual surface: auto recall plus the /connect command.
     expect(skill).toContain("skillSurface: both");
     expect(skill).toContain("commandTrigger: /connect");
-    expect(skill).toContain("commandEnabled: true");
+    expect(skill).not.toMatch(/^commandEnabled:/m);
     expect(skill).toContain("mcp_servers.json");
     expect(skill).toContain("- bash");
     // The upgraded skill covers research, CLI/HTTP channels, and persistence.

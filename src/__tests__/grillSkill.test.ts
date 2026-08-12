@@ -18,12 +18,10 @@ describe("Grill builtin skill", () => {
     const skill = read("knowledge/skill/grill.md");
     const meta = frontmatter(skill);
 
-    expect(meta).toContain("title: Grill");
-    expect(meta).toContain("path: grill.md");
     expect(meta).toContain("skillSurface: command");
-    expect(meta).toContain("commandEnabled: true");
     expect(meta).toContain("commandTrigger: /grill");
     expect(meta).toContain('argumentHint: "[requirement-or-idea]"');
+    expect(meta).not.toMatch(/^(?:title|path|commandEnabled):/m);
   });
 
   it("can investigate implementation facts without mutating the project", () => {
