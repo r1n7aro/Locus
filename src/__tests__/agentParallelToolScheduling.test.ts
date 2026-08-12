@@ -56,6 +56,26 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain("external MCP calls must run without local sibling tools");
   });
 
+  it("polls each subagent loop behind an abortable Tokio task boundary", () => {
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const runSubagent = agent.indexOf("async fn run_subagent(");
+    const childConstruction = agent.indexOf("let mut child = AgentInstance::new(", runSubagent);
+    const promptOwnership = agent.indexOf("let child_prompt = prompt.to_owned();", childConstruction);
+    const spawn = agent.indexOf("AbortOnDropTask::new(tokio::spawn(async move", promptOwnership);
+    const childRun = agent.indexOf("child\n                .run(", spawn);
+    const join = agent.indexOf("let child_result = child_task", childRun);
+
+    expect(runSubagent).toBeGreaterThan(0);
+    expect(childConstruction).toBeGreaterThan(runSubagent);
+    expect(promptOwnership).toBeGreaterThan(childConstruction);
+    expect(spawn).toBeGreaterThan(promptOwnership);
+    expect(childRun).toBeGreaterThan(spawn);
+    expect(join).toBeGreaterThan(childRun);
+    expect(agent).toContain("self.handle.abort()");
+    expect(agent).toContain("child_store.as_ref()");
+    expect(agent).not.toContain("let child_args = args.clone()");
+  });
+
   it("covers the Claude Code CLI host path with the same lock", () => {
     const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
     const executeTool = cli.indexOf("fn execute_tool");
@@ -87,14 +107,24 @@ describe("agent parallel tool scheduling safety", () => {
 
   it("emits actionable lock lifecycle and possible-deadlock logs", () => {
     const lock = read("src-tauri/src/agent/workspace_execution_lock.rs");
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
+    const sdk = read("src-tauri/src/sdk.rs");
+    const mcp = read("src-tauri/src/mcp/server/tools.rs");
 
     for (const event of ["requested", "acquired", "waiting", "cancelled", "abandoned", "released"]) {
       expect(lock).toContain(`[WorkspaceExecutionLock] ${event}`);
     }
     expect(lock).toContain("possible_deadlock=");
+    expect(lock).toContain("workspace-execution-lock-diagnostic");
+    expect(lock).toContain("WorkspaceExecutionLockDiagnostic");
+    expect(lock).toContain("clear_diagnostic");
     expect(lock).toContain("session=");
     expect(lock).toContain("run=");
     expect(lock).toContain("holders=(");
+    for (const source of [agent, cli, sdk, mcp]) {
+      expect(source).toContain("acquire_with_diagnostics");
+    }
   });
 
   it("covers the inbound MCP server tool execution path", () => {

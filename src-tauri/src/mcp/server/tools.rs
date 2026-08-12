@@ -490,7 +490,7 @@ pub async fn execute_tool(
         // guard are both released by Drop and leave an abandoned/released log.
         let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
         let workspace_guard = match process_workspace_execution_lock()
-            .acquire(lock_mode, owner, lock_cancel_rx)
+            .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
             .await
         {
             Ok(guard) => guard,

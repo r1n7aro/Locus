@@ -994,7 +994,12 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                             tools: tools.clone(),
                         };
                         match process_workspace_execution_lock()
-                            .acquire(*lock_mode, owner, self.agent.cancel_waiter())
+                            .acquire_with_diagnostics(
+                                *lock_mode,
+                                owner,
+                                self.agent.cancel_waiter(),
+                                self.app_handle,
+                            )
                             .await
                         {
                             Ok(guard) => {

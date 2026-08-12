@@ -44,6 +44,7 @@ import type {
   KnowledgeChangedEvent,
   SessionContentChangedEvent,
   SessionTitleUpdatedEvent,
+  WorkspaceExecutionLockDiagnostic,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
@@ -63,6 +64,12 @@ import {
   openKnowledgeLexicalProgressWindow,
   shouldAutoOpenKnowledgeLexicalProgressWindow,
 } from "../services/knowledgeLexicalProgressWindow";
+
+const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT = "workspace-execution-lock-diagnostic";
+
+function workspaceLockNoticeOperation(sessionId: string): string {
+  return `workspace-lock-wait:${sessionId}`;
+}
 
 function workspaceSwitchNowMs(): number {
   return typeof performance !== "undefined" && typeof performance.now === "function"
@@ -127,9 +134,56 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let unlistenKnowledgeChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionTitleUpdated: RuntimeUnsubscribe | null = null;
+  let unlistenWorkspaceLockDiagnostic: RuntimeUnsubscribe | null = null;
   let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
   let unlistenExternalScriptOpen: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
+  const workspaceLockNoticeOperations = new Set<string>();
+
+  function sessionDiagnosticLabel(sessionId: string): string {
+    const title = chatStore.sessions.find((session) => session.id === sessionId)?.title?.trim();
+    if (title) return title;
+    return sessionId.length > 12 ? `${sessionId.slice(0, 12)}…` : sessionId;
+  }
+
+  function handleWorkspaceLockDiagnostic(payload: WorkspaceExecutionLockDiagnostic) {
+    const operation = workspaceLockNoticeOperation(payload.sessionId);
+    if (!payload.active) {
+      notificationStore.clearByOperation(operation);
+      workspaceLockNoticeOperations.delete(operation);
+      return;
+    }
+
+    const mode = payload.mode === "write"
+      ? t("chat.workspaceLock.mode.write")
+      : t("chat.workspaceLock.mode.read");
+    const tools = payload.tools.slice(0, 3).join(", ") || t("chat.workspaceLock.noTools");
+    const blockerLabels = Array.from(new Set(
+      payload.blockers.map((blocker) => sessionDiagnosticLabel(blocker.sessionId)),
+    ));
+    const blockers = blockerLabels.slice(0, 2).join(", ")
+      || t("chat.workspaceLock.unknownBlocker");
+    const waitedSeconds = Math.max(1, Math.floor(payload.waitedMs / 1_000));
+
+    notificationStore.addNotice(
+      "error",
+      t(
+        "chat.workspaceLock.waiting",
+        sessionDiagnosticLabel(payload.sessionId),
+        mode,
+        waitedSeconds,
+        tools,
+        blockers,
+      ),
+      {
+        code: "workspace_lock_wait",
+        operation,
+        sticky: true,
+        replaceOperation: true,
+      },
+    );
+    workspaceLockNoticeOperations.add(operation);
+  }
 
   // -- Cross-domain watchers --
 
@@ -544,6 +598,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         operation: payload.operation,
       });
     });
+    unlistenWorkspaceLockDiagnostic = await runtime.subscribe<WorkspaceExecutionLockDiagnostic>(
+      WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT,
+      handleWorkspaceLockDiagnostic,
+    );
     unlistenLexicalRebuildStatus = await runtime.subscribe<LexicalRebuildStatus>(
       KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
       (status) => {
@@ -599,8 +657,13 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenKnowledgeChanged?.();
     unlistenSessionContentChanged?.();
     unlistenSessionTitleUpdated?.();
+    unlistenWorkspaceLockDiagnostic?.();
     unlistenPluginsChanged?.();
     unlistenExternalScriptOpen?.();
+    for (const operation of workspaceLockNoticeOperations) {
+      notificationStore.clearByOperation(operation);
+    }
+    workspaceLockNoticeOperations.clear();
     lastAutoOpenedLexicalProgressRun = "";
     resetSystemNotificationState();
     uiStore.cleanup();

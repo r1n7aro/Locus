@@ -219,6 +219,7 @@ describe("useAppBootstrap onboarding completion", () => {
 
     notificationStoreMock = {
       addNotice: vi.fn(),
+      clearByOperation: vi.fn(),
     };
   });
 
@@ -601,6 +602,65 @@ describe("useAppBootstrap onboarding completion", () => {
       "session-1",
       "openai/gpt-5.6-sol",
       "xhigh",
+    );
+  });
+
+  it("shows and clears a sticky error banner for prolonged workspace-lock waits", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+    chatStoreMock.sessions = [
+      { id: "session-waiting", title: "Waiting task" },
+      { id: "session-holder", title: "Running task" },
+    ];
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+
+    const handler = handlers.get("workspace-execution-lock-diagnostic");
+    expect(handler).toBeTypeOf("function");
+    const payload = {
+      active: true,
+      sessionId: "session-waiting",
+      runId: "run-waiting",
+      iteration: 2,
+      workspace: "F:/Project",
+      mode: "write",
+      waitedMs: 30_500,
+      tools: ["edit", "write"],
+      blockers: [{
+        sessionId: "session-holder",
+        runId: "run-holder",
+        mode: "write",
+        heldMs: 31_000,
+        tools: ["unity_execute"],
+      }],
+    };
+    handler?.({ payload });
+
+    expect(notificationStoreMock.addNotice).toHaveBeenCalledWith(
+      "error",
+      expect.stringContaining("Waiting task"),
+      expect.objectContaining({
+        code: "workspace_lock_wait",
+        operation: "workspace-lock-wait:session-waiting",
+        sticky: true,
+        replaceOperation: true,
+      }),
+    );
+    expect(notificationStoreMock.addNotice.mock.calls[0]?.[1]).toContain("Running task");
+
+    handler?.({ payload: { ...payload, active: false, waitedMs: 31_250 } });
+    expect(notificationStoreMock.clearByOperation).toHaveBeenCalledWith(
+      "workspace-lock-wait:session-waiting",
     );
   });
 

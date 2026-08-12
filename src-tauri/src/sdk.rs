@@ -1530,7 +1530,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
     let execute = async {
         let guard = match crate::agent::workspace_execution_lock::process_workspace_execution_lock()
-            .acquire(lock_mode, owner, lock_cancel_rx)
+            .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
             .await
         {
             Ok(guard) => guard,

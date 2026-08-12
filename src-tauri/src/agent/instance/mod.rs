@@ -493,6 +493,36 @@ impl Drop for SubagentSlotGuard {
     }
 }
 
+/// A spawned subagent must stop with the parent tool future. Tokio detaches a
+/// task when its plain `JoinHandle` is dropped, so keep the handle behind an
+/// abort-on-drop future while the parent awaits it.
+struct AbortOnDropTask<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<T> std::future::Future for AbortOnDropTask<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().handle).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 struct ParentStreamEvent {
     run_id: String,
     event: StreamEvent,
@@ -10724,7 +10754,12 @@ impl AgentInstance {
                                 .collect(),
                         };
                         match process_workspace_execution_lock()
-                            .acquire(lock_mode, owner, self.cancel_waiter())
+                            .acquire_with_diagnostics(
+                                lock_mode,
+                                owner,
+                                self.cancel_waiter(),
+                                app_handle,
+                            )
                             .await
                         {
                             Ok(guard) => Some(guard),
@@ -12844,7 +12879,7 @@ impl AgentInstance {
                     WorkspaceExecutionLockMode::Read
                 };
                 match process_workspace_execution_lock()
-                    .acquire(mode, owner, cancel_rx.clone())
+                    .acquire_with_diagnostics(mode, owner, cancel_rx.clone(), &app_handle)
                     .await
                 {
                     Ok(guard) => Some(guard),
@@ -18083,10 +18118,33 @@ impl AgentInstance {
             child.mark_plan_readonly_subagent();
         }
 
-        match child
-            .run(app_handle, store, prompt, None, None, "build", None)
+        // Poll the child's full agent loop as its own Tokio task. `run_with_run_id`
+        // is intentionally a large async state machine; directly awaiting it here
+        // stacks the parent tool loop, execute_single_tool and child LLM loop on
+        // one worker stack. Moving the already-built child transfers all large
+        // state without cloning it. Only the prompt needs one owned copy for the
+        // task's `'static` lifetime; registries and stores remain shared handles.
+        let child_app_handle = app_handle.clone();
+        let child_store = app_handle.state::<Arc<SessionStore>>().inner().clone();
+        let child_prompt = prompt.to_owned();
+        let child_task = AbortOnDropTask::new(tokio::spawn(async move {
+            child
+                .run(
+                    &child_app_handle,
+                    child_store.as_ref(),
+                    &child_prompt,
+                    None,
+                    None,
+                    "build",
+                    None,
+                )
+                .await
+        }));
+        let child_result = child_task
             .await
-        {
+            .map_err(|error| format!("Subagent task failed to join: {}", error))?;
+
+        match child_result {
             Ok(result_text) => {
                 eprintln!(
                     "[Agent {}] subagent '{}' completed, output_len={}",
@@ -18376,7 +18434,7 @@ mod tests {
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
         build_structure_section, compact_trigger, finalize_tool_call_record, render_tree_lines,
-        utf8_prefix_chars, AgentInstance, AgentKnowledgeDocumentContent,
+        utf8_prefix_chars, AbortOnDropTask, AgentInstance, AgentKnowledgeDocumentContent,
         AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
         AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult,
         InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer,
@@ -18402,6 +18460,35 @@ mod tests {
         sync::Arc,
     };
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn abort_on_drop_task_cancels_detached_subagent_work() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = AbortOnDropTask::new(tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+
+        started_rx.await.expect("spawned task should start");
+        drop(task);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted task should be dropped promptly")
+            .expect("drop signal should be delivered");
+    }
 
     #[test]
     fn utf8_prefix_chars_handles_unicode_tool_arguments() {
