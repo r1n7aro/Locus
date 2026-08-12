@@ -421,9 +421,8 @@ namespace Locus.Skills
             {
                 try
                 {
-                    DiscoverPanels();
-                    PanelRecord record;
-                    if (!Panels.TryGetValue(initialRecord.id, out record))
+                    PanelRecord record = RefreshPanelSnapshot(initialRecord);
+                    if (record == null)
                     {
                         if (condition == "missing")
                         {
@@ -645,11 +644,35 @@ namespace Locus.Skills
 
         private static PanelRecord RequirePanel(string panelId)
         {
-            DiscoverPanels();
             PanelRecord record;
             if (string.IsNullOrWhiteSpace(panelId) || !Panels.TryGetValue(panelId, out record))
                 throw new InvalidOperationException(
-                    "panel_not_found: refresh UIToolkitApi.Open().Panels().");
+                    "panel_not_found: call RefreshPanels() and select the panel again.");
+            record = RefreshPanelSnapshot(record);
+            if (record == null)
+                throw new InvalidOperationException(
+                    "panel_not_found: call RefreshPanels() and select the panel again.");
+            return record;
+        }
+
+        private static PanelRecord RefreshPanelSnapshot(PanelRecord record)
+        {
+            if (record == null
+                || record.panel == null
+                || record.root == null
+                || !ReferenceEquals(record.root.panel, record.panel))
+            {
+                if (record != null)
+                {
+                    RemoveOverlay(record);
+                    Panels.Remove(record.id);
+                    if (record.panel != null)
+                        PanelsByObject.Remove(record.panel);
+                }
+                return null;
+            }
+
+            RefreshDocumentRevision(record);
             return record;
         }
 

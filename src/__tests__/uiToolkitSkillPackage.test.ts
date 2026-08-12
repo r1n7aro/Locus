@@ -73,4 +73,33 @@ describe("UI Toolkit C# API Skill package", () => {
     expect(runtime).not.toContain('result["childIds"]');
     expect(runtime).toContain("CompactTextLimit = 160");
   });
+
+  it("reuses one session panel snapshot and validates only the selected panel", () => {
+    const api = read("skills/ui-toolkit/unity/Editor/UIToolkitApi.cs");
+    const runtime = read("skills/ui-toolkit/unity/Editor/UIToolkitDevTools.cs");
+
+    expect(api).toContain("private List<UIPanel> _panelSnapshot;");
+    expect(api).toContain("public IList<UIPanel> RefreshPanels(bool includeEmpty = false)");
+    expect(api).toContain("new UIToolkitDevTools.ListPanelsRequest { includeEmpty = true }");
+    expect(runtime).toContain("private static PanelRecord RefreshPanelSnapshot(PanelRecord record)");
+    expect(runtime).toContain("!ReferenceEquals(record.root.panel, record.panel)");
+    expect(runtime.match(/DiscoverPanels\(\)/g)).toHaveLength(2);
+    expect(runtime).not.toMatch(/RequirePanel\(string panelId\)[\s\S]*?\{[\s\S]*?DiscoverPanels\(\)/);
+  });
+
+  it("bounds JSON serialization and skips value-type property explosions", () => {
+    const skill = read("skills/ui-toolkit/SKILL.md");
+    const api = read("skills/ui-toolkit/unity/Editor/UIToolkitApi.cs");
+
+    expect(skill).toContain("值类型只读取公开字段");
+    expect(api).toContain("private const int MaxNodes = 4096;");
+    expect(api).toContain("private const int MaxMembersPerObject = 64;");
+    expect(api).toContain("private const int MaxCollectionItems = 512;");
+    expect(api).toContain("private const int MaxOutputChars = 256 * 1024;");
+    expect(api).toContain("if (!type.IsValueType)");
+    expect(api).toContain('"<" + property.Name + ">k__BackingField"');
+    expect(api).toContain("if (backingField == null && !trustedGetters)");
+    expect(api).toContain('WriteTruncationMember(state, ref first, "<max-members>")');
+    expect(api).toContain('StopWithValue(state, "<max-output>")');
+  });
 });

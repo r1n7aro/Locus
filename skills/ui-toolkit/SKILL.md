@@ -14,6 +14,8 @@ tools:
 
 - 在 `unity_execute` 中加入 `using Locus.Skills;`，从 `UIToolkitApi.Open()` 开始。
 - 输出通过 `print(UIToolkitApi.Json(value))` 返回。投影当前判断所需字段，避免返回完整对象。
+- `UIToolkitSession` 在首次查找时缓存面板快照；窗口或 `UIDocument` 集合变化后调用 `ui.RefreshPanels()` 再定位。
+- JSON 输出对值类型只读取公开字段，并限制深度、节点、成员、集合项与总长度；出现 `__truncated` 或 `<max-*>` 时缩小投影。
 - 元素 ID 属于当前 Unity 会话和当前面板结构。收到 `stale_element` 后重新定位。
 - selector 支持 `#name`、`.class`、`Type`、`Type#name`、`Type.class` 与 `*`。
 - `IMGUIContainer` 内部控件不属于 `VisualElement` 树。

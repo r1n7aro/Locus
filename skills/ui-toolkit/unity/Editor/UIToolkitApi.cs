@@ -181,19 +181,48 @@ namespace Locus.Skills
 
     public sealed class UIToolkitSession
     {
+        private readonly object _panelSnapshotLock = new object();
+        private List<UIPanel> _panelSnapshot;
+
         public IList<UIPanel> Panels(bool includeEmpty = false)
         {
-            Dictionary<string, object> raw = UIToolkitDevTools.ListPanels(
-                new UIToolkitDevTools.ListPanelsRequest { includeEmpty = includeEmpty });
+            List<UIPanel> snapshot = PanelSnapshot();
             List<UIPanel> output = new List<UIPanel>();
-            IList values = UIConvert.List(raw, "panels");
-            for (int i = 0; i < values.Count; i++)
+            for (int i = 0; i < snapshot.Count; i++)
             {
-                IDictionary<string, object> item = UIConvert.Map(values[i]);
-                if (item != null)
-                    output.Add(new UIPanel(this, UIConvert.PanelInfo(item)));
+                if (includeEmpty || snapshot[i].ElementCount > 1)
+                    output.Add(snapshot[i]);
             }
             return output;
+        }
+
+        public IList<UIPanel> RefreshPanels(bool includeEmpty = false)
+        {
+            lock (_panelSnapshotLock)
+                _panelSnapshot = null;
+            return Panels(includeEmpty);
+        }
+
+        private List<UIPanel> PanelSnapshot()
+        {
+            lock (_panelSnapshotLock)
+            {
+                if (_panelSnapshot != null)
+                    return _panelSnapshot;
+
+                Dictionary<string, object> raw = UIToolkitDevTools.ListPanels(
+                    new UIToolkitDevTools.ListPanelsRequest { includeEmpty = true });
+                List<UIPanel> output = new List<UIPanel>();
+                IList values = UIConvert.List(raw, "panels");
+                for (int i = 0; i < values.Count; i++)
+                {
+                    IDictionary<string, object> item = UIConvert.Map(values[i]);
+                    if (item != null)
+                        output.Add(new UIPanel(this, UIConvert.PanelInfo(item)));
+                }
+                _panelSnapshot = output;
+                return _panelSnapshot;
+            }
         }
 
         public UIPanel Panel(string panelId)
@@ -204,7 +233,7 @@ namespace Locus.Skills
                 if (string.Equals(panels[i].Id, panelId, StringComparison.Ordinal))
                     return panels[i];
             }
-            throw new InvalidOperationException("panel_not_found: refresh UIToolkitApi.Open().Panels().");
+            throw new InvalidOperationException("panel_not_found: call RefreshPanels() and select the panel again.");
         }
 
         public UIPanel FindPanel(string titleOrOwner)
@@ -797,62 +826,127 @@ namespace Locus.Skills
 
     internal static class UIToolkitJson
     {
-        internal static string Serialize(object value)
+        private const int MaxDepth = 12;
+        private const int MaxNodes = 4096;
+        private const int MaxMembersPerObject = 64;
+        private const int MaxCollectionItems = 512;
+        private const int MaxStringChars = 16384;
+        private const int MaxOutputChars = 256 * 1024;
+        private const int OutputClosingReserve = 128;
+        private static readonly object TypePlanLock = new object();
+        private static readonly Dictionary<Type, TypePlan> TypePlans = new Dictionary<Type, TypePlan>();
+
+        private sealed class WriteState
         {
-            StringBuilder output = new StringBuilder(256);
-            HashSet<object> path = new HashSet<object>(ReferenceEqualityComparer.Instance);
-            Write(output, value, path, 0);
-            return output.ToString();
+            internal readonly StringBuilder Output = new StringBuilder(256);
+            internal readonly HashSet<object> Path =
+                new HashSet<object>(ReferenceEqualityComparer.Instance);
+            internal int Nodes;
+            internal string StopReason;
         }
 
-        private static void Write(StringBuilder output, object value, HashSet<object> path, int depth)
+        private sealed class PropertyPlan
         {
-            if (value == null)
+            internal string Name;
+            internal PropertyInfo Property;
+            internal FieldInfo BackingField;
+            internal bool OmitDefault;
+
+            internal object Read(object value)
             {
-                output.Append("null");
+                return BackingField != null
+                    ? BackingField.GetValue(value)
+                    : Property.GetValue(value, null);
+            }
+        }
+
+        private sealed class TypePlan
+        {
+            internal PropertyPlan[] Properties;
+            internal FieldInfo[] Fields;
+        }
+
+        internal static string Serialize(object value)
+        {
+            WriteState state = new WriteState();
+            Write(state, value, 0);
+            return state.Output.ToString();
+        }
+
+        private static void Write(WriteState state, object value, int depth)
+        {
+            if (state.StopReason != null)
+                return;
+            if (state.Nodes >= MaxNodes)
+            {
+                StopWithValue(state, "<max-nodes>");
                 return;
             }
-            if (depth > 12)
+            if (state.Output.Length >= MaxOutputChars - OutputClosingReserve)
             {
-                Quote(output, "<max-depth>");
+                StopWithValue(state, "<max-output>");
+                return;
+            }
+            state.Nodes++;
+
+            if (value == null)
+            {
+                AppendRawValue(state, "null");
+                return;
+            }
+            if (depth > MaxDepth)
+            {
+                Quote(state, "<max-depth>");
                 return;
             }
             if (value is string || value is char)
             {
-                Quote(output, Convert.ToString(value, CultureInfo.InvariantCulture));
+                Quote(state, Convert.ToString(value, CultureInfo.InvariantCulture));
                 return;
             }
             if (value is bool)
             {
-                output.Append((bool)value ? "true" : "false");
+                AppendRawValue(state, (bool)value ? "true" : "false");
                 return;
             }
             if (IsNumber(value))
             {
                 if (value is float && (float.IsNaN((float)value) || float.IsInfinity((float)value)))
-                    Quote(output, Convert.ToString(value, CultureInfo.InvariantCulture));
+                    Quote(state, Convert.ToString(value, CultureInfo.InvariantCulture));
                 else if (value is double && (double.IsNaN((double)value) || double.IsInfinity((double)value)))
-                    Quote(output, Convert.ToString(value, CultureInfo.InvariantCulture));
+                    Quote(state, Convert.ToString(value, CultureInfo.InvariantCulture));
                 else
-                    output.Append(Convert.ToString(value, CultureInfo.InvariantCulture));
+                    AppendRawValue(state, Convert.ToString(value, CultureInfo.InvariantCulture));
                 return;
             }
             if (value is Enum)
             {
-                Quote(output, value.ToString());
+                Quote(state, value.ToString());
+                return;
+            }
+            if (value is DateTime || value is DateTimeOffset || value is TimeSpan
+                || value is Guid || value is Uri)
+            {
+                Quote(state, Convert.ToString(value, CultureInfo.InvariantCulture));
+                return;
+            }
+            if (value is Type || value is MemberInfo || value is Delegate || value is Exception)
+            {
+                Quote(state, value.ToString());
                 return;
             }
             if (value is UnityEngine.Object)
             {
                 UnityEngine.Object unityObject = (UnityEngine.Object)value;
-                Quote(output, unityObject == null ? null : unityObject.name);
+                Quote(state, unityObject == null ? null : unityObject.name);
                 return;
             }
 
-            bool track = !value.GetType().IsValueType;
-            if (track && !path.Add(value))
+            Type type = value.GetType();
+            bool track = !type.IsValueType;
+            if (track && !state.Path.Add(value))
             {
-                Quote(output, "<cycle>");
+                Quote(state, "<cycle>");
                 return;
             }
             try
@@ -860,78 +954,204 @@ namespace Locus.Skills
                 IDictionary dictionary = value as IDictionary;
                 if (dictionary != null)
                 {
-                    output.Append('{');
+                    state.Output.Append('{');
                     bool first = true;
+                    int written = 0;
                     foreach (DictionaryEntry item in dictionary)
                     {
+                        if (state.StopReason != null)
+                            break;
+                        if (written >= MaxCollectionItems)
+                        {
+                            WriteTruncationMember(state, ref first, "<max-items>");
+                            break;
+                        }
                         if (Omit(item.Value)) continue;
-                        if (!first) output.Append(',');
+                        string key = Convert.ToString(item.Key, CultureInfo.InvariantCulture);
+                        if (!CanStartMember(state, key))
+                            break;
+                        if (!first) state.Output.Append(',');
                         first = false;
-                        Quote(output, Convert.ToString(item.Key, CultureInfo.InvariantCulture));
-                        output.Append(':');
-                        Write(output, item.Value, path, depth + 1);
+                        Quote(state, key);
+                        state.Output.Append(':');
+                        Write(state, item.Value, depth + 1);
+                        written++;
                     }
-                    output.Append('}');
+                    state.Output.Append('}');
                     return;
                 }
                 IEnumerable enumerable = value as IEnumerable;
                 if (enumerable != null)
                 {
-                    output.Append('[');
+                    state.Output.Append('[');
                     bool first = true;
+                    int written = 0;
                     foreach (object item in enumerable)
                     {
-                        if (!first) output.Append(',');
+                        if (state.StopReason != null)
+                            break;
+                        if (written >= MaxCollectionItems)
+                        {
+                            if (!first) state.Output.Append(',');
+                            Quote(state, "<max-items>");
+                            break;
+                        }
+                        if (!first) state.Output.Append(',');
                         first = false;
-                        Write(output, item, path, depth + 1);
+                        Write(state, item, depth + 1);
+                        written++;
                     }
-                    output.Append(']');
+                    state.Output.Append(']');
                     return;
                 }
-                WriteObject(output, value, path, depth);
+                WriteObject(state, value, type, depth);
             }
             finally
             {
-                if (track) path.Remove(value);
+                if (track) state.Path.Remove(value);
             }
         }
 
-        private static void WriteObject(StringBuilder output, object value, HashSet<object> path, int depth)
+        private static void WriteObject(WriteState state, object value, Type type, int depth)
         {
-            output.Append('{');
+            state.Output.Append('{');
             bool first = true;
-            Type type = value.GetType();
-            PropertyInfo[] properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
-            for (int i = 0; i < properties.Length; i++)
+            int written = 0;
+            TypePlan plan = GetTypePlan(type);
+            for (int i = 0; i < plan.Properties.Length; i++)
             {
-                PropertyInfo property = properties[i];
-                if (!property.CanRead || property.GetIndexParameters().Length != 0)
-                    continue;
+                if (state.StopReason != null)
+                    break;
+                if (written >= MaxMembersPerObject)
+                {
+                    WriteTruncationMember(state, ref first, "<max-members>");
+                    break;
+                }
+                PropertyPlan property = plan.Properties[i];
+                if (!CanStartMember(state, property.Name))
+                    break;
                 object item;
-                try { item = property.GetValue(value, null); }
+                try { item = property.Read(value); }
                 catch { continue; }
                 if (Omit(item)) continue;
-                if (property.IsDefined(typeof(UIJsonOmitDefaultAttribute), true)
-                    && IsDefaultValue(item))
+                if (property.OmitDefault && IsDefaultValue(item))
                     continue;
-                if (!first) output.Append(',');
+                if (!first) state.Output.Append(',');
                 first = false;
-                Quote(output, char.ToLowerInvariant(property.Name[0]) + property.Name.Substring(1));
-                output.Append(':');
-                Write(output, item, path, depth + 1);
+                Quote(state, property.Name);
+                state.Output.Append(':');
+                Write(state, item, depth + 1);
+                written++;
             }
-            FieldInfo[] fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public);
-            for (int i = 0; i < fields.Length; i++)
+            for (int i = 0; i < plan.Fields.Length && state.StopReason == null; i++)
             {
-                object item = fields[i].GetValue(value);
+                if (written >= MaxMembersPerObject)
+                {
+                    WriteTruncationMember(state, ref first, "<max-members>");
+                    break;
+                }
+                if (!CanStartMember(state, plan.Fields[i].Name))
+                    break;
+                object item = plan.Fields[i].GetValue(value);
                 if (Omit(item)) continue;
-                if (!first) output.Append(',');
+                if (!first) state.Output.Append(',');
                 first = false;
-                Quote(output, fields[i].Name);
-                output.Append(':');
-                Write(output, item, path, depth + 1);
+                Quote(state, plan.Fields[i].Name);
+                state.Output.Append(':');
+                Write(state, item, depth + 1);
+                written++;
             }
-            output.Append('}');
+            state.Output.Append('}');
+        }
+
+        private static TypePlan GetTypePlan(Type type)
+        {
+            lock (TypePlanLock)
+            {
+                TypePlan existing;
+                if (TypePlans.TryGetValue(type, out existing))
+                    return existing;
+            }
+
+            bool trustedGetters = IsAnonymousType(type)
+                || string.Equals(type.Namespace, "Locus.Skills", StringComparison.Ordinal)
+                || (type.Namespace ?? "").StartsWith("Locus.Skills.", StringComparison.Ordinal);
+            List<PropertyPlan> properties = new List<PropertyPlan>();
+            if (!type.IsValueType)
+            {
+                PropertyInfo[] candidates = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+                for (int i = 0; i < candidates.Length; i++)
+                {
+                    PropertyInfo property = candidates[i];
+                    if (!property.CanRead || property.GetIndexParameters().Length != 0)
+                        continue;
+                    FieldInfo backingField = type.GetField(
+                        "<" + property.Name + ">k__BackingField",
+                        BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (backingField == null && !trustedGetters)
+                        continue;
+                    properties.Add(new PropertyPlan
+                    {
+                        Name = JsonMemberName(property.Name),
+                        Property = property,
+                        BackingField = backingField,
+                        OmitDefault = property.IsDefined(typeof(UIJsonOmitDefaultAttribute), true)
+                    });
+                }
+            }
+
+            TypePlan created = new TypePlan
+            {
+                Properties = properties.ToArray(),
+                Fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public)
+            };
+            lock (TypePlanLock)
+            {
+                TypePlan existing;
+                if (TypePlans.TryGetValue(type, out existing))
+                    return existing;
+                TypePlans[type] = created;
+                return created;
+            }
+        }
+
+        private static bool IsAnonymousType(Type type)
+        {
+            string name = type == null ? "" : type.Name;
+            return name.IndexOf("AnonymousType", StringComparison.Ordinal) >= 0
+                && (name.StartsWith("<>", StringComparison.Ordinal)
+                    || name.StartsWith("VB$", StringComparison.Ordinal));
+        }
+
+        private static string JsonMemberName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "value";
+            return char.ToLowerInvariant(name[0]) + name.Substring(1);
+        }
+
+        private static void WriteTruncationMember(WriteState state, ref bool first, string reason)
+        {
+            if (!CanStartMember(state, "__truncated"))
+                return;
+            if (!first) state.Output.Append(',');
+            first = false;
+            Quote(state, "__truncated");
+            state.Output.Append(':');
+            Quote(state, reason);
+        }
+
+        private static bool CanStartMember(WriteState state, string name)
+        {
+            if (state.StopReason != null)
+                return false;
+            int sourceChars = Math.Min((name ?? "").Length, MaxStringChars);
+            int worstCaseChars = sourceChars * 6 + 64;
+            if (state.Output.Length + worstCaseChars
+                < MaxOutputChars - OutputClosingReserve)
+                return true;
+            state.StopReason = "<max-output>";
+            return false;
         }
 
         private static bool Omit(object value)
@@ -958,35 +1178,70 @@ namespace Locus.Skills
                 || value is float || value is double || value is decimal;
         }
 
-        private static void Quote(StringBuilder output, string value)
+        private static void AppendRawValue(WriteState state, string value)
+        {
+            string text = value ?? "null";
+            if (state.Output.Length + text.Length >= MaxOutputChars - OutputClosingReserve)
+            {
+                StopWithValue(state, "<max-output>");
+                return;
+            }
+            state.Output.Append(text);
+        }
+
+        private static void StopWithValue(WriteState state, string reason)
+        {
+            if (state.StopReason != null)
+                return;
+            state.StopReason = reason;
+            Quote(state, reason);
+        }
+
+        private static void Quote(WriteState state, string value)
         {
             if (value == null)
             {
-                output.Append("null");
+                state.Output.Append("null");
                 return;
             }
-            output.Append('"');
-            for (int i = 0; i < value.Length; i++)
+            int sourceLimit = Math.Min(value.Length, MaxStringChars);
+            int outputLimit = MaxOutputChars - OutputClosingReserve;
+            bool truncated = sourceLimit < value.Length;
+            state.Output.Append('"');
+            for (int i = 0; i < sourceLimit; i++)
             {
                 char ch = value[i];
+                int escapedLength = ch == '"' || ch == '\\' || ch == '\b' || ch == '\f'
+                    || ch == '\n' || ch == '\r' || ch == '\t'
+                    ? 2
+                    : (ch < 32 ? 6 : 1);
+                if (state.Output.Length + escapedLength + 20 >= outputLimit)
+                {
+                    truncated = true;
+                    if (state.StopReason == null)
+                        state.StopReason = "<max-output>";
+                    break;
+                }
                 switch (ch)
                 {
-                    case '"': output.Append("\\\""); break;
-                    case '\\': output.Append("\\\\"); break;
-                    case '\b': output.Append("\\b"); break;
-                    case '\f': output.Append("\\f"); break;
-                    case '\n': output.Append("\\n"); break;
-                    case '\r': output.Append("\\r"); break;
-                    case '\t': output.Append("\\t"); break;
+                    case '"': state.Output.Append("\\\""); break;
+                    case '\\': state.Output.Append("\\\\"); break;
+                    case '\b': state.Output.Append("\\b"); break;
+                    case '\f': state.Output.Append("\\f"); break;
+                    case '\n': state.Output.Append("\\n"); break;
+                    case '\r': state.Output.Append("\\r"); break;
+                    case '\t': state.Output.Append("\\t"); break;
                     default:
                         if (ch < 32)
-                            output.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
+                            state.Output.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
                         else
-                            output.Append(ch);
+                            state.Output.Append(ch);
                         break;
                 }
             }
-            output.Append('"');
+            if (truncated && state.Output.Length + 15 < outputLimit)
+                state.Output.Append("...<truncated>");
+            state.Output.Append('"');
         }
 
         private sealed class ReferenceEqualityComparer : IEqualityComparer<object>
