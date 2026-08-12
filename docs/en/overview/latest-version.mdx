@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.7.0 (2026-08-12)"
+description: "Locus v0.7.1 (2026-08-13)"
 sidebarTitle: "Latest Version"
-version: "0.7.0"
-releasedAt: "2026-08-12"
+version: "0.7.1"
+releasedAt: "2026-08-13"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,25 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.0/locus_0.7.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.7.1 (Added)
+
+- **Live background task updates.** Async and notify tool calls now update their original tool block as execution progresses. Shell output streams live, final results persist in session history, and background shell and Unity Test runs continue until completion or cancellation without synchronous execution deadlines.
+- **Built-in Unity project-file generation.** The Locus Unity plugin can generate complete `.sln` and `.csproj` files directly from Unity's `CompilationPipeline` without Visual Studio, Rider, or VS Code integration packages. Generated workspaces retain project references, compilation defines, analyzers, and Unity project-generation callbacks.
+
+### v0.7.1 (Fixed)
+
+- **Nested subagent stack overflows.** Each child agent now runs its full loop in an independent Tokio task, separating the parent tool loop, tool execution, and child LLM loop onto distinct task stack boundaries. Ending the parent execution also aborts the child task.
+- **Concurrent agent scheduling stalls.** Foreground subagents in mixed tool rounds complete before local sibling tools run. Workspace locks are scoped to normalized project paths, allowing separate projects to execute independently. Long lock waits identify the waiting tools and blocking sessions.
+- **Unity parallel-edit deadlocks.** Completed asset changes are imported whenever any overlapping edit session ends, while remaining sessions continue normally. This prevents finished files from remaining outside the AssetDatabase behind a long-running sibling session.
+- **Interrupted tool history.** Resuming or continuing an interrupted session now records explicit interrupted results for unfinished local tool calls, preserving a valid tool-call sequence.
+- **Unity C# snippet compilation.** Common `System.IO` types now use explicit aliases in `unity_execute` and `unity_run_states`, preventing Unity Mono's internal `MonoLinqHelper.ToArray` from conflicting with LINQ `ToArray` when non-public access is enabled.
+- **Unity YAML inspection guidance.** When a direct read is redirected from a Unity YAML asset, Locus now recommends both semantic YAML tools and `unity_execute` for Editor-side C# inspection, while retaining the explicit raw-read retry path.
 
 ### v0.7.0 (Added)
 
