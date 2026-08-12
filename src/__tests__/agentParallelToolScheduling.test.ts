@@ -6,9 +6,9 @@ const root = process.cwd();
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 describe("agent parallel tool scheduling safety", () => {
-  it("keeps mutating rounds under the process workspace write lock", () => {
+  it("keeps mutating rounds under the keyed workspace write lock", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
-    const acquire = agent.indexOf("process_workspace_execution_lock()", agent.indexOf("let prepared"));
+    const acquire = agent.indexOf("process_workspace_execution_lock(", agent.indexOf("let prepared"));
     const checkpoint = agent.indexOf("let pre_checkpoint", acquire);
     const release = agent.lastIndexOf("drop(workspace_round_guard.take())");
     const afterRound = agent.indexOf(".after_round(", checkpoint);
@@ -37,14 +37,17 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain('"edits": operations');
   });
 
-  it("preconfirms before locking and isolates reentrant tool kinds", () => {
+  it("runs sync subagents before local siblings and isolates other reentrant tool kinds", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
-    const preconfirm = agent.indexOf("Confirm every local call before taking the process-wide lock");
-    const acquire = agent.indexOf("process_workspace_execution_lock()", preconfirm);
+    const subagentPhase = agent.indexOf("executing foreground subagent phase before local siblings");
+    const preconfirm = agent.indexOf("Confirm every local call before taking the workspace lock");
+    const acquire = agent.indexOf("process_workspace_execution_lock(", preconfirm);
     const deterministicPhase = agent.indexOf("executing deterministic pre-ask tools in parallel");
     const releaseBeforeAsk = agent.indexOf("drop(workspace_round_guard.take())", deterministicPhase);
     const askPhase = agent.indexOf("executing user-input phase sequentially", deterministicPhase);
 
+    expect(subagentPhase).toBeGreaterThan(0);
+    expect(preconfirm).toBeGreaterThan(subagentPhase);
     expect(preconfirm).toBeGreaterThan(0);
     expect(acquire).toBeGreaterThan(preconfirm);
     expect(agent).toContain("user-input rounds only allow deterministic pre-ask tools");
@@ -52,7 +55,9 @@ describe("agent parallel tool scheduling safety", () => {
     expect(deterministicPhase).toBeGreaterThan(acquire);
     expect(releaseBeforeAsk).toBeGreaterThan(deterministicPhase);
     expect(askPhase).toBeGreaterThan(releaseBeforeAsk);
-    expect(agent).toContain("sub-agent calls must run without local sibling tools");
+    expect(agent).toContain('"subagent-then-local"');
+    expect(agent).toContain("precompleted_results");
+    expect(agent).not.toContain("sub-agent calls must run without local sibling tools");
     expect(agent).toContain("external MCP calls must run without local sibling tools");
   });
 
@@ -80,11 +85,14 @@ describe("agent parallel tool scheduling safety", () => {
     const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
     const executeTool = cli.indexOf("fn execute_tool");
     const preconfirm = cli.indexOf("ensure_cli_round_confirmations_prepared().await", executeTool);
-    const acquire = cli.indexOf("process_workspace_execution_lock()", preconfirm);
+    const acquire = cli.indexOf("process_workspace_execution_lock(", preconfirm);
 
     expect(cli).toContain("workspace_guard: Option<WorkspaceExecutionGuard>");
     expect(cli).toContain("cli_round_workspace_policy");
-    expect(cli).toContain("process_workspace_execution_lock()");
+    expect(cli).toContain("process_workspace_execution_lock(&self.agent.working_dir)");
+    expect(cli).toContain("ensure_cli_foreground_subagent_phase().await");
+    expect(cli).toContain("precompleted_subagent_results");
+    expect(cli).not.toContain("sub-agent calls must run without local sibling tools");
     expect(cli).toContain("confirmation_preapproved");
     expect(cli).toContain("is_deterministic_pre_ask_tool");
     expect(cli).toContain("is_deterministic_pre_ask_call");
@@ -122,6 +130,8 @@ describe("agent parallel tool scheduling safety", () => {
     expect(lock).toContain("session=");
     expect(lock).toContain("run=");
     expect(lock).toContain("holders=(");
+    expect(lock).toContain("PROCESS_WORKSPACE_EXECUTION_LOCKS");
+    expect(lock).toContain("normalize_workspace_key");
     for (const source of [agent, cli, sdk, mcp]) {
       expect(source).toContain("acquire_with_diagnostics");
     }
@@ -129,7 +139,7 @@ describe("agent parallel tool scheduling safety", () => {
 
   it("covers the inbound MCP server tool execution path", () => {
     const mcp = read("src-tauri/src/mcp/server/tools.rs");
-    const acquire = mcp.indexOf("process_workspace_execution_lock()");
+    const acquire = mcp.indexOf("process_workspace_execution_lock(");
     const execute = mcp.indexOf("execute_workspace_tool(&app", acquire);
     const release = mcp.indexOf("drop(workspace_guard)", execute);
 

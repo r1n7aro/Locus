@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use tokio::io::{AsyncRead, AsyncReadExt};
+
 use super::misc::truncate_utf8_middle;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::process_util::{
@@ -132,6 +134,8 @@ pub(super) fn bash() -> ToolDef {
             Box::pin(async move {
                 let mut cancel_rx = ctx.cancel_rx.clone();
                 let progress = ctx.progress.clone();
+                let output_reporter = ctx.output.clone();
+                let background = ctx.background;
                 let command = match args.get("command").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
                     None => {
@@ -208,7 +212,7 @@ pub(super) fn bash() -> ToolDef {
                         &interactive_sh_command,
                         workdir.as_deref().unwrap_or_default(),
                         &envs,
-                        timeout_ms,
+                        (!background).then_some(timeout_ms),
                     );
                     return if let Some(ref mut cancel_rx) = cancel_rx {
                         tokio::select! {
@@ -255,32 +259,56 @@ pub(super) fn bash() -> ToolDef {
                 if let Some(report) = progress.as_ref() {
                     report(format!("Command running: {}", command));
                 }
-                let execution = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    cmd.output(),
-                );
-                let result = if let Some(ref mut cancel_rx) = cancel_rx {
-                    tokio::select! {
-                        result = execution => result,
-                        _ = cancel_rx.changed() => {
+                let execution = run_captured_command(cmd, output_reporter);
+                let result = if background {
+                    if let Some(ref mut cancel_rx) = cancel_rx {
+                        tokio::select! {
+                            result = execution => result,
+                            _ = cancel_rx.changed() => {
+                                return ToolResult {
+                                    output: "Command cancelled.".to_string(),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    } else {
+                        execution.await
+                    }
+                } else {
+                    let execution = tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout_ms),
+                        execution,
+                    );
+                    let timed = if let Some(ref mut cancel_rx) = cancel_rx {
+                        tokio::select! {
+                            result = execution => result,
+                            _ = cancel_rx.changed() => {
+                                return ToolResult {
+                                    output: "Command cancelled.".to_string(),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    } else {
+                        execution.await
+                    };
+                    match timed {
+                        Ok(result) => result,
+                        Err(_) => {
                             return ToolResult {
-                                output: "Command cancelled.".to_string(),
+                                output: format!(
+                                    "Command timed out after {}ms: {}",
+                                    timeout_ms, command
+                                ),
                                 is_error: true,
                             };
                         }
                     }
-                } else {
-                    execution.await
                 };
 
                 match result {
-                    Ok(Ok(output)) => {
-                        let stdout = decode_console_bytes(&output.stdout);
-                        let stderr = decode_console_bytes(&output.stderr);
-
-                        let mut out = String::new();
-                        out.push_str(&stdout);
-                        out.push_str(&stderr);
+                    Ok(output) => {
+                        let mut out = decode_console_bytes(&output.bytes);
 
                         if out.len() > 50_000 {
                             let total_bytes = out.len();
@@ -301,18 +329,82 @@ pub(super) fn bash() -> ToolDef {
                             is_error: exit_code != 0,
                         }
                     }
-                    Ok(Err(e)) => ToolResult {
+                    Err(e) => ToolResult {
                         output: format!("Failed to execute command: {}", e),
-                        is_error: true,
-                    },
-                    Err(_) => ToolResult {
-                        output: format!("Command timed out after {}ms: {}", timeout_ms, command),
                         is_error: true,
                     },
                 }
             })
         }),
     }
+}
+
+struct CapturedCommandOutput {
+    status: std::process::ExitStatus,
+    bytes: Vec<u8>,
+}
+
+async fn forward_captured_pipe<R>(mut pipe: R, sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0u8; 8_192];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                if sender.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn run_captured_command(
+    mut command: tokio::process::Command,
+    output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
+) -> std::io::Result<CapturedCommandOutput> {
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    if let Some(stdout) = stdout {
+        tokio::spawn(forward_captured_pipe(stdout, sender.clone()));
+    }
+    if let Some(stderr) = stderr {
+        tokio::spawn(forward_captured_pipe(stderr, sender.clone()));
+    }
+    drop(sender);
+
+    let mut wait = Box::pin(child.wait());
+    let mut status = None;
+    let mut pipes_open = true;
+    let mut bytes = Vec::new();
+    while status.is_none() || pipes_open {
+        tokio::select! {
+            result = &mut wait, if status.is_none() => {
+                status = Some(result?);
+            }
+            chunk = receiver.recv(), if pipes_open => {
+                match chunk {
+                    Some(chunk) => {
+                        if let Some(report) = output_reporter.as_ref() {
+                            report(decode_console_bytes(&chunk));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    None => pipes_open = false,
+                }
+            }
+        }
+    }
+
+    Ok(CapturedCommandOutput {
+        status: status.expect("child wait completed"),
+        bytes,
+    })
 }
 
 fn collect_shell_env(
@@ -383,7 +475,7 @@ async fn run_interactive_command(
     sh_command: &str,
     workdir: &str,
     envs: &[(String, OsString)],
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
 ) -> ToolResult {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let temp_dir = std::env::temp_dir();
@@ -461,7 +553,7 @@ async fn run_interactive_command(
 
 async fn wait_for_interactive_exit(
     marker_path: &Path,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
     mut child: Option<tokio::process::Child>,
     command: &str,
 ) -> ToolResult {
@@ -499,14 +591,16 @@ async fn wait_for_interactive_exit(
             }
         }
 
-        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+        if timeout_ms.is_some_and(|timeout_ms| {
+            started.elapsed() >= std::time::Duration::from_millis(timeout_ms)
+        }) {
             if let Some(mut child) = child.take() {
                 let _ = child.start_kill();
             }
             return ToolResult {
                 output: format!(
                     "Interactive command timed out after {}ms: {}\nThe terminal window may still be open; the user should close it manually.",
-                    timeout_ms, command
+                    timeout_ms.unwrap_or_default(), command
                 ),
                 is_error: true,
             };
@@ -911,5 +1005,55 @@ mod tests {
             .expect("cancelled command should return promptly");
         assert!(result.is_error);
         assert_eq!(result.output, "Command cancelled.");
+    }
+
+    #[tokio::test]
+    async fn background_bash_ignores_timeout_and_streams_output() {
+        let definition = bash();
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_output = streamed.clone();
+        let reporter: crate::async_tasks::TaskOutputReporter = std::sync::Arc::new(move |chunk| {
+            streamed_output
+                .lock()
+                .expect("lock streamed output")
+                .push_str(&chunk);
+        });
+        let command = match detect_shell() {
+            ShellKind::Sh => "printf 'first\\n'; sleep 0.2; printf 'second\\n'",
+            ShellKind::Cmd => "echo first & ping -n 2 127.0.0.1 >nul & echo second",
+        };
+        let context = crate::tool::ToolExecutionContext {
+            working_dir: Some(
+                std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            output: Some(reporter),
+            background: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            (definition.execute)(
+                serde_json::json!({
+                    "command": command,
+                    "description": "verify async shell streaming",
+                    "workdir": context.working_dir.clone().expect("working directory"),
+                    "timeout": 25
+                }),
+                context,
+            ),
+        )
+        .await
+        .expect("background command should complete");
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("first"));
+        assert!(result.output.contains("second"));
+        let streamed = streamed.lock().expect("lock streamed output");
+        assert!(streamed.contains("first"));
+        assert!(streamed.contains("second"));
     }
 }

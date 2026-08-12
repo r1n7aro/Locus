@@ -32,7 +32,7 @@
       "timeout_ms": {
         "type": "integer",
         "default": 600000,
-        "description": "Host-side timeout in milliseconds, clamped to 1000..3600000."
+        "description": "Host-side timeout in milliseconds for sync execution, clamped to 1000..3600000. Background async/notify execution has no time limit."
       },
       "result_detail": {
         "type": "string",

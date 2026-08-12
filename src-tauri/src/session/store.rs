@@ -683,6 +683,27 @@ fn strip_top_level_recorded_output(tool_calls: &[ToolCallInfo]) -> Vec<ToolCallI
         .collect()
 }
 
+fn update_tool_call_display_record(
+    tool_calls: &mut [ToolCallInfo],
+    tool_call_id: &str,
+    output: &str,
+    outcome: crate::commands::ToolCallOutcome,
+) -> bool {
+    for tool_call in tool_calls {
+        if tool_call.id == tool_call_id {
+            tool_call.recorded_output = Some(output.to_string());
+            tool_call.outcome = Some(outcome);
+            return true;
+        }
+        if tool_call.nested_tool_calls.as_mut().is_some_and(|nested| {
+            update_tool_call_display_record(nested, tool_call_id, output, outcome)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 fn copy_dir_recursively(source: &Path, target: &Path) -> Result<(), String> {
     if !source.is_dir() {
         return Ok(());
@@ -4121,6 +4142,70 @@ impl SessionStore {
                 message_id, e
             )
         })?;
+        Ok(())
+    }
+
+    pub fn update_background_tool_display(
+        &self,
+        message_id: &str,
+        tool_call_id: &str,
+        output: &str,
+        outcome: crate::commands::ToolCallOutcome,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT tool_calls, metadata_json FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load async tool message: {error}"))?;
+        let Some((tool_calls_json, metadata_json)) = row else {
+            return Err(format!("Assistant message '{}' was not found", message_id));
+        };
+
+        let mut tool_calls: Vec<ToolCallInfo> = tool_calls_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| format!("Failed to parse async tool calls: {error}"))?
+            .unwrap_or_default();
+        if !update_tool_call_display_record(&mut tool_calls, tool_call_id, output, outcome) {
+            return Err(format!(
+                "Tool call '{}' was not found in assistant message '{}'",
+                tool_call_id, message_id
+            ));
+        }
+
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| format!("Failed to parse async tool message metadata: {error}"))?
+            .unwrap_or_default();
+        if let Some(render_parts) = metadata.render_parts.as_mut() {
+            for part in render_parts {
+                if let AssistantRenderPart::ToolCall { tool_call, .. } = part {
+                    update_tool_call_display_record(
+                        std::slice::from_mut(tool_call),
+                        tool_call_id,
+                        output,
+                        outcome,
+                    );
+                }
+            }
+        }
+
+        let tool_calls_json = serde_json::to_string(&tool_calls)
+            .map_err(|error| format!("Failed to serialize async tool calls: {error}"))?;
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|error| format!("Failed to serialize async tool metadata: {error}"))?;
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?1, metadata_json = ?2 WHERE id = ?3",
+            params![tool_calls_json, metadata_json, message_id],
+        )
+        .map_err(|error| format!("Failed to persist async tool display: {error}"))?;
         Ok(())
     }
 

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tauri::Emitter;
 use tokio::sync::watch;
 
 use crate::tool::output::{append_field, append_text_field};
@@ -13,9 +14,11 @@ pub const GET_TASK_STATUS_TOOL_NAME: &str = "get_task_status";
 pub const CANCEL_TASK_TOOL_NAME: &str = "cancel_task";
 pub const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
 pub const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+pub const ASYNC_TASK_UPDATED_EVENT: &str = "async-task-updated";
 
 const MAX_RETAINED_TASKS: usize = 256;
 const MAX_NOTIFICATION_PREVIEW_CHARS: usize = 2_000;
+const MAX_LIVE_OUTPUT_CHARS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncMode {
@@ -96,7 +99,7 @@ pub fn augment_tool_schema(tool_name: &str, tool: &mut serde_json::Value) {
         serde_json::json!({
             "type": "string",
             "enum": ["sync", "async", "notify"],
-            "description": "Execution mode. 'sync' waits and returns the result; 'async' returns a task id immediately; 'notify' also resumes or reminds this session when the task finishes. Default 'sync'.",
+            "description": "Execution mode. 'sync' waits and returns the result; 'async' runs without an execution deadline and returns a task id immediately; 'notify' also resumes or reminds this session when the task finishes. Default 'sync'.",
             "default": "sync"
         }),
     );
@@ -148,6 +151,41 @@ pub struct AsyncTaskSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     pub notify: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsyncTaskUpdatedEvent {
+    pub session_id: String,
+    pub assistant_message_id: String,
+    pub tool_call_id: String,
+    pub task_id: String,
+    pub tool_name: String,
+    pub status: AsyncTaskStatus,
+    pub output: String,
+}
+
+pub fn emit_task_updated(
+    app_handle: &tauri::AppHandle,
+    assistant_message_id: &str,
+    tool_call_id: &str,
+    snapshot: &AsyncTaskSnapshot,
+) {
+    let event = AsyncTaskUpdatedEvent {
+        session_id: snapshot.session_id.clone(),
+        assistant_message_id: assistant_message_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        task_id: snapshot.task_id.clone(),
+        tool_name: snapshot.tool_name.clone(),
+        status: snapshot.status.clone(),
+        output: snapshot.output.clone().unwrap_or_default(),
+    };
+    if let Err(error) = app_handle.emit(ASYNC_TASK_UPDATED_EVENT, event) {
+        eprintln!(
+            "[Agent async] failed to emit task update for {}: {}",
+            snapshot.task_id, error
+        );
+    }
 }
 
 impl AsyncTaskSnapshot {
@@ -293,6 +331,25 @@ impl AsyncTaskManager {
         });
     }
 
+    pub fn append_output(&self, task_id: &str, chunk: &str) -> Option<AsyncTaskSnapshot> {
+        if chunk.is_empty() {
+            return self.snapshot(task_id);
+        }
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = tasks.get_mut(task_id)?;
+        if entry.snapshot.status.is_terminal() {
+            return Some(entry.snapshot.clone());
+        }
+        let output = entry.snapshot.output.get_or_insert_with(String::new);
+        output.push_str(chunk);
+        truncate_live_output(output);
+        entry.snapshot.updated_at = now_millis();
+        Some(entry.snapshot.clone())
+    }
+
     pub fn finish(&self, task_id: &str, result: &ToolResult) -> Option<AsyncTaskSnapshot> {
         let snapshot = {
             let mut tasks = self
@@ -311,6 +368,9 @@ impl AsyncTaskManager {
                 "Completed".to_string()
             });
             entry.snapshot.output = Some(result.output.clone());
+            if let Some(output) = entry.snapshot.output.as_mut() {
+                truncate_live_output(output);
+            }
             entry.snapshot.is_error = Some(result.is_error);
             entry.snapshot.finished_at = Some(now_millis());
             entry.snapshot.updated_at = now_millis();
@@ -335,7 +395,12 @@ impl AsyncTaskManager {
             let entry = tasks.get_mut(task_id)?;
             entry.snapshot.status = AsyncTaskStatus::Cancelled;
             entry.snapshot.progress = Some("Cancelled".to_string());
-            entry.snapshot.output = Some("Task cancelled.".to_string());
+            let output = entry.snapshot.output.get_or_insert_with(String::new);
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str("Task cancelled.");
+            truncate_live_output(output);
             entry.snapshot.is_error = Some(true);
             entry.snapshot.finished_at = Some(now_millis());
             entry.snapshot.updated_at = now_millis();
@@ -476,6 +541,23 @@ impl AsyncTaskManager {
 }
 
 pub type TaskProgressReporter = Arc<dyn Fn(String) + Send + Sync>;
+pub type TaskOutputReporter = Arc<dyn Fn(String) + Send + Sync>;
+
+fn truncate_live_output(output: &mut String) {
+    let char_count = output.chars().count();
+    if char_count <= MAX_LIVE_OUTPUT_CHARS {
+        return;
+    }
+    const MARKER: &str = "[earlier output truncated]\n";
+    let keep = MAX_LIVE_OUTPUT_CHARS.saturating_sub(MARKER.chars().count());
+    let tail = output
+        .chars()
+        .skip(char_count.saturating_sub(keep))
+        .collect::<String>();
+    output.clear();
+    output.push_str(MARKER);
+    output.push_str(&tail);
+}
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
@@ -635,5 +717,18 @@ mod tests {
         let completed = manager.status_result(&started.task_id).output;
         assert!(completed.contains(" status=completed "));
         assert!(completed.ends_with("\nresult:\nExit code: 0\ndone"));
+    }
+
+    #[test]
+    fn running_task_status_includes_incremental_output() {
+        let manager = AsyncTaskManager::default();
+        let started = manager.create_task("session", "bash", false);
+        manager.mark_running(&started.task_id, "Running bash");
+        manager.append_output(&started.task_id, "first\n");
+        manager.append_output(&started.task_id, "second\n");
+
+        let running = manager.status_result(&started.task_id).output;
+        assert!(running.contains(" status=running "));
+        assert!(running.ends_with("\nresult:\nfirst\nsecond\n"));
     }
 }

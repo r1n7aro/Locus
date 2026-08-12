@@ -150,8 +150,10 @@ fn enrich_tool_calls(
                 tool_call.nested_tool_calls = Some(enrich_embedded_tool_calls(nested_tool_calls));
             }
 
-            if let Some(output) = observed_tool_outputs.get(tool_call.id.as_str()) {
-                tool_call.recorded_output = Some(output.clone());
+            if tool_call.recorded_output.is_none() {
+                if let Some(output) = observed_tool_outputs.get(tool_call.id.as_str()) {
+                    tool_call.recorded_output = Some(output.clone());
+                }
             }
 
             if tool_call.outcome.is_none() {
@@ -472,6 +474,35 @@ mod tests {
             .as_ref()
             .expect("assistant tool calls");
         assert_eq!(tool_calls[0].recorded_output.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn preserves_background_output_over_the_queued_tool_result() {
+        let tool_call = ToolCallInfo {
+            id: "tc-1".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"async":"notify"}"#.to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: Some(ToolCallOutcome::Done),
+            recorded_output: Some("Exit code: 0\nfinished".to_string()),
+            nested_tool_calls: None,
+        };
+        let messages = vec![
+            assistant_with_tools("assistant-1", vec![tool_call]),
+            tool_message("tool-1", "tc-1", "Async task: id=task-1 status=queued"),
+        ];
+
+        let normalized = normalize_tool_round_history(&messages);
+        let tool_call = &normalized[0]
+            .tool_calls
+            .as_ref()
+            .expect("assistant tool calls")[0];
+        assert_eq!(
+            tool_call.recorded_output.as_deref(),
+            Some("Exit code: 0\nfinished")
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub struct ToolExecutionContext {
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
     pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     pub progress: Option<crate::async_tasks::TaskProgressReporter>,
+    pub output: Option<crate::async_tasks::TaskOutputReporter>,
+    pub background: bool,
 }
 
 impl ToolExecutionContext {

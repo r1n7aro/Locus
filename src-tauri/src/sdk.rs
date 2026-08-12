@@ -1513,6 +1513,8 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         runtime_state: Some(Arc::new(ToolRuntimeState::default())),
         cancel_rx: None,
         progress: None,
+        output: None,
+        background: false,
     };
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
     let lock_mode = if registry.mutates_workspace(&canonical) {
@@ -1529,9 +1531,11 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     };
     let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
     let execute = async {
-        let guard = match crate::agent::workspace_execution_lock::process_workspace_execution_lock()
-            .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
-            .await
+        let guard = match crate::agent::workspace_execution_lock::process_workspace_execution_lock(
+            &owner.workspace,
+        )
+        .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
+        .await
         {
             Ok(guard) => guard,
             Err(_) => {

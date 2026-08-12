@@ -14,8 +14,8 @@ const POSSIBLE_DEADLOCK_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT: &str =
     "workspace-execution-lock-diagnostic";
 
-static PROCESS_WORKSPACE_EXECUTION_LOCK: LazyLock<WorkspaceExecutionLock> =
-    LazyLock::new(WorkspaceExecutionLock::new);
+static PROCESS_WORKSPACE_EXECUTION_LOCKS: LazyLock<Mutex<HashMap<String, WorkspaceExecutionLock>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceExecutionLockMode {
@@ -562,16 +562,50 @@ impl Drop for WorkspaceExecutionGuard {
     }
 }
 
-pub(crate) fn process_workspace_execution_lock() -> WorkspaceExecutionLock {
-    PROCESS_WORKSPACE_EXECUTION_LOCK.clone()
+fn normalize_workspace_key(workspace: &str) -> String {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() {
+        return "<default-workspace>".to_string();
+    }
+
+    let path = std::path::PathBuf::from(trimmed);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(&path))
+            .unwrap_or(path)
+    };
+    let resolved = dunce::canonicalize(&absolute).unwrap_or(absolute);
+    let mut key = dunce::simplified(&resolved)
+        .to_string_lossy()
+        .replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    #[cfg(windows)]
+    key.make_ascii_lowercase();
+    key
+}
+
+pub(crate) fn process_workspace_execution_lock(workspace: &str) -> WorkspaceExecutionLock {
+    let key = normalize_workspace_key(workspace);
+    let mut locks = PROCESS_WORKSPACE_EXECUTION_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(WorkspaceExecutionLock::new)
+        .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkspaceExecutionLock, WorkspaceExecutionLockAcquireError,
-        WorkspaceExecutionLockDiagnostic, WorkspaceExecutionLockDiagnosticReporter,
-        WorkspaceExecutionLockMode, WorkspaceExecutionLockOwner,
+        process_workspace_execution_lock, WorkspaceExecutionLock,
+        WorkspaceExecutionLockAcquireError, WorkspaceExecutionLockDiagnostic,
+        WorkspaceExecutionLockDiagnosticReporter, WorkspaceExecutionLockMode,
+        WorkspaceExecutionLockOwner,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -584,6 +618,64 @@ mod tests {
             workspace: "test-workspace".to_string(),
             tools: vec!["test".to_string()],
         }
+    }
+
+    #[tokio::test]
+    async fn process_registry_isolates_distinct_workspaces() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let workspace_a = root.path().join("workspace-a");
+        let workspace_b = root.path().join("workspace-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+        let workspace_a = workspace_a.to_string_lossy().to_string();
+        let workspace_b = workspace_b.to_string_lossy().to_string();
+
+        let lock_a = process_workspace_execution_lock(&workspace_a);
+        let same_workspace_lock = process_workspace_execution_lock(&workspace_a);
+        let lock_b = process_workspace_execution_lock(&workspace_b);
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let writer = lock_a
+            .acquire(
+                WorkspaceExecutionLockMode::Write,
+                owner("workspace-a-writer"),
+                cancel_rx.clone(),
+            )
+            .await
+            .expect("workspace a writer");
+
+        let mut same_workspace_reader = tokio::spawn({
+            let cancel_rx = cancel_rx.clone();
+            async move {
+                same_workspace_lock
+                    .acquire(
+                        WorkspaceExecutionLockMode::Read,
+                        owner("workspace-a-reader"),
+                        cancel_rx,
+                    )
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut same_workspace_reader)
+                .await
+                .is_err()
+        );
+
+        let other_workspace_reader = tokio::time::timeout(
+            Duration::from_millis(100),
+            lock_b.acquire(
+                WorkspaceExecutionLockMode::Read,
+                owner("workspace-b-reader"),
+                cancel_rx,
+            ),
+        )
+        .await
+        .expect("different workspace must not block")
+        .expect("workspace b reader");
+        drop(other_workspace_reader);
+        drop(writer);
+        same_workspace_reader.abort();
+        let _ = same_workspace_reader.await;
     }
 
     #[tokio::test]

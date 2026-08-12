@@ -242,15 +242,20 @@ pub(super) fn unity_test_run() -> ToolDef {
                         };
                     }
                 };
-                let timeout_ms = args
-                    .get("timeout_ms")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(600_000)
-                    .clamp(1_000, 3_600_000);
+                let timeout = if ctx.background {
+                    None
+                } else {
+                    let timeout_ms = args
+                        .get("timeout_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(600_000)
+                        .clamp(1_000, 3_600_000);
+                    Some(Duration::from_millis(timeout_ms))
+                };
                 match crate::unity_bridge::unity_test_run_controlled(
                     &project_path,
                     &args,
-                    Duration::from_millis(timeout_ms),
+                    timeout,
                     ctx.cancel_rx,
                     ctx.progress,
                 )

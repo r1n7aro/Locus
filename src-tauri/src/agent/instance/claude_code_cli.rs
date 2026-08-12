@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tauri::AppHandle;
 
 use super::{
@@ -39,6 +40,8 @@ struct PendingAssistantRound {
     confirmations_prepared: bool,
     confirmation_preapproved: HashSet<String>,
     confirmation_rejections: HashMap<String, ExecutedToolResult>,
+    subagent_phase_prepared: bool,
+    precompleted_subagent_results: HashMap<String, ExecutedToolResult>,
 }
 
 struct CliRoundCompletion {
@@ -340,7 +343,6 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
 
         let has_ask = tools.iter().any(|name| name == "ask_user_question");
-        let has_subagent = tools.iter().any(|name| name == "subagent");
         let has_external_mcp = tools
             .iter()
             .any(|name| name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX));
@@ -360,9 +362,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             ));
         }
 
-        let allowed_kind = if has_subagent && tools.iter().any(|name| name != "subagent") {
-            Some("subagent")
-        } else if has_external_mcp
+        let allowed_kind = if has_external_mcp
             && tools
                 .iter()
                 .any(|name| !name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX))
@@ -373,7 +373,6 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         };
         if let Some(allowed_kind) = allowed_kind {
             let current_allowed = match allowed_kind {
-                "subagent" => current_tool_name == "subagent",
                 _ => current_tool_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX),
             };
             if !current_allowed {
@@ -384,9 +383,11 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             }
             return Ok(None);
         }
-        if has_subagent || has_external_mcp {
+        if current_tool_name == "subagent" || has_external_mcp {
             return Ok(None);
         }
+
+        tools.retain(|name| name != "subagent");
 
         Ok(Some((
             if needs_write {
@@ -396,6 +397,87 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             },
             tools,
         )))
+    }
+
+    async fn ensure_cli_foreground_subagent_phase(&mut self) {
+        let (tool_calls, assistant_message_id) = match self.pending_round.as_ref() {
+            Some(round) if !round.subagent_phase_prepared => {
+                (round.tool_calls.clone(), round.message_id.clone())
+            }
+            _ => return,
+        };
+
+        let mut prepared = Vec::new();
+        let mut has_local_sibling = false;
+        let mut has_ask = false;
+        let mut has_external_mcp = false;
+        for tool_call in &tool_calls {
+            let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            normalize_tool_args(&mut args);
+            self.agent.inject_working_dir(&tool_call.name, &mut args);
+            let effective_name = self
+                .agent
+                .effective_tool_name_for_round(&tool_call.name, &args);
+            has_ask |= effective_name == "ask_user_question";
+            has_external_mcp |= effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
+            has_local_sibling |= effective_name != "subagent"
+                && effective_name != "ask_user_question"
+                && !effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
+            if effective_name == "subagent"
+                && !self
+                    .agent
+                    .tool_call_runs_in_background(&effective_name, &args)
+            {
+                prepared.push((tool_call.clone(), args));
+            }
+        }
+
+        if let Some(round) = self.pending_round.as_mut() {
+            round.subagent_phase_prepared = true;
+        }
+        if prepared.is_empty() || !has_local_sibling || has_ask || has_external_mcp {
+            return;
+        }
+
+        eprintln!(
+            "[Agent {}] Claude Code executing foreground subagent phase before local siblings session={} run={}",
+            self.agent.id, self.agent.session_id, self.run_id
+        );
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (tool_call, args) in prepared {
+            let agent = self.agent;
+            let app_handle = self.app_handle;
+            let store = self.store;
+            let run_id = self.run_id;
+            let mode = self.mode;
+            let active_skill_tool_names = self.active_skill_tool_names;
+            let assistant_message_id = assistant_message_id.as_str();
+            pending.push(async move {
+                let result = agent
+                    .execute_single_tool(
+                        app_handle,
+                        store,
+                        &tool_call,
+                        &args,
+                        run_id,
+                        assistant_message_id,
+                        mode,
+                        active_skill_tool_names,
+                        false,
+                    )
+                    .await;
+                (tool_call.id, result)
+            });
+        }
+
+        let mut completed = HashMap::new();
+        while let Some((tool_call_id, result)) = pending.next().await {
+            completed.insert(tool_call_id, result);
+        }
+        if let Some(round) = self.pending_round.as_mut() {
+            round.precompleted_subagent_results.extend(completed);
+        }
     }
 
     async fn ensure_cli_round_confirmations_prepared(&mut self) {
@@ -834,6 +916,8 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             confirmations_prepared: false,
             confirmation_preapproved: HashSet::new(),
             confirmation_rejections: HashMap::new(),
+            subagent_phase_prepared: false,
+            precompleted_subagent_results: HashMap::new(),
         });
         self.last_persisted_assistant_message_id = Some(message_id);
         self.streamed_text.clear();
@@ -848,6 +932,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
         arguments: serde_json::Value,
     ) -> ClaudeCodeHostFuture<'b> {
         Box::pin(async move {
+            self.ensure_cli_foreground_subagent_phase().await;
             let mut tool_call = self.take_matching_tool_call(request_id, tool_name, &arguments);
             let mut args_for_exec = arguments.clone();
             if tool_call.name == "tool_call" {
@@ -911,7 +996,11 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                         })
                     });
             let mut confirmation_preapproved = false;
-            let mut result_override = match workspace_policy.as_ref() {
+            let precompleted_subagent_result = self
+                .pending_round
+                .as_mut()
+                .and_then(|round| round.precompleted_subagent_results.remove(&tool_call.id));
+            let mut result_override = precompleted_subagent_result.or_else(|| match workspace_policy.as_ref() {
                 Err(error) => {
                     eprintln!(
                         "[Agent {}] Claude Code tool round policy blocked tool='{}' id={} session={} run={} reason={}",
@@ -930,7 +1019,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                     ))
                 }
                 Ok(_) => None,
-            };
+            });
 
             if result_override.is_none() && workspace_policy.as_ref().is_ok_and(Option::is_some) {
                 if self.pending_round.is_some() {
@@ -993,7 +1082,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                             workspace: self.agent.working_dir.clone(),
                             tools: tools.clone(),
                         };
-                        match process_workspace_execution_lock()
+                        match process_workspace_execution_lock(&self.agent.working_dir)
                             .acquire_with_diagnostics(
                                 *lock_mode,
                                 owner,

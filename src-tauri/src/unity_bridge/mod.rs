@@ -3480,13 +3480,13 @@ pub async fn unity_test_run(
     request: &serde_json::Value,
     timeout: Duration,
 ) -> Result<UnityTestRunSnapshot, String> {
-    unity_test_run_controlled(project_path, request, timeout, None, None).await
+    unity_test_run_controlled(project_path, request, Some(timeout), None, None).await
 }
 
 pub async fn unity_test_run_controlled(
     project_path: &str,
     request: &serde_json::Value,
-    timeout: Duration,
+    timeout: Option<Duration>,
     mut cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     progress: Option<crate::async_tasks::TaskProgressReporter>,
 ) -> Result<UnityTestRunSnapshot, String> {
@@ -3539,7 +3539,8 @@ pub async fn unity_test_run_controlled(
                 }
             ));
         }
-        if started.elapsed() >= timeout {
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            let timeout = timeout.unwrap_or_default();
             return Err(format!(
                 "Unity Test run {} timed out after {}s (current test: {})",
                 snapshot.run_id,

@@ -21,6 +21,10 @@ import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
 import { StreamingTextChunks } from "../composables/streamingTextChunks";
 import { useThrottledStreamingText } from "../composables/streamingRenderThrottle";
 import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
+import {
+  applyAsyncTaskUpdateToMessages,
+  asyncTaskDisplayStatus,
+} from "../composables/asyncTaskUpdates";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
@@ -44,6 +48,7 @@ import type {
   AssistantRenderPart,
   PendingSessionInput,
   EffortLevel,
+  AsyncTaskUpdatedEvent,
 } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
@@ -2207,6 +2212,21 @@ export const useChatStore = defineStore("chat", () => {
     });
   }
 
+  function applyAsyncTaskUpdate(update: AsyncTaskUpdatedEvent) {
+    if (update.sessionId !== activeSessionId.value) return;
+
+    const displayStatus = asyncTaskDisplayStatus(update.status);
+
+    const activeToolCall = activeToolCalls.value.find((item) => item.id === update.toolCallId);
+    if (activeToolCall) {
+      activeToolCall.status = displayStatus;
+      activeToolCall.output = update.output;
+      if (displayStatus !== "running") activeToolCall.progress = null;
+    }
+
+    messages.value = applyAsyncTaskUpdateToMessages(messages.value, update);
+  }
+
   async function syncActiveSessionSelection(sessionId: string | null | undefined) {
     const normalizedSessionId = sessionId?.trim() || null;
     if (normalizedSessionId === activeSessionId.value) {
@@ -3360,6 +3380,7 @@ export const useChatStore = defineStore("chat", () => {
     syncActiveSessionSelection,
     setActiveSessionSelectionPersistence,
     applyActiveSessionExecutionState,
+    applyAsyncTaskUpdate,
     newChat,
     resetWorkspaceScope,
     openThinkingPanel,

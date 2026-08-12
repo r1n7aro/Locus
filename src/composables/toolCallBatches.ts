@@ -648,6 +648,14 @@ function inferToolCallStatus(
   if (toolCall.outcome) {
     return toolCall.outcome;
   }
+  try {
+    const args = JSON.parse(toolCall.arguments) as { async?: unknown };
+    if (args.async === "async" || args.async === "notify" || args.async === "async_notify") {
+      return "running";
+    }
+  } catch {
+    // Malformed historical arguments keep the regular completed fallback.
+  }
   if (output === INTERRUPTED_TOOL_RESULT) {
     return "interrupted";
   }

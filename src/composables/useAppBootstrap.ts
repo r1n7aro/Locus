@@ -45,6 +45,7 @@ import type {
   SessionContentChangedEvent,
   SessionTitleUpdatedEvent,
   WorkspaceExecutionLockDiagnostic,
+  AsyncTaskUpdatedEvent,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
@@ -135,6 +136,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionTitleUpdated: RuntimeUnsubscribe | null = null;
   let unlistenWorkspaceLockDiagnostic: RuntimeUnsubscribe | null = null;
+  let unlistenAsyncTaskUpdated: RuntimeUnsubscribe | null = null;
   let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
   let unlistenExternalScriptOpen: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
@@ -602,6 +604,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT,
       handleWorkspaceLockDiagnostic,
     );
+    unlistenAsyncTaskUpdated = await runtime.subscribe<AsyncTaskUpdatedEvent>(
+      "async-task-updated",
+      (payload) => chatStore.applyAsyncTaskUpdate(payload),
+    );
     unlistenLexicalRebuildStatus = await runtime.subscribe<LexicalRebuildStatus>(
       KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
       (status) => {
@@ -658,6 +664,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenSessionContentChanged?.();
     unlistenSessionTitleUpdated?.();
     unlistenWorkspaceLockDiagnostic?.();
+    unlistenAsyncTaskUpdated?.();
     unlistenPluginsChanged?.();
     unlistenExternalScriptOpen?.();
     for (const operation of workspaceLockNoticeOperations) {

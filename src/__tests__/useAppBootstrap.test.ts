@@ -570,6 +570,7 @@ describe("useAppBootstrap onboarding completion", () => {
 
     expect(subscribedEvents).not.toContain("active-session-selection-changed");
     expect(subscribedEvents).toContain("stream-event");
+    expect(subscribedEvents).toContain("async-task-updated");
     expect(subscribedEvents).toContain("session-content-changed");
     expect(subscribedEvents).toContain("session-execution-state-changed");
   });
