@@ -286,7 +286,7 @@ pub(super) fn read() -> ToolDef {
                     if ctx.should_redirect_unity_asset_read(&file_path) {
                         return ToolResult {
                             output: format!(
-                                "Direct file reads are not recommended for Unity YAML asset '{}'. Use `unity_yaml_list`, `unity_yaml_search`, or `unity_yaml_read` for semantic Unity YAML access. If you still need the raw file content, repeat the same `read` call once more.",
+                                "Direct file reads are not recommended for Unity YAML asset '{}'. Use `unity_yaml_list`, `unity_yaml_search`, or `unity_yaml_read` for semantic Unity YAML access. You can also use `unity_execute` to load and inspect the asset with a Unity Editor C# script. If you still need the raw file content, repeat the same `read` call once more.",
                                 file_path
                             ),
                             is_error: true,
@@ -1730,6 +1730,37 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.output.contains("<content>\nalpha\nbeta"));
         assert!(!result.output.contains('\r'));
+    }
+
+    #[test]
+    fn read_unity_asset_redirect_suggests_unity_execute_script() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("walk.anim");
+        std::fs::write(&target, "%YAML 1.1\n").expect("seed Unity asset");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (read().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string()
+                    }),
+                    ToolExecutionContext {
+                        unity_connected: Some(true),
+                        ..ToolExecutionContext::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains(
+                "use `unity_execute` to load and inspect the asset with a Unity Editor C# script"
+            ),
+            "{}",
+            result.output
+        );
     }
 
     #[test]
