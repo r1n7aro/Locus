@@ -427,8 +427,9 @@ export interface SessionMessagePage {
 export interface CompactedContextOutput {
   messageId: string;
   snapshotStatus: "complete" | "reconstructed" | "partial" | string;
-  compactionKind: "readable" | "codexEncrypted" | string;
+  compactionKind: "checkpoint" | "readable" | "codexEncrypted" | string;
   encryptedContentChars?: number;
+  checkpoint: { summary: string; recent: string } | "empty";
   messages: Array<{
     id: string;
     role: "user" | "assistant" | "tool";
