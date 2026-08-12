@@ -974,6 +974,44 @@ export interface KnowledgeChangedEvent {
   subtree?: boolean;
 }
 
+export interface WorkspaceExecutionLockBlocker {
+  sessionId: string;
+  runId: string;
+  mode: "read" | "write" | string;
+  heldMs: number;
+  tools: string[];
+}
+
+export interface WorkspaceExecutionLockDiagnostic {
+  active: boolean;
+  sessionId: string;
+  runId: string;
+  iteration: number;
+  workspace: string;
+  mode: "read" | "write" | string;
+  waitedMs: number;
+  tools: string[];
+  blockers: WorkspaceExecutionLockBlocker[];
+}
+
+export type AsyncTaskStatus =
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface AsyncTaskUpdatedEvent {
+  sessionId: string;
+  assistantMessageId: string;
+  toolCallId: string;
+  taskId: string;
+  toolName: string;
+  status: AsyncTaskStatus;
+  output: string;
+}
+
 /** Every StreamEvent is wrapped in an envelope that carries a runId for filtering stale events. */
 export type StreamEvent = { runId: string } & (
   | { type: "runStart"; sessionId: string }
