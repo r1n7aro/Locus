@@ -1,6 +1,6 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
-import { resolveToolCallDisplayShape } from "./toolCallBatches";
+import { INTERRUPTED_TOOL_RESULT, resolveToolCallDisplayShape } from "./toolCallBatches";
 import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
@@ -83,6 +83,46 @@ export function buildToolResultMessages(
       }
       return message;
     });
+}
+
+export function buildInterruptedTrailingToolResultMessages(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  const existingToolResultIds = new Set(
+    messages
+      .filter((message) => message.role === "tool" && !!message.toolCallId)
+      .map((message) => message.toolCallId!),
+  );
+
+  let trailingMessageIndex = messages.length - 1;
+  while (trailingMessageIndex >= 0 && messages[trailingMessageIndex]?.role === "tool") {
+    trailingMessageIndex -= 1;
+  }
+
+  const assistantMessage = messages[trailingMessageIndex];
+  if (!assistantMessage || assistantMessage.role !== "assistant") return [];
+
+  const toolCalls = assistantMessage.toolCalls
+    ?? assistantMessage.renderParts
+      ?.filter((part): part is Extract<AssistantRenderPart, { kind: "toolCall" }> => part.kind === "toolCall")
+      .map((part) => part.toolCall)
+    ?? [];
+
+  return toolCalls
+    .filter((toolCall) => (
+      !!toolCall.id
+      && !toolCall.serverTool
+      && toolCall.recordedOutput === undefined
+      && toolCall.serverToolOutput === undefined
+      && !existingToolResultIds.has(toolCall.id)
+    ))
+    .map((toolCall): ChatMessage => ({
+      id: `synthetic_tool_result:${assistantMessage.id}:${toolCall.id}`,
+      role: "tool",
+      content: INTERRUPTED_TOOL_RESULT,
+      createdAt: assistantMessage.createdAt,
+      toolCallId: toolCall.id,
+    }));
 }
 
 function collectToolCallInfoIds(toolCalls: ToolCallInfo[] | undefined): string[] {

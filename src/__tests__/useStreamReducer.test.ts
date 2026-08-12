@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildInterruptedTrailingToolResultMessages,
   buildToolResultMessages,
   isMatchingPendingUserMessage,
   mergeUserMessage,
@@ -68,6 +69,45 @@ describe("reduceStreamEvent", () => {
           content: "file contents",
           createdAt: 123,
           toolCallId: "tc-1",
+        },
+      ]);
+    });
+
+    it("materializes missing outputs from the trailing interrupted tool round", () => {
+      expect(buildInterruptedTrailingToolResultMessages([
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "",
+          createdAt: 123,
+          toolCalls: [
+            {
+              id: "tc-missing",
+              name: "read",
+              arguments: "{\"path\":\"Assets/Player.cs\"}",
+            },
+            {
+              id: "tc-done",
+              name: "list",
+              arguments: "{}",
+              recordedOutput: "Assets/Player.cs",
+            },
+            {
+              id: "tc-server",
+              name: "web_search",
+              arguments: "{}",
+              serverTool: "web_search",
+              serverToolOutput: "result",
+            },
+          ],
+        },
+      ])).toEqual([
+        {
+          id: "synthetic_tool_result:assistant-1:tc-missing",
+          role: "tool",
+          content: "工具执行被用户中止，未返回结果。",
+          createdAt: 123,
+          toolCallId: "tc-missing",
         },
       ]);
     });

@@ -412,6 +412,106 @@ describe("chat session panel state", () => {
     expect(chatStore.currentRunId).toBe("run-resume");
   });
 
+  it("shows missing trailing tool outputs as interrupted after resume starts", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "assistant-interrupted",
+          role: "assistant",
+          content: "",
+          createdAt: 1,
+          toolCalls: [{
+            id: "tc-read",
+            name: "read",
+            arguments: "{\"path\":\"Assets/Editor/GreatSwordPoseDumper.cs\"}",
+          }],
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 1,
+    });
+    sessionServiceMocks.getSessionResumeAvailable.mockResolvedValueOnce(true);
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-resume" });
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([{
+      id: "s1",
+      title: "Session s1",
+      agentId: null,
+      sessionType: "chat",
+      updatedAt: 1,
+      runtimeStatus: "running",
+      activeRunId: "run-resume",
+    }]);
+
+    await chatStore.selectSession("s1");
+    await chatStore.resumeInterrupted();
+
+    expect(chatStore.messages).toContainEqual({
+      id: "synthetic_tool_result:assistant-interrupted:tc-read",
+      role: "tool",
+      content: "工具执行被用户中止，未返回结果。",
+      createdAt: 1,
+      toolCallId: "tc-read",
+    });
+  });
+
+  it("shows missing trailing tool outputs when the user continues with a message", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "assistant-interrupted",
+          role: "assistant",
+          content: "继续前的工具调用",
+          createdAt: 1,
+          toolCalls: [{
+            id: "tc-read",
+            name: "read",
+            arguments: "{\"path\":\"Assets/Editor/GreatSwordPoseDumper.cs\"}",
+          }],
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 1,
+    });
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-continue" });
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([{
+      id: "s1",
+      title: "Session s1",
+      agentId: null,
+      sessionType: "chat",
+      updatedAt: 1,
+      runtimeStatus: "running",
+      activeRunId: "run-continue",
+    }]);
+
+    await chatStore.selectSession("s1");
+    await chatStore.sendMessage("继续");
+
+    expect(chatStore.messages.map((message) => message.role)).toEqual([
+      "assistant",
+      "tool",
+      "user",
+    ]);
+    expect(chatStore.messages[1]).toMatchObject({
+      id: "synthetic_tool_result:assistant-interrupted:tc-read",
+      content: "工具执行被用户中止，未返回结果。",
+      toolCallId: "tc-read",
+    });
+  });
+
   it("cancels a pending switch when the user reselects the visible session", async () => {
     const chatStore = useChatStore();
     await chatStore.selectSession("s1");

@@ -1,6 +1,6 @@
 import type { AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo } from "../types";
 
-const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
+export const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
 const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]> = [
   ["filePath", ["filePath", "file_path"]],
   ["oldString", ["oldString", "old_string"]],
