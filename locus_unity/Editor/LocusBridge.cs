@@ -1430,7 +1430,9 @@ namespace Locus
                     }
 
                     case "bridge_capabilities":
-                        return OkResponse(reqId, "managed_executor_v1,status_cached,set_editor_status_async");
+                        return OkResponse(
+                            reqId,
+                            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1");
 
                     case "status":
                         return HandleStatus(reqId);
@@ -1491,6 +1493,9 @@ namespace Locus
 
                     case "execute_loaded":
                         return await HandleExecuteLoaded(reqId, msg.message).ConfigureAwait(false);
+
+                    case "execute_code_wait":
+                        return await HandleWaitExecuteCode(reqId, msg.message).ConfigureAwait(false);
 
                     case "cancel_execute_code":
                         return HandleCancelExecuteCode(reqId, msg.message);

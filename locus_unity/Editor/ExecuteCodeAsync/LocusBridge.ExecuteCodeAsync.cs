@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -389,10 +390,177 @@ namespace Locus
         private static readonly Dictionary<string, ExecuteCodeRequestState> _executeCodeRequestStates =
             new Dictionary<string, ExecuteCodeRequestState>(StringComparer.Ordinal);
 
+        private const int CompletedExecuteCodeEntryLimit = 256;
+        private static readonly long CompletedExecuteCodeEntryLifetimeTicks = TimeSpan.FromMinutes(10).Ticks;
+        private static readonly object _executeCodeIdempotencyLock = new object();
+        private static readonly Dictionary<string, ExecuteCodeIdempotencyEntry> _activeExecuteCodeEntries =
+            new Dictionary<string, ExecuteCodeIdempotencyEntry>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, ExecuteCodeIdempotencyEntry> _completedExecuteCodeEntries =
+            new Dictionary<string, ExecuteCodeIdempotencyEntry>(StringComparer.Ordinal);
+
+        private sealed class ExecuteCodeIdempotencyEntry
+        {
+            public readonly string ExecutionId;
+            public readonly string RequestSignature;
+            public readonly TaskCompletionSource<PipeEnvelope> Completion =
+                LocusAsync.CreateTcs<PipeEnvelope>();
+            public PipeEnvelope CompletedResponse;
+            public long CompletedAtUtcTicks;
+
+            public ExecuteCodeIdempotencyEntry(string executionId, string requestSignature)
+            {
+                ExecutionId = executionId;
+                RequestSignature = requestSignature;
+            }
+        }
+
         private static string NormalizeExecuteCodeExecutionId(string executionId, string requestId)
         {
             string normalized = (executionId ?? "").Trim();
             return string.IsNullOrEmpty(normalized) ? (requestId ?? Guid.NewGuid().ToString("N")) : normalized;
+        }
+
+        private static string HashExecuteCodePayload(byte[] payload)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+                return Convert.ToBase64String(sha256.ComputeHash(payload ?? new byte[0]));
+        }
+
+        private static string HashExecuteCodePayload(string payload)
+        {
+            return HashExecuteCodePayload(Encoding.UTF8.GetBytes(payload ?? ""));
+        }
+
+        private static string BuildExecuteCodeRequestSignature(string kind, string sourceCode)
+        {
+            return (kind ?? "execute_code") + "|" + HashExecuteCodePayload(sourceCode);
+        }
+
+        private static string BuildExecuteLoadedRequestSignature(
+            string entryTypeName,
+            string sourceCode,
+            byte[] assemblyBytes)
+        {
+            return "execute_loaded|" +
+                (entryTypeName ?? "") + "|" +
+                HashExecuteCodePayload(sourceCode) + "|" +
+                HashExecuteCodePayload(assemblyBytes);
+        }
+
+        private static PipeEnvelope RebindExecuteCodeResponse(PipeEnvelope response, string requestId)
+        {
+            if (response == null)
+                return ErrorResponse(requestId, "execute_code completed without a response");
+
+            return new PipeEnvelope
+            {
+                id = response.id,
+                reply_to = requestId,
+                type = response.type,
+                ok = response.ok,
+                message = response.message,
+                error = response.error,
+                processId = response.processId,
+                processPath = response.processPath
+            };
+        }
+
+        private static void CleanupCompletedExecuteCodeEntriesLocked(long nowUtcTicks)
+        {
+            string[] expired = _completedExecuteCodeEntries
+                .Where(pair => nowUtcTicks - pair.Value.CompletedAtUtcTicks > CompletedExecuteCodeEntryLifetimeTicks)
+                .Select(pair => pair.Key)
+                .ToArray();
+            for (int i = 0; i < expired.Length; i++)
+                _completedExecuteCodeEntries.Remove(expired[i]);
+
+            int removeCount = _completedExecuteCodeEntries.Count - CompletedExecuteCodeEntryLimit;
+            if (removeCount <= 0)
+                return;
+
+            string[] oldest = _completedExecuteCodeEntries
+                .OrderBy(pair => pair.Value.CompletedAtUtcTicks)
+                .Take(removeCount)
+                .Select(pair => pair.Key)
+                .ToArray();
+            for (int i = 0; i < oldest.Length; i++)
+                _completedExecuteCodeEntries.Remove(oldest[i]);
+        }
+
+        private static ExecuteCodeIdempotencyEntry AcquireExecuteCodeEntry(
+            string executionId,
+            string requestSignature,
+            out bool isOwner,
+            out string error)
+        {
+            lock (_executeCodeIdempotencyLock)
+            {
+                CleanupCompletedExecuteCodeEntriesLocked(DateTime.UtcNow.Ticks);
+
+                ExecuteCodeIdempotencyEntry entry;
+                if (_activeExecuteCodeEntries.TryGetValue(executionId, out entry)
+                    || _completedExecuteCodeEntries.TryGetValue(executionId, out entry))
+                {
+                    isOwner = false;
+                    error = string.Equals(entry.RequestSignature, requestSignature, StringComparison.Ordinal)
+                        ? null
+                        : "execution_id is already bound to a different request: " + executionId;
+                    return entry;
+                }
+
+                entry = new ExecuteCodeIdempotencyEntry(executionId, requestSignature);
+                _activeExecuteCodeEntries.Add(executionId, entry);
+                isOwner = true;
+                error = null;
+                return entry;
+            }
+        }
+
+        private static ExecuteCodeIdempotencyEntry FindExecuteCodeEntry(string executionId)
+        {
+            lock (_executeCodeIdempotencyLock)
+            {
+                CleanupCompletedExecuteCodeEntriesLocked(DateTime.UtcNow.Ticks);
+                ExecuteCodeIdempotencyEntry entry;
+                if (_activeExecuteCodeEntries.TryGetValue(executionId, out entry)
+                    || _completedExecuteCodeEntries.TryGetValue(executionId, out entry))
+                    return entry;
+                return null;
+            }
+        }
+
+        private static void CompleteExecuteCodeEntry(
+            ExecuteCodeIdempotencyEntry entry,
+            PipeEnvelope response)
+        {
+            PipeEnvelope completedResponse = RebindExecuteCodeResponse(response, null);
+            lock (_executeCodeIdempotencyLock)
+            {
+                ExecuteCodeIdempotencyEntry current;
+                if (_activeExecuteCodeEntries.TryGetValue(entry.ExecutionId, out current)
+                    && ReferenceEquals(current, entry))
+                    _activeExecuteCodeEntries.Remove(entry.ExecutionId);
+
+                entry.CompletedResponse = completedResponse;
+                entry.CompletedAtUtcTicks = DateTime.UtcNow.Ticks;
+                _completedExecuteCodeEntries[entry.ExecutionId] = entry;
+                CleanupCompletedExecuteCodeEntriesLocked(entry.CompletedAtUtcTicks);
+            }
+            entry.Completion.TrySetResult(completedResponse);
+        }
+
+        private static async Task<PipeEnvelope> HandleWaitExecuteCode(string requestId, string executionId)
+        {
+            string normalized = (executionId ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return ErrorResponse(requestId, "execute_code_wait requires execution_id");
+
+            ExecuteCodeIdempotencyEntry entry = FindExecuteCodeEntry(normalized);
+            if (entry == null)
+                return ErrorResponse(requestId, "unknown execution_id: " + normalized);
+
+            PipeEnvelope response = await entry.Completion.Task.ConfigureAwait(false);
+            return RebindExecuteCodeResponse(response, requestId);
         }
 
         private static ExecuteCodeRequestState FindExecuteCodeRequestState(string executionId)
@@ -570,6 +738,7 @@ namespace Locus
                 requestId,
                 executionId,
                 code,
+                BuildExecuteCodeRequestSignature("execute_code", code),
                 prepareCompiler: true,
                 compileStage: "Compiling snippet",
                 compile: delegate { return CompileAsyncSnippet(code); });
@@ -650,6 +819,7 @@ namespace Locus
                 requestId,
                 NormalizeExecuteCodeExecutionId(request.execution_id, requestId),
                 request.source_code ?? "",
+                BuildExecuteLoadedRequestSignature(entryTypeName, request.source_code, assemblyBytes),
                 prepareCompiler: false,
                 compileStage: "Loading compiled snippet",
                 compile: delegate { return LoadCompiledSnippet(requestId, assemblyBytes, entryTypeName); });
@@ -756,11 +926,57 @@ namespace Locus
             string requestId,
             string executionId,
             string sourceCode,
+            string requestSignature,
             bool prepareCompiler,
             string compileStage,
             Func<CompiledAsyncSnippet> compile)
         {
             executionId = NormalizeExecuteCodeExecutionId(executionId, requestId);
+            bool isOwner;
+            string idempotencyError;
+            ExecuteCodeIdempotencyEntry entry = AcquireExecuteCodeEntry(
+                executionId,
+                requestSignature,
+                out isOwner,
+                out idempotencyError);
+            if (!string.IsNullOrEmpty(idempotencyError))
+                return ErrorResponse(requestId, idempotencyError);
+
+            if (!isOwner)
+            {
+                LogExecuteCodeDebug(requestId, "joining existing execution_id=" + executionId);
+                PipeEnvelope existingResponse = await entry.Completion.Task.ConfigureAwait(false);
+                return RebindExecuteCodeResponse(existingResponse, requestId);
+            }
+
+            PipeEnvelope ownerResponse;
+            try
+            {
+                ownerResponse = await ExecuteSnippetRequestCoreAsync(
+                    requestId,
+                    executionId,
+                    sourceCode,
+                    prepareCompiler,
+                    compileStage,
+                    compile).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ownerResponse = ErrorResponse(requestId, "execute_code exception: " + ex);
+            }
+
+            CompleteExecuteCodeEntry(entry, ownerResponse);
+            return RebindExecuteCodeResponse(ownerResponse, requestId);
+        }
+
+        private static async Task<PipeEnvelope> ExecuteSnippetRequestCoreAsync(
+            string requestId,
+            string executionId,
+            string sourceCode,
+            bool prepareCompiler,
+            string compileStage,
+            Func<CompiledAsyncSnippet> compile)
+        {
             System.Diagnostics.Stopwatch requestStarted = ExecuteCodeDebugLoggingEnabled
                 ? System.Diagnostics.Stopwatch.StartNew()
                 : null;
@@ -1554,6 +1770,15 @@ namespace Locus
                 TouchActivity();
                 ThrowIfCancellationRequested();
                 ConsoleLogResult result = BuildConsoleLogResult(level, limit);
+                TouchActivity();
+                return result;
+            }
+
+            public ConsoleLogResult GetConsoleLog(string[] levels, int limit = 50)
+            {
+                TouchActivity();
+                ThrowIfCancellationRequested();
+                ConsoleLogResult result = BuildConsoleLogResult(null, levels, limit);
                 TouchActivity();
                 return result;
             }

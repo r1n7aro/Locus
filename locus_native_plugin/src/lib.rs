@@ -108,7 +108,9 @@ mod imp {
         MANAGED_STATE_RELOADING,
     };
 
-    const NATIVE_CAPABILITIES: &str = "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1";
+    const NATIVE_CAPABILITIES: &str =
+        "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1";
+    const REQUEST_ACCEPTED_EVENT: &str = "locus-request-accepted";
     const STATUS_EVENT_BUFFER_LIMIT: usize = 256;
     const MAX_PENDING_REQUESTS: usize = 128;
     const MAX_INFLIGHT_REQUESTS: usize = 64;
@@ -312,10 +314,12 @@ mod imp {
         id: String,
         raw: Vec<u8>,
         deadline_ms: i64,
+        reattachable: bool,
     }
 
     struct InflightRequest {
         deadline_ms: i64,
+        reattachable: bool,
     }
 
     /// Process-global broker state. Lives for the lifetime of the Unity process
@@ -699,7 +703,12 @@ mod imp {
             }
         }
 
-        fn enqueue(&self, id: String, raw: Vec<u8>) -> Result<(), &'static str> {
+        fn enqueue(
+            &self,
+            id: String,
+            raw: Vec<u8>,
+            reattachable: bool,
+        ) -> Result<(), &'static str> {
             self.expire_requests();
 
             if raw.len() > MAX_REQUEST_BYTES {
@@ -728,6 +737,7 @@ mod imp {
                     id,
                     raw,
                     deadline_ms,
+                    reattachable,
                 });
             }
             self.publish_status_snapshot();
@@ -768,6 +778,7 @@ mod imp {
                     req.id.clone(),
                     InflightRequest {
                         deadline_ms: now_ms().saturating_add(REQUEST_DEADLINE_MS),
+                        reattachable: req.reattachable,
                     },
                 );
             }
@@ -824,17 +835,17 @@ mod imp {
             self.publish_status_snapshot();
         }
 
-        /// The client disconnected: its answers have nowhere to go, so drop
-        /// queued + in-flight work silently.
-        fn clear_requests_on_disconnect(&self) {
-            if let Ok(mut q) = self.queue.lock() {
-                q.clear();
-            }
-            if let Ok(mut queued_bytes) = self.queued_bytes.lock() {
-                *queued_bytes = 0;
+        /// Preserve only execution requests that can be reattached by their
+        /// managed execution_id. Every other accepted request belongs to the
+        /// disconnected transport and must not execute later on a new client.
+        fn discard_non_reattachable_on_disconnect(&self) {
+            if let (Ok(mut q), Ok(mut queued_bytes)) = (self.queue.lock(), self.queued_bytes.lock())
+            {
+                q.retain(|request| request.reattachable);
+                *queued_bytes = q.iter().map(|request| request.raw.len()).sum();
             }
             if let Ok(mut inflight) = self.inflight.lock() {
-                inflight.clear();
+                inflight.retain(|_, request| request.reattachable);
             }
             self.publish_status_snapshot();
         }
@@ -938,10 +949,11 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{
-            Broker, InflightRequest, MANAGED_STATE_READY, MANAGED_STATE_RELOADING,
-            MAX_PENDING_REQUESTS, REQUEST_DEADLINE_MS,
+            handle_line, Broker, InflightRequest, MANAGED_STATE_READY, MANAGED_STATE_RELOADING,
+            MAX_PENDING_REQUESTS, REQUEST_ACCEPTED_EVENT, REQUEST_DEADLINE_MS,
         };
         use serde_json::Value;
+        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         #[test]
@@ -961,6 +973,7 @@ mod imp {
                 "req-1".to_string(),
                 InflightRequest {
                     deadline_ms: super::now_ms() + REQUEST_DEADLINE_MS,
+                    reattachable: true,
                 },
             );
             broker.complete("req-1", br#"{"reply_to":"req-1","ok":true}"#.to_vec());
@@ -983,7 +996,11 @@ mod imp {
             );
 
             assert_eq!(
-                broker.enqueue("too-big".to_string(), vec![0; super::MAX_REQUEST_BYTES + 1]),
+                broker.enqueue(
+                    "too-big".to_string(),
+                    vec![0; super::MAX_REQUEST_BYTES + 1],
+                    false,
+                ),
                 Err("native_payload_too_large")
             );
 
@@ -992,6 +1009,7 @@ mod imp {
                     .enqueue(
                         format!("req-{i}"),
                         br#"{"id":"req","type":"ping"}"#.to_vec(),
+                        false,
                     )
                     .unwrap();
             }
@@ -999,9 +1017,77 @@ mod imp {
                 broker.enqueue(
                     "overflow".to_string(),
                     br#"{"id":"overflow","type":"ping"}"#.to_vec(),
+                    false,
                 ),
                 Err("native_queue_full")
             );
+        }
+
+        #[test]
+        fn managed_request_emits_acceptance_after_enqueue() {
+            let broker = Arc::new(Broker::new(
+                "F:/Project".to_string(),
+                r"\\.\pipe\locus_unity_native_test".to_string(),
+                1,
+            ));
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+            *broker.response_tx.lock().unwrap() = Some(tx);
+            broker.set_managed_state(MANAGED_STATE_READY, 1, Some("editing".to_string()));
+
+            handle_line(
+                &broker,
+                br#"{"id":"req-accepted","type":"execute_code","message":"code"}"#,
+            );
+
+            let frame = rx.try_recv().expect("broker acceptance event");
+            let envelope: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(envelope["type"], REQUEST_ACCEPTED_EVENT);
+            let payload: Value =
+                serde_json::from_str(envelope["message"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["requestId"], "req-accepted");
+            assert_eq!(payload["requestType"], "execute_code");
+            assert_eq!(broker.queue.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn disconnect_retains_only_reattachable_execution_requests() {
+            let broker = Broker::new(
+                "F:/Project".to_string(),
+                r"\\.\pipe\locus_unity_native_test".to_string(),
+                1,
+            );
+            broker
+                .enqueue(
+                    "ordinary".to_string(),
+                    br#"{"id":"ordinary","type":"select_asset"}"#.to_vec(),
+                    false,
+                )
+                .unwrap();
+            broker
+                .enqueue(
+                    "execute".to_string(),
+                    br#"{"id":"execute","type":"execute_code"}"#.to_vec(),
+                    true,
+                )
+                .unwrap();
+            broker.inflight.lock().unwrap().insert(
+                "ordinary-inflight".to_string(),
+                InflightRequest {
+                    deadline_ms: super::now_ms() + REQUEST_DEADLINE_MS,
+                    reattachable: false,
+                },
+            );
+
+            broker.discard_non_reattachable_on_disconnect();
+
+            let queue = broker.queue.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.front().unwrap().id, "execute");
+            assert!(!broker
+                .inflight
+                .lock()
+                .unwrap()
+                .contains_key("ordinary-inflight"));
         }
 
         #[test]
@@ -1094,11 +1180,21 @@ mod imp {
             "status" => broker.respond_status(id),
             "bridge_capabilities" => broker.respond_ok(id, Some(broker.capabilities_string())),
             _ => match broker.managed_state() {
-                MANAGED_STATE_READY => {
-                    if let Err(code) = broker.enqueue(id.to_string(), trimmed.to_vec()) {
-                        broker.respond_error(id, code);
-                    }
-                }
+                MANAGED_STATE_READY => match broker.enqueue(
+                    id.to_string(),
+                    trimmed.to_vec(),
+                    kind == "execute_code" || kind == "execute_loaded",
+                ) {
+                    Ok(()) => broker.emit_event(
+                        REQUEST_ACCEPTED_EVENT,
+                        serde_json::json!({
+                            "requestId": id,
+                            "requestType": kind,
+                        })
+                        .to_string(),
+                    ),
+                    Err(code) => broker.respond_error(id, code),
+                },
                 MANAGED_STATE_RELOADING => broker.respond_error(id, "managed_reloading"),
                 MANAGED_STATE_QUITTING => broker.respond_error(id, "unity_process_exiting"),
                 _ => broker.respond_error(id, "managed_not_ready"),
@@ -1166,8 +1262,7 @@ mod imp {
         if let Ok(mut guard) = broker.response_tx.lock() {
             *guard = None; // drops the only sender → the writer task ends
         }
-        broker.clear_requests_on_disconnect();
-        broker.publish_status_snapshot();
+        broker.discard_non_reattachable_on_disconnect();
         let _ = writer.await;
         eprintln!("[locus-native] client disconnected: {}", broker.pipe_name);
     }

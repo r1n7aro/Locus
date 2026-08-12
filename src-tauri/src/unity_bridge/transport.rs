@@ -61,6 +61,7 @@ mod windows_impl {
         pipe_name: String,
         writer: Mutex<Option<WriteHalf<NamedPipeClient>>>,
         pending: Mutex<HashMap<String, oneshot::Sender<Result<PipeEnvelope, String>>>>,
+        accepted: Mutex<HashMap<String, oneshot::Sender<()>>>,
         reader_abort: Mutex<Option<tokio::task::AbortHandle>>,
     }
 
@@ -93,6 +94,7 @@ mod windows_impl {
             let request_id = self.request_id.clone();
             tokio::spawn(async move {
                 conn.pending.lock().await.remove(&request_id);
+                conn.accepted.lock().await.remove(&request_id);
             });
         }
     }
@@ -105,6 +107,7 @@ mod windows_impl {
     static EVENT_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
     const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+    const BROKER_REQUEST_ACCEPTED_EVENT: &str = "locus-request-accepted";
 
     pub(super) fn set_event_app_handle(app_handle: AppHandle) {
         let _ = EVENT_APP_HANDLE.set(app_handle);
@@ -218,6 +221,8 @@ mod windows_impl {
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(reason.clone()));
         }
+        drop(pending);
+        conn.accepted.lock().await.clear();
     }
 
     async fn close_connection(conn: &Arc<UnityPipeConnection>, reason: String) {
@@ -294,6 +299,20 @@ mod windows_impl {
         );
     }
 
+    fn broker_accepted_request_id(env: &PipeEnvelope) -> Option<String> {
+        if env.kind != BROKER_REQUEST_ACCEPTED_EVENT {
+            return None;
+        }
+        let message = env.message.as_deref()?;
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()?
+            .get("requestId")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
     async fn reader_loop(conn: Arc<UnityPipeConnection>, reader: ReadHalf<NamedPipeClient>) {
         let pipe_name = conn.pipe_name.clone();
         let mut reader = BufReader::new(reader);
@@ -331,6 +350,24 @@ mod windows_impl {
                 }
             };
 
+            if env.kind == BROKER_REQUEST_ACCEPTED_EVENT {
+                if let Some(request_id) = broker_accepted_request_id(&env) {
+                    let tx = conn.accepted.lock().await.remove(&request_id);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(());
+                    } else {
+                        tracing::debug!(
+                            log_module = "Locus",
+                            "received broker acceptance for unknown request id: {}",
+                            request_id
+                        );
+                    }
+                } else {
+                    eprintln!("[Locus] malformed broker request acceptance: {}", trimmed);
+                }
+                continue;
+            }
+
             let reply_to = env
                 .reply_to
                 .clone()
@@ -342,6 +379,7 @@ mod windows_impl {
                     let mut pending = conn.pending.lock().await;
                     pending.remove(&reply_to)
                 };
+                conn.accepted.lock().await.remove(&reply_to);
 
                 if let Some(tx) = tx {
                     let _ = tx.send(Ok(env));
@@ -398,6 +436,7 @@ mod windows_impl {
             pipe_name: pipe_name.clone(),
             writer: Mutex::new(Some(writer)),
             pending: Mutex::new(HashMap::new()),
+            accepted: Mutex::new(HashMap::new()),
             reader_abort: Mutex::new(None),
         });
 
@@ -438,6 +477,7 @@ mod windows_impl {
         msg_type: &str,
         message: &str,
         timeout: Option<Duration>,
+        acceptance_tx: Option<oneshot::Sender<()>>,
     ) -> Result<PipeResponse, String> {
         let trace_exit_play_mode = msg_type == "exit_play_mode";
         if trace_exit_play_mode {
@@ -467,6 +507,12 @@ mod windows_impl {
         {
             let mut pending = conn.pending.lock().await;
             pending.insert(request_id.clone(), tx);
+        }
+        if let Some(acceptance_tx) = acceptance_tx {
+            conn.accepted
+                .lock()
+                .await
+                .insert(request_id.clone(), acceptance_tx);
         }
         let mut pending_guard = PendingRequestGuard::new(conn.clone(), request_id.clone());
         if trace_exit_play_mode {
@@ -502,6 +548,7 @@ mod windows_impl {
                 let mut pending = conn.pending.lock().await;
                 pending.remove(&request_id);
             }
+            conn.accepted.lock().await.remove(&request_id);
             pending_guard.disarm();
             remove_connection_if_same(&conn.pipe_name, &conn).await;
             close_connection(&conn, err.clone()).await;
@@ -531,6 +578,8 @@ mod windows_impl {
                     let err = "Unity response timed out".to_string();
                     let mut pending = conn.pending.lock().await;
                     pending.remove(&request_id);
+                    drop(pending);
+                    conn.accepted.lock().await.remove(&request_id);
                     pending_guard.disarm();
                     return Err(err);
                 }
@@ -678,7 +727,7 @@ mod windows_impl {
     ) -> Result<PipeResponse, String> {
         let result = tokio::time::timeout(
             timeout,
-            send_message_inner(project_path, msg_type, message, Some(timeout)),
+            send_message_inner(project_path, msg_type, message, Some(timeout), None),
         )
         .await
         .map_err(|_| "Unity request timed out".to_string())?;
@@ -696,7 +745,16 @@ mod windows_impl {
         msg_type: &str,
         message: &str,
     ) -> Result<PipeResponse, String> {
-        send_message_inner(project_path, msg_type, message, None).await
+        send_message_inner(project_path, msg_type, message, None, None).await
+    }
+
+    pub async fn send_message_without_timeout_with_acceptance(
+        project_path: &str,
+        msg_type: &str,
+        message: &str,
+        acceptance_tx: oneshot::Sender<()>,
+    ) -> Result<PipeResponse, String> {
+        send_message_inner(project_path, msg_type, message, None, Some(acceptance_tx)).await
     }
 
     pub async fn send_message(
@@ -767,6 +825,22 @@ mod windows_impl {
             close_connection(&first, "test complete".to_string()).await;
             server_task.abort();
         }
+
+        #[test]
+        fn parses_broker_acceptance_request_id() {
+            let env = PipeEnvelope {
+                id: None,
+                reply_to: None,
+                kind: BROKER_REQUEST_ACCEPTED_EVENT.to_string(),
+                ok: Some(true),
+                message: Some(r#"{"requestId":"req-42","requestType":"execute_code"}"#.to_string()),
+                error: None,
+                process_id: None,
+                process_path: None,
+            };
+
+            assert_eq!(broker_accepted_request_id(&env).as_deref(), Some("req-42"));
+        }
     }
 }
 
@@ -806,6 +880,22 @@ pub async fn send_message_without_timeout(
     message: &str,
 ) -> Result<PipeResponse, String> {
     windows_impl::send_message_without_timeout(project_path, msg_type, message).await
+}
+
+#[cfg(target_os = "windows")]
+pub async fn send_message_without_timeout_with_acceptance(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    acceptance_tx: tokio::sync::oneshot::Sender<()>,
+) -> Result<PipeResponse, String> {
+    windows_impl::send_message_without_timeout_with_acceptance(
+        project_path,
+        msg_type,
+        message,
+        acceptance_tx,
+    )
+    .await
 }
 
 #[cfg(target_os = "windows")]
@@ -853,6 +943,16 @@ pub async fn send_message_without_timeout(
     _project_path: &str,
     _msg_type: &str,
     _message: &str,
+) -> Result<PipeResponse, String> {
+    Err("Unity bridge is only supported on Windows (named pipes)".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn send_message_without_timeout_with_acceptance(
+    _project_path: &str,
+    _msg_type: &str,
+    _message: &str,
+    _acceptance_tx: tokio::sync::oneshot::Sender<()>,
 ) -> Result<PipeResponse, String> {
     Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }

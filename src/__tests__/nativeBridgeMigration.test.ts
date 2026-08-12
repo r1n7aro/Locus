@@ -39,8 +39,8 @@ describe("native bridge migration", () => {
     expect(native).toContain('"managedCapabilities": managed_capabilities');
     expect(native).toContain("guard.clear();");
     expect(native).toContain("const NATIVE_CAPABILITIES: &str =");
-    expect(native).toContain('"broker_v1,broker_state_mmf_v1,broker_queue_limits_v1"');
-    expect(managed).toContain('private const string ManagedCapabilities = "managed_executor_v1,status_cached,set_editor_status_async";');
+    expect(native).toContain('"broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1"');
+    expect(managed).toContain('"managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1"');
     expect(bridge).toContain("pub broker_capabilities: Vec<String>");
     expect(bridge).toContain("pub managed_capabilities: Vec<String>");
   });
@@ -182,12 +182,17 @@ describe("native bridge migration", () => {
     expect(managed).toContain("internal static bool IsNativeBridgeActive");
   });
 
-  it("drops stale native completions after reload or client disconnect cleanup", () => {
+  it("drops stale native completions after reload and retains accepted work across reconnect", () => {
     const native = read("locus_native_plugin/src/lib.rs");
 
     expect(native).toContain("dropping stale completion for non-inflight request");
     expect(native).toContain("inflight.remove(id).is_some()");
     expect(native).toContain("complete_drops_stale_or_already_interrupted_requests");
+    expect(native).toContain("Preserve only execution requests that can be reattached");
+    expect(native).not.toContain("clear_requests_on_disconnect");
+    expect(native).toContain("discard_non_reattachable_on_disconnect");
+    expect(native).toContain('kind == "execute_code" || kind == "execute_loaded"');
+    expect(native).toContain("disconnect_retains_only_reattachable_execution_requests");
   });
 
   it("closes and relaunches Unity around plugin installs", () => {

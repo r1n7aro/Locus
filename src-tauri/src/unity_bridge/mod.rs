@@ -37,7 +37,8 @@ pub use process::{
 };
 pub use state_probe::{SemanticState, UnityStateProbeStatus, UnityStateProbeTier};
 pub use transport::{
-    send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
+    send_message, send_message_with_timeout, send_message_without_timeout,
+    send_message_without_timeout_with_acceptance, set_event_app_handle,
 };
 
 pub fn initialize_background_hook(enabled: bool) {
@@ -915,6 +916,7 @@ pub const UNITY_EXECUTE_PROGRESS_TAG: &str = "locus-unity-progress";
 pub const UNITY_EXECUTE_CANCELLED: &str = "__locus_unity_execute_cancelled__";
 const UNITY_EXECUTE_PROGRESS_POLL_MS: u64 = 250;
 const UNITY_EXECUTE_START_TIMEOUT_SECS: u64 = 15;
+const UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS: u32 = 3;
 const UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS: u64 = 120;
 const UNITY_EXECUTE_WAITING_STATUS_INTERVAL_MS: u64 = 2_000;
 
@@ -4527,9 +4529,12 @@ where
     drop(_guard);
 
     let mut send_attempt = 1u32;
+    let mut reattach_attempts = 0u32;
     let resp = loop {
         on_progress(rust_unity_execute_progress(
-            if send_attempt == 1 {
+            if execute_msg_type == "execute_code_wait" {
+                "Reattaching to the original Unity execution".to_string()
+            } else if send_attempt == 1 {
                 format!("Sending {execute_msg_type} to Unity")
             } else {
                 format!("Retrying {execute_msg_type} after Unity pipe reconnect")
@@ -4548,8 +4553,13 @@ where
             attempt_payload.len(),
             send_attempt
         );
-        let execute =
-            send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
+        let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
+        let execute = send_message_without_timeout_with_acceptance(
+            project_path,
+            execute_msg_type,
+            &attempt_payload,
+            acceptance_tx,
+        );
         tokio::pin!(execute);
 
         let mut progress_tick =
@@ -4561,9 +4571,28 @@ where
         let mut last_waiting_status_at = execute_started_at;
         let mut last_progress_poll_error: Option<String> = None;
         let mut progress_unavailable_since: Option<std::time::Instant> = None;
+        let mut broker_accepted = false;
+        let mut acceptance_pending = true;
 
         let attempt_result: Result<PipeResponse, String> = loop {
             tokio::select! {
+                biased;
+                accepted = &mut acceptance_rx, if acceptance_pending => {
+                    acceptance_pending = false;
+                    if accepted.is_ok() {
+                        broker_accepted = true;
+                        eprintln!(
+                            "[Locus] native Broker accepted {} for execution_id={}",
+                            execute_msg_type, execution_id
+                        );
+                        on_progress(rust_unity_execute_progress(
+                            "Broker accepted Unity execute request",
+                            format!("{}; execution_id={}", execute_msg_type, execution_id),
+                            rust_progress_revision,
+                        ));
+                        rust_progress_revision += 1;
+                    }
+                },
                 result = &mut execute => break result,
                 _ = progress_tick.tick() => {
                     match query_unity_execute_progress(project_path, &execution_id).await {
@@ -4597,10 +4626,7 @@ where
                                         "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
                                         UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
                                     );
-                                    return Err(append_execute_reconnect_result(
-                                        &reason,
-                                        reconnect_unity_pipe_for_execute(project_path, &reason).await,
-                                    ));
+                                    break Err(reason);
                                 }
                             }
                         }
@@ -4619,7 +4645,11 @@ where
                             elapsed_ms, execute_msg_type, detail
                         );
                         on_progress(rust_unity_execute_progress(
-                            format!("Waiting for Unity progress after sending {execute_msg_type}"),
+                            if broker_accepted {
+                                "Waiting for Unity main thread after Broker acceptance".to_string()
+                            } else {
+                                format!("Waiting for Unity progress after sending {execute_msg_type}")
+                            },
                             format!("{}ms elapsed; {}", elapsed_ms, detail),
                             rust_progress_revision,
                         ));
@@ -4627,7 +4657,8 @@ where
                         last_waiting_status_at = std::time::Instant::now();
                     }
 
-                    if !saw_unity_progress
+                    if !broker_accepted
+                        && !saw_unity_progress
                         && execute_started_at.elapsed()
                             > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
                     {
@@ -4664,6 +4695,7 @@ where
             }
             Ok(resp)
                 if pipe_response_transient_broker_error(&resp)
+                    && !broker_accepted
                     && !saw_unity_progress
                     && send_attempt == 1 =>
             {
@@ -4687,7 +4719,30 @@ where
                 send_attempt += 1;
             }
             Ok(resp) => break resp,
-            Err(error) if !saw_unity_progress && send_attempt == 1 => {
+            Err(error)
+                if (broker_accepted || saw_unity_progress)
+                    && reattach_attempts < UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS =>
+            {
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting to the original Unity execution",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                if let Err(reconnect_error) =
+                    reconnect_unity_pipe_for_execute(project_path, &error).await
+                {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                execute_msg_type = "execute_code_wait";
+                execute_payload = execution_id.clone();
+                send_attempt += 1;
+                reattach_attempts += 1;
+            }
+            Err(error) if !broker_accepted && !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
                     "Reconnecting Unity pipe",
                     &error,
@@ -4864,9 +4919,12 @@ where
     drop(guard);
 
     let mut send_attempt = 1u32;
+    let mut reattach_attempts = 0u32;
     let resp = loop {
         on_progress(rust_unity_execute_progress(
-            if send_attempt == 1 {
+            if execute_msg_type == "execute_code_wait" {
+                "Reattaching to the original Unity execution".to_string()
+            } else if send_attempt == 1 {
                 format!("Sending {execute_msg_type} to Unity")
             } else {
                 format!("Retrying {execute_msg_type} after Unity pipe reconnect")
@@ -4885,8 +4943,13 @@ where
             attempt_payload.len(),
             send_attempt
         );
-        let execute =
-            send_message_without_timeout(project_path, execute_msg_type, &attempt_payload);
+        let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
+        let execute = send_message_without_timeout_with_acceptance(
+            project_path,
+            execute_msg_type,
+            &attempt_payload,
+            acceptance_tx,
+        );
         tokio::pin!(execute);
 
         let mut progress_tick =
@@ -4898,9 +4961,28 @@ where
         let mut last_waiting_status_at = execute_started_at;
         let mut last_progress_poll_error: Option<String> = None;
         let mut progress_unavailable_since: Option<std::time::Instant> = None;
+        let mut broker_accepted = false;
+        let mut acceptance_pending = true;
 
         let attempt_result: Result<PipeResponse, String> = loop {
             tokio::select! {
+                biased;
+                accepted = &mut acceptance_rx, if acceptance_pending => {
+                    acceptance_pending = false;
+                    if accepted.is_ok() {
+                        broker_accepted = true;
+                        eprintln!(
+                            "[Locus] native Broker accepted {} for execution_id={}",
+                            execute_msg_type, execution_id
+                        );
+                        on_progress(rust_unity_execute_progress(
+                            "Broker accepted Unity execute request",
+                            format!("{}; execution_id={}", execute_msg_type, execution_id),
+                            rust_progress_revision,
+                        ));
+                        rust_progress_revision += 1;
+                    }
+                },
                 result = &mut execute => break result,
                 changed = cancel_rx.changed() => {
                     let cancelled = changed.is_err() || *cancel_rx.borrow();
@@ -4975,21 +5057,7 @@ where
                                         "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
                                         UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
                                     );
-                                    let reconnect = reconnect_unity_pipe_for_execute_cancellable(
-                                        project_path,
-                                        &reason,
-                                        &mut cancel_rx,
-                                    )
-                                    .await;
-                                    if reconnect
-                                        .as_ref()
-                                        .err()
-                                        .map(|error| error == UNITY_EXECUTE_CANCELLED)
-                                        .unwrap_or(false)
-                                    {
-                                        return Err(UNITY_EXECUTE_CANCELLED.to_string());
-                                    }
-                                    return Err(append_execute_reconnect_result(&reason, reconnect));
+                                    break Err(reason);
                                 }
                             }
                         }
@@ -5008,7 +5076,11 @@ where
                             elapsed_ms, execute_msg_type, detail
                         );
                         on_progress(rust_unity_execute_progress(
-                            format!("Waiting for Unity progress after sending {execute_msg_type}"),
+                            if broker_accepted {
+                                "Waiting for Unity main thread after Broker acceptance".to_string()
+                            } else {
+                                format!("Waiting for Unity progress after sending {execute_msg_type}")
+                            },
                             format!("{}ms elapsed; {}", elapsed_ms, detail),
                             rust_progress_revision,
                         ));
@@ -5016,7 +5088,8 @@ where
                         last_waiting_status_at = std::time::Instant::now();
                     }
 
-                    if !saw_unity_progress
+                    if !broker_accepted
+                        && !saw_unity_progress
                         && execute_started_at.elapsed()
                             > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
                     {
@@ -5053,6 +5126,7 @@ where
             }
             Ok(resp)
                 if pipe_response_transient_broker_error(&resp)
+                    && !broker_accepted
                     && !saw_unity_progress
                     && send_attempt == 1 =>
             {
@@ -5088,7 +5162,42 @@ where
                 send_attempt += 1;
             }
             Ok(resp) => break resp,
-            Err(error) if !saw_unity_progress && send_attempt == 1 => {
+            Err(error)
+                if (broker_accepted || saw_unity_progress)
+                    && reattach_attempts < UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS =>
+            {
+                on_progress(rust_unity_execute_progress(
+                    "Reconnecting to the original Unity execution",
+                    &error,
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                let reconnect = reconnect_unity_pipe_for_execute_cancellable(
+                    project_path,
+                    &error,
+                    &mut cancel_rx,
+                )
+                .await;
+                if reconnect
+                    .as_ref()
+                    .err()
+                    .map(|error| error == UNITY_EXECUTE_CANCELLED)
+                    .unwrap_or(false)
+                {
+                    return Err(UNITY_EXECUTE_CANCELLED.to_string());
+                }
+                if let Err(reconnect_error) = reconnect {
+                    return Err(format!(
+                        "{}; Unity pipe reconnect failed: {}",
+                        error, reconnect_error
+                    ));
+                }
+                execute_msg_type = "execute_code_wait";
+                execute_payload = execution_id.clone();
+                send_attempt += 1;
+                reattach_attempts += 1;
+            }
+            Err(error) if !broker_accepted && !saw_unity_progress && send_attempt == 1 => {
                 on_progress(rust_unity_execute_progress(
                     "Reconnecting Unity pipe",
                     &error,

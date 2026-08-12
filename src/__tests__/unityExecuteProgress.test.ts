@@ -83,9 +83,14 @@ describe("unityExecuteProgress", () => {
     expect(unityBridgeSource).toContain("format!(\"Retrying {execute_msg_type} after Unity pipe reconnect\")");
     expect(unityBridgeSource).toContain("reconnect_unity_pipe_for_execute");
     expect(unityBridgeSource).toContain("Unity execute progress was unavailable");
+    expect(unityBridgeSource).toContain("Broker accepted Unity execute request");
+    expect(unityBridgeSource).toContain('execute_msg_type = "execute_code_wait"');
+    expect(unityBridgeSource).toMatch(/if !broker_accepted\s+&& !saw_unity_progress/);
     expect(unityBridgeSource).toContain("disconnect_with_reason(project_path");
     expect(transportSource).toContain("disconnect_with_reason");
     expect(transportSource).toContain("fail_all_pending(conn, reason)");
+    expect(transportSource).toContain("send_message_without_timeout_with_acceptance");
+    expect(transportSource).toContain("BROKER_REQUEST_ACCEPTED_EVENT");
     expect(agentSource).toContain("execute_unity_execute");
     expect(agentSource).toContain("unity_execute_editor_status_intent");
     expect(agentSource).toContain("let has_unity_execution_barrier = prepared.iter().any");
@@ -95,6 +100,7 @@ describe("unityExecuteProgress", () => {
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_progress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("cancel_execute_code");
+    expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_wait");
     expect(agentSource).toContain("Waiting for Unity execute slot");
     expect(asyncExecuteSource).toContain("Checking compiler cache");
     expect(asyncExecuteSource).toContain("HandleCancelExecuteCode");
@@ -108,6 +114,11 @@ describe("unityExecuteProgress", () => {
     expect(asyncExecuteSource).toContain("Executing snippet");
     expect(asyncExecuteSource).toContain("Compilation failed");
     expect(asyncExecuteSource).toContain("Execution failed");
+    expect(asyncExecuteSource).toContain("_activeExecuteCodeEntries");
+    expect(asyncExecuteSource).toContain("_completedExecuteCodeEntries");
+    expect(asyncExecuteSource).toContain("AcquireExecuteCodeEntry");
+    expect(asyncExecuteSource).toContain("CompleteExecuteCodeEntry");
+    expect(asyncExecuteSource).toContain("joining existing execution_id=");
     expect(asyncExecuteSource).not.toContain("DisplayCancelableProgressBar(");
     expect(read("tools/unity_execute.json")).toContain("reports progress to the Locus tool call panel");
     expect(read("tools/unity_execute.json")).toContain("code explicitly changes status through EditorApplication play/pause APIs");
