@@ -12,6 +12,12 @@ namespace Locus.CompileServer.Tests;
 /// </summary>
 public class CompileServiceTests
 {
+    private static string[] HostBclPaths()
+    {
+        return ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+    }
+
     private static JsonNode CompileRaw(CompileService service, string path, string text, JsonObject? extra = null)
     {
         var request = new JsonObject
@@ -250,6 +256,85 @@ namespace Locus
                 new JsonObject { ["path"] = "SnippetHostStubs.cs", ["text"] = hostStubs }),
             ["useHostBcl"] = true,
         });
+
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void Non_public_access_keeps_linq_to_array_unambiguous_with_common_io_aliases()
+    {
+        const string referenceSource = @"
+using System;
+using System.Collections.Generic;
+
+namespace System.IO
+{
+    internal static class MonoLinqHelper
+    {
+        public static T[] ToArray<T>(this IEnumerable<T> source) => Array.Empty<T>();
+    }
+}
+
+namespace UnityEngine
+{
+    public class Object { }
+    namespace SceneManagement { public sealed class Scene { } }
+}
+
+namespace UnityEditor
+{
+    namespace SceneManagement { public sealed class EditorSceneManager { } }
+    namespace Animations { public sealed class AnimatorController { } }
+}
+
+namespace Locus
+{
+    public static class LocusBridge
+    {
+        public sealed class ScriptGlobals
+        {
+            public void print(object value) { }
+            public void printJson(object value) { }
+            public void clear() { }
+        }
+
+        public sealed class ExecuteCodeContext
+        {
+            public void ThrowIfCancellationRequested() { }
+        }
+    }
+}";
+
+        var service = new CompileService();
+        JsonNode reference = CompileRaw(
+            service,
+            "UnityMonoReference.cs",
+            referenceSource,
+            new JsonObject
+            {
+                ["assemblyName"] = "UnityMonoReference",
+                ["returnAssemblyPath"] = true,
+            });
+        Assert.True(reference["success"]!.GetValue<bool>(), reference["error"]?.GetValue<string>());
+
+        string referencePath = reference["assemblyPath"]!.GetValue<string>();
+        var referencePaths = HostBclPaths().Append(referencePath);
+        var request = new JsonObject
+        {
+            ["code"] = "var values = new[] { Path.GetTempPath() }.Where(path => path.Length > 0).ToArray();\nprint(values.Length);",
+            ["nonPublicAccessProbeMode"] = CompileService.AccessProbeCompilerOnly,
+            ["params"] = new JsonObject
+            {
+                ["fingerprint"] = "mono-linq-helper-regression",
+                ["domainGeneration"] = "mono-linq-helper-regression",
+                ["langVersion"] = "9",
+                ["referencePaths"] = new JsonArray(
+                    referencePaths.Select(path => (JsonNode)path).ToArray()),
+                ["defines"] = new JsonArray(),
+            },
+        };
+
+        JsonNode result = service.HandleCompileSnippet(request);
 
         Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
     }

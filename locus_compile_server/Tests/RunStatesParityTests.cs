@@ -123,6 +123,28 @@ public class RunStatesParityTests
     }
 
     [Fact]
+    public void Common_io_types_use_aliases_without_importing_system_io()
+    {
+        var (port, _) = BuildPair(
+            "editing",
+            "main",
+            new[]
+            {
+                ((string?)"main", (string?)"var path = Path.GetTempPath();",
+                    (string?)null, (string?)"ctx.Done(path);", (string?)null),
+            },
+            null);
+
+        string source = RunStatesSource.BuildRunStatesSource(port);
+
+        Assert.DoesNotContain("using System.IO;", source);
+        Assert.Contains("using Path = global::System.IO.Path;", source);
+        Assert.Contains("using File = global::System.IO.File;", source);
+        Assert.Contains("using Directory = global::System.IO.Directory;", source);
+        Assert.Contains("using MemoryStream = global::System.IO.MemoryStream;", source);
+    }
+
+    [Fact]
     public void Entry_type_matches_the_unity_contract()
     {
         Assert.Equal(

@@ -2911,7 +2911,7 @@ namespace Locus
         {
             var sb = new StringBuilder(8192);
             sb.AppendLine("using System;");
-            sb.AppendLine("using System.IO;");
+            AppendCommonIoAliases(sb);
             sb.AppendLine("using System.Text;");
             sb.AppendLine("using System.Linq;");
             sb.AppendLine("using System.Reflection;");

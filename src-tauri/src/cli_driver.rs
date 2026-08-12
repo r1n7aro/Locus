@@ -3862,6 +3862,25 @@ async fn run_execute_suite(
         "E3R:42",
     )
     .await;
+    match unity_bridge::unity_execute_code_with_non_public_access(
+        project,
+        r#"var values = new[] { Path.GetTempPath() }.Where(path => path.Length > 0).ToArray(); print("E3IO:" + values.Length);"#,
+        true,
+    )
+    .await
+    {
+        Ok(output) if output.contains("E3IO:1") => {
+            run.pass("E3IO aliases + LINQ", "common IO alias and LINQ ToArray compiled together");
+        }
+        Ok(output) => run.fail(
+            "E3IO aliases + LINQ",
+            format!("expected 'E3IO:1', got '{}'", clip(&output, 160)),
+        ),
+        Err(error) => run.fail(
+            "E3IO aliases + LINQ",
+            format!("execute error: {}", clip(&error, 200)),
+        ),
+    }
     if run_cancelled(cancel_rx) {
         return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
     }

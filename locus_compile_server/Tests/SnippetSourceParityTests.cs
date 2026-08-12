@@ -118,6 +118,31 @@ public class SnippetSourceParityTests
     }
 
     [Fact]
+    public void Common_io_types_use_aliases_without_importing_system_io()
+    {
+        string source = UnitySnippetSource.BuildAsyncSnippetSource(
+            "__LocusAsyncSnippetHost",
+            "",
+            "print(Path.GetTempPath());",
+            expressionMode: false,
+            useAsyncWrapper: false);
+
+        Assert.DoesNotContain("using System.IO;", source);
+        foreach (string typeName in new[]
+        {
+            "BinaryReader", "BinaryWriter", "BufferedStream", "Directory", "DirectoryInfo",
+            "DirectoryNotFoundException", "EndOfStreamException", "File", "FileAccess",
+            "FileAttributes", "FileInfo", "FileMode", "FileNotFoundException", "FileOptions",
+            "FileShare", "FileStream", "FileSystemInfo", "IOException", "MemoryStream", "Path",
+            "SearchOption", "SeekOrigin", "Stream", "StreamReader", "StreamWriter", "StringReader",
+            "StringWriter", "TextReader", "TextWriter",
+        })
+        {
+            Assert.Contains($"using {typeName} = global::System.IO.{typeName};", source);
+        }
+    }
+
+    [Fact]
     public void Host_type_names_match_the_unity_contract()
     {
         Assert.Equal("__LocusAsyncSnippetHost", UnitySnippetSource.HostTypeName);

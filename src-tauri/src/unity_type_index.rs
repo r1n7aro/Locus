@@ -16,6 +16,10 @@ const SKILL_PACKAGE_ASSEMBLY_PREFIX: &str = "__LocusSkillPackage_";
 
 const DEFAULT_NAMESPACE_USINGS: &[&str] = &[
     "System",
+    // Generated snippets expose common IO types through aliases. Reserve the
+    // namespace here so auto-using resolution never imports all of System.IO:
+    // Unity Mono's internal MonoLinqHelper would then collide with LINQ ToArray
+    // when direct non-public access is enabled.
     "System.IO",
     "System.Text",
     "System.Linq",
@@ -1290,6 +1294,16 @@ mod tests {
         assert_eq!(prepared.code, code);
         assert!(prepared.injected_namespaces.is_empty());
         assert!(prepared.blocked_conflicts.is_empty());
+    }
+
+    #[test]
+    fn prepare_never_auto_imports_system_io_for_aliased_types() {
+        let index = test_index(&[("Path", "System.IO"), ("File", "System.IO")]);
+        let code = "var path = Path.Combine(\"a\", \"b\");\nFile.WriteAllText(path, \"x\");";
+        let prepared = prepare_unity_execute_code(code, Some(&index));
+
+        assert_eq!(prepared.code, code);
+        assert!(prepared.injected_namespaces.is_empty());
     }
 
     #[test]

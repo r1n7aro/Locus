@@ -117,7 +117,7 @@ internal static class UnityReferenceImpl
         var sb = new StringBuilder(4096);
 
         sb.AppendLine("using System;");
-        sb.AppendLine("using System.IO;");
+        AppendCommonIoAliases(sb);
         sb.AppendLine("using System.Text;");
         sb.AppendLine("using System.Linq;");
         sb.AppendLine("using System.Reflection;");
@@ -193,6 +193,39 @@ internal static class UnityReferenceImpl
         return sb.ToString();
     }
 
+    private static void AppendCommonIoAliases(StringBuilder sb)
+    {
+        sb.AppendLine("using BinaryReader = global::System.IO.BinaryReader;");
+        sb.AppendLine("using BinaryWriter = global::System.IO.BinaryWriter;");
+        sb.AppendLine("using BufferedStream = global::System.IO.BufferedStream;");
+        sb.AppendLine("using Directory = global::System.IO.Directory;");
+        sb.AppendLine("using DirectoryInfo = global::System.IO.DirectoryInfo;");
+        sb.AppendLine("using DirectoryNotFoundException = global::System.IO.DirectoryNotFoundException;");
+        sb.AppendLine("using EndOfStreamException = global::System.IO.EndOfStreamException;");
+        sb.AppendLine("using File = global::System.IO.File;");
+        sb.AppendLine("using FileAccess = global::System.IO.FileAccess;");
+        sb.AppendLine("using FileAttributes = global::System.IO.FileAttributes;");
+        sb.AppendLine("using FileInfo = global::System.IO.FileInfo;");
+        sb.AppendLine("using FileMode = global::System.IO.FileMode;");
+        sb.AppendLine("using FileNotFoundException = global::System.IO.FileNotFoundException;");
+        sb.AppendLine("using FileOptions = global::System.IO.FileOptions;");
+        sb.AppendLine("using FileShare = global::System.IO.FileShare;");
+        sb.AppendLine("using FileStream = global::System.IO.FileStream;");
+        sb.AppendLine("using FileSystemInfo = global::System.IO.FileSystemInfo;");
+        sb.AppendLine("using IOException = global::System.IO.IOException;");
+        sb.AppendLine("using MemoryStream = global::System.IO.MemoryStream;");
+        sb.AppendLine("using Path = global::System.IO.Path;");
+        sb.AppendLine("using SearchOption = global::System.IO.SearchOption;");
+        sb.AppendLine("using SeekOrigin = global::System.IO.SeekOrigin;");
+        sb.AppendLine("using Stream = global::System.IO.Stream;");
+        sb.AppendLine("using StreamReader = global::System.IO.StreamReader;");
+        sb.AppendLine("using StreamWriter = global::System.IO.StreamWriter;");
+        sb.AppendLine("using StringReader = global::System.IO.StringReader;");
+        sb.AppendLine("using StringWriter = global::System.IO.StringWriter;");
+        sb.AppendLine("using TextReader = global::System.IO.TextReader;");
+        sb.AppendLine("using TextWriter = global::System.IO.TextWriter;");
+    }
+
     // ── LocusBridge.RunStates.cs ────────────────────────────────────
 
     public sealed class RunStatesRequestRef
@@ -216,7 +249,7 @@ internal static class UnityReferenceImpl
     {
         var sb = new StringBuilder(8192);
         sb.AppendLine("using System;");
-        sb.AppendLine("using System.IO;");
+        AppendCommonIoAliases(sb);
         sb.AppendLine("using System.Text;");
         sb.AppendLine("using System.Linq;");
         sb.AppendLine("using System.Reflection;");
