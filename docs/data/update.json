@@ -1,12 +1,12 @@
 {
-  "version": "0.7.1",
+  "version": "0.7.2",
   "releasedAt": "2026-08-13",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,32 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.7.1 (2026-08-13)",
+      "summary": "Locus v0.7.2 (2026-08-13)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.7.2（新增）",
+          "items": [
+            "**后台任务实时状态。** `async` 和 `notify` 工具调用会在原工具块中持续更新执行状态。Shell 输出可实时显示，最终结果会写入会话历史；后台 Shell 与 Unity Test 任务会持续运行至完成或取消，不再应用同步执行超时。",
+            "**内置 Unity 项目文件生成器。** Locus Unity 插件可直接根据 Unity `CompilationPipeline` 生成完整的 `.sln` 和 `.csproj`，无需安装 Visual Studio、Rider 或 VS Code 集成包；生成结果保留项目引用、编译定义、分析器和 Unity 项目生成回调。"
+          ]
+        },
+        {
+          "title": "v0.7.2（修复）",
+          "items": [
+            "**减少会话提前异常中断。** 服务端工具轮次完成后，以及 Codex/Responses 返回 `end_turn: false` 时，Agent 会继续生成后续回复，减少会话在最终答复前提前结束的情况。",
+            "**Codex 请求兼容性。** 移除 Codex 服务端不支持的 `max_output_tokens` 参数，避免 checkpoint 上下文压缩请求被服务端拒绝。",
+            "**Codex 上下文压缩。** Codex 会话改用 Remote Compaction V2 流式协议，并携带完整会话标识与路由信息；服务端压缩失败时保留原上下文并停止当前运行，避免写入不兼容的压缩状态。",
+            "**压缩会话分叉。** 从压缩前的历史位置创建分叉时，Locus 会重建对应的活动上下文窗口；从工具调用组分叉时同时保留其工具输出，修复分叉后上下文为空、压缩失败或选择定位错误。",
+            "**subagent 栈溢出。** 子 Agent 的完整运行循环改为使用独立 Tokio 任务，使父工具循环、工具执行与子 LLM 循环拥有分离的任务栈；父任务结束时会同步终止子任务。",
+            "**并发 Agent 调度卡住。** 同一工具轮次中的前台 subagent 会先完成，再执行本地同级工具。工作区变更按规范化文件路径协调：不同文件可并行写入，同一路径按顺序执行，读取类工具无需等待；长时间等待会显示占用会话与工具。",
+            "**Unity 并行编辑死锁。** 任一重叠编辑会话结束时，已经完成的资源变更会立即导入，其余会话继续运行，避免完成文件因同级长任务持续停留在 AssetDatabase 之外。",
+            "**中断工具历史。** 恢复、分叉或继续中断会话时，缺失的本地工具结果会从已记录输出恢复，无法恢复时写入明确的中断结果；旧会话会通过迁移补齐终止工具轮次，保持模型请求与上下文导出的工具调用序列完整。",
+            "**错误通知保留。** 错误通知会持续显示，直到用户主动关闭；成功状态替换、按操作清理与全局清理会保留尚未处理的错误。",
+            "**Unity C# 动态代码编译。** `unity_execute` 和 `unity_run_states` 使用显式别名提供常用 `System.IO` 类型，避免启用非公开访问时 Unity Mono 内部 `MonoLinqHelper.ToArray` 与 LINQ `ToArray` 冲突。",
+            "**Unity YAML 检查引导。** 直接读取 Unity YAML 资源被重定向时，Locus 会同时推荐语义化 YAML 工具和通过 `unity_execute` 在 Editor 内运行 C# 检查，并保留明确的原始内容重试入口。"
+          ]
+        },
         {
           "title": "v0.7.1（新增）",
           "items": [
@@ -273,11 +296,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -287,9 +310,32 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.7.1 (2026-08-13)",
+      "summary": "Locus v0.7.2 (2026-08-13)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.7.2 (Added)",
+          "items": [
+            "**Live background task updates.** Async and notify tool calls now update their original tool block as execution progresses. Shell output streams live, final results persist in session history, and background shell and Unity Test runs continue until completion or cancellation without synchronous execution deadlines.",
+            "**Built-in Unity project-file generation.** The Locus Unity plugin can generate complete `.sln` and `.csproj` files directly from Unity's `CompilationPipeline` without Visual Studio, Rider, or VS Code integration packages. Generated workspaces retain project references, compilation defines, analyzers, and Unity project-generation callbacks."
+          ]
+        },
+        {
+          "title": "v0.7.2 (Fixed)",
+          "items": [
+            "**Reduced premature session termination.** Agent runs now continue after server-tool rounds and when Codex/Responses returns `end_turn: false`, reducing cases where a session ends before the model produces its final response.",
+            "**Codex request compatibility.** Removed the unsupported `max_output_tokens` parameter from Codex requests, preventing the server from rejecting checkpoint-compaction requests.",
+            "**Codex context compaction.** Codex sessions now use Remote Compaction V2 over the streaming Responses protocol with complete session identity and routing headers. Server compaction failures preserve the original context and stop the current run, preventing incompatible checkpoint state.",
+            "**Compacted-session forks.** Forks created before the latest compaction reconstruct the correct active prompt window, and forks from assistant tool groups retain their matching outputs. This fixes empty fork context, failed compaction, and incorrect history selection anchors.",
+            "**Nested subagent stack overflows.** Each child agent now runs its full loop in an independent Tokio task, separating the parent tool loop, tool execution, and child LLM loop onto distinct task stack boundaries. Ending the parent execution also aborts the child task.",
+            "**Concurrent agent scheduling stalls.** Foreground subagents in mixed tool rounds complete before local sibling tools run. Workspace mutations are coordinated by normalized file path: writes to different files can overlap, same-path writes serialize, and read-only tools bypass mutation waits. Long waits identify the blocking sessions and tools.",
+            "**Unity parallel-edit deadlocks.** Completed asset changes are imported whenever any overlapping edit session ends, while remaining sessions continue normally. This prevents finished files from remaining outside the AssetDatabase behind a long-running sibling session.",
+            "**Interrupted tool history.** Resuming, forking, or continuing interrupted sessions recovers missing local tool results from recorded output and inserts explicit interruption results when necessary. A schema migration repairs terminal tool rounds in older sessions, keeping model requests and context exports valid.",
+            "**Persistent error notifications.** Error notifications remain visible until dismissed explicitly. Success replacement, per-operation clearing, and global clearing preserve unresolved errors.",
+            "**Unity C# snippet compilation.** Common `System.IO` types now use explicit aliases in `unity_execute` and `unity_run_states`, preventing Unity Mono's internal `MonoLinqHelper.ToArray` from conflicting with LINQ `ToArray` when non-public access is enabled.",
+            "**Unity YAML inspection guidance.** When a direct read is redirected from a Unity YAML asset, Locus now recommends both semantic YAML tools and `unity_execute` for Editor-side C# inspection, while retaining the explicit raw-read retry path."
+          ]
+        },
         {
           "title": "v0.7.1 (Added)",
           "items": [
@@ -531,11 +577,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

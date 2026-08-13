@@ -1,8 +1,8 @@
 ---
 title: "当前版本"
-description: "Locus v0.7.1 (2026-08-13)"
+description: "Locus v0.7.2 (2026-08-13)"
 sidebarTitle: "当前版本"
-version: "0.7.1"
+version: "0.7.2"
 releasedAt: "2026-08-13"
 channel: "stable"
 updateTitle: "发现新版本"
@@ -11,11 +11,30 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.1/locus_0.7.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.7.2（新增）
+
+- **后台任务实时状态。** `async` 和 `notify` 工具调用会在原工具块中持续更新执行状态。Shell 输出可实时显示，最终结果会写入会话历史；后台 Shell 与 Unity Test 任务会持续运行至完成或取消，不再应用同步执行超时。
+- **内置 Unity 项目文件生成器。** Locus Unity 插件可直接根据 Unity `CompilationPipeline` 生成完整的 `.sln` 和 `.csproj`，无需安装 Visual Studio、Rider 或 VS Code 集成包；生成结果保留项目引用、编译定义、分析器和 Unity 项目生成回调。
+
+### v0.7.2（修复）
+
+- **减少会话提前异常中断。** 服务端工具轮次完成后，以及 Codex/Responses 返回 `end_turn: false` 时，Agent 会继续生成后续回复，减少会话在最终答复前提前结束的情况。
+- **Codex 请求兼容性。** 移除 Codex 服务端不支持的 `max_output_tokens` 参数，避免 checkpoint 上下文压缩请求被服务端拒绝。
+- **Codex 上下文压缩。** Codex 会话改用 Remote Compaction V2 流式协议，并携带完整会话标识与路由信息；服务端压缩失败时保留原上下文并停止当前运行，避免写入不兼容的压缩状态。
+- **压缩会话分叉。** 从压缩前的历史位置创建分叉时，Locus 会重建对应的活动上下文窗口；从工具调用组分叉时同时保留其工具输出，修复分叉后上下文为空、压缩失败或选择定位错误。
+- **subagent 栈溢出。** 子 Agent 的完整运行循环改为使用独立 Tokio 任务，使父工具循环、工具执行与子 LLM 循环拥有分离的任务栈；父任务结束时会同步终止子任务。
+- **并发 Agent 调度卡住。** 同一工具轮次中的前台 subagent 会先完成，再执行本地同级工具。工作区变更按规范化文件路径协调：不同文件可并行写入，同一路径按顺序执行，读取类工具无需等待；长时间等待会显示占用会话与工具。
+- **Unity 并行编辑死锁。** 任一重叠编辑会话结束时，已经完成的资源变更会立即导入，其余会话继续运行，避免完成文件因同级长任务持续停留在 AssetDatabase 之外。
+- **中断工具历史。** 恢复、分叉或继续中断会话时，缺失的本地工具结果会从已记录输出恢复，无法恢复时写入明确的中断结果；旧会话会通过迁移补齐终止工具轮次，保持模型请求与上下文导出的工具调用序列完整。
+- **错误通知保留。** 错误通知会持续显示，直到用户主动关闭；成功状态替换、按操作清理与全局清理会保留尚未处理的错误。
+- **Unity C# 动态代码编译。** `unity_execute` 和 `unity_run_states` 使用显式别名提供常用 `System.IO` 类型，避免启用非公开访问时 Unity Mono 内部 `MonoLinqHelper.ToArray` 与 LINQ `ToArray` 冲突。
+- **Unity YAML 检查引导。** 直接读取 Unity YAML 资源被重定向时，Locus 会同时推荐语义化 YAML 工具和通过 `unity_execute` 在 Editor 内运行 C# 检查，并保留明确的原始内容重试入口。
 
 ### v0.7.1（新增）
 
