@@ -476,6 +476,7 @@ pub(super) struct LlmCallResult {
     pub tool_calls: Vec<ToolCallInfo>,
     #[allow(dead_code)]
     pub finish_reason: String,
+    pub end_turn: Option<bool>,
     pub response_id: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,

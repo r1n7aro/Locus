@@ -207,6 +207,7 @@ where
         text: state.full_text,
         tool_calls,
         finish_reason: state.finish_reason,
+        end_turn: state.end_turn,
         response_id: state.response_id,
         input_tokens: state.input_tokens,
         output_tokens: state.output_tokens,
@@ -545,6 +546,7 @@ struct ResponsesStreamState {
     cached_tokens: u32,
     tool_calls_map: HashMap<u32, PendingToolCall>,
     response_id: Option<String>,
+    end_turn: Option<bool>,
     response_completed: bool,
     stream_broke_early: bool,
 }
@@ -563,6 +565,7 @@ impl ResponsesStreamState {
             cached_tokens: 0,
             tool_calls_map: HashMap::new(),
             response_id: None,
+            end_turn: None,
             response_completed: false,
             stream_broke_early: false,
         }
@@ -795,6 +798,7 @@ where
             if let Ok(ev) = serde_json::from_str::<CompletedEvent>(&data_str) {
                 state.finish_thinking_timing();
                 state.response_id = ev.response.id.filter(|value| !value.is_empty());
+                state.end_turn = ev.response.end_turn;
                 if let Some(usage) = ev.response.usage {
                     state.cached_tokens = usage
                         .input_tokens_details
@@ -908,6 +912,8 @@ struct CompletedResponse {
     id: Option<String>,
     usage: Option<ResponseUsage>,
     status: Option<String>,
+    #[serde(default)]
+    end_turn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1318,6 +1324,29 @@ mod tests {
         assert_eq!(state.cached_tokens, 3);
         assert_eq!(state.output_tokens, 4);
         assert_eq!(state.response_id.as_deref(), Some("resp_123"));
+    }
+
+    #[test]
+    fn parses_end_turn_false_from_completed_response() {
+        let mut state = ResponsesStreamState::new();
+        let mut buffer = concat!(
+            "event: response.completed\n",
+            "data: {\"response\":{\"id\":\"resp_continue\",\"end_turn\":false,\"status\":\"completed\"}}"
+        )
+        .to_string();
+
+        drain_sse_buffer(
+            &mut buffer,
+            true,
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_text,
+            &ignore_tool,
+        )
+        .expect("end_turn should parse");
+
+        assert_eq!(state.end_turn, Some(false));
     }
 
     #[test]

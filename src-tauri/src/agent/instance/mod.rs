@@ -909,6 +909,10 @@ pub(super) fn finalize_tool_call_record(
     finalized
 }
 
+fn model_response_needs_follow_up(tool_calls: &[ToolCallInfo], end_turn: Option<bool>) -> bool {
+    !tool_calls.is_empty() || matches!(end_turn, Some(false))
+}
+
 fn validate_llm_tool_calls(tool_calls: &[ToolCallInfo]) -> Result<(), String> {
     for (index, tool_call) in tool_calls.iter().enumerate() {
         let mut missing = Vec::new();
@@ -7149,6 +7153,7 @@ impl AgentInstance {
                     text: resp.text,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
+                    end_turn: resp.end_turn,
                     response_id: resp.response_id,
                     input_tokens: resp.input_tokens,
                     output_tokens: resp.output_tokens,
@@ -7188,6 +7193,7 @@ impl AgentInstance {
                     text: resp.text,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
+                    end_turn: None,
                     response_id: None,
                     input_tokens: resp.input_tokens,
                     output_tokens: resp.output_tokens,
@@ -7278,6 +7284,7 @@ impl AgentInstance {
                     text: resp.text,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
+                    end_turn: resp.end_turn,
                     response_id: resp.response_id,
                     input_tokens: resp.input_tokens,
                     output_tokens: resp.output_tokens,
@@ -7370,6 +7377,7 @@ impl AgentInstance {
                             text: resp.text,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
+                            end_turn: resp.end_turn,
                             response_id: resp.response_id,
                             input_tokens: resp.input_tokens,
                             output_tokens: resp.output_tokens,
@@ -7413,6 +7421,7 @@ impl AgentInstance {
                             text: resp.text,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
+                            end_turn: resp.end_turn,
                             response_id: resp.response_id,
                             input_tokens: resp.input_tokens,
                             output_tokens: resp.output_tokens,
@@ -7460,6 +7469,7 @@ impl AgentInstance {
                             text: resp.text,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
+                            end_turn: None,
                             response_id: None,
                             input_tokens: resp.input_tokens,
                             output_tokens: resp.output_tokens,
@@ -7625,9 +7635,7 @@ impl AgentInstance {
                 None,
                 None,
                 &mut compact_turn_state,
-                codex::CodexStreamOptions::compact()
-                    .with_fast_mode(self.codex_fast_mode)
-                    .with_max_output_tokens(max_output_tokens),
+                codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
                 &|_| {},
                 &|_| {},
                 &|_, _| {},
@@ -7658,9 +7666,7 @@ impl AgentInstance {
                         None,
                         None,
                         &mut compact_turn_state,
-                        codex::CodexStreamOptions::compact()
-                            .with_fast_mode(self.codex_fast_mode)
-                            .with_max_output_tokens(max_output_tokens),
+                        codex::CodexStreamOptions::compact().with_fast_mode(self.codex_fast_mode),
                         &|_| {},
                         &|_| {},
                         &|_, _| {},
@@ -7673,6 +7679,7 @@ impl AgentInstance {
                 text: resp.text,
                 tool_calls: resp.tool_calls,
                 finish_reason: resp.finish_reason,
+                end_turn: resp.end_turn,
                 response_id: resp.response_id,
                 input_tokens: resp.input_tokens,
                 output_tokens: resp.output_tokens,
@@ -9582,8 +9589,6 @@ impl AgentInstance {
         let final_continuation_request;
         let final_content_order;
         let final_thinking_order;
-        let mut done_already_emitted = false;
-        let mut terminal_done_message_id: Option<String> = None;
         // Tracks whether this run has persisted any assistant message yet; a
         // cancel before that revokes the user message back to the composer.
         let mut assistant_round_persisted = false;
@@ -10414,8 +10419,8 @@ impl AgentInstance {
                 }
             }
 
-            let has_executable_tool_calls = ordered_tool_calls.iter()
-                .any(|tc| !tc.is_server_tool());
+            let model_needs_follow_up =
+                model_response_needs_follow_up(&ordered_tool_calls, response.end_turn);
 
             if !ordered_tool_calls.is_empty() {
                 eprintln!(
@@ -11588,10 +11593,6 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
-                if !has_executable_tool_calls {
-                    store.close_run_pending_input_queue(&run_id)?;
-                }
-
                 if self.drain_queued_pending_inputs(
                     app_handle,
                     store,
@@ -11602,25 +11603,13 @@ impl AgentInstance {
                     continue 'agent_loop;
                 }
 
-                if has_executable_tool_calls {
-                    continue;
-                }
-                // Server-tool-only round: model already provided its answer alongside the
-                // server tool results. toolCallRoundDone already emitted, message already stored.
-                final_text = response.text;
-                final_thinking_text = response.thinking_text;
-                final_thinking_duration = response.thinking_duration_secs;
-                final_thinking_signature = response.thinking_signature;
-                final_response_id = response.response_id;
-                final_continuation_request = response.continuation_request;
-                final_content_order = response_content_order;
-                final_thinking_order = response_thinking_order;
-                done_already_emitted = true;
-                terminal_done_message_id = Some(assistant_msg_id);
-                break;
+                debug_assert!(model_needs_follow_up);
+                continue;
             }
 
-            store.close_run_pending_input_queue(&run_id)?;
+            if !model_needs_follow_up {
+                store.close_run_pending_input_queue(&run_id)?;
+            }
             let pending_inputs = {
                 let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                     app_handle.state();
@@ -11629,7 +11618,7 @@ impl AgentInstance {
                     .map_err(|e| format!("Failed to lock pending input queue: {}", e))?;
                 queue.claim_immediate(&self.session_id, &run_id)
             };
-            if !pending_inputs.is_empty() {
+            if model_needs_follow_up || !pending_inputs.is_empty() {
                 let thinking_opt = if response.thinking_text.is_empty() {
                     None
                 } else {
@@ -11697,8 +11686,7 @@ impl AgentInstance {
             break;
         }
 
-        if !done_already_emitted {
-            let thinking_opt = if final_thinking_text.is_empty() {
+        let thinking_opt = if final_thinking_text.is_empty() {
                 None
             } else {
                 Some(final_thinking_text.as_str())
@@ -11786,53 +11774,7 @@ impl AgentInstance {
                     render_parts: Some(final_render_parts),
                 },
             );
-            self.partial_assistant.reset();
-        } else {
-            // Server-tool-only rounds already persisted their assistant message via
-            // ToolCallRoundDone. The explicit Done event still needs to fire with the
-            // same message id so the frontend can clear its in-flight run state while
-            // still seeing the terminal response text.
-            let terminal_message_id = terminal_done_message_id.clone().unwrap_or_default();
-
-            if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(&run_id)) {
-                eprintln!(
-                    "[Agent {}] failed to persist latest completed run id for session {} run {}: {}",
-                    self.id, self.session_id, run_id, error
-                );
-                crate::error::AppError::emit_background(
-                    app_handle,
-                    &crate::error::AppError::new(
-                        "session.latest_run_persist_failed",
-                        "Latest run boundary may be unavailable for this session.",
-                    )
-                    .detail(error)
-                    .operation("session")
-                    .severity(crate::error::ErrorSeverity::Warning),
-                );
-            }
-
-            eprintln!(
-                "[Agent {}] emitting Done for session {} run {} message {} (server-tool-only round) text_len={}",
-                self.id,
-                self.session_id,
-                run_id,
-                terminal_message_id,
-                final_text.len()
-            );
-            emit_stream(
-                app_handle,
-                &run_id,
-                StreamEvent::Done {
-                    session_id: self.session_id.clone(),
-                    message_id: terminal_message_id,
-                    full_text: final_text.clone(),
-                    content_order: final_content_order,
-                    thinking_order: final_thinking_order,
-                    render_parts: None,
-                },
-            );
-            self.partial_assistant.reset();
-        }
+        self.partial_assistant.reset();
 
         if let Err(error) = self
             .flush_pending_knowledge_proposal(app_handle, store, &run_id)
@@ -18658,12 +18600,13 @@ mod tests {
     use super::{
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, compact_trigger, finalize_tool_call_record, render_tree_lines,
-        utf8_prefix_chars, AbortOnDropTask, AgentInstance, AgentKnowledgeDocumentContent,
-        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
-        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult,
-        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer,
-        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        build_structure_section, compact_trigger, finalize_tool_call_record,
+        model_response_needs_follow_up, render_tree_lines, utf8_prefix_chars, AbortOnDropTask,
+        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
+        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
+        AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult, InjectedPromptItem,
+        KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer, ParentToolCall,
+        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
         REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
@@ -18676,7 +18619,9 @@ mod tests {
         update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
         KnowledgeReadResult, KnowledgeTargetKind, KnowledgeType,
     };
-    use crate::session::models::{ToolCallInfo, UserIntentPayload, UserIntentSkill};
+    use crate::session::models::{
+        ServerToolKind, ToolCallInfo, UserIntentPayload, UserIntentSkill,
+    };
     use crate::tool::{ToolDef, ToolRegistry, ToolResult};
     use crate::unity_docs::seed_managed_documents_for_tests;
     use serde_json::json;
@@ -18749,6 +18694,19 @@ mod tests {
             nested_tool_calls: None,
             order: None,
         }
+    }
+
+    #[test]
+    fn model_follow_up_requires_a_pure_assistant_terminal_response() {
+        assert!(!model_response_needs_follow_up(&[], None));
+        assert!(!model_response_needs_follow_up(&[], Some(true)));
+        assert!(model_response_needs_follow_up(&[], Some(false)));
+
+        let mut server_tool = test_tool_call("search-1", "web_search", json!({"query": "locus"}));
+        server_tool.server_tool = Some(ServerToolKind::WebSearch);
+        server_tool.server_tool_output = Some("result".to_string());
+
+        assert!(model_response_needs_follow_up(&[server_tool], Some(true)));
     }
 
     #[test]

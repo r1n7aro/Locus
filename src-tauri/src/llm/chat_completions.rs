@@ -1302,6 +1302,7 @@ fn finalize_stream_response(
         text: state.full_text,
         tool_calls,
         finish_reason: state.finish_reason,
+        end_turn: None,
         response_id: None,
         input_tokens: state.input_tokens,
         output_tokens: state.output_tokens,

@@ -164,7 +164,6 @@ pub struct CodexStreamOptions {
     pub include_web_search: bool,
     pub use_session_continuation: bool,
     pub fast_mode: bool,
-    pub max_output_tokens: Option<u32>,
     structured_output: Option<CodexStructuredOutput>,
 }
 
@@ -180,7 +179,6 @@ impl Default for CodexStreamOptions {
             include_web_search: true,
             use_session_continuation: true,
             fast_mode: false,
-            max_output_tokens: None,
             structured_output: None,
         }
     }
@@ -192,18 +190,12 @@ impl CodexStreamOptions {
             include_web_search: false,
             use_session_continuation: false,
             fast_mode: false,
-            max_output_tokens: None,
             structured_output: None,
         }
     }
 
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
-        self
-    }
-
-    pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
-        self.max_output_tokens = (max_output_tokens > 0).then_some(max_output_tokens);
         self
     }
 
@@ -602,9 +594,6 @@ fn build_request_body(
     }
     if options.fast_mode {
         body["service_tier"] = serde_json::json!("priority");
-    }
-    if let Some(max_output_tokens) = options.max_output_tokens {
-        body["max_output_tokens"] = serde_json::json!(max_output_tokens);
     }
 
     if !responses_tools.is_empty() {
@@ -1861,6 +1850,7 @@ struct CodexStreamState {
     /// Completed web_search_call server tool calls (no local execution needed).
     web_search_tool_calls: Vec<OrderedToolCall>,
     finish_reason: String,
+    end_turn: Option<bool>,
     input_tokens: u32,
     output_tokens: u32,
     cached_tokens: u32,
@@ -1882,6 +1872,7 @@ impl CodexStreamState {
             pending_server_tool_start_orders: std::collections::HashMap::new(),
             web_search_tool_calls: Vec::new(),
             finish_reason: "stop".to_string(),
+            end_turn: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
@@ -2335,6 +2326,7 @@ where
                     state.got_terminal_event = true;
                     state.finish_thinking_timing();
                     if let Some(response) = event.get("response") {
+                        state.end_turn = response.get("end_turn").and_then(|value| value.as_bool());
                         state.response_id = response
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -3130,6 +3122,7 @@ where
         text: stream_state.full_text,
         tool_calls,
         finish_reason: stream_state.finish_reason,
+        end_turn: stream_state.end_turn,
         response_id: stream_state.response_id,
         input_tokens: stream_state.input_tokens,
         output_tokens: stream_state.output_tokens,
@@ -3524,6 +3517,7 @@ where
         text: stream_state.full_text,
         tool_calls,
         finish_reason: stream_state.finish_reason,
+        end_turn: stream_state.end_turn,
         response_id: stream_state.response_id,
         input_tokens: stream_state.input_tokens,
         output_tokens: stream_state.output_tokens,
@@ -4188,6 +4182,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_end_turn_false_from_terminal_event() {
+        let mut state = CodexStreamState::new();
+
+        let stopped = process_sse_event_block(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_continue\",\"end_turn\":false}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("terminal event should parse");
+
+        assert!(stopped);
+        assert_eq!(state.end_turn, Some(false));
+    }
+
+    #[test]
     fn supports_crlf_separated_sse_blocks() {
         let mut state = CodexStreamState::new();
         let mut buffer = concat!(
@@ -4431,13 +4443,11 @@ mod tests {
             Some("low"),
             None,
             None,
-            CodexStreamOptions::default()
-                .with_fast_mode(true)
-                .with_max_output_tokens(8_192),
+            CodexStreamOptions::default().with_fast_mode(true),
         );
 
         assert_eq!(body["service_tier"].as_str(), Some("priority"));
-        assert_eq!(body["max_output_tokens"], serde_json::json!(8_192));
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
@@ -4639,6 +4649,7 @@ mod tests {
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
