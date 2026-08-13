@@ -161,8 +161,46 @@ describe("notification store", () => {
       "Error",
     ]);
 
-    vi.advanceTimersByTime(1);
-    expect(store.notices).toHaveLength(0);
+    vi.advanceTimersByTime(60_000);
+    expect(store.notices.map((notice) => notice.message)).toEqual(["Error"]);
+  });
+
+  it("keeps errors until the user removes them explicitly", () => {
+    const store = useNotificationStore();
+    const errorId = store.addNotice("error", "Compact failed", {
+      operation: "chat",
+      ttl: 1,
+      sticky: false,
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+
+    vi.advanceTimersByTime(60_000);
+    store.clearByOperation("chat");
+    store.clearAll();
+    store.addNotice("success", "Chat recovered", {
+      operation: "chat",
+      replaceOperation: true,
+    });
+    const secondErrorId = store.addNotice("error", "Compact retry failed", {
+      operation: "chat",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+
+    expect(store.notices.find((notice) => notice.id === errorId)).toMatchObject({
+      level: "error",
+      message: "Compact failed",
+      sticky: true,
+    });
+    expect(store.notices.find((notice) => notice.id === secondErrorId)).toMatchObject({
+      level: "error",
+      message: "Compact retry failed",
+      sticky: true,
+    });
+
+    store.removeNotice(errorId);
+    expect(store.notices.some((notice) => notice.id === errorId)).toBe(false);
   });
 
   it("pauses and resumes timed removal", () => {

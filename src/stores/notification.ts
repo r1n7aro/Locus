@@ -110,7 +110,7 @@ export const useNotificationStore = defineStore("notification", () => {
   ) {
     clearRemovalTimer(notice);
     const ttl = resolveNoticeTtl(level, options);
-    const sticky = options?.sticky ?? false;
+    const sticky = level === "error" || (options?.sticky ?? false);
     notice.level = level;
     notice.message = message;
     notice.code = options?.code;
@@ -137,7 +137,9 @@ export const useNotificationStore = defineStore("notification", () => {
     options?: AddNoticeOptions,
   ): string {
     if (options?.replaceOperation && options.operation) {
-      const existingByOperation = notices.value.find((n) => n.operation === options.operation);
+      const existingByOperation = notices.value.find(
+        (n) => n.operation === options.operation && n.level !== "error" && level !== "error",
+      );
       if (existingByOperation) {
         if (shouldLogToConsole(existingByOperation, level, message, options)) {
           logNoticeToConsole(message, options);
@@ -179,8 +181,11 @@ export const useNotificationStore = defineStore("notification", () => {
     applyNoticeUpdate(notice, level, message, options);
     notices.value.push(notice);
     if (notices.value.length > MAX_STORED) {
-      const removed = notices.value.shift()!;
-      clearRemovalTimer(removed);
+      const removableIndex = notices.value.findIndex((entry) => entry.level !== "error");
+      if (removableIndex !== -1) {
+        const [removed] = notices.value.splice(removableIndex, 1);
+        clearRemovalTimer(removed);
+      }
     }
 
     return id;
@@ -217,17 +222,20 @@ export const useNotificationStore = defineStore("notification", () => {
   }
 
   function clearByOperation(operation: string) {
-    const toRemove = notices.value.filter((n) => n.operation === operation);
+    const toRemove = notices.value.filter(
+      (n) => n.operation === operation && n.level !== "error",
+    );
     for (const n of toRemove) {
       removeNotice(n.id);
     }
   }
 
   function clearAll() {
-    for (const n of notices.value) {
+    const removable = notices.value.filter((notice) => notice.level !== "error");
+    for (const n of removable) {
       clearRemovalTimer(n);
     }
-    notices.value = [];
+    notices.value = notices.value.filter((notice) => notice.level === "error");
   }
 
   return {
