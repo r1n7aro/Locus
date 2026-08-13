@@ -1517,10 +1517,30 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         background: false,
     };
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-    let lock_mode = if registry.mutates_workspace(&canonical) {
-        crate::agent::workspace_execution_lock::WorkspaceExecutionLockMode::Write
+    let lock_request = if matches!(canonical.as_str(), "write" | "edit") {
+        Some(
+            params
+                .arguments
+                .get("filePath")
+                .and_then(Value::as_str)
+                .map(|path| {
+                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::PathWrite(
+                        vec![crate::agent::workspace_execution_lock::normalize_workspace_path_key(
+                            working_dir.as_deref().unwrap_or_default(),
+                            path,
+                        )],
+                    )
+                })
+                .unwrap_or(
+                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+                ),
+        )
+    } else if registry.mutates_workspace(&canonical)
+        || crate::agent::instance::AgentInstance::is_unity_execution_barrier_tool(&canonical)
+    {
+        Some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
     } else {
-        crate::agent::workspace_execution_lock::WorkspaceExecutionLockMode::Read
+        None
     };
     let owner = crate::agent::workspace_execution_lock::WorkspaceExecutionLockOwner {
         session_id: "python-sdk".to_string(),
@@ -1531,21 +1551,25 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     };
     let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
     let execute = async {
-        let guard = match crate::agent::workspace_execution_lock::process_workspace_execution_lock(
-            &owner.workspace,
-        )
-        .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
-        .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                return ToolResult {
-                    output: format!(
-                        "Tool '{canonical}' was cancelled while waiting for the workspace lock"
-                    ),
-                    is_error: true,
+        let guard = if let Some(request) = lock_request {
+            match crate::agent::workspace_execution_lock::process_workspace_execution_lock(
+                &owner.workspace,
+            )
+            .acquire_with_diagnostics(request, owner, lock_cancel_rx, &app)
+            .await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    return ToolResult {
+                        output: format!(
+                            "Tool '{canonical}' was cancelled while waiting for workspace mutation coordination"
+                        ),
+                        is_error: true,
+                    }
                 }
             }
+        } else {
+            None
         };
         let result = registry
             .execute_with_context(&canonical, &params.arguments, context)

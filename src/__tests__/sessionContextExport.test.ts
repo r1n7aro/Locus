@@ -6,13 +6,19 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v27 with explicit attempt and checkpoint migrations", () => {
+  it("uses schema v29 with explicit context and fork/tool-round repair migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 27;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 29;");
     expect(store).toContain('Self::migrate(conn, 26, "persist session context attempts"');
     expect(store).toContain('27,\n                "persist structured conversation checkpoints"');
     expect(store).toContain("migrate_conversation_checkpoints");
+    expect(store).toContain('28,\n                "repair empty prompt windows created by historical forks"');
+    expect(store).toContain("migrate_empty_prompt_windows");
+    expect(store).toContain("v27_migration_repairs_sessions_with_visible_but_empty_prompt_history");
+    expect(store).toContain('29,\n                "repair terminal tool rounds missing persisted outputs"');
+    expect(store).toContain("migrate_terminal_tool_round_outputs");
+    expect(store).toContain("v28_migration_repairs_terminal_tool_round_and_keeps_context_exportable");
     expect(store).toContain("conversation_checkpoint: Option<compact::ConversationCheckpoint>");
     expect(store).toContain("CREATE TABLE IF NOT EXISTS session_context_attempts");
     expect(store).toContain("request_gzip BLOB NOT NULL");

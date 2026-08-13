@@ -157,6 +157,19 @@ fn is_internal_generated_changed_file(file: &ChangedFile) -> bool {
             .unwrap_or(false)
 }
 
+fn changed_file_matches_path_keys(
+    working_dir: &str,
+    file: &ChangedFile,
+    path_keys: &[String],
+) -> bool {
+    std::iter::once(file.path.as_str())
+        .chain(file.old_path.as_deref())
+        .map(|path| {
+            crate::agent::workspace_execution_lock::normalize_workspace_path_key(working_dir, path)
+        })
+        .any(|key| path_keys.binary_search(&key).is_ok())
+}
+
 fn push_changed_file_if_new_target(
     seen: &mut HashSet<String>,
     files: &mut Vec<ChangedFile>,
@@ -449,6 +462,28 @@ impl UndoManager {
         has_unity_execute: bool,
         working_dir: &str,
     ) -> Result<bool, String> {
+        self.after_round_for_paths(
+            session_id,
+            assistant_message_id,
+            run_id,
+            round,
+            has_unity_execute,
+            working_dir,
+            None,
+        )
+        .await
+    }
+
+    pub async fn after_round_for_paths(
+        &self,
+        session_id: &str,
+        assistant_message_id: &str,
+        run_id: Option<&str>,
+        round: UndoRoundGuard,
+        has_unity_execute: bool,
+        working_dir: &str,
+        path_keys: Option<&[String]>,
+    ) -> Result<bool, String> {
         let checkpoint = round.checkpoint;
         let _workspace_guard = round._workspace_guard;
         let round_diff = GitProvider::diff_files(working_dir, &checkpoint.id)
@@ -466,6 +501,10 @@ impl UndoManager {
             .filter_map(|line| {
                 let file = parse_changed_file_line(line)?;
                 if is_internal_generated_changed_file(&file) {
+                    None
+                } else if path_keys
+                    .is_some_and(|keys| !changed_file_matches_path_keys(working_dir, &file, keys))
+                {
                     None
                 } else {
                     Some(file)

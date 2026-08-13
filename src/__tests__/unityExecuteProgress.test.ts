@@ -95,7 +95,7 @@ describe("unityExecuteProgress", () => {
     expect(agentSource).toContain("unity_execute_editor_status_intent");
     expect(agentSource).toContain("let has_unity_execution_barrier = prepared.iter().any");
     expect(agentSource).toContain("Self::is_unity_execution_barrier_tool");
-    expect(agentSource).toContain("|| has_unity_execution_barrier");
+    expect(agentSource).toContain("|| Self::is_unity_execution_barrier_tool(&target_name)");
     expect(agentSource).toContain("unity_execute_code_with_progress_cancellable");
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_progress");

@@ -79,6 +79,27 @@ describe("chat compact route", () => {
     expect(compact).toContain("<recent-context>");
   });
 
+  it("stops Codex sessions when canonical remote compaction fails", () => {
+    const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
+    const codex = read("src-tauri/src/llm/codex.rs");
+
+    expect(agentInstance).toContain("Codex context compaction failed; the run was stopped");
+    expect(agentInstance).toContain("codex remote compact failed; stopping the run");
+    expect(agentInstance).toContain("codex::compact_conversation_history_v2(");
+    expect(agentInstance).not.toContain("codex remote compact failed, falling back to prompt-based compact");
+    expect(codex).toContain('push(serde_json::json!({ "type": "compaction_trigger" }))');
+    expect(codex).toContain('const REMOTE_COMPACTION_V2_BETA_FEATURE: &str = "remote_compaction_v2"');
+    expect(codex).toContain("validate_remote_compaction_v2_output(");
+  });
+
+  it("fails manual compact when visible fork history has no active prompt window", () => {
+    const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
+
+    expect(agentInstance).toContain("let visible_message_count = store.get_messages(&self.session_id)?.len()");
+    expect(agentInstance).toContain("Cannot compact this session because its active context is empty");
+    expect(agentInstance).toContain("The session fork prompt window must be repaired");
+  });
+
   it("warns with a banner when compaction reacts to a server context overflow", () => {
     const chatStore = read("src/stores/chat.ts");
     const streamEvents = read("src-tauri/src/commands/mod.rs");

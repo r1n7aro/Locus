@@ -65,6 +65,10 @@ describe("chat undo chooser", () => {
     expect(transcript).toContain("isContextSelectedAssistantGroup");
     expect(transcript).toContain("data-chat-message-group-end-id");
     expect(chatView).toContain("chatMessageGroupEndId");
+    expect(transcript).toContain("sourceMessageIds: string[]");
+    expect(transcript).toContain("endMessageId: string");
+    expect(transcript).toContain(":data-chat-message-group-end-id=\"group.endMessageId\"");
+    expect(transcript).toContain("group.sourceMessageIds.includes(selectedMessageId)");
     expect(transcript).toContain("historyRenderSegmentsForGroup(group)");
     expect(transcript).toContain("v-for=\"segment in historyRenderSegmentsForGroup(group)\"");
     expect(transcript).not.toContain("historyRenderMessageBlocksForGroup");

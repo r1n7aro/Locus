@@ -9,8 +9,8 @@ use super::{
     AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
 };
 use crate::agent::workspace_execution_lock::{
-    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockMode,
-    WorkspaceExecutionLockOwner,
+    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockOwner,
+    WorkspaceExecutionLockRequest,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::claude_code_cli::{
@@ -315,9 +315,10 @@ impl<'a> ClaudeCodeRoundHost<'a> {
     fn cli_round_workspace_policy(
         &self,
         current_tool_name: &str,
-    ) -> Result<Option<(WorkspaceExecutionLockMode, Vec<String>)>, String> {
+        current_args: &serde_json::Value,
+    ) -> Result<Option<(WorkspaceExecutionLockRequest, Vec<String>)>, String> {
         let mut tools = Vec::new();
-        let mut needs_write = false;
+        let mut request = None;
         if let Some(round) = self.pending_round.as_ref() {
             for tool_call in &round.tool_calls {
                 let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
@@ -326,20 +327,19 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                 let effective_name = self
                     .agent
                     .effective_tool_name_for_round(&tool_call.name, &args);
-                needs_write |= self
-                    .agent
-                    .tool_call_needs_undo_tracking(&tool_call.name, &args)
-                    || AgentInstance::is_unity_execution_barrier_tool(&effective_name);
+                request = AgentInstance::merge_workspace_execution_request(
+                    request,
+                    self.agent
+                        .workspace_execution_request_for_tool(&tool_call.name, &args),
+                );
                 tools.push(effective_name);
             }
         }
         if tools.is_empty() {
             tools.push(current_tool_name.to_string());
-            needs_write = self
+            request = self
                 .agent
-                .tool_registry
-                .mutates_workspace(current_tool_name)
-                || AgentInstance::is_unity_execution_barrier_tool(current_tool_name);
+                .workspace_execution_request_for_tool(current_tool_name, current_args);
         }
 
         let has_ask = tools.iter().any(|name| name == "ask_user_question");
@@ -351,10 +351,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                 return Ok(None);
             }
             if AgentInstance::is_deterministic_pre_ask_tool(current_tool_name) {
-                return Ok(Some((
-                    WorkspaceExecutionLockMode::Read,
-                    vec![current_tool_name.to_string()],
-                )));
+                return Ok(None);
             }
             return Err(format!(
                 "Tool '{}' was skipped by the Claude Code tool-round scheduler: user-input rounds only allow deterministic pre-ask tools. Retry it in the next tool round.",
@@ -387,16 +384,17 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             return Ok(None);
         }
 
+        if self
+            .agent
+            .workspace_execution_request_for_tool(current_tool_name, current_args)
+            .is_none()
+        {
+            return Ok(None);
+        }
+
         tools.retain(|name| name != "subagent");
 
-        Ok(Some((
-            if needs_write {
-                WorkspaceExecutionLockMode::Write
-            } else {
-                WorkspaceExecutionLockMode::Read
-            },
-            tools,
-        )))
+        Ok(request.map(|request| (request, tools)))
     }
 
     async fn ensure_cli_foreground_subagent_phase(&mut self) {
@@ -693,11 +691,29 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
     }
 
-    fn take_cli_round_completion_if_ready(&mut self) -> Option<CliRoundCompletion> {
-        let round = self.pending_round.as_mut()?;
-        if !round.remaining.is_empty() {
+    fn take_cli_mutation_completion_if_ready(&mut self) -> Option<CliRoundCompletion> {
+        let should_finish = self.pending_round.as_ref().is_some_and(|round| {
+            round.workspace_guard.is_some()
+                && !round.remaining.iter().any(|tool_call_id| {
+                    let Some(tool_call) = round
+                        .tool_calls
+                        .iter()
+                        .find(|tool_call| &tool_call.id == tool_call_id)
+                    else {
+                        return false;
+                    };
+                    let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    normalize_tool_args(&mut args);
+                    self.agent
+                        .workspace_execution_request_for_tool(&tool_call.name, &args)
+                        .is_some()
+                })
+        });
+        if !should_finish {
             return None;
         }
+        let round = self.pending_round.as_mut()?;
         Some(CliRoundCompletion {
             message_id: round.message_id.clone(),
             undo_guard: round.undo_guard.take(),
@@ -725,13 +741,16 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             return;
         };
         let recorded = undo_mgr
-            .after_round(
+            .after_round_for_paths(
                 &self.agent.session_id,
                 &completion.message_id,
                 Some(self.run_id),
                 undo_guard,
                 completion.has_unity_execute,
                 &self.agent.working_dir,
+                workspace_guard
+                    .as_ref()
+                    .and_then(WorkspaceExecutionGuard::path_keys),
             )
             .await;
         match recorded {
@@ -979,7 +998,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             self.agent
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
 
-            let workspace_policy = self.cli_round_workspace_policy(&tool_call.name);
+            let workspace_policy = self.cli_round_workspace_policy(&tool_call.name, &args_for_exec);
             let is_deterministic_pre_ask_call =
                 AgentInstance::is_deterministic_pre_ask_tool(&tool_call.name)
                     && self.pending_round.as_ref().is_some_and(|round| {
@@ -1060,7 +1079,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
 
             let mut _single_tool_workspace_guard: Option<WorkspaceExecutionGuard> = None;
             if result_override.is_none() {
-                if let Ok(Some((lock_mode, tools))) = workspace_policy.as_ref() {
+                if let Ok(Some((lock_request, tools))) = workspace_policy.as_ref() {
                     let already_locked = !is_deterministic_pre_ask_call
                         && self
                             .pending_round
@@ -1068,9 +1087,9 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                             .is_some_and(|round| round.workspace_guard.is_some());
                     if !already_locked {
                         eprintln!(
-                            "[Agent {}] Claude Code tool round acquiring workspace lock mode={:?} session={} run={} tools=[{}]",
+                            "[Agent {}] Claude Code tool round acquiring workspace mutation coordination mode={} session={} run={} tools=[{}]",
                             self.agent.id,
-                            lock_mode,
+                            lock_request.label(),
                             self.agent.session_id,
                             self.run_id,
                             tools.join(",")
@@ -1084,7 +1103,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                         };
                         match process_workspace_execution_lock(&self.agent.working_dir)
                             .acquire_with_diagnostics(
-                                *lock_mode,
+                                lock_request.clone(),
                                 owner,
                                 self.agent.cancel_waiter(),
                                 self.app_handle,
@@ -1214,7 +1233,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 }
                 round.remaining.remove(&tool_call.id);
             }
-            let completed_round = self.take_cli_round_completion_if_ready();
+            let completed_round = self.take_cli_mutation_completion_if_ready();
             self.maybe_finish_pending_round();
             if let Some(completed_round) = completed_round {
                 self.finish_cli_round_external_side_effects(completed_round)

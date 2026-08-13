@@ -220,6 +220,8 @@ where
         thinking_duration_secs: state.thinking_duration_secs,
         thinking_signature: String::new(),
         continuation_request: None,
+        response_items: Vec::new(),
+        response_completed: true,
     })
 }
 

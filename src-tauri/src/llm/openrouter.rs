@@ -22,6 +22,11 @@ pub struct LlmResponse {
     pub thinking_duration_secs: u32,
     pub thinking_signature: String,
     pub continuation_request: Option<serde_json::Value>,
+    /// Canonical Responses API output items when the transport exposes them.
+    /// Non-Responses backends leave this empty.
+    pub response_items: Vec<serde_json::Value>,
+    /// Whether the transport observed a complete terminal response.
+    pub response_completed: bool,
 }
 
 const DEFAULT_BASE: &str = "https://openrouter.ai";
@@ -505,6 +510,8 @@ fn finalize_stream_response(
         thinking_duration_secs: think.duration_secs,
         thinking_signature: String::new(),
         continuation_request: None,
+        response_items: Vec::new(),
+        response_completed: true,
     };
 
     if debug {

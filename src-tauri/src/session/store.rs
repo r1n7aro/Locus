@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -635,6 +635,37 @@ fn is_context_handoff_message(message: &ChatMessage) -> bool {
             && compact::is_conversation_checkpoint_content(&message.content))
 }
 
+fn persisted_context_handoff(role: &str, content: &str) -> bool {
+    (role == MessageRole::Assistant.as_str() && content.starts_with(CONTEXT_HANDOFF_MARKER))
+        || (role == MessageRole::User.as_str()
+            && compact::is_conversation_checkpoint_content(content))
+}
+
+/// Reconstructs the prompt boundary for a fork cut inside history that the
+/// source session has since compacted away. The current `include_in_prompt`
+/// flags describe the source's latest window, so a cutoff before that window
+/// can otherwise copy a visible transcript with zero prompt messages.
+fn historical_fork_prompt_start<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, i64)>,
+) -> Option<usize> {
+    let mut row_count = 0usize;
+    let mut has_included_row = false;
+    let mut latest_handoff = None;
+    for (index, (role, content, include_in_prompt)) in rows.into_iter().enumerate() {
+        row_count = index + 1;
+        has_included_row |= include_in_prompt != 0;
+        if persisted_context_handoff(role, content) {
+            latest_handoff = Some(index);
+        }
+    }
+
+    if row_count == 0 || has_included_row {
+        None
+    } else {
+        Some(latest_handoff.unwrap_or(0))
+    }
+}
+
 fn is_internal_system_reminder_message(message: &ChatMessage) -> bool {
     message.role == MessageRole::User
         && message.content.trim().is_empty()
@@ -814,7 +845,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 27;
+    const SCHEMA_VERSION: i32 = 29;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1160,7 +1191,181 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 27, "add a new migration block above");
+        if current < 28 {
+            Self::migrate(
+                conn,
+                28,
+                "repair empty prompt windows created by historical forks",
+                Self::migrate_empty_prompt_windows,
+            )?;
+        }
+
+        if current < 29 {
+            Self::migrate(
+                conn,
+                29,
+                "repair terminal tool rounds missing persisted outputs",
+                Self::migrate_terminal_tool_round_outputs,
+            )?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 29, "add a new migration block above");
+        Ok(())
+    }
+
+    fn migrate_empty_prompt_windows(conn: &Connection) -> rusqlite::Result<()> {
+        let session_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT s.id
+                 FROM sessions s
+                 WHERE EXISTS (
+                    SELECT 1 FROM messages m WHERE m.session_id = s.id
+                 )
+                   AND NOT EXISTS (
+                    SELECT 1 FROM messages m
+                    WHERE m.session_id = s.id AND m.include_in_prompt = 1
+                 )",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for session_id in session_ids {
+            let rows = {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid, role, content, include_in_prompt
+                     FROM messages
+                     WHERE session_id = ?1
+                     ORDER BY rowid ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![session_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let Some(start_index) =
+                historical_fork_prompt_start(rows.iter().map(|(_, role, content, included)| {
+                    (role.as_str(), content.as_str(), *included)
+                }))
+            else {
+                continue;
+            };
+            let Some((start_rowid, ..)) = rows.get(start_index) else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE messages
+                 SET include_in_prompt = 1
+                 WHERE session_id = ?1 AND rowid >= ?2",
+                params![session_id, start_rowid],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_terminal_tool_round_outputs(conn: &Connection) -> rusqlite::Result<()> {
+        #[derive(Debug)]
+        struct PromptTailRow {
+            id: String,
+            role: String,
+            created_at: i64,
+            tool_calls: Option<String>,
+            tool_call_id: Option<String>,
+        }
+
+        let session_ids = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id
+                 FROM messages
+                 WHERE include_in_prompt = 1",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for session_id in session_ids {
+            let rows = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, role, created_at, tool_calls, tool_call_id
+                     FROM messages
+                     WHERE session_id = ?1 AND include_in_prompt = 1
+                     ORDER BY rowid ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![session_id], |row| {
+                        Ok(PromptTailRow {
+                            id: row.get(0)?,
+                            role: row.get(1)?,
+                            created_at: row.get(2)?,
+                            tool_calls: row.get(3)?,
+                            tool_call_id: row.get(4)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+
+            let Some(assistant_index) = rows
+                .iter()
+                .rposition(|row| row.role != MessageRole::Tool.as_str())
+            else {
+                continue;
+            };
+            let assistant = &rows[assistant_index];
+            if assistant.role != MessageRole::Assistant.as_str() {
+                continue;
+            }
+            let Some(tool_calls_json) = assistant.tool_calls.as_deref() else {
+                continue;
+            };
+            let Ok(tool_calls) = serde_json::from_str::<Vec<ToolCallInfo>>(tool_calls_json) else {
+                continue;
+            };
+            let observed_outputs = rows[assistant_index + 1..]
+                .iter()
+                .filter_map(|row| row.tool_call_id.as_deref())
+                .collect::<HashSet<_>>();
+
+            for tool_call in tool_calls
+                .iter()
+                .filter(|tool_call| !tool_call.is_server_tool() && !tool_call.id.is_empty())
+            {
+                if observed_outputs.contains(tool_call.id.as_str()) {
+                    continue;
+                }
+                let content = tool_call
+                    .recorded_output
+                    .as_deref()
+                    .unwrap_or(crate::session::history::INTERRUPTED_TOOL_RESULT);
+                conn.execute(
+                    "INSERT INTO messages (
+                        id, session_id, role, content, created_at, tool_call_id,
+                        include_in_prompt
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        format!("synthetic_tool_result:{}:{}", assistant.id, tool_call.id),
+                        session_id,
+                        MessageRole::Tool.as_str(),
+                        content,
+                        assistant.created_at,
+                        tool_call.id,
+                    ],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1850,6 +2055,82 @@ impl SessionStore {
         self.fork_session_with_cutoff(source_id, title, Some(message_id))
     }
 
+    fn resolve_fork_cutoff_rowid(
+        conn: &Connection,
+        source_id: &str,
+        message_id: &str,
+    ) -> Result<i64, String> {
+        let (base_rowid, role, tool_calls_json) = conn
+            .query_row(
+                "SELECT rowid, role, tool_calls
+                 FROM messages
+                 WHERE id = ?1 AND session_id = ?2",
+                params![message_id, source_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Fork message not found: {}", e))?;
+
+        if role != MessageRole::Assistant.as_str() {
+            return Ok(base_rowid);
+        }
+        let Some(tool_calls_json) = tool_calls_json.as_deref() else {
+            return Ok(base_rowid);
+        };
+        let tool_call_ids = serde_json::from_str::<Vec<ToolCallInfo>>(tool_calls_json)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tool_call| !tool_call.is_server_tool() && !tool_call.id.is_empty())
+            .map(|tool_call| tool_call.id)
+            .collect::<HashSet<_>>();
+        if tool_call_ids.is_empty() {
+            return Ok(base_rowid);
+        }
+
+        let following_rows = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT rowid, role, tool_call_id
+                     FROM messages
+                     WHERE session_id = ?1 AND rowid > ?2
+                     ORDER BY rowid ASC",
+                )
+                .map_err(|e| format!("Failed to prepare fork tool boundary query: {}", e))?;
+            let rows = stmt
+                .query_map(params![source_id, base_rowid], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("Failed to query fork tool boundary: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read fork tool boundary: {}", e))?;
+            rows
+        };
+
+        let mut cutoff_rowid = base_rowid;
+        for (rowid, following_role, tool_call_id) in following_rows {
+            if following_role != MessageRole::Tool.as_str() {
+                break;
+            }
+            let Some(tool_call_id) = tool_call_id.as_deref() else {
+                break;
+            };
+            if !tool_call_ids.contains(tool_call_id) {
+                break;
+            }
+            cutoff_rowid = rowid;
+        }
+        Ok(cutoff_rowid)
+    }
+
     fn fork_session_with_cutoff(
         &self,
         source_id: &str,
@@ -1926,14 +2207,9 @@ impl SessionStore {
             }
 
             let cutoff_rowid = match cutoff_message_id {
-                Some(message_id) => Some(
-                    conn.query_row(
-                        "SELECT rowid FROM messages WHERE id = ?1 AND session_id = ?2",
-                        params![message_id, source_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|e| format!("Fork message not found: {}", e))?,
-                ),
+                Some(message_id) => Some(Self::resolve_fork_cutoff_rowid(
+                    &conn, source_id, message_id,
+                )?),
                 None => None,
             };
 
@@ -2022,14 +2298,32 @@ impl SessionStore {
                     .map_err(|e| format!("Failed to read fork message row: {}", e))?
             };
 
+            let recovered_prompt_start = cutoff_rowid.and_then(|_| {
+                historical_fork_prompt_start(message_rows.iter().map(|row| {
+                    (
+                        row.role.as_str(),
+                        row.content.as_str(),
+                        row.include_in_prompt,
+                    )
+                }))
+            });
+
             let rewrite_tool_paths = source_tool_dir.is_dir();
-            for row in message_rows {
+            for (row_index, row) in message_rows.into_iter().enumerate() {
                 let message_id = Uuid::new_v4().to_string();
                 let content = if rewrite_tool_paths {
                     rewrite_tool_result_references(&row.content, &source_tool_dir, &target_tool_dir)
                 } else {
                     row.content
                 };
+                let include_in_prompt =
+                    recovered_prompt_start.map_or(row.include_in_prompt, |start| {
+                        if row_index >= start {
+                            1
+                        } else {
+                            0
+                        }
+                    });
                 conn.execute(
                     "INSERT INTO messages (
                         id,
@@ -2068,7 +2362,7 @@ impl SessionStore {
                         row.thinking_signature,
                         row.metadata_json,
                         row.response_request_id,
-                        row.include_in_prompt,
+                        include_in_prompt,
                     ],
                 )
                 .map_err(|e| format!("Failed to copy message into fork: {}", e))?;
@@ -7635,6 +7929,128 @@ mod tests {
     }
 
     #[test]
+    fn v27_migration_repairs_sessions_with_visible_but_empty_prompt_history() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        let checkpoint =
+            compact::build_conversation_checkpoint_content("summary", "recent context");
+
+        conn.execute(
+            "INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('empty-prompt', 'Broken historical fork', 'chat', 10, 10)",
+            [],
+        )
+        .expect("insert session");
+        for (id, role, content) in [
+            ("old-user", "user", "old inactive history"),
+            ("checkpoint", "user", checkpoint.as_str()),
+            ("continued", "assistant", "continued after checkpoint"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, include_in_prompt
+                 ) VALUES (?1, 'empty-prompt', ?2, ?3, 10, 0)",
+                params![id, role, content],
+            )
+            .expect("insert disabled message");
+        }
+        conn.pragma_update(None, "user_version", 27)
+            .expect("set v27 schema version");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let visible = store
+            .get_messages("empty-prompt")
+            .expect("load visible history");
+        let prompt = store
+            .get_messages_for_prompt("empty-prompt")
+            .expect("load repaired prompt history");
+
+        assert_eq!(visible.len(), 3);
+        assert_eq!(prompt.len(), 2);
+        assert!(compact::is_conversation_checkpoint_content(
+            &prompt[0].content
+        ));
+        assert_eq!(prompt[1].content, "continued after checkpoint");
+        let version: i32 = Connection::open(&db_path)
+            .expect("open migrated db")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v28_migration_repairs_terminal_tool_round_and_keeps_context_exportable() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        let tool_calls = serde_json::to_string(&vec![ToolCallInfo {
+            id: "call-missing".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"filePath":"src/main.rs"}"#.to_string(),
+            order: Some(1),
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }])
+        .expect("serialize tool calls");
+
+        conn.execute(
+            "INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('terminal-tool-round', 'Broken fork', 'chat', 10, 10)",
+            [],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO messages (
+                id, session_id, role, content, created_at, tool_calls, include_in_prompt
+             ) VALUES ('assistant-call', 'terminal-tool-round', 'assistant', '', 11, ?1, 1)",
+            params![tool_calls],
+        )
+        .expect("insert dangling tool call");
+        conn.pragma_update(None, "user_version", 28)
+            .expect("set v28 schema version");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate store");
+        let prompt = store
+            .get_messages_for_prompt("terminal-tool-round")
+            .expect("load repaired prompt");
+        assert_eq!(prompt.len(), 2);
+        assert_eq!(prompt[1].role, MessageRole::Tool);
+        assert_eq!(prompt[1].tool_call_id.as_deref(), Some("call-missing"));
+        assert_eq!(
+            prompt[1].content,
+            crate::session::history::INTERRUPTED_TOOL_RESULT
+        );
+
+        let output = dir.path().join("migrated-v28-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "terminal-tool-round",
+            "",
+            None,
+            None,
+            &output,
+        )
+        .expect("export repaired session");
+        let raw = std::fs::read_to_string(output).expect("read export");
+        assert!(raw.contains("call-missing"));
+        assert!(raw.contains(crate::session::history::INTERRUPTED_TOOL_RESULT));
+
+        let version: i32 = Connection::open(&db_path)
+            .expect("open migrated db")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+    }
+
+    #[test]
     fn v15_database_migrates_message_render_orders() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("locus.db");
@@ -8962,6 +9378,151 @@ mod tests {
                 "target user"
             ]
         );
+    }
+
+    #[test]
+    fn fork_from_assistant_tool_group_includes_its_persisted_outputs() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Tool boundary", None, None, "chat", None)
+            .expect("create session");
+        let tool_calls = serde_json::to_string(&vec![ToolCallInfo {
+            id: "call-read".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"filePath":"src/main.rs"}"#.to_string(),
+            order: Some(1),
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }])
+        .expect("serialize tool calls");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, tool_calls
+                 ) VALUES ('assistant-tool-group', ?1, 'assistant', '', 100, ?2)",
+                params![session_id, tool_calls],
+            )
+            .expect("insert assistant tool call");
+            conn.execute(
+                "INSERT INTO messages (
+                    id, session_id, role, content, created_at, tool_call_id
+                 ) VALUES ('tool-output', ?1, 'tool', 'file contents', 101, 'call-read')",
+                params![session_id],
+            )
+            .expect("insert tool output");
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES ('assistant-after', ?1, 'assistant', 'later response', 102)",
+                params![session_id],
+            )
+            .expect("insert later assistant");
+        }
+
+        let fork_id = store
+            .fork_session_from_message(&session_id, "assistant-tool-group", Some("Tool fork"))
+            .expect("fork complete tool group");
+        let messages = store.get_messages(&fork_id).expect("load fork messages");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call-read"));
+        assert_eq!(messages[1].content, "file contents");
+    }
+
+    #[test]
+    fn fork_before_latest_compaction_recovers_historical_prompt_window() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compacted source", None, None, "chat", None)
+            .expect("create session");
+        let prior_checkpoint =
+            compact::build_conversation_checkpoint_content("prior summary", "prior recent context");
+        let latest_checkpoint = compact::build_conversation_checkpoint_content(
+            "latest summary",
+            "latest recent context",
+        );
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, included) in [
+                ("before-old-compact", "user", "old history", 0i64),
+                ("prior-checkpoint", "user", prior_checkpoint.as_str(), 0),
+                ("after-prior-compact", "assistant", "continued work", 0),
+                ("fork-target", "user", "fork here", 0),
+                ("latest-checkpoint", "user", latest_checkpoint.as_str(), 1),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (
+                        id, session_id, role, content, created_at, include_in_prompt
+                     ) VALUES (?1, ?2, ?3, ?4, 100, ?5)",
+                    params![id, session_id, role, content, included],
+                )
+                .expect("insert compacted source message");
+            }
+        }
+
+        let fork_id = store
+            .fork_session_from_message(&session_id, "fork-target", Some("Historical fork"))
+            .expect("fork before latest compact");
+        let visible = store.get_messages(&fork_id).expect("load visible fork");
+        let prompt = store
+            .get_messages_for_prompt(&fork_id)
+            .expect("load reconstructed prompt");
+
+        assert_eq!(visible.len(), 4);
+        assert_eq!(prompt.len(), 3);
+        assert!(compact::is_conversation_checkpoint_content(
+            &prompt[0].content
+        ));
+        assert_eq!(prompt[1].content, "continued work");
+        assert_eq!(prompt[2].content, "fork here");
+    }
+
+    #[test]
+    fn fork_before_first_compaction_reactivates_selected_history() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("First compact source", None, None, "chat", None)
+            .expect("create session");
+        let latest_checkpoint =
+            compact::build_conversation_checkpoint_content("summary", "recent context");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            for (id, role, content, included) in [
+                ("first-user", "user", "original request", 0i64),
+                ("fork-target", "assistant", "work before compact", 0),
+                ("latest-checkpoint", "user", latest_checkpoint.as_str(), 1),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (
+                        id, session_id, role, content, created_at, include_in_prompt
+                     ) VALUES (?1, ?2, ?3, ?4, 100, ?5)",
+                    params![id, session_id, role, content, included],
+                )
+                .expect("insert source message");
+            }
+        }
+
+        let fork_id = store
+            .fork_session_from_message(&session_id, "fork-target", Some("Pre-compact fork"))
+            .expect("fork before first compact");
+        let prompt = store
+            .get_messages_for_prompt(&fork_id)
+            .expect("load reconstructed prompt");
+
+        assert_eq!(prompt.len(), 2);
+        assert_eq!(prompt[0].content, "original request");
+        assert_eq!(prompt[1].content, "work before compact");
     }
 
     #[test]

@@ -6,19 +6,33 @@ const root = process.cwd();
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 describe("agent parallel tool scheduling safety", () => {
-  it("keeps mutating rounds under the keyed workspace write lock", () => {
+  it("coordinates mutations while bypassing read-only tools", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const acquire = agent.indexOf("process_workspace_execution_lock(", agent.indexOf("let prepared"));
     const checkpoint = agent.indexOf("let pre_checkpoint", acquire);
     const release = agent.lastIndexOf("drop(workspace_round_guard.take())");
-    const afterRound = agent.indexOf(".after_round(", checkpoint);
+    const afterRound = agent.indexOf(".after_round_for_paths(", checkpoint);
 
-    expect(agent).toContain("WorkspaceExecutionLockMode::Write");
-    expect(agent).toContain("let execute_sequentially = workspace_lock_mode");
+    expect(agent).toContain("WorkspaceExecutionLockRequest::PathWrite");
+    expect(agent).toContain("WorkspaceExecutionLockRequest::Exclusive");
+    expect(agent).toContain("let execute_sequentially = workspace_lock_request.is_some()");
+    expect(agent).toContain("workspace_execution_request_for_tool");
+    expect(agent).toContain('matches!(target_name.as_str(), "write" | "edit")');
     expect(agent).toContain("if execute_sequentially");
     expect(acquire).toBeGreaterThan(0);
     expect(checkpoint).toBeGreaterThan(acquire);
     expect(release).toBeGreaterThan(afterRound);
+  });
+
+  it("serializes same-path writes while allowing distinct paths", () => {
+    const lock = read("src-tauri/src/agent/workspace_execution_lock.rs");
+
+    expect(lock).toContain("PathWrite(Vec<String>)");
+    expect(lock).toContain("path_gate.lock_owned().await");
+    expect(lock).toContain("gate.read_owned().await");
+    expect(lock).toContain("gate.write_owned().await");
+    expect(lock).toContain("same_path_writes_are_serialized");
+    expect(lock).toContain("distinct_path_writes_overlap_and_exclusive_waits_for_all");
   });
 
   it("batches same-file edits and runs distinct file batches in parallel", () => {
@@ -143,7 +157,8 @@ describe("agent parallel tool scheduling safety", () => {
     const execute = mcp.indexOf("execute_workspace_tool(&app", acquire);
     const release = mcp.indexOf("drop(workspace_guard)", execute);
 
-    expect(mcp).toContain("WorkspaceExecutionLockMode::Write");
+    expect(mcp).toContain("WorkspaceExecutionLockRequest::Exclusive");
+    expect(mcp).toContain("let workspace_guard = if let Some(request) = lock_request");
     expect(acquire).toBeGreaterThan(0);
     expect(execute).toBeGreaterThan(acquire);
     expect(release).toBeGreaterThan(execute);

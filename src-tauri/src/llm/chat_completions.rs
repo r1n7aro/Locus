@@ -1315,6 +1315,8 @@ fn finalize_stream_response(
         thinking_duration_secs: state.thinking_duration_secs,
         thinking_signature: String::new(),
         continuation_request: None,
+        response_items: Vec::new(),
+        response_completed: true,
     };
 
     if debug {

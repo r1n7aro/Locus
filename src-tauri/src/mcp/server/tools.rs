@@ -18,7 +18,7 @@ use super::http::ToolCallOutcome;
 use super::protocol::ToolListing;
 use crate::agent::instance::AgentInstance;
 use crate::agent::workspace_execution_lock::{
-    process_workspace_execution_lock, WorkspaceExecutionLockMode, WorkspaceExecutionLockOwner,
+    process_workspace_execution_lock, WorkspaceExecutionLockOwner, WorkspaceExecutionLockRequest,
 };
 use crate::tool::{ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
 
@@ -471,12 +471,12 @@ pub async fn execute_tool(
     let request_run_id = format!("mcp-{}", uuid::Uuid::new_v4());
     let fut = async {
         let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-        let lock_mode = if registry.mutates_workspace(&name)
+        let lock_request = if registry.mutates_workspace(&name)
             || AgentInstance::is_unity_execution_barrier_tool(&name)
         {
-            WorkspaceExecutionLockMode::Write
+            Some(WorkspaceExecutionLockRequest::Exclusive)
         } else {
-            WorkspaceExecutionLockMode::Read
+            None
         };
         let owner = WorkspaceExecutionLockOwner {
             session_id: "mcp-server".to_string(),
@@ -489,19 +489,23 @@ pub async fn execute_tool(
         // timeout drops this future, waiter registration and any acquired
         // guard are both released by Drop and leave an abandoned/released log.
         let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
-        let workspace_guard = match process_workspace_execution_lock(&working_dir)
-            .acquire_with_diagnostics(lock_mode, owner, lock_cancel_rx, &app)
-            .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                return outcome_from_tool_result(
-                    err(&format!(
-                        "Tool '{name}' was cancelled while waiting for the workspace lock."
-                    )),
-                    None,
-                );
+        let workspace_guard = if let Some(request) = lock_request {
+            match process_workspace_execution_lock(&working_dir)
+                .acquire_with_diagnostics(request, owner, lock_cancel_rx, &app)
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    return outcome_from_tool_result(
+                        err(&format!(
+                            "Tool '{name}' was cancelled while waiting for workspace mutation coordination."
+                        )),
+                        None,
+                    );
+                }
             }
+        } else {
+            None
         };
         let outcome =
             execute_workspace_tool(&app, &name, &arguments, &working_dir, runtime_state).await;

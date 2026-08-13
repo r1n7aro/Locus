@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{watch, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{
+    watch, Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock,
+};
 
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const POSSIBLE_DEADLOCK_AFTER: Duration = Duration::from_secs(30);
@@ -17,17 +20,36 @@ pub(crate) const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT: &str =
 static PROCESS_WORKSPACE_EXECUTION_LOCKS: LazyLock<Mutex<HashMap<String, WorkspaceExecutionLock>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceExecutionLockMode {
-    Read,
-    Write,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceExecutionLockRequest {
+    PathWrite(Vec<String>),
+    Exclusive,
 }
 
-impl WorkspaceExecutionLockMode {
-    fn label(self) -> &'static str {
+impl WorkspaceExecutionLockRequest {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
-            Self::Read => "read",
-            Self::Write => "write",
+            Self::PathWrite(_) => "path_write",
+            Self::Exclusive => "write",
+        }
+    }
+
+    pub(crate) fn path_keys(&self) -> Option<&[String]> {
+        match self {
+            Self::PathWrite(paths) => Some(paths),
+            Self::Exclusive => None,
+        }
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Exclusive, _) | (_, Self::Exclusive) => Self::Exclusive,
+            (Self::PathWrite(mut left), Self::PathWrite(right)) => {
+                left.extend(right);
+                left.sort();
+                left.dedup();
+                Self::PathWrite(left)
+            }
         }
     }
 }
@@ -97,12 +119,13 @@ pub(crate) enum WorkspaceExecutionLockAcquireError {
 #[derive(Debug, Clone)]
 struct TraceHolder {
     owner: WorkspaceExecutionLockOwner,
+    request: WorkspaceExecutionLockRequest,
     acquired_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct TraceWaiter {
-    mode: WorkspaceExecutionLockMode,
+    request: WorkspaceExecutionLockRequest,
     owner: WorkspaceExecutionLockOwner,
     requested_at: Instant,
 }
@@ -116,6 +139,7 @@ struct TraceState {
 
 struct WorkspaceExecutionLockInner {
     gate: Arc<RwLock<()>>,
+    path_gates: Mutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     trace: Mutex<TraceState>,
     next_lease_id: AtomicU64,
     wait_log_interval: Duration,
@@ -125,7 +149,7 @@ struct WorkspaceExecutionLockInner {
 struct WorkspaceExecutionWaitRegistration {
     lock: WorkspaceExecutionLock,
     lease_id: u64,
-    mode: WorkspaceExecutionLockMode,
+    request: WorkspaceExecutionLockRequest,
     owner: WorkspaceExecutionLockOwner,
     requested_at: Instant,
     active: bool,
@@ -139,14 +163,17 @@ pub(crate) struct WorkspaceExecutionLock {
 }
 
 enum OwnedWorkspaceExecutionGuard {
-    Read(OwnedRwLockReadGuard<()>),
-    Write(OwnedRwLockWriteGuard<()>),
+    PathWrite {
+        _mutation_guard: OwnedRwLockReadGuard<()>,
+        _path_guards: Vec<OwnedMutexGuard<()>>,
+    },
+    Exclusive(OwnedRwLockWriteGuard<()>),
 }
 
 pub(crate) struct WorkspaceExecutionGuard {
     lock: WorkspaceExecutionLock,
     lease_id: u64,
-    mode: WorkspaceExecutionLockMode,
+    request: WorkspaceExecutionLockRequest,
     owner: WorkspaceExecutionLockOwner,
     acquired_at: Instant,
     guard: Option<OwnedWorkspaceExecutionGuard>,
@@ -157,6 +184,7 @@ impl WorkspaceExecutionLock {
         Self {
             inner: Arc::new(WorkspaceExecutionLockInner {
                 gate: Arc::new(RwLock::new(())),
+                path_gates: Mutex::new(HashMap::new()),
                 trace: Mutex::new(TraceState::default()),
                 next_lease_id: AtomicU64::new(1),
                 wait_log_interval: WAIT_LOG_INTERVAL,
@@ -170,6 +198,7 @@ impl WorkspaceExecutionLock {
         Self {
             inner: Arc::new(WorkspaceExecutionLockInner {
                 gate: Arc::new(RwLock::new(())),
+                path_gates: Mutex::new(HashMap::new()),
                 trace: Mutex::new(TraceState::default()),
                 next_lease_id: AtomicU64::new(1),
                 wait_log_interval,
@@ -183,6 +212,26 @@ impl WorkspaceExecutionLock {
             .trace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn path_gates(&self, paths: &[String]) -> Vec<Arc<AsyncMutex<()>>> {
+        let mut registry = self
+            .inner
+            .path_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, gate| gate.strong_count() > 0);
+        paths
+            .iter()
+            .map(|path| {
+                if let Some(gate) = registry.get(path).and_then(std::sync::Weak::upgrade) {
+                    return gate;
+                }
+                let gate = Arc::new(AsyncMutex::new(()));
+                registry.insert(path.clone(), Arc::downgrade(&gate));
+                gate
+            })
+            .collect()
     }
 
     fn holder_summary(&self) -> String {
@@ -199,26 +248,31 @@ impl WorkspaceExecutionLock {
                 )
             })
             .unwrap_or_else(|| "writer=none".to_string());
-        let readers = trace
+        let path_writers = trace
             .readers
             .iter()
             .take(4)
             .map(|(lease_id, holder)| {
                 format!(
-                    "reader#{} held_ms={} {}",
+                    "path_writer#{} paths={} held_ms={} {}",
                     lease_id,
+                    holder.request.path_keys().map_or(0, <[String]>::len),
                     holder.acquired_at.elapsed().as_millis(),
                     holder.owner.summary()
                 )
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        let readers = if readers.is_empty() {
-            "readers=none".to_string()
+        let path_writers = if path_writers.is_empty() {
+            "path_writers=none".to_string()
         } else if trace.readers.len() > 4 {
-            format!("readers={} [{} | ...]", trace.readers.len(), readers)
+            format!(
+                "path_writers={} [{} | ...]",
+                trace.readers.len(),
+                path_writers
+            )
         } else {
-            format!("readers={} [{}]", trace.readers.len(), readers)
+            format!("path_writers={} [{}]", trace.readers.len(), path_writers)
         };
         let waiters = trace
             .waiters
@@ -228,7 +282,7 @@ impl WorkspaceExecutionLock {
                 format!(
                     "waiter#{} mode={} wait_ms={} {}",
                     lease_id,
-                    waiter.mode.label(),
+                    waiter.request.label(),
                     waiter.requested_at.elapsed().as_millis(),
                     waiter.owner.summary()
                 )
@@ -242,30 +296,42 @@ impl WorkspaceExecutionLock {
         } else {
             format!("waiters={} [{}]", trace.waiters.len(), waiters)
         };
-        format!("{}; {}; {}", writer, readers, waiters)
+        format!("{}; {}; {}", writer, path_writers, waiters)
     }
 
-    fn blockers(&self, mode: WorkspaceExecutionLockMode) -> Vec<WorkspaceExecutionLockBlocker> {
+    fn blockers(
+        &self,
+        request: &WorkspaceExecutionLockRequest,
+    ) -> Vec<WorkspaceExecutionLockBlocker> {
         let trace = self.trace();
         let mut blockers = Vec::new();
         if let Some((_, holder)) = trace.writer.as_ref() {
             blockers.push(WorkspaceExecutionLockBlocker {
                 session_id: holder.owner.session_id.clone(),
                 run_id: holder.owner.run_id.clone(),
-                mode: WorkspaceExecutionLockMode::Write.label().to_string(),
+                mode: holder.request.label().to_string(),
                 held_ms: duration_millis(holder.acquired_at.elapsed()),
                 tools: holder.owner.tools.clone(),
             });
         }
-        if mode == WorkspaceExecutionLockMode::Write {
+        let requested_paths = request.path_keys();
+        if matches!(request, WorkspaceExecutionLockRequest::Exclusive) || requested_paths.is_some()
+        {
             blockers.extend(
                 trace
                     .readers
                     .values()
+                    .filter(|holder| {
+                        matches!(request, WorkspaceExecutionLockRequest::Exclusive)
+                            || paths_overlap(
+                                requested_paths.unwrap_or_default(),
+                                holder.request.path_keys().unwrap_or_default(),
+                            )
+                    })
                     .map(|holder| WorkspaceExecutionLockBlocker {
                         session_id: holder.owner.session_id.clone(),
                         run_id: holder.owner.run_id.clone(),
-                        mode: WorkspaceExecutionLockMode::Read.label().to_string(),
+                        mode: holder.request.label().to_string(),
                         held_ms: duration_millis(holder.acquired_at.elapsed()),
                         tools: holder.owner.tools.clone(),
                     }),
@@ -277,7 +343,7 @@ impl WorkspaceExecutionLock {
     fn diagnostic(
         &self,
         active: bool,
-        mode: WorkspaceExecutionLockMode,
+        request: &WorkspaceExecutionLockRequest,
         owner: &WorkspaceExecutionLockOwner,
         waited: Duration,
     ) -> WorkspaceExecutionLockDiagnostic {
@@ -287,26 +353,26 @@ impl WorkspaceExecutionLock {
             run_id: owner.run_id.clone(),
             iteration: owner.iteration,
             workspace: owner.workspace.clone(),
-            mode: mode.label().to_string(),
+            mode: request.label().to_string(),
             waited_ms: duration_millis(waited),
             tools: owner.tools.clone(),
-            blockers: self.blockers(mode),
+            blockers: self.blockers(request),
         }
     }
 
     #[cfg(test)]
     async fn acquire(
         &self,
-        mode: WorkspaceExecutionLockMode,
+        request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
         cancel_rx: watch::Receiver<bool>,
     ) -> Result<WorkspaceExecutionGuard, WorkspaceExecutionLockAcquireError> {
-        self.acquire_inner(mode, owner, cancel_rx, None).await
+        self.acquire_inner(request, owner, cancel_rx, None).await
     }
 
     pub(crate) async fn acquire_with_diagnostics(
         &self,
-        mode: WorkspaceExecutionLockMode,
+        request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
         cancel_rx: watch::Receiver<bool>,
         app_handle: &AppHandle,
@@ -322,31 +388,38 @@ impl WorkspaceExecutionLock {
                 );
             }
         });
-        self.acquire_inner(mode, owner, cancel_rx, Some(reporter))
+        self.acquire_inner(request, owner, cancel_rx, Some(reporter))
             .await
     }
 
     #[cfg(test)]
     async fn acquire_with_reporter(
         &self,
-        mode: WorkspaceExecutionLockMode,
+        request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
         cancel_rx: watch::Receiver<bool>,
         reporter: WorkspaceExecutionLockDiagnosticReporter,
     ) -> Result<WorkspaceExecutionGuard, WorkspaceExecutionLockAcquireError> {
-        self.acquire_inner(mode, owner, cancel_rx, Some(reporter))
+        self.acquire_inner(request, owner, cancel_rx, Some(reporter))
             .await
     }
 
     async fn acquire_inner(
         &self,
-        mode: WorkspaceExecutionLockMode,
+        mut request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
         mut cancel_rx: watch::Receiver<bool>,
         diagnostic_reporter: Option<WorkspaceExecutionLockDiagnosticReporter>,
     ) -> Result<WorkspaceExecutionGuard, WorkspaceExecutionLockAcquireError> {
         if *cancel_rx.borrow() {
             return Err(WorkspaceExecutionLockAcquireError::Cancelled);
+        }
+        if let WorkspaceExecutionLockRequest::PathWrite(paths) = &mut request {
+            paths.sort();
+            paths.dedup();
+            if paths.is_empty() {
+                request = WorkspaceExecutionLockRequest::Exclusive;
+            }
         }
 
         let lease_id = self.inner.next_lease_id.fetch_add(1, Ordering::Relaxed);
@@ -355,7 +428,7 @@ impl WorkspaceExecutionLock {
             self.trace().waiters.insert(
                 lease_id,
                 TraceWaiter {
-                    mode,
+                    request: request.clone(),
                     owner: owner.clone(),
                     requested_at,
                 },
@@ -364,7 +437,7 @@ impl WorkspaceExecutionLock {
         let mut wait_registration = WorkspaceExecutionWaitRegistration {
             lock: self.clone(),
             lease_id,
-            mode,
+            request: request.clone(),
             owner: owner.clone(),
             requested_at,
             active: true,
@@ -374,21 +447,31 @@ impl WorkspaceExecutionLock {
         eprintln!(
             "[WorkspaceExecutionLock] requested lease={} mode={} {} holders=({})",
             lease_id,
-            mode.label(),
+            request.label(),
             owner.summary(),
             self.holder_summary()
         );
 
         let gate = self.inner.gate.clone();
+        let path_gates = match &request {
+            WorkspaceExecutionLockRequest::PathWrite(paths) => self.path_gates(paths),
+            WorkspaceExecutionLockRequest::Exclusive => Vec::new(),
+        };
         let mut acquire_future: Pin<Box<dyn Future<Output = OwnedWorkspaceExecutionGuard> + Send>> =
-            match mode {
-                WorkspaceExecutionLockMode::Read => {
-                    Box::pin(
-                        async move { OwnedWorkspaceExecutionGuard::Read(gate.read_owned().await) },
-                    )
-                }
-                WorkspaceExecutionLockMode::Write => Box::pin(async move {
-                    OwnedWorkspaceExecutionGuard::Write(gate.write_owned().await)
+            match &request {
+                WorkspaceExecutionLockRequest::PathWrite(_) => Box::pin(async move {
+                    let mutation_guard = gate.read_owned().await;
+                    let mut path_guards = Vec::with_capacity(path_gates.len());
+                    for path_gate in path_gates {
+                        path_guards.push(path_gate.lock_owned().await);
+                    }
+                    OwnedWorkspaceExecutionGuard::PathWrite {
+                        _mutation_guard: mutation_guard,
+                        _path_guards: path_guards,
+                    }
+                }),
+                WorkspaceExecutionLockRequest::Exclusive => Box::pin(async move {
+                    OwnedWorkspaceExecutionGuard::Exclusive(gate.write_owned().await)
                 }),
             };
         let mut wait_log = tokio::time::interval_at(
@@ -406,13 +489,14 @@ impl WorkspaceExecutionLock {
                         trace.waiters.remove(&lease_id);
                         let holder = TraceHolder {
                             owner: owner.clone(),
+                            request: request.clone(),
                             acquired_at,
                         };
-                        match mode {
-                            WorkspaceExecutionLockMode::Read => {
+                        match &request {
+                            WorkspaceExecutionLockRequest::PathWrite(_) => {
                                 trace.readers.insert(lease_id, holder);
                             }
-                            WorkspaceExecutionLockMode::Write => {
+                            WorkspaceExecutionLockRequest::Exclusive => {
                                 trace.writer = Some((lease_id, holder));
                             }
                         }
@@ -422,14 +506,14 @@ impl WorkspaceExecutionLock {
                     eprintln!(
                         "[WorkspaceExecutionLock] acquired lease={} mode={} wait_ms={} {}",
                         lease_id,
-                        mode.label(),
+                        request.label(),
                         requested_at.elapsed().as_millis(),
                         owner.summary()
                     );
                     return Ok(WorkspaceExecutionGuard {
                         lock: self.clone(),
                         lease_id,
-                        mode,
+                        request,
                         owner,
                         acquired_at,
                         guard: Some(guard),
@@ -444,7 +528,7 @@ impl WorkspaceExecutionLock {
                     eprintln!(
                         "[WorkspaceExecutionLock] cancelled lease={} mode={} wait_ms={} {} holders=({})",
                         lease_id,
-                        mode.label(),
+                        request.label(),
                         requested_at.elapsed().as_millis(),
                         owner.summary(),
                         self.holder_summary()
@@ -456,7 +540,7 @@ impl WorkspaceExecutionLock {
                     eprintln!(
                         "[WorkspaceExecutionLock] waiting lease={} mode={} wait_ms={} possible_deadlock={} {} holders=({})",
                         lease_id,
-                        mode.label(),
+                        request.label(),
                         waited.as_millis(),
                         waited >= self.inner.possible_deadlock_after,
                         owner.summary(),
@@ -473,6 +557,16 @@ impl WorkspaceExecutionLock {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn paths_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|path| right.binary_search(path).is_ok())
+}
+
+impl WorkspaceExecutionGuard {
+    pub(crate) fn path_keys(&self) -> Option<&[String]> {
+        self.request.path_keys()
+    }
 }
 
 impl WorkspaceExecutionWaitRegistration {
@@ -492,7 +586,10 @@ impl WorkspaceExecutionWaitRegistration {
             return;
         };
         self.diagnostic_active = true;
-        reporter(self.lock.diagnostic(true, self.mode, &self.owner, waited));
+        reporter(
+            self.lock
+                .diagnostic(true, &self.request, &self.owner, waited),
+        );
     }
 
     fn clear_diagnostic(&mut self, waited: Duration) {
@@ -501,7 +598,10 @@ impl WorkspaceExecutionWaitRegistration {
         }
         self.diagnostic_active = false;
         if let Some(reporter) = self.diagnostic_reporter.as_ref() {
-            reporter(self.lock.diagnostic(false, self.mode, &self.owner, waited));
+            reporter(
+                self.lock
+                    .diagnostic(false, &self.request, &self.owner, waited),
+            );
         }
     }
 }
@@ -517,7 +617,7 @@ impl Drop for WorkspaceExecutionWaitRegistration {
         eprintln!(
             "[WorkspaceExecutionLock] abandoned lease={} mode={} wait_ms={} {} holders=({})",
             self.lease_id,
-            self.mode.label(),
+            self.request.label(),
             self.requested_at.elapsed().as_millis(),
             self.owner.summary(),
             self.lock.holder_summary()
@@ -534,15 +634,21 @@ impl Drop for WorkspaceExecutionGuard {
         let mut trace = self.lock.trace();
         if let Some(guard) = self.guard.take() {
             match guard {
-                OwnedWorkspaceExecutionGuard::Read(guard) => drop(guard),
-                OwnedWorkspaceExecutionGuard::Write(guard) => drop(guard),
+                OwnedWorkspaceExecutionGuard::PathWrite {
+                    _mutation_guard,
+                    _path_guards,
+                } => {
+                    drop(_path_guards);
+                    drop(_mutation_guard);
+                }
+                OwnedWorkspaceExecutionGuard::Exclusive(guard) => drop(guard),
             }
         }
-        match self.mode {
-            WorkspaceExecutionLockMode::Read => {
+        match &self.request {
+            WorkspaceExecutionLockRequest::PathWrite(_) => {
                 trace.readers.remove(&self.lease_id);
             }
-            WorkspaceExecutionLockMode::Write => {
+            WorkspaceExecutionLockRequest::Exclusive => {
                 if trace
                     .writer
                     .as_ref()
@@ -555,7 +661,7 @@ impl Drop for WorkspaceExecutionGuard {
         eprintln!(
             "[WorkspaceExecutionLock] released lease={} mode={} held_ms={} {}",
             self.lease_id,
-            self.mode.label(),
+            self.request.label(),
             self.acquired_at.elapsed().as_millis(),
             self.owner.summary()
         );
@@ -588,6 +694,62 @@ fn normalize_workspace_key(workspace: &str) -> String {
     key
 }
 
+pub(crate) fn normalize_workspace_path_key(workspace: &str, raw_path: &str) -> String {
+    use std::path::Component;
+
+    let requested = std::path::PathBuf::from(raw_path.trim());
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        std::path::Path::new(workspace).join(requested)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|part| matches!(part, Component::Normal(_)))
+                {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    let mut anchor = normalized.clone();
+    let mut suffix = Vec::new();
+    while !anchor.exists() {
+        let Some(name) = anchor.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = anchor.parent() else {
+            break;
+        };
+        anchor = parent.to_path_buf();
+    }
+    let mut resolved = dunce::canonicalize(&anchor).unwrap_or(anchor);
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    let key = dunce::simplified(&resolved)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
 pub(crate) fn process_workspace_execution_lock(workspace: &str) -> WorkspaceExecutionLock {
     let key = normalize_workspace_key(workspace);
     let mut locks = PROCESS_WORKSPACE_EXECUTION_LOCKS
@@ -604,8 +766,8 @@ mod tests {
     use super::{
         process_workspace_execution_lock, WorkspaceExecutionLock,
         WorkspaceExecutionLockAcquireError, WorkspaceExecutionLockDiagnostic,
-        WorkspaceExecutionLockDiagnosticReporter, WorkspaceExecutionLockMode,
-        WorkspaceExecutionLockOwner,
+        WorkspaceExecutionLockDiagnosticReporter, WorkspaceExecutionLockOwner,
+        WorkspaceExecutionLockRequest,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -636,7 +798,7 @@ mod tests {
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let writer = lock_a
             .acquire(
-                WorkspaceExecutionLockMode::Write,
+                WorkspaceExecutionLockRequest::Exclusive,
                 owner("workspace-a-writer"),
                 cancel_rx.clone(),
             )
@@ -648,7 +810,7 @@ mod tests {
             async move {
                 same_workspace_lock
                     .acquire(
-                        WorkspaceExecutionLockMode::Read,
+                        WorkspaceExecutionLockRequest::PathWrite(vec!["a.txt".to_string()]),
                         owner("workspace-a-reader"),
                         cancel_rx,
                     )
@@ -664,7 +826,7 @@ mod tests {
         let other_workspace_reader = tokio::time::timeout(
             Duration::from_millis(100),
             lock_b.acquire(
-                WorkspaceExecutionLockMode::Read,
+                WorkspaceExecutionLockRequest::PathWrite(vec!["b.txt".to_string()]),
                 owner("workspace-b-reader"),
                 cancel_rx,
             ),
@@ -679,12 +841,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readers_overlap_and_writer_waits_for_all_readers() {
+    async fn distinct_path_writes_overlap_and_exclusive_waits_for_all() {
         let lock = WorkspaceExecutionLock::new();
         let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let first_reader = lock
             .acquire(
-                WorkspaceExecutionLockMode::Read,
+                WorkspaceExecutionLockRequest::PathWrite(vec!["a.txt".to_string()]),
                 owner("reader-1"),
                 cancel_rx.clone(),
             )
@@ -693,7 +855,7 @@ mod tests {
         let second_reader = tokio::time::timeout(
             Duration::from_millis(100),
             lock.acquire(
-                WorkspaceExecutionLockMode::Read,
+                WorkspaceExecutionLockRequest::PathWrite(vec!["b.txt".to_string()]),
                 owner("reader-2"),
                 cancel_rx.clone(),
             ),
@@ -707,7 +869,7 @@ mod tests {
         let mut writer = tokio::spawn(async move {
             writer_lock
                 .acquire(
-                    WorkspaceExecutionLockMode::Write,
+                    WorkspaceExecutionLockRequest::Exclusive,
                     owner("writer"),
                     writer_cancel,
                 )
@@ -728,12 +890,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_path_writes_are_serialized() {
+        let lock = WorkspaceExecutionLock::new();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let first = lock
+            .acquire(
+                WorkspaceExecutionLockRequest::PathWrite(vec!["same.txt".to_string()]),
+                owner("path-writer-1"),
+                cancel_rx.clone(),
+            )
+            .await
+            .expect("first path writer");
+
+        let waiting_lock = lock.clone();
+        let mut second = tokio::spawn(async move {
+            waiting_lock
+                .acquire(
+                    WorkspaceExecutionLockRequest::PathWrite(vec!["same.txt".to_string()]),
+                    owner("path-writer-2"),
+                    cancel_rx,
+                )
+                .await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second)
+            .await
+            .is_err());
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("same-path writer should acquire after release")
+            .expect("same-path writer task")
+            .expect("same-path writer guard");
+        drop(second);
+    }
+
+    #[tokio::test]
     async fn waiting_acquisition_is_cancellable() {
         let lock = WorkspaceExecutionLock::new();
         let (_holder_cancel_tx, holder_cancel) = tokio::sync::watch::channel(false);
         let holder = lock
             .acquire(
-                WorkspaceExecutionLockMode::Write,
+                WorkspaceExecutionLockRequest::Exclusive,
                 owner("holder"),
                 holder_cancel,
             )
@@ -745,7 +943,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_lock
                 .acquire(
-                    WorkspaceExecutionLockMode::Read,
+                    WorkspaceExecutionLockRequest::PathWrite(vec!["a.txt".to_string()]),
                     owner("waiting"),
                     cancel_rx,
                 )
@@ -766,7 +964,7 @@ mod tests {
         let (_holder_cancel_tx, holder_cancel) = tokio::sync::watch::channel(false);
         let holder = lock
             .acquire(
-                WorkspaceExecutionLockMode::Write,
+                WorkspaceExecutionLockRequest::Exclusive,
                 owner("holder"),
                 holder_cancel,
             )
@@ -778,7 +976,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_lock
                 .acquire(
-                    WorkspaceExecutionLockMode::Read,
+                    WorkspaceExecutionLockRequest::PathWrite(vec!["a.txt".to_string()]),
                     owner("aborted-waiter"),
                     waiter_cancel,
                 )
@@ -801,7 +999,7 @@ mod tests {
         let (_holder_cancel_tx, holder_cancel) = tokio::sync::watch::channel(false);
         let holder = lock
             .acquire(
-                WorkspaceExecutionLockMode::Write,
+                WorkspaceExecutionLockRequest::Exclusive,
                 owner("holder"),
                 holder_cancel,
             )
@@ -821,7 +1019,7 @@ mod tests {
         let mut waiting = tokio::spawn(async move {
             waiting_lock
                 .acquire_with_reporter(
-                    WorkspaceExecutionLockMode::Write,
+                    WorkspaceExecutionLockRequest::Exclusive,
                     owner("waiting"),
                     waiter_cancel,
                     reporter,

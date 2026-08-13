@@ -1584,7 +1584,7 @@ fn build_anthropic_messages(
     history: &[ChatMessage],
     options: AnthropicHistoryOptions,
 ) -> Vec<AnthropicMessage> {
-    let history = crate::session::history::normalize_tool_round_history(history);
+    let history = crate::session::history::normalize_tool_round_history_for_request(history);
     let mut messages: Vec<AnthropicMessage> = Vec::new();
 
     let mut i = 0;

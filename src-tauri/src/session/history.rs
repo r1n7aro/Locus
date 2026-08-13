@@ -45,6 +45,23 @@ pub fn collect_assistant_tool_calls(messages: &[ChatMessage]) -> Vec<ToolCallInf
 }
 
 pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    normalize_tool_round_history_impl(messages, false)
+}
+
+/// Normalizes persisted history for an outbound model request.
+///
+/// A trailing assistant tool call can be genuinely pending while a run is
+/// active, so the display-oriented normalizer above leaves it untouched. Once
+/// persisted history is replayed to a provider, every local tool call must have
+/// a matching output. Codex Responses rejects the entire request otherwise.
+pub fn normalize_tool_round_history_for_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    normalize_tool_round_history_impl(messages, true)
+}
+
+fn normalize_tool_round_history_impl(
+    messages: &[ChatMessage],
+    close_trailing_tool_round: bool,
+) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(messages.len());
     let mut i = 0usize;
 
@@ -93,7 +110,8 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
         }
 
         let has_following_message = i < messages.len();
-        let interrupted_tool_ids: HashSet<String> = if has_following_message {
+        let tool_round_is_closed = has_following_message || close_trailing_tool_round;
+        let interrupted_tool_ids: HashSet<String> = if tool_round_is_closed {
             expected_tool_call_ids
                 .iter()
                 .filter(|tool_call_id| !present_tool_ids.contains(tool_call_id.as_str()))
@@ -109,14 +127,14 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
                 tool_calls,
                 &observed_tool_outputs,
                 &interrupted_tool_ids,
-                has_following_message,
+                tool_round_is_closed,
             ));
         }
 
         normalized.push(assistant_message);
         normalized.extend(following_tool_messages);
 
-        if !has_following_message {
+        if !tool_round_is_closed {
             continue;
         }
 
@@ -124,10 +142,21 @@ pub fn normalize_tool_round_history(messages: &[ChatMessage]) -> Vec<ChatMessage
             if present_tool_ids.contains(tool_call_id.as_str()) {
                 continue;
             }
-            normalized.push(build_interrupted_tool_result_message(
+            let fallback_output = msg
+                .tool_calls
+                .as_ref()
+                .and_then(|tool_calls| {
+                    tool_calls
+                        .iter()
+                        .find(|tool_call| tool_call.id == tool_call_id)
+                })
+                .and_then(|tool_call| tool_call.recorded_output.as_deref())
+                .unwrap_or(INTERRUPTED_TOOL_RESULT);
+            normalized.push(build_synthetic_tool_result_message(
                 msg.created_at,
                 &msg.id,
                 tool_call_id.as_str(),
+                fallback_output,
             ));
         }
     }
@@ -219,15 +248,16 @@ fn infer_embedded_tool_outcome(tool_call: &ToolCallInfo) -> Option<ToolCallOutco
     }
 }
 
-fn build_interrupted_tool_result_message(
+fn build_synthetic_tool_result_message(
     created_at: i64,
     assistant_message_id: &str,
     tool_call_id: &str,
+    content: &str,
 ) -> ChatMessage {
     ChatMessage {
         id: synthetic_tool_result_message_id(assistant_message_id, tool_call_id),
         role: MessageRole::Tool,
-        content: INTERRUPTED_TOOL_RESULT.to_string(),
+        content: content.to_string(),
         created_at,
         prompt_prefix: None,
         prompt_suffix: None,
@@ -256,7 +286,8 @@ fn synthetic_tool_result_message_id(assistant_message_id: &str, tool_call_id: &s
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_assistant_tool_calls, normalize_tool_round_history, INTERRUPTED_TOOL_RESULT,
+        collect_assistant_tool_calls, normalize_tool_round_history,
+        normalize_tool_round_history_for_request, INTERRUPTED_TOOL_RESULT,
     };
     use crate::commands::ToolCallOutcome;
     use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
@@ -563,6 +594,52 @@ mod tests {
         let normalized = normalize_tool_round_history(&messages);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn closes_trailing_tool_round_for_outbound_requests() {
+        let messages = vec![assistant_with_tools(
+            "assistant-1",
+            vec![ToolCallInfo {
+                id: "tc-1".to_string(),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: Some(ToolCallOutcome::Done),
+                recorded_output: None,
+                nested_tool_calls: None,
+            }],
+        )];
+
+        let normalized = normalize_tool_round_history_for_request(&messages);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[1].role, MessageRole::Tool);
+        assert_eq!(normalized[1].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(normalized[1].content, INTERRUPTED_TOOL_RESULT);
+    }
+
+    #[test]
+    fn replays_recorded_output_when_the_persisted_tool_message_is_missing() {
+        let messages = vec![assistant_with_tools(
+            "assistant-1",
+            vec![ToolCallInfo {
+                id: "tc-1".to_string(),
+                name: "background".to_string(),
+                arguments: "{}".to_string(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: Some(ToolCallOutcome::Done),
+                recorded_output: Some("completed in background".to_string()),
+                nested_tool_calls: None,
+            }],
+        )];
+
+        let normalized = normalize_tool_round_history_for_request(&messages);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[1].content, "completed in background");
     }
 
     #[test]

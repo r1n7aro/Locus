@@ -657,7 +657,7 @@ pub fn estimate_request_tokens(
 }
 
 pub fn prepare_messages_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let normalized = crate::session::history::normalize_tool_round_history(messages);
+    let normalized = crate::session::history::normalize_tool_round_history_for_request(messages);
     crate::session::history::materialize_prompt_edits(&normalized)
 }
 

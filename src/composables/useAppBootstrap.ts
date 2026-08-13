@@ -156,7 +156,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       return;
     }
 
-    const mode = payload.mode === "write"
+    const mode = payload.mode === "write" || payload.mode === "path_write"
       ? t("chat.workspaceLock.mode.write")
       : t("chat.workspaceLock.mode.read");
     const tools = payload.tools.slice(0, 3).join(", ") || t("chat.workspaceLock.noTools");

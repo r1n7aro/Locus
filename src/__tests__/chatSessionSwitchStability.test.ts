@@ -56,7 +56,7 @@ describe("chat session switch stability", () => {
     expect(transcript).toContain("(e: \"userScrollIntent\", event: Event): void;");
     expect(transcript).toContain("@wheel.passive=\"emitUserScrollIntent\"");
     expect(transcript).toContain("@pointermove.passive=\"emitPointerMoveScrollIntent\"");
-    expect(transcript).toContain(':data-scroll-anchor-id="group.items[group.items.length - 1]?.id"');
+    expect(transcript).toContain(':data-scroll-anchor-id="group.endMessageId"');
     expect(transcript).not.toContain(".chat-transcript-scroll.is-session.is-session-restore-stabilizing .chat-transcript-message.is-session");
     expect(transcript).toContain("content-visibility: auto;");
     expect(chatView).not.toContain("chat-transcript-restoring");

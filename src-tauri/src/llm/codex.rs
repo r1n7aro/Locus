@@ -32,6 +32,8 @@ use url::Url;
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+const CODEX_BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
+const REMOTE_COMPACTION_V2_BETA_FEATURE: &str = "remote_compaction_v2";
 const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
@@ -164,6 +166,7 @@ pub struct CodexStreamOptions {
     pub include_web_search: bool,
     pub use_session_continuation: bool,
     pub fast_mode: bool,
+    remote_compaction_v2: bool,
     structured_output: Option<CodexStructuredOutput>,
 }
 
@@ -179,6 +182,7 @@ impl Default for CodexStreamOptions {
             include_web_search: true,
             use_session_continuation: true,
             fast_mode: false,
+            remote_compaction_v2: false,
             structured_output: None,
         }
     }
@@ -190,6 +194,20 @@ impl CodexStreamOptions {
             include_web_search: false,
             use_session_continuation: false,
             fast_mode: false,
+            remote_compaction_v2: false,
+            structured_output: None,
+        }
+    }
+
+    /// Codex main's stable remote-compaction path: send the current prompt to
+    /// `/responses` with a terminal `compaction_trigger` request item and
+    /// expect exactly one encrypted compaction output item.
+    pub fn remote_compaction_v2() -> Self {
+        Self {
+            include_web_search: true,
+            use_session_continuation: false,
+            fast_mode: false,
+            remote_compaction_v2: true,
             structured_output: None,
         }
     }
@@ -372,6 +390,13 @@ fn build_input_with_metadata(
     history: &[ChatMessage],
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Vec<serde_json::Value> {
+    // Match codex-rs history normalization at the final transport boundary.
+    // A historical fork or interrupted run may end with a persisted function
+    // call whose tool message was never copied. Responses requires a matching
+    // output for every call, including remote-compaction requests.
+    let normalized_history =
+        crate::session::history::normalize_tool_round_history_for_request(history);
+    let history = normalized_history.as_slice();
     // call_ids of tool_search rounds; their Tool messages must replay as
     // tool_search_output items rather than function_call_output.
     let tool_search_call_ids: std::collections::HashSet<&str> = history
@@ -571,6 +596,13 @@ fn build_request_body(
         "stream": true,
         "store": false,
     });
+
+    if options.remote_compaction_v2 {
+        body["input"]
+            .as_array_mut()
+            .expect("Codex request input must be an array")
+            .push(serde_json::json!({ "type": "compaction_trigger" }));
+    }
 
     if options.use_session_continuation {
         if let Some(sid) = session_id {
@@ -941,7 +973,15 @@ fn codex_provider_base_url(base_url: Option<&str>) -> &str {
 }
 
 fn codex_responses_endpoint(base_url: Option<&str>) -> String {
-    let base_url = codex_provider_base_url(base_url).trim_end_matches('/');
+    let configured_base_url = codex_provider_base_url(base_url).trim_end_matches('/');
+    // `base_url` is shared with other providers in the app. Normalize the
+    // common ChatGPT backend root to Codex's provider prefix so a valid global
+    // override cannot accidentally produce `/backend-api/responses` (404).
+    let base_url = if configured_base_url.eq_ignore_ascii_case("https://chatgpt.com/backend-api") {
+        DEFAULT_CODEX_PROVIDER_BASE_URL
+    } else {
+        configured_base_url
+    };
     if base_url.ends_with(RESPONSES_ENDPOINT_PATH) {
         base_url.to_string()
     } else {
@@ -1213,6 +1253,127 @@ pub async fn compact_conversation_history(
     Ok(outcome)
 }
 
+const REMOTE_COMPACTION_V2_RETAINED_BYTES: usize = 64_000 * 4;
+
+fn retained_remote_compaction_v2_window(
+    history: &[ChatMessage],
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    compaction_item: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let input = build_input_with_metadata(history, response_request_metadata);
+    let mut remaining = REMOTE_COMPACTION_V2_RETAINED_BYTES;
+    let mut retained_reversed = Vec::new();
+
+    for item in input.into_iter().rev() {
+        let role = item.get("role").and_then(|value| value.as_str());
+        // Locus stores assistant entries as completed answers. Codex main
+        // excludes final agent answers from the retained V2 window, while
+        // retaining user/developer/system context around the opaque summary.
+        if !matches!(role, Some("user" | "developer" | "system")) {
+            continue;
+        }
+        let serialized_bytes = serde_json::to_vec(&item).map_or(usize::MAX, |value| value.len());
+        if serialized_bytes > remaining {
+            continue;
+        }
+        remaining = remaining.saturating_sub(serialized_bytes);
+        retained_reversed.push(item);
+    }
+
+    retained_reversed.reverse();
+    retained_reversed.push(compaction_item);
+    retained_reversed
+}
+
+fn validate_remote_compaction_v2_output(
+    response_items: &[serde_json::Value],
+    response_completed: bool,
+) -> Result<serde_json::Value, String> {
+    if !response_completed {
+        return Err(
+            "Codex remote compaction V2 stream ended without response.completed".to_string(),
+        );
+    }
+    if response_items.len() != 1
+        || response_items[0]
+            .get("type")
+            .and_then(|value| value.as_str())
+            != Some("compaction")
+    {
+        return Err(format!(
+            "Codex remote compaction V2 expected exactly one compaction output item, got {} output items with types {:?}",
+            response_items.len(),
+            response_items
+                .iter()
+                .map(|item| item.get("type").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(response_items[0].clone())
+}
+
+/// Runs Codex main's current stable remote-compaction protocol. V2 uses the
+/// ordinary Responses transport with a terminal `compaction_trigger` instead
+/// of the legacy unary `/responses/compact` endpoint.
+pub async fn compact_conversation_history_v2(
+    access_token: &str,
+    account_id: Option<&str>,
+    transport: CodexTransportMode,
+    base_url: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    fast_mode: bool,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    debug: bool,
+) -> Result<CodexRemoteCompactOutcome, CodexRemoteCompactError> {
+    let mut turn_state = TurnState::default();
+    let response = stream_chat_with_options(
+        access_token,
+        account_id,
+        transport,
+        base_url,
+        model,
+        system_prompt,
+        history,
+        tools,
+        None,
+        thinking_level,
+        debug,
+        session_id,
+        response_request_metadata,
+        &mut turn_state,
+        CodexStreamOptions::remote_compaction_v2().with_fast_mode(fast_mode),
+        &|_| {},
+        &|_| {},
+        &|_, _| {},
+    )
+    .await
+    .map_err(|error| CodexRemoteCompactError::new(error, "", ""))?;
+
+    let compaction_item =
+        validate_remote_compaction_v2_output(&response.response_items, response.response_completed)
+            .map_err(|error| {
+                CodexRemoteCompactError::new(
+                    error,
+                    response.raw_request.clone(),
+                    response.raw_response.clone(),
+                )
+            })?;
+    let output =
+        retained_remote_compaction_v2_window(history, response_request_metadata, compaction_item);
+    let encrypted_content = extract_compaction_encrypted_content(&output);
+    Ok(CodexRemoteCompactOutcome {
+        output,
+        encrypted_content,
+        raw_request: response.raw_request,
+        raw_response: response.raw_response,
+    })
+}
+
 fn codex_websocket_url(base_url: Option<&str>) -> Result<Url, String> {
     let mut url = Url::parse(&codex_responses_endpoint(base_url))
         .map_err(|e| format!("Failed to parse websocket endpoint: {}", e))?;
@@ -1237,6 +1398,7 @@ fn build_codex_websocket_handshake_request(
     access_token: &str,
     account_id: Option<&str>,
     session_id: Option<&str>,
+    routing_hint: Option<&str>,
     turn_state: Option<&str>,
 ) -> Result<http::Request<()>, String> {
     let mut request = ws_url
@@ -1255,6 +1417,10 @@ fn build_codex_websocket_handshake_request(
     request.headers_mut().insert(
         "OpenAI-Beta",
         http::HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
+    );
+    request.headers_mut().insert(
+        CODEX_BETA_FEATURES_HEADER,
+        http::HeaderValue::from_static(REMOTE_COMPACTION_V2_BETA_FEATURE),
     );
     request.headers_mut().insert(
         "originator",
@@ -1277,7 +1443,17 @@ fn build_codex_websocket_handshake_request(
         request
             .headers_mut()
             .insert("x-client-request-id", header_value.clone());
-        request.headers_mut().insert("session_id", header_value);
+        request
+            .headers_mut()
+            .insert("session-id", header_value.clone());
+        request.headers_mut().insert("thread-id", header_value);
+    }
+    if let Some(routing_hint) = routing_hint {
+        request.headers_mut().insert(
+            X_CODEX_ROUTING_HINT_HEADER,
+            http::HeaderValue::from_str(routing_hint)
+                .map_err(|e| format!("Failed to build routing-hint header: {}", e))?,
+        );
     }
     if let Some(aid) = account_id {
         request.headers_mut().insert(
@@ -1857,6 +2033,7 @@ struct CodexStreamState {
     response_id: Option<String>,
     items_added: Vec<serde_json::Value>,
     got_terminal_event: bool,
+    got_completed_event: bool,
 }
 
 impl CodexStreamState {
@@ -1879,6 +2056,7 @@ impl CodexStreamState {
             response_id: None,
             items_added: Vec::new(),
             got_terminal_event: false,
+            got_completed_event: false,
         }
     }
 
@@ -2324,6 +2502,8 @@ where
                 }
                 Some("response.completed") | Some("response.incomplete") => {
                     state.got_terminal_event = true;
+                    state.got_completed_event = event.get("type").and_then(|value| value.as_str())
+                        == Some("response.completed");
                     state.finish_thinking_timing();
                     if let Some(response) = event.get("response") {
                         state.end_turn = response.get("end_turn").and_then(|value| value.as_bool());
@@ -2714,6 +2894,7 @@ where
                 model,
                 history,
                 tools,
+                session_id,
                 debug,
                 body,
                 transport_response_request_metadata,
@@ -2731,6 +2912,7 @@ where
                 model,
                 history,
                 tools,
+                session_id,
                 transport_session_id,
                 debug,
                 body.clone(),
@@ -2750,6 +2932,7 @@ where
                         model,
                         history,
                         tools,
+                        session_id,
                         debug,
                         body,
                         transport_response_request_metadata,
@@ -2771,6 +2954,7 @@ async fn stream_chat_http_once<F, G, H>(
     model: &str,
     history: &[ChatMessage],
     tools: &[serde_json::Value],
+    session_id: Option<&str>,
     debug: bool,
     body: serde_json::Value,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
@@ -2799,6 +2983,11 @@ where
     );
     let raw_request = serde_json::to_string_pretty(&request_body).unwrap_or_default();
     let api_url = codex_responses_endpoint(base_url);
+    let fast_mode = request_body
+        .get("service_tier")
+        .and_then(|value| value.as_str())
+        == Some("priority");
+    let routing_hint = codex_routing_hint(model, fast_mode);
 
     eprintln!(
         "[OpenAI Codex][http] POST model={} messages={} tools={}",
@@ -2813,7 +3002,17 @@ where
             ("Content-Type", "application/json"),
             ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
             ("version", CODEX_CLIENT_VERSION),
+            (
+                CODEX_BETA_FEATURES_HEADER,
+                REMOTE_COMPACTION_V2_BETA_FEATURE,
+            ),
+            (X_CODEX_ROUTING_HINT_HEADER, routing_hint.as_str()),
         ];
+        if let Some(sid) = session_id {
+            headers.push(("x-client-request-id", sid));
+            headers.push(("session-id", sid));
+            headers.push(("thread-id", sid));
+        }
         if let Some(aid) = account_id {
             headers.push(("ChatGPT-Account-ID", aid));
         }
@@ -2826,8 +3025,19 @@ where
         .header("Content-Type", "application/json")
         .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
         .header("version", CODEX_CLIENT_VERSION)
+        .header(
+            CODEX_BETA_FEATURES_HEADER,
+            REMOTE_COMPACTION_V2_BETA_FEATURE,
+        )
+        .header(X_CODEX_ROUTING_HINT_HEADER, &routing_hint)
         .json(&request_body);
 
+    if let Some(sid) = session_id {
+        req = req
+            .header("x-client-request-id", sid)
+            .header("session-id", sid)
+            .header("thread-id", sid);
+    }
     if let Some(aid) = account_id {
         req = req.header("ChatGPT-Account-ID", aid);
     }
@@ -3135,6 +3345,8 @@ where
         thinking_duration_secs: stream_state.thinking_duration_secs,
         thinking_signature: String::new(),
         continuation_request: Some(continuation_request),
+        response_items: stream_state.items_added,
+        response_completed: stream_state.got_completed_event,
     })
 }
 
@@ -3145,7 +3357,8 @@ async fn stream_chat_websocket_once<F, G, H>(
     model: &str,
     history: &[ChatMessage],
     tools: &[serde_json::Value],
-    session_id: Option<&str>,
+    request_session_id: Option<&str>,
+    cache_session_id: Option<&str>,
     debug: bool,
     body: serde_json::Value,
     turn_state: &mut TurnState,
@@ -3161,7 +3374,8 @@ where
     let continuation_request = request_without_input(&body);
     let ws_url = codex_websocket_url(base_url)?;
     let connection_key = websocket_connection_key(base_url, account_id);
-    let (shared_session, cached_socket, last_response, disable_websockets) = match session_id {
+    let (shared_session, cached_socket, last_response, disable_websockets) = match cache_session_id
+    {
         Some(session_id) => take_cached_websocket_session_state(session_id, &connection_key).await,
         None => (
             Arc::new(tokio::sync::Mutex::new(CachedWebsocketSession::default())),
@@ -3181,6 +3395,11 @@ where
     );
     let raw_request = serde_json::to_string_pretty(&ws_request).unwrap_or_default();
     let cached_turn_state = turn_state.header_value().map(str::to_string);
+    let fast_mode = ws_request
+        .get("service_tier")
+        .and_then(|value| value.as_str())
+        == Some("priority");
+    let routing_hint = codex_routing_hint(model, fast_mode);
 
     eprintln!(
         "[OpenAI Codex][websocket] CONNECT model={} messages={} tools={}",
@@ -3196,13 +3415,19 @@ where
             ("OpenAI-Beta", RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
             ("originator", CODEX_ORIGINATOR_HEADER_VALUE),
             ("version", CODEX_CLIENT_VERSION),
+            (
+                CODEX_BETA_FEATURES_HEADER,
+                REMOTE_COMPACTION_V2_BETA_FEATURE,
+            ),
+            (X_CODEX_ROUTING_HINT_HEADER, routing_hint.as_str()),
         ];
         if cached_turn_state.is_some() {
             headers.push((X_CODEX_TURN_STATE_HEADER, "<sticky>"));
         }
-        if let Some(sid) = session_id {
+        if let Some(sid) = request_session_id {
             headers.push(("x-client-request-id", sid));
-            headers.push(("session_id", sid));
+            headers.push(("session-id", sid));
+            headers.push(("thread-id", sid));
         }
         if let Some(aid) = account_id {
             headers.push(("ChatGPT-Account-ID", aid));
@@ -3219,7 +3444,8 @@ where
         &ws_url,
         access_token,
         account_id,
-        session_id,
+        request_session_id,
+        Some(&routing_hint),
         cached_turn_state.as_deref(),
     )?;
 
@@ -3530,6 +3756,8 @@ where
         thinking_duration_secs: stream_state.thinking_duration_secs,
         thinking_signature: String::new(),
         continuation_request: Some(continuation_request),
+        response_items: stream_state.items_added,
+        response_completed: stream_state.got_completed_event,
     }))
 }
 
@@ -3539,18 +3767,20 @@ mod tests {
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
         build_request_body, build_request_body_with_tool_search, build_websocket_transport_request,
-        cached_websocket_http_fallback_enabled, codex_routing_hint, codex_websocket_url,
-        collect_complete_tool_calls, drain_sse_buffer, enable_cached_websocket_http_fallback,
-        extract_compaction_encrypted_content, parse_compact_response, process_sse_event_block,
-        request_without_input, safe_stream_recovery_action, uri_host_port, websocket_config,
-        websocket_event_error_message, websocket_proxy_match_uri, websocket_request_signature,
-        BoxedCodexIo, CodexStreamOptions, CodexStreamState, CodexWebsocketStream,
-        LastWebsocketResponse, PartialToolCall, SafeStreamRecoveryAction,
-        CODEX_ORIGINATOR_HEADER_VALUE, MAX_SAFE_STREAM_RECOVERY_RETRIES,
-        PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
-        TOOL_SEARCH_HISTORY_TOOL_NAME, X_CODEX_TURN_STATE_HEADER,
+        cached_websocket_http_fallback_enabled, codex_responses_endpoint, codex_routing_hint,
+        codex_websocket_url, collect_complete_tool_calls, drain_sse_buffer,
+        enable_cached_websocket_http_fallback, extract_compaction_encrypted_content,
+        parse_compact_response, process_sse_event_block, request_without_input,
+        retained_remote_compaction_v2_window, safe_stream_recovery_action, uri_host_port,
+        validate_remote_compaction_v2_output, websocket_config, websocket_event_error_message,
+        websocket_proxy_match_uri, websocket_request_signature, BoxedCodexIo, CodexStreamOptions,
+        CodexStreamState, CodexWebsocketStream, LastWebsocketResponse, PartialToolCall,
+        SafeStreamRecoveryAction, CODEX_BETA_FEATURES_HEADER, CODEX_ORIGINATOR_HEADER_VALUE,
+        MAX_SAFE_STREAM_RECOVERY_RETRIES, PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
+        REMOTE_COMPACTION_V2_BETA_FEATURE, RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE,
+        TOOL_SEARCH_HISTORY_TOOL_NAME, X_CODEX_ROUTING_HINT_HEADER, X_CODEX_TURN_STATE_HEADER,
     };
-    use crate::commands::CodexTransportMode;
+    use crate::commands::{CodexTransportMode, ToolCallOutcome};
     use crate::llm::CODEX_CLIENT_VERSION;
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
@@ -3729,6 +3959,35 @@ mod tests {
         assert_eq!(
             input[2]["output"],
             serde_json::json!("Searched: rust async await")
+        );
+    }
+
+    #[test]
+    fn build_input_closes_dangling_local_function_call() {
+        let input = build_input(&[assistant_message_with_tool_calls(
+            "assistant-1",
+            "",
+            Some("resp_prev"),
+            vec![ToolCallInfo {
+                id: "call-missing".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"filePath":"src/main.rs"}"#.to_string(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: Some(ToolCallOutcome::Done),
+                recorded_output: None,
+                nested_tool_calls: None,
+            }],
+        )]);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], serde_json::json!("function_call"));
+        assert_eq!(input[1]["type"], serde_json::json!("function_call_output"));
+        assert_eq!(input[1]["call_id"], serde_json::json!("call-missing"));
+        assert_eq!(
+            input[1]["output"],
+            serde_json::json!(crate::session::history::INTERRUPTED_TOOL_RESULT)
         );
     }
 
@@ -4169,6 +4428,7 @@ mod tests {
         let (collected, incomplete) = collect_complete_tool_calls(&state.tool_calls_map);
         assert!(stopped);
         assert!(state.got_terminal_event);
+        assert!(state.got_completed_event);
         assert_eq!(state.input_tokens, 9);
         assert_eq!(state.output_tokens, 4);
         assert_eq!(state.cached_tokens, 3);
@@ -4197,6 +4457,26 @@ mod tests {
 
         assert!(stopped);
         assert_eq!(state.end_turn, Some(false));
+        assert!(state.got_completed_event);
+    }
+
+    #[test]
+    fn distinguishes_incomplete_from_completed_terminal_event() {
+        let mut state = CodexStreamState::new();
+
+        let stopped = process_sse_event_block(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_partial\"}}",
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("incomplete event should parse");
+
+        assert!(stopped);
+        assert!(state.got_terminal_event);
+        assert!(!state.got_completed_event);
     }
 
     #[test]
@@ -4515,6 +4795,85 @@ mod tests {
     }
 
     #[test]
+    fn remote_compaction_v2_uses_responses_with_terminal_trigger() {
+        let body = build_request_body(
+            "gpt-5.6-sol",
+            "You are Codex",
+            &[user_message_with_images("compact this context", vec![])],
+            &[],
+            Some("high"),
+            Some("session-1"),
+            None,
+            CodexStreamOptions::remote_compaction_v2(),
+        );
+        let input = body["input"].as_array().expect("responses input array");
+
+        assert_eq!(
+            codex_responses_endpoint(None),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            input.last().and_then(|item| item["type"].as_str()),
+            Some("compaction_trigger")
+        );
+        assert_eq!(body["stream"].as_bool(), Some(true));
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn chatgpt_backend_root_is_normalized_to_codex_responses() {
+        assert_eq!(
+            codex_responses_endpoint(Some("https://chatgpt.com/backend-api/")),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn remote_compaction_v2_requires_completed_single_compaction_output() {
+        let compaction = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        });
+
+        assert_eq!(
+            validate_remote_compaction_v2_output(std::slice::from_ref(&compaction), true)
+                .expect("valid V2 output"),
+            compaction
+        );
+        assert!(
+            validate_remote_compaction_v2_output(std::slice::from_ref(&compaction), false)
+                .expect_err("incomplete stream must fail")
+                .contains("without response.completed")
+        );
+        assert!(validate_remote_compaction_v2_output(
+            &[
+                compaction,
+                serde_json::json!({ "type": "message", "role": "assistant", "content": [] })
+            ],
+            true,
+        )
+        .expect_err("extra output items must fail")
+        .contains("exactly one compaction output item"));
+    }
+
+    #[test]
+    fn remote_compaction_v2_retains_user_context_before_opaque_output() {
+        let history = vec![
+            user_message_with_images("latest requirement", vec![]),
+            assistant_message("answer-1", "completed answer", None),
+        ];
+        let compaction = serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        });
+        let retained = retained_remote_compaction_v2_window(&history, None, compaction.clone());
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0]["role"].as_str(), Some("user"));
+        assert_eq!(retained[1], compaction);
+    }
+
+    #[test]
     fn compact_request_body_matches_codex_compaction_input_shape() {
         let body = build_compact_request_body(
             "gpt-5.5",
@@ -4767,6 +5126,7 @@ mod tests {
             "test-token",
             Some("account-123"),
             Some("session-456"),
+            Some("model=gpt-5.4"),
             Some("sticky-turn"),
         )
         .expect("websocket request");
@@ -4807,6 +5167,35 @@ mod tests {
                 .ok(),
             Some(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE)
         );
+        assert_eq!(
+            request
+                .headers()
+                .get(CODEX_BETA_FEATURES_HEADER)
+                .expect("Codex beta-features header")
+                .to_str()
+                .ok(),
+            Some(REMOTE_COMPACTION_V2_BETA_FEATURE)
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(X_CODEX_ROUTING_HINT_HEADER)
+                .expect("routing-hint header")
+                .to_str()
+                .ok(),
+            Some("model=gpt-5.4")
+        );
+        for header_name in ["x-client-request-id", "session-id", "thread-id"] {
+            assert_eq!(
+                request
+                    .headers()
+                    .get(header_name)
+                    .expect("session identity header")
+                    .to_str()
+                    .ok(),
+                Some("session-456")
+            );
+        }
         assert_eq!(
             request
                 .headers()
