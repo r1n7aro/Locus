@@ -948,6 +948,7 @@
   "chat.turnNavigation.ariaLabel": "用户轮次",
   "chat.turnNavigation.jumpTo": "跳转到第 {0} 个用户轮次",
   "chat.turnNavigation.noContent": "（无文本内容）",
+  "chat.turnNavigation.imageAlt": "轮次图片 {0}",
   "chat.turnNavigation.loading": "正在加载…",
   "chat.turnNavigation.loadFailed": "无法加载预览",
   "chat.compactedContext.windowTitle": "压缩后上下文",

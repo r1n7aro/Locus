@@ -416,6 +416,7 @@ export interface SessionTurnPreview {
   messageId: string;
   prompt: string;
   response: string;
+  images?: ImageAttachment[];
 }
 
 export interface SessionMessagePage {

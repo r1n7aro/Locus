@@ -79,6 +79,8 @@ pub struct SessionTurnPreview {
     pub message_id: String,
     pub prompt: String,
     pub response: String,
+    #[serde(default)]
+    pub images: Vec<ImageData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

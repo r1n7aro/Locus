@@ -123,6 +123,13 @@ const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_ERROR: &str = "error";
 use crate::compact::{CONTEXT_HANDOFF_MARKER, CONVERSATION_CHECKPOINT_MARKER};
 const CONTEXT_COMPACTED_DISPLAY_MARKER: &str = "## Context Handoff\n\nContext compacted.";
+const DISPLAY_USER_MESSAGE_FILTER_SQL: &str = "NOT (
+    TRIM(content) = ''
+    AND COALESCE(images, '') = ''
+    AND COALESCE(asset_refs, '') = ''
+    AND LTRIM(COALESCE(prompt_suffix, '')) LIKE '<system-reminder>%'
+)
+AND LTRIM(content) NOT LIKE '<conversation-checkpoint>%'";
 
 impl SessionEventWriter {
     const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
@@ -679,6 +686,13 @@ fn is_internal_system_reminder_message(message: &ChatMessage) -> bool {
 
 fn remove_internal_system_reminders_from_display(messages: &mut Vec<ChatMessage>) {
     messages.retain(|message| !is_internal_system_reminder_message(message));
+}
+
+fn normalize_messages_for_display(raw_messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut messages = crate::session::history::normalize_tool_round_history(raw_messages);
+    remove_internal_system_reminders_from_display(&mut messages);
+    SessionStore::mark_missing_persisted_outputs_for_display(&mut messages);
+    messages
 }
 
 fn redact_context_handoff_for_display(message: &mut ChatMessage) {
@@ -3586,9 +3600,7 @@ impl SessionStore {
         // single SQLite connection first so unrelated lightweight reads do not
         // wait behind that CPU work.
         drop(conn);
-        let mut messages = crate::session::history::normalize_tool_round_history(&raw_messages);
-        remove_internal_system_reminders_from_display(&mut messages);
-        Self::mark_missing_persisted_outputs_for_display(&mut messages);
+        let messages = normalize_messages_for_display(&raw_messages);
 
         Ok(SessionDetail {
             id: id.to_string(),
@@ -3647,10 +3659,7 @@ impl SessionStore {
         let user_message_ids = Self::get_session_user_message_ids_with_conn(&conn, id)?;
         drop(conn);
 
-        let mut messages =
-            crate::session::history::normalize_tool_round_history(&raw_page.messages);
-        remove_internal_system_reminders_from_display(&mut messages);
-        Self::mark_missing_persisted_outputs_for_display(&mut messages);
+        let mut messages = normalize_messages_for_display(&raw_page.messages);
         Self::defer_tool_result_images_for_display(&mut messages);
 
         Ok(SessionViewSnapshot {
@@ -3681,20 +3690,40 @@ impl SessionStore {
         message_id: &str,
     ) -> Result<SessionTurnPreview, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let (message_row_id, prompt) = conn
-            .query_row(
-                "SELECT rowid, content
-                 FROM messages
-                 WHERE session_id = ?1 AND id = ?2 AND role = 'user'",
-                params![session_id, message_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
+        let target_query = format!(
+            "SELECT rowid, content, images
+             FROM messages
+             WHERE session_id = ?1
+               AND id = ?2
+               AND role = 'user'
+               AND {DISPLAY_USER_MESSAGE_FILTER_SQL}"
+        );
+        let (message_row_id, prompt, images_json) = conn
+            .query_row(&target_query, params![session_id, message_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
             .map_err(|e| format!("User message not found: {}", e))?;
+        let images = images_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| format!("Failed to parse user turn preview images: {}", e))?
+            .unwrap_or_default();
+        let next_user_query = format!(
+            "SELECT MIN(rowid)
+             FROM messages
+             WHERE session_id = ?1
+               AND role = 'user'
+               AND rowid > ?2
+               AND {DISPLAY_USER_MESSAGE_FILTER_SQL}"
+        );
         let next_user_row_id = conn
             .query_row(
-                "SELECT MIN(rowid)
-                 FROM messages
-                 WHERE session_id = ?1 AND role = 'user' AND rowid > ?2",
+                &next_user_query,
                 params![session_id, message_row_id],
                 |row| row.get::<_, Option<i64>>(0),
             )
@@ -3721,6 +3750,7 @@ impl SessionStore {
             message_id: message_id.to_string(),
             prompt,
             response,
+            images,
         })
     }
 
@@ -3735,10 +3765,7 @@ impl SessionStore {
             Self::get_message_page_with_conn(&conn, id, Some(before_row_id), message_limit)?;
         drop(conn);
 
-        let mut messages =
-            crate::session::history::normalize_tool_round_history(&raw_page.messages);
-        remove_internal_system_reminders_from_display(&mut messages);
-        Self::mark_missing_persisted_outputs_for_display(&mut messages);
+        let mut messages = normalize_messages_for_display(&raw_page.messages);
         Self::defer_tool_result_images_for_display(&mut messages);
         Ok(SessionMessagePage {
             messages,
@@ -5085,6 +5112,16 @@ impl SessionStore {
         self.get_messages_with_conn_filtered(&conn, session_id, false)
     }
 
+    /// Returns full session history normalized for transcript display.
+    /// Internal user-role reminders remain available to prompt reconstruction
+    /// while staying out of every UI refresh path, including compact events.
+    pub fn get_messages_for_display(&self, session_id: &str) -> Result<Vec<ChatMessage>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let raw_messages = self.get_messages_with_conn_filtered(&conn, session_id, false)?;
+        drop(conn);
+        Ok(normalize_messages_for_display(&raw_messages))
+    }
+
     pub fn get_messages_for_prompt(&self, session_id: &str) -> Result<Vec<ChatMessage>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.get_messages_with_conn_filtered(&conn, session_id, true)
@@ -6298,20 +6335,16 @@ impl SessionStore {
         conn: &Connection,
         session_id: &str,
     ) -> Result<Vec<String>, String> {
+        let query = format!(
+            "SELECT id
+             FROM messages
+             WHERE session_id = ?1
+               AND role = 'user'
+               AND {DISPLAY_USER_MESSAGE_FILTER_SQL}
+             ORDER BY rowid ASC"
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id
-                 FROM messages
-                 WHERE session_id = ?1
-                   AND role = 'user'
-                   AND NOT (
-                       TRIM(content) = ''
-                       AND COALESCE(images, '') = ''
-                       AND COALESCE(asset_refs, '') = ''
-                       AND LTRIM(COALESCE(prompt_suffix, '')) LIKE '<system-reminder>%'
-                   )
-                 ORDER BY rowid ASC",
-            )
+            .prepare(&query)
             .map_err(|e| format!("Failed to prepare user turn index: {}", e))?;
         let rows = stmt
             .query_map(params![session_id], |row| row.get::<_, String>(0))
@@ -7261,9 +7294,37 @@ mod tests {
         let session_id = store
             .create_session("turn index", None, None, "chat", None)
             .expect("create session");
+        let preview_image = ImageData {
+            data: "aW1hZ2U=".to_string(),
+            mime_type: "image/png".to_string(),
+        };
         let first_user_id = store
-            .add_message(&session_id, MessageRole::User, "first prompt")
+            .add_message_with_images(
+                &session_id,
+                MessageRole::User,
+                "first prompt",
+                Some(std::slice::from_ref(&preview_image)),
+            )
             .expect("add first user");
+        let internal_reminder_id = store
+            .add_message_with_images_asset_refs_and_signature(
+                &session_id,
+                MessageRole::User,
+                "",
+                None,
+                None,
+                None,
+                None,
+                Some("<system-reminder>internal</system-reminder>"),
+            )
+            .expect("add internal reminder");
+        let checkpoint_id = store
+            .add_message(
+                &session_id,
+                MessageRole::User,
+                &compact::build_conversation_checkpoint_content("summary", "recent"),
+            )
+            .expect("add compact checkpoint");
         store
             .add_message(&session_id, MessageRole::Assistant, "first response")
             .expect("add first assistant");
@@ -7293,6 +7354,23 @@ mod tests {
         assert_eq!(preview.message_id, first_user_id);
         assert_eq!(preview.prompt, "first prompt");
         assert_eq!(preview.response, "first response");
+        assert_eq!(preview.images, vec![preview_image]);
+
+        let raw_messages = store.get_messages(&session_id).expect("load raw messages");
+        assert!(raw_messages
+            .iter()
+            .any(|message| message.id == internal_reminder_id));
+        let display_messages = store
+            .get_messages_for_display(&session_id)
+            .expect("load display messages");
+        assert!(display_messages
+            .iter()
+            .all(|message| message.id != internal_reminder_id));
+        let display_checkpoint = display_messages
+            .iter()
+            .find(|message| message.id == checkpoint_id)
+            .expect("keep compact divider in display history");
+        assert_eq!(display_checkpoint.content, CONTEXT_COMPACTED_DISPLAY_MARKER);
     }
 
     #[test]

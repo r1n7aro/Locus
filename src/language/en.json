@@ -948,6 +948,7 @@
   "chat.turnNavigation.ariaLabel": "User turns",
   "chat.turnNavigation.jumpTo": "Jump to user turn {0}",
   "chat.turnNavigation.noContent": "(No text content)",
+  "chat.turnNavigation.imageAlt": "Turn image {0}",
   "chat.turnNavigation.loading": "Loading…",
   "chat.turnNavigation.loadFailed": "Unable to load preview",
   "chat.compactedContext.windowTitle": "Compacted context",

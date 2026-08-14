@@ -64,6 +64,11 @@ const previewLoading = computed(() => (
 const previewFailed = computed(() => (
   !!previewItemId.value && failedPreviewIds.value.has(previewItemId.value)
 ));
+const previewImages = computed(() => previewItem.value?.images?.slice(0, 4) ?? []);
+const remainingPreviewImageCount = computed(() => Math.max(
+  0,
+  (previewItem.value?.images?.length ?? 0) - previewImages.value.length,
+));
 const canShow = computed(() =>
   hasLeftGutter.value && visibleItems.value.length > 0);
 
@@ -655,12 +660,38 @@ onBeforeUnmount(() => {
           @pointerenter="handleTooltipPointerEnter"
           @pointerleave="handleTooltipPointerLeave"
         >
-          <div class="chat-turn-navigation-prompt" :class="{ 'is-status': previewLoading || previewFailed }">
+          <div
+            v-if="previewLoading || previewFailed || previewItem.prompt || previewImages.length === 0"
+            class="chat-turn-navigation-prompt"
+            :class="{ 'is-status': previewLoading || previewFailed }"
+          >
             {{ previewLoading
               ? t("chat.turnNavigation.loading")
               : previewFailed
                 ? t("chat.turnNavigation.loadFailed")
                 : previewItem.prompt || t("chat.turnNavigation.noContent") }}
+          </div>
+          <div
+            v-if="!previewLoading && !previewFailed && previewImages.length > 0"
+            class="chat-turn-navigation-images"
+            :class="{ 'is-single': previewImages.length === 1 }"
+          >
+            <div
+              v-for="(previewImage, imageIndex) in previewImages"
+              :key="imageIndex"
+              class="chat-turn-navigation-image-frame"
+            >
+              <img
+                :src="`data:${previewImage.mimeType};base64,${previewImage.data}`"
+                class="chat-turn-navigation-image"
+                :alt="t('chat.turnNavigation.imageAlt', imageIndex + 1)"
+                @load="scheduleTooltipPosition"
+              />
+              <span
+                v-if="imageIndex === previewImages.length - 1 && remainingPreviewImageCount > 0"
+                class="chat-turn-navigation-image-more"
+              >+{{ remainingPreviewImageCount }}</span>
+            </div>
           </div>
           <div v-if="!previewLoading && !previewFailed && previewItem.response" class="chat-turn-navigation-response">
             {{ previewItem.response }}
@@ -825,6 +856,50 @@ onBeforeUnmount(() => {
 .chat-turn-navigation-prompt.is-status {
   color: var(--text-secondary);
   font-weight: 400;
+}
+
+.chat-turn-navigation-images {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.chat-turn-navigation-images.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.chat-turn-navigation-image-frame {
+  position: relative;
+  min-width: 0;
+  height: 76px;
+  overflow: hidden;
+  border: 0.5px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-color);
+}
+
+.chat-turn-navigation-images.is-single .chat-turn-navigation-image-frame {
+  height: 156px;
+}
+
+.chat-turn-navigation-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.chat-turn-navigation-image-more {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--panel-bg) 76%, transparent);
+  color: var(--text-color);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .chat-turn-navigation-response {

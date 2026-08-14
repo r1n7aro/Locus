@@ -68,6 +68,37 @@ describe("chat turn navigation", () => {
     })).toEqual({ id: "u1", prompt: "First prompt", response: "First response" });
   });
 
+  it("keeps image turns and excludes internal reminder turns from navigation", () => {
+    const image = { mimeType: "image/png", data: "aW1hZ2U=" };
+    const internalReminder: ChatMessage = {
+      ...message("internal", "user", ""),
+      promptSuffix: "<system-reminder>internal</system-reminder>",
+    };
+    const items = buildChatTurnNavigationItems([
+      { ...message("image", "user", ""), images: [image] },
+      internalReminder,
+      message("compact", "user", "## Context Handoff\n\nContext compacted."),
+      message("a1", "assistant", "Image response"),
+      message("u2", "user", "Next prompt"),
+    ]);
+
+    expect(items).toEqual([
+      { id: "image", prompt: "", response: "Image response", images: [image] },
+      { id: "u2", prompt: "Next prompt", response: "" },
+    ]);
+    expect(normalizeChatTurnPreview({
+      messageId: "image",
+      prompt: "",
+      response: "Image response",
+      images: [image],
+    })).toEqual({
+      id: "image",
+      prompt: "",
+      response: "Image response",
+      images: [image],
+    });
+  });
+
   it("integrates a default-on setting and preserves the Codex rail interactions", () => {
     const rail = readFileSync(
       resolve(process.cwd(), "src/components/chat/ChatTurnNavigationRail.vue"),
@@ -95,6 +126,8 @@ describe("chat turn navigation", () => {
     expect(rail).toContain("visibleItems.value.length > 0");
     expect(rail).toContain("buildChatTurnNavigationItems(props.messages, props.userMessageIds)");
     expect(rail).toContain("ensurePreviewLoaded(item)");
+    expect(rail).toContain("chat-turn-navigation-images");
+    expect(rail).toContain("previewImage.mimeType");
     expect(rail).toContain("const MIN_LEFT_GUTTER = 48");
     expect(rail).toContain("target.scrollIntoView");
     expect(rail).toContain("PREVIEW_OPEN_DELAY_MS = 150");
