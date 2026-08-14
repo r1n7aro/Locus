@@ -7,6 +7,7 @@ mod misc;
 mod plugin;
 mod read_outline;
 mod search;
+mod search_core;
 mod shell;
 mod skill;
 mod unity;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 use super::{ToolDef, ToolExecuteFn, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult};
 
-pub use shell::shell_display_name;
+pub use shell::{powershell_runtime_env_prompt, shell_display_name};
 
 pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::read());
@@ -87,21 +88,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
 }
 
 pub(super) fn should_skip_generated_root_entry(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-
-    let Some(first_component) = relative.components().next() else {
-        return false;
-    };
-
-    let name = first_component.as_os_str().to_string_lossy();
-    let lower = name.trim().to_ascii_lowercase();
-
-    matches!(
-        lower.as_str(),
-        "library" | "temp" | "obj" | "logs" | "usersettings" | "memorycaptures" | "recordings"
-    ) || lower.starts_with("build")
+    search_core::should_skip_generated_root_entry(root, path)
 }
 
 /// Only offered to the LLM while the session is in plan mode (the agent loop

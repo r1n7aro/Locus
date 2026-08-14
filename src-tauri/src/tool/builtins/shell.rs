@@ -60,6 +60,58 @@ pub fn shell_display_name() -> &'static str {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn find_pwsh_in_path(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join("pwsh.exe");
+        if candidate.is_file() {
+            return Some(dunce::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn detect_pwsh_path() -> Option<PathBuf> {
+    // Match the bash tool's effective PATH: a PowerShell installation added
+    // to the machine/user registry after Locus started should be visible to
+    // both command execution and the environment prompt without a restart.
+    let path = crate::process_util::augment_path_with_registry_paths(std::env::var_os("PATH"))
+        .or_else(|| std::env::var_os("PATH"));
+    find_pwsh_in_path(path.as_deref())
+}
+
+fn render_powershell_runtime_env_prompt(pwsh_path: Option<&Path>) -> String {
+    match pwsh_path {
+        Some(path) => {
+            let display_path = path.to_string_lossy().replace('\\', "/");
+            format!(
+                "## PowerShell Runtime\n\n`pwsh` is available at `{display_path}`. Use `pwsh` for PowerShell scripts and UTF-8 text. Use `powershell.exe` only when Windows PowerShell 5.1 compatibility is required."
+            )
+        }
+        None => "## PowerShell Runtime\n\n`pwsh` is unavailable. Use `powershell.exe` for PowerShell tasks. When reading UTF-8 files, pass `-Encoding UTF8`; keep non-ASCII `.ps1` source ASCII-only or save it with a UTF-8 BOM."
+            .to_string(),
+    }
+}
+
+/// Windows-only runtime fact and execution guidance injected directly into
+/// every agent's rendered env prompt. This stays dynamic instead of living in
+/// an agent env.md so project/plugin agents receive the same machine state.
+pub fn powershell_runtime_env_prompt() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Some(render_powershell_runtime_env_prompt(
+            detect_pwsh_path().as_deref(),
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 /// Windows-only friction rules appended to the bash tool description when the
 /// shell is Git Bash. Kept out of tools/bash.json so macOS/Linux sessions
 /// never see them.
@@ -876,6 +928,39 @@ fn build_interactive_cmd_script(command: &str, workdir: &str, marker_path: &Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_runtime_prompt_prefers_detected_pwsh() {
+        let prompt = render_powershell_runtime_env_prompt(Some(Path::new(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        )));
+        assert!(prompt.contains("`pwsh` is available"));
+        assert!(prompt.contains("C:/Program Files/PowerShell/7/pwsh.exe"));
+        assert!(prompt.contains("Use `pwsh` for PowerShell scripts and UTF-8 text"));
+    }
+
+    #[test]
+    fn powershell_runtime_prompt_explains_windows_powershell_fallback() {
+        let prompt = render_powershell_runtime_env_prompt(None);
+        assert!(prompt.contains("`pwsh` is unavailable"));
+        assert!(prompt.contains("`-Encoding UTF8`"));
+        assert!(prompt.contains("UTF-8 BOM"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn find_pwsh_in_path_returns_the_resolved_executable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let executable = temp.path().join("pwsh.exe");
+        std::fs::write(&executable, b"test").expect("write fake pwsh");
+        let path = std::env::join_paths([temp.path()]).expect("join PATH");
+
+        let resolved = find_pwsh_in_path(Some(path.as_os_str())).expect("find pwsh");
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(executable).expect("canonical pwsh path")
+        );
+    }
 
     #[test]
     fn sh_single_quote_escapes_embedded_quotes() {
