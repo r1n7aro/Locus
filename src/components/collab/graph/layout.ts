@@ -240,7 +240,12 @@ function shouldCurrentLaneClaimParent(
 function resolveUpcomingPreviewCommit(
   scene: HistoryGraphScene,
   commitIndex: number,
+  workspaceAnchorIndex: number,
 ): HistoryGraphScene["primaryCommits"][number] | null {
+  if (workspaceAnchorIndex > commitIndex) {
+    return scene.primaryCommits[workspaceAnchorIndex] ?? null;
+  }
+
   const commit = scene.primaryCommits[commitIndex];
   const upcomingCommit = scene.primaryCommits[commitIndex + 1];
   if (!upcomingCommit) return null;
@@ -299,6 +304,12 @@ function buildLaneRows(
   const rows: LaneRow[] = [];
   let lanes: SparseLane<ActiveLane>[] = [];
   let nextTrackId = 0;
+  const workspaceAnchorHash = scene.auxNodes.find(auxNode =>
+    auxNode.kind === "workspace" && auxNode.anchorHash,
+  )?.anchorHash;
+  const workspaceAnchorIndex = workspaceAnchorHash
+    ? scene.primaryCommits.findIndex(commit => commit.hash === workspaceAnchorHash)
+    : -1;
 
   for (let commitIndex = 0; commitIndex < scene.primaryCommits.length; commitIndex++) {
     const commit = scene.primaryCommits[commitIndex];
@@ -316,7 +327,7 @@ function buildLaneRows(
     const currentOwner = laneOwners.get(commit.hash)
       ?? currentLane.owner
       ?? resolveCommitOwner(commit.hash, commit.parents, laneOwners, trackColor(currentLane.track));
-    const previewCommit = resolveUpcomingPreviewCommit(scene, commitIndex);
+    const previewCommit = resolveUpcomingPreviewCommit(scene, commitIndex, workspaceAnchorIndex);
     const renderBefore = buildRenderSnapshot(
       lanes,
       previewCommit,

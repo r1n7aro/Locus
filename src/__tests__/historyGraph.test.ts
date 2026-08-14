@@ -186,6 +186,38 @@ describe("history graph normalize/layout", () => {
     expect(workspaceEdge.dashed).toBe(true);
   });
 
+  it("reserves the WIP-to-HEAD mainline ahead of descendant branch commits", () => {
+    const scene = normalizeHistoryGraph({
+      commits: [
+        commit("f2", ["f1"], "feature head"),
+        commit("f1", ["m1"], "feature base"),
+        commit("m1", ["base"], "master head"),
+        commit("base", [], "base"),
+      ],
+      stashes: [],
+      refs: [
+        localRef("feature/ecs-action", "f2"),
+        localRef("master", "m1", true),
+      ],
+      headState: { hash: "m1", kind: "attached", refName: "master" },
+      selectedHistory: null,
+      workspaceChangeCount: 61,
+    });
+
+    const layout = layoutHistoryGraph(scene);
+    const workspaceNode = layout.auxNodes.find(node => node.kind === "workspace")!;
+    const featureHead = layout.commits.find(commit => commit.commit.hash === "f2")!;
+    const featureBase = layout.commits.find(commit => commit.commit.hash === "f1")!;
+    const masterHead = layout.commits.find(commit => commit.commit.hash === "m1")!;
+    const workspaceEdge = layout.edges.find(edge => edge.id.startsWith("aux:workspace"))!;
+
+    expect(workspaceNode.lane).toBe(masterHead.lane);
+    expect(featureHead.lane).toBeGreaterThan(masterHead.lane);
+    expect(featureBase.lane).toBe(featureHead.lane);
+    expect(workspaceEdge.path).toBe(`M${workspaceNode.x},${workspaceNode.y}L${masterHead.x},${masterHead.y}`);
+    expect(layout.edges.some(edge => edge.id === `lane:f1:${featureBase.lane}:${masterHead.lane}`)).toBe(true);
+  });
+
   it("shows the selected stash as an anchored row before its base commit", () => {
     const scene = normalizeHistoryGraph({
       commits: [
