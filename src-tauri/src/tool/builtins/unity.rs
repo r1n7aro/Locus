@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,6 +6,82 @@ use super::{make_exec, ToolDef, ToolResult};
 use crate::tool::output::{
     append_field, append_json_field, append_text_field, flat_json_value, push_indented_text,
 };
+
+#[derive(Debug)]
+struct UnityTestTreeLeaf {
+    label: String,
+    full_name: String,
+    categories: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct UnityTestTreeNode {
+    children: BTreeMap<String, UnityTestTreeNode>,
+    tests: Vec<UnityTestTreeLeaf>,
+}
+
+fn insert_unity_test_tree(
+    node: &mut UnityTestTreeNode,
+    directories: &[String],
+    leaf: UnityTestTreeLeaf,
+) {
+    if let Some((head, tail)) = directories.split_first() {
+        insert_unity_test_tree(node.children.entry(head.clone()).or_default(), tail, leaf);
+    } else {
+        node.tests.push(leaf);
+    }
+}
+
+fn render_unity_test_tree(node: &UnityTestTreeNode) -> Vec<String> {
+    let mut entries: Vec<(String, Vec<String>)> = node
+        .children
+        .iter()
+        .map(|(name, child)| (format!("{name}/"), render_unity_test_tree(child)))
+        .collect();
+
+    let mut tests: Vec<&UnityTestTreeLeaf> = node.tests.iter().collect();
+    tests.sort_by(|left, right| {
+        left.full_name
+            .cmp(&right.full_name)
+            .then(left.label.cmp(&right.label))
+    });
+    entries.extend(tests.into_iter().map(|test| {
+        let mut metadata = format!(
+            "test={}",
+            flat_json_value(&serde_json::Value::String(test.full_name.clone()))
+        );
+        if !test.categories.is_empty() {
+            metadata.push_str(" categories=");
+            metadata.push_str(&flat_json_value(&serde_json::json!(test.categories)));
+        }
+        (format!("{} :: {metadata}", test.label), Vec::new())
+    }));
+
+    if entries.is_empty() {
+        entries.push(("<empty>".to_string(), Vec::new()));
+    }
+
+    let mut lines = Vec::new();
+    for (index, (label, nested)) in entries.iter().enumerate() {
+        let is_last = index + 1 == entries.len();
+        let branch = if is_last { "└─ " } else { "├─ " };
+        let child_prefix = if is_last { "   " } else { "│  " };
+        lines.push(format!("{branch}{label}"));
+        lines.extend(nested.iter().map(|line| format!("{child_prefix}{line}")));
+    }
+    lines
+}
+
+fn unity_test_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> &'a str {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+}
 
 fn format_unity_test_list(raw: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
@@ -31,23 +108,84 @@ fn format_unity_test_list(raw: &str) -> Result<String, String> {
             .unwrap_or(false),
     );
 
+    let response_mode = object
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("edit|play");
+    let mut tree = UnityTestTreeNode::default();
     for test in tests {
         let Some(test) = test.as_object() else {
-            output.push_str("\n- value=");
-            output.push_str(&flat_json_value(test));
             continue;
         };
-        let mut line = "\n-".to_string();
-        append_json_field(
-            &mut line,
-            "test",
-            test.get("full_name").or_else(|| test.get("name")),
+        let full_name = {
+            let value = unity_test_string_field(test, "full_name");
+            if value.is_empty() {
+                unity_test_string_field(test, "name")
+            } else {
+                value
+            }
+        };
+        let mode = {
+            let value = unity_test_string_field(test, "mode");
+            if value.is_empty() {
+                response_mode
+            } else {
+                value
+            }
+        };
+        let assembly = {
+            let value = unity_test_string_field(test, "assembly");
+            if value.is_empty() {
+                "<unknown assembly>"
+            } else {
+                value
+            }
+        };
+        let mut path: Vec<String> = test
+            .get("path")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect();
+        if path.is_empty() {
+            path.push(if full_name.is_empty() {
+                "<unnamed test>".to_string()
+            } else {
+                full_name.to_string()
+            });
+        }
+        if path.first().is_some_and(|part| part == assembly) {
+            path.remove(0);
+        }
+        let label = path.pop().unwrap_or_else(|| "<unnamed test>".to_string());
+        let categories = test
+            .get("categories")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|category| !category.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut directories = vec![mode.to_string(), assembly.to_string()];
+        directories.extend(path);
+        insert_unity_test_tree(
+            &mut tree,
+            &directories,
+            UnityTestTreeLeaf {
+                label,
+                full_name: full_name.to_string(),
+                categories,
+            },
         );
-        append_json_field(&mut line, "assembly", test.get("assembly"));
-        append_json_field(&mut line, "mode", test.get("mode"));
-        append_json_field(&mut line, "categories", test.get("categories"));
-        output.push_str(&line);
     }
+    output.push('\n');
+    output.push_str(&render_unity_test_tree(&tree).join("\n"));
     Ok(output)
 }
 
@@ -989,14 +1127,14 @@ mod tests {
     }
 
     #[test]
-    fn test_list_is_one_test_per_line() {
+    fn test_list_is_grouped_as_a_mode_assembly_and_suite_tree() {
         let output = format_unity_test_list(
-            r#"{"mode":"edit","matched":1,"truncated":false,"tests":[{"full_name":"Game.Tests.Replay","assembly":"Game.Tests","mode":"edit","categories":["ui"]}]}"#,
+            r#"{"mode":"edit|play","matched":2,"truncated":false,"tests":[{"name":"Replay","full_name":"Game.Tests.ReplayTests.Replay","assembly":"Game.Tests","mode":"edit","path":["Game.Tests","ReplayTests","Replay"],"categories":["ui"]},{"name":"LoadsScene","full_name":"Game.PlayTests.LoadsScene","assembly":"Game.PlayTests","mode":"play","path":["Game.PlayTests","LoadsScene"],"categories":[]}]}"#,
         )
         .unwrap();
         assert_eq!(
             output,
-            "Unity tests: mode=\"edit\" matched=1 shown=1 truncated=false\n- test=\"Game.Tests.Replay\" assembly=\"Game.Tests\" mode=\"edit\" categories=[\"ui\"]"
+            "Unity tests: mode=\"edit|play\" matched=2 shown=2 truncated=false\n├─ edit/\n│  └─ Game.Tests/\n│     └─ ReplayTests/\n│        └─ Replay :: test=\"Game.Tests.ReplayTests.Replay\" categories=[\"ui\"]\n└─ play/\n   └─ Game.PlayTests/\n      └─ LoadsScene :: test=\"Game.PlayTests.LoadsScene\""
         );
     }
 

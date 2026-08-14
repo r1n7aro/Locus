@@ -1098,29 +1098,41 @@ async fn run_unity_test_suite(
         }),
     );
 
-    let list_request = json!({ "mode": "edit", "max_results": 50 });
+    let list_request = json!({ "max_results": 50 });
     let list_text = unity_bridge::unity_test_list(project, &list_request).await?;
     let list: Value = serde_json::from_str(&list_text)
         .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
+    let list_mode = list.get("mode").and_then(Value::as_str).unwrap_or_default();
+    if list_mode != "edit|play" {
+        return Err(format!(
+            "Unity Test list defaulted to unexpected mode '{list_mode}'"
+        ));
+    }
     let matched = list
         .get("matched")
         .and_then(Value::as_u64)
         .unwrap_or_default();
     if matched == 0 {
-        return Err("Unity Test Framework discovered no Edit Mode tests".to_string());
+        return Err("Unity Test Framework discovered no tests".to_string());
     }
     sink.emit(
         "suite_event",
         json!({
             "suite": suite.as_str(),
-            "line": format!("PASS  unity-test list: discovered {matched} Edit Mode test(s)"),
+            "line": format!("PASS  unity-test list: discovered {matched} Edit/Play Mode test(s)"),
             "passed": 2,
             "failed": 0,
         }),
     );
 
-    let run_request = json!({ "mode": "edit", "result_detail": "failures" });
+    let run_request = json!({ "mode": "edit|play", "result_detail": "failures" });
     let result = unity_bridge::unity_test_run(project, &run_request, config.suite_timeout).await?;
+    if result.mode != "edit|play" {
+        return Err(format!(
+            "Unity Test run used unexpected mode '{}'",
+            result.mode
+        ));
+    }
     let failed = u64::from(result.status != "passed");
     let passed_checks = if failed == 0 { 3 } else { 2 };
     sink.emit(

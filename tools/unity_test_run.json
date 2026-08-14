@@ -1,13 +1,13 @@
 {
-  "description": "Run tests through the connected project's official Unity Test Framework and wait for the structured result. Use this instead of unity_execute reflection or invoking NUnit methods directly. It supports NUnit lifecycle, UnityTest coroutines, Edit Mode, Play Mode, skips, parameterized cases, and domain reload recovery. After writing or hot-reloading C# tests, call unity_recompile before running; the new test tree becomes runnable after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed.",
+  "description": "Run tests through the connected project's official Unity Test Framework and wait for the structured result. Use this instead of unity_execute reflection or invoking NUnit methods directly. It supports NUnit lifecycle, UnityTest coroutines, Edit Mode, Play Mode, skips, parameterized cases, and domain reload recovery. After writing or hot-reloading C# tests, call unity_recompile before running; the new test tree becomes runnable after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed. All parameters are optional. Omit assemblies, tests, groups, and categories when that filter is unused; do not send empty arrays.",
   "parameters": {
     "type": "object",
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["edit", "play"],
-        "default": "edit",
-        "description": "Unity Test mode to run. Play Mode runs still start from Edit Mode and Unity Test Framework controls the transition."
+        "enum": ["edit", "play", "edit|play"],
+        "default": "edit|play",
+        "description": "Optional Unity Test mode to run. Use edit|play to run both modes in one request; defaults to edit|play. Play Mode runs still start from Edit Mode and Unity Test Framework controls the transition."
       },
       "assemblies": {
         "type": "array",
@@ -41,6 +41,6 @@
         "description": "Result detail returned to the agent. failures includes failure messages and stack traces; all includes every leaf result."
       }
     },
-    "required": ["mode"]
+    "required": []
   }
 }

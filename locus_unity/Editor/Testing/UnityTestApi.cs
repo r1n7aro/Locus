@@ -5,11 +5,13 @@ using UnityEngine;
 
 namespace Locus
 {
-    /// <summary>Unity Test Framework mode used by <see cref="UnityTestApi"/>.</summary>
+    /// <summary>Unity Test Framework modes used by <see cref="UnityTestApi"/>.</summary>
+    [Flags]
     public enum UnityTestMode
     {
-        Edit,
-        Play
+        Edit = 1 << 0,
+        Play = 1 << 1,
+        EditAndPlay = Edit | Play
     }
 
     /// <summary>Amount of per-test data retained by a Unity Test run.</summary>
@@ -24,7 +26,7 @@ namespace Locus
     [Serializable]
     public class UnityTestQuery
     {
-        public UnityTestMode Mode = UnityTestMode.Edit;
+        public UnityTestMode Mode = UnityTestMode.EditAndPlay;
         public string[] Assemblies;
         public string[] Tests;
         public string[] Groups;
@@ -47,6 +49,7 @@ namespace Locus
         public string FullName;
         public string Assembly;
         public string Mode;
+        public string[] Path;
         public string[] Categories;
     }
 
@@ -206,6 +209,7 @@ namespace Locus
                         FullName = test.full_name ?? test.name ?? "",
                         Assembly = test.assembly ?? "",
                         Mode = test.mode ?? "",
+                        Path = test.path ?? new string[0],
                         Categories = test.categories ?? new string[0]
                     });
                 }
@@ -273,7 +277,15 @@ namespace Locus
 
         private static string ModeName(UnityTestMode mode)
         {
-            return mode == UnityTestMode.Play ? "play" : "edit";
+            bool includesEdit = (mode & UnityTestMode.Edit) == UnityTestMode.Edit;
+            bool includesPlay = (mode & UnityTestMode.Play) == UnityTestMode.Play;
+            if (includesEdit && includesPlay)
+                return "edit|play";
+            if (includesPlay)
+                return "play";
+            if (includesEdit)
+                return "edit";
+            throw new ArgumentOutOfRangeException("mode", mode, "Select edit, play, or both modes.");
         }
 
         private static string ResultDetailName(UnityTestResultDetail detail)

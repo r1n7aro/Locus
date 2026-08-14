@@ -1,13 +1,13 @@
 {
-  "description": "List tests discovered by the connected project's official Unity Test Framework. Use this instead of scanning assemblies or reflecting over NUnit attributes. After writing or hot-reloading C# tests, call unity_recompile before listing; the new test tree becomes available after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed. Filters within one field are ORed; different fields are combined. Exact test names use the full Unity Test Framework name, including parameter values.",
+  "description": "List tests discovered by the connected project's official Unity Test Framework. Use this instead of scanning assemblies or reflecting over NUnit attributes. After writing or hot-reloading C# tests, call unity_recompile before listing; the new test tree becomes available after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed. All parameters are optional. Omit assemblies, tests, groups, and categories when that filter is unused; do not send empty arrays. Filters within one field are ORed; different fields are combined. Exact test names use the full Unity Test Framework name, including parameter values.",
   "parameters": {
     "type": "object",
     "properties": {
       "mode": {
         "type": "string",
-        "enum": ["edit", "play"],
-        "default": "edit",
-        "description": "Unity Test mode to discover."
+        "enum": ["edit", "play", "edit|play"],
+        "default": "edit|play",
+        "description": "Optional Unity Test mode to discover. Use edit|play to discover both modes in one call; defaults to edit|play."
       },
       "assemblies": {
         "type": "array",
@@ -35,6 +35,6 @@
         "description": "Maximum returned test cases, capped at 5000. The response reports the full matched count and whether it was truncated."
       }
     },
-    "required": ["mode"]
+    "required": []
   }
 }

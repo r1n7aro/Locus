@@ -40,6 +40,7 @@ namespace Locus.UnityTesting
         public string full_name;
         public string assembly;
         public string mode;
+        public string[] path;
         public string[] categories;
     }
 
@@ -396,7 +397,14 @@ namespace Locus.UnityTesting
                 try
                 {
                     UnityTestListDto response = new UnityTestListDto { mode = ModeName(mode) };
-                    CollectTests(root, "", request, response, maxResults);
+                    CollectTests(
+                        root,
+                        "",
+                        new List<string>(),
+                        true,
+                        request,
+                        response,
+                        maxResults);
                     completion.TrySetResult(response);
                 }
                 catch (Exception ex)
@@ -410,6 +418,8 @@ namespace Locus.UnityTesting
         private static void CollectTests(
             ITestAdaptor node,
             string assemblyName,
+            List<string> suitePath,
+            bool isRoot,
             UnityTestFilterRequest request,
             UnityTestListDto response,
             int maxResults)
@@ -417,19 +427,30 @@ namespace Locus.UnityTesting
             if (node == null)
                 return;
             if (node.IsTestAssembly)
+            {
                 assemblyName = TrimAssemblyExtension(node.Name);
+                suitePath = new List<string>();
+            }
+            else if (!isRoot && node.IsSuite && !string.IsNullOrWhiteSpace(node.Name))
+            {
+                suitePath = new List<string>(suitePath) { node.Name };
+            }
 
             if (!node.IsSuite && Matches(node, assemblyName, request))
             {
                 response.matched++;
                 if (response.tests.Count < maxResults)
                 {
+                    List<string> testPath = new List<string>(suitePath);
+                    if (!string.IsNullOrWhiteSpace(node.Name))
+                        testPath.Add(node.Name);
                     response.tests.Add(new UnityTestCaseDto
                     {
                         name = node.Name ?? "",
                         full_name = node.FullName ?? node.Name ?? "",
                         assembly = assemblyName ?? "",
-                        mode = request.mode,
+                        mode = ModeName(node.TestMode),
+                        path = testPath.ToArray(),
                         categories = node.Categories ?? new string[0]
                     });
                 }
@@ -442,7 +463,14 @@ namespace Locus.UnityTesting
             if (!node.HasChildren)
                 return;
             foreach (ITestAdaptor child in node.Children)
-                CollectTests(child, assemblyName, request, response, maxResults);
+                CollectTests(
+                    child,
+                    assemblyName,
+                    suitePath,
+                    false,
+                    request,
+                    response,
+                    maxResults);
         }
 
         private static bool Matches(
@@ -522,17 +550,38 @@ namespace Locus.UnityTesting
 
         private static TestMode ParseMode(string value)
         {
-            if (string.Equals(value, "play", StringComparison.OrdinalIgnoreCase))
-                return TestMode.PlayMode;
-            if (string.IsNullOrWhiteSpace(value) ||
-                string.Equals(value, "edit", StringComparison.OrdinalIgnoreCase))
-                return TestMode.EditMode;
-            throw new InvalidOperationException("Unity Test mode must be 'edit' or 'play'.");
+            if (string.IsNullOrWhiteSpace(value))
+                return TestMode.EditMode | TestMode.PlayMode;
+
+            TestMode mode = (TestMode)0;
+            foreach (string rawPart in value.Split('|'))
+            {
+                string part = rawPart.Trim();
+                if (string.Equals(part, "edit", StringComparison.OrdinalIgnoreCase))
+                    mode |= TestMode.EditMode;
+                else if (string.Equals(part, "play", StringComparison.OrdinalIgnoreCase))
+                    mode |= TestMode.PlayMode;
+                else
+                    throw new InvalidOperationException(
+                        "Unity Test mode must be 'edit', 'play', or 'edit|play'.");
+            }
+            if (mode == 0)
+                throw new InvalidOperationException(
+                    "Unity Test mode must be 'edit', 'play', or 'edit|play'.");
+            return mode;
         }
 
         private static string ModeName(TestMode mode)
         {
-            return mode == TestMode.PlayMode ? "play" : "edit";
+            bool includesEdit = (mode & TestMode.EditMode) == TestMode.EditMode;
+            bool includesPlay = (mode & TestMode.PlayMode) == TestMode.PlayMode;
+            if (includesEdit && includesPlay)
+                return "edit|play";
+            if (includesPlay)
+                return "play";
+            if (includesEdit)
+                return "edit";
+            throw new InvalidOperationException("Unity Test mode did not include edit or play.");
         }
 
         private static string NormalizeResultDetail(string value)
