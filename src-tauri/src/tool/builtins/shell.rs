@@ -82,12 +82,34 @@ fn detect_pwsh_path() -> Option<PathBuf> {
     find_pwsh_in_path(path.as_deref())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn detect_pwsh_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn prepend_pwsh_directory_to_path(
+    current_path: Option<OsString>,
+    pwsh_path: &Path,
+) -> Option<OsString> {
+    let directory = pwsh_path.parent()?.to_path_buf();
+    let directory_key = directory.to_string_lossy().to_ascii_lowercase();
+    let original_path = current_path.clone();
+    let mut paths: Vec<PathBuf> = current_path
+        .as_ref()
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_default();
+    paths.retain(|entry| entry.to_string_lossy().to_ascii_lowercase() != directory_key);
+    paths.insert(0, directory);
+    std::env::join_paths(paths).ok().or(original_path)
+}
+
 fn render_powershell_runtime_env_prompt(pwsh_path: Option<&Path>) -> String {
     match pwsh_path {
         Some(path) => {
             let display_path = path.to_string_lossy().replace('\\', "/");
             format!(
-                "## PowerShell Runtime\n\n`pwsh` is available at `{display_path}`. Use `pwsh` for PowerShell scripts and UTF-8 text. Use `powershell.exe` only when Windows PowerShell 5.1 compatibility is required."
+                "## PowerShell Runtime\n\n`pwsh` is available on the bash `PATH`. Invoke it directly as `pwsh`; the resolved executable is `{display_path}`. Use `pwsh` for PowerShell scripts and UTF-8 text. Use `powershell.exe` only when Windows PowerShell 5.1 compatibility is required."
             )
         }
         None => "## PowerShell Runtime\n\n`pwsh` is unavailable. Use `powershell.exe` for PowerShell tasks. When reading UTF-8 files, pass `-Encoding UTF8`; keep non-ASCII `.ps1` source ASCII-only or save it with a UTF-8 BOM."
@@ -240,19 +262,20 @@ pub(super) fn bash() -> ToolDef {
                     }
                 }
 
+                let pwsh = detect_pwsh_path();
                 let sh_command = || {
+                    let mut prefix = String::new();
                     if let Some(ref python) = python {
-                        format!(
-                            "{}{}",
-                            crate::python_runtime::sh_python_function_prefix(python),
-                            command
-                        )
-                    } else {
-                        command.clone()
+                        prefix.push_str(&crate::python_runtime::sh_python_function_prefix(python));
                     }
+                    if let Some(ref pwsh) = pwsh {
+                        prefix.push_str(&sh_pwsh_function_prefix(pwsh));
+                    }
+                    prefix.push_str(&command);
+                    prefix
                 };
 
-                let envs = collect_shell_env(python.as_ref());
+                let envs = collect_shell_env(python.as_ref(), pwsh.as_deref());
 
                 if interactive {
                     if let Some(report) = progress.as_ref() {
@@ -461,6 +484,7 @@ async fn run_captured_command(
 
 fn collect_shell_env(
     python: Option<&crate::python_runtime::ResolvedPythonRuntime>,
+    pwsh: Option<&Path>,
 ) -> Vec<(String, OsString)> {
     let mut envs: Vec<(String, OsString)> = Vec::new();
 
@@ -495,6 +519,12 @@ fn collect_shell_env(
             python.path.clone().into_os_string(),
         ));
     }
+    if let Some(pwsh) = pwsh {
+        envs.push((
+            "LOCUS_PWSH".to_string(),
+            pwsh.to_path_buf().into_os_string(),
+        ));
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -514,6 +544,10 @@ fn collect_shell_env(
     path = augment_path_with_github_cli(path.clone()).or(path);
     if let Some(python) = python {
         path = crate::python_runtime::prepend_python_to_path(path, python);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(pwsh_path) = pwsh {
+        path = prepend_pwsh_directory_to_path(path, pwsh_path);
     }
     if let Some(path) = path {
         envs.push(("PATH".to_string(), path));
@@ -863,6 +897,11 @@ fn sh_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn sh_pwsh_function_prefix(pwsh_path: &Path) -> String {
+    let executable = sh_single_quote(&pwsh_path.display().to_string().replace('\\', "/"));
+    format!("pwsh() {{ {executable} \"$@\"; }}\n")
+}
+
 fn build_interactive_sh_script(
     command: &str,
     workdir: &str,
@@ -934,7 +973,8 @@ mod tests {
         let prompt = render_powershell_runtime_env_prompt(Some(Path::new(
             "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
         )));
-        assert!(prompt.contains("`pwsh` is available"));
+        assert!(prompt.contains("`pwsh` is available on the bash `PATH`"));
+        assert!(prompt.contains("Invoke it directly as `pwsh`"));
         assert!(prompt.contains("C:/Program Files/PowerShell/7/pwsh.exe"));
         assert!(prompt.contains("Use `pwsh` for PowerShell scripts and UTF-8 text"));
     }
@@ -945,6 +985,16 @@ mod tests {
         assert!(prompt.contains("`pwsh` is unavailable"));
         assert!(prompt.contains("`-Encoding UTF8`"));
         assert!(prompt.contains("UTF-8 BOM"));
+    }
+
+    #[test]
+    fn sh_pwsh_prefix_defines_direct_command_for_paths_with_spaces() {
+        let prefix =
+            sh_pwsh_function_prefix(Path::new("C:\\Program Files\\PowerShell\\7\\pwsh.exe"));
+        assert_eq!(
+            prefix,
+            "pwsh() { 'C:/Program Files/PowerShell/7/pwsh.exe' \"$@\"; }\n"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -959,6 +1009,65 @@ mod tests {
         assert_eq!(
             resolved,
             dunce::canonicalize(executable).expect("canonical pwsh path")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepend_pwsh_directory_to_path_makes_it_the_first_entry() {
+        let existing = std::env::join_paths([
+            Path::new("C:\\Windows\\System32"),
+            Path::new("C:\\Program Files\\PowerShell\\7"),
+            Path::new("C:\\Tools"),
+        ])
+        .expect("join existing PATH");
+        let updated = prepend_pwsh_directory_to_path(
+            Some(existing),
+            Path::new("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+        )
+        .expect("updated PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&updated).collect();
+
+        assert_eq!(
+            entries.first(),
+            Some(&PathBuf::from("C:\\Program Files\\PowerShell\\7"))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("C:\\Program Files\\PowerShell\\7"))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn collect_shell_env_exposes_locus_pwsh_and_prioritizes_its_directory() {
+        let pwsh = Path::new("C:\\Program Files\\PowerShell\\7\\pwsh.exe");
+        let envs = collect_shell_env(None, Some(pwsh));
+        let locus_pwsh = envs
+            .iter()
+            .find(|(key, _)| key == "LOCUS_PWSH")
+            .map(|(_, value)| value);
+        let path = envs
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+            .expect("bash PATH");
+        let path_entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+
+        assert_eq!(
+            locus_pwsh,
+            Some(&OsString::from(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+            ))
+        );
+        assert_eq!(
+            path_entries.first(),
+            Some(&PathBuf::from("C:\\Program Files\\PowerShell\\7"))
         );
     }
 
