@@ -450,7 +450,13 @@ fn build_input_with_metadata(
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
-                        if tc.name == TOOL_SEARCH_HISTORY_TOOL_NAME && !tc.is_server_tool() {
+                        // Hosted tools have already executed inside the provider response.
+                        // Replaying them as client function calls fabricates an unresolved
+                        // tool round and can make the model answer the same request again.
+                        if tc.is_server_tool() {
+                            continue;
+                        }
+                        if tc.name == TOOL_SEARCH_HISTORY_TOOL_NAME {
                             input.push(build_tool_search_call_item(tc));
                             if !tool_output_call_ids.contains(tc.id.as_str()) {
                                 // A call without its output would 400; patch
@@ -465,13 +471,6 @@ fn build_input_with_metadata(
                             "name": tc.name,
                             "arguments": tc.arguments,
                         }));
-                        if let Some(output) = tc.server_tool_output.as_deref() {
-                            input.push(serde_json::json!({
-                                "type": "function_call_output",
-                                "call_id": tc.id,
-                                "output": output,
-                            }));
-                        }
                     }
                 }
             }
@@ -756,9 +755,10 @@ fn cached_response_item_for_request(
     response_item: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let item_type = response_item.get("type").and_then(|value| value.as_str());
-    if item_type == Some("reasoning") {
-        // The active websocket keeps reasoning in the previous-response state;
-        // Locus does not replay it in its reconstructed ChatMessage history.
+    if matches!(item_type, Some("reasoning" | "web_search_call")) {
+        // The active websocket keeps reasoning and hosted-tool state in the
+        // previous response. Locus does not replay either item from its
+        // reconstructed ChatMessage history.
         return None;
     }
 
@@ -3315,7 +3315,10 @@ where
     let tool_calls: Vec<ToolCallInfo> =
         collected.into_iter().map(|entry| entry.tool_call).collect();
 
-    if !tool_calls.is_empty() {
+    if tool_calls
+        .iter()
+        .any(|tool_call| !tool_call.is_server_tool())
+    {
         stream_state.finish_reason = "tool_calls".to_string();
     }
 
@@ -3932,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn build_input_includes_function_call_output_for_server_tool_calls() {
+    fn build_input_keeps_server_tools_out_of_client_function_history() {
         let input = build_input(&[assistant_message_with_tool_calls(
             "assistant-1",
             "查完了",
@@ -3950,16 +3953,9 @@ mod tests {
             }],
         )]);
 
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], serde_json::json!("assistant"));
-        assert_eq!(input[1]["type"], serde_json::json!("function_call"));
-        assert_eq!(input[1]["call_id"], serde_json::json!("ws_1"));
-        assert_eq!(input[2]["type"], serde_json::json!("function_call_output"));
-        assert_eq!(input[2]["call_id"], serde_json::json!("ws_1"));
-        assert_eq!(
-            input[2]["output"],
-            serde_json::json!("Searched: rust async await")
-        );
+        assert_eq!(input[0]["content"][0]["text"], serde_json::json!("查完了"));
     }
 
     #[test]
@@ -5585,7 +5581,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_transport_request_ignores_server_metadata_and_reasoning_for_incremental_input() {
+    fn websocket_transport_request_ignores_hosted_state_for_incremental_input() {
         let previous_body = serde_json::json!({
             "model": "gpt-5.4",
             "input": [{
@@ -5609,6 +5605,13 @@ mod tests {
                 "type": "reasoning",
                 "content": [],
                 "encrypted_content": "encrypted",
+                "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
+            },
+            {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": { "type": "search", "query": "unity" },
                 "internal_chat_message_metadata_passthrough": { "turn_id": "turn-1" }
             },
             {

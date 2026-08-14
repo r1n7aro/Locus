@@ -364,19 +364,15 @@ fn build_input_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
                 if let Some(ref tool_calls) = msg.tool_calls {
                     if !tool_calls.is_empty() {
                         for tc in tool_calls {
+                            if tc.is_server_tool() {
+                                continue;
+                            }
                             input.push(serde_json::json!({
                                 "type": "function_call",
                                 "call_id": tc.id,
                                 "name": tc.name,
                                 "arguments": tc.arguments,
                             }));
-                            if let Some(output) = tc.server_tool_output.as_deref() {
-                                input.push(serde_json::json!({
-                                    "type": "function_call_output",
-                                    "call_id": tc.id,
-                                    "output": output,
-                                }));
-                            }
                         }
                         if !msg.content.is_empty() {
                             input.push(serde_json::json!({
@@ -1117,10 +1113,10 @@ mod tests {
     }
 
     #[test]
-    fn build_input_messages_includes_function_call_output_for_server_tool_calls() {
+    fn build_input_messages_keep_server_tools_out_of_client_function_history() {
         let input = build_input_messages(&[assistant_message_with_tool_calls(
             "assistant-1",
-            "",
+            "Search complete",
             Some("resp_prev"),
             vec![ToolCallInfo {
                 id: "ws_1".to_string(),
@@ -1135,15 +1131,47 @@ mod tests {
             }],
         )]);
 
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], serde_json::json!("assistant"));
+        assert_eq!(input[0]["content"], serde_json::json!("Search complete"));
+    }
+
+    #[test]
+    fn build_input_messages_replay_only_executable_calls_from_mixed_rounds() {
+        let input = build_input_messages(&[assistant_message_with_tool_calls(
+            "assistant-1",
+            "",
+            Some("resp_prev"),
+            vec![
+                ToolCallInfo {
+                    id: "ws_1".to_string(),
+                    name: "web_search".to_string(),
+                    arguments: r#"{"query":"rust async await"}"#.to_string(),
+                    order: None,
+                    server_tool: Some(ServerToolKind::WebSearch),
+                    server_tool_output: Some("Searched: rust async await".to_string()),
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                },
+                ToolCallInfo {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"filePath":"README.md"}"#.to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                },
+            ],
+        )]);
+
+        assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], serde_json::json!("function_call"));
-        assert_eq!(input[0]["call_id"], serde_json::json!("ws_1"));
-        assert_eq!(input[1]["type"], serde_json::json!("function_call_output"));
-        assert_eq!(input[1]["call_id"], serde_json::json!("ws_1"));
-        assert_eq!(
-            input[1]["output"],
-            serde_json::json!("Searched: rust async await")
-        );
+        assert_eq!(input[0]["call_id"], serde_json::json!("call_1"));
+        assert_eq!(input[0]["name"], serde_json::json!("read"));
     }
 
     #[test]

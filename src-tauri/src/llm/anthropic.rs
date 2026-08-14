@@ -1344,7 +1344,10 @@ where
         })
         .collect();
 
-    let finish_reason = if !final_tool_calls.is_empty() {
+    let finish_reason = if final_tool_calls
+        .iter()
+        .any(|tool_call| !tool_call.is_server_tool())
+    {
         "tool_calls".to_string()
     } else {
         stop_reason

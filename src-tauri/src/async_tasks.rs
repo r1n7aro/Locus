@@ -99,7 +99,7 @@ pub fn augment_tool_schema(tool_name: &str, tool: &mut serde_json::Value) {
         serde_json::json!({
             "type": "string",
             "enum": ["sync", "async", "notify"],
-            "description": "Execution mode. 'sync' waits and returns the result; 'async' runs without an execution deadline and returns a task id immediately; 'notify' automatically resumes or reminds this session with the final result when the task finishes, so do not poll get_task_status. Default 'sync'.",
+            "description": "Execution mode. 'sync' waits and returns the result; 'async' runs without an execution deadline and returns a task id immediately; 'notify' automatically resumes or reminds this session with the final result when the task finishes, so do not poll get_task_status. Failures detected during startup are returned directly and do not require get_task_status. Default 'sync'.",
             "default": "sync"
         }),
     );
