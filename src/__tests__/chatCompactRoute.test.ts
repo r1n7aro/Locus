@@ -120,10 +120,13 @@ describe("chat compact route", () => {
   it("renders compacted handoff messages as a transcript divider", () => {
     const transcript = read("src/components/chat/ChatTranscript.vue");
     const store = read("src-tauri/src/session/store.rs");
+    const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
     const zh = read("src/language/zh.json");
 
     expect(store).toContain("CONTEXT_COMPACTED_DISPLAY_MARKER");
     expect(store).toContain("redact_context_handoff_for_display");
+    expect(store).toContain("pub fn get_messages_for_display");
+    expect(agentInstance).toContain("store.get_messages_for_display(&self.session_id)?");
     expect(transcript).toContain("isCompactMarkerGroup(group)");
     expect(transcript).toContain("chat-transcript-compact-marker-label");
     expect(zh).toContain('"chat.transcript.compacted": "上下文已压缩"');

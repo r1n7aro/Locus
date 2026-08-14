@@ -10,6 +10,7 @@ When to use the subagent tool:
 - When you need to trace initialization flow, runtime wiring, or dependency chains across multiple files or assets
 - When you need to answer questions about how a feature or subsystem works in the codebase
 - For broad codebase exploration and deep research, use subagent_type "explorer"
+- Read-only agents such as "explorer" can be sent in the same tool round as independent read, list, and grep calls; those calls run concurrently
 - For delegated implementation or follow-up work in a child Dev session, use subagent_type "dev"
 - For tasks involving code changes across multiple files, use the appropriate agent type
 - When calling explorer, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions

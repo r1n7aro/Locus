@@ -35,6 +35,17 @@ describe("agent parallel tool scheduling safety", () => {
     expect(lock).toContain("distinct_path_writes_overlap_and_exclusive_waits_for_all");
   });
 
+  it("runs one model batch of background bash calls under a re-entrant opaque lease", () => {
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const lock = read("src-tauri/src/agent/workspace_execution_lock.rs");
+
+    expect(agent).toContain('"bash" => Some(WorkspaceExecutionLockRequest::ParallelOpaque(');
+    expect(agent).toContain("background_workspace_execution_request_for_tool");
+    expect(agent).toContain("&assistant_message_id");
+    expect(lock).toContain("ParallelOpaque(Arc<OpaqueGroupState>)");
+    expect(lock).toContain("parallel_opaque_group_overlaps_and_blocks_other_groups");
+  });
+
   it("batches same-file edits and runs distinct file batches in parallel", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const plan = agent.indexOf("Self::plan_parallel_edit_batches(&prepared");
@@ -51,9 +62,9 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain('"edits": operations');
   });
 
-  it("runs sync subagents before local siblings and isolates other reentrant tool kinds", () => {
+  it("runs writable sync subagents before local siblings and keeps read-only agents parallel", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
-    const subagentPhase = agent.indexOf("executing foreground subagent phase before local siblings");
+    const subagentPhase = agent.indexOf("executing writable foreground subagent phase before local siblings");
     const preconfirm = agent.indexOf("Confirm every local call before taking the workspace lock");
     const acquire = agent.indexOf("process_workspace_execution_lock(", preconfirm);
     const deterministicPhase = agent.indexOf("executing deterministic pre-ask tools in parallel");
@@ -66,10 +77,14 @@ describe("agent parallel tool scheduling safety", () => {
     expect(acquire).toBeGreaterThan(preconfirm);
     expect(agent).toContain("user-input rounds only allow deterministic pre-ask tools");
     expect(agent).toContain("is_deterministic_pre_ask_tool");
+    expect(agent).toContain("subagent_call_is_workspace_readonly");
+    expect(agent).toContain("agent_definition_is_workspace_readonly");
+    expect(agent).toContain("&& !self.subagent_call_is_workspace_readonly(&tc.name, args)");
+    expect(agent).toContain('name == "subagent"\n                                && !self.subagent_call_is_workspace_readonly');
     expect(deterministicPhase).toBeGreaterThan(acquire);
     expect(releaseBeforeAsk).toBeGreaterThan(deterministicPhase);
     expect(askPhase).toBeGreaterThan(releaseBeforeAsk);
-    expect(agent).toContain('"subagent-then-local"');
+    expect(agent).toContain('"writable-subagent-then-local"');
     expect(agent).toContain("precompleted_results");
     expect(agent).not.toContain("sub-agent calls must run without local sibling tools");
     expect(agent).toContain("external MCP calls must run without local sibling tools");
@@ -106,6 +121,9 @@ describe("agent parallel tool scheduling safety", () => {
     expect(cli).toContain("process_workspace_execution_lock(&self.agent.working_dir)");
     expect(cli).toContain("ensure_cli_foreground_subagent_phase().await");
     expect(cli).toContain("precompleted_subagent_results");
+    expect(cli).toContain("subagent_call_is_workspace_readonly");
+    expect(cli).toContain("precomplete_cli_tool_calls");
+    expect(cli).toContain('"read-only parallel phase"');
     expect(cli).not.toContain("sub-agent calls must run without local sibling tools");
     expect(cli).toContain("confirmation_preapproved");
     expect(cli).toContain("is_deterministic_pre_ask_tool");
@@ -121,7 +139,10 @@ describe("agent parallel tool scheduling safety", () => {
     expect(filesystem).toContain(".create_new(true)");
     expect(filesystem).toContain("ensure_edit_base_is_current");
     expect(filesystem).toContain("replace_file_atomically");
-    expect(filesystem).toContain("current_content = op.new_string.clone()");
+    expect(filesystem).toContain("let original_content = normalize_lf(&content)");
+    expect(filesystem).toContain("plan_replace(&original_content");
+    expect(filesystem).toContain("apply_planned_replacements(");
+    expect(filesystem).toContain("current.start < previous.end");
     expect(filesystem).toContain("set_permissions(&temp_path, metadata.permissions())");
     expect(filesystem).toContain("[FilesystemEdit] conflict");
     expect(filesystem).toContain("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH");

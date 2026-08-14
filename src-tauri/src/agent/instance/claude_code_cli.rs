@@ -397,50 +397,22 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         Ok(request.map(|request| (request, tools)))
     }
 
-    async fn ensure_cli_foreground_subagent_phase(&mut self) {
-        let (tool_calls, assistant_message_id) = match self.pending_round.as_ref() {
-            Some(round) if !round.subagent_phase_prepared => {
-                (round.tool_calls.clone(), round.message_id.clone())
-            }
-            _ => return,
-        };
-
-        let mut prepared = Vec::new();
-        let mut has_local_sibling = false;
-        let mut has_ask = false;
-        let mut has_external_mcp = false;
-        for tool_call in &tool_calls {
-            let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            normalize_tool_args(&mut args);
-            self.agent.inject_working_dir(&tool_call.name, &mut args);
-            let effective_name = self
-                .agent
-                .effective_tool_name_for_round(&tool_call.name, &args);
-            has_ask |= effective_name == "ask_user_question";
-            has_external_mcp |= effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
-            has_local_sibling |= effective_name != "subagent"
-                && effective_name != "ask_user_question"
-                && !effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
-            if effective_name == "subagent"
-                && !self
-                    .agent
-                    .tool_call_runs_in_background(&effective_name, &args)
-            {
-                prepared.push((tool_call.clone(), args));
-            }
-        }
-
-        if let Some(round) = self.pending_round.as_mut() {
-            round.subagent_phase_prepared = true;
-        }
-        if prepared.is_empty() || !has_local_sibling || has_ask || has_external_mcp {
+    async fn precomplete_cli_tool_calls(
+        &mut self,
+        prepared: Vec<(ToolCallInfo, serde_json::Value)>,
+        assistant_message_id: &str,
+        phase: &str,
+    ) {
+        if prepared.is_empty() {
             return;
         }
-
         eprintln!(
-            "[Agent {}] Claude Code executing foreground subagent phase before local siblings session={} run={}",
-            self.agent.id, self.agent.session_id, self.run_id
+            "[Agent {}] Claude Code executing {} session={} run={} calls={}",
+            self.agent.id,
+            phase,
+            self.agent.session_id,
+            self.run_id,
+            prepared.len()
         );
         let mut pending = futures::stream::FuturesUnordered::new();
         for (tool_call, args) in prepared {
@@ -450,7 +422,6 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             let run_id = self.run_id;
             let mode = self.mode;
             let active_skill_tool_names = self.active_skill_tool_names;
-            let assistant_message_id = assistant_message_id.as_str();
             pending.push(async move {
                 let result = agent
                     .execute_single_tool(
@@ -475,6 +446,78 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
         if let Some(round) = self.pending_round.as_mut() {
             round.precompleted_subagent_results.extend(completed);
+        }
+    }
+
+    async fn ensure_cli_foreground_subagent_phase(&mut self) {
+        let (tool_calls, assistant_message_id) = match self.pending_round.as_ref() {
+            Some(round) if !round.subagent_phase_prepared => {
+                (round.tool_calls.clone(), round.message_id.clone())
+            }
+            _ => return,
+        };
+
+        let mut writable_subagents = Vec::new();
+        let mut readonly_subagents = Vec::new();
+        let mut readonly_local_siblings = Vec::new();
+        let mut has_local_sibling = false;
+        let mut has_ask = false;
+        let mut has_external_mcp = false;
+        for tool_call in &tool_calls {
+            let mut args = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            normalize_tool_args(&mut args);
+            self.agent.inject_working_dir(&tool_call.name, &mut args);
+            let effective_name = self
+                .agent
+                .effective_tool_name_for_round(&tool_call.name, &args);
+            has_ask |= effective_name == "ask_user_question";
+            has_external_mcp |= effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
+            has_local_sibling |= effective_name != "subagent"
+                && effective_name != "ask_user_question"
+                && !effective_name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX);
+            if effective_name == "subagent"
+                && !self
+                    .agent
+                    .tool_call_runs_in_background(&effective_name, &args)
+            {
+                if self
+                    .agent
+                    .subagent_call_is_workspace_readonly(&tool_call.name, &args)
+                {
+                    readonly_subagents.push((tool_call.clone(), args));
+                } else {
+                    writable_subagents.push((tool_call.clone(), args));
+                }
+            } else if AgentInstance::is_deterministic_pre_ask_tool(&effective_name) {
+                readonly_local_siblings.push((tool_call.clone(), args));
+            }
+        }
+
+        if let Some(round) = self.pending_round.as_mut() {
+            round.subagent_phase_prepared = true;
+        }
+        if has_ask || has_external_mcp {
+            return;
+        }
+
+        if has_local_sibling {
+            self.precomplete_cli_tool_calls(
+                writable_subagents,
+                &assistant_message_id,
+                "writable foreground subagent phase before local siblings",
+            )
+            .await;
+        }
+
+        if !readonly_subagents.is_empty() && (has_local_sibling || readonly_subagents.len() > 1) {
+            readonly_subagents.extend(readonly_local_siblings);
+            self.precomplete_cli_tool_calls(
+                readonly_subagents,
+                &assistant_message_id,
+                "read-only parallel phase",
+            )
+            .await;
         }
     }
 

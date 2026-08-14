@@ -5421,6 +5421,11 @@ impl AgentInstance {
             remove_block(&mut env, "unity");
         }
 
+        if let Some(powershell_runtime) = crate::tool::builtins::powershell_runtime_env_prompt() {
+            env.push_str("\n\n");
+            env.push_str(&powershell_runtime);
+        }
+
         if !has_working_dir {
             env.push_str(
                 "\n\n## Workspace Status\nNo working directory is selected. Do not assume project files, Git state, Unity project metadata, knowledge base contents, or workspace-relative paths. If you need to inspect the runtime environment, use tools with an explicit working directory or absolute paths.",
@@ -8067,7 +8072,7 @@ impl AgentInstance {
         let compacted_context_tokens = self
             .persist_compacted_context_usage(store, system_parts, context_limit)
             .await;
-        let compacted_messages = store.get_messages(&self.session_id)?;
+        let compacted_messages = store.get_messages_for_display(&self.session_id)?;
         eprintln!(
             "[Agent {}] codex remote compact done: {} → {} messages",
             self.id, count_before, count_after
@@ -8318,7 +8323,7 @@ impl AgentInstance {
         let compacted_context_tokens = self
             .persist_compacted_context_usage(store, system_parts, context_limit)
             .await;
-        let compacted_messages = store.get_messages(&self.session_id)?;
+        let compacted_messages = store.get_messages_for_display(&self.session_id)?;
 
         eprintln!(
             "[Agent {}] checkpoint compact done: {} → {} messages, summary_len={}, recent_tokens={}",
@@ -10624,13 +10629,14 @@ impl AgentInstance {
                     !blocked_results.contains_key(&tc.id)
                         && effective_name(tc) == "subagent"
                         && !self.tool_call_runs_in_background(&effective_name(tc), args)
+                        && !self.subagent_call_is_workspace_readonly(&tc.name, args)
                 }) && prepared.iter().any(|(tc, _)| {
                     !blocked_results.contains_key(&tc.id) && effective_name(tc) != "subagent"
                 });
                 let mut precompleted_results: HashMap<String, CompletedToolResult> = HashMap::new();
                 if has_foreground_subagent_phase {
                     eprintln!(
-                        "[Agent {}] executing foreground subagent phase before local siblings session={} run={}",
+                        "[Agent {}] executing writable foreground subagent phase before local siblings session={} run={}",
                         self.id, self.session_id, run_id
                     );
                     let mode_ref = mode.as_str();
@@ -10643,6 +10649,7 @@ impl AgentInstance {
                         if blocked_results.contains_key(&tc.id)
                             || effective_name(tc) != "subagent"
                             || self.tool_call_runs_in_background(&effective_name(tc), args)
+                            || self.subagent_call_is_workspace_readonly(&tc.name, args)
                         {
                             continue;
                         }
@@ -10798,7 +10805,8 @@ impl AgentInstance {
                         let name = effective_name(tc);
                         if blocked_results.contains_key(&tc.id)
                             || precompleted_results.contains_key(&tc.id)
-                            || name == "subagent"
+                            || (name == "subagent"
+                                && !self.subagent_call_is_workspace_readonly(&tc.name, args))
                             || name == "ask_user_question"
                             || name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
                             || self
@@ -10918,7 +10926,7 @@ impl AgentInstance {
                     run_id,
                     iteration,
                     if has_foreground_subagent_phase {
-                        "subagent-then-local"
+                        "writable-subagent-then-local"
                     } else if parallel_edit_batches.is_some() {
                         "parallel-edit-batches"
                     } else if execute_sequentially {
@@ -12087,6 +12095,56 @@ impl AgentInstance {
         }
     }
 
+    fn agent_definition_is_workspace_readonly(&self, agent_def: &AgentDef) -> bool {
+        agent_def.tools.iter().all(|tool_name| {
+            let canonical = self
+                .canonical_tool_name(tool_name)
+                .unwrap_or_else(|| tool_name.clone());
+            self.workspace_execution_request_for_tool(&canonical, &serde_json::json!({}))
+                .is_none()
+        })
+    }
+
+    fn subagent_call_is_workspace_readonly(&self, name: &str, args: &serde_json::Value) -> bool {
+        let (target_name, target_args) = self.workspace_execution_target(name, args);
+        if target_name != "subagent" {
+            return false;
+        }
+        // Plan-mode children are forcibly read-only even when their normal
+        // definition contains mutating tools.
+        if self.plan_runtime_snapshot().is_some() {
+            return true;
+        }
+        let Some(subagent_type) = target_args
+            .get("subagent_type")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        self.registry
+            .get(subagent_type)
+            .is_some_and(|agent_def| self.agent_definition_is_workspace_readonly(agent_def))
+    }
+
+    fn background_workspace_execution_request_for_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        parallel_group_id: &str,
+    ) -> Option<WorkspaceExecutionLockRequest> {
+        match name {
+            "subagent" => None,
+            // An async shell call is an explicit request to detach opaque work.
+            // A model tool-call batch shares one re-entrant opaque lease. Bash
+            // calls in that batch overlap, while other batches and foreground
+            // workspace mutations remain mutually exclusive with the group.
+            "bash" => Some(WorkspaceExecutionLockRequest::ParallelOpaque(
+                parallel_group_id.to_string(),
+            )),
+            _ => self.workspace_execution_request_for_tool(name, args),
+        }
+    }
+
     fn merge_workspace_execution_request(
         current: Option<WorkspaceExecutionLockRequest>,
         next: Option<WorkspaceExecutionLockRequest>,
@@ -13090,9 +13148,11 @@ impl AgentInstance {
         let session_id = self.session_id.clone();
         let working_dir = self.working_dir.clone();
         let mutates_workspace = self.tool_registry.mutates_workspace(&tool_name);
-        let workspace_request = (tool_name != "subagent")
-            .then(|| self.workspace_execution_request_for_tool(&tool_name, &args))
-            .flatten();
+        let workspace_request = self.background_workspace_execution_request_for_tool(
+            &tool_name,
+            &args,
+            &assistant_message_id,
+        );
         let executor = self.clone_for_background_task(started.cancel_rx.clone());
 
         let initial_manager = manager.clone();
@@ -13151,7 +13211,9 @@ impl AgentInstance {
                 {
                     Ok(guard) => Some(guard),
                     Err(_) => {
-                        if let Some(snapshot) = manager.mark_cancelled(&task_id) {
+                        if let Some(snapshot) =
+                            manager.mark_cancelled_without_notification(&task_id)
+                        {
                             crate::async_tasks::emit_task_updated(
                                 &app_handle,
                                 &assistant_message_id,
@@ -13164,6 +13226,7 @@ impl AgentInstance {
                                 snapshot.output.as_deref().unwrap_or("Task cancelled."),
                                 crate::commands::ToolCallOutcome::Interrupted,
                             );
+                            manager.enqueue_completion_notification(&snapshot);
                         }
                         run_guard.complete();
                         return;
@@ -13263,7 +13326,7 @@ impl AgentInstance {
             }
 
             if was_cancelled {
-                if let Some(snapshot) = manager.mark_cancelled(&task_id) {
+                if let Some(snapshot) = manager.mark_cancelled_without_notification(&task_id) {
                     crate::async_tasks::emit_task_updated(
                         &app_handle,
                         &assistant_message_id,
@@ -13276,6 +13339,7 @@ impl AgentInstance {
                         snapshot.output.as_deref().unwrap_or("Task cancelled."),
                         crate::commands::ToolCallOutcome::Interrupted,
                     );
+                    manager.enqueue_completion_notification(&snapshot);
                 }
                 run_guard.complete();
                 return;
@@ -13294,7 +13358,7 @@ impl AgentInstance {
                 )
                 .await;
             let result = result.into_tool_result();
-            if let Some(snapshot) = manager.finish(&task_id, &result) {
+            if let Some(snapshot) = manager.finish_without_notification(&task_id, &result) {
                 crate::async_tasks::emit_task_updated(
                     &app_handle,
                     &assistant_message_id,
@@ -13316,6 +13380,7 @@ impl AgentInstance {
                         tool_call_id, error
                     );
                 }
+                manager.enqueue_completion_notification(&snapshot);
             }
             run_guard.complete();
         });
@@ -18981,6 +19046,57 @@ mod tests {
             agent.workspace_execution_request_for_tool("bash", &json!({})),
             Some(WorkspaceExecutionLockRequest::Exclusive)
         ));
+        assert!(matches!(
+            agent.background_workspace_execution_request_for_tool(
+                "bash",
+                &json!({}),
+                "assistant-batch"
+            ),
+            Some(WorkspaceExecutionLockRequest::ParallelOpaque(group))
+                if group == "assistant-batch"
+        ));
+        assert!(matches!(
+            agent.background_workspace_execution_request_for_tool(
+                "unity_execute",
+                &json!({}),
+                "assistant-batch"
+            ),
+            Some(WorkspaceExecutionLockRequest::Exclusive)
+        ));
+        assert!(agent
+            .background_workspace_execution_request_for_tool(
+                "subagent",
+                &json!({}),
+                "assistant-batch"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn readonly_subagent_definitions_share_the_readonly_parallel_phase() {
+        let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let mut agent = test_agent_instance(String::new());
+        agent.registry = Arc::new(AgentDefRegistry::load(Some(agent_dir.as_path()), None));
+        agent.tool_registry = Arc::new(ToolRegistry::with_builtins());
+
+        assert!(agent.subagent_call_is_workspace_readonly(
+            "subagent",
+            &json!({"subagent_type": "explorer"})
+        ));
+        assert!(!agent
+            .subagent_call_is_workspace_readonly("subagent", &json!({"subagent_type": "git"})));
+        assert!(agent.subagent_call_is_workspace_readonly(
+            "tool_call",
+            &json!({
+                "toolName": "subagent",
+                "arguments": {"subagent_type": "explorer"}
+            })
+        ));
+
+        agent.mark_plan_readonly_subagent();
+        assert!(
+            agent.subagent_call_is_workspace_readonly("subagent", &json!({"subagent_type": "git"}))
+        );
     }
 
     #[test]
@@ -19913,6 +20029,23 @@ PrefabInstance:
             env_template,
             None,
         )
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rendered_env_prompt_injects_powershell_runtime_without_template_placeholder() {
+        let agent = test_agent_instance_with_prompts(
+            String::new(),
+            "",
+            "# Environment\nOS: <os> (<arch>)\nShell: <shell>",
+        );
+
+        let prompt = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(agent.rendered_env_prompt());
+
+        assert!(prompt.contains("## PowerShell Runtime"));
+        assert!(prompt.contains("`pwsh` is available") || prompt.contains("`pwsh` is unavailable"));
     }
 
     fn test_agent_instance(working_dir: String) -> AgentInstance {

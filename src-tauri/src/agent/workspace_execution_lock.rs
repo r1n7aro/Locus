@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{
-    watch, Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
-    RwLock,
+    watch, Mutex as AsyncMutex, OnceCell, OwnedMutexGuard, OwnedRwLockReadGuard,
+    OwnedRwLockWriteGuard, RwLock,
 };
 
 const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -23,6 +23,7 @@ static PROCESS_WORKSPACE_EXECUTION_LOCKS: LazyLock<Mutex<HashMap<String, Workspa
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceExecutionLockRequest {
     PathWrite(Vec<String>),
+    ParallelOpaque(String),
     Exclusive,
 }
 
@@ -30,6 +31,7 @@ impl WorkspaceExecutionLockRequest {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::PathWrite(_) => "path_write",
+            Self::ParallelOpaque(_) => "parallel_opaque",
             Self::Exclusive => "write",
         }
     }
@@ -37,13 +39,17 @@ impl WorkspaceExecutionLockRequest {
     pub(crate) fn path_keys(&self) -> Option<&[String]> {
         match self {
             Self::PathWrite(paths) => Some(paths),
-            Self::Exclusive => None,
+            Self::ParallelOpaque(_) | Self::Exclusive => None,
         }
     }
 
     pub(crate) fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Exclusive, _) | (_, Self::Exclusive) => Self::Exclusive,
+            (Self::ParallelOpaque(left), Self::ParallelOpaque(right)) if left == right => {
+                Self::ParallelOpaque(left)
+            }
+            (Self::ParallelOpaque(_), _) | (_, Self::ParallelOpaque(_)) => Self::Exclusive,
             (Self::PathWrite(mut left), Self::PathWrite(right)) => {
                 left.extend(right);
                 left.sort();
@@ -140,6 +146,7 @@ struct TraceState {
 struct WorkspaceExecutionLockInner {
     gate: Arc<RwLock<()>>,
     path_gates: Mutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
+    opaque_groups: Mutex<HashMap<String, Weak<OpaqueGroupState>>>,
     trace: Mutex<TraceState>,
     next_lease_id: AtomicU64,
     wait_log_interval: Duration,
@@ -167,7 +174,16 @@ enum OwnedWorkspaceExecutionGuard {
         _mutation_guard: OwnedRwLockReadGuard<()>,
         _path_guards: Vec<OwnedMutexGuard<()>>,
     },
+    ParallelOpaque(Arc<OpaqueGroupState>),
     Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
+struct OpaqueGroupState {
+    lease: OnceCell<Arc<OpaqueGroupLease>>,
+}
+
+struct OpaqueGroupLease {
+    _guard: OwnedRwLockWriteGuard<()>,
 }
 
 pub(crate) struct WorkspaceExecutionGuard {
@@ -185,6 +201,7 @@ impl WorkspaceExecutionLock {
             inner: Arc::new(WorkspaceExecutionLockInner {
                 gate: Arc::new(RwLock::new(())),
                 path_gates: Mutex::new(HashMap::new()),
+                opaque_groups: Mutex::new(HashMap::new()),
                 trace: Mutex::new(TraceState::default()),
                 next_lease_id: AtomicU64::new(1),
                 wait_log_interval: WAIT_LOG_INTERVAL,
@@ -199,6 +216,7 @@ impl WorkspaceExecutionLock {
             inner: Arc::new(WorkspaceExecutionLockInner {
                 gate: Arc::new(RwLock::new(())),
                 path_gates: Mutex::new(HashMap::new()),
+                opaque_groups: Mutex::new(HashMap::new()),
                 trace: Mutex::new(TraceState::default()),
                 next_lease_id: AtomicU64::new(1),
                 wait_log_interval,
@@ -234,6 +252,23 @@ impl WorkspaceExecutionLock {
             .collect()
     }
 
+    fn opaque_group_state(&self, group_id: &str) -> Arc<OpaqueGroupState> {
+        let mut registry = self
+            .inner
+            .opaque_groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, state| state.strong_count() > 0);
+        if let Some(state) = registry.get(group_id).and_then(Weak::upgrade) {
+            return state;
+        }
+        let state = Arc::new(OpaqueGroupState {
+            lease: OnceCell::new(),
+        });
+        registry.insert(group_id.to_string(), Arc::downgrade(&state));
+        state
+    }
+
     fn holder_summary(&self) -> String {
         let trace = self.trace();
         let writer = trace
@@ -248,14 +283,15 @@ impl WorkspaceExecutionLock {
                 )
             })
             .unwrap_or_else(|| "writer=none".to_string());
-        let path_writers = trace
+        let shared_holders = trace
             .readers
             .iter()
             .take(4)
             .map(|(lease_id, holder)| {
                 format!(
-                    "path_writer#{} paths={} held_ms={} {}",
+                    "shared_holder#{} mode={} paths={} held_ms={} {}",
                     lease_id,
+                    holder.request.label(),
                     holder.request.path_keys().map_or(0, <[String]>::len),
                     holder.acquired_at.elapsed().as_millis(),
                     holder.owner.summary()
@@ -263,16 +299,20 @@ impl WorkspaceExecutionLock {
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        let path_writers = if path_writers.is_empty() {
-            "path_writers=none".to_string()
+        let shared_holders = if shared_holders.is_empty() {
+            "shared_holders=none".to_string()
         } else if trace.readers.len() > 4 {
             format!(
-                "path_writers={} [{} | ...]",
+                "shared_holders={} [{} | ...]",
                 trace.readers.len(),
-                path_writers
+                shared_holders
             )
         } else {
-            format!("path_writers={} [{}]", trace.readers.len(), path_writers)
+            format!(
+                "shared_holders={} [{}]",
+                trace.readers.len(),
+                shared_holders
+            )
         };
         let waiters = trace
             .waiters
@@ -296,7 +336,7 @@ impl WorkspaceExecutionLock {
         } else {
             format!("waiters={} [{}]", trace.waiters.len(), waiters)
         };
-        format!("{}; {}; {}", writer, path_writers, waiters)
+        format!("{}; {}; {}", writer, shared_holders, waiters)
     }
 
     fn blockers(
@@ -315,18 +355,28 @@ impl WorkspaceExecutionLock {
             });
         }
         let requested_paths = request.path_keys();
-        if matches!(request, WorkspaceExecutionLockRequest::Exclusive) || requested_paths.is_some()
+        if matches!(
+            request,
+            WorkspaceExecutionLockRequest::Exclusive
+                | WorkspaceExecutionLockRequest::ParallelOpaque(_)
+        ) || requested_paths.is_some()
         {
             blockers.extend(
                 trace
                     .readers
                     .values()
                     .filter(|holder| {
-                        matches!(request, WorkspaceExecutionLockRequest::Exclusive)
-                            || paths_overlap(
-                                requested_paths.unwrap_or_default(),
-                                holder.request.path_keys().unwrap_or_default(),
-                            )
+                        matches!(
+                            request,
+                            WorkspaceExecutionLockRequest::Exclusive
+                                | WorkspaceExecutionLockRequest::ParallelOpaque(_)
+                        ) || matches!(
+                            holder.request,
+                            WorkspaceExecutionLockRequest::ParallelOpaque(_)
+                        ) || paths_overlap(
+                            requested_paths.unwrap_or_default(),
+                            holder.request.path_keys().unwrap_or_default(),
+                        )
                     })
                     .map(|holder| WorkspaceExecutionLockBlocker {
                         session_id: holder.owner.session_id.clone(),
@@ -453,9 +503,16 @@ impl WorkspaceExecutionLock {
         );
 
         let gate = self.inner.gate.clone();
+        let opaque_group_state = match &request {
+            WorkspaceExecutionLockRequest::ParallelOpaque(group_id) => {
+                Some(self.opaque_group_state(group_id))
+            }
+            _ => None,
+        };
         let path_gates = match &request {
             WorkspaceExecutionLockRequest::PathWrite(paths) => self.path_gates(paths),
-            WorkspaceExecutionLockRequest::Exclusive => Vec::new(),
+            WorkspaceExecutionLockRequest::ParallelOpaque(_)
+            | WorkspaceExecutionLockRequest::Exclusive => Vec::new(),
         };
         let mut acquire_future: Pin<Box<dyn Future<Output = OwnedWorkspaceExecutionGuard> + Send>> =
             match &request {
@@ -469,6 +526,18 @@ impl WorkspaceExecutionLock {
                         _mutation_guard: mutation_guard,
                         _path_guards: path_guards,
                     }
+                }),
+                WorkspaceExecutionLockRequest::ParallelOpaque(_) => Box::pin(async move {
+                    let group_state = opaque_group_state.expect("parallel opaque group state");
+                    group_state
+                        .lease
+                        .get_or_init(|| async move {
+                            Arc::new(OpaqueGroupLease {
+                                _guard: gate.write_owned().await,
+                            })
+                        })
+                        .await;
+                    OwnedWorkspaceExecutionGuard::ParallelOpaque(group_state)
                 }),
                 WorkspaceExecutionLockRequest::Exclusive => Box::pin(async move {
                     OwnedWorkspaceExecutionGuard::Exclusive(gate.write_owned().await)
@@ -493,7 +562,8 @@ impl WorkspaceExecutionLock {
                             acquired_at,
                         };
                         match &request {
-                            WorkspaceExecutionLockRequest::PathWrite(_) => {
+                            WorkspaceExecutionLockRequest::PathWrite(_)
+                            | WorkspaceExecutionLockRequest::ParallelOpaque(_) => {
                                 trace.readers.insert(lease_id, holder);
                             }
                             WorkspaceExecutionLockRequest::Exclusive => {
@@ -641,11 +711,13 @@ impl Drop for WorkspaceExecutionGuard {
                     drop(_path_guards);
                     drop(_mutation_guard);
                 }
+                OwnedWorkspaceExecutionGuard::ParallelOpaque(group_state) => drop(group_state),
                 OwnedWorkspaceExecutionGuard::Exclusive(guard) => drop(guard),
             }
         }
         match &self.request {
-            WorkspaceExecutionLockRequest::PathWrite(_) => {
+            WorkspaceExecutionLockRequest::PathWrite(_)
+            | WorkspaceExecutionLockRequest::ParallelOpaque(_) => {
                 trace.readers.remove(&self.lease_id);
             }
             WorkspaceExecutionLockRequest::Exclusive => {
@@ -887,6 +959,57 @@ mod tests {
             .expect("writer task")
             .expect("writer guard");
         drop(writer);
+    }
+
+    #[tokio::test]
+    async fn parallel_opaque_group_overlaps_and_blocks_other_groups() {
+        let lock = WorkspaceExecutionLock::new();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let first = lock
+            .acquire(
+                WorkspaceExecutionLockRequest::ParallelOpaque("model-round-1".to_string()),
+                owner("parallel-opaque-1"),
+                cancel_rx.clone(),
+            )
+            .await
+            .expect("first parallel opaque request");
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            lock.acquire(
+                WorkspaceExecutionLockRequest::ParallelOpaque("model-round-1".to_string()),
+                owner("parallel-opaque-2"),
+                cancel_rx.clone(),
+            ),
+        )
+        .await
+        .expect("same-group opaque requests must overlap")
+        .expect("second parallel opaque request");
+
+        let other_group_lock = lock.clone();
+        let other_group_cancel = cancel_rx.clone();
+        let mut other_group = tokio::spawn(async move {
+            other_group_lock
+                .acquire(
+                    WorkspaceExecutionLockRequest::ParallelOpaque("model-round-2".to_string()),
+                    owner("parallel-opaque-other-group"),
+                    other_group_cancel,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut other_group)
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        drop(second);
+        let other_group = tokio::time::timeout(Duration::from_secs(1), other_group)
+            .await
+            .expect("other model round should acquire after the first group releases")
+            .expect("other group task")
+            .expect("other group guard");
+        drop(other_group);
     }
 
     #[tokio::test]

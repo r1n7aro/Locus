@@ -1,5 +1,5 @@
 {
-  "description": "Get the latest progress or final result of an asynchronous tool task by id.",
+  "description": "Get the latest progress or final result of an async-mode task by id. Notify-mode tasks deliver their final result automatically, so use this only for an explicit interim progress check.",
   "parameters": {
     "type": "object",
     "properties": {
