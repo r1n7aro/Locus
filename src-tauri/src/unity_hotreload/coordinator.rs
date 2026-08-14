@@ -687,7 +687,7 @@ async fn discover_partial_siblings(
 /// what the loaded assemblies were compiled from. No-op while the feature is
 /// off or the path is not a project source.
 pub async fn note_cs_written(project_path: &str, file_path: &str, prior_content: String) {
-    if !super::is_enabled() || !crate::csharp_compile::is_enabled() {
+    if !edit_tracking_enabled(super::is_enabled(), crate::csharp_compile::is_enabled()) {
         return;
     }
     let absolute_path = normalize_project_file_path(project_path, file_path);
@@ -713,6 +713,10 @@ pub async fn note_cs_written(project_path: &str, file_path: &str, prior_content:
         });
     drop(projects);
     crate::csharp_compile::emit_status_in_background();
+}
+
+fn edit_tracking_enabled(hot_reload_enabled: bool, compiler_enabled: bool) -> bool {
+    hot_reload_enabled && compiler_enabled
 }
 
 fn display_project_path(project_path: &str, file_path: &str) -> String {
@@ -803,33 +807,24 @@ pub async fn unapplied_change_count() -> u64 {
     count
 }
 
-/// Agent-facing status appended after write/edit. It reports the C# changes
-/// that are still not live in the running Editor and uses the sidecar's
-/// cheap syntax/member diff (`analyze/hotDiff`) to hint whether the pending
-/// batch can use `unity_hot_reload`.
+/// Agent-facing status appended after write/edit while hot reload is active.
+/// It reports the C# changes that are still not live in the running Editor and
+/// uses the sidecar's cheap syntax/member diff (`analyze/hotDiff`) to hint
+/// whether the pending batch can use `unity_hot_reload`.
 pub async fn format_pending_edit_status(
     project_path: &str,
     touched_file_path: &str,
 ) -> Option<String> {
+    if !edit_tracking_enabled(super::is_enabled(), crate::csharp_compile::is_enabled()) {
+        return None;
+    }
+
     let touched_absolute = normalize_project_file_path(project_path, touched_file_path);
     let touched_trackable = is_trackable_cs_path(project_path, &touched_absolute);
     if !touched_trackable {
         return None;
     }
     crate::csharp_compile::emit_status_in_background();
-
-    if !super::is_enabled() {
-        return Some(
-            "Unity C# status:\n- This .cs change is on disk and is not applied to the running Editor yet.\n- Hot reload: disabled in Settings > Code Analysis. Use unity_recompile to apply it."
-                .to_string(),
-        );
-    }
-    if !crate::csharp_compile::is_enabled() {
-        return Some(
-            "Unity C# status:\n- This .cs change is on disk and is not applied to the running Editor yet.\n- Hot reload: unavailable because the sidecar compiler is disabled. Use unity_recompile to apply it."
-                .to_string(),
-        );
-    }
 
     let snapshot: Vec<(String, PendingEdit, bool)> = {
         let projects = projects().lock().await;
@@ -3549,6 +3544,14 @@ mod tests {
             r"C:\Proj\Game\Packages\com.farlocus.locus\Editor\LocusBridge.cs"
         ));
         assert!(!is_trackable_cs_path("", r"C:\Proj\Game\Assets\X.cs"));
+    }
+
+    #[test]
+    fn edit_feedback_requires_the_hot_reload_pipeline() {
+        assert!(!edit_tracking_enabled(false, false));
+        assert!(!edit_tracking_enabled(false, true));
+        assert!(!edit_tracking_enabled(true, false));
+        assert!(edit_tracking_enabled(true, true));
     }
 
     #[tokio::test]
