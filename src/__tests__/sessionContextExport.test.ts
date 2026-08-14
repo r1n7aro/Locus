@@ -74,7 +74,10 @@ describe("structured session context export", () => {
     expect(skill).toContain("Tool-result audit");
     expect(workspace).toContain("function reviewContextSkillIntent(): UserIntentMeta");
     expect(workspace).toContain('dirName: "review-context"');
-    expect(workspace).toContain("{ userIntent: reviewContextSkillIntent() }");
+    expect(workspace).toContain("uiStore.stageChatDraftPrefill(contextReviewDraft()");
+    expect(workspace).toContain("skills: intent.skills");
+    expect(zh["chat.contextReviewPrompt"]).toBe("请review这个context");
+    expect(en["chat.contextReviewPrompt"]).toBe("Please review this context");
     expect(zh["chat.contextReviewPrompt"]).not.toContain("完整分析轨迹");
     expect(en["chat.contextReviewPrompt"]).not.toContain("trajectory review");
   });
@@ -113,6 +116,10 @@ describe("structured session context export", () => {
     const input = read("src/components/chat/RichChatInput.vue");
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const panel = read("src/components/chat/SessionPanel.vue");
+    const reviewWorkflow = workspace.slice(
+      workspace.indexOf("async function reviewSessionContext"),
+      workspace.indexOf("onMounted("),
+    );
 
     expect(service).toContain('ipcInvoke<ContextExportResult>("export_session_context"');
     expect(registry).toContain('name: "/export-context"');
@@ -122,6 +129,16 @@ describe("structured session context export", () => {
     expect(workspace).toContain("await createSession({");
     expect(workspace).toContain("await chatStore.selectSession(reviewSessionId");
     expect(workspace).toContain('"chat.contextReviewPrompt"');
+    expect(reviewWorkflow).toContain("chatStore.newChat({ persistSelection: props.persistSessionSelection })");
+    expect(reviewWorkflow).toContain("uiStore.stageChatDraftPrefill(contextReviewDraft()");
+    expect(reviewWorkflow).toContain('status: "loading"');
+    expect(reviewWorkflow).toContain('status: "ready"');
+    expect(reviewWorkflow).not.toContain("chatStore.sendMessage(");
+    expect(reviewWorkflow.indexOf("chatStore.selectSession(reviewSessionId"))
+      .toBeLessThan(reviewWorkflow.indexOf("await exportContext(sid, null)"));
+    expect(input).toContain("managedLocalFiles");
+    expect(input).toContain("hasBlockingManagedLocalFile");
+    expect(input).toContain('t("chat.fileRefs.exporting")');
     expect(panel).toContain("chat.exportContext");
     expect(panel).toContain("chat.reviewContext");
     expect(workspace).not.toContain("includeSystemPrompt");

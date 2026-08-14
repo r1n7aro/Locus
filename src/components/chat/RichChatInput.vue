@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
-import { FileText, Layers, X } from "lucide";
+import { FileText, Layers, LoaderCircle, X } from "lucide";
 import { t } from "../../i18n";
 import { searchWorkspaceAssets } from "../../services/asset";
 import { knowledgeQuery } from "../../services/knowledge";
@@ -18,6 +18,7 @@ import type {
   ImageAttachment,
   KnowledgeDocumentType,
   KnowledgeSearchResult,
+  ManagedLocalFileAttachment,
   SkillIntentItem,
   SkillManifest,
 } from "../../types";
@@ -163,6 +164,7 @@ const props = withDefaults(defineProps<{
   showAction?: boolean;
   assetRefSyncKey?: string;
   messageHistory?: ChatMessage[];
+  managedLocalFiles?: ManagedLocalFileAttachment[];
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -181,6 +183,7 @@ const props = withDefaults(defineProps<{
   showAction: true,
   assetRefSyncKey: "",
   messageHistory: () => [],
+  managedLocalFiles: () => [],
 });
 
 const emit = defineEmits<{
@@ -194,6 +197,7 @@ const emit = defineEmits<{
   (e: "undo"): void;
   (e: "exportContext"): void;
   (e: "reviewContext"): void;
+  (e: "removeManagedLocalFile", fileId: string): void;
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
@@ -279,16 +283,25 @@ const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
   || consoleTextAttachments.value.length > 0
-  || localFileAttachments.value.length > 0,
+  || localFileAttachments.value.length > 0
+  || props.managedLocalFiles.length > 0,
+);
+
+const hasBlockingManagedLocalFile = computed(() =>
+  props.managedLocalFiles.some((file) => file.status !== "ready"),
 );
 
 const canSend = computed(() =>
-  !!props.modelValue.trim()
-  || !!pastedContent.value
-  || imageAttachments.value.length > 0
-  || assetRefAttachments.value.length > 0
-  || consoleTextAttachments.value.length > 0
-  || localFileAttachments.value.length > 0,
+  !hasBlockingManagedLocalFile.value
+  && (
+    !!props.modelValue.trim()
+    || !!pastedContent.value
+    || imageAttachments.value.length > 0
+    || assetRefAttachments.value.length > 0
+    || consoleTextAttachments.value.length > 0
+    || localFileAttachments.value.length > 0
+    || props.managedLocalFiles.some((file) => file.status === "ready" && !!file.path?.trim())
+  ),
 );
 
 const userMessageHistory = computed(() => props.messageHistory
@@ -305,6 +318,7 @@ function isDraftEmpty() {
     && assetRefAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
     && localFileAttachments.value.length === 0
+    && props.managedLocalFiles.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
 
@@ -1423,6 +1437,25 @@ function localFileDisplayName(file: Pick<LocalFileAttachment, "path" | "name">) 
   return normalized.split("/").filter(Boolean).pop() || normalized;
 }
 
+function managedLocalFileStatusLabel(file: ManagedLocalFileAttachment) {
+  if (file.status === "loading") return t("chat.fileRefs.exporting");
+  if (file.status === "error") return t("chat.fileRefs.exportFailed");
+  return file.typeLabel || t("chat.fileRefs.file");
+}
+
+function readyManagedLocalFiles(): LocalFileAttachment[] {
+  return props.managedLocalFiles
+    .filter((file) => file.status === "ready" && !!file.path?.trim())
+    .map((file) => ({
+      id: file.id,
+      path: file.path!.trim(),
+      name: file.name,
+      typeLabel: file.typeLabel,
+      isDir: false,
+      source: "managed",
+    }));
+}
+
 function toggleLocalFileDetails() {
   if (!shouldGroupLocalFiles.value) return;
   showCommandPopup.value = false;
@@ -1838,6 +1871,9 @@ function handleSend() {
   if (unityConsoleCommandPending.value) {
     return;
   }
+  if (hasBlockingManagedLocalFile.value) {
+    return;
+  }
 
   if (tryHandleExactActionCommand()) {
     return;
@@ -1857,7 +1893,10 @@ function handleSend() {
     : [];
   const assetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
   const consoleTexts = [...consoleTextAttachments.value];
-  const localFiles = [...localFileAttachments.value];
+  const localFiles = dedupeLocalFileAttachments([
+    ...localFileAttachments.value,
+    ...readyManagedLocalFiles(),
+  ]);
 
   if (
     !cleanedInput
@@ -2668,6 +2707,31 @@ defineExpose({
       <template #overlay>
         <div v-if="hasTopAttachments" class="composer-attachment-list">
           <div
+            v-for="file in managedLocalFiles"
+            :key="file.id"
+            class="local-file-chip managed-local-file-chip"
+            :class="`is-${file.status}`"
+            :title="file.path || file.name"
+          >
+            <LucideIcon
+              class="local-file-chip-icon"
+              :class="{ 'is-spinning': file.status === 'loading' }"
+              :icon="file.status === 'loading' ? LoaderCircle : FileText"
+              :size="14"
+            />
+            <span class="local-file-chip-name">{{ file.name }}</span>
+            <span class="local-file-chip-meta">{{ managedLocalFileStatusLabel(file) }}</span>
+            <button
+              type="button"
+              class="local-file-chip-remove ui-select-none"
+              :aria-label="t('chat.fileRefs.remove')"
+              :title="t('chat.fileRefs.remove')"
+              @click.stop="emit('removeManagedLocalFile', file.id)"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
             v-if="consoleTextAttachments.length > 0"
             ref="consoleTextGroupRootRef"
             class="console-text-group"
@@ -3364,6 +3428,24 @@ defineExpose({
   flex: 0 0 auto;
   margin-left: 8px;
   color: var(--text-secondary);
+}
+
+.managed-local-file-chip.is-loading .local-file-chip-meta {
+  color: var(--accent-color);
+}
+
+.managed-local-file-chip.is-error .local-file-chip-meta {
+  color: var(--status-error-fg, var(--text-secondary));
+}
+
+.local-file-chip-icon.is-spinning {
+  animation: managed-file-spin 0.9s linear infinite;
+}
+
+@keyframes managed-file-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .asset-ref-group-title {

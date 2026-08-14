@@ -7,10 +7,14 @@ import { createSession, exportSessionContext as exportContext } from "../service
 import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type {
   EffortLevel,
+  ImageAttachment,
+  AssetRefAttachment,
+  ManagedLocalFileAttachment,
   SessionContextExportRequest,
   SkillIntentItem,
   UserIntentMeta,
 } from "../types";
+import type { UserMessageDraft } from "../composables/chatMessageDraft";
 import { useAgentStore } from "../stores/agent";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
@@ -56,6 +60,7 @@ const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const uiStore = useUiStore();
 const { skillItems } = useSkills();
+const contextReviewFiles = ref(new Map<string, ManagedLocalFileAttachment>());
 
 const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
@@ -436,6 +441,65 @@ function reviewContextSkillIntent(): UserIntentMeta {
   };
 }
 
+const activeContextReviewFiles = computed(() => {
+  const sessionId = chatStore.activeSessionId;
+  if (!sessionId) return [];
+  const file = contextReviewFiles.value.get(sessionId);
+  return file ? [file] : [];
+});
+
+function setContextReviewFile(sessionId: string, file: ManagedLocalFileAttachment) {
+  const next = new Map(contextReviewFiles.value);
+  next.set(sessionId, file);
+  contextReviewFiles.value = next;
+}
+
+function removeContextReviewFile(sessionId: string, fileId?: string) {
+  const current = contextReviewFiles.value.get(sessionId);
+  if (!current || (fileId && current.id !== fileId)) return;
+  const next = new Map(contextReviewFiles.value);
+  next.delete(sessionId);
+  contextReviewFiles.value = next;
+}
+
+function contextReviewDraft(): UserMessageDraft {
+  const intent = reviewContextSkillIntent();
+  return {
+    text: t("chat.contextReviewPrompt"),
+    images: [],
+    assetRefs: [],
+    localFiles: [],
+    consoleTexts: [],
+    intent: {
+      mode: intent.mode,
+      skills: intent.skills,
+    },
+  };
+}
+
+function contextReviewFileName(filePath: string, fallback: string) {
+  return filePath.replace(/\\/g, "/").split("/").filter(Boolean).pop() || fallback;
+}
+
+async function sendWorkspaceMessage(
+  text: string,
+  images: ImageAttachment[],
+  assetRefs: AssetRefAttachment[],
+  overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
+) {
+  const sessionId = chatStore.activeSessionId;
+  if (sessionId) {
+    removeContextReviewFile(sessionId);
+  }
+  await chatStore.sendMessage(text, images, assetRefs, overrides);
+}
+
+function removeManagedComposerFile(fileId: string) {
+  const sessionId = chatStore.activeSessionId;
+  if (!sessionId) return;
+  removeContextReviewFile(sessionId, fileId);
+}
+
 async function exportSessionContext(request?: string | SessionContextExportRequest) {
   const sid = resolveContextSessionId(request);
   if (!sid) return;
@@ -465,29 +529,54 @@ async function exportSessionContext(request?: string | SessionContextExportReque
 async function reviewSessionContext(request?: string | SessionContextExportRequest) {
   const sid = resolveContextSessionId(request);
   if (!sid) return;
+
+  const source = chatStore.sessions.find((session) => session.id === sid);
+  const sourceTitle = source?.title || sid.slice(0, 8);
+  chatStore.newChat({ persistSelection: props.persistSessionSelection });
+
+  let reviewSessionId = "";
   try {
-    const source = chatStore.sessions.find((session) => session.id === sid);
-    const result = await exportContext(sid, null);
-    const reviewSessionId = await createSession({
-      title: t("chat.contextReviewTitle", source?.title || sid.slice(0, 8)),
+    reviewSessionId = await createSession({
+      title: t("chat.contextReviewTitle", sourceTitle),
       sessionType: "chat",
       agentId: agentStore.selectedAgentId || null,
     });
-    await chatStore.refreshSessions();
+    const fileId = `context-review:${reviewSessionId}`;
+    const loadingName = sessionContextExportFileName(sid, sourceTitle);
+    setContextReviewFile(reviewSessionId, {
+      id: fileId,
+      name: loadingName,
+      typeLabel: "YAML",
+      status: "loading",
+    });
     await chatStore.selectSession(reviewSessionId, {
       persist: props.persistSessionSelection,
     });
-    await chatStore.sendMessage(
-      t(
-        "chat.contextReviewPrompt",
-        result.filePath,
-        sid,
-        result.captureQuality,
-      ),
-      [],
-      [],
-      { userIntent: reviewContextSkillIntent() },
-    );
+    uiStore.stageChatDraftPrefill(contextReviewDraft(), {
+      sessionId: reviewSessionId,
+    });
+    void chatStore.refreshSessions();
+
+    try {
+      const result = await exportContext(sid, null);
+      const current = contextReviewFiles.value.get(reviewSessionId);
+      if (!current || current.id !== fileId) return;
+      setContextReviewFile(reviewSessionId, {
+        ...current,
+        name: contextReviewFileName(result.filePath, loadingName),
+        path: result.filePath,
+        status: "ready",
+      });
+    } catch (e) {
+      const current = contextReviewFiles.value.get(reviewSessionId);
+      if (current?.id === fileId) {
+        setContextReviewFile(reviewSessionId, {
+          ...current,
+          status: "error",
+        });
+      }
+      throw e;
+    }
   } catch (e) {
     const err = normalizeAppError(e);
     console.error("review_session_context failed:", e);
@@ -496,6 +585,11 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
       operation: "reviewSessionContext",
       skipConsoleLog: true,
     });
+    if (!reviewSessionId && chatStore.activeSessionId === null) {
+      void chatStore.selectSession(sid, {
+        persist: props.persistSessionSelection,
+      });
+    }
   }
 }
 
@@ -569,9 +663,10 @@ onUnmounted(() => {
       :last-scan-stats="projectStore.lastScanStats"
       :is-unity-project="projectStore.isUnityProject"
       :skills="skillItems"
+      :managed-local-files="activeContextReviewFiles"
       :streaming-session-ids="chatStore.streamingSessionIds"
       :undoable-message-ids="chatStore.undoableMessageIds"
-      @send="chatStore.sendMessage"
+      @send="sendWorkspaceMessage"
       @compact="chatStore.compactSession"
       @fork="chatStore.forkSession"
       @cancel="chatStore.cancelChat"
@@ -582,6 +677,7 @@ onUnmounted(() => {
       @select-fast-mode="(enabled: boolean) => modelStore.selectCodexFastMode(enabled)"
       @export-session-context="exportSessionContext"
       @review-session-context="reviewSessionContext"
+      @remove-managed-composer-file="removeManagedComposerFile"
       @answer-question="chatStore.answerQuestion"
       @answer-tool-confirm="chatStore.answerToolConfirm"
       @answer-all-tool-confirms="chatStore.answerAllToolConfirms"
