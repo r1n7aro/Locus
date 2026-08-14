@@ -29,6 +29,7 @@ import {
 } from "../../composables/toolCallBatches";
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
 import { collectRenderedToolCalls, planPromotedToolVisibility } from "../../composables/toolRenderPlan";
+import { settleToolCallDisplaysForHandoff } from "../../composables/toolCallHandoff";
 import {
   assertCanonicalRenderParts,
   compareAssistantRenderParts,
@@ -189,6 +190,7 @@ const emit = defineEmits<{
   (e: "toolHandoffQuietChange", quiet: boolean): void;
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
+  (e: "streamLayoutChange"): void;
 }>();
 
 const scrollRef = ref<HTMLElement | null>(null);
@@ -312,13 +314,70 @@ const visibleMessages = computed(() =>
   }),
 );
 
+const stabilizedHistoryMarkdownItemIds = ref(new Set<string>());
+const trailingAssistantContentItemId = computed(() =>
+  [...visibleMessages.value]
+    .reverse()
+    .find((message) => message.role === "assistant" && !!message.content.trim())
+    ?.id ?? null,
+);
+
+watch(
+  () => [props.sessionKey, trailingAssistantContentItemId.value] as const,
+  ([sessionKey, itemId], previous) => {
+    const previousSessionKey = previous?.[0] ?? null;
+    const next = sessionKey === previousSessionKey
+      ? new Set(stabilizedHistoryMarkdownItemIds.value)
+      : new Set<string>();
+    if (itemId) next.add(itemId);
+    stabilizedHistoryMarkdownItemIds.value = next;
+  },
+  { immediate: true, flush: "sync" },
+);
+
+function shouldUseStableHistoryMarkdown(itemId: string) {
+  return stabilizedHistoryMarkdownItemIds.value.has(itemId)
+    || itemId === trailingAssistantContentItemId.value;
+}
+
 const toolCallHandoff = ref<ToolCallHandoffState | null>(null);
 const toolCallHandoffQuiet = ref(false);
 const retainedCollapsedToolCallMatchState = ref<ToolCallMatchState>(emptyToolCallMatchState());
+const rememberedToolCollectionExpansion = ref(new Map<string, boolean>());
+const rememberedToolBlockExpansion = ref(new Map<string, boolean>());
 let toolCallHandoffSequence = 0;
 let toolCallHandoffArmTimer: ReturnType<typeof setTimeout> | null = null;
 let toolCallHandoffFrameA = 0;
 let toolCallHandoffFrameB = 0;
+
+function toolCollectionExpansionKey(toolCalls: ToolCallDisplay[]) {
+  return toolCalls.map((toolCall) => toolCall.id).join("\u241f");
+}
+
+function rememberedCollectionExpanded(toolCalls: ToolCallDisplay[]) {
+  return rememberedToolCollectionExpansion.value.get(toolCollectionExpansionKey(toolCalls));
+}
+
+function rememberCollectionExpanded(toolCalls: ToolCallDisplay[], expanded: boolean) {
+  const next = new Map(rememberedToolCollectionExpansion.value);
+  next.set(toolCollectionExpansionKey(toolCalls), expanded);
+  rememberedToolCollectionExpansion.value = next;
+}
+
+function rememberedBlockExpanded(toolCall: ToolCallDisplay) {
+  return rememberedToolBlockExpansion.value.get(toolCall.id);
+}
+
+function rememberBlockExpanded(toolCall: ToolCallDisplay, expanded: boolean) {
+  const next = new Map(rememberedToolBlockExpansion.value);
+  next.set(toolCall.id, expanded);
+  rememberedToolBlockExpansion.value = next;
+}
+
+function clearRememberedToolExpansion() {
+  rememberedToolCollectionExpansion.value = new Map();
+  rememberedToolBlockExpansion.value = new Map();
+}
 
 function requestToolHandoffFrame(callback: () => void): number {
   if (typeof requestAnimationFrame === "function") {
@@ -539,6 +598,7 @@ watch(
     if (sessionKey === previousSessionKey) return;
     clearToolCallHandoff("session-key-changed");
     clearRetainedCollapsedToolCalls("session-key-changed");
+    clearRememberedToolExpansion();
   },
   { flush: "sync" },
 );
@@ -638,7 +698,12 @@ function scheduleToolCallHandoffCollapse() {
 }
 
 function beginToolCallHandoff(previousToolCalls: ToolCallDisplay[]) {
-  const toolCalls = previousToolCalls.map((toolCall) => cloneToolCallDisplay(toolCall));
+  // Clearing activeToolCalls means the backend closed this tool round. Some
+  // transports can omit toolCallDone, leaving a regular foreground tool at
+  // `running`; settle that stale presentation state before the handoff is
+  // rendered. Explicit background tools remain running until their async
+  // task update arrives.
+  const toolCalls = settleToolCallDisplaysForHandoff(previousToolCalls);
   if (toolCalls.length === 0) {
     clearToolCallHandoff("begin-empty");
     return;
@@ -1620,6 +1685,13 @@ const hasVisibleCompletedThinkingContent = computed(() =>
 );
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
 const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);
+const hasRunningTransientToolCall = computed(() => {
+  const hasRunning = (toolCalls: ToolCallDisplay[]): boolean => toolCalls.some((toolCall) => (
+    toolCall.status === "running"
+    || hasRunning(toolCall.nestedToolCalls ?? [])
+  ));
+  return hasRunning(transientToolCalls.value);
+});
 const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
 const hasVisibleActiveThinkingBlock = computed(() =>
   props.isThinking
@@ -1631,7 +1703,8 @@ const hasVisibleTransientThinkingBlock = computed(
 const hasStreamingContent = computed(() =>
   hasVisibleStreamingText.value
   || canonicalLiveRenderParts.value.some((part) => part.kind === "text" || part.kind === "toolCall")
-  || hasLiveToolCalls.value,
+  || hasLiveToolCalls.value
+  || hasRunningTransientToolCall.value,
 );
 const isWaitingForResponse = computed(
   () => shouldShowWaitingPlaceholder({
@@ -2338,6 +2411,17 @@ const transientRenderedToolCalls = computed(() =>
   ),
 );
 
+// Handoff state and history promotion can settle in separate reactive steps.
+// Rendering a transient wrapper while its segment list is already empty adds
+// a bare 10px/12px continuation shell for one frame at stream end. Gate the
+// wrapper and its matching history padding on the concrete rendered segments.
+const shouldRenderTransientAssistantMessage = computed(() =>
+  hasTransientAssistantMessage.value && transientRenderSegments.value.length > 0,
+);
+const isRenderedStreamingContinuation = computed(() =>
+  isStreamingContinuation.value && shouldRenderTransientAssistantMessage.value,
+);
+
 function transientSegmentPaintState() {
   return transientRenderSegments.value.map((segment, index) => {
     if (segment.type === "thinking") {
@@ -2769,7 +2853,7 @@ function openImage(src: string) {
               group.role,
               {
                 'has-round-divider': shouldShowSessionRoundDivider(group, idx),
-                'before-continuation': isStreamingContinuation && idx === groupedMessages.length - 1,
+                'before-continuation': isRenderedStreamingContinuation && idx === groupedMessages.length - 1,
                 'compact-handoff': group.items.some((item) => isCompactHandoffMessage(item.message)),
                 'user-align-right': shouldRightAlignUserMessageGroup(group),
               },
@@ -2972,6 +3056,8 @@ function openImage(src: string) {
                     :tool-calls="segment.toolCalls"
                     :allow-collapse="!shouldKeepToolSegmentExpanded(segment)"
                     :collapse-enabled="!shouldKeepToolSegmentExpanded(segment)"
+                    :initial-expanded="rememberedCollectionExpanded(segment.toolCalls)"
+                    @user-expansion-change="rememberCollectionExpanded(segment.toolCalls, $event)"
                     @viewport-anchor-start="emitToolViewportAnchorStart"
                     @viewport-anchor-end="emitToolViewportAnchorEnd"
                   >
@@ -2979,12 +3065,27 @@ function openImage(src: string) {
                       <ToolCallBlock
                         :tool-call="toolCall"
                         :collapse-enabled="!shouldKeepToolSegmentExpanded(segment)"
+                        :initial-expanded="rememberedBlockExpanded(toolCall)"
+                        @user-expansion-change="rememberBlockExpanded(toolCall, $event)"
                         @tool-viewport-anchor-start="emitToolViewportAnchorStart"
                         @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
                       />
                     </template>
                   </ToolCallCollection>
                 </div>
+
+                <StreamingMarkdownRenderer
+                  v-else-if="segment.type === 'content' && shouldUseStableHistoryMarkdown(segment.itemId)"
+                  data-render-part-kind="text"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
+                  :content="segment.content"
+                  :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
+                  enable-file-refs
+                  @open-image="openImage"
+                />
 
                 <MarkdownRenderer
                   v-else-if="segment.type === 'content'"
@@ -3017,12 +3118,12 @@ function openImage(src: string) {
         </template>
 
         <div
-          v-if="hasTransientAssistantMessage"
+          v-if="shouldRenderTransientAssistantMessage"
           class="chat-transcript-message assistant transient"
           :class="[
             `is-${variant}`,
             {
-              continuation: isStreamingContinuation,
+              continuation: isRenderedStreamingContinuation,
               'waiting-placeholder': isStandaloneWaitingPlaceholder,
               'compact-handoff': isCompacting,
               'has-live-thinking': hasVisibleActiveThinkingBlock,
@@ -3032,7 +3133,7 @@ function openImage(src: string) {
           data-scroll-anchor-id="__transient__"
         >
           <div
-            v-if="!isStreamingContinuation"
+            v-if="!isRenderedStreamingContinuation"
             class="chat-transcript-message-role"
             :class="`is-${variant}`"
           >
@@ -3100,8 +3201,10 @@ function openImage(src: string) {
                     :allow-collapse="segment.allowCollapse"
                     :collapse-enabled="segment.collapseEnabled"
                     :animate-collapse-on-mount="segment.animateCollapseOnMount"
+                    :initial-expanded="rememberedCollectionExpanded(segment.toolCalls)"
                     :show-waiting-status="segment.showWaiting && isToolWaitingStatusVisible"
                     :waiting-label="effectiveWaitingLabel"
+                    @user-expansion-change="rememberCollectionExpanded(segment.toolCalls, $event)"
                     @collapse-finished="onTransientToolCallsCollapseFinished"
                     @viewport-anchor-start="emitToolViewportAnchorStart"
                     @viewport-anchor-end="emitToolViewportAnchorEnd"
@@ -3110,6 +3213,8 @@ function openImage(src: string) {
                       <ToolCallBlock
                         :tool-call="toolCall"
                         :collapse-enabled="segment.collapseEnabled"
+                        :initial-expanded="rememberedBlockExpanded(toolCall)"
+                        @user-expansion-change="rememberBlockExpanded(toolCall, $event)"
                         @tool-viewport-anchor-start="emitToolViewportAnchorStart"
                         @tool-viewport-anchor-end="emitToolViewportAnchorEnd"
                       />
@@ -3144,6 +3249,7 @@ function openImage(src: string) {
                   cursor
                   enable-file-refs
                   @open-image="openImage"
+                  @layout-change="emit('streamLayoutChange')"
                 />
               </template>
             </div>
@@ -3227,29 +3333,6 @@ function openImage(src: string) {
   max-width: 100%;
   position: relative;
   contain: layout paint;
-}
-
-@supports (content-visibility: auto) {
-  .chat-transcript-message.is-session {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 180px;
-  }
-
-  /* Freshly inserted messages have no last-remembered size, so their first
-     frame lays out at the 180px placeholder. At stream end the transient
-     block (real height) is removed in the same patch, which collapses
-     scrollHeight for one frame, clamps scrollTop, and flashes the viewport.
-     Keep the bottom three messages always laid out: the swap happens at the
-     tail, and viewport-adjacent messages gain nothing from being skippable
-     (-n+3 covers history+transient coexistence and the pending-user swap). */
-  .chat-transcript-content > .chat-transcript-message.is-session:nth-last-child(-n+3 of .chat-transcript-message) {
-    content-visibility: visible;
-  }
-
-  .chat-transcript-message.is-session.assistant.transient.has-live-thinking,
-  .chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status {
-    content-visibility: visible;
-  }
 }
 
 .chat-transcript-message.is-session.assistant {

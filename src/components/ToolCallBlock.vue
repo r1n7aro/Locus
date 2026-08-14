@@ -33,12 +33,14 @@ import type { ToolCallDisplay, FileDiffPayload } from "../types";
 const props = withDefaults(defineProps<{
   toolCall: ToolCallDisplay;
   collapseEnabled?: boolean;
+  initialExpanded?: boolean;
 }>(), {
   collapseEnabled: true,
 });
 const emit = defineEmits<{
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
+  (e: "userExpansionChange", expanded: boolean): void;
 }>();
 
 function isSubagentToolName(name: string) {
@@ -49,7 +51,7 @@ function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
   return isSubagentToolName(toolCall.name) && toolCall.status === "running";
 }
 
-const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));
+const expanded = ref(props.initialExpanded ?? shouldAutoExpandSubagentTool(props.toolCall));
 const openingViewTool = ref(false);
 const openingFilePreview = ref(false);
 const rootRef = ref<HTMLElement | null>(null);
@@ -159,7 +161,9 @@ function setExpanded(nextExpanded: boolean, preserveViewport = false) {
 }
 
 function toggleExpanded() {
-  setExpanded(!expanded.value, true);
+  const nextExpanded = !expanded.value;
+  setExpanded(nextExpanded, true);
+  emit("userExpansionChange", nextExpanded);
 }
 
 function expandFromBlockClick(event: MouseEvent) {
@@ -357,13 +361,22 @@ function escapeHtml(s: string): string {
 const parsedArgs = computed(() => {
   try {
     const args = JSON.parse(props.toolCall.arguments);
-    if (typeof args !== "object" || args === null) return [];
+    if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
     const isSubagent = props.toolCall.name === "subagent" || props.toolCall.name === "task";
     const isEdit = props.toolCall.name === "edit";
+    const isUnityTestTool = props.toolCall.name === "unity_test_list"
+      || props.toolCall.name === "unity_test_run";
     const editDiffKeys = ["oldString", "old_string", "newString", "new_string", "edits"];
+    const unityTestFilterKeys = ["assemblies", "tests", "groups", "categories"];
     return Object.entries(args)
       .filter(([key]) => !isSubagent || key === "prompt")
       .filter(([key]) => !isEdit || !editDiffKeys.includes(key))
+      .filter(([key, value]) => (
+        !isUnityTestTool
+        || !unityTestFilterKeys.includes(key)
+        || !Array.isArray(value)
+        || value.length > 0
+      ))
       .map(([key, value]) => ({
         key,
         value,
@@ -377,8 +390,22 @@ const parsedArgs = computed(() => {
 
 const rawArgsFallback = computed(() => {
   if (parsedArgs.value.length > 0) return "";
+  if (props.toolCall.name === "unity_test_list" || props.toolCall.name === "unity_test_run") {
+    try {
+      const args = JSON.parse(props.toolCall.arguments);
+      if (typeof args === "object" && args !== null && !Array.isArray(args)) return "";
+    } catch {
+      // Preserve malformed arguments for diagnostics.
+    }
+  }
   return props.toolCall.arguments;
 });
+
+const hasArgsDetail = computed(() => (
+  Boolean(isEditTool.value && editDiffData.value)
+  || parsedArgs.value.length > 0
+  || Boolean(rawArgsFallback.value)
+));
 
 function formatValue(value: unknown): string {
   if (typeof value === "string") return value;
@@ -558,7 +585,7 @@ const highlightedOutput = computed(() => {
           class="tool-call-summary"
           :title="headerSummaryTitle"
         >{{ headerSummary }}</span>
-        <span v-if="skillLoadedLabel" class="tool-call-inline-note">· {{ skillLoadedLabel }}</span>
+        <span v-if="skillLoadedLabel" class="tool-call-inline-note">{{ skillLoadedLabel }}</span>
       </button>
       <button
         v-if="showViewOpenButton"
@@ -596,7 +623,7 @@ const highlightedOutput = computed(() => {
         :empty-text="t('todo.empty')"
         compact
       />
-      <div v-else class="tool-call-section">
+      <div v-else-if="hasArgsDetail" class="tool-call-section">
         <div class="tool-call-section-label">{{ t("tool.section.args") }}</div>
         <template v-if="isEditTool && editDiffData">
           <div v-if="parsedArgs.length > 0" class="tool-args-table" style="margin-bottom: 6px;">
@@ -852,22 +879,29 @@ const highlightedOutput = computed(() => {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 38%;
+  padding: 1px 5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-secondary);
+  border: 1px solid var(--status-good-border);
+  border-radius: 4px;
+  background: var(--status-good-bg);
+  color: var(--status-good-fg);
   font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
 }
 
 .tool-call-action-button {
   appearance: none;
-  min-height: 24px;
+  height: 22px;
+  min-height: 22px;
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 5px;
-  padding: 0 8px;
+  padding: 0 6px;
   border: 1px solid transparent;
   border-radius: 5px;
   background: transparent;

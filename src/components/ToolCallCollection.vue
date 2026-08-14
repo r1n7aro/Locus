@@ -14,6 +14,7 @@ const props = withDefaults(defineProps<{
   allowCollapse?: boolean;
   collapseEnabled?: boolean;
   animateCollapseOnMount?: boolean;
+  initialExpanded?: boolean;
   showWaitingStatus?: boolean;
   waitingLabel?: string;
 }>(), {
@@ -27,16 +28,19 @@ const emit = defineEmits<{
   (e: "collapseFinished"): void;
   (e: "viewportAnchorStart", anchor: HTMLElement): void;
   (e: "viewportAnchorEnd", anchor: HTMLElement): void;
+  (e: "userExpansionChange", expanded: boolean): void;
 }>();
 
 const { state: displaySettings } = useDisplaySettings();
 const startsExpandedForCollapseAnimation =
+  props.initialExpanded === undefined
+  &&
   props.animateCollapseOnMount
   && summarizeToolCallBatch(
     props.toolCalls,
     displaySettings.compactToolCalls && props.allowCollapse && props.collapseEnabled,
   ).canCollapse;
-const expanded = ref(startsExpandedForCollapseAnimation);
+const expanded = ref(props.initialExpanded ?? startsExpandedForCollapseAnimation);
 const panelVisible = ref(false);
 const panelLeaving = ref(false);
 const autoCollapseFloatingSummary = ref(startsExpandedForCollapseAnimation);
@@ -218,6 +222,7 @@ function toggleExpanded() {
     nextExpanded: !expanded.value,
   });
   expanded.value = !expanded.value;
+  emit("userExpansionChange", expanded.value);
 }
 
 onMounted(() => {

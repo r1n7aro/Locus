@@ -39,6 +39,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "openImage", src: string): void;
+  (e: "layoutChange"): void;
 }>();
 
 /**
@@ -55,6 +56,11 @@ const PLAIN_TAIL_PART_TARGET = 4096;
 
 const splitter = new StreamingMarkdownSplitter();
 const split = shallowRef<StreamingMarkdownSplit>({ blocks: [], tail: "" });
+
+// Vue post-flush watchers run after this component's DOM patch and before the
+// browser paints. Let the transcript correct its viewport against the actual
+// Markdown height instead of the parent's independently throttled text value.
+watch(split, () => emit("layoutChange"), { flush: "post" });
 
 /**
  * Append-only projection of an oversized plain tail: frozen spans plus a

@@ -1387,9 +1387,13 @@ img.md-ref-icon-image {
 }
 
 .streaming-cursor {
+  display: inline-block;
+  width: 0;
+  margin-left: 0;
+  overflow: visible;
   color: var(--accent-color);
   font-weight: 400;
-  margin-left: 1px;
+  transform: translateX(1px);
   animation: streaming-cursor-blink 0.8s step-end infinite;
 }
 

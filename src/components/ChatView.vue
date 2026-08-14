@@ -12,7 +12,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, ManagedLocalFileAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
 import type { ChangedFile, ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -239,6 +239,7 @@ const props = defineProps<{
   lastScanStats?: ScanStats | null;
   isUnityProject?: boolean;
   skills?: SkillManifest[];
+  managedLocalFiles?: ManagedLocalFileAttachment[];
   streamingSessionIds?: Set<string>;
   undoableMessageIds?: Set<string>;
   layoutMode?: ChatLayoutMode;
@@ -273,6 +274,7 @@ const emit = defineEmits<{
   selectFastMode: [enabled: boolean];
   exportSessionContext: [request: SessionContextExportRequest];
   reviewSessionContext: [request: SessionContextExportRequest];
+  removeManagedComposerFile: [fileId: string];
   answerQuestion: [answer: string];
   answerToolConfirm: [questionId: string, answer: string];
   answerAllToolConfirms: [questionIds: string[], answer: string];
@@ -1859,7 +1861,7 @@ function handleToolViewportAnchorStart(anchor: HTMLElement) {
 
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
-  streamEndScrollScheduler.cancel();
+  if (!pendingStreamEndViewport) streamEndScrollScheduler.cancel();
   clearToolViewportAnchorFrame();
   activeToolViewportAnchor = captureLiveScrollAnchor(el, anchor);
   traceViewportAnchorSample({
@@ -1992,8 +1994,32 @@ function preserveScrollAnchor() {
   preserveScrollAnchorScheduler.schedule();
 }
 
+interface StreamEndViewportSnapshot {
+  sessionId: string | null;
+  followBottom: boolean;
+  state: SessionScrollState;
+  settleAfter: number;
+}
+
+let pendingStreamEndViewport: StreamEndViewportSnapshot | null = null;
+
+function applyPendingStreamEndViewport() {
+  const snapshot = pendingStreamEndViewport;
+  if (!snapshot || snapshot.sessionId !== props.activeSessionId) return;
+  if (toolHandoffViewportQuiet.value || isSessionRestoreViewportGuardActive()) return;
+
+  if (snapshot.followBottom) {
+    scrollToBottomNow(true);
+  } else {
+    restoreMessagesScrollState(snapshot.state, snapshot.sessionId);
+  }
+  if (Date.now() >= snapshot.settleAfter) {
+    pendingStreamEndViewport = null;
+  }
+}
+
 const streamEndScrollScheduler = createSettledScrollScheduler(
-  () => scrollToBottom(true),
+  () => nextTick(applyPendingStreamEndViewport),
   STREAM_END_SCROLL_SETTLE_MS,
 );
 
@@ -2010,11 +2036,15 @@ watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
   if (quiet) {
     scrollToBottomScheduler.cancel();
     preserveScrollAnchorScheduler.cancel();
-    streamEndScrollScheduler.cancel();
+    if (!pendingStreamEndViewport) streamEndScrollScheduler.cancel();
     return;
   }
   if (previousQuiet) {
-    reconcileViewport();
+    if (pendingStreamEndViewport) {
+      streamEndScrollScheduler.schedule();
+    } else {
+      reconcileViewport();
+    }
   }
 });
 
@@ -2045,18 +2075,34 @@ function reconcileViewport(forceBottom = false) {
   preserveScrollAnchor();
 }
 
+function reconcileStreamingLayoutNow() {
+  if (toolHandoffViewportQuiet.value || isSessionRestoreViewportGuardActive()) return;
+  if (restoreToolViewportAnchor()) return;
+
+  const el = getMessagesElement();
+  if (!el) return;
+  const remembered = props.activeSessionId
+    ? chatStore.getSessionScrollState(props.activeSessionId)
+    : null;
+  if (!shouldAutoScrollToBottom({ metrics: readMessageMetrics(el), remembered })) return;
+
+  scrollToBottomScheduler.cancel();
+  scrollToBottomNow();
+}
+
 function settleStreamEndScroll() {
-  if (toolHandoffViewportQuiet.value) return;
   const el = getMessagesElement();
   if (!el) return;
 
   const metrics = readMessageMetrics(el);
   const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
-  if (!shouldAutoScrollToBottom({ metrics, remembered })) {
-    preserveScrollAnchor();
-    return;
-  }
-
+  const followBottom = shouldAutoScrollToBottom({ metrics, remembered });
+  pendingStreamEndViewport = {
+    sessionId: props.activeSessionId,
+    followBottom,
+    state: followBottom ? { mode: "bottom" } : captureCurrentSessionScrollState(el),
+    settleAfter: Date.now() + STREAM_END_SCROLL_SETTLE_MS,
+  };
   streamEndScrollScheduler.schedule();
 }
 
@@ -2212,6 +2258,7 @@ function preserveMessagesViewportForUserScroll() {
   cancelSessionRestoreLayoutStabilization();
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
+  pendingStreamEndViewport = null;
   streamEndScrollScheduler.cancel();
   rememberScrollForSession();
 }
@@ -2388,6 +2435,7 @@ watch(
     }
     clearToolViewportAnchor();
     scrollToBottomScheduler.cancel();
+    pendingStreamEndViewport = null;
     streamEndScrollScheduler.cancel();
     preserveScrollAnchorScheduler.cancel();
     cancelSessionRestoreFrame();
@@ -2462,6 +2510,7 @@ watch(
       quiet: toolHandoffViewportQuiet.value,
     });
     if (nextStreaming) {
+      pendingStreamEndViewport = null;
       streamEndScrollScheduler.cancel();
       return;
     }
@@ -2779,6 +2828,7 @@ onUnmounted(() => {
   clearInputControlsSwitchTimer();
   scrollToBottomScheduler.cancel();
   preserveScrollAnchorScheduler.cancel();
+  pendingStreamEndViewport = null;
   streamEndScrollScheduler.cancel();
   cancelSessionRestoreFrame();
   cancelSessionRestoreLayoutStabilization();
@@ -2964,6 +3014,7 @@ onUnmounted(() => {
           @tool-handoff-quiet-change="handleToolHandoffQuietChange"
           @tool-viewport-anchor-start="handleToolViewportAnchorStart"
           @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
+          @stream-layout-change="reconcileStreamingLayoutNow"
         >
         </ChatTranscript>
         <ChatTurnNavigationRail
@@ -3144,6 +3195,7 @@ onUnmounted(() => {
           v-model="inputText"
           :selected-agent-id="selectedAgentId"
           :skills="skills"
+          :managed-local-files="managedLocalFiles"
           :placeholder="chatInputPlaceholder"
           :is-streaming="isStreaming"
           :cancelling="isCancelling"
@@ -3160,6 +3212,7 @@ onUnmounted(() => {
           @undo="openUndoChooser"
           @export-context="emit('exportSessionContext', { sessionId: activeSessionId || '' })"
           @review-context="emit('reviewSessionContext', { sessionId: activeSessionId || '' })"
+          @remove-managed-local-file="emit('removeManagedComposerFile', $event)"
           @clear="handleNewChatRequest"
           @cancel="emit('cancel')"
           @resume="emit('resume')"

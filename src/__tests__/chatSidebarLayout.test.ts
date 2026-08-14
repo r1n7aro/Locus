@@ -265,7 +265,7 @@ describe("chat sidebar layout", () => {
 
     expect(toolBlock).toContain("function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {");
     expect(toolBlock).toContain("return isSubagentToolName(toolCall.name) && toolCall.status === \"running\";");
-    expect(toolBlock).toContain("const expanded = ref(shouldAutoExpandSubagentTool(props.toolCall));");
+    expect(toolBlock).toContain("const expanded = ref(props.initialExpanded ?? shouldAutoExpandSubagentTool(props.toolCall));");
     expect(toolBlock).toContain("if (previousStatus === \"running\" && nextStatus !== \"running\") {");
     expect(toolBlock).toContain("setExpanded(false, true);");
     expect(toolBlock).toContain("} else if (previousStatus !== \"running\" && nextStatus === \"running\") {");
@@ -278,6 +278,9 @@ describe("chat sidebar layout", () => {
 
     expect(transcript).toContain("const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);");
     expect(transcript).toContain("const hasTransientToolCalls = computed(() => transientToolCalls.value.length > 0);");
+    expect(transcript).toContain("const hasRunningTransientToolCall = computed(() => {");
+    expect(transcript).toContain("|| hasRunningTransientToolCall.value");
+    expect(transcript).toContain("settleToolCallDisplaysForHandoff(previousToolCalls)");
     expect(transcript).toContain("const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);");
     expect(transcript).toContain("const canonicalLiveRenderParts = computed(() => {");
     expect(transcript).toContain("canonicalLiveRenderParts.value.some((part) => part.kind === \"text\" || part.kind === \"toolCall\")");
@@ -403,10 +406,9 @@ describe("chat sidebar layout", () => {
 
     expect(transcript).toContain("'has-live-thinking': hasVisibleActiveThinkingBlock");
     expect(transcript).toContain("'has-tool-waiting-status': isToolWaitingStatusVisible");
-    expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.has-live-thinking");
-    expect(transcript).toContain(".chat-transcript-message.is-session.assistant.transient.has-tool-waiting-status");
-    expect(transcript).toContain("content-visibility: visible;");
-    expect(transcript).toContain("contain: layout;");
+    expect(transcript).not.toContain("content-visibility:");
+    expect(transcript).not.toContain("contain-intrinsic-size:");
+    expect(transcript).toContain("contain: layout paint;");
     expect(transcript).toContain(".chat-transcript-item-stack > [data-render-part-kind]");
     expect(transcript).toContain(".chat-transcript-tool-calls-group {");
     expect(transcript).toContain("z-index: 0;");
