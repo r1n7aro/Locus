@@ -14,6 +14,7 @@ import {
   setFileToolWorkspaceBoundary,
   saveToolPermissionMode,
   setDebugMode,
+  subscribeDebugMode,
 } from "../services/permissions";
 
 describe("permissions service", () => {
@@ -50,6 +51,18 @@ describe("permissions service", () => {
     expect(ipcInvokeMock).toHaveBeenCalledWith("set_debug_mode", {
       value: false,
     });
+  });
+
+  it("publishes Debug mode changes to model availability subscribers", async () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeDebugMode(listener);
+
+    await setDebugMode(true);
+    expect(listener).toHaveBeenCalledWith(true);
+
+    unsubscribe();
+    await setDebugMode(false);
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("caches loaded file tool workspace boundary mode", async () => {

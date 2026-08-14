@@ -12,7 +12,7 @@ use super::{StreamEvent, TokenUsage};
 use crate::agent::definition::{canonical_agent_id, is_hidden_legacy_agent_id};
 use crate::agent::instance::{
     AgentInstance, AgentSystemPromptStats, AssistantStreamSnapshot, KnowledgeAccessMode,
-    LlmBackend, RawContextStore,
+    LlmBackend, MockModelProfile, RawContextStore,
 };
 use crate::auth::AuthState;
 use crate::config::AppConfig;
@@ -464,6 +464,7 @@ fn apply_knowledge_target(
                 summary_enabled: crate::knowledge_store::default_summary_enabled_for_type(doc_type),
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Inherit,
                 ai_maintained: crate::knowledge_store::default_ai_maintained_for_type(doc_type),
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: true,
@@ -711,11 +712,21 @@ async fn resolve_model_backend(
         );
     }
 
+    let is_mock = selected_model.starts_with("mock/");
     let is_custom = selected_model.starts_with("custom/");
     let is_openrouter = selected_model.starts_with("openrouter/");
     let is_claude_code = selected_model.starts_with("claude_code/");
     let is_openai_codex = selected_model.starts_with("openai/");
     let is_anthropic_direct = !selected_model.contains('/');
+
+    if is_mock {
+        if !config.debug_enabled() {
+            return Err("Simulated models require Debug mode".to_string().into());
+        }
+        let profile = MockModelProfile::from_model_id(selected_model)
+            .ok_or_else(|| format!("Unknown simulated model preset: {}", selected_model))?;
+        return Ok(LlmBackend::Mock { profile });
+    }
 
     if is_custom {
         return custom_backend_for_model(selected_model);
@@ -1091,18 +1102,23 @@ pub async fn chat(
         .operation("chat"));
     }
     let session_kind = session_type.as_deref().unwrap_or("chat");
+    let mock_model_requested = model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value.starts_with("mock/"));
     let explicit_session_title = session_title
         .as_deref()
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(str::to_string);
     let codex_model_config = crate::commands::load_codex_model_config().unwrap_or_default();
-    let codex_title_generation_enabled = if codex_model_config.generate_session_titles {
-        let status = codex.lock().await.status();
-        status.authenticated && !status.validation_failed
-    } else {
-        false
-    };
+    let codex_title_generation_enabled =
+        if codex_model_config.generate_session_titles && !mock_model_requested {
+            let status = codex.lock().await.status();
+            status.authenticated && !status.validation_failed
+        } else {
+            false
+        };
     let prepared_title_prompt = (is_new_session
         && session_kind == "chat"
         && explicit_session_title.is_none()
@@ -1204,13 +1220,21 @@ pub async fn chat(
 
     // - "openrouter/..." → OpenRouter
     // - "openai/..." → OpenAI Codex
+    let is_mock = selected_model.starts_with("mock/");
     let is_custom = selected_model.starts_with("custom/");
     let is_openrouter = selected_model.starts_with("openrouter/");
     let is_claude_code = selected_model.starts_with("claude_code/");
     let is_openai_codex = selected_model.starts_with("openai/");
     let is_anthropic_direct = !selected_model.contains('/');
 
-    let backend = if is_custom {
+    let backend = if is_mock {
+        if !config.debug_enabled() {
+            return Err("Simulated models require Debug mode".to_string().into());
+        }
+        let profile = MockModelProfile::from_model_id(&selected_model)
+            .ok_or_else(|| format!("Unknown simulated model preset: {}", selected_model))?;
+        LlmBackend::Mock { profile }
+    } else if is_custom {
         custom_backend_for_model(&selected_model)?
     } else if is_openrouter {
         let api_key = api_key_state.read().await.clone();

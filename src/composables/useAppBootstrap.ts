@@ -293,6 +293,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     await measureStartupAsync("bootstrap_model_config", async () => {
       await Promise.all([
         chatStore.loadToolPermissionMode(),
+        modelStore.loadDebugMode(),
         modelStore.loadModelDefaults(),
         modelStore.loadLastModel(),
         modelStore.loadCodexFastMode(),
@@ -751,6 +752,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     await Promise.all([
       authStore.checkAuth(),
       modelStore.loadModelDefaults(),
+      modelStore.loadDebugMode(),
       modelStore.loadLastModel(),
       modelStore.loadCodexFastMode(),
       modelStore.loadCustomProviders(),

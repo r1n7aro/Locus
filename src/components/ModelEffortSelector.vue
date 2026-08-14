@@ -40,6 +40,7 @@ const providerLabels = computed<Record<string, string>>(() => ({
   claude_code: t("model.provider.claude_code"),
   openai_codex: t("model.provider.openai"),
   custom: t("model.provider.custom"),
+  mock: t("model.provider.mock"),
 }));
 
 const providerShortLabels = computed<Record<string, string>>(() => ({
@@ -48,6 +49,7 @@ const providerShortLabels = computed<Record<string, string>>(() => ({
   claude_code: t("model.provider.claude_code.short"),
   openai_codex: t("model.provider.openai.short"),
   custom: t("model.provider.custom"),
+  mock: t("model.provider.mock.short"),
 }));
 
 const selectedModel = computed(() =>

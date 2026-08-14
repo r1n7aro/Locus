@@ -115,9 +115,34 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_prompt_too_long_error, is_retryable_llm_error, model_context_limit,
-        resolve_openrouter_model, OPENAI_CODEX_5_6_CONTEXT_LIMIT, OPENAI_CODEX_CONTEXT_LIMIT,
+        build_mock_response_plan, is_prompt_too_long_error, is_retryable_llm_error,
+        model_context_limit, resolve_openrouter_model, MockModelProfile,
+        OPENAI_CODEX_5_6_CONTEXT_LIMIT, OPENAI_CODEX_CONTEXT_LIMIT,
     };
+    use crate::session::models::{ChatMessage, MessageRole};
+
+    fn message(id: &str, role: MessageRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            role,
+            content: content.to_string(),
+            created_at: 0,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        }
+    }
 
     #[test]
     fn prompt_too_long_matches_provider_error_shapes() {
@@ -336,6 +361,69 @@ mod tests {
         ));
         assert!(!is_retryable_llm_error("tool loop aborted by user"));
     }
+
+    #[test]
+    fn recognizes_only_supported_mock_model_ids() {
+        assert_eq!(
+            MockModelProfile::from_model_id("mock/stream"),
+            Some(MockModelProfile::Stream)
+        );
+        assert_eq!(
+            MockModelProfile::from_model_id("mock/tool"),
+            Some(MockModelProfile::Tool)
+        );
+        assert_eq!(
+            MockModelProfile::from_model_id("mock/error"),
+            Some(MockModelProfile::Error)
+        );
+        assert_eq!(MockModelProfile::from_model_id("mock/unknown"), None);
+    }
+
+    #[test]
+    fn mock_stream_plan_uses_a_deterministic_local_response() {
+        let messages = vec![
+            message("user-1", MessageRole::User, "first"),
+            message("assistant-1", MessageRole::Assistant, "done"),
+            message("user-2", MessageRole::User, "测试本地回复"),
+        ];
+        let plan = build_mock_response_plan(MockModelProfile::Stream, &messages, &[]);
+
+        assert_eq!(plan.text, "模拟模型已生成本地流式响应。");
+        assert!(!plan.thinking.is_empty());
+        assert!(plan.tool_calls.is_empty());
+        assert!(plan.error.is_none());
+    }
+
+    #[test]
+    fn mock_tool_plan_calls_todowrite_then_finishes_after_its_result() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "todowrite" }
+        })];
+        let mut messages = vec![message("user-1", MessageRole::User, "run tool")];
+        let first = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].name, "todowrite");
+        assert!(first.text.is_empty());
+
+        let mut tool_result = message("tool-1", MessageRole::Tool, "Todos updated");
+        tool_result.tool_call_id = Some(first.tool_calls[0].id.clone());
+        messages.push(message("assistant-1", MessageRole::Assistant, ""));
+        messages.push(tool_result);
+        let follow_up = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert!(follow_up.tool_calls.is_empty());
+        assert!(follow_up.text.contains("simulated tool call completed"));
+    }
+
+    #[test]
+    fn mock_error_plan_returns_a_deterministic_failure() {
+        let plan = build_mock_response_plan(MockModelProfile::Error, &[], &[]);
+        assert_eq!(plan.error.as_deref(), Some("Simulated model backend error"));
+        assert!(plan.text.is_empty());
+        assert!(plan.tool_calls.is_empty());
+    }
 }
 
 /// Retry only when the transport failed before we can trust the streamed payload.
@@ -428,9 +516,40 @@ pub(super) fn is_prompt_too_long_error(error: &str) -> bool {
         || lower.contains("exceed context limit")
 }
 
+/// Deterministic, local-only model behavior exposed while Locus Debug mode is
+/// enabled. Each profile exercises a different part of the regular agent
+/// pipeline without opening a network connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockModelProfile {
+    Stream,
+    Tool,
+    Error,
+}
+
+impl MockModelProfile {
+    pub fn from_model_id(model: &str) -> Option<Self> {
+        match model.trim() {
+            "mock/stream" => Some(Self::Stream),
+            "mock/tool" => Some(Self::Tool),
+            "mock/error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Tool => "tool",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// LLM backend type
 #[derive(Debug, Clone)]
 pub enum LlmBackend {
+    /// In-process deterministic backend available only in Debug mode.
+    Mock { profile: MockModelProfile },
     /// OpenRouter API
     OpenRouter {
         api_key: String,
@@ -497,6 +616,245 @@ pub struct RawRound {
     pub timestamp: i64,
     pub request: serde_json::Value,
     pub response: String,
+}
+
+#[derive(Debug)]
+struct MockResponsePlan {
+    text: String,
+    thinking: String,
+    tool_calls: Vec<ToolCallInfo>,
+    error: Option<String>,
+}
+
+fn api_tool_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| tool.get("name").and_then(serde_json::Value::as_str))
+}
+
+fn tool_is_exposed(api_tools: &[serde_json::Value], name: &str) -> bool {
+    api_tools
+        .iter()
+        .any(|tool| api_tool_name(tool) == Some(name))
+}
+
+fn latest_user_message(
+    messages: &[crate::session::models::ChatMessage],
+) -> Option<(usize, &crate::session::models::ChatMessage)> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == crate::session::models::MessageRole::User)
+}
+
+fn mock_response_text(user_text: &str, after_tool: bool) -> String {
+    let user_text = user_text.trim();
+    let contains_cjk = user_text
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF));
+    if after_tool {
+        if contains_cjk {
+            "模拟工具调用已完成，工具结果已进入后续模型轮次。".to_string()
+        } else {
+            "The simulated tool call completed and its result reached the follow-up model round."
+                .to_string()
+        }
+    } else if contains_cjk {
+        "模拟模型已生成本地流式响应。".to_string()
+    } else {
+        "The mock model generated a local streaming response.".to_string()
+    }
+}
+
+fn build_mock_response_plan(
+    profile: MockModelProfile,
+    messages: &[crate::session::models::ChatMessage],
+    api_tools: &[serde_json::Value],
+) -> MockResponsePlan {
+    let (latest_user_index, latest_user) = latest_user_message(messages)
+        .map(|(index, message)| (index, Some(message)))
+        .unwrap_or((0, None));
+    let user_text = latest_user
+        .map(|message| message.content.as_str())
+        .unwrap_or("");
+    let has_tool_result = latest_user.is_some()
+        && messages[latest_user_index.saturating_add(1)..]
+            .iter()
+            .any(|message| message.role == crate::session::models::MessageRole::Tool);
+    match profile {
+        MockModelProfile::Stream => MockResponsePlan {
+            text: mock_response_text(user_text, false),
+            thinking: "Synthesizing a deterministic local response.".to_string(),
+            tool_calls: Vec::new(),
+            error: None,
+        },
+        MockModelProfile::Tool if has_tool_result => MockResponsePlan {
+            text: mock_response_text(user_text, true),
+            thinking: "Inspecting the simulated tool result.".to_string(),
+            tool_calls: Vec::new(),
+            error: None,
+        },
+        MockModelProfile::Tool => {
+            let tool_call = if tool_is_exposed(api_tools, "todowrite") {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-tool-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "todowrite".to_string(),
+                    arguments: serde_json::json!({
+                        "todos": [{
+                            "content": "Verify simulated model tool execution",
+                            "status": "completed",
+                            "priority": "medium"
+                        }]
+                    })
+                    .to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else if tool_is_exposed(api_tools, "tool_load") {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-tool-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "tool_load".to_string(),
+                    arguments: serde_json::json!({ "tools": ["todowrite"] }).to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else {
+                None
+            };
+            MockResponsePlan {
+                text: tool_call
+                    .is_none()
+                    .then(|| "No compatible local tool is exposed for this agent.".to_string())
+                    .unwrap_or_default(),
+                thinking: "Preparing a deterministic local tool call.".to_string(),
+                tool_calls: tool_call.into_iter().collect(),
+                error: None,
+            }
+        }
+        MockModelProfile::Error => MockResponsePlan {
+            text: String::new(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            error: Some("Simulated model backend error".to_string()),
+        },
+    }
+}
+
+fn mock_text_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    for ch in text.chars() {
+        chunk.push(ch);
+        if chunk.chars().count() >= max_chars {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+fn mock_token_count(text: &str) -> u32 {
+    ((text.chars().count() as u32).saturating_add(3) / 4).max(1)
+}
+
+pub(super) async fn stream_mock_response(
+    profile: MockModelProfile,
+    messages: &[crate::session::models::ChatMessage],
+    api_tools: &[serde_json::Value],
+    on_text_delta: impl Fn(String) + Send + Sync + 'static,
+    on_thinking_delta: impl Fn(String) + Send + Sync + 'static,
+    on_tool_call_start: impl Fn(String, String) + Send + Sync + 'static,
+) -> Result<LlmCallResult, String> {
+    const INITIAL_DELAY_MS: u64 = 320;
+    const THINKING_DELAY_MS: u64 = 90;
+    const TEXT_CHUNK_DELAY_MS: u64 = 45;
+
+    let plan = build_mock_response_plan(profile, messages, api_tools);
+    tokio::time::sleep(std::time::Duration::from_millis(INITIAL_DELAY_MS)).await;
+    if let Some(error) = plan.error.as_ref() {
+        return Err(error.clone());
+    }
+
+    for chunk in mock_text_chunks(&plan.thinking, 18) {
+        on_thinking_delta(chunk);
+        tokio::time::sleep(std::time::Duration::from_millis(THINKING_DELAY_MS)).await;
+    }
+
+    for tool_call in &plan.tool_calls {
+        on_tool_call_start(tool_call.id.clone(), tool_call.name.clone());
+    }
+
+    for chunk in mock_text_chunks(&plan.text, 10) {
+        on_text_delta(chunk);
+        tokio::time::sleep(std::time::Duration::from_millis(TEXT_CHUNK_DELAY_MS)).await;
+    }
+
+    let input_text = messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let raw_request = serde_json::json!({
+        "backend": "mock",
+        "profile": profile.label(),
+        "messageCount": messages.len(),
+        "toolCount": api_tools.len(),
+    })
+    .to_string();
+    let raw_response = serde_json::json!({
+        "text": &plan.text,
+        "thinking": &plan.thinking,
+        "toolCalls": &plan.tool_calls,
+    })
+    .to_string();
+    let has_tool_calls = !plan.tool_calls.is_empty();
+    let output_tokens = mock_token_count(&format!("{}{}", plan.thinking, plan.text));
+    let thinking_signature = format!("mock:{}", profile.label());
+
+    Ok(LlmCallResult {
+        text: plan.text,
+        tool_calls: plan.tool_calls,
+        finish_reason: if has_tool_calls { "tool_calls" } else { "stop" }.to_string(),
+        end_turn: Some(!has_tool_calls),
+        response_id: latest_user_message(messages)
+            .map(|(_, message)| format!("mock-{}-{}", profile.label(), message.id)),
+        input_tokens: mock_token_count(&input_text),
+        output_tokens,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_usd: 0.0,
+        raw_request,
+        raw_response,
+        thinking_text: plan.thinking,
+        thinking_duration_secs: 1,
+        thinking_signature,
+        continuation_request: None,
+    })
 }
 
 pub(super) fn normalize_tool_args(args: &mut serde_json::Value) {

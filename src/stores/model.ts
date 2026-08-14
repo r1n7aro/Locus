@@ -14,6 +14,8 @@ import type {
 } from "../types";
 import { filterVisibleModels } from "../config/providerVisibility";
 import { modelSupportsFastMode } from "../utils/modelDisplay";
+import { getCachedDebugMode, getDebugMode, subscribeDebugMode } from "../services/permissions";
+import { t } from "../i18n";
 
 const CLAUDE_CONTEXT_1M = 1_000_000;
 const CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW = 258_400;
@@ -301,8 +303,13 @@ export const useModelStore = defineStore("model", () => {
   const effort = ref<EffortLevel>("high");
   const defaultEffort = ref<EffortLevel>("high");
   const hasUserDefaultEffort = ref(false);
+  const debugModeEnabled = ref(getCachedDebugMode() ?? false);
   const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
   let effortPersistenceReady = false;
+
+  subscribeDebugMode((enabled) => {
+    debugModeEnabled.value = enabled;
+  });
 
   // -- Getters --
 
@@ -329,7 +336,29 @@ export const useModelStore = defineStore("model", () => {
     );
     // Claude Code CLI models are opt-in: they only join the list after the
     // user explicitly enables them in model configuration.
-    const models = [...builtinModels, ...codexModels.value, ...customs].filter(
+    const mocks: ModelOption[] = debugModeEnabled.value
+      ? [
+          {
+            id: "mock/stream",
+            name: t("model.mock.stream"),
+            provider: "mock",
+            contextWindow: 128_000,
+          },
+          {
+            id: "mock/tool",
+            name: t("model.mock.tool"),
+            provider: "mock",
+            contextWindow: 128_000,
+          },
+          {
+            id: "mock/error",
+            name: t("model.mock.error"),
+            provider: "mock",
+            contextWindow: 128_000,
+          },
+        ]
+      : [];
+    const models = [...builtinModels, ...codexModels.value, ...customs, ...mocks].filter(
       (m) => m.provider !== "claude_code" || modelDefaults.value.claudeCodeEnabled === true,
     );
     return filterVisibleModels(models);
@@ -342,6 +371,7 @@ export const useModelStore = defineStore("model", () => {
     if (authStore.claudeCodeAvailable) providers.add("claude_code");
     if (authStore.codexAuthenticated) providers.add("openai_codex");
     providers.add("custom");
+    if (debugModeEnabled.value) providers.add("mock");
     return allModels.value.filter((m) => providers.has(m.provider));
   });
 
@@ -457,6 +487,14 @@ export const useModelStore = defineStore("model", () => {
     try {
       modelDefaults.value = await modelService.getModelDefaults();
     } catch { /* ignore */ }
+  }
+
+  async function loadDebugMode() {
+    try {
+      debugModeEnabled.value = await getDebugMode();
+    } catch {
+      debugModeEnabled.value = false;
+    }
   }
 
   async function loadLastModel() {
@@ -598,6 +636,7 @@ export const useModelStore = defineStore("model", () => {
     effort,
     defaultEffort,
     hasUserDefaultEffort,
+    debugModeEnabled,
     modelDefaults,
     allModels,
     availableModels,
@@ -610,6 +649,7 @@ export const useModelStore = defineStore("model", () => {
     availableEfforts,
     effortSupported,
     loadModelDefaults,
+    loadDebugMode,
     loadLastModel,
     loadLastEffort,
     loadCodexFastMode,

@@ -3,6 +3,7 @@ import { ipcInvoke } from "./ipc";
 let cachedDebugMode: boolean | null = null;
 let pendingDebugModeLoad: Promise<boolean> | null = null;
 let debugModeCacheVersion = 0;
+const debugModeListeners = new Set<(value: boolean) => void>();
 let cachedFileToolWorkspaceBoundary: boolean | null = null;
 let pendingFileToolWorkspaceBoundaryLoad: Promise<boolean> | null = null;
 let fileToolWorkspaceBoundaryCacheVersion = 0;
@@ -27,6 +28,17 @@ export function getCachedDebugMode(): boolean | null {
   return cachedDebugMode;
 }
 
+function publishDebugMode(value: boolean) {
+  for (const listener of debugModeListeners) {
+    listener(value);
+  }
+}
+
+export function subscribeDebugMode(listener: (value: boolean) => void): () => void {
+  debugModeListeners.add(listener);
+  return () => debugModeListeners.delete(listener);
+}
+
 export function getDebugMode(): Promise<boolean> {
   if (cachedDebugMode !== null) {
     return Promise.resolve(cachedDebugMode);
@@ -38,6 +50,7 @@ export function getDebugMode(): Promise<boolean> {
       .then((value) => {
         if (cacheVersion === debugModeCacheVersion) {
           cachedDebugMode = value;
+          publishDebugMode(value);
         }
         return cachedDebugMode ?? value;
       })
@@ -53,12 +66,14 @@ export async function setDebugMode(value: boolean): Promise<void> {
   const previous = cachedDebugMode;
   debugModeCacheVersion += 1;
   cachedDebugMode = value;
+  publishDebugMode(value);
 
   try {
     await ipcInvoke("set_debug_mode", { value });
   } catch (error) {
     debugModeCacheVersion += 1;
     cachedDebugMode = previous;
+    if (previous !== null) publishDebugMode(previous);
     throw error;
   }
 }

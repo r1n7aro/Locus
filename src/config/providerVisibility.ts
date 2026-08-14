@@ -16,6 +16,7 @@ export const visibleProviderOrder = [
   "claude_code",
   "openai_codex",
   "custom",
+  "mock",
 ] as const;
 
 export function isProviderVisible(providerId: string): boolean {

@@ -176,6 +176,7 @@ describe("useAppBootstrap onboarding completion", () => {
       effort: "none",
       defaultEffort: "none",
       hasUserDefaultEffort: false,
+      loadDebugMode: vi.fn().mockResolvedValue(undefined),
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
       loadLastModel: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
