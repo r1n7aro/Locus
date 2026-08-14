@@ -1,5 +1,5 @@
 {
-  "description": "Edits an existing file by replacing one exact string with new text.\n\nUsage:\n- oldString must match exactly (including whitespace and indentation)\n- read output prefixes every line with a line number and a tab — that prefix is not part of the file; strip it before using line content in oldString/newString\n- If oldString appears multiple times, provide more surrounding context to make it unique\n- Set replaceAll=true to replace every occurrence\n- Read the required line range before editing\n- For a writable knowledge file that lacks frontmatter, Locus generates it after the edit and reports every generated field plus the final content start line\n- Successful knowledge edits update the index before returning\n- When C# code analysis and edit/write diagnostics are enabled, successful .cs edits append capped file-scope diagnostics automatically",
+  "description": "Edits multiple independent parts of one existing file in a single atomic update.\n\nUsage:\n- Every edits[] item is matched against the original file content before any replacement is applied\n- oldString must match exactly (including whitespace and indentation)\n- read output prefixes every line with a line number and a tab — that prefix is not part of the file; strip it before using line content in oldString/newString\n- If oldString appears multiple times, provide more surrounding context to make it unique\n- Set replaceAll=true to replace every occurrence matched in the original file\n- Read every required line range before editing\n- All edits must be independent and target non-overlapping original ranges\n- Array order does not make edits sequential: an edit cannot match text produced or changed by another edit\n- If any edit fails to match the original file, depends on another edit's output, or overlaps another edit, the entire call fails without changing the file\n- For a writable knowledge file that lacks frontmatter, Locus generates it after the edit and reports every generated field plus the final content start line\n- Successful knowledge edits update the index before returning\n- When C# code analysis and edit/write diagnostics are enabled, successful .cs edits append capped file-scope diagnostics automatically",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -8,20 +8,32 @@
         "type": "string",
         "description": "Absolute or relative path to the file to modify"
       },
-      "oldString": {
-        "type": "string",
-        "description": "The exact text to find and replace"
-      },
-      "newString": {
-        "type": "string",
-        "description": "The text to replace it with"
-      },
-      "replaceAll": {
-        "type": "boolean",
-        "description": "Replace all occurrences. Default is false.",
-        "default": false
+      "edits": {
+        "type": "array",
+        "description": "Independent replacement operations for this file. Every operation is resolved against the same original content.",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "oldString": {
+              "type": "string",
+              "description": "The exact original text to find and replace"
+            },
+            "newString": {
+              "type": "string",
+              "description": "The text to replace the matched original range with"
+            },
+            "replaceAll": {
+              "type": "boolean",
+              "description": "Replace every original occurrence. Default is false.",
+              "default": false
+            }
+          },
+          "required": ["oldString", "newString"]
+        }
       }
     },
-    "required": ["filePath", "oldString", "newString"]
+    "required": ["filePath", "edits"]
   }
 }

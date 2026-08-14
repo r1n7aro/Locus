@@ -34,10 +34,18 @@ describe("resolveToolFilePreviewPath", () => {
       name: "edit",
       arguments: JSON.stringify({
         filePath: "src/App.vue",
-        oldString: "before\nold\nafter",
-        newString: "before\nnew\nafter",
+        edits: [
+          {
+            oldString: "before\nold\nafter",
+            newString: "before\nnew\nafter",
+          },
+          {
+            oldString: "tailOld",
+            newString: "tailNew",
+          },
+        ],
       }),
-      output: "Edited src/App.vue [lines:12]",
+      output: "Edited src/App.vue (2 edits applied) [lines:12,40]",
       status: "done",
     });
     expect(editPayload?.highlight).toEqual({
@@ -46,6 +54,10 @@ describe("resolveToolFilePreviewPath", () => {
         startLine: 12,
         highlightStartLineOffset: 1,
         highlightEndLineOffset: 1,
+      }), expect.objectContaining({
+        startLine: 40,
+        highlightStartLineOffset: 0,
+        highlightEndLineOffset: 0,
       })],
     });
     expect(JSON.stringify(editPayload)).not.toContain('"oldString"');

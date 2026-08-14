@@ -736,6 +736,24 @@ pub(super) fn write() -> ToolDef {
 
 // ─── edit ───────────────────────────────────────────────────────────────────
 
+struct EditOp {
+    old_string: String,
+    new_string: String,
+    replace_all: bool,
+}
+
+#[derive(Clone)]
+struct PlannedReplacement {
+    edit_index: usize,
+    start: usize,
+    end: usize,
+}
+
+struct ReplacePlan {
+    ranges: Vec<(usize, usize)>,
+    match_offset: usize,
+}
+
 pub(super) fn edit() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::EDIT);
     ToolDef {
@@ -823,15 +841,9 @@ pub(super) fn edit() -> ToolDef {
                     Some(&content),
                 );
 
-                struct EditOp {
-                    old_string: String,
-                    new_string: String,
-                    replace_all: bool,
-                }
-
-                // Persisted calls may still carry the former public batch shape.
-                // The agent scheduler also uses it internally to coalesce multiple
-                // same-file edit calls into one read/modify/atomic-write cycle.
+                // Public calls use `edits`; persisted calls may still carry the
+                // former top-level single-edit shape. The scheduler can also
+                // coalesce multiple same-file calls into this batch shape.
                 let ops: Vec<EditOp> =
                     if let Some(edits_arr) = args.get("edits").and_then(|v| v.as_array()) {
                         let mut ops = Vec::with_capacity(edits_arr.len());
@@ -907,9 +919,10 @@ pub(super) fn edit() -> ToolDef {
                         }]
                     };
 
-                let mut current_content = normalize_lf(&content);
-                let mut applied_count = 0;
+                let original_content = normalize_lf(&content);
                 let mut start_lines: Vec<usize> = Vec::new();
+                let mut planned_replacements: Vec<PlannedReplacement> = Vec::new();
+                let mut full_replacement: Option<String> = None;
 
                 for (i, op) in ops.iter().enumerate() {
                     if op.old_string == op.new_string {
@@ -923,29 +936,43 @@ pub(super) fn edit() -> ToolDef {
                     }
 
                     if op.old_string.is_empty() {
-                        current_content = op.new_string.clone();
+                        if ops.len() > 1 {
+                            return ToolResult {
+                                output: format!(
+                                    "Edit {} of {} failed: an empty oldString replaces the entire file and cannot be combined with other edits. Batch edits must be independent; no changes were applied.",
+                                    i + 1,
+                                    ops.len()
+                                ),
+                                is_error: true,
+                            };
+                        }
+                        full_replacement = Some(op.new_string.clone());
                         start_lines.push(1);
-                        applied_count += 1;
                         continue;
                     }
 
-                    match do_replace(
-                        &current_content,
-                        &op.old_string,
-                        &op.new_string,
-                        op.replace_all,
-                    ) {
-                        Ok(result) => {
+                    match plan_replace(&original_content, &op.old_string, op.replace_all) {
+                        Ok(plan) => {
                             let line_no =
-                                line_number_at_offset(&current_content, result.match_offset);
+                                line_number_at_offset(&original_content, plan.match_offset);
                             start_lines.push(line_no);
-                            current_content = result.new_content;
-                            applied_count += 1;
+                            planned_replacements.extend(plan.ranges.into_iter().map(
+                                |(start, end)| PlannedReplacement {
+                                    edit_index: i,
+                                    start,
+                                    end,
+                                },
+                            ));
                         }
                         Err(e) => {
                             return ToolResult {
                                 output: if ops.len() > 1 {
-                                    format!("Edit {} of {} failed: {}", i + 1, ops.len(), e)
+                                    format!(
+                                        "Edit {} of {} failed against the original file: {} Batch edits must be independent and cannot depend on another edit's output. No changes were applied.",
+                                        i + 1,
+                                        ops.len(),
+                                        e
+                                    )
                                 } else {
                                     e
                                 },
@@ -954,6 +981,24 @@ pub(super) fn edit() -> ToolDef {
                         }
                     }
                 }
+
+                let current_content = match full_replacement {
+                    Some(content) => content,
+                    None => match apply_planned_replacements(
+                        &original_content,
+                        planned_replacements,
+                        &ops,
+                    ) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            return ToolResult {
+                                output: error,
+                                is_error: true,
+                            };
+                        }
+                    },
+                };
+                let applied_count = ops.len();
 
                 let prepared_knowledge = match prepare_missing_knowledge_frontmatter(
                     &ctx,
@@ -1041,104 +1086,105 @@ pub(super) fn edit() -> ToolDef {
     }
 }
 
-struct ReplaceResult {
-    new_content: String,
-    match_offset: usize,
-}
-
-fn do_replace(
-    content: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
-) -> Result<ReplaceResult, String> {
-    fn single_replace(content: &str, matched: &str, new_string: &str, pos: usize) -> ReplaceResult {
-        let mut result = String::with_capacity(content.len());
-        result.push_str(&content[..pos]);
-        result.push_str(new_string);
-        result.push_str(&content[pos + matched.len()..]);
-        ReplaceResult {
-            new_content: result,
-            match_offset: pos,
-        }
-    }
-
-    fn check_unique(content: &str, matched: &str) -> Result<usize, String> {
+fn plan_replace(content: &str, old_string: &str, replace_all: bool) -> Result<ReplacePlan, String> {
+    fn plan_matched(
+        content: &str,
+        matched: &str,
+        replace_all: bool,
+    ) -> Result<ReplacePlan, String> {
         let positions: Vec<usize> = content.match_indices(matched).map(|(pos, _)| pos).collect();
-        match positions.as_slice() {
-            [] => Err("Internal error: fuzzy match could not be located in content.".to_string()),
-            [first] => Ok(*first),
-            _ => {
-                let display_limit = 20;
-                let mut line_numbers: Vec<String> = positions
-                    .iter()
-                    .take(display_limit)
-                    .map(|pos| line_number_at_offset(content, *pos).to_string())
-                    .collect();
-                if positions.len() > display_limit {
-                    line_numbers.push("...".to_string());
-                }
-                Err(format!(
+        if positions.is_empty() {
+            return Err("Internal error: fuzzy match could not be located in content.".to_string());
+        }
+        if !replace_all && positions.len() > 1 {
+            let display_limit = 20;
+            let mut line_numbers: Vec<String> = positions
+                .iter()
+                .take(display_limit)
+                .map(|pos| line_number_at_offset(content, *pos).to_string())
+                .collect();
+            if positions.len() > display_limit {
+                line_numbers.push("...".to_string());
+            }
+            Err(format!(
                     "Found multiple matches for oldString at lines: {}. Provide more surrounding context to make it unique.",
                     line_numbers.join(", ")
                 ))
-            }
+        } else {
+            let selected = if replace_all {
+                positions
+            } else {
+                vec![positions[0]]
+            };
+            let match_offset = selected[0];
+            Ok(ReplacePlan {
+                ranges: selected
+                    .into_iter()
+                    .map(|start| (start, start + matched.len()))
+                    .collect(),
+                match_offset,
+            })
         }
     }
 
     if content.contains(old_string) {
-        if replace_all {
-            let offset = content.find(old_string).unwrap();
-            return Ok(ReplaceResult {
-                new_content: content.replace(old_string, new_string),
-                match_offset: offset,
-            });
-        }
-        let first = check_unique(content, old_string)?;
-        return Ok(single_replace(content, old_string, new_string, first));
+        return plan_matched(content, old_string, replace_all);
     }
 
     if let Some(matched) = line_trimmed_match(content, old_string) {
-        if replace_all {
-            let offset = content.find(&matched).unwrap_or(0);
-            return Ok(ReplaceResult {
-                new_content: content.replace(&matched, new_string),
-                match_offset: offset,
-            });
-        }
-        let first = check_unique(content, &matched)?;
-        return Ok(single_replace(content, &matched, new_string, first));
+        return plan_matched(content, &matched, replace_all);
     }
 
     if let Some(matched) = whitespace_normalized_match(content, old_string) {
-        if replace_all {
-            let offset = content.find(&matched).unwrap_or(0);
-            return Ok(ReplaceResult {
-                new_content: content.replace(&matched, new_string),
-                match_offset: offset,
-            });
-        }
-        let first = check_unique(content, &matched)?;
-        return Ok(single_replace(content, &matched, new_string, first));
+        return plan_matched(content, &matched, replace_all);
     }
 
     let trimmed = old_string.trim();
     if trimmed != old_string && content.contains(trimmed) {
-        if replace_all {
-            let offset = content.find(trimmed).unwrap();
-            return Ok(ReplaceResult {
-                new_content: content.replace(trimmed, new_string),
-                match_offset: offset,
-            });
-        }
-        let first = check_unique(content, trimmed)?;
-        return Ok(single_replace(content, trimmed, new_string, first));
+        return plan_matched(content, trimmed, replace_all);
     }
 
     Err(
         "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."
             .to_string(),
     )
+}
+
+fn apply_planned_replacements(
+    content: &str,
+    mut replacements: Vec<PlannedReplacement>,
+    ops: &[EditOp],
+) -> Result<String, String> {
+    replacements.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then(left.end.cmp(&right.end))
+            .then(left.edit_index.cmp(&right.edit_index))
+    });
+
+    for pair in replacements.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if current.start < previous.end {
+            return Err(format!(
+                "Edits {} and {} target overlapping ranges in the original file near lines {} and {}. Batch edits must be independent; no changes were applied.",
+                previous.edit_index + 1,
+                current.edit_index + 1,
+                line_number_at_offset(content, previous.start),
+                line_number_at_offset(content, current.start)
+            ));
+        }
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for replacement in replacements {
+        result.push_str(&content[cursor..replacement.start]);
+        result.push_str(&ops[replacement.edit_index].new_string);
+        cursor = replacement.end;
+    }
+    result.push_str(&content[cursor..]);
+    Ok(result)
 }
 
 fn line_number_at_offset(content: &str, offset: usize) -> usize {
@@ -1875,10 +1921,10 @@ mod tests {
     }
 
     #[test]
-    fn edit_keeps_legacy_batch_input_compatible() {
+    fn edit_batch_applies_non_overlapping_replacements_from_original_snapshot() {
         let root = tempdir().expect("temp dir");
-        let target = root.path().join("legacy.txt");
-        std::fs::write(&target, "alpha beta\n").expect("seed legacy file");
+        let target = root.path().join("batch.txt");
+        std::fs::write(&target, "alpha middle omega\n").expect("seed batch file");
 
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -1887,8 +1933,8 @@ mod tests {
                     json!({
                         "filePath": target.to_string_lossy().to_string(),
                         "edits": [
-                            { "oldString": "alpha", "newString": "ALPHA" },
-                            { "oldString": "beta", "newString": "BETA" }
+                            { "oldString": "omega", "newString": "O" },
+                            { "oldString": "alpha", "newString": "ALPHA-LONG" }
                         ]
                     }),
                     ToolExecutionContext::default(),
@@ -1899,15 +1945,86 @@ mod tests {
         assert!(!result.is_error, "{}", result.output);
         assert_eq!(
             std::fs::read_to_string(&target).expect("read edited file"),
-            "ALPHA BETA\n"
+            "ALPHA-LONG middle O\n"
         );
     }
 
     #[test]
-    fn edit_batch_applies_full_replacement_and_followup_before_one_commit() {
+    fn edit_batch_rejects_followup_that_only_matches_prior_output() {
         let root = tempdir().expect("temp dir");
         let target = root.path().join("batched.txt");
-        std::fs::write(&target, "before\n").expect("seed file");
+        let original = "before\n";
+        std::fs::write(&target, original).expect("seed file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "edits": [
+                            { "oldString": "before", "newString": "alpha beta" },
+                            { "oldString": "beta", "newString": "BETA" }
+                        ]
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("Edit 2 of 2 failed against the original file"));
+        assert!(result
+            .output
+            .contains("cannot depend on another edit's output"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read edited file"),
+            original
+        );
+    }
+
+    #[test]
+    fn edit_batch_rejects_overlapping_original_ranges() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("overlap.txt");
+        let original = "alpha beta gamma\n";
+        std::fs::write(&target, original).expect("seed file");
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (edit().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "edits": [
+                            { "oldString": "alpha beta", "newString": "first" },
+                            { "oldString": "beta gamma", "newString": "second" }
+                        ]
+                    }),
+                    ToolExecutionContext::default(),
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("Edits 1 and 2 target overlapping ranges"));
+        assert!(result.output.contains("no changes were applied"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read untouched file"),
+            original
+        );
+    }
+
+    #[test]
+    fn edit_batch_rejects_full_replacement_combined_with_other_edits() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("full-replacement.txt");
+        let original = "before\n";
+        std::fs::write(&target, original).expect("seed file");
 
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -1917,7 +2034,7 @@ mod tests {
                         "filePath": target.to_string_lossy().to_string(),
                         "edits": [
                             { "oldString": "", "newString": "alpha beta\n" },
-                            { "oldString": "beta", "newString": "BETA" }
+                            { "oldString": "before", "newString": "after" }
                         ]
                     }),
                     ToolExecutionContext::default(),
@@ -1925,11 +2042,14 @@ mod tests {
                 .await
             });
 
-        assert!(!result.is_error, "{}", result.output);
-        assert!(result.output.contains("2 edits applied"));
+        assert!(result.is_error);
+        assert!(result.output.contains("replaces the entire file"));
+        assert!(result
+            .output
+            .contains("cannot be combined with other edits"));
         assert_eq!(
-            std::fs::read_to_string(&target).expect("read edited file"),
-            "alpha BETA\n"
+            std::fs::read_to_string(&target).expect("read untouched file"),
+            original
         );
     }
 

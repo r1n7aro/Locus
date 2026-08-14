@@ -2,7 +2,7 @@
 
 * Use `unity_yaml_list`, `unity_yaml_search`, and `unity_yaml_read` to inspect Unity assets, and use the `read` tool to read ordinary files.
 
-* Use `edit` to modify existing files, and `write` to create new files. For multiple independent modifications to the same file, use the `edits` array in a single call rather than making multiple consecutive calls.
+* Use `edit` to modify existing files, and `write` to create new files. Put every known independent replacement for one file in that call's `edits` array. Each item is matched against the same original file and all target ranges must be non-overlapping. Array order does not create dependencies: an item cannot use text produced or changed by another item. Split dependent changes across tool rounds.
 
 * Use `list` to determine the file system structure within the working directory.
 

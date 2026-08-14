@@ -536,7 +536,7 @@ describe("toolCallBatches", () => {
         {
           id: "history-1",
           name: "edit",
-          arguments: "{\"file_path\":\"Assets/Test.cs\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":true}",
+          arguments: "{\"file_path\":\"Assets/Test.cs\",\"edits\":[{\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":true}]}",
           status: "done",
         },
       ],
@@ -544,7 +544,7 @@ describe("toolCallBatches", () => {
         {
           id: "active-1",
           name: "edit",
-          arguments: "{\"filePath\":\"Assets/Test.cs\",\"oldString\":\"a\",\"newString\":\"b\",\"replaceAll\":true}",
+          arguments: "{\"filePath\":\"Assets/Test.cs\",\"edits\":[{\"oldString\":\"a\",\"newString\":\"b\",\"replaceAll\":true}]}",
           status: "done",
         },
       ],
