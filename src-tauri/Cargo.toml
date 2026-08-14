@@ -85,6 +85,7 @@ fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq", "native-tls"] }
 ureq = { version = "2.12.1", default-features = false, features = ["native-tls", "socks-proxy"] }
 tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 # Pinned: the parser in src/unity_csharp/parser.rs depends on the named-node
 # layout (`modifier`, `attribute_list`, `variable_declaration`, etc.) of this
 # specific grammar release. A patch bump can silently rename or restructure

@@ -355,6 +355,19 @@ pub enum KnowledgeToolConfirmOperation {
 pub struct BasicToolConfirmDisplay {
     pub tool_name: String,
     pub arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review: Option<AutoReviewSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoReviewSummary {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    pub rationale: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

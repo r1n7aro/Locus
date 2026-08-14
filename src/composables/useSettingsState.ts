@@ -204,6 +204,7 @@ export function useSettingsState(emit: SettingsEmit) {
       transport: config?.transport === "http" ? "http" : "websocket",
       extendedContext: config?.extendedContext === true,
       generateSessionTitles: config?.generateSessionTitles === true,
+      autoReview: config?.autoReview === true,
     };
   }
 
@@ -945,6 +946,29 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
+  async function setCodexAutoReview(enabled: boolean) {
+    const next = normalizeCodexModelConfig({
+      ...codexModelConfig.value,
+      autoReview: enabled,
+    });
+    if (codexModelConfig.value.autoReview === next.autoReview) return;
+    const previous = codexModelConfig.value;
+    codexModelConfig.value = next;
+    try {
+      await serviceSaveCodexModelConfig(next);
+      emit("codexTransportChanged", next);
+      successMsg.value = t("settings.codex.autoReviewSaved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.autoReviewSaveFailed", err.message), {
+        code: err.code,
+        operation: "saveCodexModelConfig",
+      });
+      codexModelConfig.value = previous;
+    }
+  }
+
   async function pollCodex() {
     if (codexPollInFlight || codexStep.value !== "waiting") return;
     codexPollInFlight = true;
@@ -1144,6 +1168,12 @@ export function useSettingsState(emit: SettingsEmit) {
   ]);
 
   const approvalBehaviorList = computed(() => [
+    {
+      name: "behavior.local_dangerous_commands",
+      label: t("settings.perms.behavior.localDangerousCommands"),
+      desc: t("settings.perms.behavior.localDangerousCommandsDesc"),
+      defaultMode: "ask" as const,
+    },
     {
       name: "behavior.unity_editor_status_change",
       label: t("settings.perms.behavior.unityEditorStatusChange"),
@@ -1686,6 +1716,7 @@ export function useSettingsState(emit: SettingsEmit) {
     setCodexTransportMode,
     setCodexExtendedContext,
     setCodexSessionTitleGeneration,
+    setCodexAutoReview,
 
     requestCodexLogin,
 

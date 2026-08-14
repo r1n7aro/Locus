@@ -7748,6 +7748,59 @@ mod tests {
     }
 
     #[test]
+    fn model_usage_report_groups_auto_review_calls_under_reviewer_model() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Auto review", None, None, "chat", None)
+            .expect("create session");
+
+        store
+            .record_model_usage(
+                &session_id,
+                "codex-auto-review",
+                "OpenAI Codex",
+                "auto_review",
+                80,
+                12,
+                4,
+                0,
+                0.0,
+                0,
+                None,
+                None,
+            )
+            .expect("record successful review");
+        store
+            .record_model_usage_event(
+                &session_id,
+                "codex-auto-review",
+                "OpenAI Codex",
+                "auto_review",
+                0,
+                0,
+                0,
+                0,
+                0.0,
+            )
+            .expect("record failed review attempt");
+
+        let report = store
+            .get_model_usage_report(Some(30))
+            .expect("read usage report");
+        let reviewer = report
+            .by_model
+            .iter()
+            .find(|group| group.model_id == "codex-auto-review")
+            .expect("reviewer model group");
+        assert_eq!(reviewer.provider, "OpenAI Codex");
+        assert_eq!(reviewer.usage.request_count, 2);
+        assert_eq!(reviewer.usage.input_tokens, 80);
+        assert_eq!(reviewer.usage.output_tokens, 12);
+        assert_eq!(reviewer.usage.cache_read_tokens, 4);
+    }
+
+    #[test]
     fn add_tool_result_for_run_discards_stale_and_cancelling_runs() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");

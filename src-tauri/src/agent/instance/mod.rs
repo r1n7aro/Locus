@@ -1,12 +1,14 @@
+mod auto_review;
 mod backend;
 mod claude_code_cli;
+mod dangerous_command;
 mod prompt_context;
 mod read_file;
 mod unity_capture;
 mod view_capture;
 
 pub use backend::resolve_openrouter_model;
-pub use backend::{LlmBackend, RawContextStore, RawRound};
+pub use backend::{LlmBackend, MockModelProfile, RawContextStore, RawRound};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -44,7 +46,7 @@ const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 use backend::{
     is_prompt_too_long_error, is_retryable_llm_error, model_context_limit, normalize_tool_args,
-    session_unity_state, LlmCallResult, MAX_TOOL_ITERATIONS,
+    session_unity_state, stream_mock_response, LlmCallResult, MAX_TOOL_ITERATIONS,
 };
 use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
@@ -819,6 +821,22 @@ pub(crate) struct ExecutedToolResult {
     images: Option<Vec<ImageData>>,
 }
 
+const ASYNC_IMMEDIATE_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+async fn receive_immediate_async_failure(
+    mut result_rx: tokio::sync::oneshot::Receiver<ExecutedToolResult>,
+    handled_tx: tokio::sync::oneshot::Sender<bool>,
+    wait: std::time::Duration,
+) -> Option<ExecutedToolResult> {
+    let result = tokio::time::timeout(wait, &mut result_rx)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let immediate_failure = result.filter(|result| result.is_error);
+    let _ = handled_tx.send(immediate_failure.is_some());
+    immediate_failure
+}
+
 #[derive(Debug, Clone)]
 struct CompletedToolResult {
     executed: ExecutedToolResult,
@@ -910,7 +928,10 @@ pub(super) fn finalize_tool_call_record(
 }
 
 fn model_response_needs_follow_up(tool_calls: &[ToolCallInfo], end_turn: Option<bool>) -> bool {
-    !tool_calls.is_empty() || matches!(end_turn, Some(false))
+    tool_calls
+        .iter()
+        .any(|tool_call| !tool_call.is_server_tool())
+        || matches!(end_turn, Some(false))
 }
 
 fn validate_llm_tool_calls(tool_calls: &[ToolCallInfo]) -> Result<(), String> {
@@ -1177,6 +1198,17 @@ struct GitCommandEffect {
 enum ToolConfirmReason {
     UserPermission,
     KnowledgeGovernance,
+    DangerousCommand,
+}
+
+impl ToolConfirmReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserPermission => "user_permission",
+            Self::KnowledgeGovernance => "knowledge_governance",
+            Self::DangerousCommand => "dangerous_command",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1187,6 +1219,7 @@ enum PermissionModeSetting {
 
 const PERMISSION_BEHAVIOR_UNITY_EDITOR_STATUS_CHANGE: &str = "behavior.unity_editor_status_change";
 const PERMISSION_BEHAVIOR_KNOWLEDGE_GOVERNANCE: &str = "behavior.knowledge_governance";
+const PERMISSION_BEHAVIOR_LOCAL_DANGEROUS_COMMANDS: &str = "behavior.local_dangerous_commands";
 
 #[derive(Debug, Clone)]
 struct UserWaitTarget {
@@ -1416,6 +1449,15 @@ fn build_knowledge_document_create_preview(
         .unwrap_or_else(|| Some(String::new()))
         .unwrap_or_default();
     let maintenance_rules = patch.maintenance_rules.take().unwrap_or(None);
+    let ai_edit_mode = patch.ai_edit_mode.unwrap_or_else(|| {
+        if patch.inherit_ai_config.unwrap_or(true) {
+            crate::knowledge_store::KnowledgeAiEditMode::Inherit
+        } else if patch.ai_maintained.unwrap_or(false) {
+            crate::knowledge_store::KnowledgeAiEditMode::Auto
+        } else {
+            crate::knowledge_store::KnowledgeAiEditMode::Confirm
+        }
+    });
     let title = match patch.title.take() {
         Some(title) => title,
         None => crate::knowledge_store::default_document_title_from_path(&normalized_path)
@@ -1437,9 +1479,8 @@ fn build_knowledge_document_create_preview(
         }),
         command_enabled: patch.command_enabled.unwrap_or(false),
         read_only: patch.read_only.unwrap_or(false),
-        ai_maintained: patch
-            .ai_maintained
-            .unwrap_or_else(|| crate::knowledge_store::default_ai_maintained_for_type(doc_type)),
+        ai_edit_mode,
+        ai_maintained: ai_edit_mode == crate::knowledge_store::KnowledgeAiEditMode::Auto,
         storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: patch.inherit_ai_config.unwrap_or(true),
         ai_config_source: Default::default(),
@@ -1481,11 +1522,21 @@ fn build_knowledge_document_edit_preview(
 ) -> Result<KnowledgeToolConfirmPreview, String> {
     let (doc_type, normalized_path) = resolve_knowledge_document_target(&parsed.path)?;
     let parent_path = parent_knowledge_path(&normalized_path);
-    let (directory_path, directory_mode) =
+    let (directory_path, mut directory_mode) =
         resolve_existing_directory_mode(working_dir, doc_type, parent_path.as_deref())?;
 
     let current =
         crate::knowledge_store::load_document_by_path(working_dir, doc_type, &normalized_path)?;
+    ensure_agent_can_edit_knowledge_document(&current)?;
+    directory_mode = match current.ai_edit_mode {
+        crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
+            KnowledgeToolConfirmDirectoryMode::Approval
+        }
+        crate::knowledge_store::KnowledgeAiEditMode::Auto => {
+            KnowledgeToolConfirmDirectoryMode::Auto
+        }
+        _ => directory_mode,
+    };
     let before_text = crate::knowledge_store::render_document_preview(&current)?;
 
     let mut next = current;
@@ -1507,6 +1558,24 @@ fn build_knowledge_document_edit_preview(
     })
 }
 
+fn ensure_agent_can_edit_knowledge_document(
+    document: &crate::knowledge_store::KnowledgeDocument,
+) -> Result<(), String> {
+    if document.read_only {
+        return Err(format!(
+            "Knowledge document is read-only: {}/{}",
+            document.doc_type, document.path
+        ));
+    }
+    if !crate::knowledge_store::document_allows_ai_edit(document) {
+        return Err(format!(
+            "AI editing is disabled for knowledge document: {}/{}",
+            document.doc_type, document.path
+        ));
+    }
+    Ok(())
+}
+
 fn build_knowledge_move_preview(
     working_dir: &str,
     request: &crate::knowledge_store::KnowledgeMoveRequest,
@@ -1521,9 +1590,21 @@ fn build_knowledge_move_preview(
                         .to_string(),
                 );
             }
+            let document =
+                crate::knowledge_store::load_document_by_path(working_dir, doc_type, &source_path)?;
+            ensure_agent_can_edit_knowledge_document(&document)?;
             let target_parent = parent_knowledge_path(&target_path);
-            let (directory_path, directory_mode) =
+            let (directory_path, mut directory_mode) =
                 resolve_child_directory_mode(working_dir, doc_type, target_parent.as_deref())?;
+            directory_mode = match document.ai_edit_mode {
+                crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
+                    KnowledgeToolConfirmDirectoryMode::Approval
+                }
+                crate::knowledge_store::KnowledgeAiEditMode::Auto => {
+                    KnowledgeToolConfirmDirectoryMode::Auto
+                }
+                _ => directory_mode,
+            };
 
             Ok(KnowledgeToolConfirmPreview {
                 operation: KnowledgeToolConfirmOperation::Move,
@@ -1593,13 +1674,23 @@ fn build_knowledge_delete_preview(
         crate::knowledge_store::KnowledgeTargetKind::Document => {
             let (doc_type, normalized_path) = resolve_knowledge_document_target(&request.path)?;
             let parent_path = parent_knowledge_path(&normalized_path);
-            let (directory_path, directory_mode) =
+            let (directory_path, mut directory_mode) =
                 resolve_existing_directory_mode(working_dir, doc_type, parent_path.as_deref())?;
             let document = crate::knowledge_store::load_document_by_path(
                 working_dir,
                 doc_type,
                 &normalized_path,
             )?;
+            ensure_agent_can_edit_knowledge_document(&document)?;
+            directory_mode = match document.ai_edit_mode {
+                crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
+                    KnowledgeToolConfirmDirectoryMode::Approval
+                }
+                crate::knowledge_store::KnowledgeAiEditMode::Auto => {
+                    KnowledgeToolConfirmDirectoryMode::Auto
+                }
+                _ => directory_mode,
+            };
 
             Ok(KnowledgeToolConfirmPreview {
                 operation: KnowledgeToolConfirmOperation::Delete,
@@ -2754,12 +2845,6 @@ fn build_l2_full_document_section(
                 continue;
             }
 
-            let rules = doc
-                .maintenance_rules
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("<empty>");
             let body = if doc.body.trim().is_empty() {
                 "<empty>".to_string()
             } else {
@@ -2770,18 +2855,12 @@ fn build_l2_full_document_section(
                 .map(|resolved| resolved.display_path)
                 .unwrap_or_else(|| format!("{}/{}", doc.doc_type, doc.path));
 
-            blocks.push(
-                [
-                    format!("#### {}", display_path),
-                    String::new(),
-                    "Rules:".to_string(),
-                    rules.to_string(),
-                    String::new(),
-                    "Body:".to_string(),
-                    body,
-                ]
-                .join("\n"),
-            );
+            let mut lines = vec![format!("#### {}", display_path), String::new()];
+            if let Some(rules) = crate::knowledge_store::active_maintenance_rules(&doc) {
+                lines.extend(["Rules:".to_string(), rules.to_string(), String::new()]);
+            }
+            lines.extend(["Body:".to_string(), body]);
+            blocks.push(lines.join("\n"));
         }
     }
 
@@ -2813,6 +2892,7 @@ fn build_knowledge_focus_section(
         format!("- Type: {}", doc.doc_type),
         format!("- Scope: {}", scope),
         format!("- Read-only: {}", if doc.read_only { "yes (do not edit; discuss content and produce suggestions only)" } else { "no" }),
+        format!("- AI editing: {}", if crate::knowledge_store::document_allows_ai_edit(doc) { "enabled" } else { "disabled (do not modify this document with tools)" }),
     ];
 
     if doc.summary_enabled {
@@ -2826,16 +2906,9 @@ fn build_knowledge_focus_section(
             lines.push(summary.to_string());
         }
     }
-    if doc.explicit_maintenance_rules {
-        if let Some(rules) = doc
-            .maintenance_rules
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            lines.push("### Maintenance Rules".to_string());
-            lines.push(rules.to_string());
-        }
+    if let Some(rules) = crate::knowledge_store::active_maintenance_rules(doc) {
+        lines.push("### Maintenance Rules".to_string());
+        lines.push(rules.to_string());
     }
 
     let body = doc.body.trim();
@@ -3044,27 +3117,21 @@ fn build_l3_rule_entries(
             .document;
 
             let title = format_l3_rule_heading(&doc);
-            let rules = doc
-                .maintenance_rules
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("<empty>");
             let body = if doc.body.trim().is_empty() {
                 "<empty>".to_string()
             } else {
                 remap_document_body_headings(&doc.body, 4)
             };
-            let content = [
-                format!("### {}", title),
-                String::new(),
-                "Maintenance Rules:".to_string(),
-                rules.to_string(),
-                String::new(),
-                "Full Document:".to_string(),
-                body,
-            ]
-            .join("\n");
+            let mut lines = vec![format!("### {}", title), String::new()];
+            if let Some(rules) = crate::knowledge_store::active_maintenance_rules(&doc) {
+                lines.extend([
+                    "Maintenance Rules:".to_string(),
+                    rules.to_string(),
+                    String::new(),
+                ]);
+            }
+            lines.extend(["Full Document:".to_string(), body]);
+            let content = lines.join("\n");
 
             entries.push(L3RuleEntry {
                 doc_type,
@@ -3088,7 +3155,7 @@ fn build_l3_rule_section(
     }
 
     Ok(format!(
-        "## L3 Rules\nThese rule-injected documents are active session rules. Treat both maintenance rules and full document content below as always-on instructions.\n\n{}",
+        "## L3 Rules\nThese rule-injected documents are active session rules. Treat their full document content and any included maintenance rules below as always-on instructions.\n\n{}",
         entries
             .into_iter()
             .map(|entry| entry.content)
@@ -4339,6 +4406,7 @@ impl AgentInstance {
 
     fn model_usage_provider(&self) -> String {
         match &self.backend {
+            LlmBackend::Mock { .. } => "Mock".to_string(),
             LlmBackend::OpenRouter { .. } => "OpenRouter".to_string(),
             LlmBackend::Anthropic { .. } => "Anthropic".to_string(),
             LlmBackend::ClaudeCodeCli => "Claude Code CLI".to_string(),
@@ -7133,6 +7201,17 @@ impl AgentInstance {
         on_tool_call_start: impl Fn(String, String) + Send + Sync + 'static,
     ) -> Result<LlmCallResult, String> {
         match &self.backend {
+            LlmBackend::Mock { profile } => {
+                stream_mock_response(
+                    *profile,
+                    messages,
+                    api_tools,
+                    on_text_delta,
+                    on_thinking_delta,
+                    on_tool_call_start,
+                )
+                .await
+            }
             LlmBackend::OpenRouter { api_key, base_url } => {
                 let system_prompt = system_parts.join("\n\n");
                 let api_model = resolve_openrouter_model(&self.effective_model);
@@ -7496,6 +7575,7 @@ impl AgentInstance {
 
     fn context_attempt_backend(&self) -> &'static str {
         match &self.backend {
+            LlmBackend::Mock { .. } => "mock",
             LlmBackend::OpenRouter { .. } => "openrouter",
             LlmBackend::Anthropic { .. } => "anthropic",
             LlmBackend::ClaudeCodeCli => "claude_code_cli",
@@ -9564,6 +9644,7 @@ impl AgentInstance {
         );
 
         let backend_name = match &self.backend {
+            LlmBackend::Mock { .. } => "Mock",
             LlmBackend::OpenRouter { .. } => "OpenRouter",
             LlmBackend::Anthropic { .. } => "Anthropic",
             LlmBackend::ClaudeCodeCli => "Claude Code CLI",
@@ -9610,6 +9691,8 @@ impl AgentInstance {
         let final_continuation_request;
         let final_content_order;
         let final_thinking_order;
+        let final_persisted_message_id;
+        let final_render_parts;
         // Tracks whether this run has persisted any assistant message yet; a
         // cancel before that revokes the user message back to the composer.
         let mut assistant_round_persisted = false;
@@ -11685,7 +11768,7 @@ impl AgentInstance {
                     tool_calls: finalized_tool_calls,
                     content_order: response_content_order,
                     thinking_order: response_thinking_order,
-                    render_parts: Some(finalized_render_parts),
+                    render_parts: Some(finalized_render_parts.clone()),
                 });
                 self.partial_assistant.reset();
 
@@ -11711,7 +11794,21 @@ impl AgentInstance {
                     continue 'agent_loop;
                 }
 
-                debug_assert!(model_needs_follow_up);
+                if !model_needs_follow_up {
+                    store.close_run_pending_input_queue(&run_id)?;
+                    final_thinking_text = response.thinking_text;
+                    final_thinking_duration = response.thinking_duration_secs;
+                    final_thinking_signature = response.thinking_signature;
+                    final_text = response.text;
+                    final_response_id = response.response_id;
+                    final_continuation_request = response.continuation_request;
+                    final_content_order = response_content_order;
+                    final_thinking_order = response_thinking_order;
+                    final_persisted_message_id = Some(assistant_msg_id);
+                    final_render_parts = Some(finalized_render_parts);
+                    break;
+                }
+
                 continue;
             }
 
@@ -11791,6 +11888,8 @@ impl AgentInstance {
             final_continuation_request = response.continuation_request;
             final_content_order = response_content_order;
             final_thinking_order = response_thinking_order;
+            final_persisted_message_id = None;
+            final_render_parts = None;
             break;
         }
 
@@ -11809,41 +11908,48 @@ impl AgentInstance {
             } else {
                 Some(final_thinking_signature.as_str())
             };
-            let final_render_parts = assistant_render_parts_for_response(
-                &run_id,
-                final_content_order.map(|seq| RenderPartMark {
-                    id: format!("{}:text:final", run_id),
-                    seq,
-                }),
-                &final_text,
-                final_thinking_order.map(|seq| RenderPartMark {
-                    id: format!("{}:thinking:final", run_id),
-                    seq,
-                }),
-                thinking_opt.unwrap_or_default(),
-                thinking_dur,
-                thinking_sig,
-                &[],
-            );
-            let msg_id = store.add_message_with_thinking_and_render_parts(
-                &self.session_id,
-                MessageRole::Assistant,
-                &final_text,
-                thinking_opt,
-                thinking_dur,
-                thinking_sig,
-                final_response_id.as_deref(),
-                final_continuation_request.as_ref(),
-                final_content_order,
-                final_thinking_order,
-                &final_render_parts,
-            )?;
-            self.partial_assistant.mark_persisted(
-                msg_id.clone(),
-                final_text.clone(),
-                thinking_opt.map(str::to_string),
-                thinking_dur,
-            );
+            let final_render_parts = final_render_parts.unwrap_or_else(|| {
+                assistant_render_parts_for_response(
+                    &run_id,
+                    final_content_order.map(|seq| RenderPartMark {
+                        id: format!("{}:text:final", run_id),
+                        seq,
+                    }),
+                    &final_text,
+                    final_thinking_order.map(|seq| RenderPartMark {
+                        id: format!("{}:thinking:final", run_id),
+                        seq,
+                    }),
+                    thinking_opt.unwrap_or_default(),
+                    thinking_dur,
+                    thinking_sig,
+                    &[],
+                )
+            });
+            let msg_id = if let Some(message_id) = final_persisted_message_id {
+                message_id
+            } else {
+                let message_id = store.add_message_with_thinking_and_render_parts(
+                    &self.session_id,
+                    MessageRole::Assistant,
+                    &final_text,
+                    thinking_opt,
+                    thinking_dur,
+                    thinking_sig,
+                    final_response_id.as_deref(),
+                    final_continuation_request.as_ref(),
+                    final_content_order,
+                    final_thinking_order,
+                    &final_render_parts,
+                )?;
+                self.partial_assistant.mark_persisted(
+                    message_id.clone(),
+                    final_text.clone(),
+                    thinking_opt.map(str::to_string),
+                    thinking_dur,
+                );
+                message_id
+            };
 
             if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(&run_id)) {
                 eprintln!(
@@ -12519,6 +12625,7 @@ impl AgentInstance {
             None => ToolConfirmDisplay::Basic(BasicToolConfirmDisplay {
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
+                auto_review: None,
             }),
         }
     }
@@ -12543,6 +12650,186 @@ impl AgentInstance {
             reasons,
             display: Self::build_tool_confirm_display(tool_name, arguments, knowledge_preview),
         }
+    }
+
+    fn attach_auto_review_summary(
+        display: &mut ToolConfirmDisplay,
+        result: &Result<auto_review::AutoReviewDecision, String>,
+    ) {
+        let ToolConfirmDisplay::Basic(basic) = display else {
+            return;
+        };
+        basic.auto_review = Some(match result {
+            Ok(decision) => crate::commands::AutoReviewSummary {
+                status: "denied".to_string(),
+                risk_level: Some(decision.risk_level.clone()),
+                authorization: Some(decision.user_authorization.clone()),
+                rationale: decision.limited_rationale(),
+            },
+            Err(error) => crate::commands::AutoReviewSummary {
+                status: "failed".to_string(),
+                risk_level: None,
+                authorization: None,
+                rationale: error.chars().take(1_000).collect(),
+            },
+        });
+    }
+
+    fn latest_user_request_for_auto_review(&self, app_handle: &AppHandle) -> Option<String> {
+        let store = app_handle.try_state::<Arc<SessionStore>>()?;
+        store
+            .get_messages_for_prompt(&self.session_id)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| message.content)
+    }
+
+    fn record_codex_auto_review_usage(
+        &self,
+        app_handle: &AppHandle,
+        response: Option<&crate::llm::openrouter::LlmResponse>,
+    ) {
+        let Some(store) = app_handle.try_state::<Arc<SessionStore>>() else {
+            eprintln!(
+                "[Agent {}] Codex auto-review usage was not recorded: session store unavailable",
+                self.id
+            );
+            return;
+        };
+        let result = match response {
+            Some(response) => store
+                .record_model_usage(
+                    &self.session_id,
+                    auto_review::REVIEW_MODEL,
+                    "OpenAI Codex",
+                    "auto_review",
+                    response.input_tokens as u64,
+                    response.output_tokens as u64,
+                    response.cache_read_tokens as u64,
+                    response.cache_write_tokens as u64,
+                    response.cost_usd,
+                    0,
+                    None,
+                    None,
+                )
+                .map(|_| ()),
+            None => store.record_model_usage_event(
+                &self.session_id,
+                auto_review::REVIEW_MODEL,
+                "OpenAI Codex",
+                "auto_review",
+                0,
+                0,
+                0,
+                0,
+                0.0,
+            ),
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "[Agent {}] failed to record Codex auto-review model usage: {}",
+                self.id, error
+            );
+        }
+    }
+
+    async fn run_codex_auto_review(
+        &self,
+        app_handle: &AppHandle,
+        tool_name: &str,
+        args: &serde_json::Value,
+        reasons: &[ToolConfirmReason],
+        dangerous_command: Option<&dangerous_command::DangerousCommandMatch>,
+    ) -> Result<auto_review::AutoReviewDecision, String> {
+        let LlmBackend::OpenAiCodex {
+            auth,
+            transport,
+            base_url,
+        } = &self.backend
+        else {
+            return Err("Auto review is available only for the OpenAI Codex endpoint".to_string());
+        };
+
+        let latest_user_request = self.latest_user_request_for_auto_review(app_handle);
+        let reason_names = reasons
+            .iter()
+            .copied()
+            .map(ToolConfirmReason::as_str)
+            .collect::<Vec<_>>();
+        let payload = auto_review::build_review_payload(
+            tool_name,
+            args,
+            &self.working_dir,
+            latest_user_request.as_deref(),
+            &reason_names,
+            dangerous_command,
+        );
+        let review_message = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: MessageRole::User,
+            content: payload.to_string(),
+            created_at: 0,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+        let (access_token, account_id) = resolve_codex_request_auth(auth, false)
+            .await
+            .map_err(|error| format!("Codex auto-review authentication failed: {error}"))?;
+        let mut turn_state = codex::TurnState::default();
+        let on_text_delta = |_value: String| {};
+        let on_thinking_delta = |_value: String| {};
+        let on_tool_call_start = |_id: String, _name: String| {};
+        let review_history = [review_message];
+        let request = codex::stream_chat_with_options(
+            &access_token,
+            account_id.as_deref(),
+            *transport,
+            base_url.as_deref(),
+            auto_review::REVIEW_MODEL,
+            auto_review::SYSTEM_PROMPT,
+            &review_history,
+            &[],
+            None,
+            Some("low"),
+            false,
+            None,
+            None,
+            &mut turn_state,
+            codex::CodexStreamOptions::compact()
+                .with_output_schema("locus_auto_review", auto_review::response_schema()),
+            &on_text_delta,
+            &on_thinking_delta,
+            &on_tool_call_start,
+        );
+        let response = match tokio::time::timeout(auto_review::REVIEW_TIMEOUT, request).await {
+            Ok(Ok(response)) => {
+                self.record_codex_auto_review_usage(app_handle, Some(&response));
+                response
+            }
+            Ok(Err(error)) => {
+                self.record_codex_auto_review_usage(app_handle, None);
+                return Err(error);
+            }
+            Err(_) => {
+                self.record_codex_auto_review_usage(app_handle, None);
+                return Err("Codex auto review timed out".to_string());
+            }
+        };
+        auto_review::parse_decision(&response.text)
     }
 
     fn parse_tool_confirm_answer(answer: &str) -> ToolConfirmDecision {
@@ -12579,6 +12866,7 @@ impl AgentInstance {
 
         let mut knowledge_preview: Option<KnowledgeToolConfirmPreview> = None;
         let mut knowledge_governance_triggered = false;
+        let mut dangerous_command = None;
         if matches!(tool_name, "write" | "edit") {
             if let Some(file_path) = args.get("filePath").and_then(|value| value.as_str()) {
                 let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
@@ -12589,8 +12877,43 @@ impl AgentInstance {
                     if target.kind
                         == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
                     {
+                        let document_mode = if tool_name == "edit" {
+                            match crate::knowledge_store::load_document_by_path(
+                                &self.working_dir,
+                                target.doc_type,
+                                &target.logical_path,
+                            ) {
+                                Ok(document) => {
+                                    if let Err(error) =
+                                        ensure_agent_can_edit_knowledge_document(&document)
+                                    {
+                                        return knowledge_tool_confirm_preflight_error(
+                                            tool_name, error,
+                                        );
+                                    }
+                                    match document.ai_edit_mode {
+                                        crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
+                                            Some(KnowledgeToolConfirmDirectoryMode::Approval)
+                                        }
+                                        crate::knowledge_store::KnowledgeAiEditMode::Auto => {
+                                            Some(KnowledgeToolConfirmDirectoryMode::Auto)
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                Err(error) => {
+                                    return knowledge_tool_confirm_preflight_error(
+                                        tool_name, error,
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let parent_path = parent_knowledge_path(&target.logical_path);
-                        let mode = if tool_name == "write" {
+                        let mode = if let Some(mode) = document_mode {
+                            Ok((String::new(), mode))
+                        } else if tool_name == "write" {
                             resolve_child_directory_mode(
                                 &self.working_dir,
                                 target.doc_type,
@@ -12644,6 +12967,7 @@ impl AgentInstance {
                 .get("command")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
+            dangerous_command = dangerous_command::dangerous_command_match(command);
             let touches_registered_knowledge = Self::path_targets_knowledge_root(
                 &self.working_dir,
                 self.app_knowledge_dir.as_ref().as_ref(),
@@ -12675,10 +12999,18 @@ impl AgentInstance {
                     .map(String::as_str),
                 false,
             );
+        let dangerous_command_requires_confirm = dangerous_command.is_some()
+            && Self::permission_setting_requires_confirm(
+                perms
+                    .get(PERMISSION_BEHAVIOR_LOCAL_DANGEROUS_COMMANDS)
+                    .map(String::as_str),
+                true,
+            );
         drop(perms);
 
         if normalized_global_mode == PermissionModeSetting::Auto
             && !knowledge_governance_requires_confirm
+            && !dangerous_command_requires_confirm
         {
             eprintln!(
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
@@ -12687,7 +13019,7 @@ impl AgentInstance {
             return ToolConfirmDecision::Allow;
         }
 
-        let assessment = Self::assess_tool_confirmation(
+        let mut assessment = Self::assess_tool_confirmation(
             &global_mode,
             tool_mode.as_deref(),
             tool_name,
@@ -12695,6 +13027,9 @@ impl AgentInstance {
             knowledge_preview,
             knowledge_governance_requires_confirm,
         );
+        if dangerous_command_requires_confirm {
+            assessment.reasons.push(ToolConfirmReason::DangerousCommand);
+        }
 
         if assessment.reasons.is_empty() {
             eprintln!(
@@ -12708,6 +13043,46 @@ impl AgentInstance {
             "[Agent {}] tool confirm required for '{}' (global_mode='{}', tool_mode={:?}, reasons={:?})",
             self.id, tool_name, global_mode, tool_mode, assessment.reasons
         );
+
+        let auto_review_enabled = matches!(&self.backend, LlmBackend::OpenAiCodex { .. })
+            && crate::commands::load_codex_model_config()
+                .map(|config| config.auto_review)
+                .unwrap_or(false);
+        let auto_review_eligible = auto_review_enabled
+            && matches!(&assessment.display, ToolConfirmDisplay::Basic(_))
+            && !assessment
+                .reasons
+                .contains(&ToolConfirmReason::KnowledgeGovernance);
+        if auto_review_eligible {
+            eprintln!(
+                "[Agent {}] Codex auto review started for '{}' (id={})",
+                self.id, tool_name, tool_call_id
+            );
+            let review = self
+                .run_codex_auto_review(
+                    app_handle,
+                    tool_name,
+                    args,
+                    &assessment.reasons,
+                    dangerous_command.as_ref(),
+                )
+                .await;
+            if review
+                .as_ref()
+                .is_ok_and(auto_review::AutoReviewDecision::approved)
+            {
+                eprintln!(
+                    "[Agent {}] Codex auto review approved '{}' (id={})",
+                    self.id, tool_name, tool_call_id
+                );
+                return ToolConfirmDecision::Allow;
+            }
+            eprintln!(
+                "[Agent {}] Codex auto review escalated '{}' to user approval (id={}, result={:?})",
+                self.id, tool_name, tool_call_id, review
+            );
+            Self::attach_auto_review_summary(&mut assessment.display, &review);
+        }
 
         self.await_tool_confirm_decision(
             app_handle,
@@ -13136,6 +13511,8 @@ impl AgentInstance {
             .clone();
         let started = manager.create_task(&self.session_id, &tc.name, async_mode.should_notify());
         let immediate = manager.start_result(&started.task_id);
+        let (startup_result_tx, startup_result_rx) = tokio::sync::oneshot::channel();
+        let (startup_handled_tx, startup_handled_rx) = tokio::sync::oneshot::channel();
         let task_id = started.task_id.clone();
         let app_handle = app_handle.clone();
         let store = store.clone();
@@ -13345,6 +13722,10 @@ impl AgentInstance {
                 return;
             }
 
+            let startup_failure_was_returned = match startup_result_tx.send(result.clone()) {
+                Ok(()) => startup_handled_rx.await.unwrap_or(false),
+                Err(_) => false,
+            };
             executor
                 .record_failed_tool_call(
                     &app_handle,
@@ -13380,10 +13761,22 @@ impl AgentInstance {
                         tool_call_id, error
                     );
                 }
-                manager.enqueue_completion_notification(&snapshot);
+                if !startup_failure_was_returned {
+                    manager.enqueue_completion_notification(&snapshot);
+                }
             }
             run_guard.complete();
         });
+
+        if let Some(failure) = receive_immediate_async_failure(
+            startup_result_rx,
+            startup_handled_tx,
+            ASYNC_IMMEDIATE_FAILURE_WINDOW,
+        )
+        .await
+        {
+            return failure;
+        }
 
         ExecutedToolResult::from_tool_result(immediate)
     }
@@ -18836,12 +19229,12 @@ mod tests {
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
         build_structure_section, compact_trigger, finalize_tool_call_record,
-        model_response_needs_follow_up, render_tree_lines, utf8_prefix_chars, AbortOnDropTask,
-        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
-        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
-        AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult, InjectedPromptItem,
-        KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer, ParentToolCall,
-        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        model_response_needs_follow_up, receive_immediate_async_failure, render_tree_lines,
+        utf8_prefix_chars, AbortOnDropTask, AgentInstance, AgentKnowledgeDocumentContent,
+        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
+        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult,
+        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer,
+        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
         REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
@@ -18896,6 +19289,62 @@ mod tests {
             .expect("drop signal should be delivered");
     }
 
+    #[tokio::test]
+    async fn async_start_returns_an_immediate_failure_and_marks_it_handled() {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (handled_tx, handled_rx) = tokio::sync::oneshot::channel();
+        result_tx
+            .send(ExecutedToolResult::from_tool_result(ToolResult {
+                output: "failed to start".to_string(),
+                is_error: true,
+            }))
+            .expect("startup result receiver");
+
+        let result = receive_immediate_async_failure(
+            result_rx,
+            handled_tx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("immediate startup failure");
+
+        assert_eq!(result.output, "failed to start");
+        assert!(result.is_error);
+        assert!(handled_rx.await.expect("handled decision"));
+    }
+
+    #[tokio::test]
+    async fn async_start_keeps_immediate_success_and_pending_work_as_tasks() {
+        let (success_tx, success_rx) = tokio::sync::oneshot::channel();
+        let (success_handled_tx, success_handled_rx) = tokio::sync::oneshot::channel();
+        success_tx
+            .send(ExecutedToolResult::from_tool_result(ToolResult {
+                output: "done".to_string(),
+                is_error: false,
+            }))
+            .expect("startup result receiver");
+
+        assert!(receive_immediate_async_failure(
+            success_rx,
+            success_handled_tx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .is_none());
+        assert!(!success_handled_rx.await.expect("handled decision"));
+
+        let (_pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let (pending_handled_tx, pending_handled_rx) = tokio::sync::oneshot::channel();
+        assert!(receive_immediate_async_failure(
+            pending_rx,
+            pending_handled_tx,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .is_none());
+        assert!(!pending_handled_rx.await.expect("handled decision"));
+    }
+
     #[test]
     fn utf8_prefix_chars_handles_unicode_tool_arguments() {
         let value = format!("{}x", "参".repeat(200));
@@ -18933,7 +19382,7 @@ mod tests {
     }
 
     #[test]
-    fn model_follow_up_requires_a_pure_assistant_terminal_response() {
+    fn model_follow_up_requires_executable_tools_or_explicit_continuation() {
         assert!(!model_response_needs_follow_up(&[], None));
         assert!(!model_response_needs_follow_up(&[], Some(true)));
         assert!(model_response_needs_follow_up(&[], Some(false)));
@@ -18942,7 +19391,28 @@ mod tests {
         server_tool.server_tool = Some(ServerToolKind::WebSearch);
         server_tool.server_tool_output = Some("result".to_string());
 
-        assert!(model_response_needs_follow_up(&[server_tool], Some(true)));
+        assert!(!model_response_needs_follow_up(
+            std::slice::from_ref(&server_tool),
+            None,
+        ));
+        assert!(!model_response_needs_follow_up(
+            std::slice::from_ref(&server_tool),
+            Some(true),
+        ));
+        assert!(model_response_needs_follow_up(
+            std::slice::from_ref(&server_tool),
+            Some(false),
+        ));
+
+        let local_tool = test_tool_call("read-1", "read", json!({"filePath": "README.md"}));
+        assert!(model_response_needs_follow_up(
+            std::slice::from_ref(&local_tool),
+            Some(true),
+        ));
+        assert!(model_response_needs_follow_up(
+            &[server_tool, local_tool],
+            Some(true),
+        ));
     }
 
     #[test]
@@ -21817,6 +22287,7 @@ Search, install, audit, and export a plugin.
             summary_enabled: true,
             command_enabled: true,
             read_only: false,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
             ai_maintained: true,
             storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -22122,6 +22593,7 @@ Search, install, audit, and export a plugin.
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
         let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.ai_edit_mode = crate::knowledge_store::KnowledgeAiEditMode::Confirm;
         document.body = "Damage remains 20.".to_string();
         save_document(&working_dir, document).expect("save document");
 
@@ -22152,8 +22624,21 @@ Search, install, audit, and export a plugin.
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
         let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.ai_edit_mode = crate::knowledge_store::KnowledgeAiEditMode::Confirm;
         document.body = "Damage remains 20.".to_string();
         save_document(&working_dir, document).expect("save document");
+        let mut directory_config = default_directory_config_for_type(KnowledgeType::Design);
+        directory_config.ai_maintained = true;
+        directory_config.inherit_ai_config = false;
+        directory_config.explicit_maintenance_rules = true;
+        directory_config.maintenance_rules = "Keep combat design current".to_string();
+        update_directory_config(
+            &working_dir,
+            KnowledgeType::Design,
+            "combat",
+            directory_config,
+        )
+        .expect("set auto parent directory");
 
         let mut args = json!({
             "path": "design/combat/core-loop.md",
@@ -22167,6 +22652,11 @@ Search, install, audit, and export a plugin.
             .expect("inspect knowledge edit")
             .expect("knowledge preview");
 
+        assert!(inspection.governance_requires_confirm);
+        assert_eq!(
+            inspection.preview.directory_mode,
+            KnowledgeToolConfirmDirectoryMode::Approval
+        );
         assert!(inspection
             .preview
             .document_before_text
@@ -22177,6 +22667,62 @@ Search, install, audit, and export a plugin.
             .document_after_text
             .as_deref()
             .is_some_and(|text| text.contains("Damage remains 30.")));
+    }
+
+    #[test]
+    fn knowledge_edit_rejects_documents_with_ai_editing_disabled() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.ai_edit_mode = crate::knowledge_store::KnowledgeAiEditMode::Disabled;
+        document.ai_maintained = false;
+        document.inherit_ai_config = false;
+        document.explicit_maintenance_rules = true;
+        document.body = "Damage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        let error = assess_knowledge_tool_confirmation(
+            &working_dir,
+            "knowledge_edit",
+            &json!({
+                "path": "design/combat/core-loop.md",
+                "section": "body",
+                "oldString": "Damage remains 20.",
+                "newString": "Damage remains 30."
+            }),
+        )
+        .expect_err("AI-disabled knowledge edit should fail preflight");
+
+        assert!(error.contains("AI editing is disabled for knowledge document"));
+    }
+
+    #[test]
+    fn knowledge_edit_auto_mode_skips_directory_confirmation() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.ai_edit_mode = crate::knowledge_store::KnowledgeAiEditMode::Auto;
+        document.body = "Damage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        let inspection = assess_knowledge_tool_confirmation(
+            &working_dir,
+            "knowledge_edit",
+            &json!({
+                "path": "design/combat/core-loop.md",
+                "section": "body",
+                "oldString": "Damage remains 20.",
+                "newString": "Damage remains 30."
+            }),
+        )
+        .expect("inspect auto knowledge edit")
+        .expect("knowledge preview");
+
+        assert!(!inspection.governance_requires_confirm);
+        assert_eq!(
+            inspection.preview.directory_mode,
+            KnowledgeToolConfirmDirectoryMode::Auto
+        );
     }
 
     #[test]
@@ -22250,6 +22796,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22501,6 +23048,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22554,6 +23102,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22606,6 +23155,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: true,
                 command_enabled: true,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22667,6 +23217,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22765,6 +23316,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22797,6 +23349,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22855,6 +23408,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -22887,6 +23441,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -23065,6 +23620,7 @@ Search, install, audit, and export a plugin.
             summary_enabled: false,
             command_enabled: false,
             read_only: true,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
             ai_maintained: false,
             storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -23150,7 +23706,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn l2_full_document_section_injects_design_full_documents() {
+    fn l2_full_document_section_omits_rules_for_ai_disabled_documents() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
 
@@ -23167,6 +23723,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -23195,7 +23752,7 @@ Search, install, audit, and export a plugin.
             section
         );
         assert!(
-            section.contains("Rules:\n- Keep design conclusion current"),
+            !section.contains("Keep design conclusion current"),
             "{}",
             section
         );
@@ -23225,7 +23782,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn l3_rule_section_marks_empty_rules_and_body_explicitly() {
+    fn l3_rule_section_omits_rules_for_ai_disabled_documents() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
 
@@ -23242,6 +23799,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -23264,7 +23822,7 @@ Search, install, audit, and export a plugin.
 
         let rules = build_l3_rule_section(&working_dir, None).expect("build l3 rules");
         assert!(rules.contains("### Empty Memory (memory/empty-memory.md)"));
-        assert!(rules.contains("Maintenance Rules:\n<empty>"));
+        assert!(!rules.contains("Maintenance Rules:\n<empty>"));
         assert!(rules.contains("Full Document:\n<empty>"));
     }
 
@@ -23286,6 +23844,7 @@ Search, install, audit, and export a plugin.
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -23786,6 +24345,7 @@ Search, install, audit, and export a plugin.
                     summary_enabled: true,
                     command_enabled: true,
                     read_only: false,
+                    ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                     ai_maintained: true,
                     storage_source: crate::knowledge_store::KnowledgeStorageSource::Project,
                     inherit_ai_config: false,

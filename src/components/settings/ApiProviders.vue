@@ -47,6 +47,7 @@ const props = defineProps<{
   codexTransport: CodexTransportMode;
   codexExtendedContext: boolean;
   codexSessionTitleGeneration: boolean;
+  codexAutoReview: boolean;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
   dynamicToolLoadingBusy?: boolean;
   anthropicNativeLazyEnabled?: boolean;
@@ -87,6 +88,7 @@ const emit = defineEmits<{
   "update:codexTransport": [value: CodexTransportMode];
   "update:codexExtendedContext": [value: boolean];
   "update:codexSessionTitleGeneration": [value: boolean];
+  "update:codexAutoReview": [value: boolean];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
   "update:anthropicNativeLazyEnabled": [value: boolean];
   startAddProvider: [];
@@ -806,6 +808,21 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           :model-value="codexSessionTitleGeneration"
           :aria-label="t('settings.codex.sessionTitleTitle')"
           @update:model-value="emit('update:codexSessionTitleGeneration', $event)"
+        />
+      </div>
+
+      <div
+        v-if="codexStep !== 'waiting' && codexStatus.authenticated && !codexStatus.validationFailed"
+        class="provider-detail"
+      >
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.autoReviewTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.autoReviewDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="codexAutoReview"
+          :aria-label="t('settings.codex.autoReviewTitle')"
+          @update:model-value="emit('update:codexAutoReview', $event)"
         />
       </div>
     </div>

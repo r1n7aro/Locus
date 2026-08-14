@@ -953,6 +953,9 @@ pub struct CodexModelConfig {
     /// Generate a concise title for new chat sessions with Codex OAuth.
     #[serde(default)]
     pub generate_session_titles: bool,
+    /// Route approval requests through the Codex auto-review model.
+    #[serde(default)]
+    pub auto_review: bool,
 }
 
 fn codex_model_config_path() -> Result<std::path::PathBuf, String> {
@@ -3142,6 +3145,7 @@ mod tests {
         assert_eq!(config.transport, CodexTransportMode::Websocket);
         assert!(!config.extended_context);
         assert!(!config.generate_session_titles);
+        assert!(!config.auto_review);
     }
 
     #[test]

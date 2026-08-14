@@ -82,6 +82,18 @@ const basicToolDisplayName = computed(() =>
   basicDisplay.value ? toolCallDisplayName(basicDisplay.value.toolName) : "",
 );
 
+const autoReviewHeading = computed(() => {
+  const review = basicDisplay.value?.autoReview;
+  if (!review) return "";
+  if (review.status === "failed") return t("chat.toolConfirm.autoReview.failed");
+  const risk = review.riskLevel
+    ? t(`chat.toolConfirm.autoReview.risk.${review.riskLevel}`)
+    : "";
+  return risk
+    ? t("chat.toolConfirm.autoReview.deniedWithRisk", risk)
+    : t("chat.toolConfirm.autoReview.denied");
+});
+
 const unityStatusChangeDisplay = computed(() =>
   isUnityEditorStatusChangeDisplay(props.toolConfirm.display)
     ? props.toolConfirm.display
@@ -200,6 +212,10 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
           <span v-if="basicMcpParts" class="tool-confirm-mcp-origin">
             MCP · {{ basicMcpParts.serverId || "server" }}
           </span>
+        </div>
+        <div v-if="basicDisplay.autoReview" class="tool-confirm-auto-review">
+          <span class="tool-confirm-auto-review-title">{{ autoReviewHeading }}</span>
+          <span class="tool-confirm-auto-review-rationale">{{ basicDisplay.autoReview.rationale }}</span>
         </div>
         <UnityRunStatesPreview
           v-if="unityRunStatesPreview"
@@ -412,6 +428,28 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
   color: var(--text-secondary);
   vertical-align: 1px;
   white-space: nowrap;
+}
+
+.tool-confirm-auto-review {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--status-warn-fg);
+  background: color-mix(in srgb, var(--status-warn-bg) 68%, transparent);
+}
+
+.tool-confirm-auto-review-title {
+  color: var(--text-color);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.tool-confirm-auto-review-rationale {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .tool-confirm-card.is-unity-status-change .tool-confirm-name {
