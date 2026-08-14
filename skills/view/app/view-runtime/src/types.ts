@@ -72,6 +72,16 @@ export interface ImageAttachment {
   mimeType: string;
 }
 
+export type ManagedLocalFileStatus = "loading" | "ready" | "error";
+
+export interface ManagedLocalFileAttachment {
+  id: string;
+  name: string;
+  path?: string;
+  typeLabel?: string;
+  status: ManagedLocalFileStatus;
+}
+
 export type AssetRefKind = "asset" | "sceneObject" | "knowledge";
 
 export type KnowledgeAccessMode = "disabled" | "read_only" | "full";
@@ -416,6 +426,7 @@ export interface SessionTurnPreview {
   messageId: string;
   prompt: string;
   response: string;
+  images?: ImageAttachment[];
 }
 
 export interface SessionMessagePage {
@@ -542,6 +553,7 @@ export interface ModelOption {
     | "anthropic"
     | "claude_code"
     | "openai_codex"
+    | "mock"
     | "custom";
   contextWindow?: number;
   defaultEffort?: EffortLevel | null;
@@ -677,6 +689,7 @@ export interface CodexModelConfig {
   transport: CodexTransportMode;
   extendedContext: boolean;
   generateSessionTitles: boolean;
+  autoReview: boolean;
 }
 
 export interface AuthStatus {
@@ -1203,6 +1216,14 @@ export interface BasicToolConfirmDisplay {
   kind: "basic";
   toolName: string;
   arguments: string;
+  autoReview?: AutoReviewSummary | null;
+}
+
+export interface AutoReviewSummary {
+  status: "denied" | "failed";
+  riskLevel?: string | null;
+  authorization?: string | null;
+  rationale: string;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";
@@ -1357,9 +1378,10 @@ export type KnowledgeStorageSource = "project" | "app";
 export type KnowledgeInjectMode = "none" | "path" | "excerpt" | "full" | "rule";
 export type KnowledgeInjectModeSetting = "inherit" | KnowledgeInjectMode;
 export type KnowledgeAiMaintainedSetting = "inherit" | boolean;
+export type KnowledgeAiEditMode = "inherit" | "disabled" | "confirm" | "auto";
 export type KnowledgeEditMode =
   | "inherit_parent"
-  | "read_only"
+  | "disabled"
   | "proposal"
   | "auto";
 export type KnowledgeConfigSourceKind =
@@ -1402,6 +1424,7 @@ export interface KnowledgeDocumentSummary {
   effectiveInjectMode: KnowledgeInjectMode;
   injectModeSource?: KnowledgeConfigSource | null;
   readOnly: boolean;
+  aiEditMode?: KnowledgeAiEditMode;
   aiMaintained: KnowledgeAiMaintainedSetting;
   effectiveAiMaintained: boolean;
   storageSource?: KnowledgeStorageSource;
@@ -1766,6 +1789,7 @@ export interface KnowledgeDocumentPatch {
   commandTrigger?: string | null;
   argumentHint?: string | null;
   readOnly?: boolean;
+  aiEditMode?: KnowledgeAiEditMode;
   aiMaintained?: KnowledgeAiMaintainedSetting;
   externalSource?: KnowledgeExternalSource | null;
   newPath?: string;
