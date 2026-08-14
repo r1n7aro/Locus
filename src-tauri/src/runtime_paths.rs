@@ -9,6 +9,7 @@ pub(crate) const RUNTIME_CONFIG_DIR_ENV: &str = "LOCUS_RUNTIME_CONFIG_DIR";
 pub(crate) const RUNTIME_LOG_DIR_ENV: &str = "LOCUS_RUNTIME_LOG_DIR";
 pub(crate) const RUNTIME_WORKSPACE_DIR_ENV: &str = "LOCUS_RUNTIME_WORKSPACE_DIR";
 pub(crate) const WEBVIEW_DATA_DIR_ENV: &str = "WEBVIEW2_USER_DATA_FOLDER";
+pub(crate) const SKIP_ONBOARDING_ENV: &str = "LOCUS_SKIP_ONBOARDING";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeLaunchOptions {
@@ -18,6 +19,7 @@ pub(crate) struct RuntimeLaunchOptions {
     pub(crate) log_dir: Option<PathBuf>,
     pub(crate) workspace_dir: Option<PathBuf>,
     pub(crate) webview_data_dir: Option<PathBuf>,
+    pub(crate) skip_onboarding: bool,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +33,7 @@ struct ParsedRuntimeArgs {
     log_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
     webview_data_dir: Option<PathBuf>,
+    skip_onboarding: bool,
 }
 
 impl RuntimeLaunchOptions {
@@ -50,6 +53,7 @@ impl RuntimeLaunchOptions {
             log_dir: directory_from_env(RUNTIME_LOG_DIR_ENV, "log directory")?,
             workspace_dir: directory_from_env(RUNTIME_WORKSPACE_DIR_ENV, "workspace directory")?,
             webview_data_dir: directory_from_env(WEBVIEW_DATA_DIR_ENV, "WebView data directory")?,
+            skip_onboarding: bool_from_env(SKIP_ONBOARDING_ENV),
         })
     }
 
@@ -73,6 +77,7 @@ impl RuntimeLaunchOptions {
             "logFile": self.log_dir.as_ref().map(|path| path.join("locus.log").display().to_string()),
             "workspace": display_path(self.workspace_dir.as_deref()),
             "webviewDataDir": display_path(self.webview_data_dir.as_deref()),
+            "skipOnboarding": self.skip_onboarding,
         });
         println!("LOCUS_RUNTIME_JSON {value}");
     }
@@ -111,6 +116,7 @@ impl ParsedRuntimeArgs {
                     parsed.webview_data_dir =
                         Some(read_path_value(name, inline, &args, &mut index)?)
                 }
+                "--locus-skip-onboarding" => parsed.skip_onboarding = true,
                 _ => {}
             }
             index += 1;
@@ -122,6 +128,12 @@ impl ParsedRuntimeArgs {
         if self.help {
             print_runtime_help();
             std::process::exit(0);
+        }
+        if self.skip_onboarding && !self.isolated && self.runtime_root.is_none() {
+            return Err(
+                "--locus-skip-onboarding requires --locus-isolated or --locus-runtime-root"
+                    .to_string(),
+            );
         }
         if self.isolated && self.runtime_root.is_none() {
             let runtime_base = match self.runtime_base.as_ref() {
@@ -148,6 +160,9 @@ impl ParsedRuntimeArgs {
         apply_directory_override(RUNTIME_LOG_DIR_ENV, self.log_dir.as_deref())?;
         apply_directory_override(RUNTIME_WORKSPACE_DIR_ENV, self.workspace_dir.as_deref())?;
         apply_directory_override(WEBVIEW_DATA_DIR_ENV, self.webview_data_dir.as_deref())?;
+        if self.skip_onboarding {
+            std::env::set_var(SKIP_ONBOARDING_ENV, "1");
+        }
 
         if let Some(root) = self.runtime_root.as_ref() {
             let system_temp = ensure_directory(&root.join("system-temp"), "system temp directory")?;
@@ -169,6 +184,7 @@ fn print_runtime_help() {
   --locus-log-dir <dir>            Directory containing locus.log\n\
   --locus-workspace <dir>          Initial workspace\n\
   --locus-webview-data-dir <dir>   WebView2 profile and local storage\n\
+  --locus-skip-onboarding          Open directly in Chat for this runtime\n\
   --locus-runtime-help             Show this help"
     );
 }
@@ -179,6 +195,12 @@ pub(crate) fn runtime_config_dir_from_env() -> Result<Option<PathBuf>, String> {
 
 pub(crate) fn runtime_log_dir_from_env() -> Result<Option<PathBuf>, String> {
     directory_from_env(RUNTIME_LOG_DIR_ENV, "log directory")
+}
+
+fn bool_from_env(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false)
 }
 
 fn directory_from_env(key: &str, label: &str) -> Result<Option<PathBuf>, String> {
@@ -325,5 +347,17 @@ mod tests {
 
         assert!(parsed.isolated);
         assert_eq!(parsed.runtime_base.as_deref(), Some(root.path()));
+    }
+
+    #[test]
+    fn parses_skip_onboarding_for_isolated_profiles() {
+        let parsed = ParsedRuntimeArgs::parse(args(&[
+            "--locus-isolated",
+            "--locus-skip-onboarding",
+        ]))
+        .expect("parse");
+
+        assert!(parsed.isolated);
+        assert!(parsed.skip_onboarding);
     }
 }

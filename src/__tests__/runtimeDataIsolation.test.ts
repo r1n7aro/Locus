@@ -46,12 +46,16 @@ describe("runtime data isolation", () => {
     );
     expect(runtimePaths).toContain('"--locus-isolated"');
     expect(runtimePaths).toContain('"--locus-database-dir"');
+    expect(runtimePaths).toContain('"--locus-skip-onboarding"');
+    expect(runtimePaths).toContain('SKIP_ONBOARDING_ENV: &str = "LOCUS_SKIP_ONBOARDING"');
     expect(runtimePaths).toContain('println!("LOCUS_RUNTIME_JSON {value}")');
 
     expect(workspace).toContain("runtime_config_dir_from_env()?");
     expect(fileLog).toContain("runtime_log_dir_from_env()?");
     expect(lib).toContain("RuntimeLaunchOptions::configure_from_env_args()");
     expect(lib).toContain("runtime_workspace_for_setup");
+    expect(lib).toContain("skip_onboarding_for_setup");
+    expect(lib).toContain("localStorage.setItem('locus-onboarding-completed', '1')");
   });
 
   it("provides a portable bun dev-mcp entry with local runtime-base configuration", () => {
@@ -75,6 +79,7 @@ describe("runtime data isolation", () => {
       'const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json"',
     );
     expect(launcher).toContain('"--runtime-base": "runtimeBase"');
+    expect(launcher).toContain('arg === "--skip-onboarding"');
     expect(gitignore).toContain(".locus-dev.local.json");
     expect(launcher).toContain(
       "env.LOCUS_RUNTIME_DATA_DIR = manifest.databaseDir",
@@ -90,6 +95,7 @@ describe("runtime data isolation", () => {
       "env.WEBVIEW2_USER_DATA_FOLDER = manifest.webviewDataDir",
     );
     expect(launcher).toContain("LOCUS_RUNTIME_JSON");
+    expect(launcher).toContain('env[SKIP_ONBOARDING_ENV_KEY] = "1"');
   });
 
   it("discovers Bun without embedding a developer profile path", () => {

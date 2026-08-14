@@ -352,6 +352,7 @@ pub fn run() {
     let cli_driver_for_setup = cli_driver_config.clone();
     let external_script_open_for_setup = external_script_open_request.clone();
     let runtime_workspace_for_setup = runtime_launch_options.workspace_dir.clone();
+    let skip_onboarding_for_setup = runtime_launch_options.skip_onboarding;
 
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
@@ -1075,7 +1076,14 @@ pub fn run() {
                 .find(|window| window.label == MAIN_WINDOW_LABEL)
                 .ok_or_else(|| format!("Missing '{}' window config", MAIN_WINDOW_LABEL))?;
             startup_for_setup.mark("main_window_build_start");
-            tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?.build()?;
+            let mut main_window_builder =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?;
+            if skip_onboarding_for_setup {
+                main_window_builder = main_window_builder.initialization_script(
+                    "try { localStorage.setItem('locus-onboarding-completed', '1'); } catch (_) {}",
+                );
+            }
+            main_window_builder.build()?;
             startup_for_setup.mark("main_window_build_done");
             if let Err(error) = install_main_tray(app) {
                 eprintln!("[Locus] warning: failed to install tray icon: {}", error);

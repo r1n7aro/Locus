@@ -21,6 +21,7 @@ const LEGACY_CODEX_MCP_SERVER_NAMES = ["locus-webview2-devtools"];
 const CODEX_CLI_ENV_KEY = "LOCUS_CODEX_CLI";
 const CODEX_NODE_ENV_KEY = "LOCUS_CODEX_NODE";
 const ISOLATED_RUNTIME_BASE_ENV_KEY = "LOCUS_ISOLATED_RUNTIME_BASE";
+const SKIP_ONBOARDING_ENV_KEY = "LOCUS_SKIP_ONBOARDING";
 const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
@@ -67,7 +68,7 @@ const shouldRunDevWithMcp =
   requestedCommand === DEV_WITH_MCP_ISOLATED_COMMAND;
 const isolatedRuntime = supportsIsolatedRuntime
   ? parseIsolatedRuntimeArgs(args.slice(1), ISOLATED_DEV_COMMANDS.has(requestedCommand))
-  : { enabled: false, paths: {}, remainingArgs: args.slice(1) };
+  : { enabled: false, paths: {}, remainingArgs: args.slice(1), skipOnboarding: false };
 const isCustomDevCommand =
   requestedCommand === "dev" ||
   requestedCommand === DEV_WITH_MCP_COMMAND ||
@@ -93,7 +94,7 @@ if (isolatedRuntime.enabled && isHelpOrVersionCommand) {
 if (isolatedRuntime.enabled) {
   let manifest;
   try {
-    manifest = prepareIsolatedRuntime(isolatedRuntime.paths);
+    manifest = prepareIsolatedRuntime(isolatedRuntime.paths, isolatedRuntime.skipOnboarding);
   } catch (error) {
     console.error(`[locus] ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
@@ -104,6 +105,9 @@ if (isolatedRuntime.enabled) {
   env.LOCUS_RUNTIME_LOG_DIR = manifest.logDir;
   env.LOCUS_RUNTIME_WORKSPACE_DIR = manifest.workspace;
   env.WEBVIEW2_USER_DATA_FOLDER = manifest.webviewDataDir;
+  if (manifest.skipOnboarding) {
+    env[SKIP_ONBOARDING_ENV_KEY] = "1";
+  }
   env.TEMP = manifest.systemTempDir;
   env.TMP = manifest.systemTempDir;
   console.log(`LOCUS_RUNTIME_JSON ${JSON.stringify(manifest)}`);
@@ -113,11 +117,16 @@ function parseIsolatedRuntimeArgs(values, enabledByCommand) {
   const paths = {};
   const remainingArgs = [];
   let enabled = enabledByCommand;
+  let skipOnboarding = false;
 
   for (let index = 0; index < values.length; index += 1) {
     const arg = values[index];
     if (arg === "--isolated") {
       enabled = true;
+      continue;
+    }
+    if (arg === "--skip-onboarding") {
+      skipOnboarding = true;
       continue;
     }
 
@@ -147,10 +156,15 @@ function parseIsolatedRuntimeArgs(values, enabledByCommand) {
     if (!inlineValue) index += 1;
   }
 
-  return { enabled, paths, remainingArgs };
+  if (skipOnboarding && !enabled) {
+    console.error("[locus] --skip-onboarding requires an isolated runtime.");
+    process.exit(2);
+  }
+
+  return { enabled, paths, remainingArgs, skipOnboarding };
 }
 
-function prepareIsolatedRuntime(requestedPaths) {
+function prepareIsolatedRuntime(requestedPaths, skipOnboarding) {
   const runtimeRoot = requestedPaths.runtimeRoot
     ? path.resolve(requestedPaths.runtimeRoot)
     : createGeneratedRuntimeRoot(requestedPaths.runtimeBase);
@@ -166,6 +180,7 @@ function prepareIsolatedRuntime(requestedPaths) {
     webviewDataDir:
       requestedPaths.webviewDataDir ?? path.join(runtimeRoot, "webview"),
     systemTempDir: path.join(runtimeRoot, "system-temp"),
+    skipOnboarding,
   };
   manifest.databaseFile = path.join(manifest.databaseDir, "locus.db");
   manifest.logFile = path.join(manifest.logDir, "locus.log");
@@ -238,6 +253,7 @@ Options:
   --log-dir <dir>           Directory containing locus.log
   --workspace <dir>         Initial Locus workspace; created when missing
   --webview-data-dir <dir>  Isolated WebView2 profile and local storage
+  --skip-onboarding         Open the isolated instance directly in Chat
 
 Generated runtime root precedence: --runtime-base,
 ${ISOLATED_RUNTIME_BASE_ENV_KEY}, ${LOCAL_DEV_CONFIG_FILE}, then the system
