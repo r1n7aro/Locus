@@ -2366,6 +2366,32 @@ describe("useKnowledgeState", () => {
     );
 
     await state.refreshKnowledgeData();
+    const fileMetadata = {
+      byteSize: 10_800,
+      lineCount: 363,
+      charCount: 4_345,
+      estimatedTokens: 3_135,
+      modifiedAt: 2,
+    };
+    knowledgeMocks.knowledgeRead.mockResolvedValueOnce({
+      kind: "document",
+      document: {
+        id: "design-1",
+        type: "design",
+        path: "combat/core-loop.md",
+        title: "核心循环",
+        injectMode: "excerpt",
+        effectiveInjectMode: "excerpt",
+        readOnly: false,
+        aiMaintained: false,
+        effectiveAiMaintained: false,
+        summary: "摘要",
+        body: "正文",
+        maintenanceRules: null,
+        modifiedAt: 2,
+        fileMetadata,
+      },
+    });
     await state.selectDocument(state.documents.value[0]!);
     const readCallsBeforeUpdate =
       knowledgeMocks.knowledgeRead.mock.calls.length;
@@ -2414,9 +2440,10 @@ describe("useKnowledgeState", () => {
       readCallsBeforeUpdate,
     );
     expect(state.selectedDocument.value?.body).toBe("正文 v2");
+    expect(state.selectedDocument.value?.fileMetadata).toEqual(fileMetadata);
   });
 
-  it("creates a new design document in proposal mode", async () => {
+  it("creates a new design document with inherited category defaults", async () => {
     const state = useKnowledgeState(
       reactive({
         workingDir: "F:/repo",
@@ -2434,8 +2461,7 @@ describe("useKnowledgeState", () => {
         document: expect.objectContaining({
           body: "",
           injectMode: "inherit",
-          readOnly: false,
-          aiMaintained: "inherit",
+          aiEditMode: "inherit",
         }),
       }),
     );
@@ -2461,8 +2487,7 @@ describe("useKnowledgeState", () => {
         document: expect.objectContaining({
           body: "",
           injectMode: "inherit",
-          readOnly: false,
-          aiMaintained: "inherit",
+          aiEditMode: "inherit",
         }),
       }),
     );

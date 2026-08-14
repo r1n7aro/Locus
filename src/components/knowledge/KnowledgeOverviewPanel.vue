@@ -333,12 +333,27 @@ const noneCount = computed(
 );
 const autoMaintainedCount = computed(
   () =>
-    activeDocuments.value.filter((doc) => !doc.readOnly && doc.effectiveAiMaintained)
+    activeDocuments.value.filter(
+      (doc) =>
+        !doc.readOnly
+        && (doc.aiEditMode === "auto"
+          || (doc.aiEditMode === "inherit" && doc.effectiveAiMaintained)),
+    )
       .length,
 );
 const proposalMaintainedCount = computed(
   () =>
-    activeDocuments.value.filter((doc) => !doc.readOnly && !doc.effectiveAiMaintained)
+    activeDocuments.value.filter(
+      (doc) =>
+        !doc.readOnly
+        && (doc.aiEditMode === "confirm"
+          || (doc.aiEditMode === "inherit" && !doc.effectiveAiMaintained)),
+    )
+      .length,
+);
+const aiDisabledCount = computed(
+  () =>
+    activeDocuments.value.filter((doc) => !doc.readOnly && doc.aiEditMode === "disabled")
       .length,
 );
 const readOnlyCount = computed(
@@ -376,6 +391,10 @@ const maintenanceItems = computed(() => [
   {
     label: t("knowledge.dashboard.maintenance.proposal"),
     value: proposalMaintainedCount.value,
+  },
+  {
+    label: t("knowledge.dashboard.maintenance.disabled"),
+    value: aiDisabledCount.value,
   },
   {
     label: t("knowledge.dashboard.maintenance.readOnly"),

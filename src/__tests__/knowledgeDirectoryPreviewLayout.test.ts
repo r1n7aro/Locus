@@ -14,9 +14,9 @@ describe("KnowledgeDirectoryPreview layout", () => {
     const en = read("src/language/en.json");
 
     expect(zh).toContain('"knowledge.directoryConfig.aiConfig.manual": "提案后修改"');
-    expect(zh).toContain('"knowledge.meta.editMode.proposal": "提案后修改"');
+    expect(zh).toContain('"knowledge.meta.editMode.proposal": "用户确认时可以修改"');
     expect(en).toContain('"knowledge.directoryConfig.aiConfig.manual": "Proposal-based"');
-    expect(en).toContain('"knowledge.meta.editMode.proposal": "Proposal-based"');
+    expect(en).toContain('"knowledge.meta.editMode.proposal": "Edit with Confirmation"');
   });
 
   it("uses the same continuous page structure as document config", () => {

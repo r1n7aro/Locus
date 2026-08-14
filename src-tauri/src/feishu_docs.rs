@@ -3538,6 +3538,7 @@ async fn run_feishu_reference_import(
             summary_enabled: false,
             command_enabled: false,
             read_only: true,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
             ai_maintained: false,
             storage_source: knowledge_store::KnowledgeStorageSource::Project,
             inherit_ai_config: false,

@@ -804,23 +804,31 @@ pub(super) fn edit() -> ToolDef {
                     }
                     if target.kind
                         == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-                        && target.doc_type == crate::knowledge_store::KnowledgeType::Reference
                     {
                         if let Some(working_dir) = ctx.working_dir.as_deref() {
-                            if crate::knowledge_store::load_document_by_path(
+                            if let Ok(document) = crate::knowledge_store::load_document_by_path(
                                 working_dir,
                                 target.doc_type,
                                 &target.logical_path,
-                            )
-                            .is_ok_and(|document| document.read_only)
-                            {
-                                return ToolResult {
-                                    output: format!(
-                                        "Knowledge document is read-only and cannot be edited: {}",
-                                        target.display_path
-                                    ),
-                                    is_error: true,
-                                };
+                            ) {
+                                if document.read_only {
+                                    return ToolResult {
+                                        output: format!(
+                                            "Knowledge document is read-only and cannot be edited: {}",
+                                            target.display_path
+                                        ),
+                                        is_error: true,
+                                    };
+                                }
+                                if !crate::knowledge_store::document_allows_ai_edit(&document) {
+                                    return ToolResult {
+                                        output: format!(
+                                            "AI editing is disabled for knowledge document: {}",
+                                            target.display_path
+                                        ),
+                                        is_error: true,
+                                    };
+                                }
                             }
                         }
                     }

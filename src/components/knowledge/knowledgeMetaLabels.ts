@@ -65,10 +65,12 @@ export function labelForKnowledgeEditMode(mode: KnowledgeEditMode): string {
       return t("knowledge.meta.editMode.inheritParent");
     case "auto":
       return t("knowledge.meta.editMode.auto");
+    case "disabled":
+      return t("knowledge.meta.editMode.disabled");
     case "proposal":
       return t("knowledge.meta.editMode.proposal");
     default:
-      return t("knowledge.meta.editMode.readOnly");
+      return t("knowledge.meta.editMode.disabled");
   }
 }
 
@@ -78,10 +80,12 @@ export function hintForKnowledgeEditMode(mode: KnowledgeEditMode): string {
       return t("knowledge.meta.editMode.inheritParentHint");
     case "auto":
       return t("knowledge.meta.editMode.autoHint");
+    case "disabled":
+      return t("knowledge.meta.editMode.disabledHint");
     case "proposal":
       return t("knowledge.meta.editMode.proposalHint");
     default:
-      return t("knowledge.meta.editMode.readOnlyHint");
+      return t("knowledge.meta.editMode.disabledHint");
   }
 }
 

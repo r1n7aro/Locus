@@ -1433,7 +1433,9 @@ function documentTags(node: DocumentNode): Array<{
       injectMode: isSkill
         ? effectiveSkillInjectMode(node.document.skillSurface, node.document.effectiveInjectMode)
         : node.document.effectiveInjectMode,
-      aiMaintained: node.document.effectiveAiMaintained,
+      aiMaintained:
+        node.document.aiEditMode === "auto"
+        || (node.document.aiEditMode === "inherit" && node.document.effectiveAiMaintained),
     }),
   );
   return tags;

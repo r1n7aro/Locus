@@ -602,6 +602,7 @@ mod tests {
             summary_enabled: true,
             command_enabled: true,
             read_only: true,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
             ai_maintained: false,
             storage_source,
             inherit_ai_config: false,

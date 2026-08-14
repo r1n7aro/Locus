@@ -209,9 +209,9 @@ const editModeOptions = computed(() => [
     hint: hintForKnowledgeEditMode("inherit_parent"),
   },
   {
-    value: "read_only",
-    label: labelForKnowledgeEditMode("read_only"),
-    hint: hintForKnowledgeEditMode("read_only"),
+    value: "disabled",
+    label: labelForKnowledgeEditMode("disabled"),
+    hint: hintForKnowledgeEditMode("disabled"),
   },
   {
     value: "proposal",
@@ -224,10 +224,9 @@ const editModeOptions = computed(() => [
     hint: hintForKnowledgeEditMode("auto"),
   },
 ]);
-const effectiveEditMode = computed<Exclude<KnowledgeEditMode, "inherit_parent">>(() => {
-  if (props.document?.readOnly && props.document?.aiMaintained !== "inherit") return "read_only";
-  return props.document?.effectiveAiMaintained ? "auto" : "proposal";
-});
+const effectiveEditMode = computed<"auto" | "proposal">(() => (
+  props.document?.effectiveAiMaintained ? "auto" : "proposal"
+));
 const injectModeDropdownLabel = computed(() => {
   if (!props.document) return "";
   const effectiveLabel = labelForInjectMode(displayInjectMode.value, props.document.type);
@@ -238,11 +237,11 @@ const injectModeDropdownLabel = computed(() => {
 const editModeDropdownLabel = computed(() => {
   if (!props.document) return "";
   const effectiveLabel = labelForKnowledgeEditMode(effectiveEditMode.value);
-  return props.document.aiMaintained === "inherit"
+  return props.document.aiEditMode === "inherit"
     ? labelForInheritedValue(effectiveLabel, props.document.aiConfigSource)
     : labelForKnowledgeEditMode(editMode.value);
 });
-const usesInheritedMaintenanceRules = computed(() => props.document?.aiMaintained === "inherit");
+const usesInheritedMaintenanceRules = computed(() => props.document?.aiEditMode === "inherit");
 const rulesEditorDisabled = computed(() => isReadOnly.value);
 const rulesHint = computed(() => t("knowledge.preview.rulesHint"));
 const rulesPropertyValue = computed(() => rulesDraft.value);

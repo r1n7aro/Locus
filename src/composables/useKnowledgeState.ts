@@ -1356,14 +1356,24 @@ export function useKnowledgeState(props: KnowledgeProps) {
     previousPath: string,
     updated: KnowledgeDocument,
   ) {
-    if (previousPath !== updated.path) {
-      replaceDocumentPath(updated.type, previousPath, []);
+    const currentSelected = selectedDocument.value;
+    // knowledge_edit returns the authoritative document content without the
+    // file metadata that knowledge_read adds. Keep the last complete metadata
+    // snapshot until the knowledge-changed refresh supplies the new values so
+    // property rows do not disappear between the save response and refresh.
+    const reconciled = currentSelected?.id === updated.id
+      && !updated.fileMetadata
+      && currentSelected.fileMetadata
+      ? { ...updated, fileMetadata: currentSelected.fileMetadata }
+      : updated;
+    if (previousPath !== reconciled.path) {
+      replaceDocumentPath(reconciled.type, previousPath, []);
     }
-    mergeDocuments([updated]);
-    if (selectedDocumentId.value === updated.id) {
-      selectedDocument.value = updated;
+    mergeDocuments([reconciled]);
+    if (selectedDocumentId.value === reconciled.id) {
+      selectedDocument.value = reconciled;
     }
-    expandAncestors(fullDocumentPath(updated.type, updated.path));
+    expandAncestors(fullDocumentPath(reconciled.type, reconciled.path));
   }
 
   function isDocumentInDirectory(
@@ -3256,8 +3266,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           document: {
             body: "",
             injectMode: defaults.injectMode,
-            readOnly: defaults.readOnly,
-            aiMaintained: defaults.aiMaintained,
+            aiEditMode: defaults.aiEditMode,
           },
         }),
       );
@@ -3330,8 +3339,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           document: {
             body: "",
             injectMode: defaults.injectMode,
-            readOnly: defaults.readOnly,
-            aiMaintained: defaults.aiMaintained,
+            aiEditMode: defaults.aiEditMode,
           },
         }),
       );

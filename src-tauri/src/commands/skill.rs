@@ -3127,6 +3127,7 @@ fn package_to_document(
         summary_enabled: is_root,
         command_enabled,
         read_only: true,
+        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Disabled,
         ai_maintained: false,
         storage_source: if record.plugin_scope == Some(crate::plugin::PluginInstallScope::Project) {
             knowledge_store::KnowledgeStorageSource::Project
@@ -3853,6 +3854,7 @@ fn package_to_list_item(
         summary_enabled: is_root,
         command_enabled,
         read_only: true,
+        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Disabled,
         ai_maintained: false,
         explicit_maintenance_rules: false,
         storage_source: if record.plugin_scope == Some(crate::plugin::PluginInstallScope::Project) {
@@ -4545,6 +4547,7 @@ pub fn create_skill_document_sync(
         summary_enabled: true,
         command_enabled,
         read_only: false,
+        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Inherit,
         ai_maintained: false,
         storage_source: knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: true,

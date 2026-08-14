@@ -8,29 +8,44 @@ import type {
 
 type EditModeDocument = Pick<
   KnowledgeDocument,
-  "type" | "readOnly" | "aiMaintained" | "externalSource"
+  "type" | "readOnly" | "aiEditMode" | "aiMaintained" | "storageSource" | "externalSource"
 >;
 
 export function getKnowledgeEditMode(
-  document: Pick<KnowledgeDocument, "readOnly" | "aiMaintained"> | null | undefined,
+  document: Pick<KnowledgeDocument, "aiEditMode" | "aiMaintained"> | null | undefined,
 ): KnowledgeEditMode {
-  if (document?.aiMaintained === "inherit") return "inherit_parent";
-  if (document?.readOnly) return "read_only";
-  return document?.aiMaintained ? "auto" : "proposal";
+  const mode = document?.aiEditMode
+    ?? (document?.aiMaintained === "inherit"
+      ? "inherit"
+      : document?.aiMaintained
+        ? "auto"
+        : "confirm");
+  switch (mode) {
+    case "inherit":
+      return "inherit_parent";
+    case "auto":
+      return "auto";
+    case "confirm":
+      return "proposal";
+    default:
+      return "disabled";
+  }
 }
 
 export function buildKnowledgeEditModePatch(
   mode: KnowledgeEditMode,
-): Pick<KnowledgeDocumentPatch, "readOnly" | "aiMaintained"> {
+): Pick<KnowledgeDocumentPatch, "aiEditMode"> {
   switch (mode) {
     case "inherit_parent":
-      return { readOnly: false, aiMaintained: "inherit" };
-    case "read_only":
-      return { readOnly: true, aiMaintained: false };
+      return { aiEditMode: "inherit" };
     case "auto":
-      return { readOnly: false, aiMaintained: true };
+      return { aiEditMode: "auto" };
+    case "disabled":
+      return { aiEditMode: "disabled" };
+    case "proposal":
+      return { aiEditMode: "confirm" };
     default:
-      return { readOnly: false, aiMaintained: false };
+      return { aiEditMode: "disabled" };
   }
 }
 
@@ -47,9 +62,9 @@ export function defaultSummaryEnabledForType(type: KnowledgeDocumentType): boole
 }
 
 export function isKnowledgeEditModeLocked(document: EditModeDocument | null | undefined): boolean {
-  if (document?.readOnly) return true;
+  if (document?.readOnly || document?.storageSource === "app") return true;
   const provider = document?.externalSource?.provider;
-  return provider === "local_folder" || provider === "feishu";
+  return provider === "local_folder" || provider === "feishu" || provider === "package";
 }
 
 export function defaultMaintenanceRulesForType(type: KnowledgeDocumentType): string | null {

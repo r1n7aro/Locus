@@ -730,6 +730,11 @@ fn build_local_document(
         summary_enabled: false,
         command_enabled: false,
         read_only,
+        ai_edit_mode: if read_only {
+            knowledge_store::KnowledgeAiEditMode::Disabled
+        } else {
+            knowledge_store::KnowledgeAiEditMode::Confirm
+        },
         ai_maintained: false,
         storage_source: knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: false,
@@ -1190,6 +1195,7 @@ fn live_synthetic_document(
         summary_enabled: false,
         command_enabled: false,
         read_only: true,
+        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Disabled,
         ai_maintained: false,
         storage_source: knowledge_store::KnowledgeStorageSource::Project,
         inherit_ai_config: false,

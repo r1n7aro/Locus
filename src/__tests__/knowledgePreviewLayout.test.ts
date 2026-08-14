@@ -68,7 +68,7 @@ describe("KnowledgePreview continuous document layout", () => {
   it("hides inherited maintenance-rule content and keeps explicit rules editable", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain('const usesInheritedMaintenanceRules = computed(() => props.document?.aiMaintained === "inherit")');
+    expect(preview).toContain('const usesInheritedMaintenanceRules = computed(() => props.document?.aiEditMode === "inherit")');
     expect(preview).toContain("const rulesPropertyValue = computed(() => rulesDraft.value)");
     expect(preview).toContain("!usesInheritedMaintenanceRules &&");
     expect(preview).toContain(':disabled="rulesEditorDisabled"');

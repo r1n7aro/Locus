@@ -42,7 +42,7 @@ use self::tantivy_index::{
     KnowledgeTantivyIndex, LexicalBulkWriterGuard, LexicalDocumentRecord, LexicalHit,
 };
 
-pub const INDEX_VERSION: i32 = 4;
+pub const INDEX_VERSION: i32 = 5;
 const TANTIVY_BATCH_DOCS: usize = 128;
 const PARALLEL_PREPARE_DOC_THRESHOLD: usize = 16;
 const PREPARING_ANALYSIS_BATCH_DOCS: usize = 64;
@@ -4618,6 +4618,7 @@ fn build_list_item(
         summary_enabled: document.summary_enabled,
         command_enabled: document.command_enabled,
         read_only: document.read_only,
+        ai_edit_mode: document.ai_edit_mode,
         ai_maintained: document.ai_maintained,
         explicit_maintenance_rules: document.explicit_maintenance_rules,
         storage_source: document.storage_source,
@@ -6298,6 +6299,7 @@ mod tests {
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -6359,6 +6361,7 @@ mod tests {
                 summary_enabled: true,
                 command_enabled: enabled,
                 read_only: external_package,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -6404,6 +6407,7 @@ mod tests {
             summary_enabled: true,
             command_enabled: false,
             read_only: false,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
             ai_maintained: false,
             storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -6462,6 +6466,7 @@ mod tests {
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: true,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
                 ai_maintained: false,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -6557,6 +6562,7 @@ mod tests {
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: true,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
                 ai_maintained: false,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -7448,6 +7454,7 @@ mod tests {
                 summary_enabled: true,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
                 ai_maintained: false,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,

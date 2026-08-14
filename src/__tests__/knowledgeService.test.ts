@@ -77,4 +77,35 @@ describe("knowledge service visibility defaults", () => {
       },
     });
   });
+
+  it("sends the four-state AI edit mode for document metadata updates", async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: "document",
+      type: "design",
+      path: "combat.md",
+    });
+
+    await knowledgeEdit({
+      kind: "document",
+      type: "design",
+      path: "combat.md",
+      document: {
+        readOnly: false,
+        aiEditMode: "confirm",
+      },
+    });
+
+    expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", {
+      request: {
+        kind: "document",
+        path: "design/combat.md",
+        type: "design",
+        document: {
+          readOnly: false,
+          aiEditMode: "confirm",
+        },
+        config: undefined,
+      },
+    });
+  });
 });

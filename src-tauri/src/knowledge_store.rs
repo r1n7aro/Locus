@@ -225,6 +225,8 @@ pub struct KnowledgeDocument {
     pub summary_enabled: bool,
     pub command_enabled: bool,
     pub read_only: bool,
+    #[serde(default)]
+    pub ai_edit_mode: KnowledgeAiEditMode,
     pub ai_maintained: bool,
     #[serde(default, skip_deserializing)]
     pub storage_source: KnowledgeStorageSource,
@@ -279,6 +281,8 @@ struct KnowledgeFrontmatter {
     pub command_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_edit_mode: Option<KnowledgeAiEditMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_maintained: Option<KnowledgeFrontmatterAiMaintained>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +371,16 @@ enum KnowledgeFrontmatterAiMaintained {
     Mode(KnowledgeFrontmatterInheritMarker),
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeAiEditMode {
+    #[default]
+    Inherit,
+    Disabled,
+    Confirm,
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeListItem {
@@ -379,6 +393,8 @@ pub struct KnowledgeListItem {
     pub summary_enabled: bool,
     pub command_enabled: bool,
     pub read_only: bool,
+    #[serde(default)]
+    pub ai_edit_mode: KnowledgeAiEditMode,
     pub ai_maintained: bool,
     pub explicit_maintenance_rules: bool,
     #[serde(default)]
@@ -696,6 +712,8 @@ pub struct KnowledgeDocumentPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_edit_mode: Option<KnowledgeAiEditMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_maintained: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_ai_config: Option<bool>,
@@ -933,6 +951,8 @@ pub struct KnowledgeUpdateRequest {
     pub command_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_edit_mode: Option<KnowledgeAiEditMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_maintained: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1637,6 +1657,7 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: KnowledgeAiEditMode::Auto,
                 ai_maintained: true,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -1763,8 +1784,18 @@ fn has_maintenance_rules_content(value: Option<&str>) -> bool {
     value.map(|item| !item.trim().is_empty()).unwrap_or(false)
 }
 
+pub(crate) fn document_allows_ai_edit(document: &KnowledgeDocument) -> bool {
+    !document.read_only && document.ai_edit_mode != KnowledgeAiEditMode::Disabled
+}
+
+fn apply_ai_edit_mode(document: &mut KnowledgeDocument, mode: KnowledgeAiEditMode) {
+    document.ai_edit_mode = mode;
+    document.inherit_ai_config = mode == KnowledgeAiEditMode::Inherit;
+    document.ai_maintained = mode == KnowledgeAiEditMode::Auto;
+}
+
 pub(crate) fn active_maintenance_rules(document: &KnowledgeDocument) -> Option<&str> {
-    if !document.explicit_maintenance_rules {
+    if !document_allows_ai_edit(document) || !document.explicit_maintenance_rules {
         return None;
     }
     document
@@ -1852,6 +1883,7 @@ fn resolve_document_inheritance_from_root(
     }
 
     if document.inherit_ai_config {
+        document.ai_edit_mode = KnowledgeAiEditMode::Inherit;
         document.ai_maintained = inherited_config.ai_maintained;
         document.explicit_maintenance_rules = inherited_config.explicit_maintenance_rules;
         document.maintenance_rules = if inherited_config.explicit_maintenance_rules {
@@ -1875,7 +1907,7 @@ fn ensure_maintenance_rules(document: &mut KnowledgeDocument) {
         document.explicit_maintenance_rules = document.maintenance_rules.is_some();
     }
 
-    if document.ai_maintained
+    if document.ai_edit_mode == KnowledgeAiEditMode::Auto
         && !has_maintenance_rules_content(document.maintenance_rules.as_deref())
     {
         document.maintenance_rules =
@@ -3165,6 +3197,7 @@ pub fn default_document_create_patch(
         title: Some(default_document_title_from_path(&normalized_path)?),
         body: Some(Some(String::new())),
         inherit_inject_mode: Some(true),
+        ai_edit_mode: Some(KnowledgeAiEditMode::Inherit),
         inherit_ai_config: Some(true),
         ..Default::default()
     })
@@ -3575,21 +3608,36 @@ pub fn edit_document(
     if let Some(read_only) = patch.read_only {
         doc.read_only = read_only;
     }
-    if let Some(ai_maintained) = patch.ai_maintained {
-        doc.ai_maintained = ai_maintained;
+    if let Some(ai_edit_mode) = patch.ai_edit_mode {
+        apply_ai_edit_mode(&mut doc, ai_edit_mode);
+    } else if let Some(ai_maintained) = patch.ai_maintained {
+        apply_ai_edit_mode(
+            &mut doc,
+            if ai_maintained {
+                KnowledgeAiEditMode::Auto
+            } else {
+                KnowledgeAiEditMode::Confirm
+            },
+        );
     }
     let edits_maintenance_rules = patch
         .edits
         .iter()
         .any(|edit| edit.section == KnowledgeDocumentEditSection::MaintenanceRules);
-    if let Some(inherit_ai_config) = patch.inherit_ai_config {
-        doc.inherit_ai_config = inherit_ai_config;
-    } else if patch.ai_maintained.is_some()
-        || patch.explicit_maintenance_rules.is_some()
-        || patch.maintenance_rules.is_some()
-        || edits_maintenance_rules
-    {
-        doc.inherit_ai_config = false;
+    if patch.ai_edit_mode.is_none() {
+        if let Some(inherit_ai_config) = patch.inherit_ai_config {
+            doc.inherit_ai_config = inherit_ai_config;
+            if inherit_ai_config {
+                doc.ai_edit_mode = KnowledgeAiEditMode::Inherit;
+            }
+        }
+        if patch.ai_maintained.is_some()
+            || patch.explicit_maintenance_rules.is_some()
+            || patch.maintenance_rules.is_some()
+            || edits_maintenance_rules
+        {
+            doc.inherit_ai_config = false;
+        }
     }
     if let Some(explicit_maintenance_rules) = patch.explicit_maintenance_rules {
         doc.explicit_maintenance_rules = explicit_maintenance_rules;
@@ -3627,6 +3675,7 @@ pub fn edit_document(
     if let Some(id) = patch.id {
         doc.id = id;
     }
+    resolve_document_inheritance(Some(working_dir), &mut doc)?;
     ensure_summary_state(&mut doc);
     ensure_maintenance_rules(&mut doc);
     ensure_skill_defaults(&mut doc);
@@ -3684,7 +3733,7 @@ const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
     "injectMode",
     "summary",
     "readOnly",
-    "aiMaintained",
+    "aiEditMode",
     "maintenanceRules",
     "externalSource",
     "skillEnabled",
@@ -3964,11 +4013,8 @@ fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
         summary: doc.summary.clone().filter(|value| !value.trim().is_empty()),
         command_enabled: None,
         read_only: doc.read_only.then_some(true),
-        ai_maintained: Some(if doc.inherit_ai_config {
-            KnowledgeFrontmatterAiMaintained::Mode(KnowledgeFrontmatterInheritMarker::Inherit)
-        } else {
-            KnowledgeFrontmatterAiMaintained::Explicit(doc.ai_maintained)
-        }),
+        ai_edit_mode: Some(doc.ai_edit_mode),
+        ai_maintained: None,
         inherit_ai_config: None,
         explicit_maintenance_rules: None,
         maintenance_rules_cache: None,
@@ -4021,6 +4067,7 @@ pub fn prepare_generic_knowledge_write(
         summary_enabled: default_summary_enabled_for_type(doc_type),
         command_enabled: false,
         read_only: false,
+        ai_edit_mode: KnowledgeAiEditMode::Inherit,
         ai_maintained: default_ai_maintained_for_type(doc_type),
         storage_source: KnowledgeStorageSource::Project,
         inherit_ai_config: true,
@@ -4066,11 +4113,11 @@ pub fn prepare_generic_knowledge_write(
 }
 
 fn render_document_body(doc: &KnowledgeDocument) -> Result<String, String> {
-    if doc.ai_maintained
+    if doc.ai_edit_mode == KnowledgeAiEditMode::Auto
         && !doc.inherit_ai_config
         && !has_maintenance_rules_content(doc.maintenance_rules.as_deref())
     {
-        return Err("aiMaintained=true requires maintenance rules".to_string());
+        return Err("aiEditMode=auto requires maintenance rules".to_string());
     }
     let mut rendered = String::new();
     rendered.push_str(doc.body.trim_end());
@@ -4117,17 +4164,17 @@ fn validate_document(doc: &KnowledgeDocument) -> Result<(), String> {
     if doc.title.trim().is_empty() {
         return Err("Knowledge document title is required".to_string());
     }
-    if doc.ai_maintained && !doc.explicit_maintenance_rules {
-        return Err("aiMaintained=true requires explicitMaintenanceRules=true".to_string());
+    if doc.ai_edit_mode == KnowledgeAiEditMode::Auto && !doc.explicit_maintenance_rules {
+        return Err("aiEditMode=auto requires explicitMaintenanceRules=true".to_string());
     }
-    if doc.ai_maintained
+    if doc.ai_edit_mode == KnowledgeAiEditMode::Auto
         && doc
             .maintenance_rules
             .as_ref()
             .map(|value| value.trim().is_empty())
             .unwrap_or(true)
     {
-        return Err("aiMaintained=true requires non-empty maintenance rules".to_string());
+        return Err("aiEditMode=auto requires non-empty maintenance rules".to_string());
     }
     if matches!(
         doc.doc_type,
@@ -4222,17 +4269,42 @@ fn parse_document(
     let inject_mode = inject_setting
         .explicit_mode()
         .unwrap_or_else(|| default_document_inject_mode_for_type(doc_type));
-    let inherit_ai_config = frontmatter.inherit_ai_config == Some(true)
+    let legacy_ai_maintained = frontmatter.ai_maintained;
+    let legacy_inherit_ai_config = frontmatter.inherit_ai_config == Some(true)
         || matches!(
-            frontmatter.ai_maintained,
+            legacy_ai_maintained,
             Some(KnowledgeFrontmatterAiMaintained::Mode(
                 KnowledgeFrontmatterInheritMarker::Inherit
             ))
         );
-    let ai_maintained = match frontmatter.ai_maintained {
-        Some(KnowledgeFrontmatterAiMaintained::Explicit(value)) => value,
-        Some(KnowledgeFrontmatterAiMaintained::Mode(_)) => default_ai_maintained_for_type(doc_type),
-        None => default_ai_maintained_for_type(doc_type),
+    let migrates_legacy_ai_lock = frontmatter.ai_edit_mode.is_none()
+        && frontmatter.read_only == Some(true)
+        && matches!(
+            legacy_ai_maintained,
+            Some(KnowledgeFrontmatterAiMaintained::Explicit(false))
+        );
+    let ai_edit_mode = frontmatter.ai_edit_mode.unwrap_or_else(|| {
+        if migrates_legacy_ai_lock {
+            KnowledgeAiEditMode::Disabled
+        } else if legacy_inherit_ai_config {
+            KnowledgeAiEditMode::Inherit
+        } else {
+            match legacy_ai_maintained {
+                Some(KnowledgeFrontmatterAiMaintained::Explicit(true)) => KnowledgeAiEditMode::Auto,
+                Some(KnowledgeFrontmatterAiMaintained::Explicit(false)) => {
+                    KnowledgeAiEditMode::Confirm
+                }
+                Some(KnowledgeFrontmatterAiMaintained::Mode(_)) => KnowledgeAiEditMode::Inherit,
+                None if default_ai_maintained_for_type(doc_type) => KnowledgeAiEditMode::Auto,
+                None => KnowledgeAiEditMode::Confirm,
+            }
+        }
+    });
+    let inherit_ai_config = ai_edit_mode == KnowledgeAiEditMode::Inherit;
+    let ai_maintained = match ai_edit_mode {
+        KnowledgeAiEditMode::Disabled | KnowledgeAiEditMode::Confirm => false,
+        KnowledgeAiEditMode::Auto => true,
+        KnowledgeAiEditMode::Inherit => default_ai_maintained_for_type(doc_type),
     };
     let maintenance_rules =
         if inherit_ai_config || frontmatter.explicit_maintenance_rules == Some(false) {
@@ -4263,7 +4335,8 @@ fn parse_document(
         },
         summary_enabled,
         command_enabled: frontmatter.command_enabled.unwrap_or(false),
-        read_only: frontmatter.read_only.unwrap_or(false),
+        read_only: frontmatter.read_only.unwrap_or(false) && !migrates_legacy_ai_lock,
+        ai_edit_mode,
         ai_maintained,
         storage_source: KnowledgeStorageSource::Project,
         inherit_ai_config,
@@ -4315,6 +4388,7 @@ fn convert_plain_markdown_document(
         summary_enabled: default_summary_enabled_for_type(doc_type),
         command_enabled: false,
         read_only: false,
+        ai_edit_mode: KnowledgeAiEditMode::Confirm,
         ai_maintained: false,
         storage_source: KnowledgeStorageSource::Project,
         inherit_ai_config: false,
@@ -4889,6 +4963,7 @@ fn document_to_list_item(doc: KnowledgeDocument) -> KnowledgeListItem {
         summary_enabled: doc.summary_enabled,
         command_enabled: doc.command_enabled,
         read_only: doc.read_only,
+        ai_edit_mode: doc.ai_edit_mode,
         ai_maintained: doc.ai_maintained,
         explicit_maintenance_rules: doc.explicit_maintenance_rules,
         storage_source: doc.storage_source,
@@ -6055,14 +6130,21 @@ pub fn update_document(
             let inject_mode = request
                 .inject_mode
                 .unwrap_or_else(|| default_document_inject_mode_for_type(doc_type));
-            let inherit_ai_config = request.inherit_ai_config.unwrap_or(
-                request.ai_maintained.is_none()
-                    && request.explicit_maintenance_rules.is_none()
-                    && request.maintenance_rules.is_none(),
-            );
-            let ai_maintained = request
-                .ai_maintained
-                .unwrap_or_else(|| default_ai_maintained_for_type(doc_type));
+            let ai_edit_mode = request.ai_edit_mode.unwrap_or_else(|| {
+                if request.inherit_ai_config == Some(true)
+                    || (request.ai_maintained.is_none()
+                        && request.explicit_maintenance_rules.is_none()
+                        && request.maintenance_rules.is_none())
+                {
+                    KnowledgeAiEditMode::Inherit
+                } else if request.ai_maintained.unwrap_or(false) {
+                    KnowledgeAiEditMode::Auto
+                } else {
+                    KnowledgeAiEditMode::Confirm
+                }
+            });
+            let inherit_ai_config = ai_edit_mode == KnowledgeAiEditMode::Inherit;
+            let ai_maintained = ai_edit_mode == KnowledgeAiEditMode::Auto;
             let explicit_maintenance_rules = request
                 .explicit_maintenance_rules
                 .unwrap_or_else(|| default_explicit_maintenance_rules_for_type(doc_type));
@@ -6094,6 +6176,7 @@ pub fn update_document(
                 summary_enabled,
                 command_enabled: request.command_enabled.unwrap_or(false),
                 read_only: request.read_only.unwrap_or(false),
+                ai_edit_mode,
                 ai_maintained,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config,
@@ -6139,6 +6222,7 @@ pub fn update_document(
                 summary_enabled: request.summary_enabled,
                 command_enabled: request.command_enabled,
                 read_only: request.read_only,
+                ai_edit_mode: request.ai_edit_mode,
                 ai_maintained: request.ai_maintained,
                 inherit_ai_config: request.inherit_ai_config,
                 explicit_maintenance_rules: request.explicit_maintenance_rules,
@@ -6220,16 +6304,31 @@ pub fn update_document(
             if let Some(read_only) = request.read_only {
                 doc.read_only = read_only;
             }
-            if let Some(ai_maintained) = request.ai_maintained {
-                doc.ai_maintained = ai_maintained;
+            if let Some(ai_edit_mode) = request.ai_edit_mode {
+                apply_ai_edit_mode(&mut doc, ai_edit_mode);
+            } else if let Some(ai_maintained) = request.ai_maintained {
+                apply_ai_edit_mode(
+                    &mut doc,
+                    if ai_maintained {
+                        KnowledgeAiEditMode::Auto
+                    } else {
+                        KnowledgeAiEditMode::Confirm
+                    },
+                );
             }
-            if let Some(inherit_ai_config) = request.inherit_ai_config {
-                doc.inherit_ai_config = inherit_ai_config;
-            } else if request.ai_maintained.is_some()
-                || request.explicit_maintenance_rules.is_some()
-                || request.maintenance_rules.is_some()
-            {
-                doc.inherit_ai_config = false;
+            if request.ai_edit_mode.is_none() {
+                if let Some(inherit_ai_config) = request.inherit_ai_config {
+                    doc.inherit_ai_config = inherit_ai_config;
+                    if inherit_ai_config {
+                        doc.ai_edit_mode = KnowledgeAiEditMode::Inherit;
+                    }
+                }
+                if request.ai_maintained.is_some()
+                    || request.explicit_maintenance_rules.is_some()
+                    || request.maintenance_rules.is_some()
+                {
+                    doc.inherit_ai_config = false;
+                }
             }
             if let Some(explicit_maintenance_rules) = request.explicit_maintenance_rules {
                 doc.explicit_maintenance_rules = explicit_maintenance_rules;
@@ -6246,6 +6345,7 @@ pub fn update_document(
             if let Some(id) = request.id {
                 doc.id = id;
             }
+            resolve_document_inheritance(Some(working_dir), &mut doc)?;
             ensure_summary_state(&mut doc);
             ensure_maintenance_rules(&mut doc);
             ensure_skill_defaults(&mut doc);
@@ -6576,6 +6676,7 @@ mod tests {
             summary_enabled: true,
             command_enabled: true,
             read_only: false,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
             ai_maintained: false,
             storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -6615,6 +6716,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ai_disabled_documents_do_not_expose_active_maintenance_rules() {
+        let mut document = sample_doc();
+        document.ai_edit_mode = KnowledgeAiEditMode::Disabled;
+        document.explicit_maintenance_rules = true;
+        document.maintenance_rules = Some("Keep the design current".to_string());
+
+        assert!(!document_allows_ai_edit(&document));
+        assert!(active_maintenance_rules(&document).is_none());
+
+        document.inherit_ai_config = true;
+        document.ai_edit_mode = KnowledgeAiEditMode::Inherit;
+        assert!(document_allows_ai_edit(&document));
+        assert_eq!(
+            active_maintenance_rules(&document),
+            Some("Keep the design current")
+        );
+
+        document.read_only = true;
+        assert!(!document_allows_ai_edit(&document));
+        assert!(active_maintenance_rules(&document).is_none());
+    }
+
+    #[test]
+    fn legacy_ai_maintained_metadata_migrates_to_four_state_ai_edit_mode() {
+        let parse_legacy = |metadata: &str| {
+            parse_document(
+                &format!("---\nid: kd_legacy\ninjectMode: excerpt\n{metadata}\n---\n\nBody"),
+                Some(KnowledgeType::Design),
+                Some("legacy.md"),
+            )
+            .expect("parse legacy document")
+        };
+
+        let confirm = parse_legacy("aiMaintained: false");
+        assert_eq!(confirm.ai_edit_mode, KnowledgeAiEditMode::Confirm);
+        assert!(!confirm.ai_maintained);
+        assert!(!confirm.read_only);
+
+        let auto = parse_legacy("aiMaintained: true");
+        assert_eq!(auto.ai_edit_mode, KnowledgeAiEditMode::Auto);
+        assert!(auto.ai_maintained);
+
+        let inherit = parse_legacy("aiMaintained: inherit");
+        assert_eq!(inherit.ai_edit_mode, KnowledgeAiEditMode::Inherit);
+
+        let disabled = parse_legacy("readOnly: true\naiMaintained: false");
+        assert_eq!(disabled.ai_edit_mode, KnowledgeAiEditMode::Disabled);
+        assert!(!disabled.read_only);
+
+        let migrated = render_frontmatter(&disabled).expect("render migrated metadata");
+        assert!(migrated.contains("aiEditMode: disabled"));
+        assert!(!migrated.contains("aiMaintained:"));
+        assert!(!migrated.contains("readOnly:"));
+    }
+
+    #[test]
+    fn loading_legacy_ai_lock_rewrites_frontmatter_to_ai_edit_mode() {
+        let temp = TempDir::new().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let design_root = knowledge_root(&working_dir).join("design");
+        std::fs::create_dir_all(&design_root).expect("create design root");
+        let document_path = design_root.join("legacy-lock.md");
+        std::fs::write(
+            &document_path,
+            "---\nid: kd_legacy_lock\ninjectMode: excerpt\nreadOnly: true\naiMaintained: false\n---\n\nBody\n",
+        )
+        .expect("write legacy document");
+
+        let document = load_document_by_path(&working_dir, KnowledgeType::Design, "legacy-lock.md")
+            .expect("load and migrate legacy document");
+
+        assert_eq!(document.ai_edit_mode, KnowledgeAiEditMode::Disabled);
+        assert!(!document.read_only);
+        let migrated = std::fs::read_to_string(document_path).expect("read migrated document");
+        assert!(migrated.contains("aiEditMode: disabled"));
+        assert!(!migrated.contains("aiMaintained:"));
+        assert!(!migrated.contains("readOnly:"));
+    }
+
     fn sample_unity_bundle_doc() -> KnowledgeDocument {
         KnowledgeDocument {
             id: "kd_unity_bundle_doc".to_string(),
@@ -6627,6 +6808,7 @@ mod tests {
             summary_enabled: true,
             command_enabled: false,
             read_only: true,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Disabled,
             ai_maintained: false,
             storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -6667,6 +6849,7 @@ mod tests {
             summary_enabled: false,
             command_enabled: false,
             read_only: false,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
             ai_maintained: false,
             storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -7187,7 +7370,7 @@ mod tests {
         .expect("prepare generic knowledge write");
 
         assert!(prepared.frontmatter.contains("injectMode: inherit\n"));
-        assert!(prepared.frontmatter.contains("aiMaintained: inherit\n"));
+        assert!(prepared.frontmatter.contains("aiEditMode: inherit\n"));
         for redundant in [
             "type:",
             "path:",
@@ -7505,6 +7688,7 @@ updatedAt: 2
             summary_enabled: true,
             command_enabled: true,
             read_only: false,
+            ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Confirm,
             ai_maintained: false,
             storage_source: KnowledgeStorageSource::Project,
             inherit_ai_config: false,
@@ -8722,6 +8906,7 @@ Body content
                     summary_enabled: false,
                     command_enabled: false,
                     read_only: false,
+                    ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                     ai_maintained: true,
                     storage_source: KnowledgeStorageSource::Project,
                     inherit_ai_config: false,
@@ -8789,6 +8974,7 @@ Body content
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                 ai_maintained: true,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -8842,6 +9028,7 @@ Body content
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                 ai_maintained: true,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -8900,6 +9087,7 @@ Body content
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                 ai_maintained: true,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,
@@ -8997,6 +9185,7 @@ Body content
                     summary_enabled: false,
                     command_enabled: false,
                     read_only: false,
+                    ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                     ai_maintained: true,
                     storage_source: KnowledgeStorageSource::Project,
                     inherit_ai_config: false,
@@ -9127,6 +9316,7 @@ Body content
                 summary_enabled: false,
                 command_enabled: false,
                 read_only: false,
+                ai_edit_mode: crate::knowledge_store::KnowledgeAiEditMode::Auto,
                 ai_maintained: true,
                 storage_source: KnowledgeStorageSource::Project,
                 inherit_ai_config: false,

@@ -23,6 +23,7 @@ import type {
   KnowledgeInjectMode,
   KnowledgeInjectModeSetting,
   KnowledgeAiMaintainedSetting,
+  KnowledgeAiEditMode,
   EmbeddingConfig,
   EmbeddingLocalModelCatalog,
   EmbeddingLocalModelDirectoryInspection,
@@ -61,6 +62,7 @@ interface KnowledgeReadPayload {
   commandEnabled: boolean;
   readOnly: boolean;
   aiMaintained: boolean;
+  aiEditMode?: KnowledgeAiEditMode;
   storageSource?: KnowledgeDocument["storageSource"];
   inheritAiConfig?: boolean;
   aiConfigSource?: KnowledgeConfigSource | null;
@@ -229,6 +231,8 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
   const aiMaintained: KnowledgeAiMaintainedSetting = payload.inheritAiConfig
     ? "inherit"
     : payload.aiMaintained;
+  const aiEditMode: KnowledgeAiEditMode = payload.aiEditMode
+    ?? (payload.inheritAiConfig ? "inherit" : payload.aiMaintained ? "auto" : "confirm");
   const maintenanceRules = !payload.inheritAiConfig
     && payload.explicitMaintenanceRules
     && payload.maintenanceRules?.trim()
@@ -243,6 +247,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     effectiveInjectMode: payload.injectMode,
     injectModeSource: payload.injectModeSource ?? { kind: "self", path: null },
     readOnly: payload.readOnly,
+    aiEditMode,
     aiMaintained,
     effectiveAiMaintained: payload.aiMaintained,
     storageSource: payload.storageSource ?? "project",
@@ -405,7 +410,11 @@ function documentPatchForIpc(
   if (Object.prototype.hasOwnProperty.call(patch, "summary")) {
     payload.summaryEnabled = !!patch.summary?.trim();
   }
-  if (patch.aiMaintained !== undefined) {
+  if (patch.aiEditMode !== undefined) {
+    payload.aiEditMode = patch.aiEditMode;
+    delete payload.aiMaintained;
+    delete payload.inheritAiConfig;
+  } else if (patch.aiMaintained !== undefined) {
     if (patch.aiMaintained === "inherit") {
       payload.inheritAiConfig = true;
       delete payload.aiMaintained;

@@ -797,6 +797,9 @@ fn merge_document_create_patch(
     if let Some(read_only) = patch.read_only {
         base.read_only = Some(read_only);
     }
+    if let Some(ai_edit_mode) = patch.ai_edit_mode {
+        base.ai_edit_mode = Some(ai_edit_mode);
+    }
     if let Some(ai_maintained) = patch.ai_maintained {
         base.ai_maintained = Some(ai_maintained);
     }
@@ -1022,6 +1025,7 @@ pub(crate) fn execute_knowledge_create_request(
                     summary_enabled: document_patch.summary_enabled,
                     command_enabled: document_patch.command_enabled,
                     read_only: document_patch.read_only,
+                    ai_edit_mode: document_patch.ai_edit_mode,
                     ai_maintained: document_patch.ai_maintained,
                     inherit_ai_config: document_patch.inherit_ai_config,
                     explicit_maintenance_rules: document_patch.explicit_maintenance_rules,
