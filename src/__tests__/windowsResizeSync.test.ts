@@ -113,4 +113,13 @@ describe("native Windows resize sync", () => {
       major > 2 || (major === 2 && (minor > 11 || (minor === 11 && patch >= 4)));
     expect(includesDcReleaseFix).toBe(true);
   });
+
+  it("links the Tauri Common Controls manifest into Rust unit-test binaries", () => {
+    const buildScript = read("src-tauri/build.rs");
+
+    expect(buildScript).toContain('std::env::var_os("OUT_DIR")');
+    expect(buildScript).toContain('.join("resource.lib")');
+    expect(buildScript).toContain('println!("cargo:rustc-link-arg={}", resource_lib.display())');
+    expect(buildScript).toContain("STATUS_ENTRYPOINT_NOT_FOUND");
+  });
 });
