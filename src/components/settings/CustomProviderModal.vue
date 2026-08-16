@@ -163,6 +163,17 @@ function updateProviderApiFormat(value: string) {
   }
 }
 
+const prefixCacheTtlMinutes = computed(() =>
+  Math.max(0, Math.round((provider.value?.prefixCacheTtlSeconds ?? 5 * 60) / 60)),
+);
+
+function updatePrefixCacheTtl(event: Event) {
+  if (!provider.value) return;
+  const minutes = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(minutes)) return;
+  provider.value.prefixCacheTtlSeconds = Math.max(0, Math.round(minutes * 60));
+}
+
 function validate(): boolean {
   const draft = provider.value;
   if (!draft) return false;
@@ -323,6 +334,22 @@ function handleDialogKeydown(e: KeyboardEvent) {
                 :disabled="saving"
                 @update:model-value="updateProviderApiFormat"
               />
+            </div>
+            <div class="config-field">
+              <label class="config-label">{{ t("settings.custom.prefixCacheTtl") }}</label>
+              <div class="config-number-row">
+                <input
+                  class="config-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="saving"
+                  :value="prefixCacheTtlMinutes"
+                  @change="updatePrefixCacheTtl"
+                />
+                <span class="config-unit">{{ t("settings.prefixCache.minutes") }}</span>
+              </div>
+              <span class="config-hint">{{ t("settings.custom.prefixCacheTtlHint") }}</span>
             </div>
           </aside>
 
@@ -599,6 +626,26 @@ function handleDialogKeydown(e: KeyboardEvent) {
 .config-input:disabled {
   opacity: 0.65;
   cursor: not-allowed;
+}
+
+.config-number-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.config-number-row .config-input {
+  width: 92px;
+}
+
+.config-unit,
+.config-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.config-hint {
+  line-height: 1.4;
 }
 
 .provider-modal-status {

@@ -16,6 +16,7 @@ import type {
 export const DEFAULT_CATALOG_CONTEXT_LENGTH = 256_000;
 
 export const DEFAULT_REASONING_EFFORTS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+export const DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS = 5 * 60;
 
 /** Format the reasoning param takes when a model row leaves it unset (null). */
 export function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningParamFormat {
@@ -50,6 +51,7 @@ export function newCustomProvider(): CustomProvider {
     apiFormat: "openai_chat",
     apiKey: "",
     catalogId: null,
+    prefixCacheTtlSeconds: DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
     models: [newCustomProviderModel()],
   };
 }
@@ -252,6 +254,7 @@ export function catalogProviderToCustomProvider(
     apiFormat: connection.apiFormat ?? "openai_chat",
     apiKey: "",
     catalogId: providerId,
+    prefixCacheTtlSeconds: DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
     models: [],
   };
 }

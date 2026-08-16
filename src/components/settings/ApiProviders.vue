@@ -48,6 +48,7 @@ const props = defineProps<{
   codexExtendedContext: boolean;
   codexSessionTitleGeneration: boolean;
   codexAutoReview: boolean;
+  codexPrefixCacheTtlSeconds: number;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
   dynamicToolLoadingBusy?: boolean;
   anthropicNativeLazyEnabled?: boolean;
@@ -89,6 +90,7 @@ const emit = defineEmits<{
   "update:codexExtendedContext": [value: boolean];
   "update:codexSessionTitleGeneration": [value: boolean];
   "update:codexAutoReview": [value: boolean];
+  "update:codexPrefixCacheTtlSeconds": [value: number];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
   "update:anthropicNativeLazyEnabled": [value: boolean];
   startAddProvider: [];
@@ -104,6 +106,16 @@ const claudeCodeProvider = computed(() => props.providers.find((p) => p.id === "
 const claudeCodeLoggedOut = computed(
   () => claudeCodeProvider.value?.hasKey === true && claudeCodeProvider.value?.loggedIn === false,
 );
+
+const codexPrefixCacheTtlMinutes = computed(() =>
+  Math.max(0, Math.round(props.codexPrefixCacheTtlSeconds / 60)),
+);
+
+function updateCodexPrefixCacheTtl(event: Event) {
+  const minutes = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(minutes)) return;
+  emit("update:codexPrefixCacheTtlSeconds", Math.max(0, Math.round(minutes * 60)));
+}
 const claudeCodeStatusLabel = computed(() => {
   if (!claudeCodeProvider.value?.hasKey) return t("settings.claudeCode.notInstalled");
   if (claudeCodeLoggedOut.value) return t("settings.claudeCode.notLoggedIn");
@@ -796,6 +808,25 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
         />
       </div>
 
+      <div v-if="codexStep !== 'waiting'" class="provider-detail">
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.prefixCacheTtlTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.prefixCacheTtlDesc") }}</span>
+        </div>
+        <label class="ttl-control">
+          <input
+            class="ttl-input"
+            type="number"
+            min="0"
+            step="1"
+            :value="codexPrefixCacheTtlMinutes"
+            :aria-label="t('settings.codex.prefixCacheTtlTitle')"
+            @change="updateCodexPrefixCacheTtl"
+          />
+          <span>{{ t("settings.prefixCache.minutes") }}</span>
+        </label>
+      </div>
+
       <div
         v-if="codexStep !== 'waiting' && codexStatus.authenticated && !codexStatus.validationFailed"
         class="provider-detail"
@@ -1099,6 +1130,31 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
+}
+
+.ttl-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.ttl-input {
+  width: 64px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font: inherit;
+}
+
+.ttl-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
 }
 
 .codex-detail {

@@ -30,6 +30,7 @@ function createDisplayState(): DisplaySettings {
     showViewsTab: true,
     showPluginsTab: true,
     showAgentTab: true,
+    showAgentSelector: false,
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,

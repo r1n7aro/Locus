@@ -337,6 +337,8 @@ pub async fn set_working_dir(
     app_agent_dir: State<'_, crate::AppAgentDir>,
     config: State<'_, Arc<crate::config::AppConfig>>,
     local_reference_watcher_state: State<'_, crate::local_docs::LocalReferenceWatcherState>,
+    active_tasks: State<'_, crate::ActiveTasks>,
+    async_task_manager: State<'_, Arc<crate::async_tasks::AsyncTaskManager>>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let switch_started_at = Instant::now();
@@ -376,6 +378,18 @@ pub async fn set_working_dir(
     let prev_cwd = workspace.path.read().await.clone();
     let is_real_switch = prev_cwd != canonical;
     if is_real_switch {
+        {
+            let tasks = active_tasks.lock().await;
+            for task in tasks.values() {
+                let _ = task.cancel_tx.send(true);
+            }
+        }
+        async_task_manager.cancel_workspace(&prev_cwd);
+        let terminated = crate::process_util::terminate_managed_processes_for_workspace(&prev_cwd);
+        switch_timer.mark_detail(
+            "workspace_processes_cancelled",
+            format!(" terminated={}", terminated),
+        );
         reconcile_task_state.cancel_current("workspace switch");
         let cancelled = scan_task_state.cancel_current_and_wait("workspace switch");
         switch_timer.mark_detail(
@@ -888,6 +902,89 @@ pub async fn save_last_effort(effort: String, _app_handle: AppHandle) -> Result<
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelPreference {
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+fn agent_model_preferences_path() -> Result<std::path::PathBuf, String> {
+    Ok(persistent_config_dir()?.join("agent_model_preferences.json"))
+}
+
+fn load_agent_model_preferences() -> HashMap<String, AgentModelPreference> {
+    let Ok(path) = agent_model_preferences_path() else {
+        return HashMap::new();
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<HashMap<String, AgentModelPreference>>(&content) else {
+        return HashMap::new();
+    };
+
+    let mut normalized = HashMap::new();
+    for (agent_id, preference) in raw.iter().filter(|(agent_id, _)| {
+        crate::agent::definition::canonical_agent_id(agent_id) != agent_id.as_str()
+    }) {
+        normalized.insert(
+            crate::agent::definition::canonical_agent_id(agent_id).to_string(),
+            preference.clone(),
+        );
+    }
+    for (agent_id, preference) in raw.iter().filter(|(agent_id, _)| {
+        crate::agent::definition::canonical_agent_id(agent_id) == agent_id.as_str()
+    }) {
+        normalized.insert(agent_id.clone(), preference.clone());
+    }
+    normalized
+}
+
+#[tauri::command]
+pub async fn get_agent_model_preferences(
+    _app_handle: AppHandle,
+) -> Result<HashMap<String, AgentModelPreference>, AppError> {
+    Ok(load_agent_model_preferences())
+}
+
+#[tauri::command]
+pub async fn save_agent_model_preference(
+    agent_id: String,
+    model_id: String,
+    effort: String,
+    _app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let agent_id = crate::agent::definition::canonical_agent_id(agent_id.trim());
+    if agent_id.is_empty() {
+        return Err("Agent id cannot be empty".to_string().into());
+    }
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err("Model id cannot be empty".to_string().into());
+    }
+    let effort = effort.trim();
+    if !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max") {
+        return Err(format!("Unsupported reasoning effort: {}", effort).into());
+    }
+
+    let mut preferences = load_agent_model_preferences();
+    preferences.insert(
+        agent_id.to_string(),
+        AgentModelPreference {
+            model_id: model_id.to_string(),
+            effort: effort.to_string(),
+        },
+    );
+    let json = serde_json::to_string_pretty(&preferences)
+        .map_err(|error| format!("Failed to serialize Agent model preferences: {}", error))?;
+    std::fs::write(agent_model_preferences_path()?, json)
+        .map_err(|error| format!("Failed to save Agent model preferences: {}", error))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_codex_fast_mode(_app_handle: AppHandle) -> Result<bool, AppError> {
     let path = persistent_config_dir()?.join("codex_fast_mode.txt");
@@ -935,13 +1032,24 @@ pub enum CodexTransportMode {
     Websocket,
 }
 
+pub const DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS: u32 = 5 * 60;
+pub const DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS: u32 = 30 * 60;
+
+fn default_provider_prefix_cache_ttl_seconds() -> u32 {
+    DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS
+}
+
+fn default_codex_prefix_cache_ttl_seconds() -> u32 {
+    DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
+}
+
 impl Default for CodexTransportMode {
     fn default() -> Self {
         Self::Websocket
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelConfig {
     #[serde(default)]
@@ -956,6 +1064,22 @@ pub struct CodexModelConfig {
     /// Route approval requests through the Codex auto-review model.
     #[serde(default)]
     pub auto_review: bool,
+    /// How long Locus keeps a Codex session's composed prompt prefix stable
+    /// after the most recent successful remote response.
+    #[serde(default = "default_codex_prefix_cache_ttl_seconds")]
+    pub prefix_cache_ttl_seconds: u32,
+}
+
+impl Default for CodexModelConfig {
+    fn default() -> Self {
+        Self {
+            transport: CodexTransportMode::default(),
+            extended_context: false,
+            generate_session_titles: false,
+            auto_review: false,
+            prefix_cache_ttl_seconds: default_codex_prefix_cache_ttl_seconds(),
+        }
+    }
 }
 
 fn codex_model_config_path() -> Result<std::path::PathBuf, String> {
@@ -1411,6 +1535,10 @@ pub struct CustomProvider {
     pub api_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_id: Option<String>,
+    /// How long Locus keeps a session's composed prompt prefix stable after
+    /// the provider's most recent successful response. Zero disables reuse.
+    #[serde(default = "default_provider_prefix_cache_ttl_seconds")]
+    pub prefix_cache_ttl_seconds: u32,
     #[serde(default)]
     pub models: Vec<CustomProviderModel>,
 }
@@ -1509,6 +1637,7 @@ fn migrate_endpoint_to_provider(mut endpoint: CustomEndpoint) -> CustomProvider 
         api_format: endpoint.api_format,
         api_key: String::new(),
         catalog_id: None,
+        prefix_cache_ttl_seconds: default_provider_prefix_cache_ttl_seconds(),
         models: vec![CustomProviderModel {
             id: model_row_id_from_api_model(&endpoint.api_model),
             name: endpoint.api_model.clone(),
@@ -3106,13 +3235,14 @@ pub async fn get_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_dir_entries, is_stale_custom_model_ref, migrate_endpoint_to_provider,
-        normalize_custom_endpoint_config, normalize_custom_provider_config,
-        normalize_tool_permission_mode_request, normalize_workspace_sub_path,
-        resolve_workspace_dir_target, rewrite_legacy_custom_model_ref,
-        search_workspace_entries_in_dir, valid_custom_model_refs, workspace_entry_stat_for_path,
-        workspace_search_score, ApiFormat, CodexModelConfig, CodexTransportMode, CustomEndpoint,
-        CustomProvider, CustomProviderModel,
+        collect_dir_entries, default_provider_prefix_cache_ttl_seconds, is_stale_custom_model_ref,
+        migrate_endpoint_to_provider, normalize_custom_endpoint_config,
+        normalize_custom_provider_config, normalize_tool_permission_mode_request,
+        normalize_workspace_sub_path, resolve_workspace_dir_target,
+        rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir, valid_custom_model_refs,
+        workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
+        CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel,
+        DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -3146,6 +3276,10 @@ mod tests {
         assert!(!config.extended_context);
         assert!(!config.generate_session_titles);
         assert!(!config.auto_review);
+        assert_eq!(
+            config.prefix_cache_ttl_seconds,
+            DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
+        );
     }
 
     #[test]
@@ -3537,6 +3671,7 @@ mod tests {
             api_format: ApiFormat::OpenaiChat,
             api_key: String::new(),
             catalog_id: None,
+            prefix_cache_ttl_seconds: default_provider_prefix_cache_ttl_seconds(),
             models: model_ids
                 .iter()
                 .map(|mid| CustomProviderModel {

@@ -1,5 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import type {
+  AgentModelPreference,
   ModelDefaults,
   CustomEndpoint,
   CustomProvider,
@@ -7,6 +8,18 @@ import type {
   ModelCatalogResponse,
   ModelOption,
 } from "../types";
+
+export function getAgentModelPreferences(): Promise<Record<string, AgentModelPreference>> {
+  return ipcInvoke<Record<string, AgentModelPreference>>("get_agent_model_preferences");
+}
+
+export function saveAgentModelPreference(
+  agentId: string,
+  modelId: string,
+  effort: AgentModelPreference["effort"],
+): Promise<void> {
+  return ipcInvoke("save_agent_model_preference", { agentId, modelId, effort });
+}
 
 export function getModelDefaults(): Promise<ModelDefaults> {
   return ipcInvoke<ModelDefaults>("get_model_defaults");

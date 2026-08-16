@@ -104,6 +104,7 @@ vi.mock("../stores/notification", () => ({
 }));
 
 import { useSettingsState } from "../composables/useSettingsState";
+import { DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS } from "../services/modelCatalog";
 import type { CustomEndpoint, CustomProvider, CustomProviderModel } from "../types";
 
 function providerModel(partial: Partial<CustomProviderModel> = {}): CustomProviderModel {
@@ -153,6 +154,10 @@ describe("custom provider persistence", () => {
       emitted.push(args);
     }) as never);
     const saved = provider({ id: "saved", name: "Saved", apiKey: "sk-live" });
+    const normalizedSaved = {
+      ...saved,
+      prefixCacheTtlSeconds: DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
+    };
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([saved]);
 
     state.startAddCustomProvider();
@@ -168,9 +173,12 @@ describe("custom provider persistence", () => {
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
       expect.objectContaining({ id: "draft", name: "Draft", apiKey: "sk-draft" }),
     ]);
-    expect(state.customProviders.value).toEqual([saved]);
-    expect(modelServiceMocks.setWarmup).toHaveBeenCalledWith("settings:customProviders", [saved]);
-    expect(emitted).toContainEqual(["customProvidersChanged", [saved]]);
+    expect(state.customProviders.value).toEqual([normalizedSaved]);
+    expect(modelServiceMocks.setWarmup).toHaveBeenCalledWith(
+      "settings:customProviders",
+      [normalizedSaved],
+    );
+    expect(emitted).toContainEqual(["customProvidersChanged", [normalizedSaved]]);
     expect(state.customProviderSaving.value).toBe(false);
     expect(state.editingCustomProvider.value).toBeNull();
   });
@@ -228,6 +236,10 @@ describe("custom provider persistence", () => {
         replayReasoningContent: false,
       })],
     });
+    const normalizedSavedProvider = {
+      ...savedProvider,
+      prefixCacheTtlSeconds: DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
+    };
     modelServiceMocks.importClaudeCodeOAuth.mockResolvedValueOnce({
       kind: "custom_endpoint",
       source: "Claude Code settings.json",
@@ -256,8 +268,8 @@ describe("custom provider persistence", () => {
       }),
     ]);
     expect(modelServiceMocks.getProviders).not.toHaveBeenCalled();
-    expect(state.customProviders.value).toEqual([savedProvider]);
-    expect(emitted).toContainEqual(["customProvidersChanged", [savedProvider]]);
+    expect(state.customProviders.value).toEqual([normalizedSavedProvider]);
+    expect(emitted).toContainEqual(["customProvidersChanged", [normalizedSavedProvider]]);
   });
 
   it("saves new OpenAI Chat models with reasoning content replay enabled", async () => {

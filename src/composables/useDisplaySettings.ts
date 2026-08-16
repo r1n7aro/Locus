@@ -45,6 +45,8 @@ export interface DisplaySettings {
   showPluginsTab: boolean;
   /** Show Agent tab in the top navigation */
   showAgentTab: boolean;
+  /** Show the Agent column in chat model selectors */
+  showAgentSelector: boolean;
   /** Auto-open TODO panel when todos arrive */
   todoAutoOpen: boolean;
   /** Auto-open file changes panel when changes arrive */
@@ -137,6 +139,7 @@ const defaults: DisplaySettings = {
   showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
+  showAgentSelector: false,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,

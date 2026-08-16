@@ -58,10 +58,10 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain('@click="emit(\'deleteQueuedFollowUp\')"');
     expect(pane).toContain('class="embedded-queued-follow-up"');
     expect(pane).toContain('class="embedded-chat-pane"');
-    expect(knowledgePane).toContain("<AgentSelector");
     expect(knowledgePane).toContain("<ModelEffortSelector");
-    expect(knowledgePane).toContain("<template #composer-start>");
-    expect(knowledgePane).toContain('agent.id === "knowledge"');
+    expect(knowledgePane).toContain(':agents="displaySettings.showAgentSelector ? agentStore.agents : undefined"');
+    expect(knowledgePane).toContain('@select-agent="handleSelectAgent"');
+    expect(knowledgePane).toContain("agent.isDefault");
     expect(knowledgePane).toContain("show-user-images");
     expect(knowledgePane).toContain('user-content-mode="asset"');
     expect(knowledgePane).toContain(':tool-confirm-layout-key="sessionKey"');

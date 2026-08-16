@@ -165,7 +165,9 @@ describe("custom provider modal layout", () => {
     // crowding the labels. "Leave blank to keep the saved key" lives in the
     // key input's placeholder (edit flow) instead of next to the label.
     expect(source).not.toContain("side-group");
-    expect(source).not.toContain("config-hint");
+    expect(source).not.toContain(
+      '<span class="config-hint">{{ t("settings.custom.apiKeyKeepHint") }}</span>',
+    );
     expect(source).not.toContain("config-note");
     expect(source).not.toContain('t("settings.custom.connectionSettings")');
     expect(source).toContain('t("settings.custom.apiKeyKeepHint")');

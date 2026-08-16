@@ -179,12 +179,16 @@ describe("useAppBootstrap onboarding completion", () => {
       loadDebugMode: vi.fn().mockResolvedValue(undefined),
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
       loadLastModel: vi.fn().mockResolvedValue(undefined),
+      loadAgentModelPreferences: vi.fn().mockResolvedValue(undefined),
       loadLastEffort: vi.fn().mockResolvedValue(undefined),
       loadCodexFastMode: vi.fn().mockResolvedValue(undefined),
       loadCustomProviders: vi.fn().mockResolvedValue(undefined),
       loadCodexModelConfig: vi.fn().mockResolvedValue(undefined),
       loadCodexAvailableModels: vi.fn().mockResolvedValue(undefined),
       resolveSelectedModel: vi.fn(),
+      activateAgentPreference: vi.fn((_agentId: string, fallbackEffort: string, applySelection: boolean) => {
+        if (applySelection) modelStoreMock.effort = fallbackEffort;
+      }),
       applyContextEffort: vi.fn((level: string | null | undefined) => {
         modelStoreMock.effort = level || "none";
       }),
@@ -226,10 +230,10 @@ describe("useAppBootstrap onboarding completion", () => {
 
   it("uses the agent default effort when no user default exists", async () => {
     chatStoreMock.activeSessionId = "session-1";
-    agentStoreMock.selectedAgentId = "git";
+    agentStoreMock.selectedAgentId = "qa";
     agentStoreMock.agents = [
       { id: "dev", defaultEffort: "medium" },
-      { id: "git", defaultEffort: "low" },
+      { id: "qa", defaultEffort: "low" },
     ];
 
     const useAppBootstrap = await loadUseAppBootstrap();
@@ -245,9 +249,10 @@ describe("useAppBootstrap onboarding completion", () => {
     agentStoreMock.selectedAgentId = "dev";
     await nextTick();
 
-    expect(modelStoreMock.restoreDefaultEffort).toHaveBeenCalledTimes(1);
+    expect(modelStoreMock.activateAgentPreference).toHaveBeenLastCalledWith("dev", "medium", true);
+    expect(modelStoreMock.restoreDefaultEffort).not.toHaveBeenCalled();
     expect(modelStoreMock.applyContextEffort).not.toHaveBeenCalled();
-    expect(modelStoreMock.effort).toBe("none");
+    expect(modelStoreMock.effort).toBe("medium");
   });
 
   it("keeps the saved user default effort while a session is active", async () => {
@@ -551,6 +556,14 @@ describe("useAppBootstrap onboarding completion", () => {
     pluginsChangedHandler?.({ payload: undefined });
     expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+
+    agentStoreMock.loadAgents.mockClear();
+    loadSkillsMock.mockClear();
+    const agentsChangedHandler = handlers.get("agents-changed");
+    expect(agentsChangedHandler).toBeTypeOf("function");
+    agentsChangedHandler?.({ payload: undefined });
+    expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
+    expect(loadSkillsMock).not.toHaveBeenCalled();
   });
 
   it("can keep a standalone chat window pinned to its own session", async () => {

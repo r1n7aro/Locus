@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import type { EffortLevel, ModelOption } from "../types";
+import type { AgentInfo, EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelOptionDisplayName } from "../utils/modelDisplay";
@@ -9,6 +9,9 @@ import BaseSwitch from "./ui/BaseSwitch.vue";
 
 const props = defineProps<{
   models: ModelOption[];
+  agents?: AgentInfo[];
+  selectedAgentId?: string;
+  agentLocked?: boolean;
   selectedId: string;
   effort: EffortLevel;
   efforts?: EffortLevel[];
@@ -20,6 +23,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  selectAgent: [id: string];
   selectModel: [id: string];
   selectEffort: [level: EffortLevel];
   selectFastMode: [enabled: boolean];
@@ -54,6 +58,10 @@ const providerShortLabels = computed<Record<string, string>>(() => ({
 
 const selectedModel = computed(() =>
   props.models.find((model) => model.id === props.selectedId) ?? null,
+);
+const hasAgentPanel = computed(() => (props.agents?.length ?? 0) > 0);
+const selectedAgent = computed(() =>
+  props.agents?.find((agent) => agent.id === props.selectedAgentId) ?? null,
 );
 
 const selectedDisplayName = computed(() => {
@@ -94,8 +102,9 @@ const groupedModels = computed<ModelSelectorGroup[]>(() =>
 
 const triggerTitle = computed(() => {
   const modelTitle = selectedModel.value?.id || t("model.select");
-  if (!props.effortSupported || !currentLevel.value) return modelTitle;
-  return `${modelTitle} / ${currentLevel.value.desc}`;
+  const parts = [selectedAgent.value?.name, modelTitle].filter(Boolean);
+  if (props.effortSupported && currentLevel.value) parts.push(currentLevel.value.desc);
+  return parts.join(" / ");
 });
 
 function levelColor(level: EffortLevel) {
@@ -116,7 +125,12 @@ function toggle() {
 
 function selectModel(id: string) {
   emit("selectModel", id);
-  open.value = false;
+  if (!hasAgentPanel.value || !props.effortSupported) open.value = false;
+}
+
+function selectAgent(id: string) {
+  if (props.agentLocked) return;
+  emit("selectAgent", id);
 }
 
 function modelDisplayName(model: ModelOption): string {
@@ -156,6 +170,9 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
       :title="triggerTitle"
       @click="toggle"
     >
+      <span v-if="hasAgentPanel && selectedAgent" class="model-effort-agent">
+        {{ selectedAgent.name }}
+      </span>
       <span class="model-effort-model">{{ selectedDisplayName }}</span>
       <span
         v-if="effortSupported && currentLevel"
@@ -171,8 +188,28 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
       <div
         v-if="open"
         class="model-effort-dropdown"
-        :class="{ 'has-effort': effortSupported, 'align-start': align === 'start' }"
+        :class="{
+          'has-agent': hasAgentPanel,
+          'has-effort': effortSupported,
+          'align-start': align === 'start',
+        }"
       >
+        <div v-if="hasAgentPanel" class="model-effort-agent-panel">
+          <div class="model-effort-section-label">Agent</div>
+          <button
+            v-for="agent in agents"
+            :key="agent.id"
+            type="button"
+            class="model-effort-option ui-select-none"
+            :class="{ active: agent.id === selectedAgentId }"
+            :disabled="disabled || agentLocked"
+            :title="agent.description"
+            @click="selectAgent(agent.id)"
+          >
+            <span class="model-effort-option-name">{{ agent.name }}</span>
+          </button>
+        </div>
+
         <div class="model-effort-model-panel">
           <template v-if="groupedModels.length === 0">
             <div class="model-effort-empty">{{ t("model.noProvider") }}</div>
@@ -239,7 +276,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .model-effort-trigger {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
   min-height: 28px;
   max-width: min(280px, 100%);
@@ -276,6 +313,23 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.model-effort-agent {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 110px;
+  overflow: hidden;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  text-overflow: ellipsis;
+}
+
+.model-effort-agent::after {
+  content: "|";
+  margin-left: 4px;
+  color: var(--text-secondary);
 }
 
 .model-effort-level {
@@ -316,21 +370,39 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   transform-origin: bottom left;
 }
 
-.model-effort-dropdown.has-effort {
+.model-effort-dropdown.has-effort:not(.has-agent) {
   width: min(420px, calc(100vw - 24px));
   display: grid;
   grid-template-columns: minmax(0, 1fr) 96px;
+}
+
+.model-effort-dropdown.has-agent {
+  width: min(560px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+}
+
+.model-effort-dropdown.has-agent.has-effort {
+  width: min(660px, calc(100vw - 24px));
+  grid-template-columns: 150px minmax(0, 1fr) 96px;
 }
 
 :root[data-theme="dark"] .model-effort-dropdown {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
+.model-effort-agent-panel,
 .model-effort-model-panel,
 .model-effort-effort-panel {
   min-width: 0;
   max-height: min(404px, calc(100vh - 176px));
   overflow-y: auto;
+}
+
+.model-effort-agent-panel {
+  border-right: 1px solid var(--border-color);
+  padding-right: 4px;
 }
 
 .model-effort-effort-panel {
@@ -397,6 +469,15 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 
 .model-effort-option:hover {
   background: var(--hover-bg);
+}
+
+.model-effort-option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.model-effort-option:disabled:hover {
+  background: transparent;
 }
 
 .model-effort-option.active {

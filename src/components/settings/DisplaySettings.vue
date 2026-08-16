@@ -271,6 +271,15 @@ async function updateViewWindowsAboveMain(value: boolean) {
       <span>{{ t("settings.display.showWelcomeSubtitle") }}</span>
     </div>
 
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showAgentSelector"
+        :aria-label="t('settings.display.showAgentSelector')"
+        @update:model-value="setDisplay('showAgentSelector', $event)"
+      />
+      <span>{{ t("settings.display.showAgentSelector") }}</span>
+    </div>
+
     <div v-for="item in topNavigationToggles" :key="item.key" class="toggle-row">
       <BaseSwitch
         :model-value="display[item.key]"

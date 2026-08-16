@@ -6,6 +6,7 @@ import * as modelService from "../services/model";
 import type {
   ModelOption,
   ModelDefaults,
+  AgentModelPreference,
   CustomProvider,
   CustomProviderModel,
   EffortLevel,
@@ -303,9 +304,12 @@ export const useModelStore = defineStore("model", () => {
   const effort = ref<EffortLevel>("high");
   const defaultEffort = ref<EffortLevel>("high");
   const hasUserDefaultEffort = ref(false);
+  const activeAgentId = ref("");
+  const agentModelPreferences = ref<Record<string, AgentModelPreference>>({});
   const debugModeEnabled = ref(getCachedDebugMode() ?? false);
   const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
   let effortPersistenceReady = false;
+  let agentPreferenceSaveQueue = Promise.resolve();
 
   subscribeDebugMode((enabled) => {
     debugModeEnabled.value = enabled;
@@ -517,6 +521,14 @@ export const useModelStore = defineStore("model", () => {
     effortPersistenceReady = true;
   }
 
+  async function loadAgentModelPreferences() {
+    try {
+      agentModelPreferences.value = await modelService.getAgentModelPreferences();
+    } catch {
+      agentModelPreferences.value = {};
+    }
+  }
+
   async function loadCodexFastMode() {
     try {
       codexFastMode.value = await modelService.getCodexFastMode();
@@ -575,9 +587,57 @@ export const useModelStore = defineStore("model", () => {
     modelService.saveLastModel(id).catch((e: unknown) => console.warn("[model] save_last_model:", e));
   }
 
+  function persistActiveAgentPreference() {
+    const agentId = activeAgentId.value.trim();
+    const modelId = selectedModelId.value.trim();
+    if (!agentId || !modelId) return;
+    const selectedEffort = clampEffortForSelectedModel(effort.value);
+    const preference: AgentModelPreference = {
+      modelId,
+      effort: selectedEffort,
+    };
+    agentModelPreferences.value = {
+      ...agentModelPreferences.value,
+      [agentId]: preference,
+    };
+    agentPreferenceSaveQueue = agentPreferenceSaveQueue
+      .catch(() => undefined)
+      .then(() => modelService.saveAgentModelPreference(
+        agentId,
+        preference.modelId,
+        preference.effort,
+      ))
+      .catch((error: unknown) => console.warn("[model] save_agent_model_preference:", error));
+  }
+
+  function activateAgentPreference(
+    agentId: string,
+    fallbackEffort: EffortLevel,
+    applySelection = true,
+  ) {
+    activeAgentId.value = agentId.trim();
+    if (!applySelection || !activeAgentId.value) return;
+    const preference = agentModelPreferences.value[activeAgentId.value];
+    if (
+      preference?.modelId
+      && availableModels.value.some((model) => model.id === preference.modelId)
+    ) {
+      selectedModelId.value = preference.modelId;
+    }
+    const requestedEffort = preference && isEffortLevel(preference.effort)
+      ? preference.effort
+      : fallbackEffort;
+    const normalizedEffort = clampEffortForSelectedModel(requestedEffort);
+    if (preference) hasUserDefaultEffort.value = true;
+    defaultEffort.value = normalizedEffort;
+    effort.value = normalizedEffort;
+  }
+
   function selectModel(id: string) {
     selectedModelId.value = id;
     rememberLastModel(id);
+    effort.value = clampEffortForSelectedModel(effort.value);
+    persistActiveAgentPreference();
   }
 
   function applySessionModel(id: string | null | undefined) {
@@ -591,6 +651,7 @@ export const useModelStore = defineStore("model", () => {
     hasUserDefaultEffort.value = true;
     defaultEffort.value = level;
     effort.value = clampEffortForSelectedModel(level);
+    persistActiveAgentPreference();
   }
 
   function selectCodexFastMode(enabled: boolean) {
@@ -636,6 +697,8 @@ export const useModelStore = defineStore("model", () => {
     effort,
     defaultEffort,
     hasUserDefaultEffort,
+    activeAgentId,
+    agentModelPreferences,
     debugModeEnabled,
     modelDefaults,
     allModels,
@@ -652,12 +715,14 @@ export const useModelStore = defineStore("model", () => {
     loadDebugMode,
     loadLastModel,
     loadLastEffort,
+    loadAgentModelPreferences,
     loadCodexFastMode,
     loadCustomProviders,
     loadCodexModelConfig,
     loadCodexAvailableModels,
     resolveSelectedModel,
     selectModel,
+    activateAgentPreference,
     applySessionModel,
     selectEffort,
     selectCodexFastMode,

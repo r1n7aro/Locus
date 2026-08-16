@@ -8,12 +8,14 @@ const modelServiceMocks = vi.hoisted(() => ({
   getModelDefaults: vi.fn(),
   getLastModel: vi.fn(),
   getLastEffort: vi.fn(),
+  getAgentModelPreferences: vi.fn(),
   getCodexFastMode: vi.fn(),
   getCustomProviders: vi.fn(),
   getCodexModelConfig: vi.fn(),
   getCodexAvailableModels: vi.fn(),
   saveLastModel: vi.fn(),
   saveLastEffort: vi.fn(),
+  saveAgentModelPreference: vi.fn(),
   saveCodexFastMode: vi.fn(),
 }));
 
@@ -30,12 +32,14 @@ describe("useModelStore OpenAI effort mapping", () => {
     });
     modelServiceMocks.getLastModel.mockResolvedValue("");
     modelServiceMocks.getLastEffort.mockResolvedValue("");
+    modelServiceMocks.getAgentModelPreferences.mockResolvedValue({});
     modelServiceMocks.getCodexFastMode.mockResolvedValue(false);
     modelServiceMocks.getCustomProviders.mockResolvedValue([]);
     modelServiceMocks.getCodexModelConfig.mockResolvedValue({ transport: "websocket" });
     modelServiceMocks.getCodexAvailableModels.mockResolvedValue([]);
     modelServiceMocks.saveLastModel.mockResolvedValue(undefined);
     modelServiceMocks.saveLastEffort.mockResolvedValue(undefined);
+    modelServiceMocks.saveAgentModelPreference.mockResolvedValue(undefined);
     modelServiceMocks.saveCodexFastMode.mockResolvedValue(undefined);
   });
 
@@ -353,6 +357,35 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.defaultEffort).toBe("low");
     expect(modelStore.hasUserDefaultEffort).toBe(true);
     expect(modelServiceMocks.saveLastEffort).toHaveBeenCalledWith("low");
+  });
+
+  it("restores and persists model defaults independently for each Agent", async () => {
+    const authStore = useAuthStore();
+    authStore.codexAuthenticated = true;
+    modelServiceMocks.getAgentModelPreferences.mockResolvedValue({
+      dev: { modelId: "openai/gpt-5.6-terra", effort: "xhigh" },
+      explorer: { modelId: "openai/gpt-5.6-luna", effort: "low" },
+    });
+    const modelStore = useModelStore();
+    await modelStore.loadAgentModelPreferences();
+
+    modelStore.activateAgentPreference("dev", "medium", true);
+    expect(modelStore.selectedModelId).toBe("openai/gpt-5.6-terra");
+    expect(modelStore.effort).toBe("xhigh");
+
+    modelStore.activateAgentPreference("explorer", "none", true);
+    expect(modelStore.selectedModelId).toBe("openai/gpt-5.6-luna");
+    expect(modelStore.effort).toBe("low");
+
+    modelStore.selectModel("openai/gpt-5.6-sol");
+    modelStore.selectEffort("high");
+    await vi.waitFor(() => {
+      expect(modelServiceMocks.saveAgentModelPreference).toHaveBeenLastCalledWith(
+        "explorer",
+        "openai/gpt-5.6-sol",
+        "high",
+      );
+    });
   });
 
   it("does not persist context effort changes from session or agent selection", async () => {

@@ -55,7 +55,7 @@ const {
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexExtendedContext, setCodexSessionTitleGeneration, setCodexAutoReview, loadCodexRateLimits, consumeCodexResetCredit,
+  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexExtendedContext, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
@@ -307,6 +307,7 @@ watch(
           :codex-extended-context="codexModelConfig.extendedContext"
           :codex-session-title-generation="codexModelConfig.generateSessionTitles"
           :codex-auto-review="codexModelConfig.autoReview"
+          :codex-prefix-cache-ttl-seconds="codexModelConfig.prefixCacheTtlSeconds"
           :dynamic-tool-loading-mode="dynamicToolLoadingMode"
           :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
           :anthropic-native-lazy-enabled="anthropicNativeLazyEnabled"
@@ -344,6 +345,7 @@ watch(
           @update:codex-extended-context="setCodexExtendedContext"
           @update:codex-session-title-generation="setCodexSessionTitleGeneration"
           @update:codex-auto-review="setCodexAutoReview"
+          @update:codex-prefix-cache-ttl-seconds="setCodexPrefixCacheTtlSeconds"
           @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
           @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"
           @start-add-provider="startAddCustomProvider"

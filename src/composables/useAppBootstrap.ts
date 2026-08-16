@@ -138,6 +138,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let unlistenWorkspaceLockDiagnostic: RuntimeUnsubscribe | null = null;
   let unlistenAsyncTaskUpdated: RuntimeUnsubscribe | null = null;
   let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
+  let unlistenAgentsChanged: RuntimeUnsubscribe | null = null;
   let unlistenExternalScriptOpen: RuntimeUnsubscribe | null = null;
   let lastAutoOpenedLexicalProgressRun = "";
   const workspaceLockNoticeOperations = new Set<string>();
@@ -192,10 +193,15 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function syncEffortForChatContext() {
     const agentId = agentStore.selectedAgentId;
     if (!agentId) return;
+    const agent = agentStore.agents.find((item) => item.id === agentId);
+    const fallbackEffort = modelStore.hasUserDefaultEffort
+      ? modelStore.defaultEffort
+      : (agent?.defaultEffort ?? "none");
     if (!chatStore.activeSessionId) {
-      modelStore.restoreDefaultEffort();
+      modelStore.activateAgentPreference(agentId, fallbackEffort, true);
       return;
     }
+    modelStore.activateAgentPreference(agentId, fallbackEffort, false);
     if (chatStore.sessionEffort) {
       modelStore.applyContextEffort(chatStore.sessionEffort);
       return;
@@ -204,7 +210,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       modelStore.restoreDefaultEffort();
       return;
     }
-    const agent = agentStore.agents.find((a) => a.id === agentId);
     modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
   }
 
@@ -296,6 +301,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         modelStore.loadDebugMode(),
         modelStore.loadModelDefaults(),
         modelStore.loadLastModel(),
+        modelStore.loadAgentModelPreferences(),
         modelStore.loadCodexFastMode(),
         modelStore.loadCustomProviders(),
         modelStore.loadCodexModelConfig(),
@@ -631,6 +637,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       void agentStore.loadAgents();
       void loadSkills();
     });
+    unlistenAgentsChanged = await runtime.subscribe<void>("agents-changed", () => {
+      void agentStore.loadAgents();
+    });
     if (options.handleExternalScriptOpen === true) {
       unlistenExternalScriptOpen = await runtime.subscribe<ExternalScriptOpenRequest>(
         "locus-open-script",
@@ -667,6 +676,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenWorkspaceLockDiagnostic?.();
     unlistenAsyncTaskUpdated?.();
     unlistenPluginsChanged?.();
+    unlistenAgentsChanged?.();
     unlistenExternalScriptOpen?.();
     for (const operation of workspaceLockNoticeOperations) {
       notificationStore.clearByOperation(operation);
@@ -754,6 +764,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       modelStore.loadModelDefaults(),
       modelStore.loadDebugMode(),
       modelStore.loadLastModel(),
+      modelStore.loadAgentModelPreferences(),
       modelStore.loadCodexFastMode(),
       modelStore.loadCustomProviders(),
       modelStore.loadCodexModelConfig(),
