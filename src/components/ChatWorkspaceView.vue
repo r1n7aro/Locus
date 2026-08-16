@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
 import { useAgentStore } from "../stores/agent";
+import { useAuthStore } from "../stores/auth";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useModelStore } from "../stores/model";
@@ -53,6 +54,7 @@ const props = withDefaults(defineProps<{
 });
 
 const agentStore = useAgentStore();
+const authStore = useAuthStore();
 const chatStore = useChatStore();
 const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
@@ -647,6 +649,7 @@ onUnmounted(() => {
       :fast-mode-enabled="modelStore.effectiveCodexFastMode"
       :fast-mode-available="modelStore.codexFastModeAvailable"
       :token-usage="chatStore.tokenUsage"
+      :codex-connected="authStore.codexAuthenticated"
       :pending-question="chatStore.pendingQuestion"
       :pending-tool-confirms="chatStore.pendingToolConfirms"
       :sessions="chatStore.sessions"

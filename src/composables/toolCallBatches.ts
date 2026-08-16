@@ -582,11 +582,36 @@ export function mergeToolCallDisplaysWithoutDuplicates(
   if (secondary.length === 0) return [...primary];
 
   const result = [...primary];
-  const primaryState = collectToolCallDisplayMatchState(primary);
-  const remainingState = cloneToolCallMatchState(primaryState);
+  const remainingPrimary = primary.map((toolCall) => ({
+    toolCall,
+    fingerprint: getToolCallDisplayFingerprint(toolCall),
+  }));
 
   for (const toolCall of secondary) {
-    if (consumeDisplayMatch(toolCall, remainingState)) continue;
+    // Exact ids identify the same call even while its live fields change.
+    // Fingerprints are only a fallback for history/transient copies whose ids
+    // differ. A positive render order is stable across that handoff and also
+    // distinguishes legitimate repeated calls with identical arguments.
+    let duplicateIndex = remainingPrimary.findIndex(
+      (candidate) => candidate.toolCall.id === toolCall.id,
+    );
+    if (duplicateIndex < 0) {
+      const fingerprint = getToolCallDisplayFingerprint(toolCall);
+      duplicateIndex = remainingPrimary.findIndex((candidate) => {
+        if (candidate.fingerprint !== fingerprint) return false;
+        const primaryOrder = candidate.toolCall.order;
+        const secondaryOrder = toolCall.order;
+        return !primaryOrder
+          || primaryOrder <= 0
+          || !secondaryOrder
+          || secondaryOrder <= 0
+          || primaryOrder === secondaryOrder;
+      });
+    }
+    if (duplicateIndex >= 0) {
+      remainingPrimary.splice(duplicateIndex, 1);
+      continue;
+    }
     result.push(toolCall);
   }
 

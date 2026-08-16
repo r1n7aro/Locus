@@ -5,13 +5,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CHATGPT_BACKEND_API_PATH: &str = "/backend-api";
+const CHATGPT_USAGE_API_PATH: &str = "/wham";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const MODELS_ENDPOINT_PATH: &str = "/models";
 const USAGE_ENDPOINT_PATH: &str = "/usage";
 const RATE_LIMIT_RESET_CREDITS_ENDPOINT_PATH: &str = "/rate-limit-reset-credits";
 const RATE_LIMIT_RESET_CREDITS_CONSUME_ENDPOINT_PATH: &str = "/rate-limit-reset-credits/consume";
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
+const CODEX_USER_AGENT_PREFIX: &str = "codex_cli_rs";
+const MAX_ERROR_BODY_CHARS: usize = 512;
 const USAGE_REFRESH_TIMEOUT_SECS: u64 = 8;
 const RESET_CREDIT_DETAILS_TIMEOUT_SECS: u64 = 5;
 const RESET_CREDIT_CONSUME_TIMEOUT_SECS: u64 = 10;
@@ -216,7 +220,8 @@ pub async fn fetch_codex_rate_limits(
     let client = crate::network::reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS)),
+            .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
+            .user_agent(codex_user_agent()),
     )
     .map_err(|e| {
         CodexRateLimitsFetchError::Other(format!("Failed to create Codex usage client: {e}"))
@@ -268,7 +273,8 @@ pub async fn consume_codex_rate_limit_reset_credit(
     let client = crate::network::reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS)),
+            .timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))
+            .user_agent(codex_user_agent()),
     )
     .map_err(|error| {
         CodexRateLimitsFetchError::Other(format!(
@@ -318,13 +324,27 @@ async fn execute_codex_json_request<T: DeserializeOwned>(
     })?;
     let status = response.status();
     if !status.is_success() {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let body = response.text().await.unwrap_or_default();
-        let message = format!(
-            "Codex {operation} API error ({} {}): {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            body
-        );
+        let body_summary = summarize_error_body(&body, &content_type);
+        let message = if body_summary.is_empty() {
+            format!(
+                "Codex {operation} API error ({} {})",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            )
+        } else {
+            format!(
+                "Codex {operation} API error ({} {}): {body_summary}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            )
+        };
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(CodexRateLimitsFetchError::Unauthorized(message));
         }
@@ -514,17 +534,55 @@ fn normalize_plan_type(value: String) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn codex_user_agent() -> String {
+    format!("{CODEX_USER_AGENT_PREFIX}/{CODEX_CLIENT_VERSION}")
+}
+
+fn summarize_error_body(body: &str, content_type: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if content_type.to_ascii_lowercase().contains("text/html")
+        || trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html")
+    {
+        return "upstream returned an HTML challenge page".to_string();
+    }
+
+    let compact = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let summary = chars
+        .by_ref()
+        .take(MAX_ERROR_BODY_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{summary}…")
+    } else {
+        summary
+    }
+}
+
 fn codex_endpoint(base_url: Option<&str>, path: &str) -> String {
     let base_url = base_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_CODEX_PROVIDER_BASE_URL)
+        .unwrap_or(DEFAULT_CHATGPT_BASE_URL)
         .trim_end_matches('/');
+    let chatgpt_root = matches!(
+        base_url,
+        "https://chatgpt.com" | "https://chat.openai.com"
+    )
+    .then(|| format!("{base_url}{CHATGPT_BACKEND_API_PATH}"));
+    let base_url = chatgpt_root.as_deref().unwrap_or(base_url);
     let base_url = base_url
         .strip_suffix(RESPONSES_ENDPOINT_PATH)
         .or_else(|| base_url.strip_suffix(MODELS_ENDPOINT_PATH))
         .or_else(|| base_url.strip_suffix(USAGE_ENDPOINT_PATH))
         .unwrap_or(base_url);
+    if let Some((origin, _)) = base_url.split_once(CHATGPT_BACKEND_API_PATH) {
+        return format!("{origin}{CHATGPT_BACKEND_API_PATH}{CHATGPT_USAGE_API_PATH}{path}");
+    }
     format!("{base_url}{path}")
 }
 
@@ -545,36 +603,55 @@ mod tests {
     use super::{
         codex_rate_limit_reset_credits_consume_endpoint, codex_rate_limit_reset_credits_endpoint,
         codex_usage_endpoint, rate_limit_reset_credits_from_details, rate_limits_from_payload,
-        CodexRateLimitResetOutcome, CodexUsagePayload, CodexUsageRateLimitResetConsumeResponse,
-        CodexUsageRateLimitResetCreditsDetails,
+        summarize_error_body, CodexRateLimitResetOutcome, CodexUsagePayload,
+        CodexUsageRateLimitResetConsumeResponse, CodexUsageRateLimitResetCreditsDetails,
     };
     use serde_json::json;
 
     #[test]
-    fn usage_endpoint_reuses_codex_base_url() {
+    fn usage_endpoint_uses_chatgpt_wham_routes() {
         assert_eq!(
             codex_usage_endpoint(None),
-            "https://chatgpt.com/backend-api/codex/usage"
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_endpoint(Some("https://chatgpt.com")),
+            "https://chatgpt.com/backend-api/wham/usage"
         );
         assert_eq!(
             codex_usage_endpoint(Some("https://example.test/backend-api/codex/responses")),
-            "https://example.test/backend-api/codex/usage"
+            "https://example.test/backend-api/wham/usage"
         );
         assert_eq!(
             codex_usage_endpoint(Some("https://example.test/backend-api/codex/models")),
-            "https://example.test/backend-api/codex/usage"
+            "https://example.test/backend-api/wham/usage"
         );
         assert_eq!(
             codex_rate_limit_reset_credits_endpoint(Some(
                 "https://example.test/backend-api/codex/responses"
             )),
-            "https://example.test/backend-api/codex/rate-limit-reset-credits"
+            "https://example.test/backend-api/wham/rate-limit-reset-credits"
         );
         assert_eq!(
             codex_rate_limit_reset_credits_consume_endpoint(Some(
                 "https://example.test/backend-api/codex/responses"
             )),
-            "https://example.test/backend-api/codex/rate-limit-reset-credits/consume"
+            "https://example.test/backend-api/wham/rate-limit-reset-credits/consume"
+        );
+        assert_eq!(
+            codex_usage_endpoint(Some("https://example.test/v1/responses")),
+            "https://example.test/v1/usage"
+        );
+    }
+
+    #[test]
+    fn summarizes_html_errors_without_exposing_the_page() {
+        assert_eq!(
+            summarize_error_body(
+                "<!DOCTYPE html><html><body>Cloudflare challenge details</body></html>",
+                "text/html; charset=UTF-8",
+            ),
+            "upstream returned an HTML challenge page"
         );
     }
 

@@ -619,6 +619,15 @@ body.is-dragging-select-lock * {
   opacity: 0.75;
 }
 
+.dir-extra-readonly {
+  flex-shrink: 0;
+  font-size: 9px;
+  padding: 0 4px;
+  border-radius: 3px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
 .dir-extra-missing {
   flex-shrink: 0;
   font-size: 9px;

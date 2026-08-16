@@ -97,6 +97,8 @@ function emptyTokenUsage(): TokenUsage {
     totalOutputTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
+    timedOutputTokens: 0,
+    modelActiveDurationMs: 0,
     totalCostUsd: 0,
     pricedRounds: 0,
     contextTokens: 0,

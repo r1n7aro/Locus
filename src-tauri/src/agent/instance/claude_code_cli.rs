@@ -651,7 +651,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
 
     async fn prepare_cli_unity_tool(&mut self, tool_call: &ToolCallInfo, args: &serde_json::Value) {
         if let Some(round) = self.pending_round.as_mut() {
-            if tool_call.name == "unity_execute" || tool_call.name == "unity_run_states" {
+            if AgentInstance::is_unity_execute_undo_call(&tool_call.name, args) {
                 round.has_unity_execute = true;
             }
         }
@@ -1083,7 +1083,13 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 Ok(_) => None,
             });
 
-            if result_override.is_none() && workspace_policy.as_ref().is_ok_and(Option::is_some) {
+            // Bash permission semantics are call-specific. An external-workdir
+            // write skips the primary-workspace lock while remaining a write
+            // call; a declared read-only command may still need confirmation
+            // when dangerous-command or knowledge governance detects risk.
+            let needs_confirmation_preflight =
+                workspace_policy.as_ref().is_ok_and(Option::is_some) || tool_call.name == "bash";
+            if result_override.is_none() && needs_confirmation_preflight {
                 if self.pending_round.is_some() {
                     self.ensure_cli_round_confirmations_prepared().await;
                     if let Some(round) = self.pending_round.as_ref() {
@@ -1497,6 +1503,7 @@ impl AgentInstance {
                 "completion",
                 turn.input_tokens as u64,
                 turn.output_tokens as u64,
+                0,
                 turn.cache_read_tokens as u64,
                 turn.cache_write_tokens as u64,
                 turn.cost_usd,
@@ -1518,6 +1525,8 @@ impl AgentInstance {
                             total_output_tokens: totals.total_output_tokens,
                             total_cache_read_tokens: totals.total_cache_read_tokens,
                             total_cache_write_tokens: totals.total_cache_write_tokens,
+                            timed_output_tokens: totals.timed_output_tokens,
+                            model_active_duration_ms: totals.model_active_duration_ms,
                             total_cost_usd: totals.total_cost_usd,
                             priced_rounds: totals.priced_rounds,
                             context_tokens,

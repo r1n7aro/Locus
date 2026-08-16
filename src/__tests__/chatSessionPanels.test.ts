@@ -52,6 +52,7 @@ const displaySettingsState = vi.hoisted(() => ({
   showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
+  showAgentSelector: false,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
@@ -128,6 +129,8 @@ function emptyUsage() {
     totalOutputTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
+    timedOutputTokens: 0,
+    modelActiveDurationMs: 0,
     totalCostUsd: 0,
     pricedRounds: 0,
     contextTokens: 0,
@@ -200,6 +203,7 @@ describe("chat session panel state", () => {
     displaySettingsState.showViewsTab = true;
     displaySettingsState.showPluginsTab = true;
     displaySettingsState.showAgentTab = true;
+    displaySettingsState.showAgentSelector = false;
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.fileChangePopoverEnabled = true;
@@ -1379,6 +1383,108 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls[0]?.status).toBe("running");
     expect(sessionServiceMocks.getSessionActiveRun).not.toHaveBeenCalled();
     expect(sessionServiceMocks.listSessionEvents).not.toHaveBeenCalled();
+  });
+
+  it("does not restore live text that is already materialized in loaded history", async () => {
+    const chatStore = useChatStore();
+    const textPartId = "run-1:text:iteration:1:attempt:1:text";
+
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [
+        {
+          id: "msg-round",
+          role: "assistant",
+          content: "persisted answer",
+          createdAt: 1,
+          toolCalls: [{ id: "tc-current", name: "grep", arguments: "{}" }],
+          renderParts: [
+            {
+              kind: "text",
+              id: textPartId,
+              order: { runId: "run-1", seq: 1 },
+              content: "persisted answer",
+            },
+            {
+              kind: "toolCall",
+              id: "tc-current",
+              order: { runId: "run-1", seq: 2 },
+              toolCall: { id: "tc-current", name: "grep", arguments: "{}" },
+            },
+          ],
+        },
+      ],
+      agentId: null,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+      runtime: {
+        activeRun: {
+          runId: "run-1",
+          sessionId: "s1",
+          status: "running",
+          startedAt: 1,
+          updatedAt: 2,
+          finishedAt: null,
+          errorMessage: null,
+        },
+        streamingText: "persisted answer",
+        streamingTextOrder: 1,
+        streamSequence: 2,
+        liveRenderParts: [
+          {
+            kind: "text",
+            id: textPartId,
+            order: { runId: "run-1", seq: 1 },
+            content: "persisted answer",
+          },
+          {
+            kind: "toolCall",
+            id: "tc-current",
+            order: { runId: "run-1", seq: 2 },
+            toolCall: { id: "tc-current", name: "grep", arguments: "{}" },
+          },
+        ],
+        activeToolCalls: [
+          {
+            id: "tc-current",
+            name: "grep",
+            arguments: "{}",
+            status: "running",
+          },
+        ],
+        pendingQuestion: null,
+        pendingToolConfirms: [],
+        isCompacting: false,
+      },
+    });
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+    expect(chatStore.rawStreamText).toBe("");
+    expect(chatStore.streamingText).toBe("");
+    expect(chatStore.liveRenderParts).toEqual([
+      expect.objectContaining({ kind: "toolCall", id: "tc-current" }),
+    ]);
+    expect(chatStore.activeToolCalls.map((toolCall) => toolCall.id)).toEqual(["tc-current"]);
+
+    expect(chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "textDelta",
+      sessionId: "s1",
+      text: "persisted answer",
+      partId: textPartId,
+      renderSeq: 1,
+    })).toBe(true);
+    expect(chatStore.rawStreamText).toBe("");
+    expect(chatStore.streamingText).toBe("");
+    expect(chatStore.liveRenderParts).toEqual([
+      expect.objectContaining({ kind: "toolCall", id: "tc-current" }),
+    ]);
   });
 
   it("replaces a loaded assistant tool round when the live round-done event arrives", async () => {

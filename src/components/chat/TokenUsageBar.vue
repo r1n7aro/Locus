@@ -1,12 +1,25 @@
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import type { TokenUsage } from "../../types";
 import { t } from "../../i18n";
+import {
+  loadCodexQuotaSummary,
+  type CodexQuotaSummaryWindow,
+} from "../../services/codexQuotaSummary";
 
 const props = defineProps<{
   tokenUsage: TokenUsage;
+  activeSessionId?: string | null;
+  codexConnected?: boolean;
 }>();
+
+const emit = defineEmits<{
+  openContextStats: [];
+}>();
+
+const codexQuotaWindows = ref<CodexQuotaSummaryWindow[]>([]);
+const codexQuotaLoading = ref(false);
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -51,25 +64,100 @@ const contextTooltip = computed(() => {
   return parts.join(" · ");
 });
 
+function formatQuotaWindowLabel(window: CodexQuotaSummaryWindow): string {
+  const minutes = window.windowMinutes;
+  let label: string;
+  if (!minutes || minutes <= 0) {
+    label = window.key === "primary"
+      ? t("settings.codex.quotaWindowPrimary")
+      : t("settings.codex.quotaWindowSecondary");
+  } else if (minutes % 10080 === 0) {
+    label = t("settings.codex.quotaWindowWeeks", minutes / 10080);
+  } else if (minutes % 1440 === 0) {
+    label = t("settings.codex.quotaWindowDays", minutes / 1440);
+  } else if (minutes % 60 === 0) {
+    label = t("settings.codex.quotaWindowHours", minutes / 60);
+  } else {
+    label = t("settings.codex.quotaWindowMinutes", minutes);
+  }
+  return window.limitId === "codex"
+    ? label
+    : `${window.limitName || window.limitId} ${label}`;
+}
+
+const codexQuotaTooltip = computed(() => {
+  if (!props.codexConnected) return "";
+  if (codexQuotaWindows.value.length > 0) {
+    const windows = codexQuotaWindows.value.map((window) => (
+      `${formatQuotaWindowLabel(window)} ${Math.round(window.remainingPercent)}%`
+    ));
+    return t("chat.tokenUsage.codexQuota", windows.join(" · "));
+  }
+  const state = codexQuotaLoading.value
+    ? t("settings.codex.quotaLoading")
+    : t("settings.codex.quotaUnavailable");
+  return t("chat.tokenUsage.codexQuota", state);
+});
+
+const accessibleLabel = computed(() => [contextTooltip.value, codexQuotaTooltip.value]
+  .filter(Boolean)
+  .join(". "));
+
+async function refreshCodexQuota() {
+  if (!props.codexConnected || codexQuotaLoading.value) return;
+  codexQuotaLoading.value = true;
+  try {
+    codexQuotaWindows.value = await loadCodexQuotaSummary();
+  } catch {
+    codexQuotaWindows.value = [];
+  } finally {
+    codexQuotaLoading.value = false;
+  }
+}
+
+function openContextUsage() {
+  const sessionId = props.activeSessionId?.trim();
+  if (!sessionId) return;
+  emit("openContextStats");
+}
+
+onMounted(() => {
+  void refreshCodexQuota();
+});
+
+watch(() => props.codexConnected, (connected) => {
+  if (connected) void refreshCodexQuota();
+  else {
+    codexQuotaWindows.value = [];
+  }
+});
+
+watch(
+  () => [props.tokenUsage.totalInputTokens, props.tokenUsage.totalOutputTokens],
+  () => {
+    if (props.codexConnected) void refreshCodexQuota();
+  },
+);
+
 </script>
 
 <template>
-  <div
-    v-if="hasContext"
+  <button
+    v-if="hasContext && activeSessionId"
+    type="button"
     class="token-usage-group"
-    role="meter"
-    aria-valuemin="0"
-    aria-valuemax="100"
-    :aria-valuenow="contextPercent.toFixed(1)"
-    :aria-label="contextTooltip"
-    :aria-valuetext="contextTooltip"
+    :aria-label="accessibleLabel"
     :style="{ color: contextIndicatorColor }"
-    tabindex="0"
+    @click="openContextUsage"
   >
     <svg
       class="context-progress-ring"
       viewBox="0 0 16 16"
-      aria-hidden="true"
+      role="meter"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      :aria-valuenow="contextPercent.toFixed(1)"
+      :aria-label="contextTooltip"
     >
       <circle
         class="context-progress-track"
@@ -87,8 +175,13 @@ const contextTooltip = computed(() => {
         :stroke-dasharray="`${contextPercent} 100`"
       />
     </svg>
-    <span class="context-usage-label">{{ contextTooltip }}</span>
-  </div>
+    <span class="context-usage-label">
+      <span class="context-usage-line">{{ contextTooltip }}</span>
+      <span v-if="codexQuotaTooltip" class="context-usage-line context-quota-line">
+        {{ codexQuotaTooltip }}
+      </span>
+    </span>
+  </button>
 </template>
 
 <style scoped>
@@ -104,6 +197,9 @@ const contextTooltip = computed(() => {
   cursor: default;
   line-height: 0;
   outline: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .context-progress-ring {
@@ -112,6 +208,8 @@ const contextTooltip = computed(() => {
   display: block;
   flex-shrink: 0;
   transform: translateY(1px) rotate(-90deg);
+  opacity: 0.78;
+  transition: opacity 0.12s ease, filter 0.12s ease;
 }
 
 .context-progress-track,
@@ -143,14 +241,29 @@ const contextTooltip = computed(() => {
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
   color: currentColor;
   pointer-events: none;
-  overflow: hidden;
   font-size: 11px;
   line-height: 1.3;
   opacity: 0;
   transform: translate(-50%, 3px);
-  text-overflow: ellipsis;
   white-space: nowrap;
   transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.context-usage-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.context-quota-line {
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+.token-usage-group:hover .context-progress-ring,
+.token-usage-group:focus-visible .context-progress-ring {
+  opacity: 1;
+  filter: brightness(1.25);
 }
 
 .token-usage-group:hover .context-usage-label,

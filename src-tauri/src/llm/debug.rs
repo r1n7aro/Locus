@@ -11,6 +11,7 @@ fn sanitize_provider(provider: &str) -> String {
         .collect()
 }
 
+#[cfg(debug_assertions)]
 fn repo_debug_base_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -18,10 +19,24 @@ fn repo_debug_base_dir() -> PathBuf {
         .join("llm")
 }
 
+#[cfg(debug_assertions)]
+fn fallback_debug_base_dir() -> PathBuf {
+    repo_debug_base_dir()
+}
+
+#[cfg(not(debug_assertions))]
+fn fallback_debug_base_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("locus")
+        .join("debug")
+        .join("llm")
+}
+
 fn default_debug_base_dir(packaged_storage_dir: Option<PathBuf>) -> PathBuf {
     match packaged_storage_dir {
         Some(data_dir) => data_dir.join("debug").join("llm"),
-        None => repo_debug_base_dir(),
+        None => fallback_debug_base_dir(),
     }
 }
 
@@ -40,10 +55,10 @@ pub fn debug_base_dir() -> PathBuf {
             Ok(packaged_storage_dir) => default_debug_base_dir(packaged_storage_dir),
             Err(error) => {
                 eprintln!(
-                    "[debug] failed to resolve packaged runtime storage dir, falling back to repo debug dir: {}",
+                    "[debug] failed to resolve packaged runtime storage dir, using fallback debug dir: {}",
                     error
                 );
-                repo_debug_base_dir()
+                fallback_debug_base_dir()
             }
         },
     }
@@ -176,7 +191,7 @@ fn single_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_debug_base_dir, repo_debug_base_dir};
+    use super::{default_debug_base_dir, fallback_debug_base_dir};
     use std::path::PathBuf;
 
     #[test]
@@ -190,6 +205,6 @@ mod tests {
 
     #[test]
     fn default_debug_base_dir_falls_back_to_repo_debug_dir() {
-        assert_eq!(default_debug_base_dir(None), repo_debug_base_dir());
+        assert_eq!(default_debug_base_dir(None), fallback_debug_base_dir());
     }
 }

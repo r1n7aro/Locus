@@ -32,6 +32,17 @@ pub struct SessionStore {
     export_snapshot_created_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionPromptPrefixCache {
+    pub provider_key: String,
+    pub base_prompt: String,
+    pub rules_prompt: String,
+    pub knowledge_prompt: String,
+    pub env_prompt: String,
+    pub synthesized_at: i64,
+    pub last_remote_response_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactedContextMessageOutput {
@@ -859,7 +870,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 29;
+    const SCHEMA_VERSION: i32 = 31;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1223,7 +1234,29 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 29, "add a new migration block above");
+        if current < 30 {
+            Self::migrate(conn, 30, "persist session prompt-prefix cache", |conn| {
+                Self::create_prompt_prefix_cache_schema(conn)
+            })?;
+        }
+
+        if current < 31 {
+            Self::migrate(conn, 31, "persist model output timing", |conn| {
+                if !Self::table_has_column(conn, "token_usage", "timed_output_tokens")? {
+                    conn.execute_batch(
+                        "ALTER TABLE token_usage ADD COLUMN timed_output_tokens INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                if !Self::table_has_column(conn, "token_usage", "model_active_duration_ms")? {
+                    conn.execute_batch(
+                        "ALTER TABLE token_usage ADD COLUMN model_active_duration_ms INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 31, "add a new migration block above");
         Ok(())
     }
 
@@ -1524,6 +1557,8 @@ impl SessionStore {
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                timed_output_tokens INTEGER NOT NULL DEFAULT 0,
+                model_active_duration_ms INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd REAL NOT NULL DEFAULT 0,
                 priced_rounds INTEGER NOT NULL DEFAULT 0,
                 last_context_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1543,6 +1578,22 @@ impl SessionStore {
         .and_then(|_| Self::create_session_sync_schema(conn))
         .and_then(|_| Self::create_context_attempt_schema(conn))
         .and_then(|_| Self::create_model_usage_schema(conn))
+        .and_then(|_| Self::create_prompt_prefix_cache_schema(conn))
+    }
+
+    fn create_prompt_prefix_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_prompt_prefix_cache (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                provider_key TEXT NOT NULL,
+                base_prompt TEXT NOT NULL,
+                rules_prompt TEXT NOT NULL,
+                knowledge_prompt TEXT NOT NULL,
+                env_prompt TEXT NOT NULL,
+                synthesized_at INTEGER NOT NULL,
+                last_remote_response_at INTEGER
+            );",
+        )
     }
 
     fn create_context_attempt_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -2390,6 +2441,8 @@ impl SessionStore {
                         total_output_tokens,
                         total_cache_read_tokens,
                         total_cache_write_tokens,
+                        timed_output_tokens,
+                        model_active_duration_ms,
                         total_cost_usd,
                         priced_rounds,
                         last_context_tokens,
@@ -2400,6 +2453,8 @@ impl SessionStore {
                         total_output_tokens,
                         total_cache_read_tokens,
                         total_cache_write_tokens,
+                        timed_output_tokens,
+                        model_active_duration_ms,
                         total_cost_usd,
                         priced_rounds,
                         last_context_tokens,
@@ -2483,7 +2538,7 @@ impl SessionStore {
             Option<String>,
             Option<String>,
         );
-        type SnapshotUsageRow = (i64, i64, i64, i64, f64, i64, i64, i64);
+        type SnapshotUsageRow = (i64, i64, i64, i64, i64, i64, f64, i64, i64, i64);
         type SnapshotTodoRow = (i64, String, String, String);
 
         let (session, messages, usage, todos) = {
@@ -2544,7 +2599,7 @@ impl SessionStore {
 
             let usage = conn
                 .query_row(
-                    "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, total_cost_usd, priced_rounds, last_context_tokens, last_context_limit
+                    "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_write_tokens, timed_output_tokens, model_active_duration_ms, total_cost_usd, priced_rounds, last_context_tokens, last_context_limit
                      FROM token_usage WHERE session_id = ?1",
                     params![source_id],
                     |row| {
@@ -2557,6 +2612,8 @@ impl SessionStore {
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
@@ -2687,12 +2744,13 @@ impl SessionStore {
                 conn.execute(
                     "INSERT INTO token_usage (
                         session_id, total_input_tokens, total_output_tokens,
-                        total_cache_read_tokens, total_cache_write_tokens, total_cost_usd,
-                        priced_rounds, last_context_tokens, last_context_limit
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        total_cache_read_tokens, total_cache_write_tokens, timed_output_tokens,
+                        model_active_duration_ms, total_cost_usd, priced_rounds,
+                        last_context_tokens, last_context_limit
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         new_id, usage.0, usage.1, usage.2, usage.3, usage.4, usage.5, usage.6,
-                        usage.7,
+                        usage.7, usage.8, usage.9,
                     ],
                 )
                 .map_err(|e| format!("Failed to copy snapshot token usage into fork: {}", e))?;
@@ -5442,6 +5500,104 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(crate) fn fresh_prompt_prefix_cache(
+        &self,
+        session_id: &str,
+        provider_key: &str,
+        ttl_seconds: u32,
+        now: i64,
+    ) -> Result<Option<SessionPromptPrefixCache>, String> {
+        if ttl_seconds == 0 {
+            return Ok(None);
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let cache = conn
+            .query_row(
+                "SELECT provider_key, base_prompt, rules_prompt, knowledge_prompt, env_prompt,
+                        synthesized_at, last_remote_response_at
+                 FROM session_prompt_prefix_cache
+                 WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionPromptPrefixCache {
+                        provider_key: row.get(0)?,
+                        base_prompt: row.get(1)?,
+                        rules_prompt: row.get(2)?,
+                        knowledge_prompt: row.get(3)?,
+                        env_prompt: row.get(4)?,
+                        synthesized_at: row.get(5)?,
+                        last_remote_response_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load prompt-prefix cache: {}", e))?;
+
+        let Some(cache) = cache.filter(|cache| cache.provider_key == provider_key) else {
+            return Ok(None);
+        };
+        let freshness_anchor = cache
+            .last_remote_response_at
+            .unwrap_or(cache.synthesized_at);
+        let age_seconds = now.saturating_sub(freshness_anchor);
+        if age_seconds > i64::from(ttl_seconds) {
+            return Ok(None);
+        }
+        Ok(Some(cache))
+    }
+
+    pub(crate) fn replace_prompt_prefix_cache(
+        &self,
+        session_id: &str,
+        cache: &SessionPromptPrefixCache,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO session_prompt_prefix_cache (
+                session_id, provider_key, base_prompt, rules_prompt, knowledge_prompt,
+                env_prompt, synthesized_at, last_remote_response_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(session_id) DO UPDATE SET
+                provider_key = excluded.provider_key,
+                base_prompt = excluded.base_prompt,
+                rules_prompt = excluded.rules_prompt,
+                knowledge_prompt = excluded.knowledge_prompt,
+                env_prompt = excluded.env_prompt,
+                synthesized_at = excluded.synthesized_at,
+                last_remote_response_at = excluded.last_remote_response_at",
+            params![
+                session_id,
+                cache.provider_key,
+                cache.base_prompt,
+                cache.rules_prompt,
+                cache.knowledge_prompt,
+                cache.env_prompt,
+                cache.synthesized_at,
+                cache.last_remote_response_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist prompt-prefix cache: {}", e))?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_prompt_prefix_remote_response(
+        &self,
+        session_id: &str,
+        provider_key: &str,
+        responded_at: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE session_prompt_prefix_cache
+             SET last_remote_response_at = ?1
+             WHERE session_id = ?2 AND provider_key = ?3",
+            params![responded_at, session_id, provider_key],
+        )
+        .map_err(|e| format!("Failed to refresh prompt-prefix cache timestamp: {}", e))?;
+        Ok(())
+    }
+
     pub fn record_token_usage(
         &self,
         session_id: &str,
@@ -5462,10 +5618,34 @@ impl SessionStore {
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            0,
+            0,
             cost_usd,
             priced_rounds,
             context_tokens,
             context_limit,
+        )
+    }
+
+    pub fn merge_token_usage(
+        &self,
+        session_id: &str,
+        usage: &TokenUsage,
+    ) -> Result<TokenUsage, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::record_token_usage_with_conn(
+            &conn,
+            session_id,
+            usage.total_input_tokens,
+            usage.total_output_tokens,
+            usage.total_cache_read_tokens,
+            usage.total_cache_write_tokens,
+            usage.timed_output_tokens,
+            usage.model_active_duration_ms,
+            usage.total_cost_usd,
+            usage.priced_rounds,
+            None,
+            None,
         )
     }
 
@@ -5478,6 +5658,7 @@ impl SessionStore {
         request_kind: &str,
         input_tokens: u64,
         output_tokens: u64,
+        model_active_duration_ms: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
         cost_usd: f64,
@@ -5496,6 +5677,12 @@ impl SessionStore {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin model usage transaction: {}", e))?;
+        let (timed_output_tokens, model_active_duration_ms) =
+            if output_tokens > 0 && model_active_duration_ms > 0 {
+                (output_tokens, model_active_duration_ms)
+            } else {
+                (0, 0)
+            };
         let usage = Self::record_token_usage_with_conn(
             &tx,
             session_id,
@@ -5503,6 +5690,8 @@ impl SessionStore {
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            timed_output_tokens,
+            model_active_duration_ms,
             cost_usd,
             priced_rounds,
             context_tokens,
@@ -5599,6 +5788,8 @@ impl SessionStore {
         output_tokens: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
+        timed_output_tokens: u64,
+        model_active_duration_ms: u64,
         cost_usd: f64,
         priced_rounds: u64,
         context_tokens: Option<u32>,
@@ -5611,27 +5802,33 @@ impl SessionStore {
                 total_output_tokens,
                 total_cache_read_tokens,
                 total_cache_write_tokens,
+                timed_output_tokens,
+                model_active_duration_ms,
                 total_cost_usd,
                 priced_rounds,
                 last_context_tokens,
                 last_context_limit
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, 0), COALESCE(?9, 0))
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, 0), COALESCE(?11, 0))
              ON CONFLICT(session_id) DO UPDATE SET
                 total_input_tokens = total_input_tokens + ?2,
                 total_output_tokens = total_output_tokens + ?3,
                 total_cache_read_tokens = total_cache_read_tokens + ?4,
                 total_cache_write_tokens = total_cache_write_tokens + ?5,
-                total_cost_usd = total_cost_usd + ?6,
-                priced_rounds = priced_rounds + ?7,
-                last_context_tokens = CASE WHEN ?8 IS NULL THEN last_context_tokens ELSE ?8 END,
-                last_context_limit = CASE WHEN ?9 IS NULL THEN last_context_limit ELSE ?9 END",
+                timed_output_tokens = timed_output_tokens + ?6,
+                model_active_duration_ms = model_active_duration_ms + ?7,
+                total_cost_usd = total_cost_usd + ?8,
+                priced_rounds = priced_rounds + ?9,
+                last_context_tokens = CASE WHEN ?10 IS NULL THEN last_context_tokens ELSE ?10 END,
+                last_context_limit = CASE WHEN ?11 IS NULL THEN last_context_limit ELSE ?11 END",
             params![
                 session_id,
                 input_tokens as i64,
                 output_tokens as i64,
                 cache_read_tokens as i64,
                 cache_write_tokens as i64,
+                timed_output_tokens as i64,
+                model_active_duration_ms as i64,
                 cost_usd,
                 priced_rounds as i64,
                 context_tokens.map(|value| value as i64),
@@ -5645,6 +5842,8 @@ impl SessionStore {
             total_out,
             total_cr,
             total_cw,
+            timed_output_tokens,
+            model_active_duration_ms,
             total_cost_usd,
             priced_rounds,
             last_context_tokens,
@@ -5656,6 +5855,8 @@ impl SessionStore {
                     total_output_tokens,
                     total_cache_read_tokens,
                     total_cache_write_tokens,
+                    timed_output_tokens,
+                    model_active_duration_ms,
                     total_cost_usd,
                     priced_rounds,
                     last_context_tokens,
@@ -5668,10 +5869,12 @@ impl SessionStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, f64>(4)?,
+                        row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, f64>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -5682,6 +5885,8 @@ impl SessionStore {
             total_output_tokens: total_out as u64,
             total_cache_read_tokens: total_cr as u64,
             total_cache_write_tokens: total_cw as u64,
+            timed_output_tokens: timed_output_tokens as u64,
+            model_active_duration_ms: model_active_duration_ms as u64,
             total_cost_usd,
             priced_rounds: priced_rounds as u64,
             context_tokens: last_context_tokens as u32,
@@ -5789,6 +5994,8 @@ impl SessionStore {
                 total_output_tokens,
                 total_cache_read_tokens,
                 total_cache_write_tokens,
+                timed_output_tokens,
+                model_active_duration_ms,
                 total_cost_usd,
                 priced_rounds,
                 last_context_tokens,
@@ -5801,10 +6008,12 @@ impl SessionStore {
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, f64>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         );
@@ -5815,6 +6024,8 @@ impl SessionStore {
                 total_out,
                 total_cr,
                 total_cw,
+                timed_output_tokens,
+                model_active_duration_ms,
                 total_cost_usd,
                 priced_rounds,
                 last_context_tokens,
@@ -5824,6 +6035,8 @@ impl SessionStore {
                 total_output_tokens: total_out as u64,
                 total_cache_read_tokens: total_cr as u64,
                 total_cache_write_tokens: total_cw as u64,
+                timed_output_tokens: timed_output_tokens as u64,
+                model_active_duration_ms: model_active_duration_ms as u64,
                 total_cost_usd,
                 priced_rounds: priced_rounds as u64,
                 context_tokens: last_context_tokens as u32,
@@ -5834,6 +6047,8 @@ impl SessionStore {
                 total_output_tokens: 0,
                 total_cache_read_tokens: 0,
                 total_cache_write_tokens: 0,
+                timed_output_tokens: 0,
+                model_active_duration_ms: 0,
                 total_cost_usd: 0.0,
                 priced_rounds: 0,
                 context_tokens: 0,
@@ -6623,9 +6838,9 @@ impl SessionStore {
 mod tests {
     use super::{
         build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionEventAppend,
-        SessionStore, CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
-        DEFERRED_TOOL_IMAGE_DATA_PREFIX, RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING,
-        RUN_STATUS_DONE, RUN_STATUS_ERROR,
+        SessionPromptPrefixCache, SessionStore, CHILD_SESSION_FORK_ERROR,
+        CONTEXT_COMPACTED_DISPLAY_MARKER, DEFERRED_TOOL_IMAGE_DATA_PREFIX, RUN_STATUS_CANCELLED,
+        RUN_STATUS_CANCELLING, RUN_STATUS_DONE, RUN_STATUS_ERROR,
     };
     use crate::compact;
     use crate::session::models::{
@@ -6849,12 +7064,70 @@ mod tests {
         assert!(
             SessionStore::table_has_column(&conn, "token_usage", "last_context_limit").unwrap()
         );
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "timed_output_tokens").unwrap()
+        );
+        assert!(
+            SessionStore::table_has_column(&conn, "token_usage", "model_active_duration_ms")
+                .unwrap()
+        );
         assert!(table_exists(&conn, "session_runs"));
         assert!(table_exists(&conn, "session_events"));
         assert!(table_exists(&conn, "model_usage_events"));
         assert!(table_exists(&conn, "response_request_payloads"));
         assert!(table_exists(&conn, "session_context_attempts"));
         assert!(table_exists(&conn, "session_context_capture_gaps"));
+    }
+
+    #[test]
+    fn v30_database_migrates_output_timing_and_exports_missing_samples_as_empty() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v30 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "ALTER TABLE token_usage DROP COLUMN timed_output_tokens;
+             ALTER TABLE token_usage DROP COLUMN model_active_duration_ms;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-v30', 'Migrated output timing', 'chat', 100, 100);
+             INSERT INTO token_usage (
+                session_id, total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_write_tokens,
+                total_cost_usd, priced_rounds, last_context_tokens, last_context_limit
+             ) VALUES ('session-v30', 100, 20, 5, 0, 0, 0, 125, 4096);
+             PRAGMA user_version = 30;",
+        )
+        .expect("create v30 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v30 store");
+        let usage = store
+            .get_token_usage("session-v30")
+            .expect("read migrated usage");
+        assert_eq!(usage.total_output_tokens, 20);
+        assert_eq!(usage.timed_output_tokens, 0);
+        assert_eq!(usage.model_active_duration_ms, 0);
+
+        let output = dir.path().join("migrated-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-v30",
+            "",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated context");
+        let raw = std::fs::read_to_string(output).expect("read migrated export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse migrated export");
+        assert_eq!(
+            yaml["sessions"][0]["token_usage"]["timedOutputTokens"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["token_usage"]["modelActiveDurationMs"].as_str(),
+            Some("empty")
+        );
     }
 
     #[test]
@@ -7678,6 +7951,7 @@ mod tests {
                 "completion",
                 100,
                 20,
+                1_000,
                 10,
                 0,
                 0.0,
@@ -7694,6 +7968,7 @@ mod tests {
                 "completion",
                 50,
                 10,
+                500,
                 5,
                 2,
                 0.25,
@@ -7703,17 +7978,7 @@ mod tests {
             )
             .expect("record child call");
         store
-            .record_token_usage(
-                &parent_id,
-                child_usage.total_input_tokens,
-                child_usage.total_output_tokens,
-                child_usage.total_cache_read_tokens,
-                child_usage.total_cache_write_tokens,
-                child_usage.total_cost_usd,
-                child_usage.priced_rounds,
-                None,
-                None,
-            )
+            .merge_token_usage(&parent_id, &child_usage)
             .expect("merge child usage into parent");
         store
             .record_model_usage_event(
@@ -7745,6 +8010,8 @@ mod tests {
             .expect("read parent usage");
         assert_eq!(parent_usage.total_input_tokens, 150);
         assert_eq!(parent_usage.total_output_tokens, 30);
+        assert_eq!(parent_usage.timed_output_tokens, 30);
+        assert_eq!(parent_usage.model_active_duration_ms, 1_500);
     }
 
     #[test]
@@ -7763,6 +8030,7 @@ mod tests {
                 "auto_review",
                 80,
                 12,
+                600,
                 4,
                 0,
                 0.0,
@@ -10677,5 +10945,109 @@ mod tests {
         assert!(store
             .latest_run_is_interrupted(&partial_session)
             .expect("read interrupted run state"));
+    }
+
+    #[test]
+    fn prompt_prefix_cache_expires_from_last_remote_response() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Prefix cache", None, None, "chat", None)
+            .expect("create session");
+        let cache = SessionPromptPrefixCache {
+            provider_key: "provider-a".to_string(),
+            base_prompt: "base".to_string(),
+            rules_prompt: "rules".to_string(),
+            knowledge_prompt: "knowledge".to_string(),
+            env_prompt: "env".to_string(),
+            synthesized_at: 100,
+            last_remote_response_at: None,
+        };
+        store
+            .replace_prompt_prefix_cache(&session_id, &cache)
+            .expect("persist prefix cache");
+
+        assert_eq!(
+            store
+                .fresh_prompt_prefix_cache(&session_id, "provider-a", 300, 400)
+                .expect("load cache at ttl boundary"),
+            Some(cache.clone())
+        );
+        assert_eq!(
+            store
+                .fresh_prompt_prefix_cache(&session_id, "provider-a", 300, 401)
+                .expect("load expired cache"),
+            None
+        );
+
+        store
+            .mark_prompt_prefix_remote_response(&session_id, "provider-a", 500)
+            .expect("refresh response timestamp");
+        let refreshed = store
+            .fresh_prompt_prefix_cache(&session_id, "provider-a", 300, 800)
+            .expect("load response-refreshed cache")
+            .expect("cache remains fresh");
+        assert_eq!(refreshed.last_remote_response_at, Some(500));
+        assert_eq!(
+            store
+                .fresh_prompt_prefix_cache(&session_id, "provider-a", 300, 801)
+                .expect("load response-expired cache"),
+            None
+        );
+        assert_eq!(
+            store
+                .fresh_prompt_prefix_cache(&session_id, "provider-b", 300, 500)
+                .expect("load provider-mismatched cache"),
+            None
+        );
+        assert_eq!(
+            store
+                .fresh_prompt_prefix_cache(&session_id, "provider-a", 0, 500)
+                .expect("load disabled cache"),
+            None
+        );
+    }
+
+    #[test]
+    fn v29_database_migrates_prompt_prefix_cache_and_keeps_sessions_exportable() {
+        let dir = tempdir().expect("create temp dir");
+        let session_id = {
+            let store = SessionStore::new(dir.path()).expect("initialize latest store");
+            let session_id = store
+                .create_session("Migrated prefix cache", None, None, "chat", None)
+                .expect("create session");
+            store
+                .add_message(&session_id, MessageRole::User, "legacy message")
+                .expect("add legacy message");
+            {
+                let conn = store.conn.lock().expect("lock store");
+                conn.execute_batch(
+                    "DROP TABLE session_prompt_prefix_cache;
+                     PRAGMA user_version = 29;",
+                )
+                .expect("simulate v29 schema");
+            }
+            session_id
+        };
+
+        let store = SessionStore::new(dir.path()).expect("migrate v29 store");
+        let detail = store
+            .load_session(&session_id)
+            .expect("load migrated session");
+        assert_eq!(detail.messages[0].content, "legacy message");
+        let snapshot = store
+            .create_export_snapshot()
+            .expect("create migrated export snapshot");
+        let exported = snapshot
+            .load_session(&session_id)
+            .expect("load migrated export session");
+        assert_eq!(exported.messages[0].content, "legacy message");
+
+        let conn = Connection::open(dir.path().join("locus.db")).expect("reopen migrated db");
+        assert!(table_exists(&conn, "session_prompt_prefix_cache"));
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
     }
 }

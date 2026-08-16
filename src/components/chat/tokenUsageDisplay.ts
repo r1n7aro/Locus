@@ -7,6 +7,11 @@ export interface TokenUsageMetric {
   value: number;
 }
 
+export function calculateAverageOutputTokensPerSecond(usage: TokenUsage): number | null {
+  if (usage.timedOutputTokens <= 0 || usage.modelActiveDurationMs <= 0) return null;
+  return usage.timedOutputTokens * 1000 / usage.modelActiveDurationMs;
+}
+
 export function buildTokenUsageMetrics(usage: TokenUsage): TokenUsageMetric[] {
   const hasCache = usage.totalCacheReadTokens > 0 || usage.totalCacheWriteTokens > 0;
 

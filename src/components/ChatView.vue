@@ -22,6 +22,7 @@ import ChatTurnNavigationRail from "./chat/ChatTurnNavigationRail.vue";
 import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
+import SessionContextUsageWindow from "./SessionContextUsageWindow.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
 import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
@@ -223,6 +224,7 @@ const props = defineProps<{
   fastModeEnabled: boolean;
   fastModeAvailable: boolean;
   tokenUsage: TokenUsage;
+  codexConnected?: boolean;
   pendingQuestion: PendingQuestion | null;
   pendingToolConfirms: PendingToolConfirm[];
   sessions: SessionSummary[];
@@ -291,6 +293,7 @@ const emit = defineEmits<{
 }>();
 
 const lightboxSrc = ref("");
+const contextStatsOpen = ref(false);
 function openLightbox(src: string) {
   lightboxSrc.value = src;
 }
@@ -3220,6 +3223,9 @@ onUnmounted(() => {
           <template v-if="!inputControlsCollapsed" #footer-start>
             <ModelEffortSelector
               align="start"
+              :agents="displaySettings.showAgentSelector ? agents : undefined"
+              :selected-agent-id="selectedAgentId"
+              :agent-locked="agentLocked"
               :models="models"
               :selected-id="selectedModelId"
               :effort="effort"
@@ -3228,18 +3234,33 @@ onUnmounted(() => {
               :fast-mode-enabled="fastModeEnabled"
               :fast-mode-available="fastModeAvailable"
               :disabled="isStreaming"
+              @select-agent="emit('selectAgent', $event)"
               @select-model="emit('selectModel', $event)"
               @select-effort="emit('selectEffort', $event)"
               @select-fast-mode="emit('selectFastMode', $event)"
             />
             <TokenUsageBar
               :token-usage="tokenUsage"
+              :active-session-id="activeSessionId"
+              :codex-connected="codexConnected"
+              @open-context-stats="contextStatsOpen = true"
             />
           </template>
         </RichChatInput>
       </div>
     </div>
     </div><!-- /chat-view -->
+
+    <Teleport to="body">
+      <SessionContextUsageWindow
+        v-if="contextStatsOpen && activeSessionId"
+        :session-id="activeSessionId"
+        :model-id="selectedModelId"
+        :knowledge-mode="knowledgeAccessMode"
+        :token-usage="tokenUsage"
+        @close="contextStatsOpen = false"
+      />
+    </Teleport>
 
     <Teleport to="body">
       <Transition name="undo-chooser-fade">

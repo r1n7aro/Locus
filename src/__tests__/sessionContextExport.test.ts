@@ -9,7 +9,7 @@ describe("structured session context export", () => {
   it("uses schema v29 with explicit context and fork/tool-round repair migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 29;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 31;");
     expect(store).toContain('Self::migrate(conn, 26, "persist session context attempts"');
     expect(store).toContain('27,\n                "persist structured conversation checkpoints"');
     expect(store).toContain("migrate_conversation_checkpoints");

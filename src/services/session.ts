@@ -8,6 +8,7 @@ import type {
   SessionEventRecord,
   SessionRunSummary,
   TokenUsage,
+  SessionContextUsageReport,
   ModelUsageReport,
   TodoSnapshot,
   ImageAttachment,
@@ -232,6 +233,18 @@ export function rollbackSessionToMessage(
 
 export function getSessionUsage(sessionId: string): Promise<TokenUsage> {
   return ipcInvoke<TokenUsage>("get_session_usage", { sessionId });
+}
+
+export function getSessionContextUsageReport(
+  sessionId: string,
+  modelId?: string | null,
+  knowledgeMode?: KnowledgeAccessMode | null,
+): Promise<SessionContextUsageReport> {
+  return ipcInvoke<SessionContextUsageReport>("get_session_context_usage_report", {
+    sessionId,
+    modelId: modelId ?? null,
+    knowledgeMode: knowledgeMode ?? null,
+  });
 }
 
 export function getModelUsageStats(days?: number | null): Promise<ModelUsageReport> {

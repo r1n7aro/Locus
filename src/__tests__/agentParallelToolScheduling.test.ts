@@ -38,10 +38,26 @@ describe("agent parallel tool scheduling safety", () => {
   it("runs one model batch of background bash calls under a re-entrant opaque lease", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const lock = read("src-tauri/src/agent/workspace_execution_lock.rs");
+    const bashTool = read("tools/bash.json");
+    const unityExecuteTool = read("tools/unity_execute.json");
+    const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
+    const sdk = read("src-tauri/src/sdk.rs");
+    const mcp = read("src-tauri/src/mcp/server/tools.rs");
 
-    expect(agent).toContain('"bash" => Some(WorkspaceExecutionLockRequest::ParallelOpaque(');
+    expect(agent).toContain('args.get("readonly")');
+    expect(agent).toContain("bash_needs_primary_workspace_tracking");
+    expect(agent).toContain("WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())");
     expect(agent).toContain("background_workspace_execution_request_for_tool");
     expect(agent).toContain("&assistant_message_id");
+    expect(bashTool).toContain('"readonly"');
+    expect(bashTool).toContain('"required": ["command", "description", "readonly", "workdir"]');
+    expect(cli).toContain('|| tool_call.name == "bash"');
+    expect(sdk).toContain("bash_needs_primary_workspace_tracking_for");
+    expect(agent).toContain("unity_execute_is_readonly");
+    expect(agent).toContain("tool_call_has_unity_execution_barrier");
+    expect(unityExecuteTool).toContain('"readonly"');
+    expect(sdk).toContain('canonical == "unity_execute"');
+    expect(mcp).toContain('name == "unity_execute"');
     expect(lock).toContain("ParallelOpaque(Arc<OpaqueGroupState>)");
     expect(lock).toContain("parallel_opaque_group_overlaps_and_blocks_other_groups");
   });

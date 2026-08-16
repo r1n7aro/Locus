@@ -1,5 +1,9 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
-import { sortedAssistantRenderParts } from "./assistantRenderParts";
+import {
+  assistantRenderPartIdentityKey,
+  collectMaterializedAssistantRenderPartKeys,
+  sortedAssistantRenderParts,
+} from "./assistantRenderParts";
 import { INTERRUPTED_TOOL_RESULT, resolveToolCallDisplayShape } from "./toolCallBatches";
 import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
@@ -13,6 +17,7 @@ export interface StreamState {
   streamingTextOrder: number;
   thinkingOrder: number;
   liveRenderParts: AssistantRenderPart[];
+  materializedRenderPartKeys?: ReadonlySet<string>;
   isStreaming: boolean;
   isCompacting: boolean;
   isThinking: boolean;
@@ -229,6 +234,23 @@ function existingLivePart<T extends AssistantRenderPart["kind"]>(
   );
 }
 
+function isEventRenderPartMaterialized(
+  state: StreamState,
+  event: { runId: string; partId?: string; renderSeq?: number },
+  kind: "text" | "thinking",
+): boolean {
+  const id = event.partId?.trim();
+  if (!id || typeof event.renderSeq !== "number" || event.renderSeq <= 0) return false;
+  const key = assistantRenderPartIdentityKey({
+    kind,
+    id,
+    order: { runId: event.runId, seq: event.renderSeq },
+  });
+  const materializedKeys = state.materializedRenderPartKeys
+    ?? collectMaterializedAssistantRenderPartKeys(state.messages);
+  return materializedKeys.has(key);
+}
+
 function currentThinkingDuration(state: StreamState) {
   return state.isThinking && state.thinkingStartTime > 0
     ? Math.round((Date.now() - state.thinkingStartTime) / 1000)
@@ -439,6 +461,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "textDelta":
+      if (isEventRenderPartMaterialized(state, event, "text")) break;
       markTextOrder(event.order);
       {
         const order = liveOrderFromEvent(
@@ -481,6 +504,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "thinkingDelta":
+      if (isEventRenderPartMaterialized(state, event, "thinking")) break;
       markThinkingOrder(event.order);
       {
         const order = liveOrderFromEvent(
@@ -736,6 +760,8 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           totalOutputTokens: event.totalOutputTokens,
           totalCacheReadTokens: event.totalCacheReadTokens,
           totalCacheWriteTokens: event.totalCacheWriteTokens,
+          timedOutputTokens: event.timedOutputTokens,
+          modelActiveDurationMs: event.modelActiveDurationMs,
           totalCostUsd: event.totalCostUsd,
           pricedRounds: event.pricedRounds,
           contextTokens: event.contextTokens > 0 ? event.contextTokens : state.tokenUsage.contextTokens,

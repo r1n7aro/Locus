@@ -19,6 +19,29 @@ export function sortedAssistantRenderParts(parts: readonly AssistantRenderPart[]
   return [...parts].sort(compareAssistantRenderParts);
 }
 
+export interface AssistantRenderPartIdentity {
+  kind: AssistantRenderPart["kind"];
+  id: string;
+  order: RenderOrderKey;
+}
+
+export function assistantRenderPartIdentityKey(part: AssistantRenderPartIdentity): string {
+  return `${part.kind}\u{0}${part.order.runId}\u{0}${part.order.seq}\u{0}${part.id}`;
+}
+
+export function collectMaterializedAssistantRenderPartKeys(
+  messages: readonly ChatMessage[],
+): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const part of message.renderParts ?? []) {
+      keys.add(assistantRenderPartIdentityKey(part));
+    }
+  }
+  return keys;
+}
+
 function legacyOrder(seq: number): RenderOrderKey {
   return { runId: LEGACY_RUN_ID, seq };
 }
@@ -122,4 +145,3 @@ export function assertCanonicalRenderParts(parts: readonly AssistantRenderPart[]
     seen.add(key);
   }
 }
-

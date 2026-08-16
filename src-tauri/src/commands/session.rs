@@ -695,7 +695,7 @@ fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError
 }
 
 async fn resolve_model_backend(
-    app_handle: &AppHandle,
+    _app_handle: &AppHandle,
     _def: &crate::agent::definition::AgentDef,
     selected_model: &str,
     config: &AppConfig,
@@ -799,6 +799,7 @@ async fn resolve_model_backend(
 pub async fn list_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
+    selected_model: Option<String>,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
@@ -841,6 +842,11 @@ pub async fn list_agent_injected_items(
         tokio::sync::watch::channel(false).1,
     );
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
+    instance.configure_preview_lazy_tool_renderer(
+        selected_model.as_deref(),
+        config.dynamic_tool_loading_mode(),
+        config.base_url.as_deref(),
+    );
 
     Ok(instance.list_injected_prompt_items().await)
 }
@@ -2308,6 +2314,94 @@ pub async fn get_session_usage(
 }
 
 #[tauri::command]
+pub async fn get_session_context_usage_report(
+    session_id: String,
+    model_id: Option<String>,
+    knowledge_mode: Option<String>,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    registry: State<'_, AgentDefRegistryState>,
+    tool_registry: State<'_, Arc<ToolRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+    auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
+    api_key_state: State<'_, ApiKeyState>,
+    codex: State<'_, CodexAuthStateHandle>,
+    workspace: State<'_, Arc<Workspace>>,
+    raw_store: State<'_, RawContextStore>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<crate::commands::SessionContextUsageReport, AppError> {
+    let detail = store.load_session(&session_id)?;
+    let registry_snapshot = registry.snapshot().await;
+    let def = detail
+        .agent_id
+        .as_deref()
+        .map(canonical_agent_id)
+        .and_then(|agent_id| registry_snapshot.get(agent_id).cloned())
+        .or_else(|| registry_snapshot.default_def().cloned())
+        .ok_or_else(|| "No agent definitions found".to_string())?;
+    let selected_model = model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(detail.last_model_id.as_deref())
+        .ok_or_else(|| "This session has no model usage yet".to_string())?
+        .to_string();
+    let backend = resolve_model_backend(
+        &app_handle,
+        &def,
+        &selected_model,
+        config.inner().as_ref(),
+        auth.inner(),
+        api_key_state.inner(),
+        codex.inner(),
+    )
+    .await?;
+    let working_dir = workspace.path.read().await.clone();
+    let workspace_id = if working_dir.trim().is_empty() {
+        None
+    } else {
+        workspace.workspace_id.read().await.clone()
+    };
+    let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
+        .map_err(|error| AppError::new("session.invalid_knowledge_mode", error))?;
+    let prompt_messages = store.get_messages_for_prompt(&session_id)?;
+    let session_messages = store.get_messages(&session_id)?;
+    let usage = store.get_token_usage(&session_id)?;
+
+    let mut instance = AgentInstance::new(
+        Arc::new(def),
+        &session_id,
+        backend,
+        config.debug_enabled(),
+        registry_snapshot,
+        tool_registry.inner().clone(),
+        working_dir,
+        raw_store.inner().clone(),
+        workspace_id,
+        selected_model,
+        detail.last_effort,
+        app_knowledge_dir.0.clone(),
+        app_agent_dir.0.clone(),
+        knowledge_access_mode,
+        None,
+        HashMap::new(),
+        tokio::sync::watch::channel(false).1,
+    );
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
+
+    Ok(instance
+        .session_context_usage_report(
+            &app_handle,
+            &prompt_messages,
+            &session_messages,
+            detail.title,
+            usage,
+        )
+        .await)
+}
+
+#[tauri::command]
 pub async fn get_model_usage_stats(
     days: Option<u32>,
     store: State<'_, Arc<SessionStore>>,
@@ -2394,6 +2488,7 @@ fn emit_cancelled_session_run(
 
 async fn request_descendant_cancellations(
     root_session_id: &str,
+    app_handle: &AppHandle,
     store: &SessionStore,
     active_tasks: &ActiveTasks,
 ) {
@@ -2417,6 +2512,11 @@ async fn request_descendant_cancellations(
         .map(|run| (run.session_id.clone(), run.run_id.clone()))
         .collect();
 
+    let async_tasks = app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
+    for run in &descendant_runs {
+        async_tasks.cancel_session(&run.session_id);
+    }
+
     for run in &descendant_runs {
         if let Err(error) = store.update_run_status(
             &run.run_id,
@@ -2437,6 +2537,7 @@ async fn request_descendant_cancellations(
                 let _ = task.cancel_tx.send(true);
             }
         }
+        crate::process_util::terminate_managed_processes_for_session(&session_id);
     }
 }
 
@@ -2508,6 +2609,9 @@ pub async fn cancel_chat(
     store: State<'_, Arc<SessionStore>>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<(), AppError> {
+    let async_tasks = app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
+    async_tasks.cancel_session(&session_id);
+
     let graceful_wait = {
         let tasks = active_tasks.lock().await;
         tasks.get(&session_id).map(|task| {
@@ -2515,6 +2619,7 @@ pub async fn cancel_chat(
             (task.run_id.clone(), task.done_rx.clone())
         })
     };
+    crate::process_util::terminate_managed_processes_for_session(&session_id);
 
     let Some((run_id, mut done_rx)) = graceful_wait else {
         finish_cancelled_descendant_runs(
@@ -2538,8 +2643,13 @@ pub async fn cancel_chat(
         return Ok(());
     }
 
-    request_descendant_cancellations(&session_id, store.inner().as_ref(), active_tasks.inner())
-        .await;
+    request_descendant_cancellations(
+        &session_id,
+        &app_handle,
+        store.inner().as_ref(),
+        active_tasks.inner(),
+    )
+    .await;
 
     if let Err(error) = store.update_run_status(
         &run_id,

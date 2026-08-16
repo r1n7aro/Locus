@@ -226,9 +226,7 @@ pub fn export_session_context_yaml(
             "updatedAtUnix": detail.updated_at,
             "updatedAt": format_timestamp(detail.updated_at),
         });
-        let token_usage = usage
-            .and_then(|value| serde_json::to_value(value).ok())
-            .unwrap_or_else(empty_value);
+        let token_usage = usage.map(export_token_usage).unwrap_or_else(empty_value);
         let todos = todos
             .and_then(|value| serde_json::to_value(value).ok())
             .unwrap_or_else(empty_value);
@@ -339,7 +337,10 @@ pub fn export_session_context_yaml(
     };
 
     let unhashed = serialize_document(&document)?;
-    document.integrity.content_hash = format!("{:x}", Sha256::digest(unhashed.as_bytes()));
+    document.integrity.content_hash = Sha256::digest(unhashed.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let yaml = serialize_document(&document)?;
     write_atomic(file_path, yaml.as_bytes())?;
 
@@ -388,6 +389,30 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
         "knowledgeProposal": optional_json(message.knowledge_proposal)?,
         "renderParts": optional_json(message.render_parts)?,
     }))
+}
+
+fn export_token_usage(usage: crate::commands::TokenUsage) -> Value {
+    let has_output_timing = usage.timed_output_tokens > 0 && usage.model_active_duration_ms > 0;
+    json!({
+        "totalInputTokens": usage.total_input_tokens,
+        "totalOutputTokens": usage.total_output_tokens,
+        "totalCacheReadTokens": usage.total_cache_read_tokens,
+        "totalCacheWriteTokens": usage.total_cache_write_tokens,
+        "timedOutputTokens": if has_output_timing {
+            Value::from(usage.timed_output_tokens)
+        } else {
+            empty_value()
+        },
+        "modelActiveDurationMs": if has_output_timing {
+            Value::from(usage.model_active_duration_ms)
+        } else {
+            empty_value()
+        },
+        "totalCostUsd": usage.total_cost_usd,
+        "pricedRounds": usage.priced_rounds,
+        "contextTokens": usage.context_tokens,
+        "contextLimit": usage.context_limit,
+    })
 }
 
 fn export_attempt(attempt: SessionContextAttempt) -> ContextAttemptExport {

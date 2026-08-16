@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { TokenUsage } from "../types";
-import { buildTokenUsageMetrics } from "../components/chat/tokenUsageDisplay";
+import {
+  buildTokenUsageMetrics,
+  calculateAverageOutputTokensPerSecond,
+} from "../components/chat/tokenUsageDisplay";
 
 function makeUsage(overrides: Partial<TokenUsage> = {}): TokenUsage {
   return {
@@ -9,6 +12,8 @@ function makeUsage(overrides: Partial<TokenUsage> = {}): TokenUsage {
     totalOutputTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
+    timedOutputTokens: 0,
+    modelActiveDurationMs: 0,
     totalCostUsd: 0,
     pricedRounds: 0,
     contextTokens: 0,
@@ -18,6 +23,20 @@ function makeUsage(overrides: Partial<TokenUsage> = {}): TokenUsage {
 }
 
 describe("tokenUsageDisplay", () => {
+  it("calculates a weighted session average from timed model calls", () => {
+    expect(calculateAverageOutputTokensPerSecond(makeUsage({
+      totalOutputTokens: 900,
+      timedOutputTokens: 300,
+      modelActiveDurationMs: 6_000,
+    }))).toBe(50);
+  });
+
+  it("keeps historical sessions without timing samples unavailable", () => {
+    expect(calculateAverageOutputTokensPerSecond(makeUsage({
+      totalOutputTokens: 900,
+    }))).toBeNull();
+  });
+
   it("shows input and output when no cache usage exists", () => {
     const metrics = buildTokenUsageMetrics(makeUsage({
       totalInputTokens: 1200,

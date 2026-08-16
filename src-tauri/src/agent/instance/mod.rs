@@ -39,7 +39,7 @@ use crate::session::models::{
     AssistantRenderPart, ChatMessage, ImageData, MessageRole, PendingSessionInput, RenderOrderKey,
     TodoItem, ToolCallInfo,
 };
-use crate::session::store::SessionStore;
+use crate::session::store::{SessionPromptPrefixCache, SessionStore};
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
 
 const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
@@ -53,6 +53,13 @@ use prompt_context::{
 };
 
 const REACTIVE_COMPACT_ATTEMPT_KIND: &str = "reactive_compact";
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 /// Classify a compaction for the UI: manual (user-invoked), auto (preflight
 /// estimate crossed the threshold), or reactive (the request was already sent
@@ -3087,6 +3094,10 @@ struct L3RuleEntry {
     content: String,
 }
 
+fn l3_rule_injection_id(entry: &L3RuleEntry) -> String {
+    format!("knowledge_rule::{}::{}", entry.doc_type, entry.path)
+}
+
 fn build_l3_rule_entries(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
@@ -3148,8 +3159,12 @@ fn build_l3_rule_entries(
 fn build_l3_rule_section(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
+    injection_config: &crate::commands::AgentInjectionConfigLayers,
 ) -> Result<String, String> {
-    let entries = build_l3_rule_entries(working_dir, app_knowledge_dir)?;
+    let entries = build_l3_rule_entries(working_dir, app_knowledge_dir)?
+        .into_iter()
+        .filter(|entry| injection_config.state(&l3_rule_injection_id(entry)).enabled)
+        .collect::<Vec<_>>();
     if entries.is_empty() {
         return Ok(String::new());
     }
@@ -3205,17 +3220,52 @@ fn injected_item_prompt_sort_key(env_template: &str, item_id: &str) -> (u8, usiz
     }
 }
 
+fn injection_item_meta(
+    injection_config: &crate::commands::AgentInjectionConfigLayers,
+    injection_id: &str,
+    meta: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let state = injection_config.state(injection_id);
+    let mut object = meta
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert("enabled".to_string(), serde_json::json!(state.enabled));
+    object.insert("canToggleEnabled".to_string(), serde_json::json!(true));
+    object.insert(
+        "enabledDefault".to_string(),
+        serde_json::json!(state.default_enabled),
+    );
+    object.insert(
+        "enabledOverride".to_string(),
+        serde_json::json!(state.workspace_override),
+    );
+    serde_json::Value::Object(object)
+}
+
 struct SubagentRunResult {
     output: String,
     tool_calls: Vec<ToolCallInfo>,
     is_error: bool,
 }
 
+#[derive(Debug, Clone)]
 struct SystemPromptParts {
     base_prompt: String,
     rules_prompt: String,
     knowledge_prompt: String,
     env_prompt: String,
+}
+
+#[derive(Debug, Clone)]
+struct PromptPrefixCachePolicy {
+    provider_key: String,
+    ttl_seconds: u32,
+}
+
+struct ResolvedSystemPromptParts {
+    parts: SystemPromptParts,
+    policy: PromptPrefixCachePolicy,
+    reused: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3226,6 +3276,109 @@ pub struct AgentSystemPromptStats {
     pub rules_chars: usize,
     pub knowledge_chars: usize,
     pub total_chars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedToolCall {
+    name: String,
+    fallback_output: Option<String>,
+}
+
+fn index_tool_calls(tool_calls: &[ToolCallInfo], indexed: &mut HashMap<String, IndexedToolCall>) {
+    for tool_call in tool_calls {
+        if !tool_call.id.trim().is_empty() {
+            indexed
+                .entry(tool_call.id.clone())
+                .or_insert_with(|| IndexedToolCall {
+                    name: tool_call.name.clone(),
+                    fallback_output: tool_call
+                        .server_tool_output
+                        .clone()
+                        .or_else(|| tool_call.recorded_output.clone()),
+                });
+        }
+        if let Some(nested) = tool_call.nested_tool_calls.as_deref() {
+            index_tool_calls(nested, indexed);
+        }
+    }
+}
+
+fn estimate_session_tool_result_usage(
+    messages: &[ChatMessage],
+) -> Vec<crate::commands::SessionContextToolUsage> {
+    let mut indexed = HashMap::<String, IndexedToolCall>::new();
+    for message in messages {
+        if let Some(tool_calls) = message.tool_calls.as_deref() {
+            index_tool_calls(tool_calls, &mut indexed);
+        }
+    }
+
+    let mut consumed_result_ids = HashSet::<String>::new();
+    let mut usage = BTreeMap::<String, (u32, u32)>::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+    {
+        let tool_call_id = message.tool_call_id.as_deref().unwrap_or_default();
+        let name = indexed
+            .get(tool_call_id)
+            .map(|tool_call| tool_call.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let tokens = compact::estimate_message_prompt_tokens(message);
+        let entry = usage.entry(name).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(tokens);
+        if !tool_call_id.is_empty() {
+            consumed_result_ids.insert(tool_call_id.to_string());
+        }
+    }
+
+    // Provider-side tools can persist their returned payload on the tool call
+    // itself without creating a separate local Tool message. Count that
+    // payload once so the session consumption view covers both storage forms.
+    for (tool_call_id, tool_call) in indexed {
+        if consumed_result_ids.contains(&tool_call_id) {
+            continue;
+        }
+        let Some(output) = tool_call
+            .fallback_output
+            .as_deref()
+            .filter(|output| !output.is_empty())
+        else {
+            continue;
+        };
+        let name = if tool_call.name.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            tool_call.name
+        };
+        let entry = usage.entry(name).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry
+            .1
+            .saturating_add(compact::estimate_text_tokens(output));
+    }
+
+    let mut tools = usage
+        .into_iter()
+        .map(
+            |(name, (call_count, result_tokens))| crate::commands::SessionContextToolUsage {
+                name,
+                call_count,
+                result_tokens,
+            },
+        )
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        right
+            .result_tokens
+            .cmp(&left.result_tokens)
+            .then_with(|| right.call_count.cmp(&left.call_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    tools
 }
 
 // ---------------------------------------------------------------------------
@@ -3362,8 +3515,46 @@ impl AgentInstance {
         Ok((resolved, canonical_root))
     }
 
+    fn read_only_extra_workdir_for_path(working_dir: &str, raw_path: &str) -> Option<String> {
+        if !Self::has_selected_working_dir_value(working_dir) || raw_path.trim().is_empty() {
+            return None;
+        }
+
+        let requested = std::path::Path::new(raw_path.trim());
+        let logical_candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            std::path::Path::new(working_dir).join(requested)
+        };
+        let logical_path = Self::normalize_path_lexically(&logical_candidate);
+        let resolved_path = Self::resolve_workspace_scoped_path(working_dir, raw_path)
+            .ok()
+            .map(|(resolved, _)| resolved);
+
+        crate::extra_workdirs::load_entries(working_dir)
+            .into_iter()
+            .filter(|entry| entry.read_only)
+            .find_map(|entry| {
+                let configured_root = std::path::PathBuf::from(&entry.path);
+                let logical_candidate = if configured_root.is_absolute() {
+                    configured_root
+                } else {
+                    std::path::Path::new(working_dir).join(configured_root)
+                };
+                let logical_root = Self::normalize_path_lexically(&logical_candidate);
+                let canonical_root =
+                    dunce::canonicalize(&logical_root).unwrap_or_else(|_| logical_root.clone());
+                let targets_root = Self::path_is_within_root(&logical_path, &logical_root)
+                    || resolved_path
+                        .as_ref()
+                        .is_some_and(|path| Self::path_is_within_root(path, &canonical_root));
+                targets_root.then_some(entry.path)
+            })
+    }
+
     fn validate_workspace_or_app_bound_path(
         working_dir: &str,
+        app_agent_dir: &Option<std::path::PathBuf>,
         tool_name: &str,
         raw_path: &str,
     ) -> Option<String> {
@@ -3381,6 +3572,14 @@ impl AgentInstance {
         if Self::path_is_within_root(&resolved, &canonical_root) {
             None
         } else {
+            if let Some(app_agent_dir) = app_agent_dir {
+                let user_agent_root = crate::agent::definition::user_agent_dir(app_agent_dir);
+                let canonical_user_agent_root =
+                    dunce::canonicalize(&user_agent_root).unwrap_or(user_agent_root);
+                if Self::path_is_within_root(&resolved, &canonical_user_agent_root) {
+                    return None;
+                }
+            }
             for root in crate::commands::app_skill_package_dirs() {
                 let canonical_skill_root = dunce::canonicalize(&root).unwrap_or(root);
                 if Self::path_is_within_root(&resolved, &canonical_skill_root) {
@@ -3404,7 +3603,7 @@ impl AgentInstance {
                 }
             }
             Some(format!(
-                "Tool '{}' cannot access '{}': direct filesystem tools may only operate within the selected working directory '{}', an attached additional working directory, an app Skill package directory, or the app temp directory.",
+                "Tool '{}' cannot access '{}': direct filesystem tools may only operate within the selected working directory '{}', an attached additional working directory, the user Agent directory, an app Skill package directory, or the app temp directory.",
                 tool_name,
                 raw_path,
                 canonical_root.display()
@@ -3412,8 +3611,25 @@ impl AgentInstance {
         }
     }
 
+    #[cfg(test)]
     fn validate_tool_path_requirements(
         working_dir: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+        enforce_file_workspace_boundary: bool,
+    ) -> Option<String> {
+        Self::validate_tool_path_requirements_with_app_agent_dir(
+            working_dir,
+            &None,
+            tool_name,
+            args,
+            enforce_file_workspace_boundary,
+        )
+    }
+
+    fn validate_tool_path_requirements_with_app_agent_dir(
+        working_dir: &str,
+        app_agent_dir: &Option<std::path::PathBuf>,
         tool_name: &str,
         args: &serde_json::Value,
         enforce_file_workspace_boundary: bool,
@@ -3454,7 +3670,7 @@ impl AgentInstance {
                 return None;
             }
             let value = arg_str(key)?;
-            Self::validate_workspace_or_app_bound_path(working_dir, tool_name, value)
+            Self::validate_workspace_or_app_bound_path(working_dir, app_agent_dir, tool_name, value)
         };
 
         match tool_name {
@@ -3470,7 +3686,7 @@ impl AgentInstance {
                 .or_else(|| require_absolute_without_workspace("project_path")),
             // Code analysis tools read arbitrary files via `file_path`; hold
             // them to the same workspace boundary as read/write/edit. The
-            // unity_yaml_* tools read arbitrary files the same way (and
+            // Unity YAML tools read arbitrary files the same way (and
             // unity_yaml_read echoes non-YAML file content back), so they get
             // the same boundary.
             "code_find_references"
@@ -3478,7 +3694,6 @@ impl AgentInstance {
             | "code_diagnostics"
             | "code_hover"
             | "unity_code_usages"
-            | "unity_yaml_list"
             | "unity_yaml_search"
             | "unity_yaml_read" => {
                 if !has_working_dir {
@@ -3534,6 +3749,42 @@ impl AgentInstance {
             }
             _ => None,
         }
+    }
+
+    fn validate_read_only_extra_workdir_access(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let read_only_root = match tool_name {
+            "write" | "edit" => args
+                .get("filePath")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|path| Self::read_only_extra_workdir_for_path(&self.working_dir, path)),
+            "bash" => {
+                let workdir = args
+                    .get("workdir")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                Self::read_only_extra_workdir_for_path(&self.working_dir, workdir).or_else(|| {
+                    let command = args
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    Self::shell_command_mentions_read_only_extra_workdir(
+                        &self.working_dir,
+                        workdir,
+                        command,
+                    )
+                })
+            }
+            _ => None,
+        }?;
+
+        Some(format!(
+            "Additional working directory '{}' is read-only. Tool '{}' cannot modify or run Bash against this directory; use read, list, or grep instead.",
+            read_only_root, tool_name
+        ))
     }
 
     async fn build_runtime_knowledge_block(
@@ -3823,7 +4074,7 @@ impl AgentInstance {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
-        if Self::is_readonly_tool(tool_name) {
+        if Self::is_readonly_tool_call(tool_name, args) {
             return None;
         }
         match runtime {
@@ -3888,6 +4139,10 @@ impl AgentInstance {
             } else {
                 None
             },
+            process_owner: Some(crate::process_util::ProcessOwner::session(
+                self.session_id.clone(),
+                self.working_dir.clone(),
+            )),
             unity_connected,
             runtime_state: Some(self.tool_runtime_state.clone()),
             cancel_rx: Some(self.cancel_waiter()),
@@ -4032,6 +4287,16 @@ impl AgentInstance {
                 self.default_tool_load_mode(name),
                 ToolLoadMode::Direct | ToolLoadMode::Lazy
             )
+    }
+
+    fn injection_enabled(&self, injection_id: &str) -> bool {
+        crate::commands::load_agent_injection_config_layers(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        )
+        .state(injection_id)
+        .enabled
     }
 
     fn is_tool_enabled(&self, name: &str, overrides: &HashMap<String, bool>) -> bool {
@@ -4362,6 +4627,33 @@ impl AgentInstance {
             .unwrap_or_default()
     }
 
+    pub fn configure_preview_lazy_tool_renderer(
+        &mut self,
+        selected_model: Option<&str>,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        base_url: Option<&str>,
+    ) {
+        if let Some(selected_model) = selected_model
+            .map(str::trim)
+            .filter(|selected_model| !selected_model.is_empty())
+        {
+            self.effective_model = selected_model.to_string();
+        }
+
+        let renderer = if dynamic_mode == crate::config::DynamicToolLoadingMode::Native
+            && self.effective_model.trim().starts_with("openai/")
+            && Self::codex_backend_supports_tool_search(base_url)
+            && Self::codex_model_supports_tool_search(&self.effective_model)
+        {
+            LazyToolRenderer::CodexNative
+        } else {
+            LazyToolRenderer::ToolLoadFallback
+        };
+        if let Ok(mut cached) = self.lazy_tool_renderer.lock() {
+            *cached = renderer;
+        }
+    }
+
     /// Context-window budgets for the active backend/model. Codex models use
     /// the same raw-window/effective-window distinction as codex-rs so their
     /// auto-compaction threshold can be resolved independently.
@@ -4666,8 +4958,10 @@ impl AgentInstance {
             .into_iter()
             .map(|name| {
                 let summary = self
-                    .tool_registry
                     .tool_description(&name)
+                    .map(|(description, parameters)| {
+                        self.contextualize_tool_description(&name, description, parameters)
+                    })
                     .map(|(description, _)| Self::summarize_tool_description(&description))
                     .unwrap_or_default();
                 (name, summary)
@@ -4691,7 +4985,9 @@ impl AgentInstance {
     async fn available_tool_prompt_items(&self) -> Vec<InjectedPromptItem> {
         let direct_overrides = self.tool_direct_load_overrides();
         let enabled_overrides = self.tool_enabled_overrides();
-        let native_renderer_active = self.cached_lazy_tool_renderer().is_native();
+        let lazy_tool_renderer = self.cached_lazy_tool_renderer();
+        let native_renderer_active = lazy_tool_renderer.is_native();
+        let codex_native_tool_search = lazy_tool_renderer == LazyToolRenderer::CodexNative;
         let request_tool_names = self.build_request_tool_names().await;
         let mut direct_tool_names = HashSet::new();
         let mut tool_names = Vec::new();
@@ -4719,6 +5015,9 @@ impl AgentInstance {
 
         tool_names
             .iter()
+            .filter(|name| {
+                !codex_native_tool_search || !matches!(name.as_str(), "tool_load" | "tool_call")
+            })
             .filter_map(|name| self.resolve_api_tool(name))
             .map(|tool| self.contextualize_api_tool(tool))
             .filter_map(|tool| {
@@ -4742,6 +5041,8 @@ impl AgentInstance {
                     ToolLoadMode::Skill => "skill",
                 };
                 let is_built_in_tool = self.tool_registry.is_built_in(&name);
+                let description_overridden =
+                    self.def.tool_description_overrides.contains_key(&name);
                 let mcp_tool = crate::mcp::manager::resolve_wire_tool(&name);
                 let tool_source = if mcp_tool.is_some() {
                     "mcp"
@@ -4791,6 +5092,7 @@ impl AgentInstance {
                         "canToggleEnabled": can_toggle_enabled,
                         "nativeLazy": native_lazy,
                         "toolSource": tool_source,
+                        "descriptionOverridden": description_overridden,
                         "mcpServerId": mcp_tool.as_ref().map(|t| t.server_id.clone()),
                         "mcpServerName": mcp_tool.as_ref().map(|t| t.server_name.clone()),
                         "mcpToolName": mcp_tool.as_ref().map(|t| t.tool_name.clone()),
@@ -4807,6 +5109,20 @@ impl AgentInstance {
 
         let mut items = Vec::new();
         let env_template = self.def.env_template.as_str();
+        let injection_config = crate::commands::load_agent_injection_config_layers(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        );
+
+        items.push(InjectedPromptItem {
+            id: "env".to_string(),
+            title: "env.md".to_string(),
+            kind: "context".to_string(),
+            content: self.def.env_template.clone(),
+            source: "system".to_string(),
+            meta: Some(injection_item_meta(&injection_config, "env", None)),
+        });
 
         if let Some(content) = crate::extra_workdirs::build_env_prompt_block(&self.working_dir) {
             items.push(InjectedPromptItem {
@@ -4815,7 +5131,11 @@ impl AgentInstance {
                 kind: "context".to_string(),
                 content,
                 source: "workspace".to_string(),
-                meta: None,
+                meta: Some(injection_item_meta(
+                    &injection_config,
+                    "extra_workdirs",
+                    None,
+                )),
             });
         }
 
@@ -4823,17 +5143,21 @@ impl AgentInstance {
             if let Ok(rule_entries) =
                 build_l3_rule_entries(&self.working_dir, self.app_knowledge_dir.as_ref().as_ref())
             {
-                items.extend(rule_entries.into_iter().map(|entry| InjectedPromptItem {
-                    id: format!("knowledge_rule::{}::{}", entry.doc_type, entry.path),
-                    title: entry.title,
-                    kind: "rule".to_string(),
-                    content: entry.content,
-                    source: "system".to_string(),
-                    meta: Some(serde_json::json!({
+                items.extend(rule_entries.into_iter().map(|entry| {
+                    let id = l3_rule_injection_id(&entry);
+                    let meta = serde_json::json!({
                         "docType": entry.doc_type.as_str(),
                         "path": entry.path,
                         "injectMode": "rule",
-                    })),
+                    });
+                    InjectedPromptItem {
+                        id: id.clone(),
+                        title: entry.title,
+                        kind: "rule".to_string(),
+                        content: entry.content,
+                        source: "system".to_string(),
+                        meta: Some(injection_item_meta(&injection_config, &id, Some(meta))),
+                    }
                 }));
             }
 
@@ -4850,7 +5174,11 @@ impl AgentInstance {
                         kind: "context".to_string(),
                         content,
                         source: "system".to_string(),
-                        meta: None,
+                        meta: Some(injection_item_meta(
+                            &injection_config,
+                            "knowledge_context",
+                            None,
+                        )),
                     });
                 }
             }
@@ -4864,10 +5192,14 @@ impl AgentInstance {
                 kind: "context".to_string(),
                 content,
                 source: "runtime".to_string(),
-                meta: Some(serde_json::json!({
-                    "toolNames": tool_names,
-                    "loadMode": "lazy_manifest",
-                })),
+                meta: Some(injection_item_meta(
+                    &injection_config,
+                    "lazy_tool_names",
+                    Some(serde_json::json!({
+                        "toolNames": tool_names,
+                        "loadMode": "lazy_manifest",
+                    })),
+                )),
             });
         }
 
@@ -4900,8 +5232,254 @@ impl AgentInstance {
         }
     }
 
+    pub async fn session_context_usage_report(
+        &self,
+        app_handle: &AppHandle,
+        prompt_messages: &[ChatMessage],
+        session_messages: &[ChatMessage],
+        session_title: String,
+        usage: crate::commands::TokenUsage,
+    ) -> crate::commands::SessionContextUsageReport {
+        let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
+        let renderer = self.refresh_lazy_tool_renderer(
+            dynamic_mode,
+            Self::anthropic_native_lazy_enabled_from_app_handle(app_handle),
+        );
+        if dynamic_mode == crate::config::DynamicToolLoadingMode::Direct {
+            self.seed_loaded_tools_from_history(prompt_messages).await;
+        }
+        self.clear_document_skill_tool_names();
+        self.seed_active_skill_package_runtimes_from_history(prompt_messages);
+        if renderer.is_native() {
+            self.seed_native_skill_activations_from_history(renderer, prompt_messages)
+                .await;
+        }
+
+        let prompt_parts = self.build_system_prompt_parts().await;
+        let prepared_messages = compact::prepare_messages_for_llm(prompt_messages);
+        let prepared_tools = self
+            .prepare_request_tools(renderer, dynamic_mode, &HashSet::new())
+            .await;
+
+        let system_prompt_tokens =
+            compact::estimate_system_prompt_part_tokens(&prompt_parts.base_prompt);
+        let rules_tokens = compact::estimate_system_prompt_part_tokens(&prompt_parts.rules_prompt);
+        let knowledge_tokens =
+            compact::estimate_system_prompt_part_tokens(&prompt_parts.knowledge_prompt);
+
+        let environment_tokens = prompt_messages
+            .iter()
+            .map(|message| {
+                compact::estimate_text_tokens(message.prompt_prefix.as_deref().unwrap_or_default())
+            })
+            .fold(0u32, u32::saturating_add);
+        let runtime_injection_tokens = prompt_messages
+            .iter()
+            .map(|message| {
+                compact::estimate_text_tokens(message.prompt_suffix.as_deref().unwrap_or_default())
+            })
+            .fold(0u32, u32::saturating_add);
+        let prepared_message_tokens = prepared_messages
+            .iter()
+            .map(compact::estimate_message_prompt_tokens)
+            .fold(0u32, u32::saturating_add);
+        let active_tool_result_tokens = prepared_messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(compact::estimate_message_prompt_tokens)
+            .fold(0u32, u32::saturating_add);
+        let conversation_tokens = prepared_message_tokens.saturating_sub(
+            environment_tokens
+                .saturating_add(runtime_injection_tokens)
+                .saturating_add(active_tool_result_tokens),
+        );
+        let tool_definition_tokens = prepared_tools
+            .api_tools
+            .iter()
+            .map(compact::estimate_api_tool_prompt_tokens)
+            .fold(0u32, u32::saturating_add);
+        let breakdown = crate::commands::SessionContextBreakdown {
+            system_prompt_tokens,
+            environment_tokens,
+            rules_tokens,
+            knowledge_tokens,
+            runtime_injection_tokens,
+            conversation_tokens,
+            tool_definition_tokens,
+            active_tool_result_tokens,
+        };
+        let raw_estimated_context_tokens = system_prompt_tokens
+            .saturating_add(environment_tokens)
+            .saturating_add(rules_tokens)
+            .saturating_add(knowledge_tokens)
+            .saturating_add(runtime_injection_tokens)
+            .saturating_add(conversation_tokens)
+            .saturating_add(tool_definition_tokens)
+            .saturating_add(active_tool_result_tokens);
+        // Keep the detail window aligned with the ring's provider-reported
+        // occupancy. A locally estimated growth after the last completed
+        // request may raise the current value further.
+        let context_tokens = raw_estimated_context_tokens.max(usage.context_tokens);
+        let tools = estimate_session_tool_result_usage(session_messages);
+
+        let runtime_context_limit = self.context_limit();
+
+        crate::commands::SessionContextUsageReport {
+            session_id: self.session_id.clone(),
+            session_title,
+            agent_id: self.def.id.clone(),
+            model_id: self.effective_model.clone(),
+            context_tokens,
+            context_limit: if usage.context_limit > 0 {
+                usage.context_limit
+            } else {
+                runtime_context_limit
+            },
+            raw_estimated_context_tokens,
+            reported_context_tokens: usage.context_tokens,
+            breakdown,
+            tools,
+            usage,
+        }
+    }
+
     pub async fn rendered_env_prompt(&self) -> String {
         self.build_system_prompt_parts().await.env_prompt
+    }
+
+    fn prompt_prefix_cache_policy(&self) -> PromptPrefixCachePolicy {
+        let default_ttl = crate::commands::DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS;
+        match &self.backend {
+            LlmBackend::Mock { .. } => PromptPrefixCachePolicy {
+                provider_key: "mock".to_string(),
+                ttl_seconds: 0,
+            },
+            LlmBackend::OpenRouter { base_url, .. } => PromptPrefixCachePolicy {
+                provider_key: format!("openrouter:{}", base_url.as_deref().unwrap_or("default")),
+                ttl_seconds: default_ttl,
+            },
+            LlmBackend::Anthropic { base_url, .. } => PromptPrefixCachePolicy {
+                provider_key: format!("anthropic:{}", base_url.as_deref().unwrap_or("default")),
+                ttl_seconds: default_ttl,
+            },
+            LlmBackend::ClaudeCodeCli => PromptPrefixCachePolicy {
+                provider_key: "claude_code_cli".to_string(),
+                ttl_seconds: default_ttl,
+            },
+            LlmBackend::OpenAiCodex { base_url, .. } => {
+                let ttl_seconds = crate::commands::load_codex_model_config()
+                    .map(|config| config.prefix_cache_ttl_seconds)
+                    .unwrap_or(crate::commands::DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS);
+                PromptPrefixCachePolicy {
+                    provider_key: format!(
+                        "openai_codex:{}",
+                        base_url.as_deref().unwrap_or("default")
+                    ),
+                    ttl_seconds,
+                }
+            }
+            LlmBackend::Custom {
+                endpoint,
+                api_format,
+                ..
+            } => {
+                let provider_id = self
+                    .effective_model
+                    .strip_prefix("custom/")
+                    .and_then(|rest| rest.split('/').next())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("unknown");
+                let ttl_seconds =
+                    crate::commands::find_custom_provider_model(&self.effective_model)
+                        .ok()
+                        .flatten()
+                        .map(|(provider, _)| provider.prefix_cache_ttl_seconds)
+                        .unwrap_or(default_ttl);
+                PromptPrefixCachePolicy {
+                    provider_key: format!("custom:{provider_id}:{api_format:?}:{endpoint}"),
+                    ttl_seconds,
+                }
+            }
+        }
+    }
+
+    async fn resolve_system_prompt_parts(
+        &self,
+        store: &SessionStore,
+    ) -> Result<ResolvedSystemPromptParts, String> {
+        let policy = self.prompt_prefix_cache_policy();
+        let now = current_unix_seconds();
+        if let Some(cache) = store.fresh_prompt_prefix_cache(
+            &self.session_id,
+            &policy.provider_key,
+            policy.ttl_seconds,
+            now,
+        )? {
+            eprintln!(
+                "[Agent {}] prompt-prefix cache hit: session={} provider={} ttl_seconds={} synthesized_at={} last_remote_response_at={:?}",
+                self.id,
+                self.session_id,
+                policy.provider_key,
+                policy.ttl_seconds,
+                cache.synthesized_at,
+                cache.last_remote_response_at
+            );
+            return Ok(ResolvedSystemPromptParts {
+                parts: SystemPromptParts {
+                    base_prompt: cache.base_prompt,
+                    rules_prompt: cache.rules_prompt,
+                    knowledge_prompt: cache.knowledge_prompt,
+                    env_prompt: cache.env_prompt,
+                },
+                policy,
+                reused: true,
+            });
+        }
+
+        let parts = self.build_system_prompt_parts().await;
+        if policy.ttl_seconds > 0 {
+            store.replace_prompt_prefix_cache(
+                &self.session_id,
+                &SessionPromptPrefixCache {
+                    provider_key: policy.provider_key.clone(),
+                    base_prompt: parts.base_prompt.clone(),
+                    rules_prompt: parts.rules_prompt.clone(),
+                    knowledge_prompt: parts.knowledge_prompt.clone(),
+                    env_prompt: parts.env_prompt.clone(),
+                    synthesized_at: now,
+                    last_remote_response_at: None,
+                },
+            )?;
+        }
+        eprintln!(
+            "[Agent {}] prompt-prefix cache refresh: session={} provider={} ttl_seconds={}",
+            self.id, self.session_id, policy.provider_key, policy.ttl_seconds
+        );
+        Ok(ResolvedSystemPromptParts {
+            parts,
+            policy,
+            reused: false,
+        })
+    }
+
+    fn mark_prompt_prefix_remote_response(
+        &self,
+        store: &SessionStore,
+        policy: &PromptPrefixCachePolicy,
+    ) {
+        if policy.ttl_seconds == 0 {
+            return;
+        }
+        if let Err(error) = store.mark_prompt_prefix_remote_response(
+            &self.session_id,
+            &policy.provider_key,
+            current_unix_seconds(),
+        ) {
+            eprintln!(
+                "[Agent {}] failed to refresh prompt-prefix cache timestamp: session={} provider={} error={}",
+                self.id, self.session_id, policy.provider_key, error
+            );
+        }
     }
 
     fn knowledge_query_lexical_only_description() -> &'static str {
@@ -4952,12 +5530,38 @@ impl AgentInstance {
         let (description, mut parameters) = contextualized;
         if self.async_tasks_enabled && crate::async_tasks::supports_async_mode(name) {
             let mut tool = serde_json::json!({
-                "function": { "parameters": parameters }
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
             });
             crate::async_tasks::augment_tool_schema(name, &mut tool);
-            parameters = tool["function"]["parameters"].take();
+            self.def.apply_tool_description_override(name, &mut tool);
+            let function = &mut tool["function"];
+            let description = function["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            parameters = function["parameters"].take();
+            return (description, parameters);
         }
-        (description, parameters)
+        let mut tool = serde_json::json!({
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            }
+        });
+        self.def.apply_tool_description_override(name, &mut tool);
+        let function = &mut tool["function"];
+        (
+            function["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            function["parameters"].take(),
+        )
     }
 
     fn contextualize_api_tool(&self, mut tool: serde_json::Value) -> serde_json::Value {
@@ -5002,6 +5606,7 @@ impl AgentInstance {
         if self.async_tasks_enabled {
             crate::async_tasks::augment_tool_schema(&name, &mut tool);
         }
+        self.def.apply_tool_description_override(&name, &mut tool);
         tool
     }
 
@@ -5028,25 +5633,28 @@ impl AgentInstance {
             // The env-prompt manifest is withdrawn on this path; the deferred
             // catalog rides on tool_load's description instead (stable per
             // configuration, so the tools prefix does not wobble).
-            if let Some(manifest) = self.native_tool_load_manifest_section().await {
-                for tool in tools.iter_mut() {
-                    let is_tool_load = tool
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        == Some("tool_load");
-                    if !is_tool_load {
-                        continue;
-                    }
-                    if let Some(description) = tool
-                        .get_mut("function")
-                        .and_then(|f| f.get_mut("description"))
-                    {
-                        if let Some(text) = description.as_str() {
-                            *description = serde_json::json!(format!("{}\n\n{}", text, manifest));
+            if self.injection_enabled("lazy_tool_names") {
+                if let Some(manifest) = self.native_tool_load_manifest_section().await {
+                    for tool in tools.iter_mut() {
+                        let is_tool_load = tool
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some("tool_load");
+                        if !is_tool_load {
+                            continue;
                         }
+                        if let Some(description) = tool
+                            .get_mut("function")
+                            .and_then(|f| f.get_mut("description"))
+                        {
+                            if let Some(text) = description.as_str() {
+                                *description =
+                                    serde_json::json!(format!("{}\n\n{}", text, manifest));
+                            }
+                        }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -5076,8 +5684,10 @@ impl AgentInstance {
         ];
         for name in tool_names {
             let summary = self
-                .tool_registry
                 .tool_description(&name)
+                .map(|(description, parameters)| {
+                    self.contextualize_tool_description(&name, description, parameters)
+                })
                 .map(|(description, _)| Self::summarize_tool_description(&description))
                 .unwrap_or_default();
             if summary.is_empty() {
@@ -5231,6 +5841,11 @@ impl AgentInstance {
     async fn build_system_prompt_parts(&self) -> SystemPromptParts {
         let started_at = Instant::now();
         let has_working_dir = self.has_selected_working_dir();
+        let injection_config = crate::commands::load_agent_injection_config_layers(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        );
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
         let shell = crate::tool::builtins::shell_display_name().to_string();
@@ -5317,7 +5932,12 @@ impl AgentInstance {
             physics_config.len()
         );
 
-        let mut env = self.def.env_template.clone();
+        let source_env_template = self.def.env_template.clone();
+        let mut env = if injection_config.state("env").enabled {
+            source_env_template.clone()
+        } else {
+            String::new()
+        };
 
         env = env.replace("<os>", &os);
         env = env.replace("<arch>", &arch);
@@ -5409,12 +6029,17 @@ impl AgentInstance {
 
         remove_block(&mut env, "skills");
 
-        let include_index = env.contains("{{#knowledge_index}}");
-        let include_memory = env.contains("{{#knowledge_memory}}");
+        let include_index = source_env_template.contains("{{#knowledge_index}}");
+        let include_memory = source_env_template.contains("{{#knowledge_memory}}");
         let mut knowledge_prompt = String::new();
-        let include_knowledge = env.contains("{{#knowledge}}") || include_index || include_memory;
+        let include_knowledge =
+            source_env_template.contains("{{#knowledge}}") || include_index || include_memory;
         let knowledge_started_at = Instant::now();
-        if has_working_dir && include_knowledge && self.knowledge_access_mode.allows_context() {
+        if has_working_dir
+            && include_knowledge
+            && self.knowledge_access_mode.allows_context()
+            && injection_config.state("knowledge_context").enabled
+        {
             if let Some(knowledge_block) = self
                 .build_runtime_knowledge_block(include_index, include_memory)
                 .await
@@ -5501,25 +6126,32 @@ impl AgentInstance {
         }
 
         if has_working_dir {
-            if let Some(extra_workdirs_block) =
-                crate::extra_workdirs::build_env_prompt_block(&self.working_dir)
-            {
-                env.push_str("\n\n");
-                env.push_str(&extra_workdirs_block);
+            if injection_config.state("extra_workdirs").enabled {
+                if let Some(extra_workdirs_block) =
+                    crate::extra_workdirs::build_env_prompt_block(&self.working_dir)
+                {
+                    env.push_str("\n\n");
+                    env.push_str(&extra_workdirs_block);
+                }
             }
         }
 
         // Native renderers withdraw the env manifest: the deferred catalog
         // rides on the tool declarations themselves (tool_load description /
         // tool_search declaration), removing this system-prompt wobble source.
-        if has_working_dir && !self.cached_lazy_tool_renderer().is_native() {
+        if has_working_dir
+            && !self.cached_lazy_tool_renderer().is_native()
+            && injection_config.state("lazy_tool_names").enabled
+        {
             if let Some(lazy_tool_manifest) = self.lazy_tool_manifest_prompt().await {
                 env.push_str("\n\n");
                 env.push_str(&lazy_tool_manifest);
             }
         }
 
-        if self.cached_lazy_tool_renderer() == LazyToolRenderer::CodexNative {
+        if self.cached_lazy_tool_renderer() == LazyToolRenderer::CodexNative
+            && injection_config.state("lazy_tool_names").enabled
+        {
             env.push_str("\n\n## Deferred Tool Loading\n\n");
             env.push_str(CODEX_TOOL_SEARCH_EXACT_NAME_GUIDANCE);
         }
@@ -5557,6 +6189,7 @@ impl AgentInstance {
                 if let Ok(l3_rules) = build_l3_rule_section(
                     &self.working_dir,
                     self.app_knowledge_dir.as_ref().as_ref(),
+                    &injection_config,
                 ) {
                     if !l3_rules.trim().is_empty() {
                         sections.push(l3_rules);
@@ -6405,6 +7038,87 @@ impl AgentInstance {
             }
         }
         false
+    }
+
+    fn relative_shell_path(from: &std::path::Path, target: &std::path::Path) -> Option<String> {
+        let from_norm = Self::normalize_path_for_compare(from);
+        let target_norm = Self::normalize_path_for_compare(target);
+        let from_absolute = from_norm.starts_with('/')
+            || from_norm
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':');
+        let target_absolute = target_norm.starts_with('/')
+            || target_norm
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':');
+        if from_absolute != target_absolute {
+            return None;
+        }
+
+        let from_parts = from_norm
+            .trim_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let target_parts = target_norm
+            .trim_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if from_parts.first().is_some_and(|part| part.ends_with(':'))
+            && from_parts.first() != target_parts.first()
+        {
+            return None;
+        }
+
+        let common = from_parts
+            .iter()
+            .zip(&target_parts)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let mut parts = vec![".."; from_parts.len().saturating_sub(common)];
+        parts.extend(target_parts[common..].iter().copied());
+        (!parts.is_empty()).then(|| parts.join("/"))
+    }
+
+    fn shell_command_mentions_read_only_extra_workdir(
+        working_dir: &str,
+        bash_workdir: &str,
+        command: &str,
+    ) -> Option<String> {
+        if command.trim().is_empty() {
+            return None;
+        }
+        let command_norm = command.replace('\\', "/").to_ascii_lowercase();
+        let workdir = std::path::PathBuf::from(bash_workdir);
+        let canonical_workdir = dunce::canonicalize(&workdir).unwrap_or_else(|_| workdir.clone());
+
+        crate::extra_workdirs::load_entries(working_dir)
+            .into_iter()
+            .filter(|entry| entry.read_only)
+            .find_map(|entry| {
+                let configured_root = std::path::PathBuf::from(&entry.path);
+                let logical_root = if configured_root.is_absolute() {
+                    configured_root
+                } else {
+                    std::path::Path::new(working_dir).join(configured_root)
+                };
+                let canonical_root =
+                    dunce::canonicalize(&logical_root).unwrap_or_else(|_| logical_root.clone());
+                let mentions = [&logical_root, &canonical_root].into_iter().any(|root| {
+                    let root_norm = Self::normalize_path_for_compare(root);
+                    Self::shell_command_mentions_path(&command_norm, &root_norm)
+                        || Self::relative_shell_path(&workdir, root).is_some_and(|relative| {
+                            Self::shell_command_mentions_path(&command_norm, &relative)
+                        })
+                        || Self::relative_shell_path(&canonical_workdir, root).is_some_and(
+                            |relative| Self::shell_command_mentions_path(&command_norm, &relative),
+                        )
+                });
+                mentions.then_some(entry.path)
+            })
     }
 
     fn shell_command_mentions_knowledge_root(
@@ -7802,6 +8516,7 @@ impl AgentInstance {
         run_id: &str,
         response: &LlmCallResult,
         context_limit: u32,
+        model_active_duration_ms: u64,
     ) {
         if response.input_tokens == 0
             && response.output_tokens == 0
@@ -7824,6 +8539,7 @@ impl AgentInstance {
             "compaction",
             response.input_tokens as u64,
             response.output_tokens as u64,
+            model_active_duration_ms,
             response.cache_read_tokens as u64,
             response.cache_write_tokens as u64,
             response.cost_usd,
@@ -7859,6 +8575,8 @@ impl AgentInstance {
                         total_output_tokens: totals.total_output_tokens,
                         total_cache_read_tokens: totals.total_cache_read_tokens,
                         total_cache_write_tokens: totals.total_cache_write_tokens,
+                        timed_output_tokens: totals.timed_output_tokens,
+                        model_active_duration_ms: totals.model_active_duration_ms,
                         total_cost_usd: totals.total_cost_usd,
                         priced_rounds: totals.priced_rounds,
                         // Compact is an internal summarization call; keep the
@@ -8290,6 +9008,7 @@ impl AgentInstance {
                 "[Agent {}] checkpoint summary attempt {}: max_output_tokens={}",
                 self.id, summary_attempt, summary_output_tokens
             );
+            let summary_call_started_at = Instant::now();
             let summary_result = self
                 .call_compact_llm(
                     store,
@@ -8298,6 +9017,11 @@ impl AgentInstance {
                     summary_output_tokens,
                 )
                 .await;
+            let summary_model_active_duration_ms = summary_call_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX))
+                as u64;
             match &summary_result {
                 Ok(response) => {
                     self.record_raw_attempt(
@@ -8349,7 +9073,14 @@ impl AgentInstance {
                     return Err(error);
                 }
             };
-            self.record_compaction_model_usage(app_handle, store, run_id, &response, context_limit);
+            self.record_compaction_model_usage(
+                app_handle,
+                store,
+                run_id,
+                &response,
+                context_limit,
+                summary_model_active_duration_ms,
+            );
 
             if compact::checkpoint_finish_reason_reached_output_limit(&response.finish_reason) {
                 let Some(next_output_tokens) =
@@ -9336,7 +10067,17 @@ impl AgentInstance {
         }
 
         if initial_mode == "compact" {
-            let prompt_parts = self.build_system_prompt_parts().await;
+            let prompt_parts = self.resolve_system_prompt_parts(store).await?.parts;
+            if let Some(first_user_message_id) =
+                store.first_user_message_id(&self.session_id)?
+            {
+                let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
+                store.update_message_prompt_prefix(
+                    &self.session_id,
+                    &first_user_message_id,
+                    env_prompt_prefix.as_deref(),
+                )?;
+            }
             let system_parts: Vec<&str> = {
                 let mut parts = vec![prompt_parts.base_prompt.as_str()];
                 if !prompt_parts.rules_prompt.is_empty() {
@@ -9507,13 +10248,17 @@ impl AgentInstance {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| format!("Failed to serialize user intent: {}", e))?;
-        let prompt_parts = self.build_system_prompt_parts().await;
+        let resolved_prompt_parts = self.resolve_system_prompt_parts(store).await?;
+        let prompt_prefix_cache_policy = resolved_prompt_parts.policy;
+        let prompt_prefix_cache_reused = resolved_prompt_parts.reused;
+        let prompt_parts = resolved_prompt_parts.parts;
         eprintln!(
-            "[Agent {}] prompt parts ready: session={} run={} elapsed_ms={} base_chars={} env_chars={} rules_chars={} knowledge_chars={}",
+            "[Agent {}] prompt parts ready: session={} run={} elapsed_ms={} cache_reused={} base_chars={} env_chars={} rules_chars={} knowledge_chars={}",
             self.id,
             self.session_id,
             run_id,
             prompt_parts_started_at.elapsed().as_millis(),
+            prompt_prefix_cache_reused,
             prompt_parts.base_prompt.len(),
             prompt_parts.env_prompt.len(),
             prompt_parts.rules_prompt.len(),
@@ -9607,7 +10352,7 @@ impl AgentInstance {
                 parts.join("\n\n")
             };
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
-            return self
+            let result = self
                 .run_claude_code_cli(
                     app_handle,
                     store,
@@ -9619,6 +10364,10 @@ impl AgentInstance {
                     &active_skill_tool_names,
                 )
                 .await;
+            if result.is_ok() {
+                self.mark_prompt_prefix_remote_response(store, &prompt_prefix_cache_policy);
+            }
+            return result;
         }
 
         // Filter tools based on gating config
@@ -9891,6 +10640,7 @@ impl AgentInstance {
 
             const LLM_RETRIES: u32 = 2;
             let mut response = None;
+            let mut response_model_active_duration_ms = 0u64;
             let mut response_text_part: Option<RenderPartMark> = None;
             let mut response_thinking_part: Option<RenderPartMark> = None;
             let mut last_llm_error = String::new();
@@ -10118,6 +10868,14 @@ impl AgentInstance {
                         return Ok(String::new());
                     }
                     Some(Ok(resp)) => {
+                        let completed_model_active_duration_ms = llm_call_started_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64;
+                        self.mark_prompt_prefix_remote_response(
+                            store,
+                            &prompt_prefix_cache_policy,
+                        );
                         if let Err(e) = validate_llm_tool_calls(&resp.tool_calls) {
                             let attempt_had_output = attempt_emitted_output.load(Ordering::Relaxed);
                             eprintln!(
@@ -10230,6 +10988,7 @@ impl AgentInstance {
                                     )
                                 });
                         }
+                        response_model_active_duration_ms = completed_model_active_duration_ms;
                         response = Some(resp);
                         break;
                     }
@@ -10430,6 +11189,7 @@ impl AgentInstance {
                     "completion",
                     response.input_tokens as u64,
                     response.output_tokens as u64,
+                    response_model_active_duration_ms,
                     response.cache_read_tokens as u64,
                     response.cache_write_tokens as u64,
                     response.cost_usd,
@@ -10458,6 +11218,8 @@ impl AgentInstance {
                             total_output_tokens: totals.total_output_tokens,
                             total_cache_read_tokens: totals.total_cache_read_tokens,
                             total_cache_write_tokens: totals.total_cache_write_tokens,
+                            timed_output_tokens: totals.timed_output_tokens,
+                            model_active_duration_ms: totals.model_active_duration_ms,
                             total_cost_usd: totals.total_cost_usd,
                             priced_rounds: totals.priced_rounds,
                             context_tokens,
@@ -10635,6 +11397,39 @@ impl AgentInstance {
                         )
                     })
                     .collect();
+
+                // YAML Property Tree calls share one prompt-output budget for
+                // the round.  Parallel reads therefore cannot each consume a
+                // full standalone allowance and flood the next model prompt.
+                const UNITY_PROPERTY_TREE_ROUND_CHARS: usize = 48_000;
+                const UNITY_PROPERTY_TREE_CALL_MAX_CHARS: usize = 16_000;
+                const UNITY_PROPERTY_TREE_CALL_MIN_CHARS: usize = 2_000;
+                let property_tree_call_count = prepared
+                    .iter()
+                    .filter(|(tc, _)| {
+                        matches!(
+                            tc.name.as_str(),
+                            "unity_yaml_read" | "unity_yaml_search"
+                        )
+                    })
+                    .count();
+                if property_tree_call_count > 0 {
+                    let per_call = (UNITY_PROPERTY_TREE_ROUND_CHARS
+                        / property_tree_call_count)
+                        .clamp(
+                            UNITY_PROPERTY_TREE_CALL_MIN_CHARS,
+                            UNITY_PROPERTY_TREE_CALL_MAX_CHARS,
+                        );
+                    for (tc, args) in &mut prepared {
+                        if matches!(
+                            tc.name.as_str(),
+                            "unity_yaml_read" | "unity_yaml_search"
+                        ) {
+                            args["__round_output_char_limit"] =
+                                serde_json::json!(per_call);
+                        }
+                    }
+                }
                 let effective_name = |tc: &ToolCallInfo| {
                     effective_tool_names
                         .get(&tc.id)
@@ -10965,13 +11760,13 @@ impl AgentInstance {
                         && !self.tool_call_runs_in_background(&effective_name(tc), args)
                         && self.tool_call_needs_undo_tracking(&tc.name, args)
                 });
-                let has_unity_execute = prepared.iter().any(|(tc, _)| {
-                    is_active(tc) && Self::is_unity_execute_undo_tool(&effective_name(tc))
+                let has_unity_execute = prepared.iter().any(|(tc, args)| {
+                    is_active(tc) && self.tool_call_is_unity_execute_undo(&tc.name, args)
                 });
                 let has_unity_execution_barrier = prepared.iter().any(|(tc, args)| {
                     is_active(tc)
                         && !self.tool_call_runs_in_background(&effective_name(tc), args)
-                        && Self::is_unity_execution_barrier_tool(&effective_name(tc))
+                        && self.tool_call_has_unity_execution_barrier(&tc.name, args)
                 });
                 let workspace_lock_request = prepared.iter().fold(None, |current, (tc, args)| {
                     if !is_active(tc)
@@ -12065,7 +12860,6 @@ impl AgentInstance {
                 | "unity_get_console_log"
                 | "unity_test_list"
                 | "unity_test_run"
-                | "unity_yaml_list"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
                 // Deliberate: recompile rebuilds scripts and reloads the
@@ -12091,6 +12885,79 @@ impl AgentInstance {
                 | "config_query"
                 | "tool_load"
         )
+    }
+
+    fn bash_is_readonly(args: &serde_json::Value) -> bool {
+        // Preserve the historical writable classification for stored calls
+        // and clients that predate the required `readonly` parameter.
+        args.get("readonly")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn unity_execute_is_readonly(args: &serde_json::Value) -> bool {
+        // Preserve the historical writable classification for stored calls
+        // and clients that predate the required `readonly` parameter.
+        args.get("readonly")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn is_readonly_tool_call(name: &str, args: &serde_json::Value) -> bool {
+        if name == "bash" {
+            return Self::bash_is_readonly(args);
+        }
+        if name == "unity_execute" {
+            return Self::unity_execute_is_readonly(args);
+        }
+        Self::is_readonly_tool(name)
+    }
+
+    fn bash_workdir_targets_primary_workspace(working_dir: &str, args: &serde_json::Value) -> bool {
+        if !Self::has_selected_working_dir_value(working_dir) {
+            return false;
+        }
+
+        let Some(raw_workdir) = args
+            .get("workdir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            // The execution path requires workdir, but legacy or malformed
+            // calls should retain the safe, coordinated default.
+            return true;
+        };
+
+        let primary_root = Self::normalize_path_lexically(std::path::Path::new(working_dir));
+        let requested = std::path::Path::new(raw_workdir);
+        let logical_candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            std::path::Path::new(working_dir).join(requested)
+        };
+        let logical_workdir = Self::normalize_path_lexically(&logical_candidate);
+        if Self::path_is_within_root(&logical_workdir, &primary_root) {
+            return true;
+        }
+
+        let canonical_root =
+            dunce::canonicalize(&primary_root).unwrap_or_else(|_| primary_root.clone());
+        let canonical_workdir =
+            dunce::canonicalize(&logical_workdir).unwrap_or_else(|_| logical_workdir.clone());
+        Self::path_is_within_root(&canonical_workdir, &canonical_root)
+    }
+
+    pub(crate) fn bash_needs_primary_workspace_tracking_for(
+        working_dir: &str,
+        args: &serde_json::Value,
+    ) -> bool {
+        !Self::bash_is_readonly(args)
+            && Self::bash_workdir_targets_primary_workspace(working_dir, args)
+    }
+
+    fn bash_needs_primary_workspace_tracking(&self, args: &serde_json::Value) -> bool {
+        Self::bash_needs_primary_workspace_tracking_for(&self.working_dir, args)
     }
 
     /// Tools whose inputs and effects are independent of a same-round user
@@ -12122,26 +12989,17 @@ impl AgentInstance {
     }
 
     fn tool_call_needs_undo_tracking(&self, name: &str, args: &serde_json::Value) -> bool {
-        // Undo tracking is driven by each tool's `mutates_workspace`
-        // declaration (ToolDef / skill-package manifest), not a central list.
-        if self.tool_registry.mutates_workspace(name) {
-            return true;
+        let (target_name, target_args) = self.workspace_execution_target(name, args);
+        if target_name == "bash" {
+            return self.bash_needs_primary_workspace_tracking(&target_args);
         }
-        if name != "tool_call" {
-            return false;
+        if target_name == "unity_execute" {
+            return !Self::unity_execute_is_readonly(&target_args);
         }
 
-        let Some(target_name) = args
-            .get("toolName")
-            .or_else(|| args.get("tool_name"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return false;
-        };
-
-        self.tool_registry.mutates_workspace(target_name)
+        // Undo tracking for every other tool is driven by its
+        // `mutates_workspace` declaration (ToolDef / skill-package manifest).
+        self.tool_registry.mutates_workspace(&target_name)
     }
 
     fn workspace_execution_target(
@@ -12192,6 +13050,15 @@ impl AgentInstance {
                     .unwrap_or(WorkspaceExecutionLockRequest::Exclusive),
             );
         }
+        if target_name == "bash" {
+            return self
+                .bash_needs_primary_workspace_tracking(&target_args)
+                .then_some(WorkspaceExecutionLockRequest::Exclusive);
+        }
+        if target_name == "unity_execute" {
+            return (!Self::unity_execute_is_readonly(&target_args))
+                .then_some(WorkspaceExecutionLockRequest::Exclusive);
+        }
         if self.tool_registry.mutates_workspace(&target_name)
             || Self::is_unity_execution_barrier_tool(&target_name)
         {
@@ -12238,16 +13105,19 @@ impl AgentInstance {
         args: &serde_json::Value,
         parallel_group_id: &str,
     ) -> Option<WorkspaceExecutionLockRequest> {
-        match name {
+        let (target_name, target_args) = self.workspace_execution_target(name, args);
+        match target_name.as_str() {
             "subagent" => None,
             // An async shell call is an explicit request to detach opaque work.
             // A model tool-call batch shares one re-entrant opaque lease. Bash
             // calls in that batch overlap, while other batches and foreground
             // workspace mutations remain mutually exclusive with the group.
-            "bash" => Some(WorkspaceExecutionLockRequest::ParallelOpaque(
-                parallel_group_id.to_string(),
-            )),
-            _ => self.workspace_execution_request_for_tool(name, args),
+            "bash" => self
+                .bash_needs_primary_workspace_tracking(&target_args)
+                .then(|| {
+                    WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())
+                }),
+            _ => self.workspace_execution_request_for_tool(&target_name, &target_args),
         }
     }
 
@@ -12316,11 +13186,23 @@ impl AgentInstance {
         )
     }
 
-    fn is_unity_execute_undo_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "unity_execute" | "unity_run_states" | "unity_test_list" | "unity_test_run"
-        )
+    fn tool_call_has_unity_execution_barrier(&self, name: &str, args: &serde_json::Value) -> bool {
+        let (target_name, target_args) = self.workspace_execution_target(name, args);
+        Self::is_unity_execution_barrier_tool(&target_name)
+            && !(target_name == "unity_execute" && Self::unity_execute_is_readonly(&target_args))
+    }
+
+    fn is_unity_execute_undo_call(name: &str, args: &serde_json::Value) -> bool {
+        match name {
+            "unity_execute" => !Self::unity_execute_is_readonly(args),
+            "unity_run_states" | "unity_test_list" | "unity_test_run" => true,
+            _ => false,
+        }
+    }
+
+    fn tool_call_is_unity_execute_undo(&self, name: &str, args: &serde_json::Value) -> bool {
+        let (target_name, target_args) = self.workspace_execution_target(name, args);
+        Self::is_unity_execute_undo_call(&target_name, &target_args)
     }
 
     fn confirmation_rejection_result(
@@ -12373,10 +13255,10 @@ impl AgentInstance {
         })
     }
 
-    fn default_tool_requires_confirm(name: &str) -> bool {
+    fn default_tool_requires_confirm(name: &str, args: &serde_json::Value) -> bool {
         match name {
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete" => false,
-            _ => !Self::is_readonly_tool(name),
+            _ => !Self::is_readonly_tool_call(name, args),
         }
     }
 
@@ -12384,6 +13266,7 @@ impl AgentInstance {
         global_mode: &str,
         tool_mode: Option<&str>,
         tool_name: &str,
+        args: &serde_json::Value,
     ) -> bool {
         if Self::normalize_global_permission_mode(global_mode) == PermissionModeSetting::Auto {
             return false;
@@ -12392,7 +13275,7 @@ impl AgentInstance {
         match Self::normalize_tool_permission_mode(tool_mode) {
             Some(PermissionModeSetting::Auto) => false,
             Some(PermissionModeSetting::Ask) => true,
-            _ => Self::default_tool_requires_confirm(tool_name),
+            _ => Self::default_tool_requires_confirm(tool_name, args),
         }
     }
 
@@ -12610,8 +13493,9 @@ impl AgentInstance {
         global_mode: &str,
         tool_mode: Option<&str>,
         tool_name: &str,
+        args: &serde_json::Value,
     ) -> Option<ToolConfirmReason> {
-        Self::permission_requires_confirm(global_mode, tool_mode, tool_name)
+        Self::permission_requires_confirm(global_mode, tool_mode, tool_name, args)
             .then_some(ToolConfirmReason::UserPermission)
     }
 
@@ -12635,11 +13519,14 @@ impl AgentInstance {
         tool_mode: Option<&str>,
         tool_name: &str,
         arguments: &str,
+        args: &serde_json::Value,
         knowledge_preview: Option<KnowledgeToolConfirmPreview>,
         knowledge_governance_requires_confirm: bool,
     ) -> ToolConfirmAssessment {
         let mut reasons = Vec::new();
-        if let Some(reason) = Self::permission_confirm_reason(global_mode, tool_mode, tool_name) {
+        if let Some(reason) =
+            Self::permission_confirm_reason(global_mode, tool_mode, tool_name, args)
+        {
             reasons.push(reason);
         }
         if knowledge_governance_requires_confirm {
@@ -12707,6 +13594,7 @@ impl AgentInstance {
                     "auto_review",
                     response.input_tokens as u64,
                     response.output_tokens as u64,
+                    0,
                     response.cache_read_tokens as u64,
                     response.cache_write_tokens as u64,
                     response.cost_usd,
@@ -13024,6 +13912,7 @@ impl AgentInstance {
             tool_mode.as_deref(),
             tool_name,
             arguments,
+            args,
             knowledge_preview,
             knowledge_governance_requires_confirm,
         );
@@ -13509,7 +14398,12 @@ impl AgentInstance {
             .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
             .inner()
             .clone();
-        let started = manager.create_task(&self.session_id, &tc.name, async_mode.should_notify());
+        let started = manager.create_task_in_workspace(
+            &self.session_id,
+            &tc.name,
+            async_mode.should_notify(),
+            Some(&self.working_dir),
+        );
         let immediate = manager.start_result(&started.task_id);
         let (startup_result_tx, startup_result_rx) = tokio::sync::oneshot::channel();
         let (startup_handled_tx, startup_handled_rx) = tokio::sync::oneshot::channel();
@@ -13524,7 +14418,7 @@ impl AgentInstance {
         let assistant_message_id = assistant_message_id.to_string();
         let session_id = self.session_id.clone();
         let working_dir = self.working_dir.clone();
-        let mutates_workspace = self.tool_registry.mutates_workspace(&tool_name);
+        let mutates_workspace = self.tool_call_needs_undo_tracking(&tool_name, &args);
         let workspace_request = self.background_workspace_execution_request_for_tool(
             &tool_name,
             &args,
@@ -13665,6 +14559,9 @@ impl AgentInstance {
                 let mut context = executor
                     .build_tool_execution_context(&app_handle, &tool_name, &args)
                     .await;
+                if let Some(owner) = context.process_owner.take() {
+                    context.process_owner = Some(owner.with_task_id(task_id.clone()));
+                }
                 context.cancel_rx = Some(cancel_rx.clone());
                 context.progress = Some(progress);
                 context.output = Some(output);
@@ -14076,8 +14973,9 @@ impl AgentInstance {
             .is_some()
         });
         if !plan_file_write_grant && !registered_knowledge_path_grant {
-            if let Some(error) = Self::validate_tool_path_requirements(
+            if let Some(error) = Self::validate_tool_path_requirements_with_app_agent_dir(
                 &self.working_dir,
+                self.app_agent_dir.as_ref(),
                 &tc.name,
                 args,
                 file_workspace_boundary_enabled,
@@ -14087,6 +14985,13 @@ impl AgentInstance {
                     is_error: true,
                 });
             }
+        }
+
+        if let Some(error) = self.validate_read_only_extra_workdir_access(&tc.name, args) {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: error,
+                is_error: true,
+            });
         }
 
         if let Some(error) = self.validate_knowledge_tool_routing(&tc.name, args) {
@@ -14251,13 +15156,6 @@ impl AgentInstance {
             ExecutedToolResult::from_tool_result(Self::execute_unity_ref_search(app_handle, args))
         } else if tc.name == "unity_asset_search" {
             ExecutedToolResult::from_tool_result(Self::execute_unity_asset_search(app_handle, args))
-        } else if tc.name == "unity_yaml_list" {
-            self.await_tool_result(Self::execute_unity_yaml_list(
-                app_handle,
-                &self.working_dir,
-                args,
-            ))
-            .await
         } else if tc.name == "unity_yaml_search" {
             self.await_tool_result(Self::execute_unity_yaml_search(
                 app_handle,
@@ -14282,9 +15180,26 @@ impl AgentInstance {
             } else {
                 None
             };
-            let tool_context = self
+            let mut tool_context = self
                 .build_tool_execution_context(app_handle, &tc.name, args)
                 .await;
+            if tc.name == "bash" {
+                let output_handle = app_handle.clone();
+                let output_run_id = run_id.to_string();
+                let output_session_id = self.session_id.clone();
+                let output_tool_call_id = tc.id.clone();
+                tool_context.output = Some(Arc::new(move |delta| {
+                    emit_stream(
+                        &output_handle,
+                        &output_run_id,
+                        StreamEvent::ToolCallDelta {
+                            session_id: output_session_id.clone(),
+                            tool_call_id: output_tool_call_id.clone(),
+                            delta,
+                        },
+                    );
+                }));
+            }
             let mut result = self
                 .await_tool_result(self.tool_registry.execute_with_context(
                     &tc.name,
@@ -17136,60 +18051,6 @@ impl AgentInstance {
         }
     }
 
-    fn parse_unity_yaml_summary_options(
-        args: &serde_json::Value,
-    ) -> crate::unity_yaml::HierarchySummaryOptions {
-        fn positive_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
-            args.get(key)
-                .and_then(|value| value.as_u64())
-                .filter(|value| *value > 0)
-                .map(|value| value as usize)
-        }
-
-        fn trimmed_string(args: &serde_json::Value, key: &str) -> Option<String> {
-            args.get(key)
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-        }
-
-        fn push_component_filters(out: &mut Vec<String>, value: &str) {
-            out.extend(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(|entry| entry.to_string()),
-            );
-        }
-
-        let mut component_filters = Vec::new();
-        match args.get("component_filter") {
-            Some(serde_json::Value::String(value)) => {
-                push_component_filters(&mut component_filters, value);
-            }
-            Some(serde_json::Value::Array(values)) => {
-                for value in values {
-                    if let Some(text) = value.as_str() {
-                        push_component_filters(&mut component_filters, text);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        crate::unity_yaml::HierarchySummaryOptions {
-            // Upper clamps keep a hallucinated huge value from disabling the
-            // output caps (`max_nodes=1e9` would print an entire mega-scene).
-            max_depth: positive_usize(args, "max_depth").map(|v| v.min(512)),
-            max_nodes: positive_usize(args, "max_nodes").map(|v| v.min(20_000)),
-            query: trimmed_string(args, "query"),
-            component_filters,
-            path_prefix: trimmed_string(args, "path_prefix"),
-        }
-    }
-
     fn parse_unity_yaml_search_options(
         args: &serde_json::Value,
     ) -> crate::unity_yaml::HierarchySearchOptions {
@@ -17306,7 +18167,7 @@ impl AgentInstance {
             if meta.len() > Self::UNITY_YAML_MAX_FILE_BYTES {
                 return Err(ToolResult {
                     output: format!(
-                        "File '{}' is {} MB, above the {} MB unity_yaml tool limit. Use unity_yaml_list/search with path_prefix on a scene, or open the asset in Unity instead.",
+                        "File '{}' is {} MB, above the {} MB Unity YAML tool limit. Use unity_yaml_read on a precise Property Tree path, narrow the scope with unity_yaml_search, or inspect the asset in Unity.",
                         abs_path.display(),
                         meta.len() / (1024 * 1024),
                         Self::UNITY_YAML_MAX_FILE_BYTES / (1024 * 1024)
@@ -17379,6 +18240,394 @@ impl AgentInstance {
                 output: "Missing required parameter: file_path".to_string(),
                 is_error: true,
             })
+    }
+
+    fn unity_property_tree_path_arg(
+        working_dir: &str,
+        args: &serde_json::Value,
+    ) -> Result<crate::unity_serialized_property::property_tree::PropertyTreePath, ToolResult> {
+        let input = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                args.get("file_path")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .ok_or_else(|| ToolResult {
+                output: "Missing required parameter: path".to_string(),
+                is_error: true,
+            })?;
+
+        crate::unity_serialized_property::property_tree::PropertyTreePath::parse(working_dir, input)
+            .map_err(|error| ToolResult {
+                output: error,
+                is_error: true,
+            })
+    }
+
+    fn unity_property_tree_depth(args: &serde_json::Value) -> usize {
+        args.get("depth")
+            .or_else(|| args.get("max_field_depth"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(
+                crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_DEFAULT_DEPTH,
+            )
+            .min(crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_MAX_DEPTH)
+    }
+
+    fn unity_property_tree_output_char_limit(args: &serde_json::Value) -> usize {
+        args.get("__round_output_char_limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(16_000)
+            .clamp(2_000, 16_000)
+    }
+
+    fn unity_property_tree_auto_expand_char_limit(args: &serde_json::Value) -> usize {
+        Self::unity_property_tree_output_char_limit(args).min(
+            crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_AUTO_EXPAND_CHAR_LIMIT,
+        )
+    }
+
+    fn apply_unity_property_tree_output_budget(output: String, args: &serde_json::Value) -> String {
+        let limit = Self::unity_property_tree_output_char_limit(args);
+        if output.chars().count() <= limit {
+            return output;
+        }
+
+        const NOTICE: &str =
+            "… [Property Tree output budget reached; continue with a returned child path]\n";
+        let content_limit = limit.saturating_sub(NOTICE.chars().count());
+        let mut truncated = String::new();
+        for line in output.split_inclusive('\n') {
+            if truncated.chars().count() + line.chars().count() > content_limit {
+                break;
+            }
+            truncated.push_str(line);
+        }
+        if truncated.is_empty() {
+            truncated.extend(output.chars().take(content_limit));
+            if !truncated.ends_with('\n') {
+                truncated.push('\n');
+            }
+        }
+        truncated.push_str(NOTICE);
+        truncated
+    }
+
+    fn render_unity_property_tree_outline(
+        tree: &crate::unity_serialized_property::property_tree::YamlPropertyTree,
+        path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        match tree.read(path, Self::unity_property_tree_depth(args)) {
+            Ok(snapshot) => ToolResult {
+                output: Self::apply_unity_property_tree_output_budget(
+                    crate::unity_serialized_property::property_tree::format_property_tree(
+                        &snapshot,
+                    ),
+                    args,
+                ),
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: error,
+                is_error: true,
+            },
+        }
+    }
+
+    fn load_yaml_property_tree(
+        app_handle: &AppHandle,
+        working_dir: &str,
+        path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
+        use_cache: bool,
+    ) -> Result<Arc<crate::unity_serialized_property::property_tree::YamlPropertyTree>, ToolResult>
+    {
+        if use_cache {
+            if let Some(tree) =
+                crate::unity_serialized_property::property_tree::cached_yaml_property_tree(
+                    &path.absolute_asset_path,
+                )
+            {
+                return Ok(tree);
+            }
+        }
+        let (ref_graph_state, project_root, _) =
+            Self::unity_yaml_project_context(app_handle, working_dir, &path.asset_path);
+        let content = Self::read_unity_yaml_content(&path.absolute_asset_path)?;
+        if !Self::is_unity_yaml_content(&content) {
+            if Self::looks_binary_content(&content) {
+                return Err(Self::binary_asset_error(&path.asset_path));
+            }
+            return Err(ToolResult {
+                output: format!(
+                    "'{}' is not a Unity text-serialized YAML asset.",
+                    path.asset_path
+                ),
+                is_error: true,
+            });
+        }
+
+        let text = String::from_utf8_lossy(&content).into_owned();
+        let docs = crate::unity_yaml::parse_yaml_docs_str(&text);
+        let lines = text.lines().collect::<Vec<_>>();
+        let guid_map =
+            Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines);
+        let guid_paths = guid_map
+            .into_iter()
+            .map(|(guid, asset_path)| {
+                (
+                    crate::asset_db::types::guid_to_hex(&guid).to_ascii_lowercase(),
+                    asset_path,
+                )
+            })
+            .collect();
+
+        let tree = crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
+            &path.asset_path,
+            &text,
+            project_root.as_deref(),
+            &guid_paths,
+        )
+        .map_err(|error| ToolResult {
+            output: error,
+            is_error: true,
+        })?;
+        let tree = Arc::new(tree);
+        if use_cache {
+            crate::unity_serialized_property::property_tree::cache_yaml_property_tree(
+                &path.absolute_asset_path,
+                tree.clone(),
+            );
+        }
+        Ok(tree)
+    }
+
+    async fn execute_unity_property_tree_read(
+        app_handle: &AppHandle,
+        working_dir: &str,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        let path = match Self::unity_property_tree_path_arg(working_dir, args) {
+            Ok(path) => path,
+            Err(result) => return result,
+        };
+        let editor_eligible =
+            path.asset_path.starts_with("Assets/") || path.asset_path.starts_with("Packages/");
+        let auto_expand_limit = Self::unity_property_tree_auto_expand_char_limit(args);
+
+        if editor_eligible {
+            let requested_depth = Self::unity_property_tree_depth(args).max(1);
+            let mut probe_depth = requested_depth;
+            let mut requested_outline: Option<String> = None;
+            loop {
+                match crate::unity_serialized_property::property_tree::read_live_property_tree_with_limits(
+                    working_dir,
+                    &path,
+                    probe_depth,
+                    crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_ARRAY_LIMIT,
+                )
+                .await {
+                    Ok(snapshot) => {
+                        let output = crate::unity_serialized_property::property_tree::format_property_tree(&snapshot);
+                        if requested_outline.is_none() {
+                            requested_outline = Some(output.clone());
+                        }
+                        if crate::unity_serialized_property::property_tree::property_tree_snapshot_is_complete(&snapshot) {
+                            let selected = if output.chars().count() <= auto_expand_limit {
+                                output
+                            } else {
+                                requested_outline.take().unwrap_or(output)
+                            };
+                            return ToolResult {
+                                output: Self::apply_unity_property_tree_output_budget(selected, args),
+                                is_error: false,
+                            };
+                        }
+                        if path.segments.is_empty()
+                            && path.asset_path.to_ascii_lowercase().ends_with(".unity")
+                        {
+                            // The Unity bridge already performed a cheap
+                            // hierarchy-only 4,000-character budget pass. A
+                            // truncated result is therefore the requested
+                            // outline; requesting a deeper scene snapshot
+                            // would only serialize an oversized hierarchy.
+                            return ToolResult {
+                                output: Self::apply_unity_property_tree_output_budget(
+                                    requested_outline.take().unwrap_or(output),
+                                    args,
+                                ),
+                                is_error: false,
+                            };
+                        }
+                        if output.chars().count() > auto_expand_limit
+                            || probe_depth >= crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_COMPLETE_MAX_DEPTH
+                        {
+                            return ToolResult {
+                                output: Self::apply_unity_property_tree_output_budget(
+                                    requested_outline.take().unwrap_or(output),
+                                    args,
+                                ),
+                                is_error: false,
+                            };
+                        }
+                        probe_depth = (probe_depth + 2).min(
+                            crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_COMPLETE_MAX_DEPTH,
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[unity_yaml_read] live LocusBridge PropertyTree unavailable for '{}': {}",
+                            path.full_path(),
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Disk is a strict fallback after the connected Editor path fails.
+        let disk_tree = Self::load_yaml_property_tree(app_handle, working_dir, &path, true);
+        let complete_candidate = disk_tree.as_ref().ok().and_then(|tree| {
+            tree.read_complete_within_budget(&path, auto_expand_limit)
+                .ok()
+                .flatten()
+        });
+        if let Some(candidate) = complete_candidate {
+            return ToolResult {
+                output: candidate.output,
+                is_error: false,
+            };
+        }
+        match disk_tree {
+            Ok(tree) => Self::render_unity_property_tree_outline(&tree, &path, args),
+            Err(result) => result,
+        }
+    }
+
+    fn unity_property_tree_search_options(
+        args: &serde_json::Value,
+    ) -> crate::unity_serialized_property::property_tree::PropertyTreeSearchOptions {
+        let match_fields = match args.get("match_fields") {
+            Some(serde_json::Value::String(value)) => vec![value.clone()],
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        crate::unity_serialized_property::property_tree::PropertyTreeSearchOptions {
+            query: args
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            match_fields,
+            limit: args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(50),
+        }
+    }
+
+    async fn execute_unity_property_tree_search(
+        app_handle: &AppHandle,
+        working_dir: &str,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        let path = match Self::unity_property_tree_path_arg(working_dir, args) {
+            Ok(path) => path,
+            Err(result) => return result,
+        };
+        let options = Self::unity_property_tree_search_options(args);
+        let editor_eligible =
+            path.asset_path.starts_with("Assets/") || path.asset_path.starts_with("Packages/");
+        let mut live_fallback_reason = None;
+        if editor_eligible {
+            match crate::unity_serialized_property::property_tree::search_live_property_tree(
+                working_dir,
+                &path,
+                &options,
+            )
+            .await
+            {
+                Ok(search) => {
+                    let mut output = crate::unity_serialized_property::property_tree::format_property_tree_search_results(
+                        &path.full_path(),
+                        &search.matches,
+                        options.limit,
+                    );
+                    if search.traversal_truncated {
+                        output.push_str(&format!(
+                            "\n... (live Property Tree scan budget reached after {} objects / {} properties; results may be incomplete. Narrow path and search again.)",
+                            search.scanned_objects,
+                            search.scanned_properties,
+                        ));
+                    }
+                    return ToolResult {
+                        output: Self::apply_unity_property_tree_output_budget(output, args),
+                        is_error: false,
+                    };
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[unity_yaml_search] live LocusBridge PropertyTree unavailable for '{}': {}",
+                        path.full_path(),
+                        error
+                    );
+                    live_fallback_reason = Some(error);
+                }
+            }
+        }
+        let mut result =
+            Self::execute_unity_property_tree_search_from_disk(app_handle, working_dir, args);
+        if !result.is_error {
+            if let Some(reason) = live_fallback_reason.as_deref() {
+                result.output = Self::unity_yaml_source_banner(Some(reason)) + &result.output;
+            }
+        }
+        result
+    }
+
+    fn execute_unity_property_tree_search_from_disk(
+        app_handle: &AppHandle,
+        working_dir: &str,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        let path = match Self::unity_property_tree_path_arg(working_dir, args) {
+            Ok(path) => path,
+            Err(result) => return result,
+        };
+        let tree = match Self::load_yaml_property_tree(app_handle, working_dir, &path, false) {
+            Ok(tree) => tree,
+            Err(result) => return result,
+        };
+        let options = Self::unity_property_tree_search_options(args);
+        match tree.search(&path, &options) {
+            Ok(matches) => ToolResult {
+                output: Self::apply_unity_property_tree_output_budget(
+                    crate::unity_serialized_property::property_tree::format_property_tree_search_results(
+                        &path.full_path(),
+                        &matches,
+                        options.limit,
+                    ),
+                    args,
+                ),
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: error,
+                is_error: true,
+            },
+        }
     }
 
     fn unity_yaml_file_extension(abs_path: &std::path::Path) -> String {
@@ -17499,32 +18748,6 @@ impl AgentInstance {
             output: output.trim_end().to_string(),
             is_error: false,
         })
-    }
-
-    fn unity_yaml_list_editor_payload(
-        file_path_arg: &str,
-        options: &crate::unity_yaml::HierarchySummaryOptions,
-    ) -> serde_json::Value {
-        let mut payload = serde_json::json!({ "file_path": file_path_arg });
-        if let Some(path_prefix) = options.path_prefix.as_deref() {
-            payload["path_prefix"] = serde_json::json!(path_prefix);
-        }
-        if let Some(max_depth) = options.max_depth {
-            payload["max_depth"] = serde_json::json!(max_depth);
-        }
-        if let Some(max_nodes) = options.max_nodes {
-            payload["max_nodes"] = serde_json::json!(max_nodes);
-        }
-        // Not in the public list schema, but the parse layer accepts these
-        // and the disk fallback honors them — forward them so both paths
-        // behave identically if a caller supplies them anyway.
-        if let Some(query) = options.query.as_deref() {
-            payload["query"] = serde_json::json!(query);
-        }
-        if !options.component_filters.is_empty() {
-            payload["component_filter"] = serde_json::json!(options.component_filters.join(","));
-        }
-        payload
     }
 
     fn unity_yaml_search_editor_payload(
@@ -17663,101 +18886,6 @@ impl AgentInstance {
         }
     }
 
-    pub(crate) async fn execute_unity_yaml_list(
-        app_handle: &AppHandle,
-        working_dir: &str,
-        args: &serde_json::Value,
-    ) -> ToolResult {
-        use crate::unity_yaml as yaml_parser;
-
-        let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
-        let summary_options = Self::parse_unity_yaml_summary_options(args);
-        let (ref_graph_state, _project_root, abs_path) =
-            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
-        let mut live_fallback_reason: Option<String> = None;
-        if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
-            let payload = Self::unity_yaml_list_editor_payload(&file_path_arg, &summary_options);
-            match Self::try_unity_yaml_editor_tool(working_dir, "list_yaml", payload).await {
-                Ok(result) => return result,
-                Err(err) => {
-                    eprintln!(
-                        "[unity_yaml_list] Unity plugin path unavailable for '{}': {}",
-                        file_path_arg, err
-                    );
-                    live_fallback_reason = Some(err);
-                }
-            }
-        }
-
-        let content = match Self::read_unity_yaml_content(&abs_path) {
-            Ok(content) => content,
-            Err(result) => return result,
-        };
-        if !Self::is_unity_yaml_content(&content) {
-            if Self::looks_binary_content(&content) {
-                return Self::binary_asset_error(&file_path_arg);
-            }
-            return ToolResult {
-                output: format!(
-                    "unity_yaml_list only supports Unity text-serialized .unity/.prefab YAML files. '{}' does not look like Unity YAML.",
-                    file_path_arg
-                ),
-                is_error: true,
-            };
-        }
-
-        let ext = Self::unity_yaml_file_extension(&abs_path);
-        if !yaml_parser::is_hierarchical_file(&ext) {
-            return ToolResult {
-                output: format!(
-                    "unity_yaml_list only supports scene/prefab hierarchy files. Use unity_yaml_read for '{}'.",
-                    file_path_arg
-                ),
-                is_error: true,
-            };
-        }
-
-        let text = String::from_utf8_lossy(&content);
-        let docs = yaml_parser::parse_yaml_docs_str(&text);
-        let lines: Vec<&str> = text.lines().collect();
-        let tree = yaml_parser::build_go_tree(&docs);
-        if tree.is_empty() {
-            return ToolResult {
-                output: format!(
-                    "No GameObjects found in '{}'. The file may be empty or not a scene/prefab.",
-                    file_path_arg
-                ),
-                is_error: false,
-            };
-        }
-
-        let has_prefab_instances = docs.iter().any(|d| d.class_id == 1001 && !d.is_stripped);
-        let guid_map = if has_prefab_instances {
-            Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines)
-        } else {
-            std::collections::HashMap::new()
-        };
-        let guid_resolver =
-            |guid: &crate::asset_db::types::Guid| -> Option<String> { guid_map.get(guid).cloned() };
-
-        let mut output = Self::unity_yaml_source_banner(live_fallback_reason.as_deref());
-        output.push_str(&yaml_parser::format_scene_summary_with_options(
-            &tree,
-            &docs,
-            &lines,
-            &guid_resolver,
-            &file_path_arg,
-            &summary_options,
-        ));
-        ToolResult {
-            output,
-            is_error: false,
-        }
-    }
-
     /// A one-line data-source banner for disk-parse results. When the live
     /// Editor read was attempted and failed, the model needs to know the data
     /// may lag unsaved Editor state.
@@ -17778,6 +18906,10 @@ impl AgentInstance {
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
 
+        if args.get("path").is_some() {
+            return Self::execute_unity_property_tree_search(app_handle, working_dir, args).await;
+        }
+
         let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
             Ok(value) => value,
             Err(result) => return result,
@@ -17785,7 +18917,7 @@ impl AgentInstance {
         let search_options = Self::parse_unity_yaml_search_options(args);
         if !search_options.has_search_filters() {
             return ToolResult {
-                output: "unity_yaml_search requires query or component_filter. Use unity_yaml_list to inspect a subtree without a search filter.".to_string(),
+                output: "unity_yaml_search requires query or component_filter. Use unity_yaml_read with an asset-qualified path to inspect a subtree without a search filter.".to_string(),
                 is_error: true,
             };
         }
@@ -17845,13 +18977,19 @@ impl AgentInstance {
 
         let ext = Self::unity_yaml_file_extension(&abs_path);
         if !yaml_parser::is_hierarchical_file(&ext) {
-            return ToolResult {
-                output: format!(
-                    "unity_yaml_search only supports scene/prefab hierarchy files. Use unity_yaml_read for '{}'.",
-                    file_path_arg
-                ),
-                is_error: true,
-            };
+            let mut property_args = args.clone();
+            let scoped_path = search_options
+                .path_prefix
+                .as_deref()
+                .map(|prefix| format!("{}/{}", file_path_arg.trim_end_matches('/'), prefix))
+                .unwrap_or_else(|| file_path_arg.clone());
+            property_args["path"] = serde_json::Value::String(scoped_path);
+            return Self::execute_unity_property_tree_search(
+                app_handle,
+                working_dir,
+                &property_args,
+            )
+            .await;
         }
 
         let text = String::from_utf8_lossy(&content);
@@ -17899,6 +19037,10 @@ impl AgentInstance {
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
 
+        if args.get("path").is_some() {
+            return Self::execute_unity_property_tree_read(app_handle, working_dir, args).await;
+        }
+
         let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
             Ok(value) => value,
             Err(result) => return result,
@@ -17931,9 +19073,16 @@ impl AgentInstance {
         let ext = Self::unity_yaml_file_extension(&abs_path);
         let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
 
+        if !is_hierarchical {
+            let mut property_args = args.clone();
+            property_args["path"] = serde_json::Value::String(file_path_arg.clone());
+            return Self::execute_unity_property_tree_read(app_handle, working_dir, &property_args)
+                .await;
+        }
+
         if is_hierarchical && object_path.is_none() {
             return ToolResult {
-                output: "unity_yaml_read requires object_path for .unity/.prefab files. Use unity_yaml_list for hierarchy listing or unity_yaml_search to locate a target.".to_string(),
+                output: "unity_yaml_read requires object_path for this legacy .unity/.prefab request. Use the asset-qualified path parameter to read the hierarchy, or unity_yaml_search to locate a target.".to_string(),
                 is_error: true,
             };
         }
@@ -18048,7 +19197,7 @@ impl AgentInstance {
                 None => {
                     let roots: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
                     let slash_hint = if obj_path.split('/').count() > 1 {
-                        " Note: GameObject names containing '/' cannot be addressed through object_path (the '/' is read as a hierarchy separator); names are shown verbatim inside ⟦ ⟧ in unity_yaml_list output."
+                        " Note: GameObject names containing '/' cannot be addressed through legacy object_path syntax because '/' is a hierarchy separator. Use the asset-qualified Property Tree path syntax, where '~1' escapes '/' inside one segment."
                     } else {
                         ""
                     };
@@ -18954,17 +20103,7 @@ impl AgentInstance {
                         || child_usage.total_cache_read_tokens > 0
                         || child_usage.total_cache_write_tokens > 0
                     {
-                        match store.record_token_usage(
-                            &self.session_id,
-                            child_usage.total_input_tokens,
-                            child_usage.total_output_tokens,
-                            child_usage.total_cache_read_tokens,
-                            child_usage.total_cache_write_tokens,
-                            child_usage.total_cost_usd,
-                            child_usage.priced_rounds,
-                            None,
-                            None,
-                        ) {
+                        match store.merge_token_usage(&self.session_id, &child_usage) {
                             Ok(parent_totals) => {
                                 eprintln!(
                                     "[Agent {}] merged subagent tokens: +{}in/+{}out/+{}cache_r/+{}cache_w/${:.6} -> parent total: {}in/{}out/{}cache_r/{}cache_w/${:.6}",
@@ -19007,6 +20146,9 @@ impl AgentInstance {
                                             .total_cache_read_tokens,
                                         total_cache_write_tokens: parent_totals
                                             .total_cache_write_tokens,
+                                        timed_output_tokens: parent_totals.timed_output_tokens,
+                                        model_active_duration_ms: parent_totals
+                                            .model_active_duration_ms,
                                         total_cost_usd: parent_totals.total_cost_usd,
                                         priced_rounds: parent_totals.priced_rounds,
                                         context_tokens: 0,
@@ -19047,17 +20189,9 @@ impl AgentInstance {
                         || child_usage.total_cache_read_tokens > 0
                         || child_usage.total_cache_write_tokens > 0
                     {
-                        if let Ok(parent_totals) = store.record_token_usage(
-                            &self.session_id,
-                            child_usage.total_input_tokens,
-                            child_usage.total_output_tokens,
-                            child_usage.total_cache_read_tokens,
-                            child_usage.total_cache_write_tokens,
-                            child_usage.total_cost_usd,
-                            child_usage.priced_rounds,
-                            None,
-                            None,
-                        ) {
+                        if let Ok(parent_totals) =
+                            store.merge_token_usage(&self.session_id, &child_usage)
+                        {
                             emit_stream(
                                 app_handle,
                                 run_id,
@@ -19084,6 +20218,9 @@ impl AgentInstance {
                                     total_cache_read_tokens: parent_totals.total_cache_read_tokens,
                                     total_cache_write_tokens: parent_totals
                                         .total_cache_write_tokens,
+                                    timed_output_tokens: parent_totals.timed_output_tokens,
+                                    model_active_duration_ms: parent_totals
+                                        .model_active_duration_ms,
                                     total_cost_usd: parent_totals.total_cost_usd,
                                     priced_rounds: parent_totals.priced_rounds,
                                     context_tokens: 0,
@@ -19228,14 +20365,14 @@ mod tests {
     use super::{
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, compact_trigger, finalize_tool_call_record,
-        model_response_needs_follow_up, receive_immediate_async_failure, render_tree_lines,
-        utf8_prefix_chars, AbortOnDropTask, AgentInstance, AgentKnowledgeDocumentContent,
-        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
-        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult,
-        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer,
-        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
-        REACTIVE_COMPACT_ATTEMPT_KIND,
+        build_structure_section, compact_trigger, estimate_session_tool_result_usage,
+        finalize_tool_call_record, model_response_needs_follow_up, receive_immediate_async_failure,
+        render_tree_lines, utf8_prefix_chars, AbortOnDropTask, AgentInstance,
+        AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem,
+        AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse, AgentKnowledgeSearchHit,
+        ChatMessage, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
+        KnowledgeFocusDoc, LazyToolRenderer, ParentToolCall, PromptKnowledgeItem, RawContextStore,
+        ToolConfirmDecision, ToolRunOutcome, REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest;
@@ -19259,6 +20396,82 @@ mod tests {
         sync::Arc,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn session_tool_result_usage_groups_returned_content_by_tool() {
+        fn message(
+            id: &str,
+            role: crate::session::models::MessageRole,
+            content: &str,
+            tool_calls: Option<Vec<ToolCallInfo>>,
+            tool_call_id: Option<&str>,
+        ) -> ChatMessage {
+            ChatMessage {
+                id: id.to_string(),
+                role,
+                content: content.to_string(),
+                created_at: 0,
+                prompt_prefix: None,
+                prompt_suffix: None,
+                response_id: None,
+                content_order: None,
+                thinking_order: None,
+                tool_calls,
+                tool_call_id: tool_call_id.map(str::to_string),
+                images: None,
+                asset_refs: None,
+                thinking_content: None,
+                thinking_duration: None,
+                thinking_signature: None,
+                knowledge_proposal: None,
+                render_parts: None,
+            }
+        }
+
+        let tool_call = |id: &str, name: &str| ToolCallInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        };
+        let messages = vec![
+            message(
+                "assistant-1",
+                crate::session::models::MessageRole::Assistant,
+                "",
+                Some(vec![
+                    tool_call("call-1", "read"),
+                    tool_call("call-2", "read"),
+                ]),
+                None,
+            ),
+            message(
+                "result-1",
+                crate::session::models::MessageRole::Tool,
+                "short result",
+                None,
+                Some("call-1"),
+            ),
+            message(
+                "result-2",
+                crate::session::models::MessageRole::Tool,
+                "a much longer returned result that consumes more input tokens",
+                None,
+                Some("call-2"),
+            ),
+        ];
+
+        let usage = estimate_session_tool_result_usage(&messages);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].name, "read");
+        assert_eq!(usage[0].call_count, 2);
+        assert!(usage[0].result_tokens > 0);
+    }
 
     #[tokio::test]
     async fn abort_on_drop_task_cancels_detached_subagent_work() {
@@ -19490,6 +20703,7 @@ mod tests {
     #[test]
     fn workspace_coordination_bypasses_reads_and_classifies_writes() {
         let root = tempdir().expect("temp dir");
+        let external = tempdir().expect("external temp dir");
         let agent = test_agent_instance(root.path().to_string_lossy().to_string());
 
         for tool in ["read", "grep", "list", "todowrite"] {
@@ -19512,10 +20726,63 @@ mod tests {
             agent.workspace_execution_request_for_tool("unity_execute", &json!({})),
             Some(WorkspaceExecutionLockRequest::Exclusive)
         ));
+        let readonly_unity_execute = json!({"readonly": true});
+        assert!(agent
+            .workspace_execution_request_for_tool("unity_execute", &readonly_unity_execute)
+            .is_none());
+        assert!(!agent.tool_call_needs_undo_tracking("unity_execute", &readonly_unity_execute));
+        assert!(AgentInstance::is_readonly_tool_call(
+            "unity_execute",
+            &readonly_unity_execute
+        ));
+        assert!(
+            !agent.tool_call_has_unity_execution_barrier("unity_execute", &readonly_unity_execute)
+        );
+        let writable_unity_execute = json!({"readonly": false});
+        assert!(matches!(
+            agent.workspace_execution_request_for_tool("unity_execute", &writable_unity_execute),
+            Some(WorkspaceExecutionLockRequest::Exclusive)
+        ));
+        assert!(agent.tool_call_needs_undo_tracking("unity_execute", &writable_unity_execute));
+        assert!(
+            agent.tool_call_has_unity_execution_barrier("unity_execute", &writable_unity_execute)
+        );
         assert!(matches!(
             agent.workspace_execution_request_for_tool("bash", &json!({})),
             Some(WorkspaceExecutionLockRequest::Exclusive)
         ));
+        let readonly_bash = json!({
+            "workdir": root.path(),
+            "readonly": true,
+        });
+        assert!(agent
+            .workspace_execution_request_for_tool("bash", &readonly_bash)
+            .is_none());
+        assert!(!agent.tool_call_needs_undo_tracking("bash", &readonly_bash));
+        assert!(AgentInstance::is_readonly_tool_call("bash", &readonly_bash));
+
+        let external_write_bash = json!({
+            "workdir": external.path(),
+            "readonly": false,
+        });
+        assert!(agent
+            .workspace_execution_request_for_tool("bash", &external_write_bash)
+            .is_none());
+        assert!(!agent.tool_call_needs_undo_tracking("bash", &external_write_bash));
+        assert!(!AgentInstance::is_readonly_tool_call(
+            "bash",
+            &external_write_bash
+        ));
+
+        let primary_write_bash = json!({
+            "workdir": root.path(),
+            "readonly": false,
+        });
+        assert!(matches!(
+            agent.workspace_execution_request_for_tool("bash", &primary_write_bash),
+            Some(WorkspaceExecutionLockRequest::Exclusive)
+        ));
+        assert!(agent.tool_call_needs_undo_tracking("bash", &primary_write_bash));
         assert!(matches!(
             agent.background_workspace_execution_request_for_tool(
                 "bash",
@@ -19525,6 +20792,20 @@ mod tests {
             Some(WorkspaceExecutionLockRequest::ParallelOpaque(group))
                 if group == "assistant-batch"
         ));
+        assert!(agent
+            .background_workspace_execution_request_for_tool(
+                "bash",
+                &readonly_bash,
+                "assistant-batch"
+            )
+            .is_none());
+        assert!(agent
+            .background_workspace_execution_request_for_tool(
+                "bash",
+                &external_write_bash,
+                "assistant-batch"
+            )
+            .is_none());
         assert!(matches!(
             agent.background_workspace_execution_request_for_tool(
                 "unity_execute",
@@ -20191,6 +21472,7 @@ PrefabInstance:
             &[crate::extra_workdirs::ExtraWorkdirEntry {
                 path: attached.to_string_lossy().to_string(),
                 comment: "art sources".to_string(),
+                read_only: false,
             }],
         )
         .expect("save extra workdirs");
@@ -20227,6 +21509,129 @@ PrefabInstance:
             true
         )
         .is_some());
+    }
+
+    #[test]
+    fn read_only_extra_workdirs_allow_reads_and_block_mutating_file_tools() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let read_only = root.path().join("reference-assets");
+        let writable = root.path().join("generated-assets");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&read_only).expect("create read-only attachment");
+        std::fs::create_dir_all(&writable).expect("create writable attachment");
+        let read_only_file = read_only.join("source.psd");
+        std::fs::write(&read_only_file, "source").expect("write fixture");
+
+        let workspace_str = workspace.to_string_lossy().to_string();
+        crate::extra_workdirs::save_entries(
+            &workspace_str,
+            &[
+                crate::extra_workdirs::ExtraWorkdirEntry {
+                    path: read_only.to_string_lossy().to_string(),
+                    comment: "source assets".to_string(),
+                    read_only: true,
+                },
+                crate::extra_workdirs::ExtraWorkdirEntry {
+                    path: writable.to_string_lossy().to_string(),
+                    comment: "generated assets".to_string(),
+                    read_only: false,
+                },
+            ],
+        )
+        .expect("save extra workdirs");
+        let agent = test_agent_instance(workspace_str);
+
+        for (tool, args) in [
+            (
+                "read",
+                json!({"filePath":read_only_file.to_string_lossy().to_string()}),
+            ),
+            (
+                "list",
+                json!({"path":read_only.to_string_lossy().to_string()}),
+            ),
+            (
+                "grep",
+                json!({"path":read_only.to_string_lossy().to_string(),"pattern":"source"}),
+            ),
+            (
+                "write",
+                json!({"filePath":writable.join("new.txt").to_string_lossy().to_string(),"content":"ok"}),
+            ),
+        ] {
+            assert_eq!(
+                agent.validate_read_only_extra_workdir_access(tool, &args),
+                None,
+                "tool {tool} should be allowed"
+            );
+        }
+
+        for (tool, args) in [
+            (
+                "write",
+                json!({"filePath":read_only.join("new.txt").to_string_lossy().to_string(),"content":"no"}),
+            ),
+            (
+                "edit",
+                json!({"filePath":read_only_file.to_string_lossy().to_string(),"oldString":"source","newString":"changed"}),
+            ),
+        ] {
+            let error = agent
+                .validate_read_only_extra_workdir_access(tool, &args)
+                .expect("mutation should be blocked");
+            assert!(error.contains("is read-only"));
+        }
+    }
+
+    #[test]
+    fn read_only_extra_workdirs_block_bash_workdirs_and_path_targets() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let read_only = root.path().join("reference-assets");
+        let writable = root.path().join("generated-assets");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&read_only).expect("create read-only attachment");
+        std::fs::create_dir_all(&writable).expect("create writable attachment");
+
+        let workspace_str = workspace.to_string_lossy().to_string();
+        crate::extra_workdirs::save_entries(
+            &workspace_str,
+            &[
+                crate::extra_workdirs::ExtraWorkdirEntry {
+                    path: read_only.to_string_lossy().to_string(),
+                    comment: String::new(),
+                    read_only: true,
+                },
+                crate::extra_workdirs::ExtraWorkdirEntry {
+                    path: writable.to_string_lossy().to_string(),
+                    comment: String::new(),
+                    read_only: false,
+                },
+            ],
+        )
+        .expect("save extra workdirs");
+        let agent = test_agent_instance(workspace_str.clone());
+
+        assert!(agent
+            .validate_read_only_extra_workdir_access(
+                "bash",
+                &json!({"workdir":read_only.to_string_lossy().to_string(),"command":"rm -rf source.psd"})
+            )
+            .is_some());
+        assert!(agent
+            .validate_read_only_extra_workdir_access(
+                "bash",
+                &json!({"workdir":workspace_str,"command":format!("rm -rf '{}'", read_only.join("source.psd").display())})
+            )
+            .is_some());
+        assert_eq!(
+            agent.validate_read_only_extra_workdir_access(
+                "bash",
+                &json!({"workdir":writable.to_string_lossy().to_string(),"command":"rm -rf generated.tmp"})
+            ),
+            None
+        );
     }
 
     #[cfg(windows)]
@@ -20467,6 +21872,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -20540,6 +21946,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -20637,6 +22044,39 @@ PrefabInstance:
     }
 
     #[tokio::test]
+    async fn codex_native_preview_hides_fallback_meta_tools() {
+        let temp = tempdir().expect("temp dir");
+        let mut instance = test_agent_instance_with_tools_and_mode(
+            temp.path().to_string_lossy().to_string(),
+            vec![
+                "tool_load".to_string(),
+                "tool_call".to_string(),
+                "read".to_string(),
+            ],
+            KnowledgeAccessMode::Full,
+        );
+        instance.configure_preview_lazy_tool_renderer(
+            Some("openai/gpt-5.6-sol"),
+            crate::config::DynamicToolLoadingMode::Native,
+            None,
+        );
+
+        let native_items = instance.available_tool_prompt_items().await;
+        assert!(native_items.iter().all(|item| item.title != "tool_load"));
+        assert!(native_items.iter().all(|item| item.title != "tool_call"));
+        assert!(native_items.iter().any(|item| item.title == "read"));
+
+        instance.configure_preview_lazy_tool_renderer(
+            Some("openai/gpt-5.6-sol"),
+            crate::config::DynamicToolLoadingMode::MetaTool,
+            None,
+        );
+        let fallback_items = instance.available_tool_prompt_items().await;
+        assert!(fallback_items.iter().any(|item| item.title == "tool_load"));
+        assert!(fallback_items.iter().any(|item| item.title == "tool_call"));
+    }
+
+    #[tokio::test]
     async fn available_tool_prompt_items_marks_direct_and_lazy_tools() {
         let temp = tempdir().expect("temp dir");
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
@@ -20660,6 +22100,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -20728,6 +22169,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21196,6 +22638,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21296,6 +22739,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21378,6 +22822,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21467,6 +22912,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21536,6 +22982,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21601,6 +23048,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -21800,6 +23248,7 @@ PrefabInstance:
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -22064,6 +23513,7 @@ Create a reusable Skill.
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -22177,6 +23627,7 @@ Search, install, audit, and export a plugin.
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",
@@ -22847,12 +24298,14 @@ Search, install, audit, and export a plugin.
         assert!(!AgentInstance::permission_requires_confirm(
             "auto",
             Some("ask"),
-            "unity_execute"
+            "unity_execute",
+            &json!({})
         ));
         assert!(!AgentInstance::permission_requires_confirm(
             "auto",
             None,
-            "unity_execute"
+            "unity_execute",
+            &json!({})
         ));
     }
 
@@ -22861,12 +24314,14 @@ Search, install, audit, and export a plugin.
         assert!(!AgentInstance::permission_requires_confirm(
             "auto",
             Some("ask"),
-            "write"
+            "write",
+            &json!({})
         ));
         assert!(!AgentInstance::permission_requires_confirm(
             " auto ",
             Some(" ask "),
-            "write"
+            "write",
+            &json!({})
         ));
     }
 
@@ -22877,6 +24332,7 @@ Search, install, audit, and export a plugin.
             Some("auto"),
             "knowledge_edit",
             "{\"path\":\"design/core.md\"}",
+            &json!({"path": "design/core.md"}),
             None,
             true,
         );
@@ -22893,6 +24349,7 @@ Search, install, audit, and export a plugin.
             Some("auto"),
             "knowledge_edit",
             "{\"path\":\"memory/project.md\"}",
+            &json!({"path": "memory/project.md"}),
             None,
             false,
         );
@@ -22904,25 +24361,50 @@ Search, install, audit, and export a plugin.
         assert!(!AgentInstance::permission_requires_confirm(
             "ask",
             Some("auto"),
-            "unity_execute"
+            "unity_execute",
+            &json!({})
         ));
         assert!(AgentInstance::permission_requires_confirm(
             "ask",
             Some("ask"),
-            "unity_execute"
+            "unity_execute",
+            &json!({})
         ));
         assert!(AgentInstance::permission_requires_confirm(
             "ask",
             None,
-            "unity_execute"
+            "unity_execute",
+            &json!({})
         ));
         assert!(!AgentInstance::permission_requires_confirm(
             "ask",
             None,
-            "unity_yaml_read"
+            "unity_execute",
+            &json!({"readonly": true})
         ));
         assert!(!AgentInstance::permission_requires_confirm(
-            "ask", None, "list"
+            "ask",
+            None,
+            "unity_yaml_read",
+            &json!({})
+        ));
+        assert!(!AgentInstance::permission_requires_confirm(
+            "ask",
+            None,
+            "list",
+            &json!({})
+        ));
+        assert!(!AgentInstance::permission_requires_confirm(
+            "ask",
+            None,
+            "bash",
+            &json!({"readonly": true})
+        ));
+        assert!(AgentInstance::permission_requires_confirm(
+            "ask",
+            None,
+            "bash",
+            &json!({"readonly": false})
         ));
     }
 
@@ -23768,7 +25250,12 @@ Search, install, audit, and export a plugin.
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
 
-        let rules = build_l3_rule_section(&working_dir, None).expect("build l3 rules");
+        let rules = build_l3_rule_section(
+            &working_dir,
+            None,
+            &crate::commands::AgentInjectionConfigLayers::default(),
+        )
+        .expect("build l3 rules");
         assert!(rules.contains("## L3 Rules"));
         assert!(rules.contains("### User Preferences (memory/user-preference.md)"));
         assert!(rules.contains("Maintenance Rules:"));
@@ -23779,6 +25266,25 @@ Search, install, audit, and export a plugin.
         ));
         assert!(rules.contains("- Keep the list within 20 items and merge similar preferences"));
         assert!(rules.contains("Full Document:\n<empty>"));
+    }
+
+    #[test]
+    fn l3_rule_section_honors_agent_injection_override() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let config_dir = temp.path().join("Locus/agent/test");
+        std::fs::create_dir_all(&config_dir).expect("Agent config dir");
+        std::fs::write(
+            config_dir.join("injection_config.json"),
+            r#"{"knowledge_rule::memory::user-preference.md":{"enabled":false}}"#,
+        )
+        .expect("injection override");
+        let injection_config =
+            crate::commands::load_agent_injection_config_layers(&None, &working_dir, "test");
+
+        let rules =
+            build_l3_rule_section(&working_dir, None, &injection_config).expect("build l3 rules");
+        assert!(!rules.contains("User Preferences"), "{}", rules);
     }
 
     #[test]
@@ -23820,7 +25326,12 @@ Search, install, audit, and export a plugin.
         )
         .expect("save empty memory");
 
-        let rules = build_l3_rule_section(&working_dir, None).expect("build l3 rules");
+        let rules = build_l3_rule_section(
+            &working_dir,
+            None,
+            &crate::commands::AgentInjectionConfigLayers::default(),
+        )
+        .expect("build l3 rules");
         assert!(rules.contains("### Empty Memory (memory/empty-memory.md)"));
         assert!(!rules.contains("Maintenance Rules:\n<empty>"));
         assert!(rules.contains("Full Document:\n<empty>"));
@@ -23865,7 +25376,12 @@ Search, install, audit, and export a plugin.
         )
         .expect("save mapped memory");
 
-        let rules = build_l3_rule_section(&working_dir, None).expect("build mapped rules");
+        let rules = build_l3_rule_section(
+            &working_dir,
+            None,
+            &crate::commands::AgentInjectionConfigLayers::default(),
+        )
+        .expect("build mapped rules");
         assert!(rules.contains("### Heading Map (memory/heading-map.md)"));
         assert!(rules.contains("Full Document:\n#### 一级\n##### 二级\n正文"));
     }
@@ -24485,6 +26001,17 @@ Search, install, audit, and export a plugin.
             );
         }
 
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "bash", &serde_json::json!({"readonly": true}))
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(
+                &runtime,
+                "unity_execute",
+                &serde_json::json!({"readonly": true})
+            )
+            .is_none());
+
         let foreign_write = serde_json::json!({ "filePath": "C:/Project/Assets/Foo.cs" });
         assert!(instance
             .plan_mode_tool_violation(&runtime, "write", &foreign_write)
@@ -24525,6 +26052,16 @@ Search, install, audit, and export a plugin.
         }
         assert!(instance
             .plan_mode_tool_violation(&runtime, "read", &serde_json::json!({}))
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "bash", &serde_json::json!({"readonly": true}))
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(
+                &runtime,
+                "unity_execute",
+                &serde_json::json!({"readonly": true})
+            )
             .is_none());
     }
 
@@ -24605,6 +26142,7 @@ Search, install, audit, and export a plugin.
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
+                tool_description_overrides: HashMap::new(),
                 source: "test".to_string(),
             }),
             "session-test",

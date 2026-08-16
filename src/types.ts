@@ -541,6 +541,11 @@ export interface AgentInfo {
   source: string;
 }
 
+export interface AgentModelPreference {
+  modelId: string;
+  effort: EffortLevel;
+}
+
 export type EffortLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevel = EffortLevel;
 export type ModelRecommendation = "small" | "large";
@@ -633,6 +638,8 @@ export interface CustomProvider {
   /** Keychain-backed; empty string means "keep existing / none". */
   apiKey: string;
   catalogId?: string | null;
+  /** Session prompt-prefix stability window after the latest provider response. */
+  prefixCacheTtlSeconds?: number;
   models: CustomProviderModel[];
 }
 
@@ -690,6 +697,7 @@ export interface CodexModelConfig {
   extendedContext: boolean;
   generateSessionTitles: boolean;
   autoReview: boolean;
+  prefixCacheTtlSeconds: number;
 }
 
 export interface AuthStatus {
@@ -881,10 +889,43 @@ export interface TokenUsage {
   totalOutputTokens: number;
   totalCacheReadTokens: number;
   totalCacheWriteTokens: number;
+  timedOutputTokens: number;
+  modelActiveDurationMs: number;
   totalCostUsd: number;
   pricedRounds: number;
   contextTokens: number;
   contextLimit: number;
+}
+
+export interface SessionContextBreakdown {
+  systemPromptTokens: number;
+  environmentTokens: number;
+  rulesTokens: number;
+  knowledgeTokens: number;
+  runtimeInjectionTokens: number;
+  conversationTokens: number;
+  toolDefinitionTokens: number;
+  activeToolResultTokens: number;
+}
+
+export interface SessionContextToolUsage {
+  name: string;
+  callCount: number;
+  resultTokens: number;
+}
+
+export interface SessionContextUsageReport {
+  sessionId: string;
+  sessionTitle: string;
+  agentId: string;
+  modelId: string;
+  contextTokens: number;
+  contextLimit: number;
+  rawEstimatedContextTokens: number;
+  reportedContextTokens: number;
+  breakdown: SessionContextBreakdown;
+  tools: SessionContextToolUsage[];
+  usage: TokenUsage;
 }
 
 export interface ModelUsageMetrics {
@@ -1111,6 +1152,8 @@ export type StreamEvent = { runId: string } & (
       totalOutputTokens: number;
       totalCacheReadTokens: number;
       totalCacheWriteTokens: number;
+      timedOutputTokens: number;
+      modelActiveDurationMs: number;
       totalCostUsd: number;
       pricedRounds: number;
       contextTokens: number;
@@ -2343,7 +2386,10 @@ export interface InjectedToolMeta {
   canConfigureDirectLoad?: boolean;
   enabled?: boolean;
   canToggleEnabled?: boolean;
+  enabledDefault?: boolean;
+  enabledOverride?: boolean | null;
   nativeLazy?: boolean;
+  descriptionOverridden?: boolean;
   toolSource?: "builtIn" | "skill" | string;
 }
 

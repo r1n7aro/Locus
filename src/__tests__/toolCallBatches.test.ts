@@ -508,6 +508,67 @@ describe("toolCallBatches", () => {
     expect(merged.map((toolCall) => toolCall.id)).toEqual(["history-1", "active-2"]);
   });
 
+  it("keeps repeated calls with the same arguments when their render orders differ", () => {
+    const merged = mergeToolCallDisplaysWithoutDuplicates(
+      [
+        {
+          id: "history-1",
+          name: "unity_recompile",
+          arguments: "{\"editor_status\":\"editing\"}",
+          status: "done",
+          order: 12,
+        },
+        {
+          id: "history-2",
+          name: "unity_recompile",
+          arguments: "{\"editorStatus\":\"editing\"}",
+          status: "done",
+          order: 20,
+        },
+      ],
+      [
+        {
+          id: "active-3",
+          name: "unity_recompile",
+          arguments: "{\"editor_status\":\"editing\"}",
+          status: "running",
+          order: 35,
+        },
+      ],
+    );
+
+    expect(merged.map((toolCall) => toolCall.id)).toEqual([
+      "history-1",
+      "history-2",
+      "active-3",
+    ]);
+  });
+
+  it("deduplicates semantic history/transient copies that share a render order", () => {
+    const merged = mergeToolCallDisplaysWithoutDuplicates(
+      [
+        {
+          id: "history-copy",
+          name: "read",
+          arguments: "{\"filePath\":\"Assets/Test.cs\"}",
+          status: "done",
+          order: 9,
+        },
+      ],
+      [
+        {
+          id: "transient-copy",
+          name: "read",
+          arguments: "{\"path\":\"Assets/Test.cs\"}",
+          status: "running",
+          order: 9,
+        },
+      ],
+    );
+
+    expect(merged.map((toolCall) => toolCall.id)).toEqual(["history-copy"]);
+  });
+
   it("deduplicates read tool calls when path aliases differ across transient and history copies", () => {
     const filtered = filterToolCallsByMatchState(
       [
