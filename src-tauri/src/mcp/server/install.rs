@@ -193,13 +193,13 @@ fn save_json_document(path: &Path, document: &Value) -> Result<(), String> {
     std::fs::write(path, data).map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
-fn load_codex_document(path: &Path) -> Result<toml_edit::Document, String> {
+fn load_codex_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
     if !path.exists() {
-        return Ok(toml_edit::Document::new());
+        return Ok(toml_edit::DocumentMut::new());
     }
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-    data.parse::<toml_edit::Document>().map_err(|e| {
+    data.parse::<toml_edit::DocumentMut>().map_err(|e| {
         format!(
             "{} is not valid TOML ({e}); refusing to modify it",
             path.display()
@@ -207,7 +207,7 @@ fn load_codex_document(path: &Path) -> Result<toml_edit::Document, String> {
     })
 }
 
-fn codex_entry_value(document: &toml_edit::Document) -> Option<Value> {
+fn codex_entry_value(document: &toml_edit::DocumentMut) -> Option<Value> {
     let entry = document
         .get("mcp_servers")
         .and_then(|servers| servers.get(SERVER_ENTRY_NAME))?;

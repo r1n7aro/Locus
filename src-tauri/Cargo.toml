@@ -1,6 +1,6 @@
 [package]
 name = "locus"
-version = "0.7.2"
+version = "0.7.3"
 description = "A opensource unity dev agent"
 authors = ["FarLocus"]
 edition = "2021"
@@ -24,98 +24,104 @@ crate-type = ["rlib"]
 incremental = true
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-semver = "1"
+# tauri-runtime-wry 2.10.1 leaked one window DC on every DPI lookup for the
+# undecorated resize border. Tauri 2.11.5 resolves to the fixed runtime line.
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-opener = "2.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+semver = "1.0.28"
 aisdk = { version = "0.5.2", features = ["openrouter"] }
-rusqlite = { version = "0.38.0", features = ["backup", "bundled"] }
-uuid = { version = "1.22.0", features = ["v4", "serde"] }
-futures = "0.3.32"
-fs4 = "0.13.1"
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
+uuid = { version = "1.24.1", features = ["v4", "serde"] }
+futures = "0.3.34"
+fs4 = "1.1.0"
 walkdir = "2.5.0"
-ignore = "0.4"
-grep-searcher = "0.1"
-grep-regex = "0.1"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks"], default-features = false }
+ignore = "0.4.33"
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+tokio = { version = "1.53.1", features = ["full"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks", "form"], default-features = false }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["native-tls", "proxy"] }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate", "proxy"] }
-hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
+hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
 # MCP server (expose unity tools to external harnesses): hyper serves the
 # localhost Streamable HTTP endpoint; toml_edit rewrites Codex's config.toml
 # format-preservingly for one-click setup. All three are already in the
 # dependency tree transitively.
-hyper = { version = "1", features = ["server", "http1"] }
-http-body-util = "0.1"
-toml_edit = "0.19"
-native-tls = "0.2"
-tokio-native-tls = "0.3"
-tower-service = "0.3"
-url = "2"
-http = "1"
-glob = "0.3"
-regex = "1"
-pulldown-cmark = "0.13"
-sha2 = "0.10"
-base64 = "0.22"
-aes-gcm = "0.10"
-rand = "0.8"
-dirs = "5"
-flate2 = "1"
-chrono = { version = "0.4", features = ["serde"] }
-tauri-plugin-dialog = "2.6.0"
-rayon = "1.10"
-blake3 = "1"
-notify = "8"
-dunce = "1"
-keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
-anyhow = "1"
-thiserror = "2"
-similar = "2"
-indexmap = { version = "2", features = ["serde"] }
-tantivy = "0.26"
-font-kit = "0.14"
-fastembed = { version = "5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-load-dynamic"] }
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq", "native-tls"] }
-ureq = { version = "2.12.1", default-features = false, features = ["native-tls", "socks-proxy"] }
-tree-sitter = "0.25"
-tree-sitter-bash = "0.25"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+http-body-util = "0.1.5"
+toml_edit = "0.25.13"
+native-tls = "0.2.18"
+tokio-native-tls = "0.3.1"
+tower-service = "0.3.3"
+url = "2.5.8"
+http = "1.5.0"
+glob = "0.3.4"
+regex = "1.13.1"
+pulldown-cmark = "0.13.4"
+sha2 = "0.11.0"
+base64 = "0.23.1"
+aes-gcm = "0.11.0"
+rand = "0.10.2"
+dirs = "6.0.0"
+flate2 = "1.1.9"
+chrono = { version = "0.4.45", features = ["serde"] }
+tauri-plugin-dialog = "2.7.2"
+rayon = "1.12.0"
+blake3 = "1.8.6"
+notify = "8.2.0"
+dunce = "1.0.5"
+keyring = "4.1.6"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+similar = "3.1.2"
+indexmap = { version = "2.14.0", features = ["serde"] }
+tantivy = "0.26.1"
+font-kit = "0.14.3"
+# fastembed 5.13.2 is the newest release compatible with ort rc.11.
+# fastembed 5.14+ requires ort rc.12 or newer, so upgrade these together only.
+fastembed = { version = "=5.13.2", default-features = false, features = ["hf-hub-native-tls", "ort-load-dynamic"] }
+hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls", "socks"] }
+ureq = { version = "3.4.0", default-features = false, features = ["native-tls", "socks-proxy", "json"] }
+tree-sitter = "0.26.12"
+tree-sitter-bash = "0.25.1"
 # Pinned: the parser in src/unity_csharp/parser.rs depends on the named-node
 # layout (`modifier`, `attribute_list`, `variable_declaration`, etc.) of this
-# specific grammar release. A patch bump can silently rename or restructure
-# nodes, which would cause `collect_modifiers` and friends to return empty
-# without any compile error. Re-run the unity_csharp tests after bumping.
-tree-sitter-c-sharp = "=0.23.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "std"] }
+# exact grammar release. Re-run the unity_csharp tests after every bump.
+tree-sitter-c-sharp = "=0.23.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "std"] }
 html2md = "0.2.15"
-zip = { version = "2.2.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ndarray = "0.17.2"
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
-socket2 = "0.5"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+socket2 = "0.6.5"
 sys-locale = "0.3.2"
 tauri-plugin-notification = "2.3.3"
 rodio = "0.22.2"
 # Global allocator (see lib.rs). The Windows system heap scales poorly under
 # multi-threaded small-object churn; mimalloc is the standard replacement.
-mimalloc = "0.1"
+mimalloc = "0.1.52"
 
-# Keep this pinned to rc.11 because fastembed 5.13.2 still depends on the same
-# ort/ort-sys pair upstream; rc.12 would create an unresolved onnxruntime links conflict.
+# Keep this pinned to rc.11. fastembed 5.13.2 is the matching upstream
+# release; newer fastembed versions require a newer ort/ort-sys pair.
 [target.'cfg(windows)'.dependencies]
-junction = "1"
+junction = "2.0.0"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
-tauri-winrt-notification = "0.7.2"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+tauri-winrt-notification = "0.8.1"
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-core = "0.61.2"
+# Keep these aligned with Tauri/Wry; newer lines generate incompatible COM types.
 webview2-com = "0.38.2"
-winreg = "0.55.0"
+winreg = "0.56.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"

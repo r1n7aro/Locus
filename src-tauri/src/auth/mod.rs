@@ -8,7 +8,7 @@ use aes_gcm::{
 #[cfg(windows)]
 use base64::engine::general_purpose::STANDARD;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -517,7 +517,7 @@ fn generate_oauth_state() -> String {
 
 fn generate_random_urlsafe_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1062,14 +1062,14 @@ fn decrypt_chromium_aes_gcm_blob(key: &[u8], blob: &[u8]) -> Result<Vec<u8>, Str
     let (nonce, ciphertext_and_tag) = payload.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|_| "Claude Desktop OAuth token cache key is invalid".to_string())?;
-    cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext_and_tag)
-        .map_err(|err| {
-            format!(
-                "Failed to decrypt Claude Desktop OAuth token cache: {}",
-                err
-            )
-        })
+    let nonce = Nonce::try_from(nonce)
+        .map_err(|_| "Claude Desktop OAuth token cache nonce is invalid".to_string())?;
+    cipher.decrypt(&nonce, ciphertext_and_tag).map_err(|err| {
+        format!(
+            "Failed to decrypt Claude Desktop OAuth token cache: {}",
+            err
+        )
+    })
 }
 
 fn parse_claude_desktop_oauth_token_cache(
@@ -1220,7 +1220,7 @@ fn normalize_epoch_seconds(value: i64) -> i64 {
 
 fn generate_device_id() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{:02x}", byte));

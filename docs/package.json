@@ -12,6 +12,6 @@
     "build": "bun run validate"
   },
   "devDependencies": {
-    "mint": "^4.2.523"
+    "mint": "^4.2.804"
   }
 }

@@ -2,8 +2,8 @@ use fastembed::{
     EmbeddingModel as FastembedModel, ExecutionProviderDispatch, InitOptionsUserDefined, Pooling,
     QuantizationMode, TextEmbedding, TextInitOptions, TokenizerFiles, UserDefinedEmbeddingModel,
 };
-use hf_hub::api::sync::{ApiBuilder, ApiRepo};
-use hf_hub::{Cache, Repo, RepoType};
+use hf_hub::repository::RepoTypeModel;
+use hf_hub::{split_id, HFClient, HFClientSync, HFRepositorySync};
 #[cfg(windows)]
 use ndarray::{s, Array, Array2, ArrayView, Axis, Dim, Dimension, IxDynImpl};
 #[cfg(windows)]
@@ -29,6 +29,28 @@ use std::time::Instant;
 use tokenizers::{AddedToken, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use url::Url;
 use walkdir::WalkDir;
+
+type ApiRepo = HFRepositorySync<RepoTypeModel>;
+
+fn build_hf_sync_client(
+    cache_dir: PathBuf,
+    endpoint: Option<&str>,
+) -> Result<HFClientSync, hf_hub::HFError> {
+    let mut builder = HFClient::builder().cache_dir(cache_dir);
+    if let Some(endpoint) = endpoint {
+        builder = builder.endpoint(endpoint);
+    }
+    HFClientSync::from_inner(builder.build()?)
+}
+
+fn hf_model_repo(client: &HFClientSync, repo_id: &str) -> ApiRepo {
+    let (owner, name) = split_id(repo_id);
+    client.model(owner, name)
+}
+
+fn hf_repo_get(repo: &ApiRepo, file_name: &str) -> Result<PathBuf, hf_hub::HFError> {
+    repo.download_file().filename(file_name.to_string()).send()
+}
 
 const LOCAL_RUNTIME_FASTEMBED: &str = "fastembed";
 const LOCAL_EMBED_BATCH_SIZE: usize = 64;
@@ -584,32 +606,35 @@ fn runtime_helper_search_dirs() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(current_dir) = std::env::current_dir() {
-        push_runtime_helper_root_candidates(&mut dirs, &current_dir);
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(current_dir) = std::env::current_dir() {
+            push_runtime_helper_root_candidates(&mut dirs, &current_dir);
+            push_unique_path(
+                &mut dirs,
+                &current_dir
+                    .join("src-tauri")
+                    .join("gen")
+                    .join("ort-runtime")
+                    .join("windows-x64"),
+            );
+            push_unique_path(
+                &mut dirs,
+                &current_dir
+                    .join("gen")
+                    .join("ort-runtime")
+                    .join("windows-x64"),
+            );
+        }
+
         push_unique_path(
             &mut dirs,
-            &current_dir
-                .join("src-tauri")
-                .join("gen")
-                .join("ort-runtime")
-                .join("windows-x64"),
-        );
-        push_unique_path(
-            &mut dirs,
-            &current_dir
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("gen")
                 .join("ort-runtime")
                 .join("windows-x64"),
         );
     }
-
-    push_unique_path(
-        &mut dirs,
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("gen")
-            .join("ort-runtime")
-            .join("windows-x64"),
-    );
 
     dirs
 }
@@ -2599,12 +2624,10 @@ fn resolve_directml_assets_for_fastembed_model(
         .map_err(|error| format!("Failed to resolve model info: {error}"))?;
     let model_code = info.model_code.clone();
     let cache_dir = effective_fastembed_cache_dir(model_dir);
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir)
-        .build()
+    let api = build_hf_sync_client(cache_dir, None)
         .map_err(|error| format!("Failed to open local Hugging Face cache: {error}"))?;
-    let repo = api.model(model_code.clone());
-    let model_file_path = repo.get(&info.model_file).map_err(|error| {
+    let repo = hf_model_repo(&api, &model_code);
+    let model_file_path = hf_repo_get(&repo, &info.model_file).map_err(|error| {
         format!(
             "Failed to resolve cached model file '{}': {}",
             info.model_file, error
@@ -2679,12 +2702,12 @@ fn resolve_directml_assets_for_manual_model(
 fn load_tokenizer_files_from_repo(repo: &ApiRepo) -> Result<TokenizerFiles, String> {
     Ok(TokenizerFiles {
         tokenizer_file: std::fs::read(
-            repo.get("tokenizer.json")
+            hf_repo_get(repo, "tokenizer.json")
                 .map_err(|error| format!("Failed to resolve tokenizer.json from cache: {error}"))?,
         )
         .map_err(|error| format!("Failed to read tokenizer.json: {error}"))?,
         config_file: std::fs::read(
-            repo.get("config.json")
+            hf_repo_get(repo, "config.json")
                 .map_err(|error| format!("Failed to resolve config.json from cache: {error}"))?,
         )
         .map_err(|error| format!("Failed to read config.json: {error}"))?,
@@ -2693,7 +2716,7 @@ fn load_tokenizer_files_from_repo(repo: &ApiRepo) -> Result<TokenizerFiles, Stri
             "special_tokens_map.json",
             EMPTY_JSON_OBJECT,
         )?,
-        tokenizer_config_file: std::fs::read(repo.get("tokenizer_config.json").map_err(
+        tokenizer_config_file: std::fs::read(hf_repo_get(repo, "tokenizer_config.json").map_err(
             |error| format!("Failed to resolve tokenizer_config.json from cache: {error}"),
         )?)
         .map_err(|error| format!("Failed to read tokenizer_config.json: {error}"))?,
@@ -2706,7 +2729,7 @@ fn read_optional_repo_file(
     file_name: &str,
     default_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let Ok(path) = repo.get(file_name) else {
+    let Ok(path) = hf_repo_get(repo, file_name) else {
         return Ok(default_bytes.to_vec());
     };
     std::fs::read(&path).map_err(|error| format!("Failed to read {}: {error}", path.display()))
@@ -2840,7 +2863,7 @@ fn add_special_token(
     if content.trim().is_empty() || !seen_tokens.insert(content) {
         return;
     }
-    tokenizer.add_special_tokens(&[token]);
+    let _ = tokenizer.add_special_tokens([token]);
 }
 
 #[cfg(windows)]
@@ -3461,12 +3484,14 @@ impl RemoteEmbeddingRuntime {
             return Err("Remote embedding model is required".into());
         }
         let (_, client) = crate::network::with_proxy_env_for_url(&endpoint, |_| {
-            ureq::AgentBuilder::new()
-                .try_proxy_from_env(true)
-                .timeout_connect(std::time::Duration::from_secs(15))
-                .timeout_read(std::time::Duration::from_secs(60))
-                .timeout_write(std::time::Duration::from_secs(60))
-                .build()
+            let config = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_connect(Some(std::time::Duration::from_secs(15)))
+                .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+                .timeout_recv_body(Some(std::time::Duration::from_secs(60)))
+                .timeout_send_body(Some(std::time::Duration::from_secs(60)))
+                .build();
+            ureq::Agent::new_with_config(config)
         })?;
 
         let max_batch = config.remote_max_batch.max(1) as usize;
@@ -3507,29 +3532,24 @@ impl RemoteEmbeddingRuntime {
 
         let mut req = self.client.post(&self.endpoint);
         if !self.api_key.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
         }
-        let response = req.set("Content-Type", "application/json").send_json(body);
-        let text = match response {
-            Ok(resp) => resp
-                .into_string()
-                .map_err(|e| format!("Failed to read embedding response: {}", e))?,
-            Err(ureq::Error::Status(status, resp)) => {
-                let detail = resp
-                    .into_string()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(240)
-                    .collect::<String>();
-                return Err(format!(
-                    "Remote embedding request failed (HTTP {}): {}",
-                    status, detail
-                ));
-            }
-            Err(ureq::Error::Transport(err)) => {
-                return Err(format!("Remote embedding request failed: {}", err));
-            }
-        };
+        let mut response = req
+            .send_json(&body)
+            .map_err(|error| format!("Remote embedding request failed: {error}"))?;
+        let status = response.status();
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| format!("Failed to read embedding response: {error}"))?;
+        if !status.is_success() {
+            let detail = text.chars().take(240).collect::<String>();
+            return Err(format!(
+                "Remote embedding request failed (HTTP {}): {}",
+                status.as_u16(),
+                detail
+            ));
+        }
 
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| format!("Invalid embedding response: {}", e))?;
@@ -3803,11 +3823,7 @@ where
     })?;
     let hf_endpoint = download_source_endpoint(download_source).to_string();
     let (_, api_result) = crate::network::with_proxy_env_for_url(&hf_endpoint, |_| {
-        ApiBuilder::new()
-            .with_cache_dir(cache_dir.clone())
-            .with_endpoint(hf_endpoint.clone())
-            .with_progress(false)
-            .build()
+        build_hf_sync_client(cache_dir.clone(), Some(&hf_endpoint))
     })
     .map_err(EmbeddingDownloadError::failed)?;
     let api = api_result.map_err(|error| {
@@ -3816,16 +3832,25 @@ where
             error
         ))
     })?;
-    let repo = api.model(info.model_code.clone());
-    let cache_repo =
-        Cache::new(cache_dir.clone()).repo(Repo::new(info.model_code.clone(), RepoType::Model));
-    let repo_info = repo.info().map_err(|error| {
+    let repo = hf_model_repo(&api, &info.model_code);
+    let repo_info = repo.info().send().map_err(|error| {
         EmbeddingDownloadError::failed(format!(
             "Failed to inspect Hugging Face repo '{}' for local model '{}': {}",
             info.model_code, info.model_code, error
         ))
     })?;
-    let revision = repo_info.sha.trim().to_string();
+    let revision = repo_info
+        .sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            EmbeddingDownloadError::failed(format!(
+                "Hugging Face repo '{}' did not return a revision",
+                info.model_code
+            ))
+        })?
+        .to_string();
     let target_snapshot_dir =
         fastembed_snapshot_dir_for_revision(&cache_dir, &info.model_code, &revision);
 
@@ -3839,7 +3864,7 @@ where
         download_metadata_client(&hf_endpoint).map_err(EmbeddingDownloadError::failed)?;
     let pending_files: Vec<String> = required_fastembed_files(info)
         .into_iter()
-        .filter(|file_name| cache_repo.get(file_name).is_none())
+        .filter(|file_name| !target_snapshot_dir.join(file_name).is_file())
         .collect();
     let size_by_path = fetch_remote_repo_file_sizes(
         &metadata_client,
@@ -3852,12 +3877,8 @@ where
     let files_to_download = collect_remote_download_entries(pending_files, &size_by_path);
 
     if files_to_download.is_empty() {
-        cache_repo.create_ref(&revision).map_err(|error| {
-            EmbeddingDownloadError::failed(format!(
-                "Failed to update local model cache ref '{}': {}",
-                revision, error
-            ))
-        })?;
+        write_fastembed_cache_ref(&cache_dir, &info.model_code, &revision)
+            .map_err(EmbeddingDownloadError::failed)?;
         return Ok(());
     }
 
@@ -3873,7 +3894,9 @@ where
     let mut completed_bytes = 0u64;
     let download_result = download_repo_files_to_directory(
         &metadata_client,
-        &repo,
+        &hf_endpoint,
+        &info.model_code,
+        &revision,
         &files_to_download,
         &target_snapshot_dir,
         overall_total_bytes,
@@ -3884,12 +3907,8 @@ where
 
     match download_result {
         Ok(()) => {
-            cache_repo.create_ref(&revision).map_err(|error| {
-                EmbeddingDownloadError::failed(format!(
-                    "Failed to update local model cache ref '{}': {}",
-                    revision, error
-                ))
-            })?;
+            write_fastembed_cache_ref(&cache_dir, &info.model_code, &revision)
+                .map_err(EmbeddingDownloadError::failed)?;
             Ok(())
         }
         Err(EmbeddingDownloadError::Cancelled) => {
@@ -3929,12 +3948,9 @@ where
     }
 
     let hf_endpoint = download_source_endpoint(download_source).to_string();
+    let cache_dir = effective_fastembed_cache_dir(managed_directory);
     let (_, api_result) = crate::network::with_proxy_env_for_url(&hf_endpoint, |_| {
-        ApiBuilder::new()
-            .with_cache_dir(effective_fastembed_cache_dir(managed_directory))
-            .with_endpoint(hf_endpoint.clone())
-            .with_progress(false)
-            .build()
+        build_hf_sync_client(cache_dir.clone(), Some(&hf_endpoint))
     })
     .map_err(EmbeddingDownloadError::failed)?;
     let api = api_result.map_err(|error| {
@@ -3943,16 +3959,28 @@ where
             error
         ))
     })?;
-    let repo = api.model(download_model_id.to_string());
-    let repo_info = repo.info().map_err(|error| {
+    let repo = hf_model_repo(&api, download_model_id);
+    let repo_info = repo.info().send().map_err(|error| {
         EmbeddingDownloadError::failed(format!(
             "Failed to inspect Hugging Face repo '{}' for local model '{}': {}",
             download_model_id, managed_model_id, error
         ))
     })?;
-    let revision = repo_info.sha.trim().to_string();
+    let revision = repo_info
+        .sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            EmbeddingDownloadError::failed(format!(
+                "Hugging Face repo '{}' did not return a revision",
+                download_model_id
+            ))
+        })?
+        .to_string();
     let siblings: Vec<String> = repo_info
         .siblings
+        .unwrap_or_default()
         .into_iter()
         .map(|item| item.rfilename)
         .collect();
@@ -4023,7 +4051,9 @@ where
 
     let download_result = download_repo_files_to_directory(
         &metadata_client,
-        &repo,
+        &hf_endpoint,
+        download_model_id,
+        &revision,
         &files_to_download,
         &target_dir,
         overall_total_bytes,
@@ -4071,7 +4101,7 @@ fn required_fastembed_files(info: &fastembed::ModelInfo<FastembedModel>) -> Vec<
 }
 
 fn fastembed_repo_dir(cache_root: &Path, repo_id: &str) -> PathBuf {
-    cache_root.join(Repo::new(repo_id.to_string(), RepoType::Model).folder_name())
+    cache_root.join(format!("models--{}", repo_id.replace('/', "--")))
 }
 
 fn fastembed_snapshot_dir_for_revision(
@@ -4084,6 +4114,32 @@ fn fastembed_snapshot_dir_for_revision(
         .join(revision)
 }
 
+fn write_fastembed_cache_ref(
+    cache_root: &Path,
+    repo_id: &str,
+    revision: &str,
+) -> Result<(), String> {
+    let ref_path = fastembed_repo_dir(cache_root, repo_id)
+        .join("refs")
+        .join("main");
+    if let Some(parent) = ref_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create model cache ref directory '{}': {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
+    std::fs::write(&ref_path, revision.trim()).map_err(|error| {
+        format!(
+            "Failed to update local model cache ref '{}': {}",
+            ref_path.display(),
+            error
+        )
+    })
+}
+
 fn effective_fastembed_cache_dir(default_dir: &Path) -> PathBuf {
     std::env::var("HF_HOME")
         .map(PathBuf::from)
@@ -4092,10 +4148,8 @@ fn effective_fastembed_cache_dir(default_dir: &Path) -> PathBuf {
 
 fn download_metadata_client(endpoint: &str) -> Result<ureq::Agent, String> {
     crate::network::with_proxy_env_for_url(endpoint, |_| {
-        ureq::AgentBuilder::new()
-            .try_proxy_from_env(true)
-            .redirects(10)
-            .build()
+        let config = ureq::Agent::config_builder().max_redirects(10).build();
+        ureq::Agent::new_with_config(config)
     })
     .map(|(_, agent)| agent)
 }
@@ -4150,15 +4204,19 @@ fn fetch_remote_repo_file_sizes(
             return Err("Too many pages while loading Hugging Face repo tree metadata".to_string());
         }
 
-        let response = client.get(&url).call().map_err(|error| {
+        let mut response = client.get(&url).call().map_err(|error| {
             format!(
                 "Failed to inspect Hugging Face repo tree metadata for '{}': {}",
                 repo_id, error
             )
         })?;
-        let next_link = response.header("link").map(str::to_string);
-        let entries: Vec<HubRepoTreeEntry> = serde_json::from_reader(response.into_reader())
-            .map_err(|error| {
+        let next_link = response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let entries: Vec<HubRepoTreeEntry> =
+            serde_json::from_reader(response.body_mut().as_reader()).map_err(|error| {
                 format!(
                     "Failed to parse Hugging Face repo tree metadata for '{}': {}",
                     repo_id, error
@@ -4243,9 +4301,36 @@ fn resolve_next_link_url(endpoint: &str, next_link: &str) -> Result<String, Stri
         })
 }
 
+fn build_remote_repo_file_url(
+    endpoint: &str,
+    repo_id: &str,
+    revision: &str,
+    relative_path: &str,
+) -> Result<String, String> {
+    let mut url = Url::parse(endpoint)
+        .map_err(|error| format!("Invalid Hugging Face endpoint '{}': {}", endpoint, error))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| format!("Invalid Hugging Face endpoint '{}'", endpoint))?;
+        segments.pop_if_empty();
+        for segment in repo_id.split('/') {
+            segments.push(segment);
+        }
+        segments.push("resolve");
+        segments.push(revision);
+        for segment in relative_path.split('/') {
+            segments.push(segment);
+        }
+    }
+    Ok(url.into())
+}
+
 fn download_repo_files_to_directory<F>(
     client: &ureq::Agent,
-    repo: &ApiRepo,
+    endpoint: &str,
+    repo_id: &str,
+    revision: &str,
     files: &[(String, u64)],
     target_root: &Path,
     overall_total_bytes: u64,
@@ -4269,9 +4354,11 @@ where
             on_progress,
         );
         let target_path = join_relative_path(target_root, relative_path);
+        let download_url = build_remote_repo_file_url(endpoint, repo_id, revision, relative_path)
+            .map_err(EmbeddingDownloadError::failed)?;
         download_remote_file_to_path(
             client,
-            &repo.url(relative_path),
+            &download_url,
             &target_path,
             relative_path,
             *expected_size,
@@ -4314,11 +4401,16 @@ where
             display_name, error
         ))
     })?;
-    let response_size =
-        parse_u64_header(response.header("content-length")).unwrap_or(expected_size);
+    let response_size = parse_u64_header(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .unwrap_or(expected_size);
     progress.start_file(display_name, response_size);
 
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut file = std::fs::File::create(&temp_path).map_err(|error| {
         EmbeddingDownloadError::failed(format!(
             "Failed to create temporary model file '{}': {}",

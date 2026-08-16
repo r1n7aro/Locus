@@ -75,5 +75,7 @@ export function drawRasterToCanvas(
   }
 
   const pixels = buildTransformedPixels(source.data, channelMode, alphaAsTransparency);
-  ctx.putImageData(new ImageData(pixels, source.width, source.height), 0, 0);
+  const transformed = new ImageData(source.width, source.height);
+  transformed.data.set(pixels);
+  ctx.putImageData(transformed, 0, 0);
 }

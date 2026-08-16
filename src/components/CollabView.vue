@@ -89,6 +89,12 @@ const {
   },
 });
 
+// vue-tsc with TypeScript 6 does not count string template refs returned by a
+// composable as script reads, even though Vue assigns these refs at runtime.
+void containerRef;
+void leftAreaRef;
+void leftColRef;
+
 const hasConflictState = computed(() => isMerging.value || hasUnresolvedFiles.value);
 const selectedHistoryKind = computed(() =>
   resolveHistorySelectionKind(

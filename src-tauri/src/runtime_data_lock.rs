@@ -3,7 +3,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 
 const LOCK_FILE_NAME: &str = ".locus-instance.lock";
 
@@ -35,9 +35,9 @@ impl RuntimeDataDirLock {
                 )
             })?;
 
-        match file.try_lock_exclusive() {
-            Ok(true) => {}
-            Ok(false) => {
+        match FileExt::try_lock(&file) {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
                 let owner = std::fs::read_to_string(&path)
                     .ok()
                     .map(|value| value.trim().to_string())
@@ -48,7 +48,7 @@ impl RuntimeDataDirLock {
                     data_dir.display()
                 ));
             }
-            Err(error) => {
+            Err(TryLockError::Error(error)) => {
                 return Err(format!(
                     "Failed to lock runtime data directory '{}': {}",
                     data_dir.display(),

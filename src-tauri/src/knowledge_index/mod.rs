@@ -2745,7 +2745,11 @@ fn managed_reference_config_signature(
         hasher.update(contents);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn build_unity_managed_retrieval_summary_cache_row(

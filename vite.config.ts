@@ -13,7 +13,7 @@ export default defineConfig(async () => ({
     viteStaticCopy({
       targets: [
         {
-          src: normalizePath(path.resolve(__dirname, "node_modules/vditor/dist/**/*")),
+          src: normalizePath(path.resolve(import.meta.dirname, "node_modules/vditor/dist/**/*")),
           dest: "vendor/vditor",
           rename: {
             stripBase: 2,
@@ -48,14 +48,23 @@ export default defineConfig(async () => ({
         // Main app entry plus the lightweight sub-window entry; sub-windows
         // (plan review, diff review, View hosts, ...) skip the main store
         // and service graph entirely.
-        main: path.resolve(__dirname, "index.html"),
-        window: path.resolve(__dirname, "window.html"),
+        main: path.resolve(import.meta.dirname, "index.html"),
+        window: path.resolve(import.meta.dirname, "window.html"),
       },
       output: {
-        manualChunks: {
-          vendor: ["vue", "pinia", "marked", "highlight.js"],
-          "binary-preview": ["ag-psd"],
-          "three-preview": ["three"],
+        manualChunks(id) {
+          const normalizedId = normalizePath(id);
+          if (normalizedId.includes("/node_modules/ag-psd/")) return "binary-preview";
+          if (normalizedId.includes("/node_modules/three/")) return "three-preview";
+          if (
+            normalizedId.includes("/node_modules/vue/")
+            || normalizedId.includes("/node_modules/@vue/")
+            || normalizedId.includes("/node_modules/pinia/")
+            || normalizedId.includes("/node_modules/marked/")
+            || normalizedId.includes("/node_modules/highlight.js/")
+          ) {
+            return "vendor";
+          }
         },
       },
     },

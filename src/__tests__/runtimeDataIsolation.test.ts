@@ -114,7 +114,7 @@ describe("runtime data isolation", () => {
     expect(lib.indexOf("RuntimeDataDirLock::acquire(&data_dir)")).toBeLessThan(
       lib.indexOf("SessionStore::new_with_tool_results_root"),
     );
-    expect(lock).toContain("try_lock_exclusive");
+    expect(lock).toContain("FileExt::try_lock(&file)");
     expect(lock).toContain("already in use by another process");
   });
 });
