@@ -67,13 +67,17 @@ struct InstalledPluginDir {
 }
 
 pub fn find_plugin_source_dir() -> Option<std::path::PathBuf> {
-    let mut candidates = vec![
+    let mut candidates = Vec::new();
+
+    #[cfg(debug_assertions)]
+    candidates.extend([
         std::path::PathBuf::from("../locus_unity"), // dev: src-tauri/../locus_unity
-        std::path::PathBuf::from("locus_unity"),    // cwd/locus_unity
-    ];
+        std::path::PathBuf::from("locus_unity"),    // dev: cwd/locus_unity
+    ]);
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
+            #[cfg(debug_assertions)]
             candidates.push(exe_dir.join("../locus_unity")); // dev: target/debug/../../../locus_unity
             candidates.push(exe_dir.join("locus_unity")); // production: alongside exe
         }

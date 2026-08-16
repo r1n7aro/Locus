@@ -204,6 +204,8 @@ struct RestorableToolRequest {
     detail: Option<String>,
     summary_options: crate::unity_yaml::HierarchySummaryOptions,
     search_options: crate::unity_yaml::HierarchySearchOptions,
+    property_tree_path: Option<String>,
+    property_tree_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -500,7 +502,7 @@ pub fn auto_compact_buffer(context_limit: u32) -> u32 {
     )
 }
 
-fn estimate_text_tokens(text: &str) -> u32 {
+pub(crate) fn estimate_text_tokens(text: &str) -> u32 {
     if text.is_empty() {
         return 0;
     }
@@ -528,7 +530,7 @@ fn estimate_tool_call_prompt_tokens(tool_call: &ToolCallInfo) -> u32 {
         ))
 }
 
-fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
+pub(crate) fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
     let mut total = MESSAGE_OVERHEAD_TOKENS
         .saturating_add(estimate_text_tokens(&message.content))
         .saturating_add(estimate_text_tokens(
@@ -553,6 +555,21 @@ fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
     }
 
     total
+}
+
+pub(crate) fn estimate_system_prompt_part_tokens(part: &str) -> u32 {
+    if part.is_empty() {
+        return 0;
+    }
+    MESSAGE_OVERHEAD_TOKENS.saturating_add(estimate_text_tokens(part))
+}
+
+pub(crate) fn estimate_api_tool_prompt_tokens(tool: &serde_json::Value) -> u32 {
+    if tool.get("defer_loading").and_then(|value| value.as_bool()) == Some(true) {
+        return 0;
+    }
+    let serialized = serde_json::to_string(tool).unwrap_or_default();
+    TOOL_SCHEMA_OVERHEAD_TOKENS.saturating_add(estimate_text_tokens(&serialized))
 }
 
 /// Budget for user messages retained verbatim across a compact, scaled to the
@@ -631,9 +648,7 @@ pub fn estimate_request_tokens(
     let mut total = 0u32;
 
     for part in system_parts {
-        total = total
-            .saturating_add(MESSAGE_OVERHEAD_TOKENS)
-            .saturating_add(estimate_text_tokens(part));
+        total = total.saturating_add(estimate_system_prompt_part_tokens(part));
     }
 
     for msg in messages {
@@ -644,13 +659,7 @@ pub fn estimate_request_tokens(
         // Deferred declarations (native lazy loading) are stripped from the
         // rendered prompt by the API until referenced; they cost request
         // bytes but no context tokens, so they stay out of the estimate.
-        if tool.get("defer_loading").and_then(|v| v.as_bool()) == Some(true) {
-            continue;
-        }
-        let serialized = serde_json::to_string(tool).unwrap_or_default();
-        total = total
-            .saturating_add(TOOL_SCHEMA_OVERHEAD_TOKENS)
-            .saturating_add(estimate_text_tokens(&serialized));
+        total = total.saturating_add(estimate_api_tool_prompt_tokens(tool));
     }
 
     total
@@ -1777,6 +1786,9 @@ fn parse_read_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequest> {
         detail: None,
         summary_options: crate::unity_yaml::HierarchySummaryOptions::default(),
         search_options: crate::unity_yaml::HierarchySearchOptions::default(),
+        property_tree_path: None,
+        property_tree_depth:
+            crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_DEFAULT_DEPTH,
     })
 }
 
@@ -1789,7 +1801,20 @@ fn parse_unity_yaml_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequ
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&tc.arguments).ok()?;
-    let file_path = parsed.get("file_path")?.as_str()?.trim();
+    let property_tree_path = parsed
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let parsed_property_tree_path = property_tree_path.as_deref().and_then(|path| {
+        crate::unity_serialized_property::property_tree::PropertyTreePath::parse("", path).ok()
+    });
+    let file_path = parsed_property_tree_path
+        .as_ref()
+        .map(|path| path.asset_path.as_str())
+        .or_else(|| parsed.get("file_path").and_then(|value| value.as_str()))?
+        .trim();
     if file_path.is_empty() {
         return None;
     }
@@ -1892,6 +1917,15 @@ fn parse_unity_yaml_tool_request(tc: &ToolCallInfo) -> Option<RestorableToolRequ
             path_prefix: trimmed_string(&parsed, "path_prefix"),
             limit: positive_usize(&parsed, "limit"),
         },
+        property_tree_path,
+        property_tree_depth: parsed
+            .get("depth")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(
+                crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_DEFAULT_DEPTH,
+            )
+            .min(crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_MAX_DEPTH),
     })
 }
 
@@ -2085,6 +2119,52 @@ fn read_current_unity_yaml_excerpt(
     let docs = crate::unity_yaml::parse_yaml_docs(&content);
     let text = String::from_utf8_lossy(&content);
     let lines: Vec<&str> = text.lines().collect();
+    if let Some(property_path) = request.property_tree_path.as_deref() {
+        let parsed_path = crate::unity_serialized_property::property_tree::PropertyTreePath::parse(
+            "",
+            property_path,
+        )
+        .ok()?;
+        let tree = crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
+            &parsed_path.asset_path,
+            &text,
+            None,
+            &HashMap::new(),
+        )
+        .ok()?;
+        let output = if matches!(request.kind, RestorableToolKind::UnityYamlSearch) {
+            let matches = tree
+                .search(
+                    &parsed_path,
+                    &crate::unity_serialized_property::property_tree::PropertyTreeSearchOptions {
+                        query: request.search_options.query.clone().unwrap_or_default(),
+                        match_fields: request.search_options.match_fields.clone(),
+                        limit: request.search_options.limit.unwrap_or(50),
+                    },
+                )
+                .ok()?;
+            crate::unity_serialized_property::property_tree::format_property_tree_search_results(
+                &parsed_path.full_path(),
+                &matches,
+                request.search_options.limit.unwrap_or(50),
+            )
+        } else {
+            match tree
+                .read_complete_within_budget(
+                    &parsed_path,
+                    crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_AUTO_EXPAND_CHAR_LIMIT,
+                )
+                .ok()?
+            {
+                Some(complete) => complete.output,
+                None => {
+                    let snapshot = tree.read(&parsed_path, request.property_tree_depth).ok()?;
+                    crate::unity_serialized_property::property_tree::format_property_tree(&snapshot)
+                }
+            }
+        };
+        return Some(truncate_for_token_budget(&output, max_tokens_per_file));
+    }
     let ext = resolved_path
         .extension()
         .unwrap_or_default()
@@ -2283,7 +2363,11 @@ pub fn build_post_compact_restored_files_section(
             };
 
             let resolved_path = resolve_read_path(working_dir_path, &request.file_path);
-            let dedupe_key = dedupe_key_for_path(&resolved_path);
+            let mut dedupe_key = dedupe_key_for_path(&resolved_path);
+            if let Some(property_tree_path) = request.property_tree_path.as_deref() {
+                dedupe_key.push('|');
+                dedupe_key.push_str(&property_tree_path.to_ascii_lowercase());
+            }
             if !seen_paths.insert(dedupe_key) {
                 continue;
             }

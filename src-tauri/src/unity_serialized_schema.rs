@@ -1382,6 +1382,7 @@ mod tests {
             message: "ok".to_string(),
             target,
             matches: vec![UnitySerializedPropertyDiscoverMatch {
+                semantic_path: String::new(),
                 property_path: "items.Array.size".to_string(),
                 name: "size".to_string(),
                 display_name: "Size".to_string(),
@@ -1394,8 +1395,14 @@ mod tests {
                 has_children: false,
                 is_array: false,
                 is_managed_reference: false,
+                managed_reference_id: 0,
+                reference_target: None,
                 depth: 2,
+                ..Default::default()
             }],
+            truncated: false,
+            scanned_objects: 0,
+            scanned_properties: 0,
         };
 
         index.enrich_discover_result(
@@ -1424,6 +1431,7 @@ mod tests {
             message: "ok".to_string(),
             target,
             matches: vec![UnitySerializedPropertyDiscoverMatch {
+                semantic_path: String::new(),
                 property_path: "items.Array.data[0].label".to_string(),
                 name: "label".to_string(),
                 display_name: "Label".to_string(),
@@ -1436,8 +1444,14 @@ mod tests {
                 has_children: false,
                 is_array: false,
                 is_managed_reference: false,
+                managed_reference_id: 0,
+                reference_target: None,
                 depth: 3,
+                ..Default::default()
             }],
+            truncated: false,
+            scanned_objects: 0,
+            scanned_properties: 0,
         };
 
         index.enrich_discover_result(
@@ -1774,6 +1788,7 @@ mod tests {
             target,
             matches: vec![
                 UnitySerializedPropertyDiscoverMatch {
+                    semantic_path: String::new(),
                     property_path: "items".to_string(),
                     name: "items".to_string(),
                     display_name: "Items".to_string(),
@@ -1786,9 +1801,13 @@ mod tests {
                     has_children: true,
                     is_array: true,
                     is_managed_reference: false,
+                    managed_reference_id: 0,
+                    reference_target: None,
                     depth: 1,
+                    ..Default::default()
                 },
                 UnitySerializedPropertyDiscoverMatch {
+                    semantic_path: String::new(),
                     property_path: "items.Array.data[0]".to_string(),
                     name: "data".to_string(),
                     display_name: "Element 0".to_string(),
@@ -1801,9 +1820,15 @@ mod tests {
                     has_children: true,
                     is_array: false,
                     is_managed_reference: false,
+                    managed_reference_id: 0,
+                    reference_target: None,
                     depth: 2,
+                    ..Default::default()
                 },
             ],
+            truncated: false,
+            scanned_objects: 0,
+            scanned_properties: 0,
         };
 
         index.enrich_discover_result(

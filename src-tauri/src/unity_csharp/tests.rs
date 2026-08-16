@@ -108,6 +108,31 @@ public class Hero : MonoBehaviour
 }
 
 #[test]
+fn parses_serialize_reference_fields_and_backing_fields() {
+    let content = r#"
+using UnityEngine;
+public class ActionConfig : ScriptableObject
+{
+    [SerializeReference] private IAction action;
+    [field: SerializeReference] public IAction Fallback { get; private set; }
+}
+"#;
+    let meta = parse_cs_script(content, Some("ActionConfig")).unwrap();
+    let action = meta
+        .serialized_fields
+        .iter()
+        .find(|field| field.name == "action")
+        .expect("private SerializeReference field");
+    assert!(action.serialize_reference);
+    let fallback = meta
+        .serialized_fields
+        .iter()
+        .find(|field| field.name == "Fallback")
+        .expect("SerializeReference backing field");
+    assert!(fallback.serialize_reference);
+}
+
+#[test]
 fn excludes_static_const_and_non_serialized_fields() {
     let content = r#"
 using System;

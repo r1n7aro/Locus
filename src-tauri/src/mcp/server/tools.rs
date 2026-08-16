@@ -37,7 +37,6 @@ pub const EXPOSED_TOOLS: &[&str] = &[
     "unity_asset_search",
     "unity_ref_search",
     "unity_code_usages",
-    "unity_yaml_list",
     "unity_yaml_search",
     "unity_yaml_read",
     "code_symbol_search",
@@ -471,7 +470,10 @@ pub async fn execute_tool(
     let request_run_id = format!("mcp-{}", uuid::Uuid::new_v4());
     let fut = async {
         let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-        let lock_request = if registry.mutates_workspace(&name)
+        let lock_request = if name == "unity_execute" {
+            (!AgentInstance::unity_execute_is_readonly(&arguments))
+                .then_some(WorkspaceExecutionLockRequest::Exclusive)
+        } else if registry.mutates_workspace(&name)
             || AgentInstance::is_unity_execution_barrier_tool(&name)
         {
             Some(WorkspaceExecutionLockRequest::Exclusive)
@@ -579,10 +581,6 @@ async fn execute_workspace_tool(
             AgentInstance::execute_unity_asset_search(app, arguments),
             None,
         ),
-        "unity_yaml_list" => outcome_from_tool_result(
-            AgentInstance::execute_unity_yaml_list(app, working_dir, arguments).await,
-            None,
-        ),
         "unity_yaml_search" => outcome_from_tool_result(
             AgentInstance::execute_unity_yaml_search(app, working_dir, arguments).await,
             None,
@@ -598,6 +596,10 @@ async fn execute_workspace_tool(
             let context = ToolExecutionContext {
                 app_handle: Some(app.clone()),
                 working_dir: Some(working_dir.to_string()),
+                process_owner: Some(crate::process_util::ProcessOwner {
+                    working_dir: Some(working_dir.to_string()),
+                    ..Default::default()
+                }),
                 // Registry tools that need Unity perform their own authoritative
                 // request. Eagerly probing here duplicated status traffic and
                 // could race the real request; this field is only consumed by

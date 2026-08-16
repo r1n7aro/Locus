@@ -6,6 +6,8 @@ use crate::view::{
     UnitySerializedPropertyWriteResult,
 };
 
+pub mod property_tree;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnitySerializedPropertyReadRequest {
@@ -16,6 +18,8 @@ pub struct UnitySerializedPropertyReadRequest {
     pub max_depth: Option<i32>,
     #[serde(default)]
     pub max_array_items: Option<i32>,
+    #[serde(default)]
+    pub auto_expand_char_limit: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,9 +35,15 @@ pub struct UnitySerializedPropertyDiscoverRequest {
     #[serde(default)]
     pub field_type: Option<String>,
     #[serde(default)]
+    pub match_fields: Option<Vec<String>>,
+    #[serde(default)]
     pub max_depth: Option<i32>,
     #[serde(default)]
     pub max_results: Option<i32>,
+    #[serde(default)]
+    pub include_all: Option<bool>,
+    #[serde(default)]
+    pub shallow_path_matches: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,9 +86,10 @@ pub async fn read(
         "target": request.target,
         "maxDepth": request.max_depth.unwrap_or_default(),
         "maxArrayItems": request.max_array_items.unwrap_or_default(),
+        "autoExpandCharLimit": request.auto_expand_char_limit.unwrap_or_default(),
         "schemaMode": schema_mode,
     });
-    let raw = crate::unity_bridge::view_binding_read(working_dir, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_read(working_dir, &payload).await?;
     let mut result: UnitySerializedPropertyReadResult = serde_json::from_str(&raw)
         .map_err(|error| format!("Invalid unity_serialized_property_read response: {}", error))?;
     if let Some(schema) = schema {
@@ -99,7 +110,8 @@ pub async fn discover(
         field_type: request.field_type.clone(),
         max_results: request.max_results,
     };
-    let include_all = schema.is_some() && !discover_has_filters(&filters);
+    let include_all = request.include_all.unwrap_or(false)
+        || (schema.is_some() && !discover_has_filters(&filters));
     let schema_mode = if include_all { "dynamic" } else { "full" };
     let unity_max_results = if include_all {
         request.max_results.unwrap_or_default().max(5000)
@@ -112,12 +124,14 @@ pub async fn discover(
         "query": if include_all { String::new() } else { request.query.unwrap_or_default() },
         "fieldName": if include_all { String::new() } else { request.field_name.unwrap_or_default() },
         "fieldType": if include_all { String::new() } else { request.field_type.unwrap_or_default() },
+        "matchFields": request.match_fields.unwrap_or_default(),
         "maxDepth": request.max_depth.unwrap_or_default(),
         "maxResults": unity_max_results,
         "includeAll": include_all,
+        "shallowPathMatches": request.shallow_path_matches.unwrap_or(false),
         "schemaMode": schema_mode,
     });
-    let raw = crate::unity_bridge::view_binding_discover(working_dir, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_discover(working_dir, &payload).await?;
     let mut result: UnitySerializedPropertyDiscoverResult =
         serde_json::from_str(&raw).map_err(|error| {
             format!(
@@ -149,7 +163,7 @@ pub async fn write(
         "mode": normalize_write_mode(request.write_mode.as_deref())?,
         "schemaMode": schema_mode,
     });
-    let raw = crate::unity_bridge::view_binding_write(working_dir, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_write(working_dir, &payload).await?;
     let mut result: UnitySerializedPropertyWriteResult =
         serde_json::from_str(&raw).map_err(|error| {
             format!(
@@ -201,7 +215,7 @@ pub async fn apply(
         }));
     }
     let payload = serde_json::json!({ "writes": writes });
-    let raw = crate::unity_bridge::view_binding_apply(working_dir, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_apply(working_dir, &payload).await?;
     let mut result: UnitySerializedPropertyApplyResult =
         serde_json::from_str(&raw).map_err(|error| {
             format!(

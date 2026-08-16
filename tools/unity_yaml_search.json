@@ -1,34 +1,28 @@
 {
-  "description": "Search within a Unity scene or prefab hierarchy and return precise object paths for later unity_yaml_read calls.\n\nFor .unity/.prefab files, live Unity Editor state is read first (unsaved changes visible), falling back to direct text YAML parsing when the Editor is unavailable. Use this when you know a name, component, tag/layer clue, prefab source, serialized field clue, or subtree but need the exact object path. Each result row shows full path, component names, active/static state, Tag, and Layer; prefab-source and serialized-field matches participate in matching but are omitted from rows. When sibling names repeat, paths use a 1-based segment ordinal such as `Root/Enemy[2]`.\n\nWhen both query and component_filter are given, a result must satisfy both. Field matching (field_name/field_value in match_fields) is expensive on large scenes — combine it with path_prefix when possible.",
+  "description": "Search a Unity asset or one internal Property Tree subtree when unity_yaml_read has not already revealed the target path. Use the narrowest known scope. `path` uses the same asset-qualified syntax as unity_yaml_read, and every result path can be passed to unity_yaml_read unchanged for verification before editing. At a compound asset root, search covers the main object and every same-file Subasset and returns paths from the serialized-reference ownership hierarchy. The first same-file ObjectReference reached through serialized properties claims the child; non-serialized runtime fields never participate. Path matching keeps only the shallowest matching node on each branch, so a matching ancestor does not emit every descendant whose full path inherits the same query. Field-name and field-value matches remain separate results and include explicit evidence showing the matched field name and compact field value; type matches identify the matched type. When Unity is connected, search filters the live Editor Property Tree so unsaved values, all serialized array indices, and loaded Scene hierarchy changes are visible without transferring a whole asset; disk YAML is used only when the live target is unavailable. Search stops at shared/cyclic references after their first canonical path. Results omit repeated asset metadata.",
   "parameters": {
     "type": "object",
     "properties": {
-      "file_path": {
+      "path": {
         "type": "string",
-        "description": "Path to the Unity .unity or .prefab YAML file, relative to the project root (e.g. 'Assets/Scenes/Main.unity') or absolute path."
+        "description": "Asset-qualified search scope such as `Assets/Actions/LightNormalAttack1.asset/hitTrack`."
       },
       "query": {
         "type": "string",
-        "description": "Optional text search over object paths, names, component names, annotations, and resolved prefab source paths. Case-insensitive substring by default; use 're:<pattern>' for a case-insensitive regular expression."
-      },
-      "component_filter": {
-        "type": "string",
-        "description": "Optional component filter. Use a component name such as 'Light' or 'Canvas', or comma-separated component names for OR matching."
+        "description": "Case-insensitive substring. Prefix with `re:` for a case-insensitive regular expression."
       },
       "match_fields": {
         "type": "string",
-        "description": "Optional comma-separated query scope. Supported values: path, name, component, annotation, tag, layer, prefab_source, field_name, field_value, default, all. Omit to use default matching. Use field_name or field_value only when you need serialized component field matching."
-      },
-      "path_prefix": {
-        "type": "string",
-        "description": "Optional hierarchy path prefix for searching one subtree, such as 'Environment/Lighting' or a returned duplicate-safe path like 'Root/Enemy[2]'."
+        "description": "Optional comma-separated scope: path, field_name, field_value, type, or all. Defaults to all."
       },
       "limit": {
         "type": "integer",
         "minimum": 1,
-        "description": "Optional maximum number of search results to print. Defaults to 50 and is clamped to 1000."
+        "maximum": 1000,
+        "default": 50,
+        "description": "Maximum number of retained result nodes after shallow path de-duplication. Each field or type node remains an individual result."
       }
     },
-    "required": ["file_path"]
+    "required": ["path", "query"]
   }
 }

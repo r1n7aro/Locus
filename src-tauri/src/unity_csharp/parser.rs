@@ -40,6 +40,7 @@ pub struct ScriptFieldMeta {
     pub former_names: Vec<String>,
     pub hidden: bool,
     pub serialize_field: bool,
+    pub serialize_reference: bool,
 }
 
 /// Parse a C# script source string and extract Unity-relevant metadata.
@@ -382,6 +383,10 @@ struct AttrInfo {
     /// `[field: SerializeField]` on a property declaration — targets the
     /// compiler-generated backing field rather than the property itself.
     has_field_target_serialize_field: bool,
+    /// `[SerializeReference]` directly on a field declaration.
+    has_plain_serialize_reference: bool,
+    /// `[field: SerializeReference]` on an auto-property backing field.
+    has_field_target_serialize_reference: bool,
     has_hide_in_inspector: bool,
     has_non_serialized: bool,
     former_names: Vec<String>,
@@ -414,6 +419,7 @@ fn collect_attribute_info(source: &[u8], node: Node) -> AttrInfo {
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or("");
             let short = name.rsplit('.').next().unwrap_or(name);
+            let short = short.strip_suffix("Attribute").unwrap_or(short);
 
             match short {
                 "SerializeField" => {
@@ -421,6 +427,13 @@ fn collect_attribute_info(source: &[u8], node: Node) -> AttrInfo {
                         info.has_field_target_serialize_field = true;
                     } else {
                         info.has_plain_serialize_field = true;
+                    }
+                }
+                "SerializeReference" => {
+                    if is_field_target {
+                        info.has_field_target_serialize_reference = true;
+                    } else {
+                        info.has_plain_serialize_reference = true;
                     }
                 }
                 "HideInInspector" => info.has_hide_in_inspector = true,
@@ -557,7 +570,7 @@ fn parse_field_declaration(source: &[u8], node: Node, out: &mut Vec<ScriptFieldM
     if is_static || is_const {
         return;
     }
-    if !is_public && !attrs.has_plain_serialize_field {
+    if !is_public && !attrs.has_plain_serialize_field && !attrs.has_plain_serialize_reference {
         return;
     }
 
@@ -595,6 +608,7 @@ fn parse_field_declaration(source: &[u8], node: Node, out: &mut Vec<ScriptFieldM
             former_names: attrs.former_names.clone(),
             hidden: attrs.has_hide_in_inspector,
             serialize_field: true,
+            serialize_reference: attrs.has_plain_serialize_reference,
         });
     }
 }
@@ -638,7 +652,9 @@ fn parse_property_declaration(source: &[u8], node: Node, out: &mut Vec<ScriptFie
     // Only properties tagged with `[field: SerializeField]` participate in
     // Unity serialization.
     let attrs = collect_attribute_info(source, node);
-    if !attrs.has_field_target_serialize_field || attrs.has_non_serialized {
+    if (!attrs.has_field_target_serialize_field && !attrs.has_field_target_serialize_reference)
+        || attrs.has_non_serialized
+    {
         return;
     }
 
@@ -676,5 +692,6 @@ fn parse_property_declaration(source: &[u8], node: Node, out: &mut Vec<ScriptFie
         former_names: attrs.former_names,
         hidden: attrs.has_hide_in_inspector,
         serialize_field: true,
+        serialize_reference: attrs.has_field_target_serialize_reference,
     });
 }

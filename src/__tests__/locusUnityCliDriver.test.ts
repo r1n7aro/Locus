@@ -167,14 +167,14 @@ describe("Locus Unity CLI driver", () => {
 
   it("keeps Type Index include-all discover large enough for dense Unity assets", () => {
     const typeIndex = read("src-tauri/src/unity_type_index_selftest.rs");
-    const viewBindings = read("locus_unity/Editor/LocusBridge.ViewBindings.cs");
+    const viewBindings = read("locus_unity/Editor/LocusBridge.PropertyTree.cs");
 
     expect(typeIndex).toContain("DISCOVER_INCLUDE_ALL_MAX_RESULTS: i32 = 50_000");
     expect(typeIndex).toContain(
       "if include_all { DISCOVER_INCLUDE_ALL_MAX_RESULTS } else { DISCOVER_MAX_RESULTS }",
     );
-    expect(viewBindings).toContain("ViewBindingIncludeAllDiscoverMaxResults = 50000");
-    expect(viewBindings).toContain("ViewBindingFilteredDiscoverMaxResults = 500");
+    expect(viewBindings).toContain("PropertyTreeIncludeAllDiscoverMaxResults = 50000");
+    expect(viewBindings).toContain("PropertyTreeFilteredDiscoverMaxResults = 500");
   });
 
   it("streams Type Index progress every ~1% of sampled targets", () => {

@@ -808,17 +808,30 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UnitySerializedPropertySnapshot {
     #[serde(default)]
     pub property_path: String,
+    /// Asset-qualified path assigned by the shared Property Tree projection.
+    #[serde(default)]
+    pub semantic_path: String,
+    #[serde(default)]
+    pub node_kind: String,
+    #[serde(default)]
+    pub canonical_path: String,
     #[serde(
         default,
         deserialize_with = "lenient_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub binding_target: Option<UnitySerializedPropertyTarget>,
+    #[serde(
+        default,
+        deserialize_with = "lenient_or_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reference_target: Option<UnitySerializedPropertyTarget>,
     #[serde(default)]
     pub display_name: String,
     #[serde(default)]
@@ -844,6 +857,10 @@ pub struct UnitySerializedPropertySnapshot {
     #[serde(default)]
     pub array_size: i32,
     #[serde(default)]
+    pub visible_child_count: i32,
+    #[serde(default)]
+    pub children_truncated: bool,
+    #[serde(default)]
     pub is_flags_enum: bool,
     #[serde(default)]
     pub enum_value_index: i32,
@@ -855,6 +872,8 @@ pub struct UnitySerializedPropertySnapshot {
     pub children: Vec<UnitySerializedPropertySnapshot>,
     #[serde(default)]
     pub is_managed_reference: bool,
+    #[serde(default)]
+    pub managed_reference_id: i64,
     #[serde(default)]
     pub managed_reference_full_typename: String,
     #[serde(default)]
@@ -887,6 +906,41 @@ pub struct UnitySerializedPropertySnapshot {
     pub reference_type_assembly: String,
     #[serde(default, deserialize_with = "lenient_or_default")]
     pub attributes: Vec<UnitySerializedPropertyAttributeInfo>,
+    /// Addressable Unity objects stored in the same asset file. They are
+    /// rendered as a separate directory and never count as serialized
+    /// property children of the main object.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub subassets: Vec<UnityPropertyTreeSubassetEntry>,
+    /// Read-only semantic context rendered outside the addressable property
+    /// hierarchy.  These lines never participate in path resolution/search.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub display_sections: Vec<UnityPropertyTreeDisplaySection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityPropertyTreeSubassetEntry {
+    #[serde(default)]
+    pub segment: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default, rename = "type")]
+    pub property_type: String,
+    #[serde(default)]
+    pub type_full_name: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub target: UnitySerializedPropertyTarget,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub children: Vec<UnityPropertyTreeSubassetEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityPropertyTreeDisplaySection {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -903,9 +957,13 @@ pub struct UnitySerializedPropertyReadResult {
     pub properties: Vec<UnitySerializedPropertySnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UnitySerializedPropertyDiscoverMatch {
+    /// Asset-qualified Property Tree path when discovery spans an object
+    /// hierarchy (for example, a loaded Scene).
+    #[serde(default)]
+    pub semantic_path: String,
     #[serde(default)]
     pub property_path: String,
     #[serde(default)]
@@ -931,7 +989,23 @@ pub struct UnitySerializedPropertyDiscoverMatch {
     #[serde(default)]
     pub is_managed_reference: bool,
     #[serde(default)]
+    pub managed_reference_id: i64,
+    #[serde(
+        default,
+        deserialize_with = "lenient_or_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reference_target: Option<UnitySerializedPropertyTarget>,
+    #[serde(default)]
     pub depth: i32,
+    #[serde(default)]
+    pub matched_path: bool,
+    #[serde(default)]
+    pub matched_field_name: bool,
+    #[serde(default)]
+    pub matched_field_value: bool,
+    #[serde(default)]
+    pub matched_type: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -944,6 +1018,12 @@ pub struct UnitySerializedPropertyDiscoverResult {
     pub target: UnitySerializedPropertyTarget,
     #[serde(default)]
     pub matches: Vec<UnitySerializedPropertyDiscoverMatch>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub scanned_objects: i32,
+    #[serde(default)]
+    pub scanned_properties: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3007,7 +3087,9 @@ pub(crate) fn copy_view_package_for_plugin_sync(
     })
 }
 
-fn zip_entry_rel_path(file: &zip::read::ZipFile<'_>) -> Result<String, String> {
+fn zip_entry_rel_path<R: std::io::Read>(
+    file: &zip::read::ZipFile<'_, R>,
+) -> Result<String, String> {
     let path = file
         .enclosed_name()
         .ok_or_else(|| format!("Unsafe archive entry path: {}", file.name()))?;
@@ -3126,7 +3208,7 @@ fn imported_view_display_path(
     Ok(display_path)
 }
 
-fn is_zip_entry_symlink(file: &zip::read::ZipFile<'_>) -> bool {
+fn is_zip_entry_symlink<R: std::io::Read>(file: &zip::read::ZipFile<'_, R>) -> bool {
     const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
     const UNIX_SYMLINK_TYPE: u32 = 0o120000;
     file.unix_mode()

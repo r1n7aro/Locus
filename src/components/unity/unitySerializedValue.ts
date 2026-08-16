@@ -54,7 +54,11 @@ export interface UnitySerializedPropertyTargetSnapshot {
 
 export interface UnitySerializedPropertySnapshot {
   propertyPath: string;
+  semanticPath?: string;
+  nodeKind?: string;
+  canonicalPath?: string;
   bindingTarget?: UnitySerializedPropertyTargetSnapshot | null;
+  referenceTarget?: UnitySerializedPropertyTargetSnapshot | null;
   target?: UnitySerializedPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
@@ -68,12 +72,15 @@ export interface UnitySerializedPropertySnapshot {
   hasChildren?: boolean;
   isArray?: boolean;
   arraySize?: number;
+  visibleChildCount?: number;
+  childrenTruncated?: boolean;
   isFlagsEnum?: boolean;
   enumValueIndex?: number;
   enumValueFlag?: number;
   enumOptions?: UnitySelectOption[];
   children?: UnitySerializedPropertySnapshot[];
   isManagedReference?: boolean;
+  managedReferenceId?: number;
   managedReferenceFullTypename?: string;
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
@@ -90,6 +97,22 @@ export interface UnitySerializedPropertySnapshot {
   referenceTypeFullName?: string;
   referenceTypeAssembly?: string;
   attributes?: UnitySerializedPropertyAttributeInfo[];
+  subassets?: UnityPropertyTreeSubassetEntry[];
+  displaySections?: UnityPropertyTreeDisplaySection[];
+}
+
+export interface UnityPropertyTreeSubassetEntry {
+  segment: string;
+  displayName?: string;
+  type?: string;
+  typeFullName?: string;
+  target: UnitySerializedPropertyTargetSnapshot;
+  children?: UnityPropertyTreeSubassetEntry[];
+}
+
+export interface UnityPropertyTreeDisplaySection {
+  title: string;
+  lines: string[];
 }
 
 export interface UnitySerializedPropertyCommitEvent {

@@ -64,14 +64,12 @@ describe("Unity Console log tool", () => {
     expect(consoleTool).not.toContain("is_unity_connected");
   });
 
-  it("exposes the tool to debugging agents and the Locus MCP surface", () => {
+  it("exposes the tool to Unity and the Locus MCP surface", () => {
     const dev = JSON.parse(read("agent/dev/config.json"));
-    const runtimeDebugger = JSON.parse(read("agent/runtime_debugger/config.json"));
     const mcpTools = read("src-tauri/src/mcp/server/tools.rs");
     const registry = read("src-tauri/src/tool/builtins/mod.rs");
 
     expect(dev.tools).toContain("unity_get_console_log");
-    expect(runtimeDebugger.tools).toContain("unity_get_console_log");
     expect(mcpTools).toContain('"unity_get_console_log"');
     expect(registry).toContain("registry.register_builtin(unity::unity_get_console_log())");
   });

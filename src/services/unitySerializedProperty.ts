@@ -14,6 +14,7 @@ export interface UnitySerializedPropertyReadRequest {
   target: UnitySerializedPropertyTarget;
   maxDepth?: number | null;
   maxArrayItems?: number | null;
+  autoExpandCharLimit?: number | null;
 }
 
 export interface UnitySerializedPropertyDiscoverRequest {
@@ -22,8 +23,10 @@ export interface UnitySerializedPropertyDiscoverRequest {
   query?: string | null;
   fieldName?: string | null;
   fieldType?: string | null;
+  matchFields?: string[] | null;
   maxDepth?: number | null;
   maxResults?: number | null;
+  includeAll?: boolean | null;
 }
 
 export interface UnitySerializedPropertyWriteRequest {
@@ -45,6 +48,7 @@ export interface UnitySerializedPropertyApplyRequest {
 }
 
 export interface UnitySerializedPropertyDiscoverMatch {
+  semanticPath?: string;
   propertyPath: string;
   displayName: string;
   name: string;
@@ -57,6 +61,8 @@ export interface UnitySerializedPropertyDiscoverMatch {
   hasChildren: boolean;
   isArray: boolean;
   isManagedReference: boolean;
+  managedReferenceId?: number;
+  referenceTarget?: UnitySerializedPropertyTarget | null;
   depth: number;
 }
 
@@ -74,6 +80,9 @@ export interface UnitySerializedPropertyDiscoverResult {
   message: string;
   target: UnitySerializedPropertyTarget;
   matches: UnitySerializedPropertyDiscoverMatch[];
+  truncated?: boolean;
+  scannedObjects?: number;
+  scannedProperties?: number;
 }
 
 export interface UnitySerializedPropertyWriteResult extends UnitySerializedPropertyReadResult {

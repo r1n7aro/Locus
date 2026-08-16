@@ -286,7 +286,7 @@ pub(super) fn read() -> ToolDef {
                     if ctx.should_redirect_unity_asset_read(&file_path) {
                         return ToolResult {
                             output: format!(
-                                "Direct file reads are not recommended for Unity YAML asset '{}'. Use `unity_yaml_list`, `unity_yaml_search`, or `unity_yaml_read` for semantic Unity YAML access. You can also use `unity_execute` to load and inspect the asset with a Unity Editor C# script. If you still need the raw file content, repeat the same `read` call once more.",
+                                "Direct raw reads are disabled for Unity YAML asset '{}'. Use `unity_yaml_read` with an asset-qualified Property Tree `path`, then continue with returned child paths; use `unity_yaml_search` to locate a precise path.",
                                 file_path
                             ),
                             is_error: true,

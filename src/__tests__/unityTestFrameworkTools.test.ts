@@ -35,14 +35,14 @@ describe("Unity Test Framework tools", () => {
     expect(api).toContain("LocusUnityTestService.Start");
     expect(api).not.toContain("System.Reflection");
 
-    expect(service).toContain("internal static Task<UnityTestListDto> ListAsync");
+    expect(service).toContain("internal static async Task<UnityTestListDto> ListAsync");
     expect(service).toContain("internal static UnityTestRunSnapshotDto Start");
     expect(service).toContain("internal static UnityTestRunSnapshotDto Status");
     expect(service).toContain("internal static UnityTestRunSnapshotDto Cancel");
     expect(executeDefinition.description).toContain("UnityTestApi.ListAsync");
     expect(executeDefinition.description).toContain("UnityTestApi.Start");
     expect(executeDefinition.description).toContain("Status(runId)");
-    expect(executeDefinition.description).toContain("official TestRunner directly");
+    expect(executeDefinition.description).toContain("com.unity.test-framework");
     expect(read("agent/dev/rule/tool_usage_strategy.md")).toContain(
       "UnityTestApi.ListAsync",
     );
@@ -124,7 +124,11 @@ describe("Unity Test Framework tools", () => {
     const formatter = read("src-tauri/src/tool/builtins/unity.rs");
 
     expect(service).toContain("public string[] path;");
-    expect(service).toContain("mode = ModeName(node.TestMode)");
+    expect(service).toContain("await CollectModeAsync(");
+    expect(service).toMatch(/TestMode\.EditMode,\s+"edit"/);
+    expect(service).toMatch(/TestMode\.PlayMode,\s+"play"/);
+    expect(service).toContain("mode = modeName");
+    expect(service).not.toContain("ModeName(node.TestMode)");
     expect(service).toContain("path = testPath.ToArray()");
     expect(formatter).toContain("render_unity_test_tree");
     expect(formatter).toContain('let branch = if is_last { "└─ " } else { "├─ " };');

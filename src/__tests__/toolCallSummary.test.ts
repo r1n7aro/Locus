@@ -28,19 +28,27 @@ describe("toolCallSummary", () => {
     }))).toBe("Assets/Scripts/Gameplay/PlayerController.cs");
   });
 
+  it("shows asset-qualified Property Tree paths for read and search", () => {
+    const path = "Assets/Actions/LightNormalAttack1.asset/hitTrack/clips/4";
+    expect(buildToolCallArgsSummary("unity_yaml_read", JSON.stringify({ path, depth: 2 })))
+      .toBe(path);
+    expect(buildToolCallArgsSummary("unity_yaml_search", JSON.stringify({ path, query: "damage" })))
+      .toBe(path);
+  });
+
   it("makes absolute workspace paths project-relative", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
-      file_path: "F:\\SampleGame-6.5\\Assets\\Scripts\\ECS\\Runtime\\Time\\TimelineTypes.cs",
+      file_path: "F:\\SampleGame\\Assets\\Scripts\\ECS\\Runtime\\Time\\TimelineTypes.cs",
     }), {
-      workingDir: "f:/samplegame-6.5/",
+      workingDir: "f:/samplegame/",
     })).toBe("Assets/Scripts/ECS/Runtime/Time/TimelineTypes.cs");
   });
 
   it("keeps other Unity project roots project-relative", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
-      file_path: "F:/SampleGame-6.5/Packages/com.example.tool/Editor/Tool.cs",
+      file_path: "F:/SampleGame/Packages/com.example.tool/Editor/Tool.cs",
     }), {
-      workingDir: "F:/SampleGame-6.5",
+      workingDir: "F:/SampleGame",
     })).toBe("Packages/com.example.tool/Editor/Tool.cs");
   });
 
@@ -48,7 +56,7 @@ describe("toolCallSummary", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
       file_path: "D:/SharedTools/Scripts/Build.cs",
     }), {
-      workingDir: "F:/SampleGame-6.5",
+      workingDir: "F:/SampleGame",
       extraWorkdirs: ["D:/SharedTools"],
     })).toBe("SharedTools/Scripts/Build.cs");
   });
@@ -57,16 +65,16 @@ describe("toolCallSummary", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
       file_path: "D:/OtherProject/Assets/Scripts/Runtime/Time/TimelineTypes.cs",
     }), {
-      workingDir: "F:/SampleGame-6.5",
+      workingDir: "F:/SampleGame",
     })).toBe("D:/OtherProject/Assets/…/Time/TimelineTypes.cs");
   });
 
   it("matches workspace roots on complete path segments", () => {
     expect(buildToolCallArgsSummary("read", JSON.stringify({
-      file_path: "F:/SampleGame-6.5-copy/Assets/Scripts/Player.cs",
+      file_path: "F:/SampleGame-copy/Assets/Scripts/Player.cs",
     }), {
-      workingDir: "F:/SampleGame-6.5",
-    })).toBe("F:/SampleGame-6.5-copy/Assets/Scripts/Player.cs");
+      workingDir: "F:/SampleGame",
+    })).toBe("F:/SampleGame-copy/Assets/Scripts/Player.cs");
   });
 
   it("shows url summaries for web_fetch", () => {

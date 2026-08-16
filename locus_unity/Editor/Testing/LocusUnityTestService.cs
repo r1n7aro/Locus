@@ -382,30 +382,55 @@ namespace Locus.UnityTesting
             return JsonUtility.ToJson(response, true);
         }
 
-        internal static Task<UnityTestListDto> ListAsync(UnityTestFilterRequest request)
+        internal static async Task<UnityTestListDto> ListAsync(UnityTestFilterRequest request)
         {
             if (request == null)
                 request = new UnityTestFilterRequest();
             TestMode mode = ParseMode(request.mode);
             ValidateRegexes(request.groups);
             int maxResults = request.max_results <= 0 ? 500 : Math.Min(request.max_results, 5000);
-            TaskCompletionSource<UnityTestListDto> completion =
-                new TaskCompletionSource<UnityTestListDto>();
+            UnityTestListDto response = new UnityTestListDto { mode = ModeName(mode) };
 
+            if ((mode & TestMode.EditMode) == TestMode.EditMode)
+                await CollectModeAsync(
+                    TestMode.EditMode,
+                    "edit",
+                    request,
+                    response,
+                    maxResults);
+            if ((mode & TestMode.PlayMode) == TestMode.PlayMode)
+                await CollectModeAsync(
+                    TestMode.PlayMode,
+                    "play",
+                    request,
+                    response,
+                    maxResults);
+
+            return response;
+        }
+
+        private static Task CollectModeAsync(
+            TestMode mode,
+            string modeName,
+            UnityTestFilterRequest request,
+            UnityTestListDto response,
+            int maxResults)
+        {
+            TaskCompletionSource<bool> completion = new TaskCompletionSource<bool>();
             Api.RetrieveTestList(mode, delegate(ITestAdaptor root)
             {
                 try
                 {
-                    UnityTestListDto response = new UnityTestListDto { mode = ModeName(mode) };
                     CollectTests(
                         root,
                         "",
                         new List<string>(),
                         true,
+                        modeName,
                         request,
                         response,
                         maxResults);
-                    completion.TrySetResult(response);
+                    completion.TrySetResult(true);
                 }
                 catch (Exception ex)
                 {
@@ -420,6 +445,7 @@ namespace Locus.UnityTesting
             string assemblyName,
             List<string> suitePath,
             bool isRoot,
+            string modeName,
             UnityTestFilterRequest request,
             UnityTestListDto response,
             int maxResults)
@@ -449,7 +475,7 @@ namespace Locus.UnityTesting
                         name = node.Name ?? "",
                         full_name = node.FullName ?? node.Name ?? "",
                         assembly = assemblyName ?? "",
-                        mode = ModeName(node.TestMode),
+                        mode = modeName,
                         path = testPath.ToArray(),
                         categories = node.Categories ?? new string[0]
                     });
@@ -468,6 +494,7 @@ namespace Locus.UnityTesting
                     assemblyName,
                     suitePath,
                     false,
+                    modeName,
                     request,
                     response,
                     maxResults);

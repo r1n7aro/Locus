@@ -577,9 +577,8 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("code_hover", "C# hover info (Roslyn)"),
         ("unity_code_usages", "Script usages in Unity assets"),
         ("unity_asset_search", "Unity asset search"),
-        ("unity_yaml_list", "List Unity YAML hierarchy"),
-        ("unity_yaml_search", "Search Unity YAML hierarchy"),
-        ("unity_yaml_read", "Read Unity YAML detail"),
+        ("unity_yaml_search", "Search Unity Property Tree"),
+        ("unity_yaml_read", "Progressively read Unity Property Tree"),
         ("knowledge_query", "Unified knowledge document search"),
     ];
 

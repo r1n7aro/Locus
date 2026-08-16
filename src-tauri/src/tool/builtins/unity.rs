@@ -869,7 +869,7 @@ pub(super) fn unity_get_console_log() -> ToolDef {
 
 // ─── Unity YAML tools ────────────────────────────────────────────────────────
 
-/// Shared closure body for the three unity_yaml tools: resolve the app
+/// Shared closure body for the two unity_yaml tools: resolve the app
 /// handle + working dir from the execution context, then run the same
 /// implementation the agent loop calls.
 macro_rules! unity_yaml_tool_def {
@@ -908,14 +908,6 @@ macro_rules! unity_yaml_tool_def {
             }),
         }
     }};
-}
-
-pub(super) fn unity_yaml_list() -> ToolDef {
-    unity_yaml_tool_def!(
-        "unity_yaml_list",
-        crate::prompt::tools::UNITY_YAML_LIST,
-        execute_unity_yaml_list
-    )
 }
 
 pub(super) fn unity_yaml_search() -> ToolDef {

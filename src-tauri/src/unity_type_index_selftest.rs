@@ -256,7 +256,7 @@ async fn read_target(
         "maxArrayItems": READ_MAX_ARRAY_ITEMS,
         "schemaMode": schema_mode,
     });
-    let raw = crate::unity_bridge::view_binding_read(project_path, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_read(project_path, &payload).await?;
     serde_json::from_str(&raw)
         .map_err(|error| format!("{schema_mode} read response parse failed: {error}"))
 }
@@ -278,7 +278,7 @@ async fn discover_target(
         "includeAll": include_all,
         "schemaMode": schema_mode,
     });
-    let raw = crate::unity_bridge::view_binding_discover(project_path, &payload).await?;
+    let raw = crate::unity_bridge::property_tree_discover(project_path, &payload).await?;
     serde_json::from_str(&raw)
         .map_err(|error| format!("{schema_mode} discover response parse failed: {error}"))
 }

@@ -89,13 +89,6 @@ namespace Locus
             new List<YamlPreviewSceneCacheEntry>();
         private static double _yamlPreviewSceneCacheNextSweepAt;
 
-        /// <summary>
-        /// </summary>
-        private static async Task<PipeEnvelope> HandleListYaml(string requestId, string json)
-        {
-            return await HandleYamlTool(requestId, json, UnityYamlModeList, "list_yaml");
-        }
-
         private static async Task<PipeEnvelope> HandleSearchYaml(string requestId, string json)
         {
             return await HandleYamlTool(requestId, json, UnityYamlModeSearch, "search_yaml");
@@ -2832,25 +2825,7 @@ namespace Locus
         /// </summary>
         private static string FormatObjectReference(UnityEngine.Object obj)
         {
-            if (obj is Component comp)
-            {
-                string hierarchyPath = GetHierarchyPath(comp.gameObject);
-                return hierarchyPath + "." + comp.GetType().Name;
-            }
-
-            if (obj is GameObject go)
-            {
-                string assetPath = AssetDatabase.GetAssetPath(go);
-                if (!string.IsNullOrEmpty(assetPath) && !assetPath.EndsWith(".unity"))
-                    return go.name + " (" + assetPath + ")";
-                return GetHierarchyPath(go) + " [GameObject]";
-            }
-
-            string path = AssetDatabase.GetAssetPath(obj);
-            if (!string.IsNullOrEmpty(path))
-                return obj.name + " (" + path + ")";
-
-            return obj.name + " [" + obj.GetType().Name + "]";
+            return SerializedObjectReferenceDisplay(obj);
         }
 
         /// <summary>

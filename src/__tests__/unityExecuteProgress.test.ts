@@ -138,6 +138,11 @@ describe("unityExecuteProgress", () => {
       "code explicitly changes status through EditorApplication play/pause APIs",
     );
     expect(unityExecuteDefinition.parameters.required).toContain("request_editor_status");
+    expect(unityExecuteDefinition.parameters.properties.readonly.type).toBe("boolean");
+    expect(unityExecuteDefinition.parameters.properties.readonly.description).toContain(
+      "scheduled with read tools",
+    );
+    expect(unityExecuteDefinition.parameters.required).toContain("readonly");
     expect(unityExecuteDefinition.parameters.required).not.toContain("editor_status");
   });
 

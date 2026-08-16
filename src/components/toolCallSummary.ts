@@ -204,7 +204,7 @@ export function buildToolCallArgsSummary(
       return summarizePath(p, pathContext);
     }
 
-    if (toolName === "unity_yaml_read") {
+    if (toolName === "unity_yaml_read" || toolName === "unity_yaml_search") {
       const filePath = getStringArg(args, ["filePath", "file_path", "path"]);
       const objectPath = getStringArg(args, ["objectPath", "object_path"]);
       const targetPath = joinUnityYamlPath(summarizePath(filePath, pathContext), objectPath);

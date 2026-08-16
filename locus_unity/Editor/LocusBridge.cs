@@ -1593,17 +1593,21 @@ namespace Locus
                     case "invoke_named_cached":
                         return await HandleInvokeNamedCached(reqId, msg.message).ConfigureAwait(false);
 
+                    case "property_tree_read":
                     case "view_binding_read":
-                        return await HandleViewBindingRead(reqId, msg.message).ConfigureAwait(false);
+                        return await HandlePropertyTreeRead(reqId, msg.message).ConfigureAwait(false);
 
+                    case "property_tree_write":
                     case "view_binding_write":
-                        return await HandleViewBindingWrite(reqId, msg.message).ConfigureAwait(false);
+                        return await HandlePropertyTreeWrite(reqId, msg.message).ConfigureAwait(false);
 
+                    case "property_tree_apply":
                     case "view_binding_apply":
-                        return await HandleViewBindingApply(reqId, msg.message).ConfigureAwait(false);
+                        return await HandlePropertyTreeApply(reqId, msg.message).ConfigureAwait(false);
 
+                    case "property_tree_discover":
                     case "view_binding_discover":
-                        return await HandleViewBindingDiscover(reqId, msg.message).ConfigureAwait(false);
+                        return await HandlePropertyTreeDiscover(reqId, msg.message).ConfigureAwait(false);
 
                     case "capture_viewport":
                         return await HandleCaptureViewport(reqId, msg.message).ConfigureAwait(false);
@@ -1920,9 +1924,6 @@ namespace Locus
                         });
                         return await tcs.Task.ConfigureAwait(false);
                     }
-
-                    case "list_yaml":
-                        return await HandleListYaml(reqId, msg.message).ConfigureAwait(false);
 
                     case "search_yaml":
                         return await HandleSearchYaml(reqId, msg.message).ConfigureAwait(false);

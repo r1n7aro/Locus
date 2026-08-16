@@ -2217,7 +2217,6 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
         "unity_run_states" => "UnityRunStates".to_string(),
         "unity_recompile" => "UnityRecompile".to_string(),
         "unity_ref_search" => "UnityRefSearch".to_string(),
-        "unity_yaml_list" => "UnityYamlList".to_string(),
         "unity_yaml_search" => "UnityYamlSearch".to_string(),
         "unity_yaml_read" => "UnityYamlRead".to_string(),
         "web_fetch" => "WebFetch".to_string(),

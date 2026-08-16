@@ -41,7 +41,7 @@ const bun = process.execPath;
 
 // Keep the integration driver from silently exercising an old sidecar after
 // compile-server request/response changes. This is deliberately explicit even
-// though Tauri's beforeDevCommand performs the same check: the test launcher is
+// though the Tauri launcher performs the same check: the test launcher is
 // an independent contract and should remain safe if the Tauri hook changes.
 await runRequired(bun, ["run", "compile-server:ensure"]);
 

@@ -3317,31 +3317,97 @@ pub async fn view_binding_read(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
-    send_view_binding_message(project_path, "view_binding_read", request).await
+    send_property_tree_message(project_path, "view_binding_read", request).await
+}
+
+pub async fn property_tree_read(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_property_tree_message_with_legacy_alias(
+        project_path,
+        "property_tree_read",
+        "view_binding_read",
+        request,
+    )
+    .await
 }
 
 pub async fn view_binding_discover(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
-    send_view_binding_message(project_path, "view_binding_discover", request).await
+    send_property_tree_message(project_path, "view_binding_discover", request).await
+}
+
+pub async fn property_tree_discover(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_property_tree_message_with_legacy_alias(
+        project_path,
+        "property_tree_discover",
+        "view_binding_discover",
+        request,
+    )
+    .await
 }
 
 pub async fn view_binding_write(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
-    send_view_binding_message(project_path, "view_binding_write", request).await
+    send_property_tree_message(project_path, "view_binding_write", request).await
+}
+
+pub async fn property_tree_write(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_property_tree_message_with_legacy_alias(
+        project_path,
+        "property_tree_write",
+        "view_binding_write",
+        request,
+    )
+    .await
 }
 
 pub async fn view_binding_apply(
     project_path: &str,
     request: &serde_json::Value,
 ) -> Result<String, String> {
-    send_view_binding_message(project_path, "view_binding_apply", request).await
+    send_property_tree_message(project_path, "view_binding_apply", request).await
 }
 
-async fn send_view_binding_message(
+pub async fn property_tree_apply(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_property_tree_message_with_legacy_alias(
+        project_path,
+        "property_tree_apply",
+        "view_binding_apply",
+        request,
+    )
+    .await
+}
+
+async fn send_property_tree_message_with_legacy_alias(
+    project_path: &str,
+    canonical_type: &str,
+    legacy_type: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    match send_property_tree_message(project_path, canonical_type, request).await {
+        Err(error) if error.contains("unknown message type:") => {
+            send_property_tree_message(project_path, legacy_type, request).await
+        }
+        result => result,
+    }
+}
+
+async fn send_property_tree_message(
     project_path: &str,
     message_type: &str,
     request: &serde_json::Value,

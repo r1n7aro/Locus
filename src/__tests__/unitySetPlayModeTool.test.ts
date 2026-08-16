@@ -31,10 +31,9 @@ describe("Unity Play Mode tool", () => {
 
   it("offers the tool to agents that can execute Unity code", () => {
     const dev = JSON.parse(read("agent/dev/config.json"));
-    const runtimeDebugger = JSON.parse(read("agent/runtime_debugger/config.json"));
     const wiki = JSON.parse(read("agent/wiki/config.json"));
 
-    for (const agent of [dev, runtimeDebugger, wiki]) {
+    for (const agent of [dev, wiki]) {
       expect(agent.tools).toContain("unity_execute");
       expect(agent.tools).toContain("unity_set_play_mode");
     }

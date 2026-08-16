@@ -1,85 +1,27 @@
-pub(super) const BUILTIN_TAGS: &[(usize, &str)] = &[
-    (0, "Untagged"),
-    (1, "Respawn"),
-    (2, "Finish"),
-    (3, "EditorOnly"),
-    (4, "MainCamera"),
-    (5, "Player"),
-    (6, "GameController"),
-];
+use crate::unity_project_config::{load_tag_manager, BUILTIN_TAGS};
 
 pub(super) fn parse_tag_manager(
     project_dir: &std::path::Path,
 ) -> (Vec<(usize, String)>, Vec<(usize, String)>) {
-    let path = project_dir.join("ProjectSettings").join("TagManager.asset");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
+    let config = match load_tag_manager(project_dir) {
+        Ok(config) => config,
         Err(_) => return (Vec::new(), Vec::new()),
     };
 
-    let mut custom_tags: Vec<String> = Vec::new();
-    let mut layers: Vec<(usize, String)> = Vec::new();
-
-    #[derive(PartialEq)]
-    enum Section {
-        None,
-        Tags,
-        Layers,
-    }
-    let mut section = Section::None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed == "tags:" || trimmed == "tags: []" {
-            section = if trimmed == "tags: []" {
-                Section::None
-            } else {
-                Section::Tags
-            };
-            continue;
-        }
-        if trimmed == "layers:" {
-            section = Section::Layers;
-            continue;
-        }
-        if !line.starts_with(' ') && !line.starts_with('-') && trimmed.contains(':') {
-            section = Section::None;
-        }
-
-        match section {
-            Section::Tags => {
-                if let Some(val) = trimmed.strip_prefix("- ") {
-                    let tag = val.trim();
-                    if !tag.is_empty() {
-                        custom_tags.push(tag.to_string());
-                    }
-                }
-            }
-            Section::Layers => {
-                if trimmed.starts_with("- ") {
-                    let name = trimmed.strip_prefix("- ").unwrap_or("").trim().to_string();
-                    let idx = layers.len();
-                    if !name.is_empty() {
-                        layers.push((idx, name));
-                    } else {
-                        layers.push((idx, String::new()));
-                    }
-                }
-            }
-            Section::None => {}
-        }
-    }
+    let layers = config
+        .named_layers()
+        .map(|(index, name)| (index, name.to_string()))
+        .collect();
 
     let mut tags: Vec<(usize, String)> = BUILTIN_TAGS
         .iter()
-        .map(|&(i, name)| (i, name.to_string()))
+        .enumerate()
+        .map(|(index, name)| (index, (*name).to_string()))
         .collect();
-    for (i, name) in custom_tags.into_iter().enumerate() {
-        tags.push((7 + i, name));
+    for (index, name) in config.custom_tags.into_iter().enumerate() {
+        tags.push((BUILTIN_TAGS.len() + index, name));
     }
 
-    let layers: Vec<(usize, String)> = layers.into_iter().filter(|(_, n)| !n.is_empty()).collect();
     (tags, layers)
 }
 
@@ -140,14 +82,7 @@ fn read_collision_matrix(path: &std::path::Path) -> Vec<u32> {
                 .unwrap()
                 .trim();
             if !rest.is_empty() {
-                let hex = rest.trim();
-                for chunk in hex.as_bytes().chunks(8) {
-                    if let Ok(s) = std::str::from_utf8(chunk) {
-                        if let Ok(v) = u32::from_str_radix(s, 16) {
-                            matrix.push(v);
-                        }
-                    }
-                }
+                matrix = decode_collision_matrix_hex(rest);
                 if !matrix.is_empty() {
                     return matrix;
                 }
@@ -170,6 +105,30 @@ fn read_collision_matrix(path: &std::path::Path) -> Vec<u32> {
         }
     }
 
+    matrix
+}
+
+fn decode_collision_matrix_hex(hex: &str) -> Vec<u32> {
+    let bytes = hex.trim().as_bytes();
+    if bytes.is_empty() || bytes.len() % 8 != 0 {
+        return Vec::new();
+    }
+
+    let mut matrix = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let mut word = [0u8; 4];
+        for (index, byte) in word.iter_mut().enumerate() {
+            let start = index * 2;
+            let Ok(pair) = std::str::from_utf8(&chunk[start..start + 2]) else {
+                return Vec::new();
+            };
+            let Ok(value) = u8::from_str_radix(pair, 16) else {
+                return Vec::new();
+            };
+            *byte = value;
+        }
+        matrix.push(u32::from_le_bytes(word));
+    }
     matrix
 }
 
@@ -204,7 +163,7 @@ fn format_collision_matrix(label: &str, matrix: &[u32], layers: &[(usize, String
             if other_idx > 31 {
                 continue;
             }
-            if bits & (1 << other_idx) == 0 {
+            if bits & (1u32 << other_idx) == 0 {
                 ignored.push(format!("{}:{}", other_idx, other_name));
             }
         }
@@ -273,5 +232,57 @@ pub(super) fn detect_render_pipeline(project_dir: &std::path::Path) -> String {
         (true, true, _) => "URP + HDRP (both packages present)".to_string(),
         (false, false, true) => "Custom SRP".to_string(),
         (false, false, false) => "Built-in Render Pipeline (BIRP)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_layers_keep_unity_indices_and_omit_empty_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = temp.path().join("ProjectSettings");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(
+            settings.join("TagManager.asset"),
+            r#"TagManager:
+  tags: []
+  layers:
+  - Default
+  - TransparentFX
+  - Ignore Raycast
+  -
+  - Water
+  - UI
+  - Ground
+  -
+  m_SortingLayers:
+  - name: Default
+"#,
+        )
+        .unwrap();
+
+        let (_, layers) = parse_tag_manager(temp.path());
+        assert_eq!(
+            layers,
+            vec![
+                (0, "Default".to_string()),
+                (1, "TransparentFX".to_string()),
+                (2, "Ignore Raycast".to_string()),
+                (4, "Water".to_string()),
+                (5, "UI".to_string()),
+                (6, "Ground".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn collision_matrix_hex_words_are_little_endian() {
+        assert_eq!(
+            decode_collision_matrix_hex("ffdfffffc8c0ffff"),
+            vec![0xffff_dfff, 0xffff_c0c8]
+        );
+        assert!(decode_collision_matrix_hex("not-hex").is_empty());
     }
 }

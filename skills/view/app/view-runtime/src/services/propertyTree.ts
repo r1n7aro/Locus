@@ -68,9 +68,27 @@ export type InspectorSelectOptionInput = {
   numericValue?: number;
 };
 
+export interface InspectorPropertyDisplaySection {
+  title: string;
+  lines: string[];
+}
+
+export interface InspectorPropertySubassetEntry {
+  segment: string;
+  displayName?: string;
+  type?: string;
+  typeFullName?: string;
+  target: InspectorPropertyTargetSnapshot;
+  children?: InspectorPropertySubassetEntry[];
+}
+
 export interface InspectorPropertySnapshot {
   propertyPath: string;
+  semanticPath?: string;
+  nodeKind?: string;
+  canonicalPath?: string;
   bindingTarget?: InspectorPropertyTargetSnapshot | null;
+  referenceTarget?: InspectorPropertyTargetSnapshot | null;
   target?: InspectorPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
@@ -84,12 +102,15 @@ export interface InspectorPropertySnapshot {
   hasChildren?: boolean;
   isArray?: boolean;
   arraySize?: number;
+  visibleChildCount?: number;
+  childrenTruncated?: boolean;
   isFlagsEnum?: boolean;
   enumValueIndex?: number;
   enumValueFlag?: number;
   enumOptions?: InspectorSelectOptionInput[];
   children?: InspectorPropertySnapshot[];
   isManagedReference?: boolean;
+  managedReferenceId?: number;
   managedReferenceFullTypename?: string;
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
@@ -106,6 +127,8 @@ export interface InspectorPropertySnapshot {
   referenceTypeFullName?: string;
   referenceTypeAssembly?: string;
   attributes?: InspectorPropertyAttributeInfo[];
+  subassets?: InspectorPropertySubassetEntry[];
+  displaySections?: InspectorPropertyDisplaySection[];
 }
 
 export interface InspectorPropertyResolvedDrawer {

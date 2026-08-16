@@ -1783,6 +1783,18 @@ namespace Locus
                 return result;
             }
 
+            public string PropertyTree(
+                UnityEngine.Object target,
+                int depth = 2,
+                int maxArrayItems = 4)
+            {
+                TouchActivity();
+                ThrowIfCancellationRequested();
+                string result = LocusPropertyTree.Format(target, depth, maxArrayItems);
+                TouchActivity();
+                return result;
+            }
+
             public bool Progress(string title, string info, float progress)
             {
                 TouchActivity();

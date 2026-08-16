@@ -4,9 +4,8 @@ pub(crate) mod output;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -18,14 +17,13 @@ pub struct ToolResult {
 }
 
 #[derive(Debug, Default)]
-pub struct ToolRuntimeState {
-    seen_unity_asset_reads: Mutex<HashSet<String>>,
-}
+pub struct ToolRuntimeState;
 
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
     pub app_handle: Option<AppHandle>,
     pub working_dir: Option<String>,
+    pub process_owner: Option<crate::process_util::ProcessOwner>,
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
     pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
@@ -46,34 +44,7 @@ impl ToolExecutionContext {
     }
 
     pub fn should_redirect_unity_asset_read(&self, file_path: &str) -> bool {
-        if !self.is_unity_connected() || !is_unity_yaml_candidate_path(file_path) {
-            return false;
-        }
-
-        let key = self.normalize_path_for_session(file_path);
-        match self.runtime_state.as_ref() {
-            Some(state) => {
-                let mut seen = state
-                    .seen_unity_asset_reads
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                seen.insert(key)
-            }
-            None => true,
-        }
-    }
-
-    fn normalize_path_for_session(&self, file_path: &str) -> String {
-        let path = Path::new(file_path);
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(working_dir) = self.working_dir.as_deref() {
-            Path::new(working_dir).join(path)
-        } else {
-            path.to_path_buf()
-        };
-
-        resolved.to_string_lossy().replace('\\', "/").to_lowercase()
+        is_unity_yaml_candidate_path(file_path)
     }
 }
 
@@ -86,6 +57,9 @@ pub fn is_unity_yaml_candidate_path(file_path: &str) -> bool {
         ".mat",
         ".anim",
         ".controller",
+        ".overridecontroller",
+        ".playable",
+        ".mask",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
@@ -143,7 +117,7 @@ pub fn built_in_tool_name_keys() -> BTreeSet<String> {
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "create_skill_package" | "skill_list" | "skill_reload" | "mcp_reload"
+        "create_skill_package" | "skill_list" | "skill_reload" | "agent_reload" | "mcp_reload"
     ) {
         return ToolLoadMode::Skill;
     }
@@ -198,7 +172,6 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "unity_code_usages",
     "unity_yaml_search",
     "unity_yaml_read",
-    "unity_yaml_list",
     // C# code intelligence.
     "code_symbol_search",
     "code_goto_definition",
@@ -216,6 +189,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "create_skill_package",
     "skill_list",
     "skill_reload",
+    "agent_reload",
     "mcp_reload",
     "plugin_list",
     "plugin_search",
@@ -723,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn unity_asset_read_redirects_only_once_for_same_file() {
+    fn unity_asset_read_always_redirects_every_path_spelling() {
         let context = ToolExecutionContext {
             app_handle: None,
             working_dir: Some("C:/Project".to_string()),
@@ -733,12 +707,12 @@ mod tests {
         };
 
         assert!(context.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
-        assert!(!context.should_redirect_unity_asset_read("Assets\\Test\\MyAsset.asset"));
-        assert!(!context.should_redirect_unity_asset_read("C:/Project/Assets/Test/MyAsset.asset"));
+        assert!(context.should_redirect_unity_asset_read("Assets\\Test\\MyAsset.asset"));
+        assert!(context.should_redirect_unity_asset_read("C:/Project/Assets/Test/MyAsset.asset"));
     }
 
     #[test]
-    fn unity_asset_read_redirect_requires_connection_and_supported_extension() {
+    fn unity_asset_read_redirect_requires_a_supported_extension() {
         let disconnected = ToolExecutionContext {
             app_handle: None,
             working_dir: Some("C:/Project".to_string()),
@@ -746,7 +720,7 @@ mod tests {
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             ..Default::default()
         };
-        assert!(!disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
+        assert!(disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
 
         let connected = ToolExecutionContext {
             app_handle: None,

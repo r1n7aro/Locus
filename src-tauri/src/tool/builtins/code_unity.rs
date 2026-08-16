@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use super::code::{require_workspace, string_arg};
 use super::{make_exec, ToolDef, ToolResult};
 use crate::asset_db::types::{guid_to_hex, AssetKind, Guid};
+use crate::unity_project_config::{load_tag_manager, BUILTIN_TAGS};
 
 fn err(message: impl Into<String>) -> ToolResult {
     ToolResult {
@@ -456,16 +457,6 @@ fn push_grouped_entries(output: &mut String, entries: &[(String, u32, String)], 
 
 // ─── project string-ref validation (folded into code_diagnostics) ──────────
 
-const BUILTIN_TAGS: &[&str] = &[
-    "Untagged",
-    "Respawn",
-    "Finish",
-    "EditorOnly",
-    "MainCamera",
-    "Player",
-    "GameController",
-];
-
 const MAX_SOURCE_FILES: usize = 5000;
 const MAX_RESOURCE_ENTRIES: usize = 20000;
 
@@ -515,62 +506,19 @@ fn parse_active_input_handler(root: &Path) -> Option<u8> {
     None
 }
 
-/// Tags (built-in + custom) and layers from `ProjectSettings/TagManager.asset`.
-/// Unlike tags, the built-in layer names are present in the file itself.
+/// Tags (built-in + custom) and named layers from
+/// `ProjectSettings/TagManager.asset`.
 fn parse_tag_manager(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut tags: Vec<String> = BUILTIN_TAGS.iter().map(|t| t.to_string()).collect();
-    let mut layers: Vec<String> = Vec::new();
-    let path = root.join("ProjectSettings").join("TagManager.asset");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return (tags, layers);
+    let Ok(config) = load_tag_manager(root) else {
+        return (tags, Vec::new());
     };
 
-    #[derive(PartialEq)]
-    enum Section {
-        None,
-        Tags,
-        Layers,
-    }
-    let mut section = Section::None;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed == "tags:" {
-            section = Section::Tags;
-            continue;
-        }
-        if trimmed == "tags: []" {
-            section = Section::None;
-            continue;
-        }
-        if trimmed == "layers:" {
-            section = Section::Layers;
-            continue;
-        }
-        if !line.starts_with(' ') && !line.starts_with('-') && trimmed.contains(':') {
-            section = Section::None;
-        }
-        match section {
-            Section::Tags => {
-                if let Some(value) = trimmed.strip_prefix("- ") {
-                    let tag = value.trim();
-                    if !tag.is_empty() {
-                        tags.push(tag.to_string());
-                    }
-                }
-            }
-            Section::Layers => {
-                if let Some(value) = trimmed.strip_prefix("- ") {
-                    let layer = value.trim();
-                    if !layer.is_empty() {
-                        layers.push(layer.to_string());
-                    }
-                } else if trimmed == "-" {
-                    // unnamed layer slot
-                }
-            }
-            Section::None => {}
-        }
-    }
+    let layers = config
+        .named_layers()
+        .map(|(_, name)| name.to_string())
+        .collect();
+    tags.extend(config.custom_tags);
     (tags, layers)
 }
 
