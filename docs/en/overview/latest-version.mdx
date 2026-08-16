@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.7.2 (2026-08-13)"
+description: "Locus v0.7.3 (2026-08-16)"
 sidebarTitle: "Latest Version"
-version: "0.7.2"
-releasedAt: "2026-08-13"
+version: "0.7.3"
+releasedAt: "2026-08-16"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,45 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.7.3 (Added)
+
+- **Codex automatic approval review.** Codex users can opt into a structured review of pending tool actions. Reviews use the latest user request and bounded local inspection data; safe actions can proceed automatically, while escalated actions show the review rationale and risk level.
+- **Dangerous command interception.** Forced deletion patterns in Bash, PowerShell, and CMD request approval by default.
+- **Four-state knowledge editing.** Knowledge documents now support inherited, disabled, confirmation-required, and automatic AI editing modes, with legacy metadata migration and consistent enforcement across knowledge and filesystem tools.
+- **Local simulated models.** Debug mode exposes deterministic streaming, tool-call, and error-response presets without network access.
+- **Atomic multi-edit batches.** The `edit` tool can apply multiple independent replacements against one original file snapshot and commits the update only when every replacement is valid.
+- **Combined Unity Test discovery.** Unity Test tools discover Edit and Play Mode tests together by default and render assembly, suite, and test paths as a tree.
+- **Staged context review.** Session context review creates a dedicated chat, exports the context asynchronously, and places the resulting file in the composer for inspection before sending.
+- **Testing workflows.** Added isolated-instance onboarding bypass and WebView stress drivers for streaming, session switching, and live tool calls.
+- **Unity Property Tree.** `unity_yaml_read` and `unity_yaml_search` now use one path-addressable property tree for scene hierarchies, components, subassets, and serialized fields, returning child paths for continued inspection when output exceeds the current budget.
+- **Agent customization.** User Agents and tool-description overlays can load from `user-agents`; the Agent panel can control environment, rule, knowledge-context, and lazy-tool prompt injections and reload changed definitions immediately.
+- **Session context usage.** A context-usage window breaks token consumption down across system prompts, runtime injections, messages, and tool results, with per-tool distribution and effective model output speed.
+- **Per-Agent model defaults.** Model and reasoning effort defaults persist independently for each Agent, while Codex and custom providers expose prompt-prefix cache lifetime controls.
+
+### v0.7.3 (Fixed)
+
+- **Abnormal web-search continuation.** Fixed Codex hosted `web_search` results being replayed as local tool calls, which could trigger duplicate follow-up turns.
+- **Windows handle leak.** Updated to the upstream-fixed Tauri/Wry runtime so window-border DPI queries no longer leak Windows device-context handles.
+- **Child-process lifecycle.** Shell, Skill, development-server, and other child process trees are tracked by session, workspace, and application lifecycle and terminate with the owning operation.
+- **Read-only additional directories.** File writes, Shell working directories, and command path targets now consistently enforce read-only additional-workspace constraints.
+- **Message layout stability.** Improved message layout stability and fixed most flicker caused by streaming chat rendering, covering Markdown height reconciliation, stream-end scrolling, tool state settlement, and expansion-state retention.
+- **Parallel tool execution.** Workspace mutations use path-aware coordination, same-file edits are batched safely, independent writes can overlap, and read-only subagents can run alongside compatible tools.
+- **Hosted tools and background tasks.** Provider-hosted tool calls stay out of client function history, completed hosted rounds stop correctly, immediate async startup failures return directly, and notify-mode results arrive without status polling.
+- **Image-only chat turns.** Compaction, paging, and turn navigation retain image prompts and exclude internal reminder turns.
+- **Shell and search environment.** Search paths resolve consistently against the workspace, PowerShell guidance reflects the detected runtime, and `pwsh` is directly available from the Bash environment.
+- **Unity hot-reload feedback.** Edit feedback appears only while the hot-reload pipeline is active.
+- **Knowledge metadata refresh.** Document file metadata remains visible while save responses reconcile with the following refresh.
+- **History graph layout.** The workspace WIP lane stays anchored to HEAD ahead of descendant branch commits.
+
+### v0.7.3 (Removed)
+
+- No user-facing workflows or compatibility paths were removed.
 
 ### v0.7.2 (Added)
 

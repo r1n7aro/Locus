@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.7.2 (2026-08-13)"
+description: "Locus v0.7.3 (2026-08-16)"
 sidebarTitle: "当前版本"
-version: "0.7.2"
-releasedAt: "2026-08-13"
+version: "0.7.3"
+releasedAt: "2026-08-16"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,45 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.2/locus_0.7.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.7.3（新增）
+
+- **Codex 自动审批审查。** Codex 用户可选择启用待批准操作的结构化审查。审查仅使用最近一条用户请求与受限的本地检查信息；安全操作可自动继续，需要人工判断时会显示风险级别与审查理由。
+- **危险命令拦截。** Bash、PowerShell 和 CMD 中的强制删除命令默认请求批准。
+- **知识文档四态编辑。** 知识文档支持继承、禁止 AI 编辑、用户确认后编辑和自动编辑，并迁移旧元数据，在知识工具与文件工具中统一执行约束。
+- **本地模拟模型。** Debug 模式提供确定性的流式回复、工具调用与错误回复预设，全程本地运行。
+- **原子批量编辑。** `edit` 可基于同一份原始文件快照执行多处独立替换，全部校验成功后一次写入。
+- **Unity Test 联合发现。** Unity Test 工具默认同时发现 Edit 和 Play Mode 测试，并按模式、程序集、套件和测试输出树状结构。
+- **上下文审查附件。** 会话回顾会创建独立聊天、异步导出上下文，并将导出文件放入输入区供发送前检查。
+- **测试工作流。** 新增隔离实例跳过首次引导，以及聊天流式渲染、会话切换和实时工具调用的 WebView 压力测试。
+- **Unity Property Tree。** `unity_yaml_read` 和 `unity_yaml_search` 统一使用可逐层展开、可按路径续读的属性树，覆盖场景层级、组件、子资源与序列化字段，并在超出输出预算时返回可继续读取的子路径。
+- **Agent 定制。** 支持从 `user-agents` 加载用户 Agent 与工具描述覆盖，在 Agent 面板中控制环境、规则、知识上下文及延迟工具清单等提示词注入项，并在配置变化后即时重载。
+- **会话上下文用量。** 新增上下文用量窗口，按系统提示、运行时注入、会话消息和工具结果拆分 token 占用，并显示工具调用分布与模型有效输出速度。
+- **每 Agent 模型默认值。** 模型和推理强度可按 Agent 独立保存；Codex 与自定义供应商可设置提示词前缀缓存有效期。
+
+### v0.7.3（修复）
+
+- **Web 搜索异常续轮。** 修复 Codex 托管 `web_search` 结果被重复回放为本地工具调用、进而触发异常重复续轮的问题。
+- **Windows 句柄泄漏。** 更新到包含上游修复的 Tauri/Wry 运行时，避免窗口边框 DPI 查询持续泄漏 Windows 设备上下文句柄。
+- **子进程生命周期。** Shell、Skill、开发服务器及其他子进程按会话、工作区和应用生命周期统一管理；取消会话、切换工作区或退出应用时会终止对应进程树。
+- **只读附加目录。** 文件写入、Shell 工作目录和命令路径统一遵守附加工作目录的只读约束。
+- **消息界面布局稳定性。** 增强消息界面的布局稳定性，修复了大部分会话流式渲染造成的闪烁问题，覆盖 Markdown 高度对账、流结束滚动、工具状态收敛与展开状态保留。
+- **并行工具执行。** 工作区写入按路径协调，同文件编辑安全合并，独立写入可并行执行，只读子 Agent 可与兼容工具同时运行。
+- **托管工具与后台任务。** 服务端托管工具不会作为本地函数历史重复回放；托管轮次可正确结束；异步启动失败会直接返回；notify 结果会自动送达。
+- **纯图片聊天轮次。** 上下文压缩、历史分页与轮次导航会保留图片提示，并排除内部提醒轮次。
+- **Shell 与搜索环境。** 搜索路径统一按工作区解析，PowerShell 提示与实际运行时保持一致，Bash 环境可直接调用 `pwsh`。
+- **Unity 热重载反馈。** 编辑状态仅在热重载管线启用时显示。
+- **知识元数据刷新。** 保存响应与后续刷新交接期间，文档文件元数据保持可见。
+- **历史图布局。** 工作区 WIP 主线会优先连接 HEAD，避免被后代分支占用。
+
+### v0.7.3（移除）
+
+- 本版本未移除面向用户的工作流或兼容路径。
 
 ### v0.7.2（新增）
 
