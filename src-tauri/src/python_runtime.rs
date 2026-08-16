@@ -783,6 +783,7 @@ fn managed_python_roots(app_handle: Option<&AppHandle>) -> Vec<PathBuf> {
         }
     }
 
+    #[cfg(debug_assertions)]
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen"));
     roots
 }
@@ -811,6 +812,7 @@ fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
             candidates.push(exe_dir.join("resources").join(LOCUS_SDK_RESOURCE_DIR));
         }
     }
+    #[cfg(debug_assertions)]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python"));
     candidates
         .into_iter()

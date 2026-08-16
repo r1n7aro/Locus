@@ -71,21 +71,30 @@ pub fn find_server_dll() -> Option<PathBuf> {
         if let Some(exe_dir) = exe.parent() {
             candidates.push(exe_dir.join("compile-server"));
             candidates.push(exe_dir.join("resources").join("compile-server"));
-            // target/debug or target/release -> src-tauri/gen/compile-server
-            candidates.push(exe_dir.join("../../gen/compile-server"));
+            #[cfg(debug_assertions)]
+            {
+                // target/debug -> src-tauri/gen/compile-server
+                candidates.push(exe_dir.join("../../gen/compile-server"));
+            }
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("gen").join("compile-server"));
-        candidates.push(cwd.join("src-tauri").join("gen").join("compile-server"));
-    }
+    // Repository-relative fallbacks are development-only. Keeping them out of
+    // release builds prevents an installed Locus from loading and locking a
+    // sidecar in the checkout where the release binary was built.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("gen").join("compile-server"));
+            candidates.push(cwd.join("src-tauri").join("gen").join("compile-server"));
+        }
 
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("gen")
-            .join("compile-server"),
-    );
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("gen")
+                .join("compile-server"),
+        );
+    }
 
     pick_newest_dll(candidates.into_iter().map(|dir| dir.join(SERVER_DLL_NAME)))
 }

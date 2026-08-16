@@ -19,14 +19,18 @@ describe("app close confirm flow", () => {
 
     expect(rustApp).toContain("const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = \"locus-main-window-close-requested\";");
     expect(rustApp).toContain("window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())");
-    expect(rustSystem).toContain("pub fn request_app_exit(app_handle: AppHandle)");
+    expect(rustSystem).toContain("pub async fn request_app_exit(app_handle: AppHandle)");
+    expect(rustSystem).toContain("pub async fn get_running_task_count(");
+    expect(rustSystem).toContain("begin_managed_process_shutdown()");
     expect(rustSystem).toContain("app_handle.exit(0);");
     expect(systemService).toContain("export const APP_CLOSE_REQUESTED_EVENT = \"locus-main-window-close-requested\";");
     expect(systemService).toContain("export function requestAppExit(): Promise<void>");
+    expect(systemService).toContain("export function getRunningTaskCount(): Promise<number>");
 
     expect(app).toContain("const appCloseConfirmOpen = ref(false);");
     expect(app).toContain("const appCloseRunningTaskCount = ref(0);");
     expect(app).toContain("appCloseRunningTaskCount.value = runningTaskCount;");
+    expect(app).toContain("await getRunningTaskCount()");
     expect(app).toContain("appCloseConfirmOpen.value = true;");
     expect(app).toContain("await requestAppExit();");
     expect(app).toContain("await listen<void>(APP_CLOSE_REQUESTED_EVENT");

@@ -15,7 +15,7 @@ use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::{
     self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType, SkillSurface,
 };
-use crate::process_util::{async_command, augment_path_with_git};
+use crate::process_util::{async_command, augment_path_with_git, spawn_managed, ProcessOwner};
 use crate::tool::{ToolDef, ToolExecutionContext, ToolRegistry, ToolResult};
 use crate::workspace::Workspace;
 
@@ -2442,14 +2442,18 @@ async fn run_skill_process(
     stdin_payload: Option<String>,
     timeout: Duration,
     output_mode: &str,
+    ctx: &ToolExecutionContext,
 ) -> Result<String, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
+    let owner = ctx.process_owner.clone().unwrap_or_else(|| ProcessOwner {
+        working_dir: ctx.working_dir.clone(),
+        ..Default::default()
+    });
+    let mut child = spawn_managed(cmd, owner)
         .map_err(|e| format!("Failed to start Skill package tool process: {}", e))?;
 
     if let Some(payload) = stdin_payload {
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = child.take_stdin() {
             stdin
                 .write_all(payload.as_bytes())
                 .await
@@ -2457,15 +2461,26 @@ async fn run_skill_process(
         }
     }
 
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            format!(
-                "Skill package tool process timed out after {}ms",
-                timeout.as_millis()
-            )
-        })?
-        .map_err(|e| format!("Failed to wait for Skill package tool process: {}", e))?;
+    let wait = async {
+        let execution = child.wait_with_output();
+        if let Some(mut cancel_rx) = ctx.cancel_rx.clone() {
+            tokio::select! {
+                result = execution => result
+                    .map_err(|e| format!("Failed to wait for Skill package tool process: {}", e)),
+                _ = cancel_rx.changed() => Err("Skill package tool process cancelled.".to_string()),
+            }
+        } else {
+            execution
+                .await
+                .map_err(|e| format!("Failed to wait for Skill package tool process: {}", e))
+        }
+    };
+    let output = tokio::time::timeout(timeout, wait).await.map_err(|_| {
+        format!(
+            "Skill package tool process timed out after {}ms",
+            timeout.as_millis()
+        )
+    })??;
 
     format_skill_process_output(output, output_mode)
 }
@@ -2578,6 +2593,7 @@ async fn run_skill_package_python_tool(
         stdin_payload,
         skill_tool_timeout(tool),
         skill_tool_output_mode(tool),
+        ctx,
     )
     .await
 }
@@ -2615,6 +2631,7 @@ async fn run_skill_package_cli_tool(
         stdin_payload,
         skill_tool_timeout(tool),
         skill_tool_output_mode(tool),
+        ctx,
     )
     .await
 }
@@ -2691,6 +2708,7 @@ async fn run_skill_package_bash_tool(
         stdin_payload,
         skill_tool_timeout(tool),
         skill_tool_output_mode(tool),
+        ctx,
     )
     .await
 }

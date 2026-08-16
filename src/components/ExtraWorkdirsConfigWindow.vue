@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import BaseButton from "./ui/BaseButton.vue";
+import BaseCheckbox from "./ui/BaseCheckbox.vue";
 import {
   extraWorkdirsGet,
   extraWorkdirsSet,
@@ -103,7 +104,12 @@ async function addFolder() {
     formNotice.value = t("extraWorkdirs.duplicate");
     return;
   }
-  entries.value = [...entries.value, { path: selected, comment: "", exists: true }];
+  entries.value = [...entries.value, {
+    path: selected,
+    comment: "",
+    readOnly: false,
+    exists: true,
+  }];
 }
 
 function removeEntry(index: number) {
@@ -119,7 +125,11 @@ async function save() {
   try {
     const saved = await extraWorkdirsSet(
       workspacePath.value,
-      entries.value.map((entry) => ({ path: entry.path, comment: entry.comment })),
+      entries.value.map((entry) => ({
+        path: entry.path,
+        comment: entry.comment,
+        readOnly: entry.readOnly,
+      })),
     );
     entries.value = saved;
     await broadcastExtraWorkdirsUpdated(workspacePath.value);
@@ -234,14 +244,25 @@ onUnmounted(() => {
                 </svg>
               </button>
             </div>
-            <input
-              v-model="entry.comment"
-              class="extra-workdirs-comment-input"
-              type="text"
-              :placeholder="t('extraWorkdirs.commentPlaceholder')"
-              :disabled="saving"
-              spellcheck="false"
-            />
+            <div class="extra-workdirs-row-fields">
+              <input
+                v-model="entry.comment"
+                class="extra-workdirs-comment-input"
+                type="text"
+                :placeholder="t('extraWorkdirs.commentPlaceholder')"
+                :disabled="saving"
+                spellcheck="false"
+              />
+              <div class="extra-workdirs-readonly-option" :title="t('extraWorkdirs.readOnlyHint')">
+                <BaseCheckbox
+                  :model-value="entry.readOnly"
+                  :disabled="saving"
+                  :aria-label="t('extraWorkdirs.readOnly')"
+                  @update:model-value="entry.readOnly = $event"
+                />
+                <span>{{ t("extraWorkdirs.readOnly") }}</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -478,7 +499,8 @@ onUnmounted(() => {
 }
 
 .extra-workdirs-comment-input {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   box-sizing: border-box;
   padding: 6px 8px;
   border: 1px solid var(--border-color);
@@ -488,6 +510,22 @@ onUnmounted(() => {
   font-size: 12px;
   font-family: var(--font-ui);
   outline: none;
+}
+
+.extra-workdirs-row-fields {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.extra-workdirs-readonly-option {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .extra-workdirs-comment-input:focus {

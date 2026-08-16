@@ -23,6 +23,8 @@ pub struct ExtraWorkdirEntry {
     pub path: String,
     #[serde(default)]
     pub comment: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +32,7 @@ pub struct ExtraWorkdirEntry {
 pub struct ExtraWorkdirStatus {
     pub path: String,
     pub comment: String,
+    pub read_only: bool,
     pub exists: bool,
 }
 
@@ -109,6 +112,7 @@ pub fn normalize_entries(
         result.push(ExtraWorkdirEntry {
             path: path.to_string(),
             comment: entry.comment.trim().to_string(),
+            read_only: entry.read_only,
         });
     }
     result
@@ -120,6 +124,7 @@ pub fn entry_statuses(entries: &[ExtraWorkdirEntry]) -> Vec<ExtraWorkdirStatus> 
         .map(|entry| ExtraWorkdirStatus {
             path: entry.path.clone(),
             comment: entry.comment.clone(),
+            read_only: entry.read_only,
             exists: Path::new(&entry.path).is_dir(),
         })
         .collect()
@@ -138,10 +143,11 @@ pub fn build_env_prompt_block(workspace_dir: &str) -> Option<String> {
         .iter()
         .filter(|entry| Path::new(&entry.path).is_dir())
         .map(|entry| {
+            let access = if entry.read_only { " [read-only]" } else { "" };
             if entry.comment.trim().is_empty() {
-                format!("- {}", entry.path)
+                format!("- {}{}", entry.path, access)
             } else {
-                format!("- {} — {}", entry.path, entry.comment.trim())
+                format!("- {}{} — {}", entry.path, access, entry.comment.trim())
             }
         })
         .collect();
@@ -149,7 +155,7 @@ pub fn build_env_prompt_block(workspace_dir: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "## Additional Working Directories\nThe user attached these directories to this workspace as additional working directories (each entry is the full path, followed by the user's note on what the folder is for). They live outside the main working directory: treat them as part of the project scope and access them with absolute paths.\n{}",
+        "## Additional Working Directories\nThe user attached these directories to this workspace as additional working directories. Each entry includes its full path, optional read-only status, and the user's note on what the folder is for. They live outside the main working directory: treat them as part of the project scope and access them with absolute paths. For entries marked read-only, use read, list, and grep only; write, edit, and bash access targeting those directories is blocked.\n{}",
         lines.join("\n")
     ))
 }
@@ -162,6 +168,14 @@ mod tests {
         ExtraWorkdirEntry {
             path: path.to_string(),
             comment: comment.to_string(),
+            read_only: false,
+        }
+    }
+
+    fn read_only_entry(path: &str, comment: &str) -> ExtraWorkdirEntry {
+        ExtraWorkdirEntry {
+            read_only: true,
+            ..entry(path, comment)
         }
     }
 
@@ -170,7 +184,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().to_string_lossy().to_string();
         let entries = vec![
-            entry("D:/Art/Sources", "美术资产目录"),
+            read_only_entry("D:/Art/Sources", "美术资产目录"),
             entry("D:/Docs", ""),
         ];
 
@@ -178,6 +192,21 @@ mod tests {
         assert_eq!(load_entries(&workspace), entries);
         assert!(config_path(&workspace)
             .starts_with(Path::new(&workspace).join("Library").join("Locus")));
+    }
+
+    #[test]
+    fn old_config_defaults_entries_to_writable() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().to_string_lossy().to_string();
+        let library_dir = crate::knowledge_index::library_dir_for_working_dir(&workspace);
+        std::fs::create_dir_all(&library_dir).unwrap();
+        std::fs::write(
+            config_path(&workspace),
+            r#"{"entries":[{"path":"D:/Art","comment":"legacy"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(load_entries(&workspace), vec![entry("D:/Art", "legacy")]);
     }
 
     #[test]
@@ -233,13 +262,19 @@ mod tests {
 
         save_entries(
             &workspace,
-            &[entry(&art, "美术资产目录"), entry(&missing, "gone")],
+            &[
+                read_only_entry(&art, "美术资产目录"),
+                entry(&missing, "gone"),
+            ],
         )
         .unwrap();
 
         let block = build_env_prompt_block(&workspace).unwrap();
         assert!(block.starts_with("## Additional Working Directories"));
-        assert!(block.contains(&format!("- {} — 美术资产目录", art)));
+        assert!(block.contains(&format!("- {} [read-only] — 美术资产目录", art)));
+        assert!(
+            block.contains("write, edit, and bash access targeting those directories is blocked")
+        );
         assert!(!block.contains(&missing));
 
         // Only missing dirs configured -> no block at all.

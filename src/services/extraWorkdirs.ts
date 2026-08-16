@@ -3,6 +3,7 @@ import { ipcInvoke } from "./ipc";
 export interface ExtraWorkdirEntry {
   path: string;
   comment: string;
+  readOnly: boolean;
 }
 
 export interface ExtraWorkdirStatus extends ExtraWorkdirEntry {

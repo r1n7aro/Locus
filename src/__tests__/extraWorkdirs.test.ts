@@ -34,6 +34,9 @@ describe("extra workdirs (additional working directories)", () => {
     expect(service).toContain('ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_get"');
     expect(service).toContain('ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_set"');
     expect(service).toContain('ipcInvoke<Record<string, ExtraWorkdirStatus[]>>("extra_workdirs_map"');
+    expect(rustCore).toContain("pub read_only: bool");
+    expect(rustCore).toContain("#[serde(default)]");
+    expect(service).toContain("readOnly: boolean");
   });
 
   it("injects attached directories into the agent env prompt with an independent injected item", () => {
@@ -76,6 +79,18 @@ describe("extra workdirs (additional working directories)", () => {
     // check must exempt them alongside skill-package and app-temp roots.
     expect(instance).toContain("crate::extra_workdirs::load_entries(working_dir)");
     expect(instance).toContain("an attached additional working directory");
+    expect(instance).toContain("validate_read_only_extra_workdir_access");
+    expect(instance).toContain("shell_command_mentions_read_only_extra_workdir");
+  });
+
+  it("configures and surfaces read-only attachment state", () => {
+    const app = read("src/App.vue");
+    const window = read("src/components/ExtraWorkdirsConfigWindow.vue");
+
+    expect(window).toContain('import BaseCheckbox from "./ui/BaseCheckbox.vue"');
+    expect(window).toContain(':model-value="entry.readOnly"');
+    expect(window).toContain("readOnly: entry.readOnly");
+    expect(app).toContain('v-if="extra.readOnly" class="dir-extra-readonly"');
   });
 
   it("guards the config window against stale loads and pre-listener payloads", () => {
@@ -112,6 +127,8 @@ describe("extra workdirs (additional working directories)", () => {
       expect(lang).toContain('"extraWorkdirs.windowTitle"');
       expect(lang).toContain('"extraWorkdirs.commentPlaceholder"');
       expect(lang).toContain('"extraWorkdirs.missingBadge"');
+      expect(lang).toContain('"extraWorkdirs.readOnly"');
+      expect(lang).toContain('"extraWorkdirs.readOnlyHint"');
     }
   });
 });

@@ -4309,7 +4309,7 @@ mod git_name_status_tests {
 
     #[test]
     fn rename_aware_fallback_index_lock_error_becomes_status_warning() {
-        let raw = "git write-tree failed: fatal: Unable to create 'G:/SampleGame-Light/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository";
+        let raw = "git write-tree failed: fatal: Unable to create 'G:/SampleGame/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository";
         let error = AppError::from(raw.to_string());
         let warning = git_status_warning_for_rename_aware_fallback(&error)
             .expect("index.lock errors should become status warnings");
@@ -4318,9 +4318,7 @@ mod git_name_status_tests {
         assert_eq!(warning.operation.as_deref(), Some("git_status"));
         assert_eq!(warning.severity, ErrorSeverity::Warning);
         assert!(warning.retryable);
-        assert!(warning
-            .message
-            .contains("G:/SampleGame-Light/.git/index.lock"));
+        assert!(warning.message.contains("G:/SampleGame/.git/index.lock"));
         assert_eq!(warning.detail.as_deref(), Some(raw));
     }
 

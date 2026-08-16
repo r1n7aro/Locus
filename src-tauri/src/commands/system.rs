@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use tauri::AppHandle;
 use tauri::State;
+use tauri::{AppHandle, Manager};
 
 #[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
@@ -110,19 +112,70 @@ pub fn play_custom_notification_sound(path: String, volume: Option<f32>) -> Resu
 }
 
 #[tauri::command]
-pub fn request_app_exit(app_handle: AppHandle) {
-    exit_app(&app_handle);
+pub async fn request_app_exit(app_handle: AppHandle) {
+    exit_app_inner(app_handle).await;
 }
 
 pub(crate) fn exit_app(app_handle: &AppHandle) {
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        exit_app_inner(app_handle).await;
+    });
+}
+
+static APP_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+async fn exit_app_inner(app_handle: AppHandle) {
+    if APP_EXIT_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Some(tasks) = app_handle.try_state::<crate::ActiveTasks>() {
+        let tasks = tasks.lock().await;
+        for task in tasks.values() {
+            let _ = task.cancel_tx.send(true);
+        }
+    }
+    if let Some(tasks) = app_handle.try_state::<Arc<crate::async_tasks::AsyncTaskManager>>() {
+        tasks.cancel_all();
+    }
+    let terminated = crate::process_util::begin_managed_process_shutdown();
+    if terminated > 0 {
+        eprintln!(
+            "[Locus] terminating {} managed process tree(s) before exit",
+            terminated
+        );
+    }
+    let drained =
+        crate::process_util::wait_for_managed_processes(std::time::Duration::from_millis(1500))
+            .await;
+    if !drained {
+        eprintln!("[Locus] managed process shutdown grace period elapsed; forcing remaining trees");
+        crate::process_util::terminate_all_managed_processes();
+    }
+    if let Some(tasks) = app_handle.try_state::<crate::ActiveTasks>() {
+        let mut tasks = tasks.lock().await;
+        for (_, task) in tasks.drain() {
+            task.join_handle.abort();
+        }
+    }
+
     if let Err(error) = crate::unity_bridge::restore_background_hook_runtime() {
         eprintln!("[Locus] failed to restore Unity background hook before exit: {error}");
     }
     crate::csharp_lsp::kill_active_server_for_exit();
     crate::csharp_compile::kill_active_server_for_exit();
     crate::mcp::manager::kill_all_for_exit();
-    crate::commands::destroy_unity_embed_control_window_on_main(app_handle);
+    crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);
     app_handle.exit(0);
+}
+
+#[tauri::command]
+pub async fn get_running_task_count(
+    active_tasks: State<'_, crate::ActiveTasks>,
+    async_tasks: State<'_, Arc<crate::async_tasks::AsyncTaskManager>>,
+) -> Result<usize, crate::error::AppError> {
+    Ok(active_tasks.lock().await.len() + async_tasks.active_count())
 }
 
 #[tauri::command]

@@ -33,7 +33,10 @@ export async function findLocusWebViewTarget(
       const target = targets.find((item) => (
         item.type === "page"
         && !!item.webSocketDebuggerUrl
-        && /^http:\/\/localhost:\d+\/$/.test(item.url)
+        && (
+          /^http:\/\/localhost:\d+\/$/.test(item.url)
+          || /^http:\/\/tauri\.localhost\/$/.test(item.url)
+        )
       ));
       if (target) return target;
     }

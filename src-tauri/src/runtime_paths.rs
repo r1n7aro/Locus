@@ -351,11 +351,9 @@ mod tests {
 
     #[test]
     fn parses_skip_onboarding_for_isolated_profiles() {
-        let parsed = ParsedRuntimeArgs::parse(args(&[
-            "--locus-isolated",
-            "--locus-skip-onboarding",
-        ]))
-        .expect("parse");
+        let parsed =
+            ParsedRuntimeArgs::parse(args(&["--locus-isolated", "--locus-skip-onboarding"]))
+                .expect("parse");
 
         assert!(parsed.isolated);
         assert!(parsed.skip_onboarding);

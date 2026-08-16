@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use rand::{rngs::OsRng, RngCore};
+use rand::RngExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -256,7 +256,7 @@ fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, String
 
 fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -788,6 +788,7 @@ impl SdkAgentSpec {
             default: false,
             default_effort: self.default_effort.clone(),
             model_recommendation: self.model_recommendation.clone(),
+            tool_description_overrides: HashMap::new(),
             source: "python".to_string(),
         }
     }
@@ -1509,6 +1510,10 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     let context = ToolExecutionContext {
         app_handle: Some(app.clone()),
         working_dir: working_dir.clone(),
+        process_owner: Some(crate::process_util::ProcessOwner {
+            working_dir: working_dir.clone(),
+            ..Default::default()
+        }),
         unity_connected,
         runtime_state: Some(Arc::new(ToolRuntimeState::default())),
         cancel_rx: None,
@@ -1535,6 +1540,17 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
                     crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
                 ),
         )
+    } else if canonical == "bash" {
+        crate::agent::instance::AgentInstance::bash_needs_primary_workspace_tracking_for(
+            working_dir.as_deref().unwrap_or_default(),
+            &params.arguments,
+        )
+        .then_some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
+    } else if canonical == "unity_execute" {
+        (!crate::agent::instance::AgentInstance::unity_execute_is_readonly(&params.arguments))
+            .then_some(
+                crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+            )
     } else if registry.mutates_workspace(&canonical)
         || crate::agent::instance::AgentInstance::is_unity_execution_barrier_tool(&canonical)
     {

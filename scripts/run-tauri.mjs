@@ -26,6 +26,14 @@ const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
 const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";
+const DEV_SERVER_PORT = 14901;
+const DEV_SERVER_START_TIMEOUT_MS = 30_000;
+const DEV_PREREQUISITE_SCRIPTS = [
+  "compile-server:ensure",
+  "ort:bundle",
+  "github-cli:bundle",
+  "renderdoc:bundle",
+];
 const ISOLATED_DEV_COMMANDS = new Set([
   DEV_ISOLATED_COMMAND,
   DEV_WITH_MCP_ISOLATED_COMMAND,
@@ -39,6 +47,7 @@ const DEFAULT_RELEASE_FLAVOR_CONFIG = path.relative(
   path.join(srcTauriDir, "tauri.with_embed_python_git.conf.json"),
 );
 const chromeDevtoolsMcpWrapper = path.join(scriptDir, "chrome-devtools-mcp-wrapper.mjs");
+const processTreeWatchdog = path.join(scriptDir, "process-tree-watchdog.mjs");
 const TAURI_TOP_LEVEL_COMMANDS = new Set([
   "android",
   "build",
@@ -401,25 +410,244 @@ function getTauriCommand(currentArgs) {
   return currentArgs.find((arg) => !arg.startsWith("-")) ?? "";
 }
 
-function runTauriCli() {
-  return new Promise((resolve, reject) => {
-    if (!existsSync(tauriCliScript)) {
-      console.error(`[locus] Tauri CLI not found at ${tauriCliScript}. Run "bun install" first.`);
-      resolve({ code: 1, signal: null });
-      return;
-    }
+const managedChildren = new Set();
+let shutdownPromise = null;
 
-    const child = spawn(process.execPath, [tauriCliScript, ...tauriArgs], {
+function startProcessTreeWatchdog(child) {
+  if (!child.pid || !existsSync(processTreeWatchdog)) {
+    return null;
+  }
+
+  const watchdog = spawn(process.execPath, [processTreeWatchdog, String(child.pid)], {
+    stdio: ["pipe", "ignore", "ignore"],
+    windowsHide: true,
+  });
+  watchdog.on("error", (error) => {
+    console.warn(`[locus] Process watchdog failed: ${error.message}`);
+  });
+  watchdog.stdin?.on("error", () => {
+    // The watchdog can exit as soon as the target process exits.
+  });
+  watchdog.unref();
+  watchdog.stdin?.unref?.();
+  return watchdog;
+}
+
+function closeProcessTreeWatchdog(managed) {
+  const watchdog = managed.watchdog;
+  if (!watchdog) {
+    return;
+  }
+  managed.watchdog = null;
+  if (!watchdog.stdin?.destroyed) {
+    watchdog.stdin.end();
+  }
+}
+
+function spawnManagedChild(command, commandArgs, options) {
+  const { label = path.basename(command), ...spawnOptions } = options;
+  const child = spawn(command, commandArgs, spawnOptions);
+  const managed = {
+    child,
+    label,
+    watchdog: null,
+    result: null,
+  };
+  managed.watchdog = startProcessTreeWatchdog(child);
+  managed.result = new Promise((resolve) => {
+    let settled = false;
+    const settle = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      managedChildren.delete(managed);
+      closeProcessTreeWatchdog(managed);
+      resolve(result);
+    };
+    child.once("error", (error) => settle({ code: 1, signal: null, error }));
+    child.once("exit", (code, signal) => settle({ code, signal, error: null }));
+  });
+  managedChildren.add(managed);
+  return managed;
+}
+
+function isManagedChildRunning(managed) {
+  return (
+    managed?.child?.pid &&
+    managed.child.exitCode === null &&
+    managed.child.signalCode === null
+  );
+}
+
+function terminateProcessTree(pid) {
+  if (!pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // The process can finish before the termination request reaches it.
+  }
+}
+
+async function terminateManagedChild(managed) {
+  if (!managed) {
+    return;
+  }
+  if (isManagedChildRunning(managed)) {
+    terminateProcessTree(managed.child.pid);
+  }
+  closeProcessTreeWatchdog(managed);
+  await managed.result;
+}
+
+async function terminateAllManagedChildren() {
+  const active = [...managedChildren].reverse();
+  await Promise.allSettled(active.map((managed) => terminateManagedChild(managed)));
+}
+
+function signalExitCode(signal) {
+  return signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 1;
+}
+
+function installShutdownHandlers() {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.once(signal, () => {
+      shutdownPromise ??= terminateAllManagedChildren().finally(() => {
+        process.exit(signalExitCode(signal));
+      });
+    });
+  }
+}
+
+function formatChildFailure(label, result) {
+  if (result.error) {
+    return `${label} failed to start: ${result.error.message}`;
+  }
+  if (result.signal) {
+    return `${label} exited from ${result.signal}`;
+  }
+  return `${label} exited with code ${result.code ?? 1}`;
+}
+
+async function runDevPrerequisites() {
+  for (const scriptName of DEV_PREREQUISITE_SCRIPTS) {
+    const managed = spawnManagedChild(process.execPath, ["run", scriptName], {
+      cwd: repoRoot,
       stdio: "inherit",
       env,
+      label: `bun run ${scriptName}`,
     });
+    const result = await managed.result;
+    if (result.error || result.signal || result.code !== 0) {
+      throw new Error(formatChildFailure(managed.label, result));
+    }
+  }
+}
 
-    child.on("exit", (code, signal) => {
-      resolve({ code, signal });
+function canConnectToPort(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: Number(port) });
+    socket.setTimeout(500);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
     });
-
-    child.on("error", reject);
+    const unavailable = () => {
+      socket.destroy();
+      resolve(false);
+    };
+    socket.once("error", unavailable);
+    socket.once("timeout", unavailable);
   });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDevServer(port) {
+  const deadline = Date.now() + DEV_SERVER_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (await canConnectToPort(port)) {
+      return;
+    }
+    await delay(100);
+  }
+  throw new Error(`Dev server did not listen on port ${port} within ${DEV_SERVER_START_TIMEOUT_MS}ms.`);
+}
+
+async function startManagedDevServer() {
+  if (!(await canListenOnPort(DEV_SERVER_PORT))) {
+    throw new Error(
+      `Dev server port ${DEV_SERVER_PORT} is already in use. Close the owning process before starting another Locus dev instance.`,
+    );
+  }
+
+  await runDevPrerequisites();
+
+  if (!(await canListenOnPort(DEV_SERVER_PORT))) {
+    throw new Error(`Dev server port ${DEV_SERVER_PORT} became unavailable during preparation.`);
+  }
+
+  const managed = spawnManagedChild(process.execPath, ["run", "dev"], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env,
+    label: "Vite dev server",
+  });
+  const startup = await Promise.race([
+    waitForDevServer(DEV_SERVER_PORT).then(() => ({ ready: true })),
+    managed.result.then((result) => ({ ready: false, result })),
+  ]);
+
+  if (!startup.ready) {
+    throw new Error(formatChildFailure(managed.label, startup.result));
+  }
+  return managed;
+}
+
+function runTauriCli() {
+  if (!existsSync(tauriCliScript)) {
+    console.error(`[locus] Tauri CLI not found at ${tauriCliScript}. Run "bun install" first.`);
+    return null;
+  }
+
+  return spawnManagedChild(process.execPath, [tauriCliScript, ...tauriArgs], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env,
+    label: "Tauri CLI",
+  });
+}
+
+async function superviseTauriDev(devServer, tauri) {
+  const firstExit = await Promise.race([
+    tauri.result.then((result) => ({ source: "tauri", result })),
+    devServer.result.then((result) => ({ source: "dev-server", result })),
+  ]);
+
+  if (firstExit.source === "tauri") {
+    await terminateManagedChild(devServer);
+    return firstExit.result;
+  }
+
+  console.error(`[locus] ${formatChildFailure(devServer.label, firstExit.result)}.`);
+  await terminateManagedChild(tauri);
+  return {
+    ...firstExit.result,
+    code: firstExit.result.code || 1,
+  };
 }
 
 function runCodexMcp(args) {
@@ -527,6 +755,8 @@ function ensureCodexDevtoolsMcp(port) {
   );
 }
 
+installShutdownHandlers();
+
 if (shouldExposeWebView2DebugPort) {
   const debugPort = await findAvailableDebugPort();
 
@@ -548,11 +778,29 @@ if (shouldExposeWebView2DebugPort) {
   env[WEBVIEW2_ARGS_KEY] = withRemoteDebugPort(env[WEBVIEW2_ARGS_KEY], debugPort);
 }
 
-const tauriResult = await runTauriCli();
+let tauriResult = { code: 1, signal: null, error: null };
+
+try {
+  const shouldManageDevServer = getTauriCommand(tauriArgs) === "dev" && !isHelpOrVersionCommand;
+  const devServer = shouldManageDevServer ? await startManagedDevServer() : null;
+  const tauri = runTauriCli();
+
+  if (tauri) {
+    tauriResult = devServer
+      ? await superviseTauriDev(devServer, tauri)
+      : await tauri.result;
+  } else if (devServer) {
+    await terminateManagedChild(devServer);
+  }
+} catch (error) {
+  console.error(`[locus] ${error instanceof Error ? error.message : String(error)}`);
+} finally {
+  await terminateAllManagedChildren();
+}
 
 if (tauriResult.signal) {
   process.kill(process.pid, tauriResult.signal);
-} else if (tauriResult.code !== 0) {
+} else if (tauriResult.error || tauriResult.code !== 0) {
   process.exit(tauriResult.code ?? 1);
 } else {
   process.exit(0);

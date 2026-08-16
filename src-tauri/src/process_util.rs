@@ -1,13 +1,406 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const GIT_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
 const GITHUB_CLI_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessOwner {
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub working_dir: Option<String>,
+}
+
+impl ProcessOwner {
+    pub fn session(session_id: impl Into<String>, working_dir: impl Into<String>) -> Self {
+        Self {
+            session_id: Some(session_id.into()),
+            task_id: None,
+            working_dir: Some(working_dir.into()),
+        }
+    }
+
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+}
+
+struct ManagedProcessEntry {
+    owner: ProcessOwner,
+    controller: Arc<PlatformProcessTree>,
+}
+
+#[derive(Default)]
+struct ManagedProcessRegistry {
+    entries: std::collections::HashMap<String, ManagedProcessEntry>,
+}
+
+fn managed_process_registry() -> &'static Mutex<ManagedProcessRegistry> {
+    static REGISTRY: OnceLock<Mutex<ManagedProcessRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ManagedProcessRegistry::default()))
+}
+
+static MANAGED_PROCESS_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+struct ManagedProcessRegistration {
+    id: String,
+    controller: Arc<PlatformProcessTree>,
+}
+
+impl Drop for ManagedProcessRegistration {
+    fn drop(&mut self) {
+        managed_process_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .remove(&self.id);
+    }
+}
+
+pub struct ManagedChild {
+    child: tokio::process::Child,
+    _registration: ManagedProcessRegistration,
+}
+
+impl ManagedChild {
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    pub async fn wait_with_output(self) -> io::Result<std::process::Output> {
+        let Self {
+            child,
+            _registration,
+        } = self;
+        child.wait_with_output().await
+    }
+
+    pub fn terminate_tree(&mut self) -> io::Result<()> {
+        self._registration.controller.terminate();
+        match self.child.start_kill() {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn register_managed_process(
+    owner: ProcessOwner,
+    controller: Arc<PlatformProcessTree>,
+) -> ManagedProcessRegistration {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    managed_process_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .insert(
+            id.clone(),
+            ManagedProcessEntry {
+                owner,
+                controller: controller.clone(),
+            },
+        );
+    ManagedProcessRegistration { id, controller }
+}
+
+fn terminate_managed_processes_matching(predicate: impl Fn(&ProcessOwner) -> bool) -> usize {
+    let controllers = managed_process_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .values()
+        .filter(|entry| predicate(&entry.owner))
+        .map(|entry| entry.controller.clone())
+        .collect::<Vec<_>>();
+    for controller in &controllers {
+        controller.terminate();
+    }
+    controllers.len()
+}
+
+pub fn terminate_managed_processes_for_session(session_id: &str) -> usize {
+    terminate_managed_processes_matching(|owner| owner.session_id.as_deref() == Some(session_id))
+}
+
+pub fn terminate_managed_processes_for_workspace(working_dir: &str) -> usize {
+    let target = process_owner_path_key(working_dir);
+    terminate_managed_processes_matching(|owner| {
+        owner
+            .working_dir
+            .as_deref()
+            .is_some_and(|path| process_owner_path_key(path) == target)
+    })
+}
+
+pub fn terminate_all_managed_processes() -> usize {
+    terminate_managed_processes_matching(|_| true)
+}
+
+pub fn begin_managed_process_shutdown() -> usize {
+    MANAGED_PROCESS_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    terminate_all_managed_processes()
+}
+
+pub fn managed_process_count() -> usize {
+    managed_process_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .len()
+}
+
+pub async fn wait_for_managed_processes(timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if managed_process_count() == 0 {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn process_owner_path_key(path: &str) -> String {
+    let normalized = path
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(target_os = "windows") {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+pub fn spawn_managed(
+    mut command: tokio::process::Command,
+    owner: ProcessOwner,
+) -> io::Result<ManagedChild> {
+    if MANAGED_PROCESS_SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Locus is shutting down; managed process startup was cancelled",
+        ));
+    }
+
+    prepare_managed_command(&mut command);
+    command.kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let controller = match PlatformProcessTree::attach(&child) {
+        Ok(controller) => Arc::new(controller),
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(error);
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    if let Err(error) = resume_managed_process(&child) {
+        controller.terminate();
+        let _ = child.start_kill();
+        return Err(error);
+    }
+
+    let registration = register_managed_process(owner, controller);
+    Ok(ManagedChild {
+        child,
+        _registration: registration,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_managed_command(command: &mut tokio::process::Command) {
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+}
+
+#[cfg(unix)]
+fn prepare_managed_command(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn prepare_managed_command(_command: &mut tokio::process::Command) {}
+
+#[cfg(target_os = "windows")]
+struct PlatformProcessTree {
+    job: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for PlatformProcessTree {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for PlatformProcessTree {}
+
+#[cfg(target_os = "windows")]
+impl PlatformProcessTree {
+    fn attach(child: &tokio::process::Child) -> io::Result<Self> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(None, windows_core::PCWSTR::null()) }
+            .map_err(windows_io_error)?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Err(error) = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+            return Err(windows_io_error(error));
+        }
+        let raw_process = child.raw_handle().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "spawned process handle is unavailable",
+            )
+        })?;
+        if let Err(error) = unsafe { AssignProcessToJobObject(job, HANDLE(raw_process)) } {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+            return Err(windows_io_error(error));
+        }
+        Ok(Self { job })
+    }
+
+    fn terminate(&self) {
+        let _ = unsafe { windows::Win32::System::JobObjects::TerminateJobObject(self.job, 1) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PlatformProcessTree {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.job) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resume_managed_process(child: &tokio::process::Child) -> io::Result<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let process_id = child
+        .id()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "spawned process id is unavailable"))?;
+    let snapshot =
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }.map_err(windows_io_error)?;
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut resumed = 0usize;
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) }.is_ok();
+    while has_entry {
+        if entry.th32OwnerProcessID == process_id {
+            if let Ok(thread) =
+                unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+            {
+                let previous = unsafe { ResumeThread(thread) };
+                let _ = unsafe { CloseHandle(thread) };
+                if previous != u32::MAX {
+                    resumed += 1;
+                }
+            }
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    if resumed == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to resume suspended managed process {process_id}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_io_error(error: windows_core::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, error.to_string())
+}
+
+#[cfg(unix)]
+struct PlatformProcessTree {
+    process_group_id: i32,
+}
+
+#[cfg(unix)]
+impl PlatformProcessTree {
+    fn attach(child: &tokio::process::Child) -> io::Result<Self> {
+        let process_group_id = child.id().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "spawned process id is unavailable")
+        })? as i32;
+        Ok(Self { process_group_id })
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            libc::kill(-self.process_group_id, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PlatformProcessTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+struct PlatformProcessTree;
+
+#[cfg(not(any(target_os = "windows", unix)))]
+impl PlatformProcessTree {
+    fn attach(_child: &tokio::process::Child) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn terminate(&self) {}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitDiscoverySource {
@@ -708,6 +1101,7 @@ fn managed_git_roots() -> Vec<PathBuf> {
         }
     }
 
+    #[cfg(debug_assertions)]
     push_managed_git_root_candidates(
         &mut roots,
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen"),
@@ -743,6 +1137,7 @@ fn managed_github_cli_roots() -> Vec<PathBuf> {
         }
     }
 
+    #[cfg(debug_assertions)]
     push_managed_github_cli_root_candidates(
         &mut roots,
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen"),

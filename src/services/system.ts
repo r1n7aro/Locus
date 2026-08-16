@@ -42,6 +42,10 @@ export function requestAppExit(): Promise<void> {
   return ipcInvoke<void>("request_app_exit");
 }
 
+export function getRunningTaskCount(): Promise<number> {
+  return ipcInvoke<number>("get_running_task_count");
+}
+
 export async function getCloseBehavior(): Promise<AppCloseBehavior> {
   return normalizeCloseBehavior(await ipcInvoke<AppCloseBehavior>("get_close_behavior"));
 }

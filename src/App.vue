@@ -20,7 +20,7 @@ import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
 import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
-import { APP_CLOSE_REQUESTED_EVENT, requestAppExit } from "./services/system";
+import { APP_CLOSE_REQUESTED_EVENT, getRunningTaskCount, requestAppExit } from "./services/system";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
@@ -396,6 +396,7 @@ const showDirDropdown = ref(false);
 const dirDropdownRef = ref<HTMLElement | null>(null);
 const recentDirContextMenu = ref<RecentDirContextMenu | null>(null);
 const pendingWorkspaceSwitchPath = ref<string | null>(null);
+const workspaceSwitchRunningTaskCount = ref(0);
 const switchingWorkspacePath = ref<string | null>(null);
 const workspaceSwitchBusy = ref(false);
 const appCloseConfirmOpen = ref(false);
@@ -487,7 +488,9 @@ function extraWorkdirsFor(dir: string): ExtraWorkdirStatus[] {
 }
 
 function extraWorkdirTooltip(extra: ExtraWorkdirStatus): string {
-  return extra.comment ? `${extra.path} — ${extra.comment}` : extra.path;
+  return [extra.path, extra.readOnly ? t("extraWorkdirs.readOnly") : "", extra.comment]
+    .filter(Boolean)
+    .join(" — ");
 }
 
 function closeRecentDirContextMenu() {
@@ -497,6 +500,7 @@ function closeRecentDirContextMenu() {
 function closeWorkspaceSwitchDialog() {
   if (workspaceSwitchBusy.value) return;
   pendingWorkspaceSwitchPath.value = null;
+  workspaceSwitchRunningTaskCount.value = 0;
 }
 
 function closeAppCloseDialog() {
@@ -546,8 +550,10 @@ async function performWorkingDirChange(dir: string, cancelledSessionCount = 0) {
 
 async function requestWorkingDirChange(dir: string) {
   if (!dir || dir === projectStore.workingDir || workspaceSwitchBusy.value) return;
-  if (runningSessionCount.value > 0) {
+  const runningTaskCount = await getRunningTaskCount().catch(() => runningSessionCount.value);
+  if (runningTaskCount > 0) {
     pendingWorkspaceSwitchPath.value = dir;
+    workspaceSwitchRunningTaskCount.value = runningTaskCount;
     return;
   }
   workspaceSwitchBusy.value = true;
@@ -567,10 +573,12 @@ async function confirmWorkspaceSwitch() {
   switchingWorkspacePath.value = target;
   try {
     const sessionIds = Array.from(chatStore.streamingSessionIds);
+    const runningTaskCount = workspaceSwitchRunningTaskCount.value;
     await chatStore.cancelSessions(sessionIds);
-    const switched = await performWorkingDirChange(target, sessionIds.length);
+    const switched = await performWorkingDirChange(target, runningTaskCount);
     if (switched) {
       pendingWorkspaceSwitchPath.value = null;
+      workspaceSwitchRunningTaskCount.value = 0;
     }
   } catch (error) {
     reportWorkingDirSwitchError(error);
@@ -593,7 +601,7 @@ async function confirmAppClose() {
 
 async function handleAppCloseRequest() {
   if (isStandaloneWindow || appCloseBusy.value || appCloseConfirmOpen.value) return;
-  const runningTaskCount = runningSessionCount.value;
+  const runningTaskCount = await getRunningTaskCount().catch(() => runningSessionCount.value);
   if (runningTaskCount > 0) {
     appCloseRunningTaskCount.value = runningTaskCount;
     appCloseConfirmOpen.value = true;
@@ -1062,6 +1070,7 @@ watch(() => projectStore.workingDir, () => {
                     </svg>
                     <span class="dir-extra-name">{{ shortDir(extra.path) }}</span>
                     <span v-if="extra.comment" class="dir-extra-comment">{{ extra.comment }}</span>
+                    <span v-if="extra.readOnly" class="dir-extra-readonly">{{ t("extraWorkdirs.readOnly") }}</span>
                     <span v-if="!extra.exists" class="dir-extra-missing">{{ t("extraWorkdirs.missingBadge") }}</span>
                   </div>
                 </div>
@@ -1318,7 +1327,7 @@ watch(() => projectStore.workingDir, () => {
         </div>
         <div class="workspace-switch-body">
           <p class="workspace-switch-message">
-            {{ t("app.dir.runningConfirmMessage", String(runningSessionCount), workspaceSwitchTargetName) }}
+            {{ t("app.dir.runningConfirmMessage", String(workspaceSwitchRunningTaskCount), workspaceSwitchTargetName) }}
           </p>
           <div class="workspace-switch-path">{{ pendingWorkspaceSwitchPath }}</div>
           <p class="workspace-switch-warning">

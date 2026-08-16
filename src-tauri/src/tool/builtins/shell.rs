@@ -7,7 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use super::misc::truncate_utf8_middle;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::process_util::{
-    async_command, augment_path_with_git, augment_path_with_github_cli, command,
+    async_command, augment_path_with_git, augment_path_with_github_cli, command, spawn_managed,
+    ManagedChild, ProcessOwner,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -248,6 +249,10 @@ pub(super) fn bash() -> ToolDef {
                         is_error: true,
                     };
                 }
+                let process_owner = ctx.process_owner.clone().unwrap_or_else(|| ProcessOwner {
+                    working_dir: workdir.clone(),
+                    ..Default::default()
+                });
 
                 let python =
                     crate::python_runtime::resolve_effective_python(ctx.app_handle.as_ref());
@@ -288,6 +293,7 @@ pub(super) fn bash() -> ToolDef {
                         workdir.as_deref().unwrap_or_default(),
                         &envs,
                         (!background).then_some(timeout_ms),
+                        process_owner,
                     );
                     return if let Some(ref mut cancel_rx) = cancel_rx {
                         tokio::select! {
@@ -334,7 +340,7 @@ pub(super) fn bash() -> ToolDef {
                 if let Some(report) = progress.as_ref() {
                     report(format!("Command running: {}", command));
                 }
-                let execution = run_captured_command(cmd, output_reporter);
+                let execution = run_captured_command(cmd, output_reporter, process_owner);
                 let result = if background {
                     if let Some(ref mut cancel_rx) = cancel_rx {
                         tokio::select! {
@@ -438,12 +444,13 @@ where
 }
 
 async fn run_captured_command(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
+    process_owner: ProcessOwner,
 ) -> std::io::Result<CapturedCommandOutput> {
-    let mut child = command.spawn()?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let mut child = spawn_managed(command, process_owner)?;
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     if let Some(stdout) = stdout {
         tokio::spawn(forward_captured_pipe(stdout, sender.clone()));
@@ -562,6 +569,7 @@ async fn run_interactive_command(
     workdir: &str,
     envs: &[(String, OsString)],
     timeout_ms: Option<u64>,
+    process_owner: ProcessOwner,
 ) -> ToolResult {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let temp_dir = std::env::temp_dir();
@@ -608,6 +616,7 @@ async fn run_interactive_command(
             is_error: true,
         };
     }
+    let mut temp_files = InteractiveTempFiles(vec![script_path.clone(), marker_path.clone()]);
 
     let (child, launcher_path) = match spawn_interactive_terminal(
         &script_path,
@@ -616,6 +625,7 @@ async fn run_interactive_command(
         envs,
         &temp_dir,
         &run_id,
+        process_owner,
     ) {
         Ok(spawned) => spawned,
         Err(message) => {
@@ -626,21 +636,27 @@ async fn run_interactive_command(
             };
         }
     };
-
-    let result = wait_for_interactive_exit(&marker_path, timeout_ms, child, raw_command).await;
-
-    let _ = std::fs::remove_file(&script_path);
-    let _ = std::fs::remove_file(&marker_path);
-    if let Some(ref launcher_path) = launcher_path {
-        let _ = std::fs::remove_file(launcher_path);
+    if let Some(path) = launcher_path {
+        temp_files.0.push(path);
     }
-    result
+
+    wait_for_interactive_exit(&marker_path, timeout_ms, child, raw_command).await
+}
+
+struct InteractiveTempFiles(Vec<PathBuf>);
+
+impl Drop for InteractiveTempFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 async fn wait_for_interactive_exit(
     marker_path: &Path,
     timeout_ms: Option<u64>,
-    mut child: Option<tokio::process::Child>,
+    mut child: Option<ManagedChild>,
     command: &str,
 ) -> ToolResult {
     let started = std::time::Instant::now();
@@ -681,7 +697,7 @@ async fn wait_for_interactive_exit(
             started.elapsed() >= std::time::Duration::from_millis(timeout_ms)
         }) {
             if let Some(mut child) = child.take() {
-                let _ = child.start_kill();
+                let _ = child.terminate_tree();
             }
             return ToolResult {
                 output: format!(
@@ -728,7 +744,8 @@ fn spawn_interactive_terminal(
     envs: &[(String, OsString)],
     temp_dir: &Path,
     run_id: &str,
-) -> Result<(Option<tokio::process::Child>, Option<PathBuf>), String> {
+    process_owner: ProcessOwner,
+) -> Result<(Option<ManagedChild>, Option<PathBuf>), String> {
     // `start` treats its first quoted argument as the window title, so the
     // program path can be quoted safely. Routing `start` through a launcher
     // script avoids the quoting pitfalls of passing it via `cmd /C` arguments.
@@ -766,8 +783,7 @@ fn spawn_interactive_terminal(
     cmd.current_dir(workdir);
     // The launcher lives for as long as the terminal window; killing it on
     // cancellation stops the wait without leaving the helper process behind.
-    cmd.kill_on_drop(true);
-    match cmd.spawn() {
+    match spawn_managed(cmd, process_owner) {
         Ok(child) => Ok((Some(child), Some(launcher_path))),
         Err(error) => {
             let _ = std::fs::remove_file(&launcher_path);
@@ -787,7 +803,8 @@ fn spawn_interactive_terminal(
     _envs: &[(String, OsString)],
     _temp_dir: &Path,
     _run_id: &str,
-) -> Result<(Option<tokio::process::Child>, Option<PathBuf>), String> {
+    _process_owner: ProcessOwner,
+) -> Result<(Option<ManagedChild>, Option<PathBuf>), String> {
     // Terminal.app does not inherit our environment; the script exports it.
     let invocation = format!("/bin/sh '{}'", script_path.display());
     let escaped = invocation.replace('\\', "\\\\").replace('"', "\\\"");
@@ -818,7 +835,8 @@ fn spawn_interactive_terminal(
     _envs: &[(String, OsString)],
     _temp_dir: &Path,
     _run_id: &str,
-) -> Result<(Option<tokio::process::Child>, Option<PathBuf>), String> {
+    _process_owner: ProcessOwner,
+) -> Result<(Option<ManagedChild>, Option<PathBuf>), String> {
     let script = script_path.display().to_string();
     let attempts: [(&str, &[&str]); 4] = [
         ("x-terminal-emulator", &["-e", "sh"]),
@@ -1168,9 +1186,17 @@ mod tests {
     async fn bash_stops_waiting_when_the_execution_context_is_cancelled() {
         let definition = bash();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("cancelled-child-survived.txt");
         let command = match detect_shell() {
-            ShellKind::Sh => "sleep 30",
-            ShellKind::Cmd => "ping -n 30 127.0.0.1 >nul",
+            ShellKind::Sh => format!(
+                "(sleep 1; printf survived > '{}') & wait",
+                marker.to_string_lossy().replace('\\', "/").replace('\'', "'\\''")
+            ),
+            ShellKind::Cmd => format!(
+                "powershell.exe -NoProfile -Command \"Start-Sleep -Milliseconds 1000; Set-Content -LiteralPath '{}' -Value survived\"",
+                marker.to_string_lossy().replace('\'', "''")
+            ),
         };
         let context = crate::tool::ToolExecutionContext {
             working_dir: Some(
@@ -1199,6 +1225,12 @@ mod tests {
             .expect("cancelled command should return promptly");
         assert!(result.is_error);
         assert_eq!(result.output, "Command cancelled.");
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+        assert!(
+            !marker.exists(),
+            "the cancelled shell's descendant process survived and wrote {}",
+            marker.display()
+        );
     }
 
     #[tokio::test]

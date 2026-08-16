@@ -104,6 +104,7 @@ describe("Python runtime settings", () => {
     const script = read("scripts/prepare-managed-git.mjs");
     const githubCliScript = read("scripts/prepare-managed-github-cli.mjs");
     const licenseScript = read("scripts/generate-third-party-bundle.mjs");
+    const runTauri = read("scripts/run-tauri.mjs");
 
     expect(pkg).toContain('"git:bundle": "bun run scripts/prepare-managed-git.mjs"');
     expect(pkg).toContain('"github-cli:bundle": "bun run scripts/prepare-managed-github-cli.mjs"');
@@ -112,7 +113,8 @@ describe("Python runtime settings", () => {
     expect(tauriConfig).toContain('"./gen/managed-git": "managed-git/"');
     expect(tauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
     expect(baseTauriConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
-    expect(baseTauriConfig).toContain("bun run github-cli:bundle && bun run renderdoc:bundle && bun run dev");
+    expect(runTauri).toContain('"github-cli:bundle"');
+    expect(runTauri).toContain('"renderdoc:bundle"');
     expect(withoutEmbedConfig).toContain('"./gen/gh-runtime": "gh-runtime/"');
     expect(installer).toContain("Function LocusDetectSystemGit");
     expect(installer).toContain("SearchPath $LocusGitProbePath \"git.exe\"");

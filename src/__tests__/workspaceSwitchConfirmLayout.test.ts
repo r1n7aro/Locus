@@ -16,6 +16,7 @@ describe("workspace switch confirm flow", () => {
     const en = read("src/language/en.json");
 
     expect(app).toContain("const pendingWorkspaceSwitchPath = ref<string | null>(null);");
+    expect(app).toContain("const workspaceSwitchRunningTaskCount = ref(0);");
     expect(app).toContain("const switchingWorkspacePath = ref<string | null>(null);");
     expect(app).toContain("const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);");
     expect(app).toContain('t("app.dir.switching")');
@@ -30,9 +31,9 @@ describe("workspace switch confirm flow", () => {
     expect(chatStore).toContain("await Promise.all(targets.map((sessionId) => cancelSession(sessionId)));");
     expect(zh).toContain('"app.dir.switching": "正在切换…"');
     expect(zh).toContain('"app.dir.runningConfirmTitle": "切换工作区"');
-    expect(zh).toContain('"app.dir.runningCancelledNotice": "已取消 {0} 个进行中的会话"');
+    expect(zh).toContain('"app.dir.runningCancelledNotice": "已取消 {0} 个进行中的任务"');
     expect(en).toContain('"app.dir.switching": "Switching…"');
     expect(en).toContain('"app.dir.runningConfirmTitle": "Switch workspace"');
-    expect(en).toContain('"app.dir.runningCancelledNotice": "Cancelled {0} running sessions"');
+    expect(en).toContain('"app.dir.runningCancelledNotice": "Cancelled {0} running tasks"');
   });
 });

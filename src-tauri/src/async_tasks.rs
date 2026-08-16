@@ -239,6 +239,7 @@ fn format_task_snapshot(snapshot: &AsyncTaskSnapshot, include_output: bool) -> S
 struct AsyncTaskEntry {
     snapshot: AsyncTaskSnapshot,
     cancel_tx: watch::Sender<bool>,
+    working_dir: Option<String>,
 }
 
 #[derive(Clone)]
@@ -288,6 +289,16 @@ impl AsyncTaskManager {
     }
 
     pub fn create_task(&self, session_id: &str, tool_name: &str, notify: bool) -> AsyncTaskStart {
+        self.create_task_in_workspace(session_id, tool_name, notify, None)
+    }
+
+    pub fn create_task_in_workspace(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        notify: bool,
+        working_dir: Option<&str>,
+    ) -> AsyncTaskStart {
         let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let now = now_millis();
@@ -306,6 +317,7 @@ impl AsyncTaskManager {
                 notify,
             },
             cancel_tx,
+            working_dir: working_dir.map(str::to_string),
         };
         let mut tasks = self
             .tasks
@@ -437,6 +449,55 @@ impl AsyncTaskManager {
         entry.snapshot.updated_at = now_millis();
         entry.cancel_tx.send_replace(true);
         Ok(entry.snapshot.clone())
+    }
+
+    fn cancel_matching(
+        &self,
+        predicate: impl Fn(&AsyncTaskEntry) -> bool,
+    ) -> Vec<AsyncTaskSnapshot> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cancelled = Vec::new();
+        for entry in tasks.values_mut() {
+            if entry.snapshot.status.is_terminal() || !predicate(entry) {
+                continue;
+            }
+            entry.snapshot.status = AsyncTaskStatus::Cancelling;
+            entry.snapshot.progress = Some("Cancellation requested".to_string());
+            entry.snapshot.updated_at = now_millis();
+            entry.cancel_tx.send_replace(true);
+            cancelled.push(entry.snapshot.clone());
+        }
+        cancelled
+    }
+
+    pub fn cancel_session(&self, session_id: &str) -> Vec<AsyncTaskSnapshot> {
+        self.cancel_matching(|entry| entry.snapshot.session_id == session_id)
+    }
+
+    pub fn cancel_workspace(&self, working_dir: &str) -> Vec<AsyncTaskSnapshot> {
+        let target = working_dir_key(working_dir);
+        self.cancel_matching(|entry| {
+            entry
+                .working_dir
+                .as_deref()
+                .is_some_and(|value| working_dir_key(value) == target)
+        })
+    }
+
+    pub fn cancel_all(&self) -> Vec<AsyncTaskSnapshot> {
+        self.cancel_matching(|_| true)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|entry| !entry.snapshot.status.is_terminal())
+            .count()
     }
 
     pub fn start_result(&self, task_id: &str) -> ToolResult {
@@ -619,6 +680,19 @@ fn now_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn working_dir_key(path: &str) -> String {
+    let normalized = path
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(target_os = "windows") {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +758,46 @@ mod tests {
         assert!(*started.cancel_rx.borrow_and_update());
         let (_, pending) = manager.take_notifications_and_pending("session");
         assert!(pending);
+    }
+
+    #[test]
+    fn session_cancellation_reaches_every_background_task_in_that_session() {
+        let manager = AsyncTaskManager::default();
+        let mut first =
+            manager.create_task_in_workspace("session-a", "bash", false, Some("C:/workspace-a"));
+        let mut second =
+            manager.create_task_in_workspace("session-a", "bash", true, Some("C:/workspace-a"));
+        let mut unrelated =
+            manager.create_task_in_workspace("session-b", "bash", false, Some("C:/workspace-b"));
+
+        let cancelled = manager.cancel_session("session-a");
+
+        assert_eq!(cancelled.len(), 2);
+        assert!(*first.cancel_rx.borrow_and_update());
+        assert!(*second.cancel_rx.borrow_and_update());
+        assert!(!*unrelated.cancel_rx.borrow_and_update());
+        assert_eq!(manager.active_count(), 3);
+    }
+
+    #[test]
+    fn workspace_cancellation_matches_normalized_paths() {
+        let manager = AsyncTaskManager::default();
+        let mut task = manager.create_task_in_workspace(
+            "session-a",
+            "bash",
+            false,
+            Some("C:\\Workspace\\Project\\"),
+        );
+
+        let cancelled = manager.cancel_workspace("c:/workspace/project");
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(cancelled.len(), 1);
+            assert!(*task.cancel_rx.borrow_and_update());
+        } else {
+            assert!(cancelled.is_empty());
+            assert!(!*task.cancel_rx.borrow_and_update());
+        }
     }
 
     #[test]
