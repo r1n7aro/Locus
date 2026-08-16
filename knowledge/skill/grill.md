@@ -18,7 +18,6 @@ tools:
   - code_find_references
   - unity_asset_search
   - unity_ref_search
-  - unity_yaml_list
   - unity_yaml_search
   - unity_yaml_read
 ---

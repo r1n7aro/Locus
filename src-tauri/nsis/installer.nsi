@@ -718,6 +718,8 @@ FunctionEnd
 
 Section Install
   SetOutPath $INSTDIR
+  ; Locus: $INSTDIR\user-agents is user-owned. The installer never removes or copies it,
+  ; so custom Agent definitions survive both automatic and manual updates.
   Call LocusDetectSystemGit
   ; Locus: replace optional bundled Python and Git resources.
   RMDir /r "$INSTDIR\managed-python"
@@ -895,6 +897,7 @@ Section Uninstall
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources
+  ; Keep $INSTDIR\user-agents untouched. Update uninstalls must preserve user Agents.
   {{#each resources}}
     Delete "$INSTDIR\\{{this.[1]}}"
   {{/each}}

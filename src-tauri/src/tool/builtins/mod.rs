@@ -1,3 +1,4 @@
+mod agent;
 mod code;
 mod code_unity;
 mod filesystem;
@@ -49,7 +50,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(code::code_diagnostics());
     registry.register_builtin(code::code_hover());
     registry.register_builtin(code_unity::unity_code_usages());
-    registry.register_builtin(unity::unity_yaml_list());
     registry.register_builtin(unity::unity_yaml_search());
     registry.register_builtin(unity::unity_yaml_read());
     registry.register_builtin(misc::ask());
@@ -58,6 +58,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
         .register_builtin_with_load_mode(skill::create_skill_package_tool(), ToolLoadMode::Skill);
     registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
+    registry.register_builtin_with_load_mode(agent::agent_reload(), ToolLoadMode::Skill);
     registry.register_builtin(mcp::mcp_reload_tool());
     registry.register_builtin_with_load_mode(plugin::plugin_list(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_search(), ToolLoadMode::Skill);

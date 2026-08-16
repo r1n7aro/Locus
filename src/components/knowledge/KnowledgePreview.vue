@@ -109,7 +109,6 @@ const skillArgumentHintDraft = ref("");
 const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
 const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
-const previewMainRef = ref<HTMLElement | null>(null);
 const summaryRenderedSearchRef = ref<HTMLElement | null>(null);
 const rulesRenderedSearchRef = ref<HTMLElement | null>(null);
 const bodyRenderedSearchRef = ref<HTMLElement | null>(null);
@@ -1248,7 +1247,7 @@ function labelForProvider(provider?: string | null): string {
           </div>
         </div>
 
-        <div ref="previewMainRef" class="preview-main">
+        <div class="preview-main">
           <div v-if="loading && !document" class="preview-empty">{{ t("common.loading") }}</div>
           <div v-else-if="!document" class="preview-empty">{{ t("knowledge.empty.title") }}</div>
           <article v-else class="document-page">

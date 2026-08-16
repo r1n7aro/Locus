@@ -1,19 +1,47 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub const KNOWLEDGE_AGENT_ID: &str = "knowledge";
+pub const DEFAULT_AGENT_ID: &str = "dev";
+pub const USER_AGENTS_DIR_NAME: &str = "user-agents";
 
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
-        "doc" | "wiki" => KNOWLEDGE_AGENT_ID,
+        "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger" => DEFAULT_AGENT_ID,
         _ => agent_id,
     }
 }
 
 pub fn is_hidden_legacy_agent_id(agent_id: &str) -> bool {
-    matches!(agent_id, "doc" | "wiki")
+    matches!(
+        agent_id,
+        "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger"
+    )
+}
+
+pub fn user_agent_dir(app_agent_dir: &Path) -> PathBuf {
+    app_agent_dir
+        .parent()
+        .unwrap_or(app_agent_dir)
+        .join(USER_AGENTS_DIR_NAME)
+}
+
+pub fn app_agent_layer_dirs(app_agent_dir: &Path, agent_id: &str) -> [PathBuf; 2] {
+    let agent_id = canonical_agent_id(agent_id);
+    [
+        app_agent_dir.join(agent_id),
+        user_agent_dir(app_agent_dir).join(agent_id),
+    ]
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentToolDescriptionOverride {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +65,8 @@ pub struct AgentDef {
     pub default_effort: Option<String>,
     #[serde(default)]
     pub model_recommendation: Option<String>,
+    #[serde(skip)]
+    pub tool_description_overrides: HashMap<String, AgentToolDescriptionOverride>,
     #[serde(skip)]
     pub source: String,
 }
@@ -66,6 +96,10 @@ impl AgentDefRegistry {
         }
 
         Self::scan_plugin_agent_sources(plugin_agent_sources, &mut defs, &mut default_id);
+
+        if let Some(app_dir) = app_agent_dir {
+            Self::scan_user_agent_dir(&user_agent_dir(app_dir), &mut defs, &mut default_id);
+        }
 
         if let Some(project_dir) = project_agent_dir {
             Self::scan_agent_dir_with_merge(project_dir, &mut defs, &mut default_id);
@@ -227,6 +261,62 @@ impl AgentDefRegistry {
         }
     }
 
+    fn scan_user_agent_dir(
+        dir: &Path,
+        defs: &mut HashMap<String, AgentDef>,
+        default_id: &mut Option<String>,
+    ) {
+        if !dir.is_dir() {
+            return;
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("[Locus] failed to read user agent dir {:?}: {}", dir, error);
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+
+            if let Some(existing) = defs.get_mut(&id) {
+                Self::merge_project_overlay(existing, &path);
+                existing.source = "appUser".to_string();
+                if existing.default {
+                    *default_id = Some(id.clone());
+                }
+                println!("[Locus] merged user overlay for agent '{}'", id);
+                continue;
+            }
+
+            match Self::load_agent_from_dir(&path, &id) {
+                Ok(mut def) => {
+                    def.source = "user".to_string();
+                    if def.default {
+                        *default_id = Some(id.clone());
+                    }
+                    println!("[Locus] loaded user agent def '{}' from {:?}", id, path);
+                    defs.insert(id, def);
+                }
+                Err(error) => eprintln!(
+                    "[Locus] failed to load user agent '{}' from {:?}: {}",
+                    id, path, error
+                ),
+            }
+        }
+    }
+
     fn load_agent_from_dir(dir: &Path, id: &str) -> Result<AgentDef, String> {
         let config_path = dir.join("config.json");
         if !config_path.is_file() {
@@ -252,7 +342,123 @@ impl AgentDefRegistry {
                 fs::read_to_string(&env_path).map_err(|e| format!("read env.md error: {}", e))?;
         }
 
+        def.tool_description_overrides = Self::load_tool_description_overrides(dir)?;
+
         Ok(def)
+    }
+
+    fn load_tool_description_overrides(
+        agent_dir: &Path,
+    ) -> Result<HashMap<String, AgentToolDescriptionOverride>, String> {
+        let tools_dir = agent_dir.join("tools");
+        if !tools_dir.is_dir() {
+            return Ok(HashMap::new());
+        }
+
+        let entries = fs::read_dir(&tools_dir)
+            .map_err(|error| format!("read tools directory error: {}", error))?;
+        let mut overrides = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let tool_name = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("invalid tool override file name: {:?}", path))?
+                .to_string();
+            let content = fs::read_to_string(&path)
+                .map_err(|error| format!("read {:?} error: {}", path, error))?;
+            let definition: AgentToolDescriptionOverride = serde_json::from_str(&content)
+                .map_err(|error| format!("parse {:?} error: {}", path, error))?;
+            if definition.description.is_none() && definition.parameters.is_none() {
+                return Err(format!(
+                    "tool override {:?} must define description or parameters",
+                    path
+                ));
+            }
+            if definition
+                .parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.is_object())
+            {
+                return Err(format!(
+                    "tool override {:?} parameters must be a JSON object",
+                    path
+                ));
+            }
+            overrides.insert(tool_name, definition);
+        }
+        Ok(overrides)
+    }
+
+    fn apply_schema_description_overlay(
+        target: &mut serde_json::Value,
+        overlay: &serde_json::Value,
+    ) {
+        let (Some(target_object), Some(overlay_object)) =
+            (target.as_object_mut(), overlay.as_object())
+        else {
+            return;
+        };
+
+        if let Some(description) = overlay_object
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+        {
+            target_object.insert(
+                "description".to_string(),
+                serde_json::Value::String(description.to_string()),
+            );
+        }
+
+        for map_key in ["properties", "$defs", "definitions"] {
+            let Some(overlay_entries) = overlay_object
+                .get(map_key)
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let Some(target_entries) = target_object
+                .get_mut(map_key)
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            for (name, overlay_entry) in overlay_entries {
+                if let Some(target_entry) = target_entries.get_mut(name) {
+                    Self::apply_schema_description_overlay(target_entry, overlay_entry);
+                }
+            }
+        }
+
+        if let (Some(target_items), Some(overlay_items)) =
+            (target_object.get_mut("items"), overlay_object.get("items"))
+        {
+            Self::apply_schema_description_overlay(target_items, overlay_items);
+        }
+
+        for list_key in ["allOf", "anyOf", "oneOf"] {
+            let Some(overlay_items) = overlay_object
+                .get(list_key)
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            let Some(target_items) = target_object
+                .get_mut(list_key)
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for (target_item, overlay_item) in target_items.iter_mut().zip(overlay_items) {
+                Self::apply_schema_description_overlay(target_item, overlay_item);
+            }
+        }
     }
 
     fn merge_project_overlay(base: &mut AgentDef, project_dir: &Path) {
@@ -327,6 +533,14 @@ impl AgentDefRegistry {
                 base.env_template = template;
             }
         }
+
+        match Self::load_tool_description_overrides(project_dir) {
+            Ok(overrides) => base.tool_description_overrides.extend(overrides),
+            Err(error) => eprintln!(
+                "[Locus] failed to load Agent tool description overrides from {:?}: {}",
+                project_dir, error
+            ),
+        }
     }
 
     /// Normalize retired aliases and keep the unified knowledge/file tool
@@ -361,23 +575,11 @@ impl AgentDefRegistry {
             )
         });
 
-        if !matches!(canonical_agent_id(agent_id), "dev" | KNOWLEDGE_AGENT_ID) {
+        if canonical_agent_id(agent_id) != DEFAULT_AGENT_ID {
             return;
         }
 
-        let required_tools: &[&str] = if canonical_agent_id(agent_id) == "dev" {
-            &["knowledge_query"]
-        } else {
-            &[
-                "knowledge_query",
-                "read",
-                "write",
-                "edit",
-                "bash",
-                "list",
-                "grep",
-            ]
-        };
+        let required_tools: &[&str] = &["knowledge_query"];
 
         for &tool in required_tools {
             if !tools.iter().any(|name| name == tool) {
@@ -425,9 +627,44 @@ impl AgentDefRegistry {
     }
 }
 
+impl AgentDef {
+    pub fn apply_tool_description_override(
+        &self,
+        tool_name: &str,
+        tool: &mut serde_json::Value,
+    ) -> bool {
+        let Some(definition) = self.tool_description_overrides.get(tool_name) else {
+            return false;
+        };
+        let Some(function) = tool
+            .get_mut("function")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return false;
+        };
+        if let Some(description) = definition.description.as_ref() {
+            function.insert(
+                "description".to_string(),
+                serde_json::Value::String(description.clone()),
+            );
+        }
+        if let (Some(target_parameters), Some(overlay_parameters)) = (
+            function.get_mut("parameters"),
+            definition.parameters.as_ref(),
+        ) {
+            AgentDefRegistry::apply_schema_description_overlay(
+                target_parameters,
+                overlay_parameters,
+            );
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AgentDefRegistry;
+    use super::{canonical_agent_id, user_agent_dir, AgentDefRegistry, DEFAULT_AGENT_ID};
+    use std::fs;
     use std::path::PathBuf;
 
     fn repo_agent_dir() -> PathBuf {
@@ -566,17 +803,111 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_agent_exposes_unified_knowledge_tools() {
-        assert_unified_knowledge_tools("knowledge");
+    fn retired_builtin_agent_ids_resolve_to_unity_dev() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        for legacy_id in ["git", "knowledge", "runtime_debugger", "doc", "wiki"] {
+            assert_eq!(canonical_agent_id(legacy_id), DEFAULT_AGENT_ID);
+            assert_eq!(
+                registry.get(legacy_id).map(|def| def.id.as_str()),
+                Some("dev")
+            );
+        }
     }
 
     #[test]
-    fn git_agent_exposes_knowledge_inspection_tools() {
-        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
-        let agent = registry.get("git").expect("git agent should be loadable");
+    fn loads_user_agents_from_install_sibling_directory() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bundled_root = root.path().join("agent");
+        let bundled_dev = bundled_root.join("dev");
+        fs::create_dir_all(&bundled_dev).expect("bundled dev dir");
+        fs::write(
+            bundled_dev.join("config.json"),
+            r#"{"name":"Unity","description":"Default","tools":[],"default":true}"#,
+        )
+        .expect("bundled config");
+        fs::write(bundled_dev.join("system.md"), "Bundled prompt").expect("bundled prompt");
 
-        assert!(agent.tools.iter().any(|name| name == "knowledge_query"));
-        assert!(agent.tools.iter().all(|name| name != "knowledge_read"));
+        let custom = user_agent_dir(&bundled_root).join("build-auditor");
+        fs::create_dir_all(&custom).expect("user agent dir");
+        fs::write(
+            custom.join("config.json"),
+            r#"{"name":"Build Auditor","description":"Audit builds","tools":["read"],"default":false}"#,
+        )
+        .expect("user config");
+        fs::write(custom.join("system.md"), "Audit every build").expect("user prompt");
+
+        let registry = AgentDefRegistry::load(Some(&bundled_root), None);
+        let user = registry
+            .get("build-auditor")
+            .expect("user Agent should be indexed");
+        assert_eq!(user.name, "Build Auditor");
+        assert_eq!(user.source, "user");
+        assert_eq!(registry.default_id(), "dev");
+    }
+
+    #[test]
+    fn agent_tool_override_changes_descriptions_without_changing_schema() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bundled_root = root.path().join("agent");
+        let custom = user_agent_dir(&bundled_root).join("simple");
+        fs::create_dir_all(custom.join("tools")).expect("user Agent tools dir");
+        fs::write(
+            custom.join("config.json"),
+            r#"{"name":"Simple","description":"Simple Agent","tools":["list"],"default":false}"#,
+        )
+        .expect("user config");
+        fs::write(custom.join("system.md"), "Keep the workflow simple.").expect("system prompt");
+        fs::write(
+            custom.join("tools/list.json"),
+            r#"{
+  "description": "List ordinary project files.",
+  "parameters": {
+    "properties": {
+      "path": { "description": "Directory to inspect.", "type": "number" },
+      "missing": { "description": "Must stay absent." }
+    },
+    "required": []
+  }
+}"#,
+        )
+        .expect("tool override");
+
+        let registry = AgentDefRegistry::load(Some(&bundled_root), None);
+        let agent = registry.get("simple").expect("user Agent should load");
+        let mut tool = serde_json::json!({
+            "function": {
+                "name": "list",
+                "description": "Unity-specific list description.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Unity project directory." }
+                    },
+                    "required": ["path"]
+                }
+            }
+        });
+
+        assert!(agent.apply_tool_description_override("list", &mut tool));
+        assert_eq!(
+            tool["function"]["description"],
+            serde_json::json!("List ordinary project files.")
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["path"]["description"],
+            serde_json::json!("Directory to inspect.")
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["path"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["required"],
+            serde_json::json!(["path"])
+        );
+        assert!(tool["function"]["parameters"]["properties"]
+            .get("missing")
+            .is_none());
     }
 
     #[test]
@@ -584,9 +915,10 @@ mod tests {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
         let descriptions = registry.list_subagent_descriptions();
 
-        assert!(descriptions
-            .iter()
-            .all(|(id, _)| id != "doc" && id != "wiki"));
-        assert!(descriptions.iter().any(|(id, _)| id == "knowledge"));
+        assert!(descriptions.iter().all(|(id, _)| !matches!(
+            id.as_str(),
+            "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger"
+        )));
+        assert!(descriptions.iter().any(|(id, _)| id == "dev"));
     }
 }

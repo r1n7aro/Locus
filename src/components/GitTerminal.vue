@@ -360,7 +360,7 @@ async function submit() {
     const { sessionId: sid, runId } = await chat({
       sessionId: sessionId.value,
       text: text,
-      agentId: "git",
+      agentId: "dev",
       model: props.selectedModelId || null,
       sessionType: "git",
     });

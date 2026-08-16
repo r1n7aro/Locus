@@ -3,9 +3,9 @@ import { computed, ref } from "vue";
 import { t } from "../../i18n";
 import type { KnowledgeDocument } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
-import AgentSelector from "../AgentSelector.vue";
 import ModelEffortSelector from "../ModelEffortSelector.vue";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { useSkills } from "../../composables/useSkills";
 import { useAgentStore } from "../../stores/agent";
 import { useModelStore } from "../../stores/model";
@@ -19,16 +19,14 @@ const agentStore = useAgentStore();
 const modelStore = useModelStore();
 const projectStore = useProjectStore();
 const { skillItems } = useSkills();
+const { state: displaySettings } = useDisplaySettings();
 
 const sessionKey = computed(() => `${projectStore.workingDir}::knowledge::${props.document.path}`);
 const sessionTitle = computed(() => `Knowledge: ${props.document.title || props.document.path}`);
 const manualKnowledgeAgentId = ref("");
 const knowledgeDefaultAgentId = computed(() => {
-  if (agentStore.agents.some((agent) => agent.id === "knowledge")) return "knowledge";
-  const selectedAgentId = agentStore.selectedAgentId.trim();
-  if (selectedAgentId && agentStore.agents.some((agent) => agent.id === selectedAgentId)) {
-    return selectedAgentId;
-  }
+  const defaultAgent = agentStore.agents.find((agent) => agent.isDefault);
+  if (defaultAgent) return defaultAgent.id;
   return agentStore.agents[0]?.id || null;
 });
 const knowledgeAgentId = computed(() => {
@@ -98,6 +96,11 @@ const {
 
 function handleSelectAgent(agentId: string) {
   manualKnowledgeAgentId.value = agentId;
+  const agent = agentStore.agents.find((item) => item.id === agentId);
+  const fallbackEffort = modelStore.hasUserDefaultEffort
+    ? modelStore.defaultEffort
+    : (agent?.defaultEffort ?? "none");
+  modelStore.activateAgentPreference(agentId, fallbackEffort, true);
 }
 </script>
 
@@ -150,16 +153,10 @@ function handleSelectAgent(agentId: string) {
     @apply-knowledge-proposal="applyKnowledgeProposal"
     @ignore-knowledge-proposal="ignoreKnowledgeProposal"
   >
-    <template #composer-start>
-      <AgentSelector
-        :agents="agentStore.agents"
-        :selected-id="knowledgeAgentId || ''"
-        :disabled="isStreaming"
-        @select="handleSelectAgent"
-      />
-    </template>
     <template #composer-actions>
       <ModelEffortSelector
+        :agents="displaySettings.showAgentSelector ? agentStore.agents : undefined"
+        :selected-agent-id="knowledgeAgentId || ''"
         :models="modelStore.availableModels"
         :selected-id="modelStore.selectedModelId"
         :effort="modelStore.effort"
@@ -168,6 +165,7 @@ function handleSelectAgent(agentId: string) {
         :fast-mode-enabled="modelStore.effectiveCodexFastMode"
         :fast-mode-available="modelStore.codexFastModeAvailable"
         :disabled="isStreaming"
+        @select-agent="handleSelectAgent"
         @select-model="modelStore.selectModel"
         @select-effort="modelStore.selectEffort"
         @select-fast-mode="modelStore.selectCodexFastMode"

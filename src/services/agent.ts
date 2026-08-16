@@ -34,11 +34,21 @@ export function getAgentSystemPromptStats(agentId: string): Promise<AgentSystemP
 export function listAgentInjectedItems(
   agentId: string,
   knowledgeMode?: KnowledgeAccessMode | null,
+  selectedModel?: string | null,
 ): Promise<InjectedPromptItem[]> {
   return ipcInvoke<InjectedPromptItem[]>("list_agent_injected_items", {
     agentId,
     knowledgeMode: knowledgeMode ?? null,
+    selectedModel: selectedModel ?? null,
   });
+}
+
+export function setAgentInjectionEnabled(
+  agentId: string,
+  injectionId: string,
+  enabled: boolean,
+): Promise<void> {
+  return ipcInvoke("set_agent_injection_enabled", { agentId, injectionId, enabled });
 }
 
 export function setAgentToolDirectLoad(agentId: string, toolName: string, directLoad: boolean): Promise<void> {

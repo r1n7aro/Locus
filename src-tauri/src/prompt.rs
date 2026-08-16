@@ -39,7 +39,6 @@ pub mod tools {
     pub const UNITY_TEST_RUN: &str = include_str!("../../tools/unity_test_run.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
     pub const UNITY_ASSET_SEARCH: &str = include_str!("../../tools/unity_asset_search.json");
-    pub const UNITY_YAML_LIST: &str = include_str!("../../tools/unity_yaml_list.json");
     pub const UNITY_YAML_SEARCH: &str = include_str!("../../tools/unity_yaml_search.json");
     pub const UNITY_YAML_READ: &str = include_str!("../../tools/unity_yaml_read.json");
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
@@ -56,6 +55,7 @@ pub mod tools {
     pub const CREATE_SKILL_PACKAGE: &str = include_str!("../../tools/create_skill_package.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
+    pub const AGENT_RELOAD: &str = include_str!("../../tools/agent_reload.json");
     pub const MCP_RELOAD: &str = include_str!("../../tools/mcp_reload.json");
     pub const PLUGIN_LIST: &str = include_str!("../../tools/plugin_list.json");
     pub const PLUGIN_SEARCH: &str = include_str!("../../tools/plugin_search.json");
@@ -140,7 +140,6 @@ mod tests {
             ("unity_test_run", tools::UNITY_TEST_RUN),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
-            ("unity_yaml_list", tools::UNITY_YAML_LIST),
             ("unity_yaml_search", tools::UNITY_YAML_SEARCH),
             ("unity_yaml_read", tools::UNITY_YAML_READ),
             ("unity_recompile", tools::UNITY_RECOMPILE),
@@ -157,6 +156,7 @@ mod tests {
             ("create_skill_package", tools::CREATE_SKILL_PACKAGE),
             ("skill_reload", tools::SKILL_RELOAD),
             ("skill_list", tools::SKILL_LIST),
+            ("agent_reload", tools::AGENT_RELOAD),
             ("plugin_list", tools::PLUGIN_LIST),
             ("plugin_search", tools::PLUGIN_SEARCH),
             ("plugin_install", tools::PLUGIN_INSTALL),

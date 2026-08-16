@@ -19,7 +19,7 @@ describe("AgentView injected env entry", () => {
     expect(source).toContain('class="env-preview-mode"');
     expect(source).toContain('class="injected-section"');
     expect(source).toContain('class="kb-item injected-item"');
-    expect(source).toContain(':class="{ selected: selected?.type === \'env\' }"');
+    expect(source).toMatch(/selected:\s*selected\?\.type === ['"]env['"]/);
     expect(source).toContain('{{ t("agent.envTemplate") }}');
     expect(source).toContain('{{ t("agent.injected.context") }}');
     expect(source).not.toContain(

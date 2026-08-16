@@ -30,6 +30,7 @@ use crate::workspace::Workspace;
 use crate::{AgentDefRegistryState, AppAgentDir};
 
 pub const PLUGINS_CHANGED_EVENT: &str = "plugins-changed";
+pub const AGENTS_CHANGED_EVENT: &str = "agents-changed";
 const DEFAULT_PLUGIN_REGISTRY_BASE_URL: &str =
     "https://raw.githubusercontent.com/r1n7aro/locus-plugin-registry/main/public/v1";
 const PLUGIN_REGISTRY_DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -85,6 +86,12 @@ pub(crate) async fn reload_agent_registry(
         &crate::plugin::installed_agent_sources(working_dir),
     );
     *registry.0.write().await = next;
+}
+
+pub(crate) fn emit_agents_changed(app_handle: &AppHandle) {
+    if let Err(error) = app_handle.emit(AGENTS_CHANGED_EVENT, ()) {
+        eprintln!("[Locus] failed to emit {}: {}", AGENTS_CHANGED_EVENT, error);
+    }
 }
 
 fn default_registry_entry_base_path() -> String {

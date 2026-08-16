@@ -19,7 +19,6 @@ describe("skill package namespace settings", () => {
     const uiStore = read("src/stores/ui.ts");
     const knowledgeService = read("src/services/knowledge.ts");
     const devAgent = read("agent/dev/config.json");
-    const knowledgeAgent = read("agent/knowledge/config.json");
     const createSkillPackageTool = read("tools/create_skill_package.json");
     const createSkillDoc = read("knowledge/skill/create-skill.md");
     const zh = read("src/language/zh.json");
@@ -43,7 +42,6 @@ describe("skill package namespace settings", () => {
     expect(knowledgeService).toContain("get_default_skill_package_namespace");
     expect(knowledgeService).toContain("set_default_skill_package_namespace");
     expect(devAgent).not.toContain("create_skill_package");
-    expect(knowledgeAgent).not.toContain("create_skill_package");
     expect(settingsState).not.toContain("create_skill_package");
 
     expect(createSkillPackageTool).toContain("short kebab-case id");

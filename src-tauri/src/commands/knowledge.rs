@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::agent::definition::canonical_agent_id;
+use crate::agent::definition::{app_agent_layer_dirs, canonical_agent_id};
 use crate::binary_cache::BinaryCache;
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
@@ -3605,13 +3605,19 @@ fn load_app_tool_load_config(
     agent_id: &str,
 ) -> AgentToolLoadConfig {
     let agent_id = canonical_agent_id(agent_id);
+    let mut merged = AgentToolLoadConfig::default();
     if let Some(app_dir) = app_agent_dir {
-        let path = app_dir.join(agent_id).join("tool_load_config.json");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return serde_json::from_str(&content).unwrap_or_default();
+        for layer_dir in app_agent_layer_dirs(app_dir, agent_id) {
+            let path = layer_dir.join("tool_load_config.json");
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let layer: AgentToolLoadConfig = serde_json::from_str(&content).unwrap_or_default();
+            merged.direct_load.extend(layer.direct_load);
+            merged.enabled.extend(layer.enabled);
         }
     }
-    AgentToolLoadConfig::default()
+    merged
 }
 
 pub fn merged_tool_load_config_for_agent(
@@ -3796,6 +3802,143 @@ impl Default for RuleConfig {
 
 pub type AgentRuleConfig = std::collections::HashMap<String, RuleConfig>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+pub type AgentInjectionConfig = std::collections::HashMap<String, InjectionConfig>;
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentInjectionConfigLayers {
+    app: AgentInjectionConfig,
+    workspace: AgentInjectionConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentInjectionState {
+    pub enabled: bool,
+    pub default_enabled: bool,
+    pub workspace_override: Option<bool>,
+}
+
+impl AgentInjectionConfigLayers {
+    pub fn state(&self, injection_id: &str) -> AgentInjectionState {
+        let default_enabled = self
+            .app
+            .get(injection_id)
+            .map(|config| config.enabled)
+            .unwrap_or(true);
+        let workspace_override = self
+            .workspace
+            .get(injection_id)
+            .map(|config| config.enabled);
+        AgentInjectionState {
+            enabled: workspace_override.unwrap_or(default_enabled),
+            default_enabled,
+            workspace_override,
+        }
+    }
+}
+
+fn injection_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
+    let agent_id = canonical_agent_id(agent_id);
+    std::path::Path::new(working_dir)
+        .join("Locus")
+        .join("agent")
+        .join(agent_id)
+        .join("injection_config.json")
+}
+
+fn load_injection_config_file(path: &std::path::Path) -> AgentInjectionConfig {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn load_workspace_injection_config(working_dir: &str, agent_id: &str) -> AgentInjectionConfig {
+    if working_dir.trim().is_empty() {
+        return AgentInjectionConfig::new();
+    }
+    load_injection_config_file(&injection_config_path(working_dir, agent_id))
+}
+
+fn save_workspace_injection_config(
+    working_dir: &str,
+    agent_id: &str,
+    configs: &AgentInjectionConfig,
+) -> Result<(), String> {
+    let path = injection_config_path(working_dir, agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create Agent config directory: {}", error))?;
+    }
+    let json = serde_json::to_string_pretty(configs)
+        .map_err(|error| format!("Failed to serialize injection config: {}", error))?;
+    std::fs::write(&path, json)
+        .map_err(|error| format!("Failed to save injection config: {}", error))
+}
+
+pub fn load_agent_injection_config_layers(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+) -> AgentInjectionConfigLayers {
+    let agent_id = canonical_agent_id(agent_id);
+    let mut app = AgentInjectionConfig::new();
+    if let Some(app_dir) = app_agent_dir {
+        for layer_dir in app_agent_layer_dirs(app_dir, agent_id) {
+            app.extend(load_injection_config_file(
+                &layer_dir.join("injection_config.json"),
+            ));
+        }
+    }
+    AgentInjectionConfigLayers {
+        app,
+        workspace: load_workspace_injection_config(working_dir, agent_id),
+    }
+}
+
+fn valid_injection_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '-' | ':' | '.' | '/' | '\\' | ' ')
+                || !ch.is_ascii()
+        })
+}
+
+#[tauri::command]
+pub async fn set_agent_injection_enabled(
+    agent_id: String,
+    injection_id: String,
+    enabled: bool,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<(), AppError> {
+    let agent_id = canonical_agent_id(agent_id.trim()).to_string();
+    let injection_id = injection_id.trim().to_string();
+    if agent_id.is_empty() || !valid_injection_id(&injection_id) {
+        return Err("Invalid Agent injection id".to_string().into());
+    }
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err("No working directory selected".to_string().into());
+    }
+    let mut configs = load_workspace_injection_config(&working_dir, &agent_id);
+    configs.insert(injection_id, InjectionConfig { enabled });
+    save_workspace_injection_config(&working_dir, &agent_id, &configs).map_err(Into::into)
+}
+
 const PLUGIN_RULE_KEY_PREFIX: &str = "plugin:";
 const PLUGIN_RULE_DEFAULT_ORDER_BASE: i32 = 10_000;
 
@@ -3906,13 +4049,18 @@ fn load_app_rule_config(
     agent_id: &str,
 ) -> AgentRuleConfig {
     let agent_id = canonical_agent_id(agent_id);
+    let mut merged = AgentRuleConfig::new();
     if let Some(app_dir) = app_agent_dir {
-        let path = app_dir.join(agent_id).join("rule_config.json");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return serde_json::from_str(&content).unwrap_or_default();
+        for layer_dir in app_agent_layer_dirs(app_dir, agent_id) {
+            let path = layer_dir.join("rule_config.json");
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let layer: AgentRuleConfig = serde_json::from_str(&content).unwrap_or_default();
+            merged.extend(layer);
         }
     }
-    AgentRuleConfig::new()
+    merged
 }
 
 pub fn merged_rule_config_for_agent(
@@ -4127,12 +4275,19 @@ pub fn collect_agent_rule_files(
     scan_plugin_rule_sources(working_dir, &configs, &mut items);
 
     if let Some(app_dir) = app_agent_dir {
-        let app_rules = app_dir.join(&agent_id).join("rule");
-        if app_rules.is_dir() {
+        for (index, layer_dir) in app_agent_layer_dirs(app_dir, &agent_id)
+            .into_iter()
+            .enumerate()
+            .rev()
+        {
+            let app_rules = layer_dir.join("rule");
+            if !app_rules.is_dir() {
+                continue;
+            }
             scan_static_rules_dir(
                 &agent_id,
                 &app_rules,
-                "app",
+                if index == 0 { "app" } else { "user" },
                 &configs,
                 &mut seen_static_names,
                 &mut items,
@@ -4247,11 +4402,13 @@ pub async fn read_rule(
             .map_err(Into::into);
     }
     if let Some(app_dir) = app_agent_dir.0.as_ref() {
-        let app_path = app_dir.join(&agent_id).join("rule").join(&file_name);
-        if app_path.is_file() {
-            return std::fs::read_to_string(&app_path)
-                .map_err(|e| format!("Failed to read rule: {}", e))
-                .map_err(Into::into);
+        for layer_dir in app_agent_layer_dirs(app_dir, &agent_id).into_iter().rev() {
+            let app_path = layer_dir.join("rule").join(&file_name);
+            if app_path.is_file() {
+                return std::fs::read_to_string(&app_path)
+                    .map_err(|e| format!("Failed to read rule: {}", e))
+                    .map_err(Into::into);
+            }
         }
     }
     Err(format!("Rule file not found: {}", file_name).into())
@@ -4357,6 +4514,52 @@ mod tests {
     use super::*;
     use crate::knowledge_store::KnowledgeInjectMode;
     use tempfile::TempDir;
+
+    #[test]
+    fn agent_injection_config_layers_apply_user_defaults_and_workspace_overrides() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bundled_root = root.path().join("agent");
+        let bundled_agent = bundled_root.join("dev");
+        let user_agent = crate::agent::definition::user_agent_dir(&bundled_root).join("dev");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&bundled_agent).expect("bundled Agent dir");
+        std::fs::create_dir_all(&user_agent).expect("user Agent dir");
+        std::fs::write(
+            bundled_agent.join("injection_config.json"),
+            r#"{"env":{"enabled":false},"knowledge_context":{"enabled":true}}"#,
+        )
+        .expect("bundled injection config");
+        std::fs::write(
+            user_agent.join("injection_config.json"),
+            r#"{"knowledge_context":{"enabled":false}}"#,
+        )
+        .expect("user injection config");
+
+        let mut workspace_config = AgentInjectionConfig::new();
+        workspace_config.insert("env".to_string(), InjectionConfig { enabled: true });
+        save_workspace_injection_config(
+            workspace.to_string_lossy().as_ref(),
+            "dev",
+            &workspace_config,
+        )
+        .expect("workspace injection config");
+
+        let layers = load_agent_injection_config_layers(
+            &Some(bundled_root),
+            workspace.to_string_lossy().as_ref(),
+            "dev",
+        );
+        let env = layers.state("env");
+        assert!(env.enabled);
+        assert!(!env.default_enabled);
+        assert_eq!(env.workspace_override, Some(true));
+
+        let knowledge = layers.state("knowledge_context");
+        assert!(!knowledge.enabled);
+        assert!(!knowledge.default_enabled);
+        assert_eq!(knowledge.workspace_override, None);
+        assert!(layers.state("extra_workdirs").enabled);
+    }
 
     fn sample_parent_config() -> KnowledgeDirectoryConfig {
         KnowledgeDirectoryConfig {

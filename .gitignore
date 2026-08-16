@@ -120,6 +120,7 @@ locus_unity/Editor/Roslyn/Locus.Roslyn.dll
 # Workspace-only directories
 plans/
 experiments/
+user-agents/
 ref
 AGENTS.md
 testproject/

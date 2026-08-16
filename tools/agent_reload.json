@@ -1,0 +1,9 @@
+{
+  "description": "Refresh the Locus Agent index after creating or editing Agent files. Returns the writable user Agent root in the Locus installation directory and the newly loaded Agent list. Call once before editing to resolve the root, then again after edits to validate discovery.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {},
+    "required": []
+  }
+}

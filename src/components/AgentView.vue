@@ -4,7 +4,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { Plus, Trash2 } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, setAgentToolEnabled, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
+import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentInjectionEnabled, setAgentToolDirectLoad, setAgentToolEnabled, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
@@ -18,11 +18,13 @@ import { normalizeAppError } from "../services/errors";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import { parseAgentToolDefinition } from "./agent/toolSchema";
 import { buildAgentPromptDashboard, type AgentPromptHealthLevel, type AgentPromptPartKey } from "./agent/agentPromptDashboard";
+import { useModelStore } from "../stores/model";
 
 const props = defineProps<{
   workingDir: string;
   agentList: AgentInfo[];
 }>();
+const modelStore = useModelStore();
 
 const selectedAgentId = ref<string>("");
 const allAgents = ref<AgentInfo[]>([]);
@@ -105,6 +107,8 @@ const toolLoadSaving = ref(false);
 const toolLoadConfigError = ref("");
 const toolEnabledSavingId = ref<string | null>(null);
 const toolEnabledError = ref("");
+const injectionSavingId = ref<string | null>(null);
+const injectionError = ref("");
 const availableToolItems = computed(() =>
   injectedItems.value.filter((item) => item.kind === "tools"),
 );
@@ -126,8 +130,11 @@ const skillToolItems = computed(() =>
 const injectedRuleItems = computed(() =>
   injectedItems.value.filter((item) => item.kind === "rule"),
 );
+const envInjectionItem = computed(() =>
+  injectedItems.value.find((item) => item.id === "env") ?? null,
+);
 const injectedContextItems = computed(() =>
-  injectedItems.value.filter((item) => item.kind === "context"),
+  injectedItems.value.filter((item) => item.kind === "context" && item.id !== "env"),
 );
 const ruleSectionEntryCount = computed(() =>
   ruleItems.value.length + injectedRuleItems.value.length,
@@ -205,6 +212,7 @@ let resizeStartX = 0;
 let resizeStartWidth = 0;
 let releaseSelectionLock: (() => void) | null = null;
 let pluginsChangedUnlisten: UnlistenFn | null = null;
+let agentsChangedUnlisten: UnlistenFn | null = null;
 let agentViewUnmounted = false;
 
 function selectedRule(): RuleItem | null {
@@ -291,6 +299,16 @@ function toolItemEnabled(item: InjectedPromptItem): boolean {
 
 function canToggleToolEnabled(item: InjectedPromptItem): boolean {
   return toolMetaBoolean(item.meta, "canToggleEnabled") === true;
+}
+
+function injectionItemEnabled(item: InjectedPromptItem | null | undefined): boolean {
+  return toolMetaBoolean(item?.meta, "enabled") !== false;
+}
+
+function canToggleInjectionItem(item: InjectedPromptItem | null | undefined): boolean {
+  return !!item
+    && item.kind !== "tools"
+    && toolMetaBoolean(item.meta, "canToggleEnabled") === true;
 }
 
 const selectedToolLoadConfigSummary = computed(() => {
@@ -469,16 +487,12 @@ function injectedItemMeta(kind: InjectedPromptItem["kind"]): string {
   return t("agent.injectedContext");
 }
 
-function injectedItemIcon(kind: InjectedPromptItem["kind"]): string {
-  if (kind === "rule") return "◎";
-  if (kind === "tools") return "◈";
-  return "◌";
-}
-
 function sourceBadgeLabel(source: string | null | undefined): string {
   if (source === "app") return t("common.builtIn");
   if (source === "project") return t("common.project");
   if (source === "both") return t("common.builtInAndProject");
+  if (source === "user") return t("agent.source.user");
+  if (source === "appUser") return t("agent.source.appUser");
   if (source === "pluginApp" || source?.startsWith("pluginApp:")) {
     return t("agent.source.pluginApp");
   }
@@ -492,6 +506,8 @@ function sourceBadgeClass(source: string | null | undefined): string {
   if (source === "app") return "source-app";
   if (source === "project") return "source-project";
   if (source === "both") return "source-both";
+  if (source === "user") return "source-project";
+  if (source === "appUser") return "source-both";
   if (source === "pluginApp" || source?.startsWith("pluginApp:")) return "source-plugin";
   if (source === "pluginProject" || source?.startsWith("pluginProject:")) return "source-plugin";
   return "";
@@ -510,6 +526,7 @@ function resetAgentDetailState() {
   envRenderedLoading.value = false;
   envRenderedRequestId += 1;
   injectedItems.value = [];
+  injectionError.value = "";
   promptStats.value = null;
   promptStatsError.value = "";
   promptStatsLoading.value = false;
@@ -568,6 +585,7 @@ function selectPrompt() {
 
 function selectEnv() {
   selected.value = { type: "env" };
+  injectionError.value = "";
   closeRuleContextMenu();
   ruleEditing.value = false;
   ruleCreating.value = false;
@@ -666,7 +684,11 @@ async function loadInjectedItems() {
   if (!selectedAgentId.value) return;
   injectedLoading.value = true;
   try {
-    const items = await listAgentInjectedItems(selectedAgentId.value);
+    const items = await listAgentInjectedItems(
+      selectedAgentId.value,
+      null,
+      modelStore.selectedModelId,
+    );
     injectedItems.value = items;
     if (selected.value?.type === "injected") {
       const selectedId = selected.value.item.id;
@@ -689,6 +711,7 @@ function selectInjectedItem(item: InjectedPromptItem) {
   selected.value = { type: "injected", item };
   toolLoadConfigError.value = "";
   toolEnabledError.value = "";
+  injectionError.value = "";
   closeRuleContextMenu();
   ruleEditing.value = false;
   ruleCreating.value = false;
@@ -741,6 +764,35 @@ async function setSelectedToolEnabledState(enabled: boolean) {
   const item = selectedInjectedItem();
   if (!item) return;
   await setToolEnabledState(item, enabled);
+}
+
+async function setInjectionEnabledState(item: InjectedPromptItem, enabled: boolean) {
+  if (!selectedAgentId.value || !canToggleInjectionItem(item) || injectionSavingId.value) return;
+
+  injectionSavingId.value = item.id;
+  injectionError.value = "";
+  const record = toolMetaRecord(item.meta);
+  const previous = record?.enabled;
+  if (record) record.enabled = enabled;
+  try {
+    await setAgentInjectionEnabled(selectedAgentId.value, item.id, enabled);
+    envRenderedContent.value = "";
+    await loadInjectedItems();
+    void loadPromptStats();
+    if (envPreviewMode.value === "rendered") void loadRenderedEnvPrompt();
+  } catch (e) {
+    console.error("set_agent_injection_enabled failed:", e);
+    if (record) record.enabled = previous;
+    injectionError.value = t("agent.injection.saveFailed", normalizeAppError(e).message);
+  } finally {
+    injectionSavingId.value = null;
+  }
+}
+
+async function setSelectedInjectionEnabledState(enabled: boolean) {
+  const item = selectedInjectedItem();
+  if (!item) return;
+  await setInjectionEnabledState(item, enabled);
 }
 
 async function selectRuleItem(rule: RuleItem) {
@@ -996,6 +1048,17 @@ onMounted(async () => {
   } else {
     pluginsChangedUnlisten = releasePluginsChanged;
   }
+  const releaseAgentsChanged = await listen<void>("agents-changed", async () => {
+    await loadAllAgents();
+    if (selectedAgentId.value) {
+      refreshAll();
+    }
+  });
+  if (agentViewUnmounted) {
+    releaseAgentsChanged();
+  } else {
+    agentsChangedUnlisten = releaseAgentsChanged;
+  }
 });
 
 onUnmounted(() => {
@@ -1007,6 +1070,8 @@ onUnmounted(() => {
   releaseSelectionLock = null;
   pluginsChangedUnlisten?.();
   pluginsChangedUnlisten = null;
+  agentsChangedUnlisten?.();
+  agentsChangedUnlisten = null;
 });
 
 watch(
@@ -1015,6 +1080,13 @@ watch(
     loadAllAgents().then(() => {
       if (selectedAgentId.value) loadAgentData();
     });
+  },
+);
+
+watch(
+  () => modelStore.selectedModelId,
+  () => {
+    if (selectedAgentId.value) void loadInjectedItems();
   },
 );
 </script>
@@ -1117,12 +1189,23 @@ watch(
                 :key="item.id"
                 type="button"
                 class="kb-item injected-item rule-injected-item"
-                :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+                :class="{
+                  selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id,
+                  'injection-disabled': !injectionItemEnabled(item),
+                }"
                 @click="selectInjectedItem(item)"
               >
-                <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-                <span class="item-title">{{ item.title }}</span>
+                <label class="rule-toggle-label" @click.stop>
+                  <BaseCheckbox
+                    :model-value="injectionItemEnabled(item)"
+                    :disabled="!canToggleInjectionItem(item) || injectionSavingId === item.id"
+                    :aria-label="injectionItemEnabled(item) ? t('common.enabled') : t('common.disabled')"
+                    @update:model-value="setInjectionEnabledState(item, $event)"
+                  />
+                </label>
+                <span class="item-title" :class="{ 'rule-title-disabled': !injectionItemEnabled(item) }">{{ item.title }}</span>
                 <span class="injected-kind-badge">{{ injectedItemBadge(item.kind) }}</span>
+                <span v-if="!injectionItemEnabled(item)" class="rule-off-badge">OFF</span>
               </button>
               <div v-if="ruleCreating" class="kb-item inline-create-row">
                 <input
@@ -1152,12 +1235,24 @@ watch(
               <button
                 type="button"
                 class="kb-item injected-item"
-                :class="{ selected: selected?.type === 'env' }"
+                :class="{
+                  selected: selected?.type === 'env',
+                  'injection-disabled': envInjectionItem && !injectionItemEnabled(envInjectionItem),
+                }"
                 @click="selectEnv"
               >
-                <span class="prompt-icon injected-icon">&#9881;</span>
-                <span class="item-title">{{ t("agent.envTemplate") }}</span>
+                <label v-if="envInjectionItem" class="rule-toggle-label" @click.stop>
+                  <BaseCheckbox
+                    :model-value="injectionItemEnabled(envInjectionItem)"
+                    :disabled="!canToggleInjectionItem(envInjectionItem) || injectionSavingId === envInjectionItem.id"
+                    :aria-label="injectionItemEnabled(envInjectionItem) ? t('common.enabled') : t('common.disabled')"
+                    @update:model-value="setInjectionEnabledState(envInjectionItem, $event)"
+                  />
+                </label>
+                <span v-else class="prompt-icon injected-icon">&#9881;</span>
+                <span class="item-title" :class="{ 'rule-title-disabled': envInjectionItem && !injectionItemEnabled(envInjectionItem) }">{{ t("agent.envTemplate") }}</span>
                 <span class="injected-kind-badge">{{ t("agent.injected.context") }}</span>
+                <span v-if="envInjectionItem && !injectionItemEnabled(envInjectionItem)" class="rule-off-badge">OFF</span>
               </button>
               <div v-if="injectedLoading && injectedContextItems.length === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
               <button
@@ -1165,12 +1260,23 @@ watch(
                 :key="item.id"
                 type="button"
                 class="kb-item injected-item"
-                :class="{ selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id }"
+                :class="{
+                  selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id,
+                  'injection-disabled': !injectionItemEnabled(item),
+                }"
                 @click="selectInjectedItem(item)"
               >
-                <span class="prompt-icon injected-icon">{{ injectedItemIcon(item.kind) }}</span>
-                <span class="item-title">{{ item.title }}</span>
+                <label class="rule-toggle-label" @click.stop>
+                  <BaseCheckbox
+                    :model-value="injectionItemEnabled(item)"
+                    :disabled="!canToggleInjectionItem(item) || injectionSavingId === item.id"
+                    :aria-label="injectionItemEnabled(item) ? t('common.enabled') : t('common.disabled')"
+                    @update:model-value="setInjectionEnabledState(item, $event)"
+                  />
+                </label>
+                <span class="item-title" :class="{ 'rule-title-disabled': !injectionItemEnabled(item) }">{{ item.title }}</span>
                 <span class="injected-kind-badge">{{ injectedItemBadge(item.kind) }}</span>
+                <span v-if="!injectionItemEnabled(item)" class="rule-off-badge">OFF</span>
               </button>
             </template>
           </div>
@@ -1251,6 +1357,18 @@ watch(
             @update:model-value="setEnvPreviewMode"
           />
         </div>
+        <div v-if="envInjectionItem" class="rule-action-bar">
+          <label class="skill-toggle">
+            <BaseCheckbox
+              :model-value="injectionItemEnabled(envInjectionItem)"
+              :disabled="!canToggleInjectionItem(envInjectionItem) || injectionSavingId !== null"
+              :aria-label="injectionItemEnabled(envInjectionItem) ? t('common.enabled') : t('common.disabled')"
+              @update:model-value="setInjectionEnabledState(envInjectionItem, $event)"
+            />
+            <span>{{ injectionItemEnabled(envInjectionItem) ? t("common.enabled") : t("common.disabled") }}</span>
+          </label>
+          <span v-if="injectionError" class="tool-config-error">{{ injectionError }}</span>
+        </div>
         <div class="preview-body env-template-body" :class="{ 'is-loading': envPreviewLoading }">
           <div v-if="envPreviewLoading && !envPreviewContent" class="preview-loading">{{ t("common.loading") }}</div>
           <pre v-show="!envPreviewLoading || envPreviewContent" class="env-template-pre" v-html="highlightedEnv(envPreviewContent)"></pre>
@@ -1316,6 +1434,18 @@ watch(
           <span class="source-badge source-runtime">{{ selectedInjectedItem()?.source === "builtIn" ? t("common.builtIn") : t("agent.runtime") }}</span>
           <span class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
           <button class="preview-close" :aria-label="t('agent.closePreview')" @click="selected = null" :title="t('common.close')">&times;</button>
+        </div>
+        <div v-if="selectedInjectedItem()?.kind !== 'tools'" class="rule-action-bar">
+          <label class="skill-toggle">
+            <BaseCheckbox
+              :model-value="injectionItemEnabled(selectedInjectedItem())"
+              :disabled="!canToggleInjectionItem(selectedInjectedItem()) || injectionSavingId !== null"
+              :aria-label="injectionItemEnabled(selectedInjectedItem()) ? t('common.enabled') : t('common.disabled')"
+              @update:model-value="setSelectedInjectionEnabledState"
+            />
+            <span>{{ injectionItemEnabled(selectedInjectedItem()) ? t("common.enabled") : t("common.disabled") }}</span>
+          </label>
+          <span v-if="injectionError" class="tool-config-error">{{ injectionError }}</span>
         </div>
         <div class="preview-body" :class="{ 'is-loading': injectedLoading }">
           <div v-if="injectedLoading && !selectedInjectedItem()?.content" class="preview-loading">{{ t("common.loading") }}</div>
@@ -2537,6 +2667,10 @@ watch(
 .injected-item {
   gap: 8px;
   cursor: pointer;
+}
+
+.injected-item.injection-disabled {
+  opacity: 0.6;
 }
 
 .injected-icon {
