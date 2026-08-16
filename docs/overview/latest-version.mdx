@@ -36,6 +36,7 @@ changelogUrl: "/overview/latest-version"
 
 - **Web 搜索异常续轮。** 修复 Codex 托管 `web_search` 结果被重复回放为本地工具调用、进而触发异常重复续轮的问题。
 - **Windows 句柄泄漏。** 更新到包含上游修复的 Tauri/Wry 运行时，避免窗口边框 DPI 查询持续泄漏 Windows 设备上下文句柄。
+- **Windows Rust 测试启动。** 为 Rust 单元测试二进制嵌入 Common Controls v6 清单，修复加载 `TaskDialogIndirect` 时触发 `STATUS_ENTRYPOINT_NOT_FOUND` 的问题。
 - **子进程生命周期。** Shell、Skill、开发服务器及其他子进程按会话、工作区和应用生命周期统一管理；取消会话、切换工作区或退出应用时会终止对应进程树。
 - **只读附加目录。** 文件写入、Shell 工作目录和命令路径统一遵守附加工作目录的只读约束。
 - **消息界面布局稳定性。** 增强消息界面的布局稳定性，修复了大部分会话流式渲染造成的闪烁问题，覆盖 Markdown 高度对账、流结束滚动、工具状态收敛与展开状态保留。

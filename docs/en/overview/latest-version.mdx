@@ -36,6 +36,7 @@ changelogUrl: "/en/overview/latest-version"
 
 - **Abnormal web-search continuation.** Fixed Codex hosted `web_search` results being replayed as local tool calls, which could trigger duplicate follow-up turns.
 - **Windows handle leak.** Updated to the upstream-fixed Tauri/Wry runtime so window-border DPI queries no longer leak Windows device-context handles.
+- **Windows Rust test startup.** Embedded the Common Controls v6 manifest in Rust unit-test binaries, preventing `STATUS_ENTRYPOINT_NOT_FOUND` while loading `TaskDialogIndirect`.
 - **Child-process lifecycle.** Shell, Skill, development-server, and other child process trees are tracked by session, workspace, and application lifecycle and terminate with the owning operation.
 - **Read-only additional directories.** File writes, Shell working directories, and command path targets now consistently enforce read-only additional-workspace constraints.
 - **Message layout stability.** Improved message layout stability and fixed most flicker caused by streaming chat rendering, covering Markdown height reconciliation, stream-end scrolling, tool state settlement, and expansion-state retention.
