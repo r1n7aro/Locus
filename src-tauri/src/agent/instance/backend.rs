@@ -418,6 +418,32 @@ mod tests {
     }
 
     #[test]
+    fn mock_tool_plan_can_reproduce_an_orphaned_stream_start() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "todowrite" }
+        })];
+        let messages = vec![message(
+            "user-orphan",
+            MessageRole::User,
+            "[[mock:orphan-tool-start]] reproduce the handoff",
+        )];
+        let plan = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert_eq!(
+            plan.provisional_tool_call,
+            Some((
+                "mock-orphan-user-orphan-initial".to_string(),
+                "edit".to_string(),
+            ))
+        );
+        assert!(plan.tool_starts_after_text);
+        assert!(!plan.text.is_empty());
+        assert_eq!(plan.tool_calls.len(), 1);
+        assert_ne!(plan.tool_calls[0].id, "mock-orphan-user-orphan-initial");
+    }
+
+    #[test]
     fn mock_error_plan_returns_a_deterministic_failure() {
         let plan = build_mock_response_plan(MockModelProfile::Error, &[], &[]);
         assert_eq!(plan.error.as_deref(), Some("Simulated model backend error"));
@@ -623,8 +649,12 @@ struct MockResponsePlan {
     text: String,
     thinking: String,
     tool_calls: Vec<ToolCallInfo>,
+    provisional_tool_call: Option<(String, String)>,
+    tool_starts_after_text: bool,
     error: Option<String>,
 }
+
+const MOCK_ORPHAN_TOOL_START_SCENARIO: &str = "[[mock:orphan-tool-start]]";
 
 fn api_tool_name(tool: &serde_json::Value) -> Option<&str> {
     tool.get("function")
@@ -683,17 +713,38 @@ fn build_mock_response_plan(
         && messages[latest_user_index.saturating_add(1)..]
             .iter()
             .any(|message| message.role == crate::session::models::MessageRole::Tool);
+    let simulate_orphan_tool_start = user_text.contains(MOCK_ORPHAN_TOOL_START_SCENARIO);
+    let provisional_tool_call = simulate_orphan_tool_start.then(|| {
+        (
+            format!(
+                "mock-orphan-{}-{}",
+                latest_user
+                    .map(|message| message.id.as_str())
+                    .unwrap_or("turn"),
+                if has_tool_result {
+                    "follow-up"
+                } else {
+                    "initial"
+                },
+            ),
+            "edit".to_string(),
+        )
+    });
     match profile {
         MockModelProfile::Stream => MockResponsePlan {
             text: mock_response_text(user_text, false),
             thinking: "Synthesizing a deterministic local response.".to_string(),
             tool_calls: Vec::new(),
+            provisional_tool_call,
+            tool_starts_after_text: simulate_orphan_tool_start,
             error: None,
         },
         MockModelProfile::Tool if has_tool_result => MockResponsePlan {
             text: mock_response_text(user_text, true),
             thinking: "Inspecting the simulated tool result.".to_string(),
             tool_calls: Vec::new(),
+            provisional_tool_call,
+            tool_starts_after_text: simulate_orphan_tool_start,
             error: None,
         },
         MockModelProfile::Tool => {
@@ -742,12 +793,18 @@ fn build_mock_response_plan(
                 None
             };
             MockResponsePlan {
-                text: tool_call
-                    .is_none()
-                    .then(|| "No compatible local tool is exposed for this agent.".to_string())
-                    .unwrap_or_default(),
+                text: if simulate_orphan_tool_start {
+                    mock_response_text(user_text, false)
+                } else {
+                    tool_call
+                        .is_none()
+                        .then(|| "No compatible local tool is exposed for this agent.".to_string())
+                        .unwrap_or_default()
+                },
                 thinking: "Preparing a deterministic local tool call.".to_string(),
                 tool_calls: tool_call.into_iter().collect(),
+                provisional_tool_call,
+                tool_starts_after_text: simulate_orphan_tool_start,
                 error: None,
             }
         }
@@ -755,6 +812,8 @@ fn build_mock_response_plan(
             text: String::new(),
             thinking: String::new(),
             tool_calls: Vec::new(),
+            provisional_tool_call,
+            tool_starts_after_text: simulate_orphan_tool_start,
             error: Some("Simulated model backend error".to_string()),
         },
     }
@@ -805,13 +864,25 @@ pub(super) async fn stream_mock_response(
         tokio::time::sleep(std::time::Duration::from_millis(THINKING_DELAY_MS)).await;
     }
 
-    for tool_call in &plan.tool_calls {
-        on_tool_call_start(tool_call.id.clone(), tool_call.name.clone());
+    if let Some((id, name)) = &plan.provisional_tool_call {
+        on_tool_call_start(id.clone(), name.clone());
+    }
+
+    if !plan.tool_starts_after_text {
+        for tool_call in &plan.tool_calls {
+            on_tool_call_start(tool_call.id.clone(), tool_call.name.clone());
+        }
     }
 
     for chunk in mock_text_chunks(&plan.text, 10) {
         on_text_delta(chunk);
         tokio::time::sleep(std::time::Duration::from_millis(TEXT_CHUNK_DELAY_MS)).await;
+    }
+
+    if plan.tool_starts_after_text {
+        for tool_call in &plan.tool_calls {
+            on_tool_call_start(tool_call.id.clone(), tool_call.name.clone());
+        }
     }
 
     let input_text = messages

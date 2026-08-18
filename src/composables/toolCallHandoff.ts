@@ -37,3 +37,29 @@ export function settleToolCallDisplaysForHandoff(
       : undefined,
   }));
 }
+
+/**
+ * A provider's provisional start contains only an id and name. If that start
+ * is absent from the completed response it never receives arguments, output,
+ * progress, or nested calls. Keep only materialized calls when promoting a
+ * closed round into its completed handoff presentation.
+ */
+export function retainMaterializedToolCallDisplays(
+  toolCalls: readonly ToolCallDisplay[],
+): ToolCallDisplay[] {
+  return toolCalls.flatMap((toolCall) => {
+    const nestedToolCalls = toolCall.nestedToolCalls
+      ? retainMaterializedToolCallDisplays(toolCall.nestedToolCalls)
+      : undefined;
+    const hasPayload = toolCall.arguments.trim().length > 0
+      || toolCall.output !== undefined
+      || !!toolCall.images?.length
+      || toolCall.progress != null
+      || !!nestedToolCalls?.length;
+    if (!hasPayload) return [];
+    return [{
+      ...toolCall,
+      nestedToolCalls,
+    }];
+  });
+}

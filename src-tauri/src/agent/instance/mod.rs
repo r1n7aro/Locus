@@ -2160,17 +2160,6 @@ fn set_prompt_tree_visibility_limit(
     set_prompt_tree_visibility_limit(child, &parts[1..], max_visible_files);
 }
 
-fn prompt_tree_node_mut<'a>(
-    node: &'a mut PromptTreeNode,
-    parts: &[String],
-) -> &'a mut PromptTreeNode {
-    if parts.is_empty() {
-        return node;
-    }
-    let child = node.dirs.entry(parts[0].clone()).or_default();
-    prompt_tree_node_mut(child, &parts[1..])
-}
-
 fn sort_prompt_tree(node: &mut PromptTreeNode) {
     node.notes.sort();
     node.files
@@ -2368,16 +2357,37 @@ struct PromptPhysicalRoot {
     label_suffix: Option<String>,
     desc: Option<String>,
     managed_library: Option<(String, String, String)>,
+    app_skill_packages: BTreeMap<String, PromptAppSkillPackage>,
+}
+
+struct PromptAppSkillPackage {
+    relative_root: String,
+    desc: Option<String>,
 }
 
 fn prompt_source_group_root(
     source: &crate::knowledge_source_registry::KnowledgeSource,
 ) -> std::path::PathBuf {
     match source.kind {
-        crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-        | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge => source
+        crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge => source
             .physical_root
             .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| source.physical_root.clone()),
+        // App knowledge is stored below `<app>/knowledge/<type>`, while
+        // Locus-created package Skills live below `<app>/skills/<package>`.
+        // Group both at the real app directory so every descendant rendered
+        // in the tree stays relative to its displayed physical root.
+        crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge => source
+            .physical_root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| source.physical_root.clone()),
+        crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage => source
+            .physical_root
+            .parent()
+            .and_then(std::path::Path::parent)
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| source.physical_root.clone()),
         _ => source.physical_root.clone(),
@@ -2409,7 +2419,7 @@ fn ensure_prompt_physical_root<'a>(
 ) -> &'a mut PromptPhysicalRoot {
     let physical_root = prompt_source_group_root(source);
     let key = prompt_physical_root_key(&physical_root);
-    roots.entry(key).or_insert_with(|| PromptPhysicalRoot {
+    let root = roots.entry(key).or_insert_with(|| PromptPhysicalRoot {
         display_root: registry.display_path(&physical_root),
         physical_root,
         storage_source: source.storage_source,
@@ -2418,14 +2428,26 @@ fn ensure_prompt_physical_root<'a>(
         directories: Vec::new(),
         label_suffix: matches!(
             source.kind,
-            crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
-                | crate::knowledge_source_registry::KnowledgeSourceKind::PluginSkillPackage
+            crate::knowledge_source_registry::KnowledgeSourceKind::PluginSkillPackage
                 | crate::knowledge_source_registry::KnowledgeSourceKind::ExternalSkill
         )
         .then(|| "[package]".to_string()),
         desc: None,
         managed_library: None,
-    })
+        app_skill_packages: BTreeMap::new(),
+    });
+    if source.kind == crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage {
+        root.app_skill_packages
+            .entry(source.source_id.clone())
+            .or_insert_with(|| PromptAppSkillPackage {
+                relative_root: prompt_relative_physical_path(
+                    &source.physical_root,
+                    &root.physical_root,
+                ),
+                desc: None,
+            });
+    }
+    root
 }
 
 fn add_prompt_items_to_physical_roots(
@@ -2447,11 +2469,25 @@ fn add_prompt_items_to_physical_roots(
         let root = ensure_prompt_physical_root(roots, registry, source);
         root.source_ids.insert(source.source_id.clone());
         item.path = prompt_relative_physical_path(&resolved.physical_path, &root.physical_root);
-        let is_package_root = root.label_suffix.is_some()
-            && item.path.eq_ignore_ascii_case("SKILL.md")
-            && prompt_item_is_structure_injected(&item);
+        let is_package_root =
+            matches!(
+                source.kind,
+                crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
+                    | crate::knowledge_source_registry::KnowledgeSourceKind::PluginSkillPackage
+                    | crate::knowledge_source_registry::KnowledgeSourceKind::ExternalSkill
+            ) && prompt_relative_physical_path(&resolved.physical_path, &source.physical_root)
+                .eq_ignore_ascii_case("SKILL.md")
+                && prompt_item_is_structure_injected(&item);
         if is_package_root {
-            root.desc = Some(prompt_file_desc(&item));
+            let desc = Some(prompt_file_desc(&item));
+            if source.kind == crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
+            {
+                if let Some(package) = root.app_skill_packages.get_mut(&source.source_id) {
+                    package.desc = desc;
+                }
+            } else {
+                root.desc = desc;
+            }
         } else {
             root.items.push(item);
         }
@@ -2513,6 +2549,15 @@ fn build_prompt_physical_root_tree(
         insert_prompt_tree_directory(&mut tree, &parts, Some(desc), None);
         insert_prompt_tree_note(&mut tree, &parts, note);
     }
+    for package in root.app_skill_packages.values() {
+        let parts = prompt_path_parts(&package.relative_root);
+        insert_prompt_tree_directory(
+            &mut tree,
+            &parts,
+            package.desc.as_deref(),
+            Some("[package]"),
+        );
+    }
     for source in registry
         .sources()
         .iter()
@@ -2570,43 +2615,12 @@ fn prompt_physical_root_label(root: &PromptPhysicalRoot) -> String {
     label
 }
 
-fn prompt_physical_root_is_package(root: &PromptPhysicalRoot) -> bool {
-    root.label_suffix.as_deref() == Some("[package]")
-}
-
 fn render_prompt_physical_root(
     root: &PromptPhysicalRoot,
-    packages: &[&PromptPhysicalRoot],
     registry: &crate::knowledge_source_registry::KnowledgeSourceRegistry,
     access_mode: KnowledgeAccessMode,
 ) -> Vec<String> {
-    let mut tree = build_prompt_physical_root_tree(root, registry, access_mode);
-    if !packages.is_empty() {
-        if let Some(skill_source) = registry.sources().iter().find(|source| {
-            root.source_ids.contains(&source.source_id)
-                && source.doc_type == crate::knowledge_store::KnowledgeType::Skill
-                && matches!(
-                    source.kind,
-                    crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-                        | crate::knowledge_source_registry::KnowledgeSourceKind::AppKnowledge
-                )
-        }) {
-            let relative_root =
-                prompt_relative_physical_path(&skill_source.physical_root, &root.physical_root);
-            let skill_parts = prompt_path_parts(&relative_root);
-            let skill_node = prompt_tree_node_mut(&mut tree, &skill_parts);
-            for package in packages {
-                let mut package_tree =
-                    build_prompt_physical_root_tree(package, registry, access_mode);
-                package_tree.label_suffix = package.label_suffix.clone();
-                package_tree.desc = package.desc.clone();
-                skill_node.dirs.insert(
-                    package.display_root.trim_end_matches('/').to_string(),
-                    package_tree,
-                );
-            }
-        }
-    }
+    let tree = build_prompt_physical_root_tree(root, registry, access_mode);
 
     let label = prompt_physical_root_label(root);
     let mut lines = vec![label];
@@ -2750,19 +2764,10 @@ fn build_structure_section(
     }
 
     let render_roots = |storage_source| {
-        let scoped_roots = physical_roots
+        physical_roots
             .values()
             .filter(|root| root.storage_source == storage_source)
-            .collect::<Vec<_>>();
-        let packages = scoped_roots
-            .iter()
-            .copied()
-            .filter(|root| prompt_physical_root_is_package(root))
-            .collect::<Vec<_>>();
-        scoped_roots
-            .into_iter()
-            .filter(|root| !prompt_physical_root_is_package(root))
-            .map(|root| render_prompt_physical_root(root, &packages, &registry, access_mode))
+            .map(|root| render_prompt_physical_root(root, &registry, access_mode))
             .collect::<Vec<_>>()
     };
     let project_roots = render_roots(crate::knowledge_store::KnowledgeStorageSource::Project);
@@ -4669,7 +4674,7 @@ impl AgentInstance {
                 if let Some(limits) = crate::llm::codex_models::resolve_context_limits(
                     cache_dir.as_deref(),
                     &self.effective_model,
-                    config.extended_context,
+                    config.resolved_context_window(),
                 ) {
                     return RuntimeContextLimits {
                         effective_context_window: limits.effective_context_window,
@@ -5238,6 +5243,7 @@ impl AgentInstance {
         prompt_messages: &[ChatMessage],
         session_messages: &[ChatMessage],
         session_title: String,
+        cache_invalidations: Vec<crate::commands::SessionCacheInvalidation>,
         usage: crate::commands::TokenUsage,
     ) -> crate::commands::SessionContextUsageReport {
         let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
@@ -5339,6 +5345,7 @@ impl AgentInstance {
             reported_context_tokens: usage.context_tokens,
             breakdown,
             tools,
+            cache_invalidations,
             usage,
         }
     }
@@ -7631,54 +7638,40 @@ impl AgentInstance {
             return "No results.".to_string();
         }
 
+        if include_summary {
+            return items
+                .iter()
+                .map(|item| {
+                    let summary = item
+                        .summary
+                        .as_deref()
+                        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "empty".to_string());
+                    format!("{} :: {}", item.path, summary)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+
         let mut output = String::new();
         for (index, item) in items.iter().enumerate() {
             if index > 0 {
-                output.push_str("\n\n");
+                output.push('\n');
             }
 
-            output.push_str("path: ");
+            output.push_str("--- ");
             output.push_str(&item.path);
-            output.push('\n');
-            output.push_str("lines: ");
+            output.push_str(" | lines ");
             output.push_str(&format!("{}-{}", item.start_line, item.end_line));
-            output.push('\n');
-            if include_summary {
-                output.push_str("summary:");
-                match item
-                    .summary
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    Some(summary) => {
-                        for line in summary.lines() {
-                            output.push('\n');
-                            output.push_str("  ");
-                            output.push_str(line.trim_end());
-                        }
-                    }
-                    None => output.push_str(" empty"),
-                }
-                output.push('\n');
-            } else {
-                output.push_str("summary_start_line: ");
-                match item.summary_start_line {
-                    Some(line) => output.push_str(&line.to_string()),
-                    None => output.push_str("empty"),
-                }
-                output.push('\n');
-                output.push_str("body_start_line: ");
-                output.push_str(&item.body_start_line.to_string());
-                output.push('\n');
+            output.push_str(" | summary ");
+            match item.summary_start_line {
+                Some(line) => output.push_str(&line.to_string()),
+                None => output.push_str("empty"),
             }
-            output.push_str("match: ");
-            output.push_str(item.match_kind.trim());
-            output.push_str(&format!(" | score={:.3}", item.score));
-            if !item.matched_terms.is_empty() {
-                output.push_str(" | terms=");
-                output.push_str(&item.matched_terms.join(", "));
-            }
+            output.push_str(" | body ");
+            output.push_str(&item.body_start_line.to_string());
+            output.push_str(" ---");
 
             let context = include_hit_context
                 .then(|| {
@@ -7690,12 +7683,14 @@ impl AgentInstance {
                 })
                 .unwrap_or_default();
             if !context.is_empty() {
-                output.push_str("\ncontext:");
-                for line in context.lines() {
-                    output.push('\n');
-                    output.push_str("  ");
-                    output.push_str(line.trim_end());
-                }
+                output.push('\n');
+                output.push_str(
+                    &context
+                        .lines()
+                        .map(str::trim_end)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
             }
         }
 
@@ -8571,6 +8566,9 @@ impl AgentInstance {
                         output_tokens: response.output_tokens,
                         cache_read_tokens: response.cache_read_tokens,
                         cache_write_tokens: response.cache_write_tokens,
+                        cache_invalidated: false,
+                        cache_baseline_tokens: 0,
+                        cache_invalidation_reason: None,
                         total_input_tokens: totals.total_input_tokens,
                         total_output_tokens: totals.total_output_tokens,
                         total_cache_read_tokens: totals.total_cache_read_tokens,
@@ -10688,8 +10686,6 @@ impl AgentInstance {
                 let emitted_output_for_thinking = attempt_emitted_output.clone();
 
                 let sid3 = session_id.clone();
-                let hdl3 = handle.clone();
-                let ptc3 = parent_tc.clone();
                 let rid3 = run_id.clone();
                 let render_order_for_tool = render_order_tracker.clone();
                 let agent_id_for_tool_start = self.id.clone();
@@ -10780,7 +10776,11 @@ impl AgentInstance {
                                 .canonical_name(&tool_name)
                                 .unwrap_or(tool_name);
                             emitted_output_for_tool.store(true, Ordering::Relaxed);
-                            let mark = render_order_for_tool
+                            // Provider callbacks can announce a provisional tool call that is
+                            // later superseded or omitted by the completed response. Reserve its
+                            // render order here, then publish ToolCallStart only from the
+                            // authoritative response below, where complete arguments are known.
+                            let _mark = render_order_for_tool
                                 .lock()
                                 .map(|mut tracker| tracker.mark_tool(&rid3, &tool_call_id))
                                 .unwrap_or(RenderPartMark {
@@ -10799,28 +10799,6 @@ impl AgentInstance {
                                     llm_call_started_at.elapsed().as_millis(),
                                     tool_call_id,
                                     tool_name
-                                );
-                            }
-                            emit_stream(&hdl3, &rid3, StreamEvent::ToolCallStart {
-                                session_id: sid3.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                tool_name: tool_name.clone(),
-                                arguments: String::new(),
-                                order: Some(mark.seq),
-                                part_id: Some(tool_call_id.clone()),
-                                render_seq: Some(mark.seq),
-                            });
-                            if let Some(ref parent) = ptc3 {
-                                emit_parent_stream(
-                                    &hdl3,
-                                    parent.subagent_tool_call_start(
-                                        tool_call_id,
-                                        tool_name,
-                                        String::new(),
-                                        Some(mark.seq),
-                                        Some(mark.id),
-                                        Some(mark.seq),
-                                    ),
                                 );
                             }
                         },
@@ -11182,7 +11160,7 @@ impl AgentInstance {
                     + response.cache_write_tokens
                     + response.output_tokens;
                 let context_limit = self.context_limit();
-                match store.record_model_usage(
+                match store.record_model_usage_with_cache_check(
                     &self.session_id,
                     &self.effective_model,
                     &usage_provider,
@@ -11197,7 +11175,18 @@ impl AgentInstance {
                     Some(context_tokens),
                     Some(context_limit),
                 ) {
-                    Ok(totals) => {
+                    Ok((totals, cache_check)) => {
+                        let cache_invalidated = cache_check
+                            .as_ref()
+                            .is_some_and(|check| check.invalidated);
+                        let cache_baseline_tokens = cache_check
+                            .as_ref()
+                            .map(|check| check.baseline_tokens)
+                            .unwrap_or(0);
+                        let cache_invalidation_reason = cache_check
+                            .as_ref()
+                            .filter(|check| check.invalidated)
+                            .map(|check| check.reason.clone());
                         eprintln!(
                             "[Agent {}] tokens: +{}in/+{}out/+{}cache_r/+{}cache_w, cost=${:.6}, total: {}in/{}out/{}cache_r/{}cache_w/${:.6}",
                             self.id,
@@ -11214,6 +11203,9 @@ impl AgentInstance {
                             output_tokens: response.output_tokens,
                             cache_read_tokens: response.cache_read_tokens,
                             cache_write_tokens: response.cache_write_tokens,
+                            cache_invalidated,
+                            cache_baseline_tokens,
+                            cache_invalidation_reason,
                             total_input_tokens: totals.total_input_tokens,
                             total_output_tokens: totals.total_output_tokens,
                             total_cache_read_tokens: totals.total_cache_read_tokens,
@@ -18280,6 +18272,19 @@ impl AgentInstance {
             .min(crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_MAX_DEPTH)
     }
 
+    fn unity_property_tree_array_limit(args: &serde_json::Value) -> usize {
+        args.get("max_array_items")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(
+                crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_ARRAY_LIMIT,
+            )
+            .clamp(
+                1,
+                crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS,
+            )
+    }
+
     fn unity_property_tree_output_char_limit(args: &serde_json::Value) -> usize {
         args.get("__round_output_char_limit")
             .and_then(|value| value.as_u64())
@@ -18325,7 +18330,11 @@ impl AgentInstance {
         path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         args: &serde_json::Value,
     ) -> ToolResult {
-        match tree.read(path, Self::unity_property_tree_depth(args)) {
+        match tree.read_with_array_limit(
+            path,
+            Self::unity_property_tree_depth(args),
+            Self::unity_property_tree_array_limit(args),
+        ) {
             Ok(snapshot) => ToolResult {
                 output: Self::apply_unity_property_tree_output_budget(
                     crate::unity_serialized_property::property_tree::format_property_tree(
@@ -18349,6 +18358,10 @@ impl AgentInstance {
         use_cache: bool,
     ) -> Result<Arc<crate::unity_serialized_property::property_tree::YamlPropertyTree>, ToolResult>
     {
+        // A Prefab Variant disk tree depends on both the instance file and its
+        // source Prefab chain. The single-file cache key cannot validate that
+        // dependency, so Prefabs stay uncached and always reflect source edits.
+        let use_cache = use_cache && !path.asset_path.to_ascii_lowercase().ends_with(".prefab");
         if use_cache {
             if let Some(tree) =
                 crate::unity_serialized_property::property_tree::cached_yaml_property_tree(
@@ -18375,26 +18388,62 @@ impl AgentInstance {
         }
 
         let text = String::from_utf8_lossy(&content).into_owned();
-        let docs = crate::unity_yaml::parse_yaml_docs_str(&text);
+        let (docs, raw_refs) = crate::unity_yaml::parse_yaml_docs_with_refs(text.as_bytes());
         let lines = text.lines().collect::<Vec<_>>();
         let guid_map =
             Self::build_guid_map_for_docs(app_handle, working_dir, &ref_graph_state, &docs, &lines);
-        let guid_paths = guid_map
-            .into_iter()
+        let mut guid_paths: std::collections::HashMap<String, String> = guid_map
+            .iter()
             .map(|(guid, asset_path)| {
                 (
-                    crate::asset_db::types::guid_to_hex(&guid).to_ascii_lowercase(),
-                    asset_path,
+                    crate::asset_db::types::guid_to_hex(guid).to_ascii_lowercase(),
+                    asset_path.clone(),
                 )
             })
             .collect();
+        for ((guid, file_id), semantic_path) in
+            Self::build_asset_object_map_for_refs(&ref_graph_state, &raw_refs)
+        {
+            guid_paths.insert(
+                format!(
+                    "{}#{}",
+                    crate::asset_db::types::guid_to_hex(&guid).to_ascii_lowercase(),
+                    file_id
+                ),
+                semantic_path,
+            );
+        }
 
-        let tree = crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
-            &path.asset_path,
-            &text,
-            project_root.as_deref(),
-            &guid_paths,
-        )
+        let prefab_source = if path.asset_path.to_ascii_lowercase().ends_with(".prefab") {
+            crate::unity_yaml::extract_prefab_instance_irs(&docs, &lines)
+                .into_iter()
+                .find_map(|instance| {
+                    let source_asset_path = guid_map.get(&instance.source_prefab_guid)?.clone();
+                    let source_absolute_path = project_root.as_ref()?.join(&source_asset_path);
+                    let source_text = std::fs::read_to_string(source_absolute_path).ok()?;
+                    Some((source_asset_path, source_text))
+                })
+        } else {
+            None
+        };
+
+        let tree = if let Some((source_asset_path, source_text)) = prefab_source {
+            crate::unity_serialized_property::property_tree::YamlPropertyTree::parse_prefab_instance(
+                &path.asset_path,
+                &text,
+                &source_asset_path,
+                &source_text,
+                project_root.as_deref(),
+                &guid_paths,
+            )
+        } else {
+            crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
+                &path.asset_path,
+                &text,
+                project_root.as_deref(),
+                &guid_paths,
+            )
+        }
         .map_err(|error| ToolResult {
             output: error,
             is_error: true,
@@ -18421,6 +18470,8 @@ impl AgentInstance {
         let editor_eligible =
             path.asset_path.starts_with("Assets/") || path.asset_path.starts_with("Packages/");
         let auto_expand_limit = Self::unity_property_tree_auto_expand_char_limit(args);
+        let array_limit = Self::unity_property_tree_array_limit(args);
+        let mut live_fallback_reason: Option<String> = None;
 
         if editor_eligible {
             let requested_depth = Self::unity_property_tree_depth(args).max(1);
@@ -18431,7 +18482,7 @@ impl AgentInstance {
                     working_dir,
                     &path,
                     probe_depth,
-                    crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_ARRAY_LIMIT,
+                    array_limit,
                 )
                 .await {
                     Ok(snapshot) => {
@@ -18446,7 +18497,10 @@ impl AgentInstance {
                                 requested_outline.take().unwrap_or(output)
                             };
                             return ToolResult {
-                                output: Self::apply_unity_property_tree_output_budget(selected, args),
+                                output: Self::apply_unity_property_tree_output_budget(
+                                    Self::unity_yaml_live_source_banner() + &selected,
+                                    args,
+                                ),
                                 is_error: false,
                             };
                         }
@@ -18460,7 +18514,8 @@ impl AgentInstance {
                             // would only serialize an oversized hierarchy.
                             return ToolResult {
                                 output: Self::apply_unity_property_tree_output_budget(
-                                    requested_outline.take().unwrap_or(output),
+                                    Self::unity_yaml_live_source_banner()
+                                        + &requested_outline.take().unwrap_or(output),
                                     args,
                                 ),
                                 is_error: false,
@@ -18471,7 +18526,8 @@ impl AgentInstance {
                         {
                             return ToolResult {
                                 output: Self::apply_unity_property_tree_output_budget(
-                                    requested_outline.take().unwrap_or(output),
+                                    Self::unity_yaml_live_source_banner()
+                                        + &requested_outline.take().unwrap_or(output),
                                     args,
                                 ),
                                 is_error: false,
@@ -18482,11 +18538,18 @@ impl AgentInstance {
                         );
                     }
                     Err(error) => {
+                        if Self::unity_property_tree_live_response_decode_failed(&error) {
+                            return ToolResult {
+                                output: Self::unity_yaml_live_source_banner() + &error,
+                                is_error: true,
+                            };
+                        }
                         eprintln!(
                             "[unity_yaml_read] live LocusBridge PropertyTree unavailable for '{}': {}",
                             path.full_path(),
                             error
                         );
+                        live_fallback_reason = Some(error);
                         break;
                     }
                 }
@@ -18496,20 +18559,30 @@ impl AgentInstance {
         // Disk is a strict fallback after the connected Editor path fails.
         let disk_tree = Self::load_yaml_property_tree(app_handle, working_dir, &path, true);
         let complete_candidate = disk_tree.as_ref().ok().and_then(|tree| {
-            tree.read_complete_within_budget(&path, auto_expand_limit)
+            tree.read_complete_within_budget_and_array_limit(&path, auto_expand_limit, array_limit)
                 .ok()
                 .flatten()
         });
         if let Some(candidate) = complete_candidate {
             return ToolResult {
-                output: candidate.output,
+                output: Self::apply_unity_property_tree_output_budget(
+                    Self::unity_yaml_source_banner(live_fallback_reason.as_deref())
+                        + &candidate.output,
+                    args,
+                ),
                 is_error: false,
             };
         }
-        match disk_tree {
+        let mut result = match disk_tree {
             Ok(tree) => Self::render_unity_property_tree_outline(&tree, &path, args),
             Err(result) => result,
+        };
+        result.output =
+            Self::unity_yaml_source_banner(live_fallback_reason.as_deref()) + &result.output;
+        if !result.is_error {
+            result.output = Self::apply_unity_property_tree_output_budget(result.output, args);
         }
+        result
     }
 
     fn unity_property_tree_search_options(
@@ -18886,16 +18959,26 @@ impl AgentInstance {
         }
     }
 
+    fn unity_yaml_live_source_banner() -> String {
+        "[source: live Editor]\n".to_string()
+    }
+
+    fn unity_property_tree_live_response_decode_failed(error: &str) -> bool {
+        error
+            .trim_start()
+            .starts_with("Invalid unity_serialized_property_read response:")
+    }
+
     /// A one-line data-source banner for disk-parse results. When the live
-    /// Editor read was attempted and failed, the model needs to know the data
-    /// may lag unsaved Editor state.
+    /// Editor read was attempted and unavailable, the reason makes the
+    /// fallback and its stale-data risk explicit.
     fn unity_yaml_source_banner(live_fallback_reason: Option<&str>) -> String {
         match live_fallback_reason {
             Some(reason) => format!(
                 "[source: disk YAML — live Editor read unavailable: {}. Unsaved Editor changes are not reflected.]\n",
                 reason.trim()
             ),
-            None => String::new(),
+            None => "[source: disk YAML]\n".to_string(),
         }
     }
 
@@ -19771,7 +19854,7 @@ impl AgentInstance {
                     format!(
                         "{}/{}",
                         identity.path.trim_end_matches('/'),
-                        identity.name.trim()
+                        identity.name.trim().replace('~', "~0").replace('/', "~1")
                     )
                 } else {
                     identity.path
@@ -20140,6 +20223,9 @@ impl AgentInstance {
                                             .total_cache_write_tokens
                                             .min(u32::MAX as u64)
                                             as u32,
+                                        cache_invalidated: false,
+                                        cache_baseline_tokens: 0,
+                                        cache_invalidation_reason: None,
                                         total_input_tokens: parent_totals.total_input_tokens,
                                         total_output_tokens: parent_totals.total_output_tokens,
                                         total_cache_read_tokens: parent_totals
@@ -20213,6 +20299,9 @@ impl AgentInstance {
                                         .total_cache_write_tokens
                                         .min(u32::MAX as u64)
                                         as u32,
+                                    cache_invalidated: false,
+                                    cache_baseline_tokens: 0,
+                                    cache_invalidation_reason: None,
                                     total_input_tokens: parent_totals.total_input_tokens,
                                     total_output_tokens: parent_totals.total_output_tokens,
                                     total_cache_read_tokens: parent_totals.total_cache_read_tokens,
@@ -20363,16 +20452,18 @@ impl AgentInstance {
 #[cfg(test)]
 mod tests {
     use super::{
-        assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
-        build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, compact_trigger, estimate_session_tool_result_usage,
-        finalize_tool_call_record, model_response_needs_follow_up, receive_immediate_async_failure,
-        render_tree_lines, utf8_prefix_chars, AbortOnDropTask, AgentInstance,
-        AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem,
-        AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse, AgentKnowledgeSearchHit,
-        ChatMessage, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
-        KnowledgeFocusDoc, LazyToolRenderer, ParentToolCall, PromptKnowledgeItem, RawContextStore,
-        ToolConfirmDecision, ToolRunOutcome, REACTIVE_COMPACT_ATTEMPT_KIND,
+        add_prompt_items_to_physical_roots, assess_knowledge_tool_confirmation,
+        assess_knowledge_tool_confirmation_decision, build_l2_full_document_section,
+        build_l3_rule_section, build_prompt_tree, build_structure_section, compact_trigger,
+        ensure_prompt_physical_root, estimate_session_tool_result_usage, finalize_tool_call_record,
+        model_response_needs_follow_up, receive_immediate_async_failure,
+        render_prompt_physical_root, render_tree_lines, utf8_prefix_chars, AbortOnDropTask,
+        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
+        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
+        AgentKnowledgeSearchHit, ChatMessage, ExecutedToolResult, InjectedPromptItem,
+        KnowledgeAccessMode, KnowledgeFocusDoc, LazyToolRenderer, ParentToolCall,
+        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest;
@@ -20380,10 +20471,13 @@ mod tests {
         CompactTrigger, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
         StreamEvent, ToolCallOutcome,
     };
+    use crate::knowledge_source_registry::{
+        KnowledgeSource, KnowledgeSourceKind, KnowledgeSourceMutability, KnowledgeSourceRegistry,
+    };
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
         update_directory_config, KnowledgeDocument, KnowledgeInjectMode, KnowledgeReadResponse,
-        KnowledgeReadResult, KnowledgeTargetKind, KnowledgeType,
+        KnowledgeReadResult, KnowledgeStorageSource, KnowledgeTargetKind, KnowledgeType,
     };
     use crate::session::models::{
         ServerToolKind, ToolCallInfo, UserIntentPayload, UserIntentSkill,
@@ -20392,10 +20486,54 @@ mod tests {
     use crate::unity_docs::seed_managed_documents_for_tests;
     use serde_json::json;
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         sync::Arc,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn unity_yaml_source_banners_identify_live_and_disk_results() {
+        assert_eq!(
+            AgentInstance::unity_yaml_live_source_banner(),
+            "[source: live Editor]\n"
+        );
+        assert_eq!(
+            AgentInstance::unity_yaml_source_banner(None),
+            "[source: disk YAML]\n"
+        );
+        assert!(
+            AgentInstance::unity_yaml_source_banner(Some("bridge disconnected"))
+                .contains("live Editor read unavailable: bridge disconnected")
+        );
+    }
+
+    #[test]
+    fn unity_property_tree_array_limit_defaults_and_clamps() {
+        assert_eq!(
+            AgentInstance::unity_property_tree_array_limit(&json!({})),
+            crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_ARRAY_LIMIT
+        );
+        assert_eq!(
+            AgentInstance::unity_property_tree_array_limit(&json!({ "max_array_items": 12 })),
+            12
+        );
+        assert_eq!(
+            AgentInstance::unity_property_tree_array_limit(&json!({ "max_array_items": 4096 })),
+            crate::unity_serialized_property::property_tree::AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS
+        );
+    }
+
+    #[test]
+    fn live_property_tree_decode_failures_are_terminal() {
+        assert!(AgentInstance::unity_property_tree_live_response_decode_failed(
+            "Invalid unity_serialized_property_read response: invalid type: null, expected a string"
+        ));
+        assert!(
+            !AgentInstance::unity_property_tree_live_response_decode_failed(
+                "Unity is not connected"
+            )
+        );
+    }
 
     #[test]
     fn session_tool_result_usage_groups_returned_content_by_tool() {
@@ -25087,6 +25225,136 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
+    fn app_structure_groups_locus_skill_packages_under_real_app_roots() {
+        let temp = tempdir().expect("temp dir");
+        let bundled_app_root = temp.path().join("bundled-locus");
+        let profile_app_root = temp.path().join("profile").join("locus");
+        let app_knowledge_skill = bundled_app_root.join("knowledge").join("skill");
+        let bundled_package_root = bundled_app_root.join("skills").join("view");
+        let profile_package_root = profile_app_root.join("skills").join("motion-vault");
+        for path in [
+            &app_knowledge_skill,
+            &bundled_package_root,
+            &profile_package_root,
+        ] {
+            std::fs::create_dir_all(path).expect("create app source directory");
+        }
+        std::fs::write(bundled_package_root.join("SKILL.md"), "# View\n")
+            .expect("write bundled Skill");
+        std::fs::write(profile_package_root.join("SKILL.md"), "# Motion Vault\n")
+            .expect("write profile Skill");
+
+        let registry = KnowledgeSourceRegistry::from_sources_for_test(
+            None,
+            vec![
+                KnowledgeSource {
+                    source_id: "app-knowledge:skill".to_string(),
+                    kind: KnowledgeSourceKind::AppKnowledge,
+                    doc_type: KnowledgeType::Skill,
+                    physical_root: app_knowledge_skill,
+                    logical_prefix: String::new(),
+                    storage_source: KnowledgeStorageSource::App,
+                    mutability: KnowledgeSourceMutability::ReadOnly,
+                    watch: true,
+                    priority: 50,
+                },
+                KnowledgeSource {
+                    source_id: "app-skill:view".to_string(),
+                    kind: KnowledgeSourceKind::AppSkillPackage,
+                    doc_type: KnowledgeType::Skill,
+                    physical_root: bundled_package_root.clone(),
+                    logical_prefix: "view".to_string(),
+                    storage_source: KnowledgeStorageSource::App,
+                    mutability: KnowledgeSourceMutability::ReadOnly,
+                    watch: true,
+                    priority: 300,
+                },
+                KnowledgeSource {
+                    source_id: "app-skill:motion-vault".to_string(),
+                    kind: KnowledgeSourceKind::AppSkillPackage,
+                    doc_type: KnowledgeType::Skill,
+                    physical_root: profile_package_root.clone(),
+                    logical_prefix: "motion-vault".to_string(),
+                    storage_source: KnowledgeStorageSource::App,
+                    mutability: KnowledgeSourceMutability::Writable,
+                    watch: true,
+                    priority: 300,
+                },
+            ],
+        );
+        let app_knowledge_source = registry
+            .sources()
+            .iter()
+            .find(|source| source.kind == KnowledgeSourceKind::AppKnowledge)
+            .expect("app knowledge source");
+        let mut roots = BTreeMap::new();
+        let root = ensure_prompt_physical_root(&mut roots, &registry, app_knowledge_source);
+        root.source_ids
+            .insert(app_knowledge_source.source_id.clone());
+        add_prompt_items_to_physical_roots(
+            &registry,
+            &mut roots,
+            vec![
+                PromptKnowledgeItem {
+                    doc_type: KnowledgeType::Skill,
+                    path: "view/SKILL.md".to_string(),
+                    title: "View".to_string(),
+                    inject_mode: KnowledgeInjectMode::Excerpt,
+                    summary: Some("Use for Locus View requests.".to_string()),
+                },
+                PromptKnowledgeItem {
+                    doc_type: KnowledgeType::Skill,
+                    path: "motion-vault/SKILL.md".to_string(),
+                    title: "Motion Vault".to_string(),
+                    inject_mode: KnowledgeInjectMode::Excerpt,
+                    summary: Some("Use for motion-vault requests.".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(roots.len(), 2);
+        let rendered = roots
+            .values()
+            .map(|root| {
+                render_prompt_physical_root(root, &registry, KnowledgeAccessMode::Full).join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(rendered.contains("knowledge/"), "{}", rendered);
+        assert!(
+            rendered.contains("skill/ [read-only] :: Standard workflows for getting work done"),
+            "{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("skills/\n   └─ view/ [package] :: Use for Locus View requests."),
+            "{}",
+            rendered
+        );
+        assert!(
+            rendered.contains(
+                "skills/\n   └─ motion-vault/ [package] :: Use for motion-vault requests."
+            ),
+            "{}",
+            rendered
+        );
+        let bundled_package_path = bundled_package_root.to_string_lossy().replace('\\', "/");
+        let profile_package_path = profile_package_root.to_string_lossy().replace('\\', "/");
+        assert!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with('├')
+                    || line.starts_with('└')
+                    || line.starts_with('│')
+                    || line.starts_with(' '))
+                .all(|line| !line.contains(&bundled_package_path)
+                    && !line.contains(&profile_package_path)),
+            "{}",
+            rendered
+        );
+    }
+
+    #[test]
     fn structure_section_summarizes_managed_unity_reference_library() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -25551,7 +25819,7 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
-    fn knowledge_query_output_uses_plain_text_blocks() {
+    fn knowledge_query_detailed_output_uses_single_line_document_header() {
         let output = AgentInstance::format_knowledge_query_output(
             &[AgentKnowledgeSearchHit {
                 doc_type: KnowledgeType::Design,
@@ -25571,20 +25839,19 @@ Search, install, audit, and export a plugin.
             220,
         );
 
-        assert!(output.contains("design/project-overview.md"));
-        assert!(output.contains("lines: 18-24"));
-        assert!(output.contains("summary_start_line: 4"));
-        assert!(output.contains("body_start_line: 12"));
-        assert!(output.contains("match: lexical | score=0.875"));
-        assert!(output.contains("terms=core, loop"));
-        assert!(output.contains("context:\n  Core loop summary"));
-        assert!(!output.contains("title:"));
-        assert!(!output.trim_start().starts_with('{'));
-        assert!(!output.trim_start().starts_with('['));
+        assert_eq!(
+            output,
+            "--- design/project-overview.md | lines 18-24 | summary 4 | body 12 ---\nCore loop summary"
+        );
+        assert!(!output.contains("<document>"));
+        assert!(!output.contains("context:"));
+        assert!(!output.contains("match:"));
+        assert!(!output.contains("score="));
+        assert!(!output.contains("terms="));
     }
 
     #[test]
-    fn knowledge_query_output_can_include_summary_without_hit_context() {
+    fn knowledge_query_summary_output_contains_only_path_and_summary() {
         let output = AgentInstance::format_knowledge_query_output(
             &[AgentKnowledgeSearchHit {
                 doc_type: KnowledgeType::Memory,
@@ -25604,11 +25871,52 @@ Search, install, audit, and export a plugin.
             220,
         );
 
-        assert!(output.contains("summary:\n  Stable preferences\n  Across projects"));
+        assert_eq!(
+            output,
+            "memory/preferences.md :: Stable preferences Across projects"
+        );
+        assert!(!output.contains("lines:"));
         assert!(!output.contains("summary_start_line"));
         assert!(!output.contains("body_start_line"));
+        assert!(!output.contains("match:"));
+        assert!(!output.contains("score="));
+        assert!(!output.contains("terms="));
         assert!(!output.contains("context:"));
         assert!(!output.contains("Hidden hit context"));
+    }
+
+    #[test]
+    fn knowledge_query_summary_output_uses_one_line_per_document() {
+        let hit = |path: &str, summary: &str| AgentKnowledgeSearchHit {
+            doc_type: KnowledgeType::Memory,
+            path: path.to_string(),
+            summary: Some(summary.to_string()),
+            snippet: "Internal metadata".to_string(),
+            score: 0.75,
+            match_kind: "lexical".to_string(),
+            matched_terms: vec!["query".to_string()],
+            start_line: 1,
+            end_line: 6,
+            summary_start_line: Some(4),
+            body_start_line: 8,
+        };
+        let output = AgentInstance::format_knowledge_query_output(
+            &[
+                hit("memory/first.md", "First summary"),
+                hit("memory/second.md", "Second summary"),
+            ],
+            true,
+            true,
+            220,
+        );
+
+        assert_eq!(
+            output,
+            "memory/first.md :: First summary\nmemory/second.md :: Second summary"
+        );
+        assert_eq!(output.lines().count(), 2);
+        assert!(!output.contains("<document>"));
+        assert!(!output.contains("Internal metadata"));
     }
 
     #[test]

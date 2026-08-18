@@ -29,7 +29,10 @@ import {
 } from "../../composables/toolCallBatches";
 import type { ToolCallMatchState } from "../../composables/toolCallBatches";
 import { collectRenderedToolCalls, planPromotedToolVisibility } from "../../composables/toolRenderPlan";
-import { settleToolCallDisplaysForHandoff } from "../../composables/toolCallHandoff";
+import {
+  retainMaterializedToolCallDisplays,
+  settleToolCallDisplaysForHandoff,
+} from "../../composables/toolCallHandoff";
 import {
   assertCanonicalRenderParts,
   compareAssistantRenderParts,
@@ -703,7 +706,9 @@ function beginToolCallHandoff(previousToolCalls: ToolCallDisplay[]) {
   // `running`; settle that stale presentation state before the handoff is
   // rendered. Explicit background tools remain running until their async
   // task update arrives.
-  const toolCalls = settleToolCallDisplaysForHandoff(previousToolCalls);
+  const toolCalls = retainMaterializedToolCallDisplays(
+    settleToolCallDisplaysForHandoff(previousToolCalls),
+  );
   if (toolCalls.length === 0) {
     clearToolCallHandoff("begin-empty");
     return;

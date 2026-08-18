@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { settleToolCallDisplaysForHandoff } from "../composables/toolCallHandoff";
+import {
+  retainMaterializedToolCallDisplays,
+  settleToolCallDisplaysForHandoff,
+} from "../composables/toolCallHandoff";
 import type { ToolCallDisplay } from "../types";
 
 function tool(
@@ -49,5 +52,21 @@ describe("tool call handoff presentation", () => {
     ]);
 
     expect(settled[0]?.status).toBe("done");
+  });
+
+  it("drops provisional tool calls that never receive a payload", () => {
+    const retained = retainMaterializedToolCallDisplays(
+      [tool("provisional", "running", ""), tool("confirmed", "done")],
+    );
+
+    expect(retained.map((item) => item.id)).toEqual(["confirmed"]);
+  });
+
+  it("drops an empty completed handoff when the response contains no tools", () => {
+    const retained = retainMaterializedToolCallDisplays(
+      settleToolCallDisplaysForHandoff([tool("provisional", "running", "")]),
+    );
+
+    expect(retained).toEqual([]);
   });
 });
