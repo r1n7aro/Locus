@@ -13,18 +13,34 @@ const withoutEmbedConfig = path.join(srcTauriDir, "tauri.without_embed_python_gi
 // the official release flow). Passing --compression=lzma layers this overlay on
 // top for a smaller but much slower-to-build installer.
 const nsisLzmaConfig = path.join(srcTauriDir, "tauri.nsis-lzma.conf.json");
-// `[profile.release] incremental = true` in src-tauri/Cargo.toml trades codegen
-// quality for fast warm rebuilds during development. Shipped installers should
-// not pay that tax: these cargo profile env overrides restore full optimization
-// (no incremental CGU splitting, thin LTO, single codegen unit) for this script
-// only. Installer builds get slower — no incremental reuse plus an LTO link —
-// and the next plain release build after one recompiles from scratch because
-// the profile fingerprint differs.
-const releaseCargoEnv = {
-  CARGO_PROFILE_RELEASE_INCREMENTAL: "false",
-  CARGO_PROFILE_RELEASE_LTO: "thin",
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1",
-};
+const buildModes = new Map([
+  [
+    "development",
+    {
+      label: "development",
+      outputSuffix: "dev",
+      defaultFlavors: ["without_embed_python_git"],
+      cargoEnv: {
+        CARGO_PROFILE_RELEASE_INCREMENTAL: "true",
+        CARGO_PROFILE_RELEASE_LTO: "off",
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256",
+      },
+    },
+  ],
+  [
+    "release",
+    {
+      label: "release",
+      outputSuffix: "",
+      defaultFlavors: ["without_embed_python_git", "default"],
+      cargoEnv: {
+        CARGO_PROFILE_RELEASE_INCREMENTAL: "false",
+        CARGO_PROFILE_RELEASE_LTO: "thin",
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1",
+      },
+    },
+  ],
+]);
 const compressions = new Set(["zlib", "lzma"]);
 const flavors = new Map([
   [
@@ -72,10 +88,11 @@ function readJson(filePath) {
 function usage() {
   const names = [...flavors.keys()].join(", ");
   return [
-    "Usage: bun run release:installers [--compression=zlib|lzma] [flavor...] [-- tauri args...]",
+    "Usage: bun run scripts/build-release-installers.mjs [--mode=development|release] [--compression=zlib|lzma] [flavor...] [-- tauri args...]",
     "",
     `Flavors: ${names}`,
-    "Default: without_embed_python_git default",
+    "Mode: release (default)",
+    "Default flavors: development = without_embed_python_git; release = without_embed_python_git default",
     "Compression: zlib (default, fast packaging) or lzma (smaller installer, much slower)",
   ].join("\n");
 }
@@ -85,9 +102,21 @@ function parseArgs(rawArgs) {
   const ownArgs = separatorIndex >= 0 ? rawArgs.slice(0, separatorIndex) : rawArgs;
   const tauriArgs = separatorIndex >= 0 ? rawArgs.slice(separatorIndex + 1) : [];
   const flavorArgs = [];
+  let buildMode = "release";
   let compression = "zlib";
+  let showHelp = false;
 
   for (const arg of ownArgs) {
+    if (arg === "-h" || arg === "--help") {
+      showHelp = true;
+      continue;
+    }
+
+    if (arg.startsWith("--mode=")) {
+      buildMode = arg.slice("--mode=".length);
+      continue;
+    }
+
     if (arg.startsWith("--compression=")) {
       compression = arg.slice("--compression=".length);
       continue;
@@ -96,19 +125,24 @@ function parseArgs(rawArgs) {
     flavorArgs.push(arg);
   }
 
+  if (!buildModes.has(buildMode)) {
+    throw new Error(`Unknown installer build mode "${buildMode}".\n\n${usage()}`);
+  }
+
   if (!compressions.has(compression)) {
     throw new Error(`Unknown NSIS compression "${compression}".\n\n${usage()}`);
   }
 
-  const requestedFlavors = flavorArgs.length > 0 ? flavorArgs : ["without_embed_python_git", "default"];
+  const mode = buildModes.get(buildMode);
+  const requestedFlavors = flavorArgs.length > 0 ? flavorArgs : mode.defaultFlavors;
 
   for (const flavor of requestedFlavors) {
     if (!flavors.has(flavor)) {
-      throw new Error(`Unknown release installer flavor "${flavor}".\n\n${usage()}`);
+      throw new Error(`Unknown installer flavor "${flavor}".\n\n${usage()}`);
     }
   }
 
-  return { requestedFlavors, tauriArgs, compression };
+  return { buildMode, requestedFlavors, tauriArgs, compression, showHelp };
 }
 
 function run(command, args, extraEnv) {
@@ -139,7 +173,9 @@ function expectedInstallerBaseName() {
   return `${productName}_${version}_x64-setup.exe`;
 }
 
-function installerNameForFlavor(baseName, suffix) {
+function installerNameForFlavor(baseName, suffixes) {
+  const suffix = suffixes.filter(Boolean).join("-");
+
   if (!suffix) {
     return baseName;
   }
@@ -174,9 +210,9 @@ function findGeneratedInstaller(baseName, startedAtMs) {
   throw new Error(`Unable to find generated NSIS installer ${baseName}.`);
 }
 
-function finalizeInstaller(flavor, baseName, startedAtMs) {
+function finalizeInstaller(flavor, mode, baseName, startedAtMs) {
   const sourcePath = findGeneratedInstaller(baseName, startedAtMs);
-  const finalName = installerNameForFlavor(baseName, flavor.suffix);
+  const finalName = installerNameForFlavor(baseName, [mode.outputSuffix, flavor.suffix]);
   const finalPath = path.join(nsisBundleDir, finalName);
 
   if (sourcePath !== finalPath) {
@@ -189,16 +225,18 @@ function finalizeInstaller(flavor, baseName, startedAtMs) {
   return finalPath;
 }
 
-function buildFlavor(flavorName, compression, tauriArgs, baseName) {
+function buildFlavor(flavorName, mode, compression, tauriArgs, baseName) {
   const flavor = flavors.get(flavorName);
   const startedAtMs = Date.now();
   // Config overlays merge in order, so the compression overlay must come after
   // the flavor config to win.
   const compressionArgs =
     compression === "lzma" ? ["--config", path.relative(repoRoot, nsisLzmaConfig)] : [];
-  console.log(`[locus] Building release installer flavor: ${flavorName} (nsis compression: ${compression})`);
-  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], releaseCargoEnv);
-  const finalPath = finalizeInstaller(flavor, baseName, startedAtMs);
+  console.log(
+    `[locus] Building ${mode.label} installer flavor: ${flavorName} (nsis compression: ${compression})`,
+  );
+  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], mode.cargoEnv);
+  const finalPath = finalizeInstaller(flavor, mode, baseName, startedAtMs);
 
   return {
     flavor: flavorName,
@@ -208,13 +246,22 @@ function buildFlavor(flavorName, compression, tauriArgs, baseName) {
 }
 
 try {
-  const { requestedFlavors, tauriArgs, compression } = parseArgs(process.argv.slice(2));
-  const baseName = expectedInstallerBaseName();
-  const results = requestedFlavors.map((flavorName) =>
-    buildFlavor(flavorName, compression, tauriArgs, baseName),
+  const { buildMode, requestedFlavors, tauriArgs, compression, showHelp } = parseArgs(
+    process.argv.slice(2),
   );
 
-  console.log("[locus] Release installers ready:");
+  if (showHelp) {
+    console.log(usage());
+    process.exit(0);
+  }
+
+  const mode = buildModes.get(buildMode);
+  const baseName = expectedInstallerBaseName();
+  const results = requestedFlavors.map((flavorName) =>
+    buildFlavor(flavorName, mode, compression, tauriArgs, baseName),
+  );
+
+  console.log(`[locus] ${mode.label} installers ready:`);
   for (const result of results) {
     console.log(`- ${result.label}: ${path.relative(repoRoot, result.path)}`);
   }

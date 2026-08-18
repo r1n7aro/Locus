@@ -96,17 +96,27 @@ bun run locus:test:app -- --runtime-root <绝对运行目录>
 
 ### 构建
 
+快速生成 Windows 开发安装包：
+
 ```powershell
-bun tauri build
+bun run build:installers
 ```
 
-该命令会重新生成合并后的 Unity Editor DLL bundle、完成前端构建、生成第三方许可证 bundle，并打包桌面应用。当前默认输出 Windows `NSIS` 安装包，产物位于 `src-tauri/target/release/bundle/nsis/`。
+该模式使用增量编译、256 个 codegen unit、关闭 LTO，并采用 zlib 压缩。默认构建不内嵌 Python/Git 的开发包，产物名带 `-dev-without_embed_python_git` 后缀，位于 `src-tauri/target/release/bundle/nsis/`。
+
+验证完整内嵌运行时时使用：
+
+```powershell
+bun run build:installers default
+```
+
+完整内嵌开发包的产物名带 `-dev` 后缀。
 
 ## 发布版本
 
 发布安装包与版本说明见 [GitHub Releases](https://github.com/r1n7aro/Locus/releases)。
 
-本地构建两个 Windows 发布安装包：
+构建两个经过 ThinLTO 优化的 Windows 发布安装包：
 
 ```powershell
 bun run release:installers

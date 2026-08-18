@@ -168,14 +168,20 @@ describe("Python runtime settings", () => {
     expect(bashTool).toContain("Managed Python installs pip packages into the Locus data directory by default");
   });
 
-  it("defines release installer flavors for embedded and no-embed packages", () => {
+  it("defines development and release installer profiles for embedded and no-embed packages", () => {
     const pkg = read("package.json");
     const releaseScript = read("scripts/build-release-installers.mjs");
+    const cargoManifest = read("src-tauri/Cargo.toml");
     const tauriConfig = read("src-tauri/tauri.conf.json");
     const runTauri = read("scripts/run-tauri.mjs");
     const withoutEmbedConfig = read("src-tauri/tauri.without_embed_python_git.conf.json");
 
-    expect(pkg).toContain('"release:installers": "bun run scripts/build-release-installers.mjs"');
+    expect(pkg).toContain(
+      '"build:installers": "bun run scripts/build-release-installers.mjs --mode=development"',
+    );
+    expect(pkg).toContain(
+      '"release:installers": "bun run scripts/build-release-installers.mjs --mode=release"',
+    );
     expect(pkg).toContain('"build:tauri": "bun run build:tauri:with_embed_python_git"');
     expect(pkg).toContain('"build:tauri:without_embed_python_git"');
     expect(tauriConfig).not.toContain("managed-python");
@@ -187,7 +193,12 @@ describe("Python runtime settings", () => {
     expect(releaseScript).toContain('"with_embed_python_git"');
     expect(releaseScript).toContain('"without_embed_python_git"');
     expect(releaseScript).toContain("Windows x64 - without_embed_python_git");
+    expect(releaseScript).toContain('CARGO_PROFILE_RELEASE_LTO: "off"');
+    expect(releaseScript).toContain('CARGO_PROFILE_RELEASE_LTO: "thin"');
+    expect(releaseScript).toContain('outputSuffix: "dev"');
     expect(releaseScript).toContain("`-${suffix}-setup.exe`");
+    expect(cargoManifest).toContain('lto = "off"');
+    expect(cargoManifest).toContain("codegen-units = 256");
     expect(withoutEmbedConfig).toContain('"beforeBuildCommand": "bun run build:tauri:without_embed_python_git"');
     expect(withoutEmbedConfig).not.toContain("managed-python");
     expect(withoutEmbedConfig).not.toContain("managed-git");

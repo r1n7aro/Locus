@@ -96,17 +96,27 @@ The equivalent Tauri entry is `bun tauri dev-mcp --isolated`. Run `bun run locus
 
 ### Build
 
+Build a fast Windows development installer:
+
 ```powershell
-bun tauri build
+bun run build:installers
 ```
 
-This command rebuilds the merged Unity Editor DLL bundles, prepares the managed Python and Git runtimes, builds the frontend, generates the third-party license bundle, and packages the desktop app. The default output is a Windows `NSIS` installer under `src-tauri/target/release/bundle/nsis/`.
+This mode uses incremental compilation, 256 codegen units, LTO disabled, and zlib compression. It builds the no-embedded-Python/Git flavor by default and writes an installer with the `-dev-without_embed_python_git` suffix under `src-tauri/target/release/bundle/nsis/`.
+
+Use the full embedded runtime flavor when validating bundled Python and Git:
+
+```powershell
+bun run build:installers default
+```
+
+The full embedded development installer uses the `-dev` suffix.
 
 ## Releases
 
 See [GitHub Releases](https://github.com/r1n7aro/Locus/releases) for published installers and release notes.
 
-To build both Windows release installers locally:
+To build both ThinLTO-optimized Windows release installers locally:
 
 ```powershell
 bun run release:installers

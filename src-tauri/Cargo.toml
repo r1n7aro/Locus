@@ -15,13 +15,16 @@ license = "GPL-3.0-or-later"
 name = "locus_lib"
 crate-type = ["rlib"]
 
-# This app is a single ~185k-LOC crate; with cargo's release default
-# (incremental = false) every release build recompiles all of it at opt-level 3
-# even for a one-line change. Incremental trades target-dir disk space for much
-# faster warm rebuilds. Registry dependencies are never built incrementally,
-# so their artifacts and runtime performance are unaffected.
+# Fast installer builds keep release runtime semantics while favoring warm
+# rebuild speed. `lto = "off"` is intentional: Cargo's boolean `lto = false`
+# still enables local ThinLTO when multiple codegen units are used, which can
+# produce unresolved `.llvm.*` symbols with the LLVM 22 Windows toolchain.
+# The release installer script overrides these settings with non-incremental
+# ThinLTO and a single codegen unit for shipped artifacts.
 [profile.release]
 incremental = true
+lto = "off"
+codegen-units = 256
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
