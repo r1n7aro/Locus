@@ -96,6 +96,16 @@ describe("BaseMarkdownEditor source", () => {
     expect(source).toContain("deferRenderedEditor && !renderedEditing.value");
   });
 
+  it("preserves the rendered scroll position and click caret while activating Vditor", () => {
+    expect(source).toContain("captureMarkdownEditorActivation");
+    expect(source).toContain("focusMarkdownEditorAtActivation");
+    expect(source).toContain("restoreMarkdownEditorActivationScroll");
+    expect(source).toContain("placeMarkdownEditorCaretAtActivation");
+    expect(source).toContain("activationMinHeight");
+    expect(source).toContain("completeRenderedActivation()");
+    expect(source).not.toContain("requestAnimationFrame(() => editor?.focus())");
+  });
+
   it("supports document-flow auto growth without nested vertical scrolling", () => {
     expect(source).toContain("autoGrow?: boolean;");
     expect(source).toContain("minHeight?: number;");

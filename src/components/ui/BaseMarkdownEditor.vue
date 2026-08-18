@@ -17,6 +17,13 @@ import {
   MARKDOWN_EDITOR_PANEL_HEIGHT,
   MARKDOWN_EDITOR_PANEL_MAX_WIDTH,
 } from "./markdownEditorLayout";
+import {
+  captureMarkdownEditorActivation,
+  focusMarkdownEditorAtActivation,
+  placeMarkdownEditorCaretAtActivation,
+  restoreMarkdownEditorActivationScroll,
+  type MarkdownEditorActivationSnapshot,
+} from "./markdownEditorActivation";
 import type { MarkdownEditorViewMode } from "./markdownEditorViewMode";
 
 const props = withDefaults(defineProps<{
@@ -50,6 +57,7 @@ const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const editorReady = ref(false);
 const focused = ref(false);
 const renderedEditing = ref(false);
+const activationMinHeight = ref<number | null>(null);
 const syncing = ref(false);
 const pendingModelValue = ref<string | null>(null);
 const isNativeMode = computed(() => props.viewMode === "native");
@@ -65,6 +73,8 @@ let editor: Vditor | null = null;
 let themeObserver: MutationObserver | null = null;
 let layoutSync: { disconnect(): void } | null = null;
 let pasteInterceptorCleanup: (() => void) | null = null;
+let pendingRenderedActivation: MarkdownEditorActivationSnapshot | null = null;
+let activationRestoreFrame = 0;
 
 const VDITOR_ICON_SCRIPT_ID = "vditorIconScript";
 
@@ -155,7 +165,40 @@ function syncPanelLayout() {
   applyMarkdownEditorPanelLayout(mountRef.value);
 }
 
+function cancelRenderedActivationRestore() {
+  if (activationRestoreFrame) {
+    window.cancelAnimationFrame(activationRestoreFrame);
+    activationRestoreFrame = 0;
+  }
+}
+
+function clearRenderedActivation() {
+  cancelRenderedActivationRestore();
+  pendingRenderedActivation = null;
+  activationMinHeight.value = null;
+}
+
+function completeRenderedActivation() {
+  const activation = pendingRenderedActivation;
+  const editable = mountRef.value?.querySelector<HTMLElement>(".vditor-ir .vditor-reset");
+  if (!activation || !editable) return;
+
+  cancelRenderedActivationRestore();
+  focusMarkdownEditorAtActivation(editable, activation);
+  activationRestoreFrame = window.requestAnimationFrame(() => {
+    activationRestoreFrame = 0;
+    activationMinHeight.value = null;
+    activationRestoreFrame = window.requestAnimationFrame(() => {
+      activationRestoreFrame = 0;
+      restoreMarkdownEditorActivationScroll(activation);
+      placeMarkdownEditorCaretAtActivation(editable, activation);
+      pendingRenderedActivation = null;
+    });
+  });
+}
+
 function destroyEditor() {
+  clearRenderedActivation();
   pasteInterceptorCleanup?.();
   pasteInterceptorCleanup = null;
   layoutSync?.disconnect();
@@ -291,7 +334,7 @@ function mountEditor() {
       layoutSync?.disconnect();
       layoutSync = createMarkdownEditorResizeSync(mountRef.value, syncPanelLayout);
       if (renderedEditing.value) {
-        requestAnimationFrame(() => editor?.focus());
+        completeRenderedActivation();
       }
     },
   });
@@ -301,6 +344,7 @@ watch(
   () => props.contentKey,
   (nextKey, previousKey) => {
     if (nextKey === previousKey) return;
+    clearRenderedActivation();
     pendingModelValue.value = null;
     if (!shouldUseVditor.value || !editorReady.value || !editor) return;
     // A Vditor instance may stay mounted while the knowledge document changes.
@@ -384,8 +428,17 @@ onBeforeUnmount(() => {
   destroyEditor();
 });
 
-function activateRenderedEditor() {
+function activateRenderedEditor(event: MouseEvent | KeyboardEvent) {
   if (props.disabled || !props.deferRenderedEditor || props.viewMode !== "rendered") return;
+  const source = event.currentTarget as HTMLElement | null;
+  if (!source) return;
+  const point = event instanceof MouseEvent
+    ? { x: event.clientX, y: event.clientY }
+    : null;
+  pendingRenderedActivation = captureMarkdownEditorActivation(source, point);
+  if (props.autoGrow) {
+    activationMinHeight.value = Math.ceil(pendingRenderedActivation.renderedHeight);
+  }
   renderedEditing.value = true;
   void nextTick(() => {
     mountEditor();
@@ -397,7 +450,10 @@ function activateRenderedEditor() {
   <div
     class="base-markdown-editor"
     :class="{ disabled, 'is-native': isNativeMode, 'auto-grow': autoGrow }"
-    :style="{ '--markdown-editor-min-height': `${minHeight}px` }"
+    :style="{
+      '--markdown-editor-min-height': `${minHeight}px`,
+      minHeight: activationMinHeight === null ? undefined : `${activationMinHeight}px`,
+    }"
   >
     <div v-if="isNativeMode" class="base-markdown-editor-native">
       <textarea
