@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.7.3 (2026-08-16)"
+description: "Locus v0.7.4 (2026-08-18)"
 sidebarTitle: "当前版本"
-version: "0.7.3"
-releasedAt: "2026-08-16"
+version: "0.7.4"
+releasedAt: "2026-08-18"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,32 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.7.4（新增）
+
+- **可配置的 Codex 上下文窗口。** ChatGPT 订阅模型支持 16K 至 1M Tokens，默认 272K；有效上下文与自动压缩阈值随配置同步调整，旧版“扩展上下文”设置会迁移为 372K。
+- **提示词缓存诊断。** 会话上下文用量会根据服务端统计记录缓存失效，包括模型或提供方切换、异常未缓存输入增长；诊断记录会写入上下文导出，并可在通知设置中启用应用内警告。
+- **Prefab 感知的 Unity Property Tree。** `unity_yaml_read` 会标明实时 Editor 或磁盘 YAML 来源，支持配置数组展开数量，合并 Prefab 源与 Variant 数据，标记覆盖属性，折叠相同的重复 Prefab 实例，并返回可读的子资源语义路径。
+- **更安全的 `unity_execute` 结构化输出。** `printJson` 支持匿名对象、存储字段、字典、已物化集合、共享与循环引用及嵌套 Unity 对象；延迟枚举器与目标属性 getter 保持未执行状态。
+- **快速开发安装包。** `bun run build:installers` 可生成采用增量编译和 zlib 压缩的开发安装包；发布安装包继续使用 ThinLTO，并生成两种运行时版本。
+
+### v0.7.4（修复）
+
+- **Unity 重编译生命周期。** 重编译请求会等待 Unity 发出编译开始事件，在 Domain Reload 期间持久化中间状态，连接恢复后继续核对结果，并提供完整的超时诊断。
+- **知识查询输出。** 摘要模式每篇文档占一行，详细模式使用紧凑的路径与行号标题；Frontmatter 命中仅返回相关摘要或维护规则。应用 Skill 包会归入真实应用目录，知识或插件变化后会立即刷新 Skill 缓存。
+- **工具调用交接。** Provider 预告后未出现在最终响应中的工具调用，不再显示为空的已完成调用。
+- **渲染态 Markdown 编辑。** 从渲染内容进入编辑时会保留滚动位置、文档高度和点击位置对应的光标。
+- **View 运行时导入。** TypeScript 6 CommonJS 互操作下的 `.vue` 默认导入保持稳定。
+- **文件读取上下文。** 绝对行号改用紧凑前缀，减少上下文占用，并与压缩摘录格式保持一致。
+
+### v0.7.4（移除）
+
+- 本版本没有移除面向用户的工作流或兼容路径。
 
 ### v0.7.3（新增）
 

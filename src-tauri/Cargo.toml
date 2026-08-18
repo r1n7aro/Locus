@@ -1,6 +1,6 @@
 [package]
 name = "locus"
-version = "0.7.3"
+version = "0.7.4"
 description = "A opensource unity dev agent"
 authors = ["FarLocus"]
 edition = "2021"

@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.7.3 (2026-08-16)"
+description: "Locus v0.7.4 (2026-08-18)"
 sidebarTitle: "Latest Version"
-version: "0.7.3"
-releasedAt: "2026-08-16"
+version: "0.7.4"
+releasedAt: "2026-08-18"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,32 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.3/locus_0.7.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.7.4 (Added)
+
+- **Configurable Codex context windows.** ChatGPT subscription models now accept context windows from 16K to 1M tokens, defaulting to 272K. Effective context and automatic compaction limits scale with the configured value, and legacy Extended Context settings migrate to 372K.
+- **Prompt cache diagnostics.** Session context usage now records cache invalidations from provider-reported usage, including model or provider changes and abnormal uncached input growth. These records are included in context exports, with optional in-app warnings available under Notifications.
+- **Prefab-aware Unity Property Tree.** `unity_yaml_read` now identifies live Editor and disk YAML sources, supports configurable array limits, merges Prefab source and Variant data, marks overridden properties, folds identical repeated Prefab instances, and returns readable semantic subasset paths.
+- **Safer structured output from `unity_execute`.** `printJson` now supports anonymous objects, stored fields, dictionaries, materialized collections, shared and cyclic references, and nested Unity objects. Deferred enumerables and target property getters remain unevaluated.
+- **Fast development installers.** `bun run build:installers` creates incremental zlib-compressed development installers. Release installers retain ThinLTO optimization and both embedded-runtime flavors.
+
+### v0.7.4 (Fixed)
+
+- **Unity recompilation lifecycle.** Recompile requests now wait for Unity's compilation-start event, persist intermediate state across domain reloads, reconcile after bridge reconnection, and report detailed timeout diagnostics.
+- **Knowledge query output.** Summary results use one line per document, detailed results use compact path-and-line headers, and frontmatter matches expose only the relevant summary or maintenance-rule value. App Skill packages are grouped under their real application roots, and Skill caches refresh after knowledge or plugin changes.
+- **Tool-call handoffs.** Provisional provider tool calls omitted from the completed response no longer appear as empty completed calls.
+- **Rendered Markdown editing.** Activating the editor from rendered content preserves the scroll position, document height, and clicked caret location.
+- **View runtime imports.** Default `.vue` imports remain stable with TypeScript 6 CommonJS interop.
+- **File-read context.** Absolute line numbers now use compact prefixes, reducing context usage and matching compaction excerpts.
+
+### v0.7.4 (Removed)
+
+- No user-facing workflows or compatibility paths were removed.
 
 ### v0.7.3 (Added)
 
