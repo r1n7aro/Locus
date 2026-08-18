@@ -9,6 +9,7 @@ import {
   ViewCompileError,
 } from "../components/view/viewCompiler";
 import { compileViewSfc } from "../components/view/viewSfcCompiler";
+import { createViewSfcModuleExports } from "../components/view/viewRuntime";
 
 function read(path: string): string {
   return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
@@ -218,6 +219,30 @@ export { answer as alias };
       const execute = new Function("__import", "exports", "module", code);
       execute(() => ({}), module.exports, module);
     }).not.toThrow();
+  });
+
+  it("keeps default .vue imports stable with TypeScript 6 CommonJS interop", () => {
+    const code = transformModuleSource(`
+import App from "./App.vue";
+export default App;
+`, "src/main.ts");
+    const component = { render: () => null };
+    const sfcModule = createViewSfcModuleExports(component);
+    const module = { exports: {} as Record<string, unknown> };
+    const execute = new Function("__import", "exports", "module", code);
+
+    execute(
+      (specifier: string) => {
+        if (specifier === "./App.vue") return sfcModule;
+        throw new Error(`Unexpected import: ${specifier}`);
+      },
+      module.exports,
+      module,
+    );
+
+    expect(code).toContain("__importDefault(require(\"./App.vue\"))");
+    expect(sfcModule.__esModule).toBe(true);
+    expect(module.exports.default).toBe(component);
   });
 
   it("uses the Vue build with runtime template compilation", () => {
