@@ -15,6 +15,7 @@ Run `bun run unity:bundle-json` after changing any original DLL input.
 - This document follows the assembly version and file version of the DLL actually shipped in this directory.
 - `Locus.Json.dll` is generated with ILRepack `2.0.44` from the original input above, with assembly identity `Locus.Json, Version=13.0.3.0`.
 - The Newtonsoft.Json input is internalized and renamed in the merged assembly. The public API exposed by this bundle is `Locus.Json.LocusJson`.
+- The public wrapper source is maintained in `locus_json/LocusJson.cs`; `scripts/build-locus-json-bundle.mjs` copies it into the temporary build project before merging.
 
 ## Redistribution Requirements
 

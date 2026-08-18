@@ -836,6 +836,29 @@ pub struct UnitySerializedPropertySnapshot {
     pub display_name: String,
     #[serde(default)]
     pub name: String,
+    /// Original hierarchy name before sibling ordinals such as `[2]` are
+    /// appended. Populated only for GameObject hierarchy projections.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_original_name: String,
+    /// Direct source Prefab identity for a foldable Prefab instance root.
+    /// Empty for ordinary GameObjects and Prefab asset contents.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_prefab_source: String,
+    /// Stable component-type inventory used with the original name and source
+    /// Prefab to decide whether repeated sibling instances can be folded.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_component_signature: String,
+    /// Unity Inspector-style marker for a serialized value overridden on the
+    /// nearest Prefab instance.
+    #[serde(default)]
+    pub prefab_override: bool,
+    /// True when the selected asset/object is an effective Prefab instance
+    /// view (including a Prefab Variant asset root).
+    #[serde(default)]
+    pub is_prefab_instance: bool,
+    /// Direct source Prefab path for `is_prefab_instance` snapshots.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub prefab_source: String,
     #[serde(default, rename = "type")]
     pub property_type: String,
     #[serde(default)]
@@ -6772,11 +6795,12 @@ mod tests {
         view_file_watch_roots, view_manifest_requirements, view_package_root,
         view_script_bridge_payload, view_script_cached_invoke_payload, view_storage_get_sync,
         view_storage_remove_sync, view_storage_set_sync, view_tab_hosts,
-        UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyTarget,
-        UnitySerializedPropertyWriteResult, ViewExportPackageRequest, ViewFrontendLogReadRequest,
-        ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest,
-        ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
-        LEGACY_VIEW_API_VERSION, VIEW_API_VERSION, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyReadResult,
+        UnitySerializedPropertyTarget, UnitySerializedPropertyWriteResult,
+        ViewExportPackageRequest, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
+        ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest, ViewStorageGetRequest,
+        ViewStorageRemoveRequest, ViewStorageSetRequest, LEGACY_VIEW_API_VERSION, VIEW_API_VERSION,
+        VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
     };
     use notify::{
         event::{DataChange, ModifyKind},
@@ -6791,6 +6815,30 @@ mod tests {
         PathBuf::from(working_dir)
             .join(VIEW_ROOT_RELATIVE)
             .join(default_view_package_name(working_dir).expect("default package name"))
+    }
+
+    #[test]
+    fn property_tree_read_accepts_null_optional_snapshot_metadata() {
+        let result: UnitySerializedPropertyReadResult = serde_json::from_value(json!({
+            "ok": true,
+            "message": "ok",
+            "target": {
+                "kind": "asset",
+                "path": "Assets/Data/ActionSet.asset"
+            },
+            "nodeKind": "object",
+            "displayName": "ActionSet",
+            "hierarchyOriginalName": null,
+            "hierarchyPrefabSource": null,
+            "hierarchyComponentSignature": null,
+            "prefabSource": null
+        }))
+        .expect("older bridge snapshots may serialize unused metadata as null");
+
+        assert_eq!(result.property.hierarchy_original_name, "");
+        assert_eq!(result.property.hierarchy_prefab_source, "");
+        assert_eq!(result.property.hierarchy_component_signature, "");
+        assert_eq!(result.property.prefab_source, "");
     }
 
     #[test]

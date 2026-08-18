@@ -5368,16 +5368,6 @@ async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<
     Err(last_error)
 }
 
-/// Trigger a Unity recompile and wait until the new domain is ready.
-///
-/// Flow:
-/// 1. Release every edit session so Unity can see the full batch of file writes.
-/// 2. Send `request_recompile`.
-/// 3. Poll `get_compile_result`.
-///    - `pending`: compilation or reload is still in progress.
-///    - `ok`: compilation succeeded and the reloaded AppDomain reported completion.
-///    - `error:*`: compilation failed; surface the compiler errors immediately.
-/// 4. If the pipe drops during reload, wait for Unity to reconnect as a fallback signal.
 /// Project-relative, forward-slash asset paths for absolute file paths under
 /// `project_path`. Windows paths reach the tracker with inconsistent drive or
 /// directory casing; the prefix match is case-insensitive but the returned
@@ -5401,24 +5391,326 @@ fn relative_asset_paths(project_path: &str, absolute_paths: &[String]) -> Vec<St
     rels
 }
 
-pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
-    let op_lock = project_unity_op_lock(project_path).await;
-    let _guard = op_lock.lock().await;
-    let _recompile_wait_guard = UnityRecompileWaitGuard::new(project_path);
-    let hook_effective = background_hook_effective_for_project(project_path).await;
-    let prev_foreground = if hook_effective {
-        None
-    } else {
-        focus::bring_unity_to_foreground()
-    };
+const RECOMPILE_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90);
+const RECOMPILE_START_STATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const RECOMPILE_START_STATE_HISTORY_LIMIT: usize = 6;
+const RECOMPILE_POLL_TIMEOUT: Duration = Duration::from_secs(4);
+const RECOMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-    let finish = |result: Result<String, String>| -> Result<String, String> {
-        if let Some(hwnd) = prev_foreground {
-            focus::restore_foreground(hwnd);
+#[derive(Debug)]
+struct RecompileStateSample {
+    first_elapsed_secs: u64,
+    last_elapsed_secs: u64,
+    signature: String,
+    detail: String,
+}
+
+#[derive(Debug, Default)]
+struct RecompileStartDiagnostics {
+    broker_accepted: bool,
+    samples: Vec<RecompileStateSample>,
+}
+
+impl RecompileStartDiagnostics {
+    fn record_formatted_state(&mut self, elapsed_secs: u64, signature: String, detail: String) {
+        if let Some(last) = self.samples.last_mut() {
+            if last.signature == signature {
+                last.last_elapsed_secs = elapsed_secs;
+                last.detail = detail;
+                return;
+            }
         }
-        result
-    };
 
+        self.samples.push(RecompileStateSample {
+            first_elapsed_secs: elapsed_secs,
+            last_elapsed_secs: elapsed_secs,
+            signature,
+            detail,
+        });
+        if self.samples.len() > RECOMPILE_START_STATE_HISTORY_LIMIT {
+            self.samples.remove(0);
+        }
+    }
+
+    fn record_state(&mut self, elapsed_secs: u64, state: &SemanticState) {
+        self.record_formatted_state(
+            elapsed_secs,
+            recompile_state_signature(state),
+            format_recompile_state_detail(state),
+        );
+    }
+
+    fn format_log(&self, summary: &str) -> String {
+        let mut output = format!(
+            "{summary}\n- Native Broker 已接收请求：{}",
+            if self.broker_accepted { "是" } else { "否" }
+        );
+        if self.samples.is_empty() {
+            output.push_str("\n- Unity 状态探测：尚未取得有效样本");
+            return output;
+        }
+
+        output.push_str("\n- Unity 状态探测：");
+        for sample in &self.samples {
+            let elapsed = if sample.first_elapsed_secs == sample.last_elapsed_secs {
+                format!("{}s", sample.first_elapsed_secs)
+            } else {
+                format!(
+                    "{}-{}s",
+                    sample.first_elapsed_secs, sample.last_elapsed_secs
+                )
+            };
+            output.push_str(&format!("\n  - {elapsed}: {}", sample.detail));
+        }
+        output
+    }
+}
+
+fn compact_recompile_state_text(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.replace(['\r', '\n'], " "))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn recompile_state_signature(state: &SemanticState) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        state.phase,
+        state.reload_phase.as_deref().unwrap_or("none"),
+        state.process.state,
+        state.channel.control_pipe,
+        state.domain.phase,
+        state.editor_mode.value,
+        state.main_thread.state,
+        state.safety.recommended_action,
+    )
+}
+
+fn format_recompile_state_detail(state: &SemanticState) -> String {
+    format!(
+        "phase={}/{} source={} confidence={}; process={} pid={}; channel={} latency={}ms; domain={} reload={}; editor={}; main_thread={} cpu_active={} quiescent={}ms stack={}; action={}; broker={} hook={}; detail={}; channel_error={}",
+        state.phase,
+        state.reload_phase.as_deref().unwrap_or("none"),
+        state.source,
+        state.confidence,
+        state.process.state,
+        state
+            .process
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        state.channel.control_pipe,
+        state
+            .channel
+            .last_latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        state.domain.phase,
+        state
+            .domain
+            .reload_sub_phase
+            .as_deref()
+            .unwrap_or("none"),
+        state.editor_mode.value,
+        state.main_thread.state,
+        state.main_thread.cpu_active,
+        state.main_thread.quiescent_for_ms,
+        state.main_thread.stack_class.as_deref().unwrap_or("none"),
+        state.safety.recommended_action,
+        state.state_plane.native_broker,
+        state.state_plane.native_hook,
+        compact_recompile_state_text(state.detail.as_deref()),
+        compact_recompile_state_text(state.channel.last_error.as_deref()),
+    )
+}
+
+fn recompile_timeout_reason(state: &SemanticState) -> String {
+    if state.process.state == "not_running" || matches!(state.phase.as_str(), "quit" | "crashed") {
+        return "Unity Editor 进程已退出，重编译无法完成。".to_string();
+    }
+    if state.domain.phase == "reloading" || state.phase == "reloading" {
+        return "Unity 持续处于域重载阶段，未能确认本次重编译完成。".to_string();
+    }
+    if matches!(state.main_thread.state.as_str(), "hung" | "stalled") {
+        return "Unity 主线程无响应，编译请求未能继续处理。".to_string();
+    }
+    if matches!(state.channel.control_pipe.as_str(), "busy" | "timeout") {
+        return "Unity 控制通道持续繁忙，未能读取本次重编译结果。".to_string();
+    }
+    if state.main_thread.state == "active" {
+        return "Unity 主线程持续处理导入、刷新或其他 Editor 工作，未能确认本次重编译完成。"
+            .to_string();
+    }
+    if state.editor_mode.value == "editing" && state.main_thread.state == "idle" {
+        return "Unity 已恢复编辑状态，但本次编译请求没有产生可确认的完成结果。".to_string();
+    }
+    "Unity 未能在等待上限内返回可确认的重编译结果。".to_string()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecompileStartAck {
+    Started,
+    Unconfirmed,
+    ReloadBoundary,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecompilePollState {
+    Waiting,
+    Completed,
+    Transient,
+}
+
+fn classify_recompile_start_response(resp: &PipeResponse) -> Result<RecompileStartAck, String> {
+    if resp.ok {
+        return match resp.message.as_deref() {
+            Some("recompile_started") => Ok(RecompileStartAck::Started),
+            Some(other) => Err(format!(
+                "Unity 没有开始编译。启动确认返回了意外状态：{other}"
+            )),
+            None => Err("Unity 没有开始编译。未收到 recompile_started 启动确认。".to_string()),
+        };
+    }
+
+    let error = resp
+        .error
+        .clone()
+        .unwrap_or_else(|| "Unity 没有开始编译。启动确认失败。".to_string());
+    if is_reload_boundary_broker_error(&error) {
+        Ok(RecompileStartAck::ReloadBoundary)
+    } else {
+        Err(error)
+    }
+}
+
+async fn request_recompile_and_wait_for_start(
+    project_path: &str,
+    tracked_dirty_paths: &str,
+) -> Result<RecompileStartAck, String> {
+    let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
+    let request = send_message_without_timeout_with_acceptance(
+        project_path,
+        "request_recompile",
+        tracked_dirty_paths,
+        acceptance_tx,
+    );
+    tokio::pin!(request);
+
+    let started_at = Instant::now();
+    let deadline = tokio::time::sleep(RECOMPILE_START_CONFIRM_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut sample_tick = tokio::time::interval(RECOMPILE_START_STATE_SAMPLE_INTERVAL);
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut acceptance_pending = true;
+    let mut diagnostics = RecompileStartDiagnostics::default();
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut request => {
+                let classified = match result {
+                    Ok(resp) => classify_recompile_start_response(&resp),
+                    Err(error) if is_reload_boundary_broker_error(&error) => {
+                        Ok(RecompileStartAck::ReloadBoundary)
+                    }
+                    Err(error) => Err(error),
+                };
+                return match classified {
+                    Ok(ack) => Ok(ack),
+                    Err(error) => {
+                        let state = state_probe::semantic_state_for_project(project_path).await;
+                        diagnostics.record_state(started_at.elapsed().as_secs(), &state);
+                        eprintln!(
+                            "[Locus] request_recompile start failed:\n{}",
+                            diagnostics.format_log(&error)
+                        );
+                        Err(error)
+                    }
+                };
+            }
+            accepted = &mut acceptance_rx, if acceptance_pending => {
+                acceptance_pending = false;
+                if accepted.is_ok() {
+                    diagnostics.broker_accepted = true;
+                    eprintln!(
+                        "[Locus] native Broker accepted request_recompile after {}ms; waiting for CompilationPipeline.compilationStarted",
+                        started_at.elapsed().as_millis()
+                    );
+                }
+            }
+            _ = &mut deadline => {
+                let state = state_probe::semantic_state_for_project(project_path).await;
+                diagnostics.record_state(started_at.elapsed().as_secs(), &state);
+                eprintln!(
+                    "[Locus] request_recompile start acknowledgement exceeded {}s; switching to persisted compile-result reconciliation:\n{}",
+                    RECOMPILE_START_CONFIRM_TIMEOUT.as_secs(),
+                    diagnostics.format_log("start acknowledgement deadline reached")
+                );
+                // The editor may be blocked in AssetDatabase.Refresh ("Hold on")
+                // and raise compilationStarted after this foreground handshake
+                // window. Continue through get_compile_result: its persisted
+                // starting/pending/ok state remains authoritative even when the
+                // original response arrives too late for this request future.
+                return Ok(RecompileStartAck::Unconfirmed);
+            }
+            _ = sample_tick.tick() => {
+                let state = state_probe::semantic_state_for_project(project_path).await;
+                let elapsed_secs = started_at.elapsed().as_secs();
+                diagnostics.record_state(elapsed_secs, &state);
+                eprintln!(
+                    "[Locus] request_recompile still waiting for compilationStarted after {}s (broker_accepted={}): {}",
+                    elapsed_secs,
+                    diagnostics.broker_accepted,
+                    format_recompile_state_detail(&state)
+                );
+            }
+        }
+    }
+}
+
+fn classify_recompile_poll_response(resp: &PipeResponse) -> Result<RecompilePollState, String> {
+    if resp.ok {
+        return match resp.message.as_deref().unwrap_or_default() {
+            "starting" | "pending" => Ok(RecompilePollState::Waiting),
+            "ok" => Ok(RecompilePollState::Completed),
+            other => Err(format!("Unexpected Unity compile result: {other}")),
+        };
+    }
+
+    let error = resp
+        .error
+        .clone()
+        .unwrap_or_else(|| "Compilation failed (unknown error)".to_string());
+    if is_transient_broker_error(&error) {
+        Ok(RecompilePollState::Transient)
+    } else {
+        Err(error)
+    }
+}
+
+async fn finish_recompile_success(
+    project_path: &str,
+    unity_test_pending_seq: u64,
+) -> Result<String, String> {
+    crate::unity_type_index::invalidate_cached_type_index(project_path).await;
+    crate::unity_hotreload::coordinator::on_recompile_converged(project_path).await;
+    wait_for_unity_bridge_ready_after_recompile(project_path).await?;
+    crate::workspace::clear_unity_test_pending_sources_through(
+        project_path,
+        unity_test_pending_seq,
+    );
+    if let Err(error) = refresh_unity_type_index_after_recompile(project_path).await {
+        eprintln!(
+            "[Locus] Unity type index refresh after recompile skipped: {}",
+            error
+        );
+    }
+    Ok("Compilation succeeded, domain reload complete".to_string())
+}
+
+async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> {
     if let Err(e) = end_edit_session(project_path, "").await {
         eprintln!(
             "[Locus] failed to end edit sessions before recompile (continuing): {}",
@@ -5440,129 +5732,105 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     tracked_dirty_sources.dedup();
     let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources).join("\n");
 
-    let resp = match send_message(project_path, "request_recompile", &tracked_dirty_paths).await {
-        Ok(resp) => resp,
-        Err(error) => return finish(Err(error)),
-    };
-    let mut request_recompile_reloading = false;
-    if !resp.ok {
-        let error = resp
-            .error
-            .unwrap_or_else(|| "request_recompile failed".to_string());
-        if is_reload_boundary_broker_error(&error) {
-            request_recompile_reloading = true;
+    let mut disconnected = match request_recompile_and_wait_for_start(
+        project_path,
+        &tracked_dirty_paths,
+    )
+    .await?
+    {
+        RecompileStartAck::Started => false,
+        RecompileStartAck::Unconfirmed => {
+            eprintln!(
+                "[Locus] compilation start acknowledgement was not observed; reconciling persisted compile state"
+            );
+            false
+        }
+        RecompileStartAck::ReloadBoundary => {
             transport::disconnect(project_path).await;
             eprintln!(
-                "[Locus] request_recompile hit native reload boundary, waiting for reconnect: {}",
-                error
+                "[Locus] request_recompile crossed a domain reload before the start acknowledgement; waiting for persisted state"
             );
-        } else {
-            return finish(Err(error));
+            true
         }
-    }
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let max_wait = Duration::from_secs(120);
-    let start = std::time::Instant::now();
-    let mut disconnected = request_recompile_reloading;
+    };
 
     loop {
-        if start.elapsed() > max_wait {
-            return finish(Err("Compilation timed out (120s)".to_string()));
-        }
-
         if disconnected {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            match send_message(project_path, "ping", "").await {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match send_message_with_timeout(project_path, "ping", "", RECOMPILE_POLL_TIMEOUT).await
+            {
                 Ok(resp) if resp.ok => {
                     eprintln!("[Locus] Unity reconnected after domain reload");
-                    crate::unity_type_index::invalidate_cached_type_index(project_path).await;
-                    crate::unity_hotreload::coordinator::on_recompile_converged(project_path).await;
-                    if let Err(error) =
-                        wait_for_unity_bridge_ready_after_recompile(project_path).await
-                    {
-                        return finish(Err(error));
-                    }
-                    crate::workspace::clear_unity_test_pending_sources_through(
-                        project_path,
-                        unity_test_pending_seq,
-                    );
-                    if let Err(error) = refresh_unity_type_index_after_recompile(project_path).await
-                    {
-                        eprintln!(
-                            "[Locus] Unity type index refresh after recompile skipped: {}",
-                            error
-                        );
-                    }
-                    return finish(Ok(
-                        "Compilation succeeded, domain reload complete".to_string()
-                    ));
+                    disconnected = false;
                 }
                 _ => continue,
             }
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
-        match send_message(project_path, "get_compile_result", "").await {
-            Ok(resp) => {
-                if resp.ok {
-                    let msg = resp.message.unwrap_or_default();
-                    match msg.as_str() {
-                        "pending" => continue,
-                        "ok" => {
-                            crate::unity_type_index::invalidate_cached_type_index(project_path)
-                                .await;
-                            crate::unity_hotreload::coordinator::on_recompile_converged(
-                                project_path,
-                            )
-                            .await;
-                            if let Err(error) =
-                                wait_for_unity_bridge_ready_after_recompile(project_path).await
-                            {
-                                return finish(Err(error));
-                            }
-                            crate::workspace::clear_unity_test_pending_sources_through(
-                                project_path,
-                                unity_test_pending_seq,
-                            );
-                            if let Err(error) =
-                                refresh_unity_type_index_after_recompile(project_path).await
-                            {
-                                eprintln!(
-                                    "[Locus] Unity type index refresh after recompile skipped: {}",
-                                    error
-                                );
-                            }
-                            return finish(Ok(
-                                "Compilation succeeded, domain reload complete".to_string()
-                            ));
-                        }
-                        other => {
-                            eprintln!("[Locus] unexpected compile result: {}", other);
-                            continue;
-                        }
-                    }
-                } else {
-                    let error = resp
-                        .error
-                        .unwrap_or_else(|| "Compilation failed (unknown error)".to_string());
-                    // Native broker is up but the managed executor is mid
-                    // domain reload: keep polling — the result resolves once the
-                    // new domain re-registers.
-                    if is_transient_broker_error(&error) {
-                        continue;
-                    }
-                    return finish(Err(error));
+        match send_message_with_timeout(
+            project_path,
+            "get_compile_result",
+            "",
+            RECOMPILE_POLL_TIMEOUT,
+        )
+        .await
+        {
+            Ok(resp) => match classify_recompile_poll_response(&resp)? {
+                RecompilePollState::Waiting | RecompilePollState::Transient => continue,
+                RecompilePollState::Completed => {
+                    return finish_recompile_success(project_path, unity_test_pending_seq).await
                 }
-            }
-            Err(_) => {
+            },
+            Err(error) => {
                 disconnected = true;
                 transport::disconnect(project_path).await;
-                eprintln!("[Locus] Unity disconnected during recompile, waiting for reconnect...");
+                eprintln!(
+                    "[Locus] Unity compile-result polling lost the bridge ({error}); reconnecting before re-checking persisted state"
+                );
             }
         }
     }
+}
+
+/// Trigger a Unity recompile and wait until the requested compilation starts,
+/// finishes, and loads into a new AppDomain. `request_recompile` acknowledges
+/// only from Unity's `CompilationPipeline.compilationStarted` event. A pipe
+/// reconnect is connectivity evidence only; completion still requires the
+/// persisted `get_compile_result == ok` state from the reloaded domain.
+pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let _recompile_wait_guard = UnityRecompileWaitGuard::new(project_path);
+    let hook_effective = background_hook_effective_for_project(project_path).await;
+    let prev_foreground = if hook_effective {
+        None
+    } else {
+        focus::bring_unity_to_foreground()
+    };
+
+    let result = match tokio::time::timeout(
+        RECOMPILE_TOTAL_TIMEOUT,
+        recompile_and_wait_inner(project_path),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let state = state_probe::semantic_state_for_project(project_path).await;
+            eprintln!(
+                "[Locus] Unity recompile exceeded {}s: {}",
+                RECOMPILE_TOTAL_TIMEOUT.as_secs(),
+                format_recompile_state_detail(&state)
+            );
+            Err(recompile_timeout_reason(&state))
+        }
+    };
+
+    if let Some(hwnd) = prev_foreground {
+        focus::restore_foreground(hwnd);
+    }
+    result
 }
 
 /// C# source written by [`run_recompile_probe`]. `__CLASS__`/`__STAMP__` are
@@ -6004,12 +6272,15 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
+        classify_recompile_poll_response, classify_recompile_start_response,
         is_transient_broker_error, native_background_hook_markers_present,
         parse_unity_hub_editor_locations, pipe_response_transient_broker_error,
         play_mode_target_status, read_project_unity_version, relative_asset_paths,
         requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
-        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
-        UnityEditorProcessState, UNITY_EDITOR_STATUS_EDITING, UNITY_EDITOR_STATUS_PLAYING,
+        RecompilePollState, RecompileStartAck, RecompileStartDiagnostics, UnityBackgroundHookState,
+        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
+        RECOMPILE_START_STATE_HISTORY_LIMIT, UNITY_EDITOR_STATUS_EDITING,
+        UNITY_EDITOR_STATUS_PLAYING,
     };
     use serde_json::json;
 
@@ -6019,6 +6290,16 @@ mod tests {
             .find_map(|line| line.strip_prefix("result_file: "))
             .expect("result_file field")
             .to_string()
+    }
+
+    fn pipe_response(ok: bool, message: Option<&str>, error: Option<&str>) -> PipeResponse {
+        PipeResponse {
+            ok,
+            error: error.map(ToOwned::to_owned),
+            message: message.map(ToOwned::to_owned),
+            process_id: None,
+            process_path: None,
+        }
     }
 
     fn test_connection_status(project_path: &str, checked_at_ms: u64) -> UnityConnectionStatus {
@@ -6076,6 +6357,96 @@ mod tests {
             process_id: None,
             process_path: None,
         }));
+    }
+
+    #[test]
+    fn recompile_start_ack_requires_the_compilation_started_event_response() {
+        assert_eq!(
+            classify_recompile_start_response(&pipe_response(
+                true,
+                Some("recompile_started"),
+                None,
+            )),
+            Ok(RecompileStartAck::Started)
+        );
+
+        let error =
+            classify_recompile_start_response(&pipe_response(true, Some("request_queued"), None))
+                .expect_err("a queued request is not a started compilation");
+        assert!(error.contains("没有开始编译"), "{error}");
+
+        assert_eq!(
+            classify_recompile_start_response(&pipe_response(
+                false,
+                None,
+                Some("managed_reloading"),
+            )),
+            Ok(RecompileStartAck::ReloadBoundary)
+        );
+    }
+
+    #[test]
+    fn recompile_polling_requires_persisted_ok_after_reconnect() {
+        for state in ["starting", "pending"] {
+            assert_eq!(
+                classify_recompile_poll_response(&pipe_response(true, Some(state), None)),
+                Ok(RecompilePollState::Waiting)
+            );
+        }
+        assert_eq!(
+            classify_recompile_poll_response(&pipe_response(true, Some("ok"), None)),
+            Ok(RecompilePollState::Completed)
+        );
+        assert_eq!(
+            classify_recompile_poll_response(&pipe_response(
+                false,
+                None,
+                Some("managed_not_ready"),
+            )),
+            Ok(RecompilePollState::Transient)
+        );
+
+        let error = classify_recompile_poll_response(&pipe_response(
+            false,
+            None,
+            Some("Unity 没有开始编译。"),
+        ))
+        .expect_err("no compilation is terminal");
+        assert!(error.contains("没有开始编译"), "{error}");
+    }
+
+    #[test]
+    fn recompile_start_diagnostics_coalesce_stable_state_and_bound_history() {
+        let mut diagnostics = RecompileStartDiagnostics::default();
+        diagnostics.broker_accepted = true;
+        diagnostics.record_formatted_state(5, "editing".to_string(), "idle at 5s".to_string());
+        diagnostics.record_formatted_state(10, "editing".to_string(), "idle at 10s".to_string());
+
+        assert_eq!(diagnostics.samples.len(), 1);
+        assert_eq!(diagnostics.samples[0].first_elapsed_secs, 5);
+        assert_eq!(diagnostics.samples[0].last_elapsed_secs, 10);
+        let output = diagnostics.format_log("start timed out");
+        assert!(output.contains("Native Broker 已接收请求：是"), "{output}");
+        assert!(output.contains("5-10s: idle at 10s"), "{output}");
+
+        for index in 0..RECOMPILE_START_STATE_HISTORY_LIMIT + 2 {
+            diagnostics.record_formatted_state(
+                20 + index as u64,
+                format!("state-{index}"),
+                format!("detail-{index}"),
+            );
+        }
+        assert_eq!(
+            diagnostics.samples.len(),
+            RECOMPILE_START_STATE_HISTORY_LIMIT
+        );
+        assert_eq!(
+            diagnostics
+                .samples
+                .last()
+                .map(|sample| sample.signature.as_str()),
+            Some("state-7")
+        );
     }
 
     #[test]

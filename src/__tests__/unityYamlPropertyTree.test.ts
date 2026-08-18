@@ -11,13 +11,31 @@ describe("Unity YAML Property Tree", () => {
     expect(schema.parameters.required).toEqual(["path"]);
     expect(schema.parameters.properties.path).toBeDefined();
     expect(schema.parameters.properties.depth.maximum).toBe(4);
+    expect(schema.parameters.properties.max_array_items).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 1024,
+      default: 4,
+    });
     expect(schema.parameters.properties.file_path).toBeUndefined();
     expect(schema.parameters.properties.detail).toBeUndefined();
     expect(schema.description).toContain("4,000 characters");
     expect(schema.description).toContain("live Editor object graph first");
+    expect(schema.description).toContain("[source: live Editor]");
+    expect(schema.description).toContain("[source: disk YAML]");
+    expect(schema.description).toContain(
+      "Malformed live Editor responses end the tool call as errors",
+    );
     expect(schema.description).toContain("all non-array descendants");
-    expect(schema.description).toContain("at most four items");
+    expect(schema.description).toContain(
+      "`max_array_items` controls how many items each array exposes",
+    );
+    expect(schema.description).toContain(
+      "Same-named sibling instances from one Prefab",
+    );
+    expect(schema.description).toContain("annotated with their total count");
     expect(schema.description).toContain("Subasset");
+    expect(schema.description).toContain("never expose `#fileID` suffixes");
     expect(schema.description).toContain("never returns a whole raw YAML file");
   });
 
@@ -48,13 +66,25 @@ describe("Unity YAML Property Tree", () => {
       agent.indexOf("async fn execute_unity_property_tree_read"),
       agent.indexOf("fn unity_property_tree_search_options"),
     );
+    expect(readFlow).toContain("unity_property_tree_array_limit(args)");
     expect(readFlow).toContain("read_live_property_tree_with_limits");
-    expect(readFlow).toContain("read_complete_within_budget(&path, auto_expand_limit)");
+    expect(readFlow).toContain(
+      "read_complete_within_budget_and_array_limit",
+    );
     expect(
       readFlow.indexOf("read_live_property_tree_with_limits"),
     ).toBeLessThan(
-      readFlow.indexOf("read_complete_within_budget(&path, auto_expand_limit)"),
+      readFlow.indexOf("read_complete_within_budget_and_array_limit"),
     );
+    expect(readFlow).toContain(
+      "unity_property_tree_live_response_decode_failed",
+    );
+    const liveDecodeFailure = readFlow.slice(
+      readFlow.indexOf("unity_property_tree_live_response_decode_failed"),
+      readFlow.indexOf("live LocusBridge PropertyTree unavailable"),
+    );
+    expect(liveDecodeFailure).toContain("return ToolResult");
+    expect(liveDecodeFailure).toContain("is_error: true");
     expect(agent).toContain("async fn execute_unity_property_tree_search");
     expect(agent).toContain("search_live_property_tree");
   });
@@ -129,6 +159,8 @@ describe("Unity YAML Property Tree", () => {
     expect(snapshots).toContain("IsSerializedPropertyCompactValue");
     expect(snapshots).toContain("SerializedObjectReferenceDisplay");
     expect(snapshots).toContain('return "None";');
+    expect(snapshots).toContain('public string hierarchyOriginalName = "";');
+    expect(snapshots).toContain('public string prefabSource = "";');
 
     const projection = read(
       "src-tauri/src/unity_serialized_property/property_tree.rs",
@@ -140,6 +172,8 @@ describe("Unity YAML Property Tree", () => {
     expect(projection).toContain("serialized_local_reference_order");
     expect(projection).toContain("entry.children.as_slice()");
     expect(projection).toContain("if !child.name.is_empty()");
+    expect(projection).toContain("group_repeated_prefab_siblings");
+    expect(projection).toContain("[same Prefab, identical components]");
 
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     expect(agent).not.toContain("editor_eligible && !hierarchy_outline");

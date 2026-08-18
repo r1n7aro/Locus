@@ -19,7 +19,8 @@ SerializeReference、数组和写回能力。YAML 磁盘解析与 Unity Editor �
 ```json
 {
   "path": "Assets/Actions/LightNormalAttack1.asset/hitTrack/clips/4",
-  "depth": 2
+  "depth": 2,
+  "max_array_items": 4
 }
 ```
 
@@ -28,7 +29,7 @@ SerializeReference、数组和写回能力。YAML 磁盘解析与 Unity Editor �
 - 每次 Read 从请求深度开始渐进探测完整投影；紧凑树超过 4,000 字符后回到请求深度的大纲。
 - 完整输出不超过 4,000 字符时直接返回全部非数组后代；该规则同样适用于显式传入 `depth` 的调用。
 - 超过阈值后，`depth` 表示从目标节点继续展开的层数；目标节点为 0，直接子节点为 1。默认 `depth=2`，硬限制为 4。
-- 所有分支中的数组单次最多展开 4 项，任意索引仍可通过完整 path 直接读取。
+- `max_array_items` 控制所有分支中每个数组单次展开的项数，默认 4，硬上限 1,024；任意索引仍可通过完整 path 直接读取。
 
 ### Search
 
@@ -233,14 +234,14 @@ Group→Track→Clip 形成嵌套路径，没有所有者的对象作为额外�
 - `file_path + object_path` 转译为完整 `path`。
 - `path_prefix` 转译为 search `path`。
 - `max_field_depth` 转译为 `depth`。
-- `max_array_items` 固定为 4；4,000 字符以内的完整分支也保留四项预览和末尾省略量。
+- `max_array_items` 公开为 Read 参数；4,000 字符以内的完整分支与渐进大纲使用同一请求值。
 - `detail=document` 退出公开协议；原始字段通过精确 Property Tree path 获取。
 
 ## 预算
 
 - Read 的完整分支采用 4,000 字符硬阈值，投影过程中逐节点精确累计最终树文本；即将超限时立即终止并回到大纲分支。
-- 完整分支不受 `depth` 限制，数组仍受四项硬限制；共享引用与循环引用在 canonical path 处停止。
-- 大纲分支默认展开 2 层，硬上限 4 层，单个数组最多返回 4 项。
+- 完整分支不受 `depth` 限制，数组使用 `max_array_items`；共享引用与循环引用在 canonical path 处停止。
+- 大纲分支默认展开 2 层，硬上限 4 层，单个数组默认返回 4 项。
 - 单次文本在完整节点边界截断。
 - 同一模型工具轮次的 YAML read/search 结果使用总预算，公平分配给并行调用。
 - 单次文本默认最多 16,000 字符；同轮多个 YAML 调用共享 48,000 字符预算。
@@ -252,7 +253,7 @@ Group→Track→Clip 形成嵌套路径，没有所有者的对象作为额外�
 - 单 document asset 的完整紧凑树不超过 4,000 字符时直接返回全部 Property Tree。
 - C# `T`、`List<T>`、`T[]`、`SerializeReference` 与 `FormerlySerializedAs` 均能绑定。
 - 共享引用与循环引用固定指向第一次出现的 canonical path。
-- 数组第 5 项及后续项可按完整 path 直接读取；所有树输出最多预览前 4 项。
+- 数组超出 `max_array_items` 的项可按完整 path 直接读取；所有树输出默认预览前 4 项。
 - search 返回的每个 path 均可原样交给 read。
 - 主资产 Read 在独立 `Subassets` 分节按首次序列化引用列出全部同文件对象；循环、共享引用、同名、空名和 32 项以上目录保持稳定且有界。
 - Scene/Prefab 使用同一 asset-qualified path，Prefab 根组件路径无需重复根 GameObject 名。

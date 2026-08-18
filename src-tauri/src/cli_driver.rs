@@ -3874,6 +3874,41 @@ async fn run_execute_suite(
         "E3R:42",
     )
     .await;
+    run.check_marker(
+        project,
+        "E3J anonymous JSON",
+        r#"printJson(new { Migrated = 3, MainScene = "Assets/Main.unity", EntityScene = "Assets/Entity.unity", Counts = new Dictionary<string, int> { { "Enemy", 4 } } });"#,
+        r#"{"Migrated":3,"MainScene":"Assets/Main.unity","EntityScene":"Assets/Entity.unity","Counts":{"Enemy":4}}"#,
+    )
+    .await;
+    run.check_marker(
+        project,
+        "E3J reference loop",
+        r#"var value = new Dictionary<string, object>(); value["Count"] = 7; value["Self"] = value; printJson(value);"#,
+        r#"{"$id":1,"Count":7,"Self":{"$ref":1}}"#,
+    )
+    .await;
+    run.check_marker(
+        project,
+        "E3J BFS ownership",
+        r#"var shared = new Dictionary<string, object> { { "Value", 9 } }; var deep = new Dictionary<string, object> { { "Child", shared } }; var value = new Dictionary<string, object> { { "Deep", deep }, { "Shallow", shared } }; printJson(value);"#,
+        r#"{"Deep":{"Child":{"$ref":3}},"Shallow":{"$id":3,"Value":9}}"#,
+    )
+    .await;
+    run.check_marker(
+        project,
+        "E3J deferred enumerable",
+        r#"IEnumerable<int> Infinite() { while (true) yield return 1; } printJson(new { Values = Infinite() });"#,
+        r#""$deferredEnumerable":"#,
+    )
+    .await;
+    run.check_marker(
+        project,
+        "E3J nested Unity object",
+        r#"var go = new GameObject("LocusPrintJsonProbe"); try { printJson(new { UnityObject = go }); } finally { UnityEngine.Object.DestroyImmediate(go); }"#,
+        r#""UnityObject":{"$unityObject":true,"type":"UnityEngine.GameObject","instanceId":"#,
+    )
+    .await;
     match unity_bridge::unity_execute_code_with_non_public_access(
         project,
         r#"var values = new[] { Path.GetTempPath() }.Where(path => path.Length > 0).ToArray(); print("E3IO:" + values.Length);"#,

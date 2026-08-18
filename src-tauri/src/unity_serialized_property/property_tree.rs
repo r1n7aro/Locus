@@ -172,15 +172,17 @@ struct CompleteProjectionBudget {
     chars_used: usize,
     max_depth: usize,
     max_array_items: usize,
+    array_limit: usize,
 }
 
 impl CompleteProjectionBudget {
-    fn new(char_limit: usize) -> Self {
+    fn new(char_limit: usize, array_limit: usize) -> Self {
         Self {
             char_limit,
             chars_used: 0,
             max_depth: 0,
             max_array_items: 0,
+            array_limit,
         }
     }
 
@@ -202,7 +204,7 @@ impl CompleteProjectionBudget {
         if node.is_array {
             self.max_array_items = self
                 .max_array_items
-                .max(AGENT_PROPERTY_TREE_ARRAY_LIMIT.min(node.array_size.max(0) as usize));
+                .max(self.array_limit.min(node.array_size.max(0) as usize));
         }
         true
     }
@@ -1224,7 +1226,8 @@ impl YamlPropertyTree {
             .map(|doc| doc.file_id)
             .unwrap_or_default();
 
-        let hierarchy_root = build_hierarchy_property_tree_root(asset_path, &docs, &descriptors);
+        let hierarchy_root =
+            build_hierarchy_property_tree_root(asset_path, &docs, &lines, &descriptors, guid_paths);
         let (root_owner_file_id, root) = if let Some(root) = hierarchy_root {
             (0, root)
         } else {
@@ -1249,10 +1252,94 @@ impl YamlPropertyTree {
         Ok(tree)
     }
 
+    pub fn parse_prefab_instance(
+        asset_path: &str,
+        instance_text: &str,
+        source_asset_path: &str,
+        source_text: &str,
+        project_root: Option<&Path>,
+        guid_paths: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let instance_docs = crate::unity_yaml::parse_yaml_docs_str(instance_text);
+        let instance_lines = instance_text.lines().collect::<Vec<_>>();
+        let instance =
+            crate::unity_yaml::extract_prefab_instance_irs(&instance_docs, &instance_lines)
+                .into_iter()
+                .find(|instance| {
+                    instance_docs
+                        .iter()
+                        .any(|doc| doc.file_id == instance.local_file_id && doc.class_id == 1001)
+                })
+                .ok_or_else(|| format!("PrefabInstance is unavailable in '{}'", asset_path))?;
+
+        // Parse the source through the current asset path so every returned
+        // child remains addressable through the instance asset. The source
+        // document ids are the ids used by m_Modifications targets.
+        let mut tree = Self::parse(asset_path, source_text, project_root, guid_paths)?;
+        tree.root.is_prefab_instance = true;
+        tree.root.prefab_source = source_asset_path.to_string();
+
+        for property_override in &instance.property_overrides {
+            let Some(document) = tree
+                .documents
+                .get_mut(&property_override.target.source_file_id)
+            else {
+                continue;
+            };
+            apply_disk_prefab_property_override(&mut document.root, property_override, guid_paths);
+        }
+
+        let removed_ids = instance
+            .removed_components
+            .iter()
+            .chain(instance.removed_game_objects.iter())
+            .map(|removed| removed.target.source_file_id)
+            .collect::<HashSet<_>>();
+        if !removed_ids.is_empty() {
+            remove_prefab_source_nodes(&mut tree.root, &removed_ids);
+            tree.documents
+                .retain(|file_id, _| !removed_ids.contains(file_id));
+        }
+
+        // New GameObjects/components are ordinary documents in the instance
+        // YAML. Preserve the hierarchy nodes produced from those documents
+        // while keeping PrefabInstance/m_Modification itself hidden.
+        if let Ok(instance_tree) = Self::parse(asset_path, instance_text, project_root, guid_paths)
+        {
+            for child in instance_tree.root.children {
+                if is_game_object_hierarchy_node(&child) {
+                    tree.root.children.push(child);
+                }
+            }
+            for (file_id, document) in instance_tree.documents {
+                tree.documents.entry(file_id).or_insert(document);
+            }
+            make_sibling_names_unique(&mut tree.root.children);
+        }
+
+        let source_docs = crate::unity_yaml::parse_yaml_docs_str(source_text);
+        let source_hierarchy = crate::unity_yaml::build_go_tree(&source_docs);
+        let hierarchy_by_id = flatten_hierarchy_nodes_by_id(&source_hierarchy);
+        refresh_prefab_hierarchy_snapshots(&mut tree.root, &tree.documents, &hierarchy_by_id);
+        tree.root.has_children = !tree.root.children.is_empty();
+        tree.root.visible_child_count = tree.root.children.len() as i32;
+        tree.canonical_paths = tree.compute_canonical_paths();
+        Ok(tree)
+    }
+
     pub fn read(
         &self,
         path: &PropertyTreePath,
         requested_depth: usize,
+    ) -> Result<UnitySerializedPropertySnapshot, String> {
+        self.read_with_array_limit(path, requested_depth, AGENT_PROPERTY_TREE_ARRAY_LIMIT)
+    }
+
+    pub fn read_with_array_limit(
+        &self,
+        path: &PropertyTreePath,
+        requested_depth: usize,
+        requested_array_items: usize,
     ) -> Result<UnitySerializedPropertySnapshot, String> {
         if !self.asset_path.eq_ignore_ascii_case(&path.asset_path) {
             return Err(format!(
@@ -1261,6 +1348,9 @@ impl YamlPropertyTree {
             ));
         }
         let depth = requested_depth.min(AGENT_PROPERTY_TREE_MAX_DEPTH);
+        let array_limit = requested_array_items
+            .max(1)
+            .min(AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS);
         let cursor = self.resolve(path)?;
         let scoped_subassets = cursor.subassets;
         let mut canonical = cursor.canonical;
@@ -1274,6 +1364,7 @@ impl YamlPropertyTree {
             cursor.owner_file_id,
             &path.full_path(),
             depth,
+            array_limit,
             &mut canonical,
         );
         snapshot.subassets = scoped_subassets.to_vec();
@@ -1284,6 +1375,19 @@ impl YamlPropertyTree {
         &self,
         path: &PropertyTreePath,
         char_limit: usize,
+    ) -> Result<Option<CompletePropertyTreeRead>, String> {
+        self.read_complete_within_budget_and_array_limit(
+            path,
+            char_limit,
+            AGENT_PROPERTY_TREE_ARRAY_LIMIT,
+        )
+    }
+
+    pub fn read_complete_within_budget_and_array_limit(
+        &self,
+        path: &PropertyTreePath,
+        char_limit: usize,
+        requested_array_items: usize,
     ) -> Result<Option<CompletePropertyTreeRead>, String> {
         if char_limit == 0 {
             return Ok(None);
@@ -1303,7 +1407,10 @@ impl YamlPropertyTree {
                 .entry(PropertyInstanceId::UnityObject(cursor.owner_file_id))
                 .or_insert_with(|| cursor.owner_path.clone());
         }
-        let mut budget = CompleteProjectionBudget::new(char_limit);
+        let array_limit = requested_array_items
+            .max(1)
+            .min(AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS);
+        let mut budget = CompleteProjectionBudget::new(char_limit, array_limit);
         let Some(mut snapshot) = self.project_complete_node(
             cursor.node,
             cursor.owner_file_id,
@@ -1667,6 +1774,7 @@ impl YamlPropertyTree {
         owner_file_id: i64,
         semantic_path: &str,
         depth: usize,
+        array_limit: usize,
         canonical: &mut HashMap<PropertyInstanceId, String>,
     ) -> UnitySerializedPropertySnapshot {
         let mut projected = source.clone();
@@ -1744,7 +1852,7 @@ impl YamlPropertyTree {
         }
 
         let limit = if content.is_array {
-            AGENT_PROPERTY_TREE_ARRAY_LIMIT.min(total)
+            array_limit.min(total)
         } else {
             total
         };
@@ -1755,6 +1863,7 @@ impl YamlPropertyTree {
                 child_owner_file_id,
                 &child_path,
                 depth - 1,
+                array_limit,
                 canonical,
             ));
         }
@@ -1858,7 +1967,7 @@ impl YamlPropertyTree {
         }
 
         let limit = if content.is_array {
-            AGENT_PROPERTY_TREE_ARRAY_LIMIT.min(total)
+            budget.array_limit.min(total)
         } else {
             total
         };
@@ -2098,12 +2207,88 @@ impl SearchMatcher {
 
 pub fn format_property_tree(snapshot: &UnitySerializedPropertySnapshot) -> String {
     let mut out = String::new();
-    out.push_str(&format_node(snapshot, true));
-    out.push('\n');
+    if is_scene_property_tree_root(snapshot) {
+        out.push_str(&format_node(snapshot, true));
+        out.push('\n');
+        format_scene_hierarchy_children(snapshot, "", &mut out);
+        return out;
+    }
+
+    if snapshot.is_prefab_instance {
+        out.push_str("Prefab Instance: ");
+        out.push_str(if snapshot.semantic_path.trim().is_empty() {
+            snapshot.display_name.trim()
+        } else {
+            snapshot.semantic_path.trim()
+        });
+        out.push('\n');
+        if !snapshot.prefab_source.trim().is_empty() {
+            out.push_str("Source Prefab: ");
+            out.push_str(snapshot.prefab_source.trim());
+            out.push('\n');
+        }
+    } else {
+        out.push_str(&format_node(snapshot, true));
+        out.push('\n');
+    }
     format_children(snapshot, "", &mut out);
     format_subassets(snapshot, &mut out);
-    format_display_sections(snapshot, &mut out);
+    format_display_sections(snapshot, &mut out, snapshot.is_prefab_instance);
     out
+}
+
+fn is_scene_property_tree_root(snapshot: &UnitySerializedPropertySnapshot) -> bool {
+    snapshot.property_type.eq_ignore_ascii_case("Scene")
+        && matches!(snapshot.node_kind.as_str(), "asset" | "scene")
+}
+
+fn is_game_object_hierarchy_node(snapshot: &UnitySerializedPropertySnapshot) -> bool {
+    snapshot.property_path.is_empty()
+        && (snapshot.node_kind == "hierarchy"
+            || snapshot
+                .binding_target
+                .as_ref()
+                .map(|target| target.kind.eq_ignore_ascii_case("gameobject"))
+                .unwrap_or(false))
+}
+
+fn format_scene_hierarchy_children(
+    node: &UnitySerializedPropertySnapshot,
+    prefix: &str,
+    out: &mut String,
+) {
+    let children = node
+        .children
+        .iter()
+        .filter(|child| is_game_object_hierarchy_node(child))
+        .collect::<Vec<_>>();
+    let mut groups = Vec::<(&UnitySerializedPropertySnapshot, usize)>::new();
+    let mut group_indexes = HashMap::<(String, String, String), usize>::new();
+    for child in children {
+        if let Some(key) = repeated_prefab_fold_key(child) {
+            if let Some(index) = group_indexes.get(&key).copied() {
+                groups[index].1 += 1;
+                continue;
+            }
+            group_indexes.insert(key, groups.len());
+        }
+        groups.push((child, 1));
+    }
+
+    for (index, (child, repeated_count)) in groups.iter().enumerate() {
+        let last = index + 1 == groups.len();
+        out.push_str(prefix);
+        out.push_str(if last { "└─ " } else { "├─ " });
+        out.push_str(&format_node(child, false));
+        if *repeated_count > 1 {
+            out.push_str(" ×");
+            out.push_str(&repeated_count.to_string());
+            out.push_str(" [same Prefab, identical components]");
+        }
+        out.push('\n');
+        let next_prefix = format!("{}{}", prefix, if last { "   " } else { "│  " });
+        format_scene_hierarchy_children(child, &next_prefix, out);
+    }
 }
 
 fn format_subassets(snapshot: &UnitySerializedPropertySnapshot, out: &mut String) {
@@ -2185,12 +2370,17 @@ fn count_subasset_entries(entries: &[UnityPropertyTreeSubassetEntry]) -> usize {
         .sum()
 }
 
-fn format_display_sections(snapshot: &UnitySerializedPropertySnapshot, out: &mut String) {
+fn format_display_sections(
+    snapshot: &UnitySerializedPropertySnapshot,
+    out: &mut String,
+    skip_prefab_section: bool,
+) {
     let sections = snapshot
         .display_sections
         .iter()
         .filter(|section| {
-            !section.title.trim().is_empty()
+            (!skip_prefab_section || !section.title.eq_ignore_ascii_case("Prefab"))
+                && !section.title.trim().is_empty()
                 && section.lines.iter().any(|line| !line.trim().is_empty())
         })
         .collect::<Vec<_>>();
@@ -2362,11 +2552,17 @@ fn format_children(node: &UnitySerializedPropertySnapshot, prefix: &str, out: &m
         0
     };
     let has_array_omission = node.is_array && node.children_truncated;
-    for (index, child) in node.children.iter().enumerate() {
-        let last = index + 1 == node.children.len() && !has_array_omission;
+    let groups = group_repeated_prefab_siblings(&node.children);
+    for (index, (child, repeated_count)) in groups.iter().enumerate() {
+        let last = index + 1 == groups.len() && !has_array_omission;
         out.push_str(prefix);
         out.push_str(if last { "└─ " } else { "├─ " });
         out.push_str(&format_node(child, false));
+        if *repeated_count > 1 {
+            out.push_str(" ×");
+            out.push_str(&repeated_count.to_string());
+            out.push_str(" [same Prefab, identical components]");
+        }
         out.push('\n');
         let mut next_prefix = prefix.to_string();
         next_prefix.push_str(if last { "   " } else { "│  " });
@@ -2380,6 +2576,43 @@ fn format_children(node: &UnitySerializedPropertySnapshot, prefix: &str, out: &m
         }
         out.push('\n');
     }
+}
+
+fn group_repeated_prefab_siblings(
+    children: &[UnitySerializedPropertySnapshot],
+) -> Vec<(&UnitySerializedPropertySnapshot, usize)> {
+    let mut groups = Vec::<(&UnitySerializedPropertySnapshot, usize)>::new();
+    let mut group_indexes = HashMap::<(String, String, String), usize>::new();
+
+    for child in children {
+        let fold_key = repeated_prefab_fold_key(child);
+        if let Some(key) = fold_key {
+            if let Some(index) = group_indexes.get(&key).copied() {
+                groups[index].1 += 1;
+                continue;
+            }
+            group_indexes.insert(key, groups.len());
+        }
+        groups.push((child, 1));
+    }
+
+    groups
+}
+
+fn repeated_prefab_fold_key(
+    node: &UnitySerializedPropertySnapshot,
+) -> Option<(String, String, String)> {
+    let name = node.hierarchy_original_name.trim();
+    let prefab_source = node.hierarchy_prefab_source.trim();
+    let component_signature = node.hierarchy_component_signature.trim();
+    if name.is_empty() || prefab_source.is_empty() || component_signature.is_empty() {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        prefab_source.to_string(),
+        component_signature.to_string(),
+    ))
 }
 
 fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
@@ -2397,7 +2630,17 @@ fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
 
     if !node.canonical_path.is_empty() {
         out.push_str(" → ");
-        out.push_str(&node.canonical_path);
+        let canonical_is_current_asset_root = PropertyTreePath::parse("", &node.semantic_path)
+            .map(|path| path.asset_path == node.canonical_path)
+            .unwrap_or(false);
+        out.push_str(if canonical_is_current_asset_root {
+            "<asset root>"
+        } else {
+            &node.canonical_path
+        });
+        if node.prefab_override {
+            out.push_str(" (override)");
+        }
         return out;
     }
 
@@ -2435,6 +2678,9 @@ fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
 
     if node.children_truncated && !node.is_array {
         out.push_str(" …");
+    }
+    if node.prefab_override {
+        out.push_str(" (override)");
     }
     out
 }
@@ -2539,7 +2785,11 @@ fn build_snapshot(
         let internal = reference.guid.is_none()
             && reference.file_id != 0
             && descriptors.contains_key(&reference.file_id);
-        let target_descriptor = descriptors.get(&reference.file_id);
+        let target_descriptor = reference
+            .guid
+            .is_none()
+            .then(|| descriptors.get(&reference.file_id))
+            .flatten();
         let reference_target = internal.then(|| {
             let descriptor = target_descriptor.expect("checked above");
             document_target(
@@ -2553,15 +2803,12 @@ fn build_snapshot(
         } else if let Some(descriptor) = target_descriptor {
             descriptor.display_name.clone()
         } else if let Some(guid) = reference.guid.as_deref() {
-            let resolved = guid_paths
-                .get(&guid.to_ascii_lowercase())
+            let object_key = format!("{}#{}", guid.to_ascii_lowercase(), reference.file_id);
+            guid_paths
+                .get(&object_key)
+                .or_else(|| guid_paths.get(&guid.to_ascii_lowercase()))
                 .cloned()
-                .unwrap_or_else(|| format!("guid:{}", guid));
-            if reference.file_id == 0 {
-                resolved
-            } else {
-                format!("{}#{}", resolved, reference.file_id)
-            }
+                .unwrap_or_else(|| format!("guid:{}", guid))
         } else {
             format!("fileID:{}", reference.file_id)
         };
@@ -3108,7 +3355,9 @@ fn untag_yaml(value: &YamlValue) -> &YamlValue {
 fn build_hierarchy_property_tree_root(
     asset_path: &str,
     docs: &[crate::unity_yaml::YamlDoc],
+    lines: &[&str],
     descriptors: &HashMap<i64, DocumentDescriptor>,
+    guid_paths: &HashMap<String, String>,
 ) -> Option<UnitySerializedPropertySnapshot> {
     let normalized = asset_path.trim_end_matches('/');
     let lower = normalized.to_ascii_lowercase();
@@ -3121,6 +3370,13 @@ fn build_hierarchy_property_tree_root(
     if hierarchy.is_empty() {
         return None;
     }
+    let prefab_instance = if is_prefab && hierarchy.len() == 1 {
+        crate::unity_yaml::extract_prefab_instance_irs(docs, lines)
+            .into_iter()
+            .find(|instance| instance.local_file_id == hierarchy[0].file_id)
+    } else {
+        None
+    };
 
     let mut component_docs = HashMap::<i64, Vec<&crate::unity_yaml::YamlDoc>>::new();
     for doc in docs {
@@ -3134,11 +3390,18 @@ fn build_hierarchy_property_tree_root(
     for entries in component_docs.values_mut() {
         entries.sort_by_key(|doc| doc.doc_index);
     }
+    let prefab_fold_metadata = build_hierarchy_prefab_fold_metadata(docs, lines);
 
     let mut hierarchy_children = hierarchy
         .iter()
         .map(|node| {
-            build_hierarchy_game_object_snapshot(normalized, node, descriptors, &component_docs)
+            build_hierarchy_game_object_snapshot(
+                normalized,
+                node,
+                descriptors,
+                &component_docs,
+                &prefab_fold_metadata,
+            )
         })
         .collect::<Vec<_>>();
     make_sibling_names_unique(&mut hierarchy_children);
@@ -3172,6 +3435,17 @@ fn build_hierarchy_property_tree_root(
         .to_string(),
         value: serde_json::Value::String(normalized.to_string()),
         display_value: normalized.to_string(),
+        is_prefab_instance: prefab_instance.is_some(),
+        prefab_source: prefab_instance
+            .as_ref()
+            .map(|instance| {
+                let guid = crate::asset_db::types::guid_to_hex(&instance.source_prefab_guid);
+                guid_paths
+                    .get(&guid.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| format!("guid:{}", guid))
+            })
+            .unwrap_or_default(),
         editable: false,
         has_children: !children.is_empty(),
         array_size: -1,
@@ -3179,6 +3453,50 @@ fn build_hierarchy_property_tree_root(
         children,
         ..Default::default()
     })
+}
+
+#[derive(Debug, Clone)]
+struct HierarchyPrefabFoldMetadata {
+    source: String,
+    component_signature: String,
+}
+
+fn build_hierarchy_prefab_fold_metadata(
+    docs: &[crate::unity_yaml::YamlDoc],
+    lines: &[&str],
+) -> HashMap<i64, HierarchyPrefabFoldMetadata> {
+    if docs
+        .iter()
+        .filter(|doc| doc.class_id == 1001 && !doc.is_stripped)
+        .take(2)
+        .count()
+        < 2
+    {
+        return HashMap::new();
+    }
+
+    let mut metadata = HashMap::new();
+    for instance in crate::unity_yaml::extract_prefab_instance_irs(docs, lines) {
+        // Instances from one source Prefab have the same base component
+        // inventory. Disk YAML records every structural component change on
+        // the PrefabInstance, so any added/removed component keeps that
+        // instance expanded. Ordinary value/transform overrides are safe.
+        if !instance.removed_components.is_empty() || instance.added_component_count > 0 {
+            continue;
+        }
+        metadata.insert(
+            instance.local_file_id,
+            HierarchyPrefabFoldMetadata {
+                source: format!(
+                    "{}#{}",
+                    crate::asset_db::types::guid_to_hex(&instance.source_prefab_guid),
+                    instance.source_prefab_file_id
+                ),
+                component_signature: "source-prefab-components".to_string(),
+            },
+        );
+    }
+    metadata
 }
 
 fn build_asset_property_tree_root(
@@ -3443,19 +3761,26 @@ fn build_hierarchy_game_object_snapshot(
     node: &crate::unity_yaml::HierarchyNode,
     descriptors: &HashMap<i64, DocumentDescriptor>,
     component_docs: &HashMap<i64, Vec<&crate::unity_yaml::YamlDoc>>,
+    prefab_fold_metadata: &HashMap<i64, HierarchyPrefabFoldMetadata>,
 ) -> UnitySerializedPropertySnapshot {
     let mut children = Vec::new();
     if let Some(descriptor) = descriptors.get(&node.file_id) {
-        let document_name = if descriptor.type_name == "GameObject" {
-            "GameObject"
-        } else {
-            descriptor.type_name.as_str()
-        };
-        children.push(build_hierarchy_document_reference(
-            document_name,
-            asset_path,
-            descriptor,
-        ));
+        // PrefabInstance is a serialization implementation detail. Effective
+        // values come from the live Editor view; disk fallback keeps the
+        // hierarchy readable and never asks the agent to interpret
+        // m_Modification manually.
+        if descriptor.type_name != "PrefabInstance" {
+            let document_name = if descriptor.type_name == "GameObject" {
+                "GameObject"
+            } else {
+                descriptor.type_name.as_str()
+            };
+            children.push(build_hierarchy_document_reference(
+                document_name,
+                asset_path,
+                descriptor,
+            ));
+        }
     }
     if let Some(components) = component_docs.get(&node.file_id) {
         for component in components {
@@ -3469,7 +3794,13 @@ fn build_hierarchy_game_object_snapshot(
         }
     }
     children.extend(node.children.iter().map(|child| {
-        build_hierarchy_game_object_snapshot(asset_path, child, descriptors, component_docs)
+        build_hierarchy_game_object_snapshot(
+            asset_path,
+            child,
+            descriptors,
+            component_docs,
+            prefab_fold_metadata,
+        )
     }));
     make_sibling_names_unique(&mut children);
 
@@ -3482,17 +3813,25 @@ fn build_hierarchy_game_object_snapshot(
         target_type_name: Some("GameObject".to_string()),
         ..Default::default()
     };
+    let prefab_fold = prefab_fold_metadata.get(&node.file_id);
     UnitySerializedPropertySnapshot {
         property_path: String::new(),
-        node_kind: "object".to_string(),
+        node_kind: "hierarchy".to_string(),
         binding_target: Some(target),
         display_name: node.name.clone(),
         name: node.name.clone(),
+        hierarchy_original_name: prefab_fold.map(|_| node.name.clone()).unwrap_or_default(),
+        hierarchy_prefab_source: prefab_fold
+            .map(|metadata| metadata.source.clone())
+            .unwrap_or_default(),
+        hierarchy_component_signature: prefab_fold
+            .map(|metadata| metadata.component_signature.clone())
+            .unwrap_or_default(),
         property_type: "GameObject".to_string(),
         value_type: "Object".to_string(),
         field_type_full_name: "UnityEngine.GameObject".to_string(),
         value: serde_json::Value::String(node.name.clone()),
-        display_value: node.name.clone(),
+        display_value: format_disk_hierarchy_summary(node),
         editable: false,
         has_children: !children.is_empty(),
         array_size: -1,
@@ -3500,6 +3839,267 @@ fn build_hierarchy_game_object_snapshot(
         children,
         ..Default::default()
     }
+}
+
+fn format_disk_hierarchy_summary(node: &crate::unity_yaml::HierarchyNode) -> String {
+    let mut summary = if node.components.is_empty() {
+        String::new()
+    } else {
+        format!("({})", node.components.join(", "))
+    };
+    let tag = node.tag.as_deref().unwrap_or("Untagged");
+    let layer = node.layer.unwrap_or(0);
+    if !summary.is_empty() {
+        summary.push_str("  ");
+    }
+    summary.push_str(&format!("[Tag:{}, Layer:{}]", tag, layer));
+    summary
+}
+
+fn apply_disk_prefab_property_override(
+    root: &mut UnitySerializedPropertySnapshot,
+    property_override: &crate::asset_db::types::PropertyOverride,
+    guid_paths: &HashMap<String, String>,
+) {
+    if let Some(snapshot) =
+        find_snapshot_by_property_path_mut(root, &property_override.property_path)
+    {
+        apply_disk_prefab_override_value(snapshot, property_override, guid_paths);
+        return;
+    }
+
+    let Some((parent_path, component)) = property_override.property_path.rsplit_once('.') else {
+        return;
+    };
+    if !matches!(component, "x" | "y" | "z" | "w") {
+        return;
+    }
+    let Some(snapshot) = find_snapshot_by_property_path_mut(root, parent_path) else {
+        return;
+    };
+    let Some(value) = property_override.value.as_deref() else {
+        return;
+    };
+    let parsed = value
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(serde_json::Value::Number)
+        .unwrap_or_else(|| serde_json::Value::String(value.to_string()));
+    if let Some(object) = snapshot.value.as_object_mut() {
+        object.insert(component.to_string(), parsed);
+        snapshot.display_value = format_compact_json_object(object);
+        snapshot.prefab_override = true;
+    }
+}
+
+fn find_snapshot_by_property_path_mut<'a>(
+    node: &'a mut UnitySerializedPropertySnapshot,
+    property_path: &str,
+) -> Option<&'a mut UnitySerializedPropertySnapshot> {
+    if node.property_path == property_path {
+        return Some(node);
+    }
+    for child in &mut node.children {
+        if let Some(found) = find_snapshot_by_property_path_mut(child, property_path) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn apply_disk_prefab_override_value(
+    snapshot: &mut UnitySerializedPropertySnapshot,
+    property_override: &crate::asset_db::types::PropertyOverride,
+    guid_paths: &HashMap<String, String>,
+) {
+    snapshot.prefab_override = true;
+    if let Some(reference) = property_override.object_ref.as_ref() {
+        let guid = crate::asset_db::types::guid_to_hex(&reference.guid);
+        let object_key = format!("{}#{}", guid.to_ascii_lowercase(), reference.source_file_id);
+        let path = guid_paths
+            .get(&object_key)
+            .or_else(|| guid_paths.get(&guid.to_ascii_lowercase()))
+            .cloned()
+            .unwrap_or_else(|| format!("guid:{}", guid));
+        snapshot.display_value = if reference.source_file_id == 0 {
+            "null".to_string()
+        } else {
+            path
+        };
+        snapshot.value = serde_json::Value::String(snapshot.display_value.clone());
+        return;
+    }
+
+    let Some(value) = property_override.value.as_deref() else {
+        return;
+    };
+    snapshot.display_value = value.to_string();
+    snapshot.value = match snapshot.property_type.as_str() {
+        "Boolean" => serde_json::Value::Bool(matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true"
+        )),
+        "Integer" | "LayerMask" | "ArraySize" => value
+            .trim()
+            .parse::<i64>()
+            .map(|value| serde_json::Value::Number(value.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_string())),
+        "Float" => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
+        _ => serde_json::Value::String(value.to_string()),
+    };
+}
+
+fn format_compact_json_object(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut keys = object.keys().collect::<Vec<_>>();
+    keys.sort_by_key(|key| match key.as_str() {
+        "x" => 0,
+        "y" => 1,
+        "z" => 2,
+        "w" => 3,
+        _ => 4,
+    });
+    let values = keys
+        .into_iter()
+        .map(|key| {
+            let value = object.get(key).cloned().unwrap_or_default();
+            let value = match value {
+                serde_json::Value::String(value) => value,
+                serde_json::Value::Number(value) => value
+                    .as_f64()
+                    .map(|value| {
+                        if value.fract().abs() < f64::EPSILON {
+                            format!("{:.0}", value)
+                        } else {
+                            value.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| value.to_string()),
+                value => value.to_string(),
+            };
+            format!("{}: {}", key, value)
+        })
+        .collect::<Vec<_>>();
+    format!("{{{}}}", values.join(", "))
+}
+
+fn remove_prefab_source_nodes(
+    node: &mut UnitySerializedPropertySnapshot,
+    removed_ids: &HashSet<i64>,
+) {
+    node.children.retain(|child| {
+        !child
+            .binding_target
+            .as_ref()
+            .and_then(|target| target.target_file_id)
+            .map(|file_id| removed_ids.contains(&file_id))
+            .unwrap_or(false)
+            && !child
+                .reference_target
+                .as_ref()
+                .and_then(|target| target.target_file_id)
+                .map(|file_id| removed_ids.contains(&file_id))
+                .unwrap_or(false)
+    });
+    for child in &mut node.children {
+        remove_prefab_source_nodes(child, removed_ids);
+    }
+    node.has_children = !node.children.is_empty();
+    node.visible_child_count = node.children.len() as i32;
+}
+
+fn flatten_hierarchy_nodes_by_id<'a>(
+    roots: &'a [crate::unity_yaml::HierarchyNode],
+) -> HashMap<i64, &'a crate::unity_yaml::HierarchyNode> {
+    fn visit<'a>(
+        nodes: &'a [crate::unity_yaml::HierarchyNode],
+        output: &mut HashMap<i64, &'a crate::unity_yaml::HierarchyNode>,
+    ) {
+        for node in nodes {
+            output.insert(node.file_id, node);
+            visit(&node.children, output);
+        }
+    }
+
+    let mut output = HashMap::new();
+    visit(roots, &mut output);
+    output
+}
+
+fn refresh_prefab_hierarchy_snapshots(
+    node: &mut UnitySerializedPropertySnapshot,
+    documents: &HashMap<i64, YamlPropertyDocument>,
+    hierarchy_by_id: &HashMap<i64, &crate::unity_yaml::HierarchyNode>,
+) {
+    if node.node_kind == "hierarchy" {
+        if let Some(file_id) = node
+            .binding_target
+            .as_ref()
+            .and_then(|target| target.target_file_id)
+        {
+            if let Some(source_node) = hierarchy_by_id.get(&file_id) {
+                if let Some(document) = documents.get(&file_id) {
+                    if let Some(name) = find_snapshot_by_property_path(&document.root, "m_Name")
+                        .map(|snapshot| snapshot.display_value.trim())
+                        .filter(|name| !name.is_empty())
+                    {
+                        node.name = name.to_string();
+                        node.display_name = name.to_string();
+                        node.hierarchy_original_name = name.to_string();
+                    }
+                    node.display_value =
+                        format_effective_disk_hierarchy_summary(source_node, &document.root);
+                }
+            }
+        }
+    }
+    for child in &mut node.children {
+        refresh_prefab_hierarchy_snapshots(child, documents, hierarchy_by_id);
+    }
+    make_sibling_names_unique(&mut node.children);
+}
+
+fn find_snapshot_by_property_path<'a>(
+    node: &'a UnitySerializedPropertySnapshot,
+    property_path: &str,
+) -> Option<&'a UnitySerializedPropertySnapshot> {
+    if node.property_path == property_path {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_snapshot_by_property_path(child, property_path))
+}
+
+fn format_effective_disk_hierarchy_summary(
+    source_node: &crate::unity_yaml::HierarchyNode,
+    document: &UnitySerializedPropertySnapshot,
+) -> String {
+    let mut summary = if source_node.components.is_empty() {
+        String::new()
+    } else {
+        format!("({})", source_node.components.join(", "))
+    };
+    let tag = find_snapshot_by_property_path(document, "m_TagString")
+        .map(|snapshot| snapshot.display_value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .or(source_node.tag.as_deref())
+        .unwrap_or("Untagged");
+    let layer = find_snapshot_by_property_path(document, "m_Layer")
+        .and_then(|snapshot| snapshot.display_value.trim().parse::<i32>().ok())
+        .or(source_node.layer)
+        .unwrap_or(0);
+    if !summary.is_empty() {
+        summary.push_str("  ");
+    }
+    summary.push_str(&format!("[Tag:{}, Layer:{}]", tag, layer));
+    summary
 }
 
 fn build_hierarchy_document_reference(
@@ -3749,6 +4349,10 @@ fn compact_scalar(value: &str) -> String {
     let prefix: String = chars.by_ref().take(LIMIT).collect();
     if chars.next().is_some() {
         format!("{}…", prefix)
+    } else if (normalized.starts_with('{') && normalized.ends_with('}'))
+        || (normalized.starts_with('[') && normalized.ends_with(']'))
+    {
+        normalized
     } else if normalized.contains(' ') || normalized.is_empty() {
         format!("{:?}", normalized)
     } else {
@@ -3997,6 +4601,73 @@ MonoBehaviour:
     }
 
     #[test]
+    fn external_object_references_use_subasset_semantic_paths_without_file_ids() {
+        let yaml = r#"--- !u!114 &11400000
+MonoBehaviour:
+  m_Name: Holder
+  mainAsset: {fileID: 11400000, guid: aabbccdd11223344aabbccdd11223344, type: 2}
+  subAsset: {fileID: 11400001, guid: aabbccdd11223344aabbccdd11223344, type: 2}
+  unknownObject: {fileID: 11400999, guid: aabbccdd11223344aabbccdd11223344, type: 2}
+"#;
+        let guid_paths = HashMap::from([
+            (
+                "aabbccdd11223344aabbccdd11223344".to_string(),
+                "Assets/Data/ActionSet.asset".to_string(),
+            ),
+            (
+                "aabbccdd11223344aabbccdd11223344#11400000".to_string(),
+                "Assets/Data/ActionSet.asset".to_string(),
+            ),
+            (
+                "aabbccdd11223344aabbccdd11223344#11400001".to_string(),
+                "Assets/Data/ActionSet.asset/Secondary".to_string(),
+            ),
+        ]);
+        let tree = YamlPropertyTree::parse("Assets/Data/Holder.asset", yaml, None, &guid_paths)
+            .expect("parse external object references");
+
+        let main = tree
+            .read(&path("Assets/Data/Holder.asset/mainAsset"), 0)
+            .expect("read main asset reference");
+        let sub = tree
+            .read(&path("Assets/Data/Holder.asset/subAsset"), 0)
+            .expect("read subasset reference");
+        let unknown = tree
+            .read(&path("Assets/Data/Holder.asset/unknownObject"), 0)
+            .expect("read unresolved object reference");
+
+        assert_eq!(main.display_value, "Assets/Data/ActionSet.asset");
+        assert_eq!(sub.display_value, "Assets/Data/ActionSet.asset/Secondary");
+        assert_eq!(unknown.display_value, "Assets/Data/ActionSet.asset");
+        assert!(!format_property_tree(&tree.root).contains("#114"));
+    }
+
+    #[test]
+    fn digit_leading_external_guid_with_matching_local_file_id_stays_external() {
+        let yaml = r#"--- !u!114 &11400000
+MonoBehaviour:
+  m_Name: ActionSet
+  defaultAction: {fileID: 11400000, guid: 1047a07f63d775149873e2e1cc5a8d46, type: 2}
+"#;
+        let guid_paths = HashMap::from([(
+            "1047a07f63d775149873e2e1cc5a8d46#11400000".to_string(),
+            "Assets/Data/Actions/KalanIdle.asset".to_string(),
+        )]);
+        let tree = YamlPropertyTree::parse("Assets/Data/ActionSet.asset", yaml, None, &guid_paths)
+            .expect("parse digit-leading external GUID");
+
+        let reference = tree
+            .read(&path("Assets/Data/ActionSet.asset/defaultAction"), 0)
+            .expect("read external reference");
+
+        assert_eq!(
+            reference.display_value,
+            "Assets/Data/Actions/KalanIdle.asset"
+        );
+        assert!(reference.reference_target.is_none());
+    }
+
+    #[test]
     fn live_property_names_prefer_the_property_over_its_inherited_object_target() {
         let parent = UnitySerializedPropertySnapshot {
             name: "GameObject".to_string(),
@@ -4094,6 +4765,336 @@ MonoBehaviour:
         assert!(output.contains("└─ GameObject (GameObject)\n"));
         assert!(output.contains("--- Transform ---\n  World Position: {x: 1, y: 2, z: 3}"));
         assert!(!output.contains("├─ Transform\n"));
+    }
+
+    #[test]
+    fn prefab_instance_header_and_override_marker_are_inline() {
+        let root = UnitySerializedPropertySnapshot {
+            semantic_path: "Assets/Prefabs/HeroVariant.prefab".to_string(),
+            display_name: "HeroVariant".to_string(),
+            node_kind: "object".to_string(),
+            property_type: "GameObject".to_string(),
+            is_prefab_instance: true,
+            prefab_source: "Assets/Prefabs/Hero.prefab".to_string(),
+            children: vec![UnitySerializedPropertySnapshot {
+                name: "Speed".to_string(),
+                display_name: "Speed".to_string(),
+                property_type: "Float".to_string(),
+                display_value: "12".to_string(),
+                prefab_override: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = format_property_tree(&root);
+        assert!(output.starts_with(
+            "Prefab Instance: Assets/Prefabs/HeroVariant.prefab\nSource Prefab: Assets/Prefabs/Hero.prefab\n"
+        ));
+        assert!(output.contains("└─ Speed: 12 (override)"));
+    }
+
+    #[test]
+    fn scene_root_formats_only_gameobject_hierarchy_summaries() {
+        let game_object_target = UnitySerializedPropertyTarget {
+            kind: "gameobject".to_string(),
+            ..Default::default()
+        };
+        let root = UnitySerializedPropertySnapshot {
+            semantic_path: "Assets/Scenes/Arena.unity".to_string(),
+            display_name: "Arena".to_string(),
+            node_kind: "scene".to_string(),
+            property_type: "Scene".to_string(),
+            children: vec![UnitySerializedPropertySnapshot {
+                name: "Ground".to_string(),
+                display_name: "Ground".to_string(),
+                node_kind: "hierarchy".to_string(),
+                property_type: "GameObject".to_string(),
+                display_value: "(MeshFilter, MeshRenderer)  [Tag:Environment, Layer:6 (Ground)]"
+                    .to_string(),
+                binding_target: Some(game_object_target),
+                children: vec![UnitySerializedPropertySnapshot {
+                    name: "MeshRenderer".to_string(),
+                    node_kind: "object".to_string(),
+                    property_type: "MeshRenderer".to_string(),
+                    children: vec![UnitySerializedPropertySnapshot {
+                        name: "m_CastShadows".to_string(),
+                        display_value: "true".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = format_property_tree(&root);
+        assert!(output
+            .contains("└─ Ground (MeshFilter, MeshRenderer) [Tag:Environment, Layer:6 (Ground)]"));
+        assert!(!output.contains("MeshRenderer (MeshRenderer)"));
+        assert!(!output.contains("m_CastShadows"));
+    }
+
+    #[test]
+    fn disk_prefab_instance_hides_raw_modification_tree() {
+        let yaml = r#"--- !u!1001 &9000
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 1, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: HeroVariant
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+"#;
+        let guid_paths = HashMap::from([(
+            "aabbccdd11223344aabbccdd11223344".to_string(),
+            "Assets/Prefabs/Hero.prefab".to_string(),
+        )]);
+        let tree =
+            YamlPropertyTree::parse("Assets/Prefabs/HeroVariant.prefab", yaml, None, &guid_paths)
+                .expect("parse Prefab instance fallback");
+        let snapshot = tree
+            .read(&path("Assets/Prefabs/HeroVariant.prefab"), 4)
+            .expect("read Prefab instance fallback");
+        let output = format_property_tree(&snapshot);
+
+        assert!(output.starts_with(
+            "Prefab Instance: Assets/Prefabs/HeroVariant.prefab\nSource Prefab: Assets/Prefabs/Hero.prefab\n"
+        ));
+        assert!(!output.contains("m_Modification"));
+        assert!(!output.contains("m_Modifications"));
+    }
+
+    #[test]
+    fn disk_prefab_instance_merges_source_values_and_marks_overrides() {
+        let source = r#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 2}
+  m_Name: Hero
+  m_TagString: Untagged
+  m_Layer: 0
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Father: {fileID: 0}
+  m_Children:
+  - {fileID: 5}
+  m_LocalPosition: {x: 1, y: 2, z: 3}
+--- !u!1 &4
+GameObject:
+  m_Component:
+  - component: {fileID: 5}
+  m_Name: Child
+  m_TagString: Untagged
+  m_Layer: 0
+--- !u!4 &5
+Transform:
+  m_GameObject: {fileID: 4}
+  m_Father: {fileID: 2}
+  m_Children: []
+"#;
+        let instance = r#"--- !u!1001 &9000
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 1, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: HeroVariant
+      objectReference: {fileID: 0}
+    - target: {fileID: 2, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_LocalPosition.x
+      value: 9
+      objectReference: {fileID: 0}
+    - target: {fileID: 4, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: RenamedChild
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+"#;
+        let tree = YamlPropertyTree::parse_prefab_instance(
+            "Assets/Prefabs/HeroVariant.prefab",
+            instance,
+            "Assets/Prefabs/Hero.prefab",
+            source,
+            None,
+            &HashMap::new(),
+        )
+        .expect("merge Prefab instance source");
+
+        let name = tree
+            .read(
+                &path("Assets/Prefabs/HeroVariant.prefab/GameObject/m_Name"),
+                0,
+            )
+            .expect("read overridden root name");
+        assert_eq!(name.display_value, "HeroVariant");
+        assert!(name.prefab_override);
+
+        let position = tree
+            .read(
+                &path("Assets/Prefabs/HeroVariant.prefab/Transform/m_LocalPosition"),
+                0,
+            )
+            .expect("read overridden position");
+        assert_eq!(position.display_value, "{x: 9, y: 2, z: 3}");
+        assert!(position.prefab_override);
+
+        let root = tree
+            .read(&path("Assets/Prefabs/HeroVariant.prefab"), 1)
+            .expect("read merged Prefab root");
+        let output = format_property_tree(&root);
+        assert!(output.starts_with(
+            "Prefab Instance: Assets/Prefabs/HeroVariant.prefab\nSource Prefab: Assets/Prefabs/Hero.prefab\n"
+        ));
+        assert!(output.contains("RenamedChild [Tag:Untagged, Layer:0]"));
+        assert!(!output.contains("m_Modification"));
+    }
+
+    #[test]
+    fn repeated_prefab_siblings_fold_only_when_name_source_and_components_match() {
+        let make_instance = |name: &str, original_name: &str, source: &str, components: &str| {
+            UnitySerializedPropertySnapshot {
+                name: name.to_string(),
+                display_name: name.to_string(),
+                hierarchy_original_name: original_name.to_string(),
+                hierarchy_prefab_source: source.to_string(),
+                hierarchy_component_signature: components.to_string(),
+                node_kind: "hierarchy".to_string(),
+                property_type: "GameObject".to_string(),
+                ..Default::default()
+            }
+        };
+        let root = UnitySerializedPropertySnapshot {
+            semantic_path: "Assets/Scenes/Arena.unity/Wall".to_string(),
+            node_kind: "hierarchy".to_string(),
+            name: "Wall".to_string(),
+            property_type: "GameObject".to_string(),
+            children: vec![
+                make_instance("Collider", "Collider", "prefab-a", "Transform|BoxCollider"),
+                make_instance(
+                    "Collider[2]",
+                    "Collider",
+                    "prefab-a",
+                    "Transform|BoxCollider",
+                ),
+                make_instance(
+                    "Collider[3]",
+                    "Collider",
+                    "prefab-a",
+                    "Transform|BoxCollider",
+                ),
+                make_instance(
+                    "Collider[4]",
+                    "Collider",
+                    "prefab-b",
+                    "Transform|BoxCollider",
+                ),
+                make_instance(
+                    "Collider[5]",
+                    "Collider",
+                    "prefab-a",
+                    "Transform|SphereCollider",
+                ),
+                make_instance("Trigger", "Trigger", "prefab-a", "Transform|BoxCollider"),
+            ],
+            ..Default::default()
+        };
+
+        let output = format_property_tree(&root);
+        assert!(output.contains("Collider (GameObject) ×3 [same Prefab, identical components]"));
+        assert!(output.contains("Collider[4] (GameObject)"));
+        assert!(output.contains("Collider[5] (GameObject)"));
+        assert!(output.contains("Trigger (GameObject)"));
+        assert!(!output.contains("Collider[2] (GameObject)"));
+        assert!(!output.contains("Collider[3] (GameObject)"));
+    }
+
+    #[test]
+    fn disk_scene_folds_unchanged_copies_and_keeps_component_overrides_expanded() {
+        let yaml = r#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 4}
+  m_Name: Wall
+  m_IsActive: 1
+--- !u!4 &4
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Father: {fileID: 0}
+  m_RootOrder: 0
+--- !u!1001 &9001
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 4}
+    m_Modifications:
+    - target: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: Collider
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+--- !u!1001 &9002
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 4}
+    m_Modifications:
+    - target: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: Collider
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+--- !u!1001 &9003
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 4}
+    m_Modifications:
+    - target: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: Collider
+      objectReference: {fileID: 0}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+--- !u!1001 &9004
+PrefabInstance:
+  m_Modification:
+    m_TransformParent: {fileID: 4}
+    m_Modifications:
+    - target: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      propertyPath: m_Name
+      value: Collider
+      objectReference: {fileID: 0}
+    m_AddedComponents:
+    - targetCorrespondingSourceObject: {fileID: 100, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 9904}
+  m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
+"#;
+        let tree =
+            YamlPropertyTree::parse("Assets/Scenes/Repeated.unity", yaml, None, &HashMap::new())
+                .expect("parse repeated Prefab instances");
+        let snapshot = tree
+            .read(&path("Assets/Scenes/Repeated.unity/Wall"), 2)
+            .expect("read parent hierarchy");
+
+        let output = format_property_tree(&snapshot);
+        assert!(output
+            .contains("Collider [Tag:Untagged, Layer:0] ×3 [same Prefab, identical components]"));
+        assert!(output.contains("Collider[4] [Tag:Untagged, Layer:0]"));
+
+        let second = tree
+            .read(&path("Assets/Scenes/Repeated.unity/Wall/Collider[2]"), 1)
+            .expect("folded siblings keep every indexed path addressable");
+        assert_eq!(second.name, "Collider[2]");
+        assert!(!second.hierarchy_prefab_source.is_empty());
+
+        let fourth = tree
+            .read(&path("Assets/Scenes/Repeated.unity/Wall/Collider[4]"), 1)
+            .expect("component-overridden sibling remains addressable");
+        assert_eq!(fourth.name, "Collider[4]");
+        assert!(fourth.hierarchy_prefab_source.is_empty());
     }
 
     #[test]
@@ -4468,6 +5469,31 @@ MonoBehaviour:
     }
 
     #[test]
+    fn array_preview_limit_is_configurable_for_direct_array_reads() {
+        let tree = parse_tree();
+        let array_path = path("Assets/Actions/LightNormalAttack1.asset/bakedRootMotion");
+        let expanded = tree
+            .read_with_array_limit(&array_path, 1, 5)
+            .expect("read the complete array with a custom preview limit");
+
+        assert_eq!(expanded.array_size, 5);
+        assert_eq!(expanded.children.len(), 5);
+        assert!(!expanded.children_truncated);
+        assert_eq!(expanded.children[4].display_value, "4");
+
+        let complete = tree
+            .read_complete_within_budget_and_array_limit(
+                &array_path,
+                AGENT_PROPERTY_TREE_AUTO_EXPAND_CHAR_LIMIT,
+                5,
+            )
+            .expect("read complete array candidate")
+            .expect("custom array preview fits within the compact budget");
+        assert_eq!(complete.max_array_items, 5);
+        assert!(complete.output.contains("└─ 4: 4"));
+    }
+
+    #[test]
     fn array_omission_is_rendered_as_the_final_tree_child() {
         let tree = parse_tree();
         let snapshot = tree
@@ -4721,6 +5747,29 @@ Transform:
         assert!(output.contains("m_LocalPosition: {x: 1, y: 2, z: 3}"));
         assert!(output.contains("m_LocalScale: {x: 1, y: 1, z: 1}"));
         assert!(!output.contains("m_LocalPosition …"));
+    }
+
+    #[test]
+    fn disk_scene_asset_root_never_expands_component_values() {
+        let tree =
+            YamlPropertyTree::parse("Assets/Arena.unity", PREFAB_YAML, None, &HashMap::new())
+                .expect("parse scene");
+        let scene = tree
+            .read(&path("Assets/Arena.unity"), 4)
+            .expect("read scene root");
+        let scene_output = format_property_tree(&scene);
+
+        assert!(scene_output.contains("Hero (MonoBehaviour) [Tag:Untagged, Layer:0]"));
+        assert!(scene_output.contains("Child [Tag:Untagged, Layer:0]"));
+        assert!(!scene_output.contains("m_LocalPosition"));
+        assert!(!scene_output.contains("damage"));
+
+        let game_object = tree
+            .read(&path("Assets/Arena.unity/Hero"), 3)
+            .expect("read GameObject detail");
+        let game_object_output = format_property_tree(&game_object);
+        assert!(game_object_output.contains("m_LocalPosition"));
+        assert!(game_object_output.contains("damage"));
     }
 
     #[test]

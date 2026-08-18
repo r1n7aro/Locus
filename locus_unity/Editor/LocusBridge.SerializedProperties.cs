@@ -22,6 +22,12 @@ namespace Locus
             public SerializedPropertyBindingTarget referenceTarget;
             public string displayName;
             public string name;
+            public string hierarchyOriginalName = "";
+            public string hierarchyPrefabSource = "";
+            public string hierarchyComponentSignature = "";
+            public bool prefabOverride;
+            public bool isPrefabInstance;
+            public string prefabSource = "";
             public string type;
             public string valueType;
             public string fieldTypeFullName;
@@ -671,7 +677,9 @@ namespace Locus
             {
                 string name = obj.name ?? "";
                 if (!string.IsNullOrWhiteSpace(name))
-                    return path.TrimEnd('/') + "/" + name.Trim();
+                    return path.TrimEnd('/') + "/" + name.Trim()
+                        .Replace("~", "~0")
+                        .Replace("/", "~1");
             }
             return path;
         }
@@ -695,9 +703,9 @@ namespace Locus
                 return GetHierarchyPath(go) + " [GameObject]";
             }
 
-            string path = AssetDatabase.GetAssetPath(obj);
+            string path = SerializedObjectReferencePath(obj);
             if (!string.IsNullOrEmpty(path))
-                return obj.name + " (" + path + ")";
+                return path;
 
             return (obj.name ?? "") + " [" + obj.GetType().Name + "]";
         }
@@ -1013,6 +1021,7 @@ namespace Locus
                     : null,
                 displayName = prop.displayName,
                 name = prop.name,
+                prefabOverride = prop.prefabOverride,
                 type = prop.propertyType.ToString(),
                 valueType = prop.propertyType.ToString(),
                 fieldTypeFullName = FieldTypeFullName(fieldType),

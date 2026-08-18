@@ -1,6 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,9 +24,11 @@ const ilRepackDir = path.join(tmpRoot, `ilrepack.${ilRepackVersion}`);
 const ilRepackExe = path.join(ilRepackDir, "tools", "ILRepack.exe");
 const stubDir = path.join(tmpRoot, "stub");
 const stubProject = path.join(stubDir, "Locus.Json.csproj");
+const stubSource = path.join(stubDir, "LocusJson.cs");
 const stubDll = path.join(stubDir, "bin", "Release", "netstandard2.0", "Locus.Json.dll");
 const bundleOutputDir = path.join(tmpRoot, "bundle-output");
 const tmpOutputDll = path.join(bundleOutputDir, "Locus.Json.dll");
+const wrapperSource = path.join(repoRoot, "locus_json", "LocusJson.cs");
 const sourceDir = path.join(repoRoot, "third_party", `newtonsoft-json-${jsonVersion}`, "assemblies");
 const outputDir = path.join(repoRoot, "locus_unity", "Editor", "Json");
 const outputDll = path.join(outputDir, "Locus.Json.dll");
@@ -116,52 +126,7 @@ async function buildStub() {
 </Project>
 `,
   );
-  await writeFile(
-    path.join(stubDir, "LocusJson.cs"),
-    `using System;
-using System.Globalization;
-
-using Newtonsoft.Json;
-
-namespace Locus.Json
-{
-    public static class LocusJson
-    {
-        private static readonly JsonSerializerSettings Settings = new JsonSerializerSettings
-        {
-            ConstructorHandling = ConstructorHandling.AllowNonPublicDefaultConstructor,
-            Culture = CultureInfo.InvariantCulture,
-            DateParseHandling = DateParseHandling.None,
-            MetadataPropertyHandling = MetadataPropertyHandling.Ignore,
-            MissingMemberHandling = MissingMemberHandling.Ignore,
-            NullValueHandling = NullValueHandling.Include,
-            ObjectCreationHandling = ObjectCreationHandling.Replace,
-            TypeNameHandling = TypeNameHandling.None
-        };
-
-        public static object Deserialize(string json, Type type)
-        {
-            if (type == null)
-                throw new ArgumentNullException("type");
-
-            string source = string.IsNullOrWhiteSpace(json) ? "{}" : json;
-            return JsonConvert.DeserializeObject(source, type, Settings);
-        }
-
-        public static T Deserialize<T>(string json)
-        {
-            object value = Deserialize(json, typeof(T));
-            return value == null ? default(T) : (T)value;
-        }
-
-        public static string Serialize(object value)
-        {
-            return JsonConvert.SerializeObject(value, Formatting.None, Settings);
-        }
-    }
-}
-`,
-  );
+  await copyFile(wrapperSource, stubSource);
   run("dotnet", ["build", stubProject, "-c", "Release", "-v", "minimal"]);
 }
 
@@ -172,6 +137,10 @@ async function validateInputs() {
     if (!existsSync(filePath)) {
       missing.push(filePath);
     }
+  }
+
+  if (!existsSync(wrapperSource)) {
+    missing.push(wrapperSource);
   }
 
   if (missing.length > 0) {

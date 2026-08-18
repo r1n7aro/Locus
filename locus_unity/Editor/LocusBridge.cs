@@ -126,18 +126,20 @@ namespace Locus
 
         private static volatile bool _recompileRequested;
         private static volatile string _lastCompileResult;
+        private static TaskCompletionSource<PipeEnvelope> _recompileStartCompletion;
+        private static string _recompileStartRequestId;
+        private static bool _recompileStartWatchActive;
+        private static double _recompileStartIdleSince = -1;
+        // RequestScriptCompilation can remain queued behind a long asset import
+        // (the Editor shows "Hold on") even after the request reaches the main
+        // thread. Count only continuously idle editor time and leave enough room
+        // for Unity to publish CompilationPipeline.compilationStarted.
+        private const double RecompileStartIdleTimeoutSeconds = 30.0;
         private static readonly HashSet<string> _activeEditSessionOwners =
             new HashSet<string>(StringComparer.Ordinal);
         private static readonly HashSet<string> _pendingChangedAssetPaths =
             new HashSet<string>(StringComparer.Ordinal);
         private static int _autoRefreshSuppressionCount;
-
-        /// <summary>
-        /// Frame counter for detecting "no compilation started" after request_recompile.
-        /// -1 = inactive; 0+ = counting frames since recompile was requested.
-        /// </summary>
-        private static int _recompileCheckFrames = -1;
-        private const int RecompileCheckDelayFrames = 5;
 
         /// <summary>
         /// Frame counter for detecting "domain reload not triggered" after compilation succeeded.
@@ -465,6 +467,7 @@ namespace Locus
             CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
+            RestorePendingRecompileStartAfterReload();
             RegisterExtensionMessageHandler(
                 "yaml_preview_cache_selftest",
                 HandleYamlPreviewCacheSelfTest);
@@ -648,14 +651,123 @@ namespace Locus
 
         // ───────────────── Compilation events ─────────────────
 
+        private static bool IsWaitingForRequestedCompilationStart()
+        {
+            if (!SessionState.GetBool(SessionKey_RecompileInProgress, false) ||
+                !SessionState.GetBool(SessionKey_RecompilePendingCompile, false))
+                return false;
+
+            int targetEpoch = SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0);
+            return targetEpoch > 0 &&
+                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) < targetEpoch;
+        }
+
+        private static void CompleteRecompileStartResponse()
+        {
+            TaskCompletionSource<PipeEnvelope> completion = _recompileStartCompletion;
+            string requestId = _recompileStartRequestId;
+            _recompileStartCompletion = null;
+            _recompileStartRequestId = null;
+
+            if (completion != null && !string.IsNullOrEmpty(requestId))
+                completion.TrySetResult(OkResponse(requestId, "recompile_started"));
+        }
+
+        private static void FailRecompileStart(string detail)
+        {
+            const string summary = "Unity 没有开始编译。";
+            string message = string.IsNullOrEmpty(detail)
+                ? summary
+                : summary + " " + detail;
+
+            _recompileRequested = false;
+            _recompileStartWatchActive = false;
+            _recompileStartIdleSince = -1;
+            _domainReloadCheckFrames = -1;
+            SessionState.SetBool(SessionKey_RecompileInProgress, false);
+            SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
+            SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
+            SetCompileResult("error:" + message);
+
+            TaskCompletionSource<PipeEnvelope> completion = _recompileStartCompletion;
+            string requestId = _recompileStartRequestId;
+            _recompileStartCompletion = null;
+            _recompileStartRequestId = null;
+            if (completion != null && !string.IsNullOrEmpty(requestId))
+                completion.TrySetResult(ErrorResponse(requestId, message));
+
+            Debug.LogWarning("[Locus] " + message);
+        }
+
+        private static void RestorePendingRecompileStartAfterReload()
+        {
+            if (!SessionState.GetBool(SessionKey_RecompileInProgress, false) ||
+                !SessionState.GetBool(SessionKey_RecompilePendingCompile, false))
+                return;
+
+            int targetEpoch = SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0);
+            int startedEpoch = SessionState.GetInt(SessionKey_CompileEpochStarted, 0);
+            if (targetEpoch <= 0)
+            {
+                FailRecompileStart("重编译请求缺少目标编译序号。");
+                return;
+            }
+
+            if (startedEpoch >= targetEpoch)
+            {
+                FailRecompileStart("编译启动后的完成状态已中断。");
+                return;
+            }
+
+            // An earlier compilation or unrelated reload destroyed the original
+            // request handler before the requested compile started. Keep the
+            // persisted request alive in the new domain and issue it again after
+            // editor initialization finishes. Rust will reconnect and observe
+            // "starting" until this reaches compilationStarted or fails.
+            _recompileRequested = true;
+            SetCompileResult("starting");
+            _recompileStartWatchActive = true;
+            _recompileStartIdleSince = -1;
+            EditorApplication.delayCall += ResumePendingRecompileStart;
+        }
+
+        private static void ResumePendingRecompileStart()
+        {
+            if (!IsWaitingForRequestedCompilationStart())
+                return;
+
+            try
+            {
+                CompilationPipeline.RequestScriptCompilation();
+                if (_recompileStartWatchActive && !EditorApplication.isCompiling)
+                    _recompileStartIdleSince = EditorApplication.timeSinceStartup;
+            }
+            catch (Exception ex)
+            {
+                FailRecompileStart("请求编译失败：" + ex.Message);
+            }
+        }
+
         private static void OnCompilationStarted(object context)
         {
             // Epoch for the request/finish pairing — see
             // SessionKey_CompileEpochStarted. SessionState survives the domain
             // reload between a pre-request compile and the requested one.
-            SessionState.SetInt(
-                SessionKey_CompileEpochStarted,
-                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1);
+            int startedEpoch = SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1;
+            SessionState.SetInt(SessionKey_CompileEpochStarted, startedEpoch);
+
+            int targetEpoch = SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0);
+            if (SessionState.GetBool(SessionKey_RecompileInProgress, false) &&
+                targetEpoch > 0 && startedEpoch >= targetEpoch)
+            {
+                // This response is the start handshake: request_recompile does
+                // not acknowledge success before Unity raises this event for the
+                // requested epoch.
+                _recompileStartWatchActive = false;
+                _recompileStartIdleSince = -1;
+                SetCompileResult("pending");
+                CompleteRecompileStartResponse();
+            }
         }
 
         private static void OnAssemblyCompilationFinished(string assemblyPath, CompilerMessage[] messages)
@@ -699,7 +811,8 @@ namespace Locus
                 // watchdog satisfied — a pre-request compile finishing must not
                 // disarm it (the requested compile may still never start).
                 SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
-                _recompileCheckFrames = -1;
+                _recompileStartWatchActive = false;
+                _recompileStartIdleSince = -1;
             }
 
             // Snapshot + reset the per-cycle error set (collected for every
@@ -1027,33 +1140,28 @@ namespace Locus
             if (desktopConnected)
                 MaybeSendEditorUpdateEvent();
 
-            // Detect "no compilation started" after request_recompile
-            if (_recompileCheckFrames >= 0)
+            // Keep the start handshake alive until the requested epoch really
+            // enters CompilationPipeline.compilationStarted. Time only counts
+            // while the editor is continuously idle; an earlier compilation may
+            // legitimately occupy the pipeline before the requested one starts.
+            if (_recompileStartWatchActive)
             {
-                _recompileCheckFrames++;
-                if (_recompileCheckFrames >= RecompileCheckDelayFrames)
+                if (!IsWaitingForRequestedCompilationStart())
                 {
-                    _recompileCheckFrames = -1;
-                    // "Never started" now means the REQUESTED epoch never
-                    // started: a pre-request compile finishing inside this
-                    // window no longer consumes the request (see the epoch
-                    // gate), so also require the target epoch to still be
-                    // unreached before declaring a no-compile failure.
-                    if (_recompileRequested && !EditorApplication.isCompiling &&
-                        SessionState.GetInt(SessionKey_CompileEpochStarted, 0) <
-                            SessionState.GetInt(SessionKey_RecompileTargetEpoch, 0))
-                    {
-                        // Unity never started compilation — no script changes detected
-                        _recompileRequested = false;
-                        SetCompileResult("error:Unity 未检测到脚本变更，编译未触发。请确认 .cs 文件已正确写入且路径位于 Assets 目录内。");
-                        SessionState.SetBool(SessionKey_RecompileInProgress, false);
-                        // No compile/reload happened — drop any stale awaiting flag
-                        // so it cannot be consumed by a later unrelated reload, and
-                        // clear the in-flight marker so future reloads converge.
-                        SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
-                        SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
-                        _domainReloadCheckFrames = -1;
-                    }
+                    _recompileStartWatchActive = false;
+                    _recompileStartIdleSince = -1;
+                }
+                else if (EditorApplication.isCompiling)
+                {
+                    _recompileStartIdleSince = -1;
+                }
+                else
+                {
+                    double now = EditorApplication.timeSinceStartup;
+                    if (_recompileStartIdleSince < 0)
+                        _recompileStartIdleSince = now;
+                    else if (now - _recompileStartIdleSince >= RecompileStartIdleTimeoutSeconds)
+                        FailRecompileStart("编辑器在请求后保持空闲，未触发 CompilationPipeline.compilationStarted。");
                 }
             }
 
@@ -1108,7 +1216,7 @@ namespace Locus
         {
             return _activeRunStatesSession != null
                 || HasActiveExecuteCodeAsyncRuntime()
-                || _recompileCheckFrames >= 0
+                || _recompileStartWatchActive
                 || _domainReloadCheckFrames >= 0;
         }
 
@@ -1620,46 +1728,68 @@ namespace Locus
                         // ones refresh away before the compile. Older callers
                         // send an empty message — unchanged behavior.
                         string changedPathsRaw = msg.message ?? "";
+                        var startCompletion = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
-                            ReleaseAllEditSessions();
-                            lock (_recompileErrorsLock) { _recompileErrors.Clear(); }
-                            ClearCompileResult();
-                            SetCompileResult("pending");
-                            _recompileRequested = true;
+                            try
+                            {
+                                if (SessionState.GetBool(SessionKey_RecompileInProgress, false))
+                                {
+                                    startCompletion.TrySetResult(
+                                        ErrorResponse(reqId, "Unity 重编译请求正在进行中。"));
+                                    return;
+                                }
 
-                            SessionState.SetBool(SessionKey_RecompileInProgress, true);
-                            if (changedPathsRaw.Length > 0)
-                                QueueChangedAssets(changedPathsRaw.Split('\n'));
-                            FlushQueuedAssetImports();
-                            // Catch out-of-band file changes the AssetDatabase
-                            // never saw — chiefly a Locus plugin push, which
-                            // copies new/changed .cs straight into Packages
-                            // without going through ImportAsset. Without this a
-                            // newly added plugin file (no .meta yet) is absent
-                            // from the next compilation and any reference to it
-                            // fails to compile. Refresh imports them first.
-                            AssetDatabase.Refresh();
-                            _domainReloadCheckFrames = -1;
-                            // Stamp the target epoch BEFORE issuing the request:
-                            // the requested compilation is the next one to start
-                            // (a compile already in flight has already counted
-                            // its own start, so the request queues behind it).
-                            int targetEpoch =
-                                SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1;
-                            CompilationPipeline.RequestScriptCompilation();
-                            // Mark the requested compile in-flight: until a
-                            // compilation that STARTED at or after the request
-                            // finishes, any domain reload is an earlier compile's
-                            // and must not complete this request or advance the
-                            // convergence serial.
-                            SessionState.SetInt(SessionKey_RecompileTargetEpoch, targetEpoch);
-                            SessionState.SetBool(SessionKey_RecompilePendingCompile, true);
+                                lock (_recompileErrorsLock) { _recompileErrors.Clear(); }
+                                ClearCompileResult();
+                                SetCompileResult("starting");
+                                _recompileRequested = true;
+                                _recompileStartCompletion = startCompletion;
+                                _recompileStartRequestId = reqId;
+                                _recompileStartWatchActive = true;
+                                _recompileStartIdleSince = -1;
+                                _domainReloadCheckFrames = -1;
 
-                            _recompileCheckFrames = 0;
+                                // Persist the target before releasing edit
+                                // sessions or importing assets. Every operation
+                                // below may itself start compilation; that first
+                                // post-request epoch is a valid requested compile.
+                                int targetEpoch =
+                                    SessionState.GetInt(SessionKey_CompileEpochStarted, 0) + 1;
+                                SessionState.SetInt(SessionKey_RecompileTargetEpoch, targetEpoch);
+                                SessionState.SetBool(SessionKey_RecompilePendingCompile, true);
+                                SessionState.SetBool(SessionKey_RecompileInProgress, true);
+                                SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
+
+                                ReleaseAllEditSessions();
+                                if (changedPathsRaw.Length > 0)
+                                    QueueChangedAssets(changedPathsRaw.Split('\n'));
+                                FlushQueuedAssetImports();
+                                // Catch out-of-band file changes the AssetDatabase
+                                // never saw — chiefly a Locus plugin push, which
+                                // copies new/changed .cs straight into Packages
+                                // without going through ImportAsset. Without this a
+                                // newly added plugin file (no .meta yet) is absent
+                                // from the next compilation and any reference to it
+                                // fails to compile. Refresh imports them first.
+                                AssetDatabase.Refresh();
+
+                                // Refresh/import may already have started the
+                                // target epoch. Request explicitly only while it
+                                // is still pending.
+                                if (SessionState.GetInt(SessionKey_CompileEpochStarted, 0) < targetEpoch)
+                                    CompilationPipeline.RequestScriptCompilation();
+
+                                if (_recompileStartWatchActive && !EditorApplication.isCompiling)
+                                    _recompileStartIdleSince = EditorApplication.timeSinceStartup;
+                            }
+                            catch (Exception ex)
+                            {
+                                FailRecompileStart("启动请求执行失败：" + ex.Message);
+                            }
                         });
 
-                        return OkResponse(reqId, "recompile_started");
+                        return await startCompletion.Task.ConfigureAwait(false);
                     }
 
                     case "begin_edit_session":
@@ -1762,11 +1892,24 @@ namespace Locus
                             try
                             {
                                 string result = GetCompileResult();
-                                if (string.IsNullOrEmpty(result) ||
-                                    string.Equals(result, "pending", StringComparison.Ordinal) ||
-                                    string.Equals(result, "awaiting_reload", StringComparison.Ordinal))
+                                if (string.IsNullOrEmpty(result))
+                                {
+                                    tcs.SetResult(ErrorResponse(
+                                        reqId,
+                                        "Unity 没有开始编译。未找到活动重编译请求。"));
+                                    return;
+                                }
+
+                                if (string.Equals(result, "awaiting_reload", StringComparison.Ordinal))
                                 {
                                     tcs.SetResult(OkResponse(reqId, "pending"));
+                                    return;
+                                }
+
+                                if (string.Equals(result, "starting", StringComparison.Ordinal) ||
+                                    string.Equals(result, "pending", StringComparison.Ordinal))
+                                {
+                                    tcs.SetResult(OkResponse(reqId, result));
                                     return;
                                 }
 

@@ -31,6 +31,63 @@ describe("unityBridgeCompatibility", () => {
     expect(transport).toContain(".filter(|value| !value.is_empty())");
   });
 
+  it("acknowledges recompile only after Unity starts the requested epoch", () => {
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+    const requestHandler = bridge.slice(
+      bridge.indexOf('case "request_recompile":'),
+      bridge.indexOf('case "begin_edit_session":'),
+    );
+    const compilationStarted = bridge.slice(
+      bridge.indexOf("private static void OnCompilationStarted"),
+      bridge.indexOf("private static void OnAssemblyCompilationFinished"),
+    );
+
+    expect(requestHandler).toContain("return await startCompletion.Task.ConfigureAwait(false);");
+    expect(requestHandler).not.toContain('return OkResponse(reqId, "recompile_started")');
+    expect(compilationStarted).toContain('CompleteRecompileStartResponse();');
+    expect(compilationStarted).toContain('SetCompileResult("pending");');
+    expect(bridge).toContain('OkResponse(requestId, "recompile_started")');
+    expect(bridge).toContain('SetCompileResult("starting")');
+    expect(bridge).toContain("Unity 没有开始编译。");
+    expect(bridge).toContain("Unity 没有开始编译。未找到活动重编译请求。");
+    expect(bridge).toContain("RecompileStartIdleTimeoutSeconds = 30.0");
+
+    const targetPersisted = requestHandler.indexOf(
+      "SessionState.SetInt(SessionKey_RecompileTargetEpoch, targetEpoch)",
+    );
+    expect(targetPersisted).toBeGreaterThan(-1);
+    expect(targetPersisted).toBeLessThan(requestHandler.indexOf("ReleaseAllEditSessions();"));
+    expect(targetPersisted).toBeLessThan(requestHandler.indexOf("AssetDatabase.Refresh();"));
+    expect(targetPersisted).toBeLessThan(
+      requestHandler.indexOf("CompilationPipeline.RequestScriptCompilation();"),
+    );
+    expect(bridge).not.toContain("RecompileCheckDelayFrames");
+    expect(bridge).not.toContain("_recompileCheckFrames");
+  });
+
+  it("rechecks persisted compile state after a bridge reconnect", () => {
+    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const reconnectBranch = bridge.slice(
+      bridge.indexOf("if disconnected {", bridge.indexOf("async fn recompile_and_wait_inner")),
+      bridge.indexOf('"get_compile_result"', bridge.indexOf("async fn recompile_and_wait_inner")),
+    );
+
+    expect(reconnectBranch).toContain("disconnected = false;");
+    expect(reconnectBranch).not.toContain("finish_recompile_success");
+    expect(bridge).toContain('"starting" | "pending" => Ok(RecompilePollState::Waiting)');
+    expect(bridge).toContain('"ok" => Ok(RecompilePollState::Completed)');
+    expect(bridge).toContain("RECOMPILE_TOTAL_TIMEOUT");
+    expect(bridge).toContain("RECOMPILE_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90)");
+    expect(bridge).toContain("RECOMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300)");
+    expect(bridge).toContain("send_message_without_timeout_with_acceptance(");
+    expect(bridge).toContain("state_probe::semantic_state_for_project(project_path).await");
+    expect(bridge).toContain("Native Broker 已接收请求");
+    expect(bridge).toContain("main_thread=");
+    expect(bridge).toContain("RecompileStartAck::Unconfirmed");
+    expect(bridge).toContain("recompile_timeout_reason(&state)");
+    expect(bridge).not.toContain("Unity 最终状态：");
+  });
+
   it("samples Unity editor state only for confirmed bridge work or outbound updates", () => {
     const bridge = read("locus_unity/Editor/LocusBridge.cs");
     const pump = bridge.slice(

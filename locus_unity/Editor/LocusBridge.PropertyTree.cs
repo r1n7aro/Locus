@@ -501,6 +501,15 @@ namespace Locus
             if (sceneRead != null)
                 return sceneRead;
 
+            string prefabRead = TryReadPropertyTreePrefabAsset(
+                bindingId,
+                target,
+                maxDepth,
+                maxArrayItems,
+                dynamicSchema);
+            if (prefabRead != null)
+                return prefabRead;
+
             UnityEngine.Object obj = ResolvePropertyTreeObject(target);
             target = PropertyTreeTargetWithLocalFileIds(target, obj);
             var serialized = new SerializedObject(obj);
@@ -525,6 +534,7 @@ namespace Locus
                     .Select(record => record.entry)
                     .ToArray();
                 objectSnapshot.displaySections = BuildPropertyTreeDisplaySections(obj);
+                ApplyPropertyTreePrefabInstanceMetadata(obj, objectSnapshot);
                 return BuildBindingReadJson(bindingId, target, objectSnapshot, false, properties.Length > 1 ? properties : null);
             }
             if (IsPropertyTreeSyntheticHeaderProperty(obj, target))
@@ -583,7 +593,7 @@ namespace Locus
             {
                 depthLimit = 16;
             }
-            int arrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 4) : 4;
+            int arrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 1024) : 4;
             target.scenePath = scenePath;
             target.targetTypeFullName = "UnityEngine.SceneManagement.Scene";
             target.targetTypeAssembly = typeof(Scene).Assembly.GetName().Name;
@@ -680,6 +690,271 @@ namespace Locus
             };
         }
 
+        private static string TryReadPropertyTreePrefabAsset(
+            string bindingId,
+            PropertyTreeTarget target,
+            int maxDepth,
+            int maxArrayItems,
+            bool dynamicSchema)
+        {
+            if (target == null
+                || !string.Equals(
+                    (target.kind ?? "").Trim(),
+                    "asset",
+                    StringComparison.OrdinalIgnoreCase)
+                || !string.IsNullOrWhiteSpace(target.propertyPath))
+            {
+                return null;
+            }
+
+            string assetPath = ResolvePropertyTreeAssetPath(target);
+            if (!IsPrefabAssetPath(assetPath))
+                return null;
+
+            GameObject root = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (root == null)
+                throw new Exception("Prefab asset target not found: " + assetPath);
+
+            int depthLimit = maxDepth > 0 ? Math.Min(maxDepth, 16) : 4;
+            int arrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 1024) : 64;
+            target.path = assetPath;
+            target.targetTypeFullName = "UnityEngine.GameObject";
+            target.targetTypeAssembly = typeof(GameObject).Assembly.GetName().Name;
+            target.targetTypeName = "GameObject";
+
+            var rootObjectTarget = new PropertyTreeTarget
+            {
+                kind = "gameobject",
+                guid = !string.IsNullOrWhiteSpace(target.guid)
+                    ? target.guid
+                    : AssetDatabase.AssetPathToGUID(assetPath),
+                path = assetPath,
+                objectPath = "",
+                componentType = "",
+                componentIndex = 0,
+                targetTypeFullName = "UnityEngine.GameObject",
+                targetTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                targetTypeName = "GameObject",
+                propertyPath = ""
+            };
+            rootObjectTarget = PropertyTreeTargetWithLocalFileIds(rootObjectTarget, root);
+
+            var children = new List<SerializedPropertySnapshot>();
+            if (depthLimit > 0)
+            {
+                children.AddRange(SnapshotPropertyTreeObjectProperties(
+                    rootObjectTarget,
+                    root,
+                    Math.Max(1, depthLimit - 1),
+                    arrayLimit,
+                    dynamicSchema));
+                children.AddRange(BuildPropertyTreePrefabHierarchyChildren(
+                    rootObjectTarget,
+                    root.transform,
+                    "",
+                    depthLimit - 1,
+                    arrayLimit,
+                    dynamicSchema));
+            }
+
+            var snapshot = new SerializedPropertySnapshot
+            {
+                propertyPath = "",
+                semanticPath = "",
+                nodeKind = "asset",
+                canonicalPath = "",
+                bindingTarget = ToSerializedPropertyBindingTarget(target),
+                referenceTarget = null,
+                displayName = assetPath,
+                name = assetPath,
+                type = "Prefab",
+                valueType = "Object",
+                fieldTypeFullName = "UnityEngine.GameObject",
+                fieldTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                value = assetPath,
+                displayValue = assetPath,
+                editable = false,
+                hasChildren = root != null,
+                isArray = false,
+                arraySize = -1,
+                visibleChildCount = children.Count,
+                childrenTruncated = depthLimit <= 0,
+                isFlagsEnum = false,
+                enumValueIndex = -1,
+                enumValueFlag = 0,
+                enumOptions = new SerializedEnumOption[0],
+                children = children.ToArray(),
+                isManagedReference = false,
+                managedReferenceId = 0,
+                managedReferenceFullTypename = "",
+                managedReferenceFieldTypename = "",
+                managedReferenceDisplayName = "",
+                managedReferenceTypes = new SerializedManagedReferenceTypeOption[0],
+                tooltip = "",
+                header = "",
+                hasRange = false,
+                rangeMin = 0f,
+                rangeMax = 0f,
+                numberStep = 0f,
+                multiline = false,
+                minLines = 0,
+                maxLines = 0,
+                referenceTypeFullName = "UnityEngine.GameObject",
+                referenceTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                attributes = new SerializedPropertyAttributeInfo[0],
+                subassets = new PropertyTreeSubassetEntry[0],
+                displaySections = new PropertyTreeDisplaySection[0]
+            };
+            ApplyPropertyTreePrefabInstanceMetadata(root, snapshot);
+            return BuildBindingReadJson(bindingId, target, snapshot, false);
+        }
+
+        private static SerializedPropertySnapshot[] BuildPropertyTreePrefabHierarchyChildren(
+            PropertyTreeTarget prefabTarget,
+            Transform parent,
+            string parentObjectPath,
+            int remainingDepth,
+            int maxArrayItems,
+            bool dynamicSchema)
+        {
+            if (parent == null || remainingDepth < 0 || parent.childCount == 0)
+                return new SerializedPropertySnapshot[0];
+
+            var totals = new Dictionary<string, int>(StringComparer.Ordinal);
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                string name = parent.GetChild(i).name ?? "GameObject";
+                int count;
+                totals.TryGetValue(name, out count);
+                totals[name] = count + 1;
+            }
+
+            var ordinals = new Dictionary<string, int>(StringComparer.Ordinal);
+            var snapshots = new List<SerializedPropertySnapshot>(parent.childCount);
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                GameObject go = parent.GetChild(i).gameObject;
+                string segment = PropertyTreeUniqueHierarchySegment(
+                    go.name ?? "GameObject",
+                    totals,
+                    ordinals);
+                string objectPath = string.IsNullOrWhiteSpace(parentObjectPath)
+                    ? segment
+                    : parentObjectPath + "/" + segment;
+                snapshots.Add(BuildPropertyTreePrefabHierarchyNode(
+                    prefabTarget,
+                    go,
+                    segment,
+                    objectPath,
+                    remainingDepth,
+                    maxArrayItems,
+                    dynamicSchema));
+            }
+            return snapshots.ToArray();
+        }
+
+        private static SerializedPropertySnapshot BuildPropertyTreePrefabHierarchyNode(
+            PropertyTreeTarget prefabTarget,
+            GameObject go,
+            string segment,
+            string objectPath,
+            int remainingDepth,
+            int maxArrayItems,
+            bool dynamicSchema)
+        {
+            var objectTarget = new PropertyTreeTarget
+            {
+                kind = "gameobject",
+                guid = prefabTarget.guid ?? "",
+                path = prefabTarget.path ?? "",
+                objectPath = objectPath,
+                componentType = "",
+                componentIndex = 0,
+                targetTypeFullName = "UnityEngine.GameObject",
+                targetTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                targetTypeName = "GameObject",
+                propertyPath = ""
+            };
+            objectTarget = PropertyTreeTargetWithLocalFileIds(objectTarget, go);
+
+            var children = new List<SerializedPropertySnapshot>();
+            if (remainingDepth > 0)
+            {
+                children.AddRange(SnapshotPropertyTreeObjectProperties(
+                    objectTarget,
+                    go,
+                    Math.Max(1, remainingDepth - 1),
+                    maxArrayItems,
+                    dynamicSchema));
+                children.AddRange(BuildPropertyTreePrefabHierarchyChildren(
+                    prefabTarget,
+                    go.transform,
+                    objectPath,
+                    remainingDepth - 1,
+                    maxArrayItems,
+                    dynamicSchema));
+            }
+
+            bool hasChildren = go.GetComponents<Component>().Any(component => component != null)
+                || (go.transform != null && go.transform.childCount > 0);
+            string sourcePath = PrefabUtility.IsAnyPrefabInstanceRoot(go)
+                ? BuildSourcePrefabPath(go)
+                : null;
+            return new SerializedPropertySnapshot
+            {
+                propertyPath = "",
+                semanticPath = "",
+                nodeKind = "hierarchy",
+                canonicalPath = "",
+                bindingTarget = ToSerializedPropertyBindingTarget(objectTarget),
+                referenceTarget = null,
+                displayName = segment,
+                name = segment,
+                hierarchyOriginalName = go.name ?? "GameObject",
+                hierarchyPrefabSource = sourcePath ?? "",
+                hierarchyComponentSignature = !string.IsNullOrWhiteSpace(sourcePath)
+                    ? BuildPropertyTreeHierarchyComponentSignature(go)
+                    : "",
+                type = "GameObject",
+                valueType = "Object",
+                fieldTypeFullName = "UnityEngine.GameObject",
+                fieldTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                value = go.name ?? "",
+                displayValue = BuildPropertyTreeHierarchySummary(go),
+                editable = false,
+                hasChildren = hasChildren,
+                isArray = false,
+                arraySize = -1,
+                visibleChildCount = children.Count,
+                childrenTruncated = remainingDepth <= 0 && hasChildren,
+                isFlagsEnum = false,
+                enumValueIndex = -1,
+                enumValueFlag = 0,
+                enumOptions = new SerializedEnumOption[0],
+                children = children.ToArray(),
+                isManagedReference = false,
+                managedReferenceId = 0,
+                managedReferenceFullTypename = "",
+                managedReferenceFieldTypename = "",
+                managedReferenceDisplayName = "",
+                managedReferenceTypes = new SerializedManagedReferenceTypeOption[0],
+                tooltip = "",
+                header = "",
+                hasRange = false,
+                rangeMin = 0f,
+                rangeMax = 0f,
+                numberStep = 0f,
+                multiline = false,
+                minLines = 0,
+                maxLines = 0,
+                referenceTypeFullName = "UnityEngine.GameObject",
+                referenceTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
+                attributes = new SerializedPropertyAttributeInfo[0],
+                subassets = new PropertyTreeSubassetEntry[0],
+                displaySections = new PropertyTreeDisplaySection[0]
+            };
+        }
+
         private static bool PropertyTreeSceneHierarchyFitsBudget(
             GameObject[] roots,
             int charLimit)
@@ -700,7 +975,7 @@ namespace Locus
                 GameObject go = objects[i];
                 if (go == null)
                     continue;
-                string summary = BuildComponentSuffix(go) + BuildGoAnnotations(go);
+                string summary = BuildPropertyTreeHierarchySummary(go);
                 remaining -= depth * 3
                     + (go.name ?? "GameObject").Length
                     + summary.Length
@@ -805,7 +1080,19 @@ namespace Locus
                     maxArrayItems);
             }
 
-            string summary = BuildComponentSuffix(go) + BuildGoAnnotations(go);
+            string summary = BuildPropertyTreeHierarchySummary(go);
+            bool foldablePrefabInstance = PrefabUtility.IsAnyPrefabInstanceRoot(go);
+            string hierarchyPrefabSource = foldablePrefabInstance
+                ? BuildSourcePrefabPath(go)
+                : null;
+            string hierarchyComponentSignature = !string.IsNullOrEmpty(hierarchyPrefabSource)
+                ? BuildPropertyTreeHierarchyComponentSignature(go)
+                : "";
+            if (!string.IsNullOrEmpty(hierarchyPrefabSource)
+                && string.IsNullOrEmpty(hierarchyComponentSignature))
+            {
+                hierarchyComponentSignature = "Transform";
+            }
             return new SerializedPropertySnapshot
             {
                 propertyPath = "",
@@ -816,6 +1103,9 @@ namespace Locus
                 referenceTarget = null,
                 displayName = segment,
                 name = segment,
+                hierarchyOriginalName = go.name ?? "GameObject",
+                hierarchyPrefabSource = hierarchyPrefabSource ?? "",
+                hierarchyComponentSignature = hierarchyComponentSignature,
                 type = "GameObject",
                 valueType = "Object",
                 fieldTypeFullName = "UnityEngine.GameObject",
@@ -853,6 +1143,32 @@ namespace Locus
                 attributes = new SerializedPropertyAttributeInfo[0],
                 displaySections = new PropertyTreeDisplaySection[0]
             };
+        }
+
+        private static string BuildPropertyTreeHierarchyComponentSignature(GameObject go)
+        {
+            if (go == null)
+                return "";
+
+            Component[] components = go.GetComponents<Component>();
+            var identities = new List<string>(components.Length);
+            for (int i = 0; i < components.Length; i++)
+            {
+                Component component = components[i];
+                if (component == null)
+                {
+                    identities.Add("<MissingScript>");
+                    continue;
+                }
+
+                Type type = component.GetType();
+                string assemblyName = type.Assembly != null
+                    ? type.Assembly.GetName().Name
+                    : "";
+                identities.Add((type.FullName ?? type.Name) + "," + assemblyName);
+            }
+            identities.Sort(StringComparer.Ordinal);
+            return string.Join("|", identities.ToArray());
         }
 
         private static string PropertyTreeUniqueHierarchySegment(
@@ -978,7 +1294,13 @@ namespace Locus
                     go.name ?? ""));
 
                 RemovePropertyTreeProperty(remaining, PropertyTreeGameObjectActivePropertyPath);
-                semantic.Add(BuildPropertyTreeSyntheticHeaderPropertySnapshot(obj, bindingTarget));
+                SerializedPropertySnapshot activeProperty =
+                    BuildPropertyTreeSyntheticHeaderPropertySnapshot(obj, bindingTarget);
+                if (activeProperty != null)
+                    activeProperty.prefabOverride = IsPropertyTreePrefabOverride(
+                        obj,
+                        PropertyTreeGameObjectActivePropertyPath);
+                semantic.Add(activeProperty);
 
                 // Unity serializes several static-editor flags as an integer.
                 // The semantic Property Tree exposes the effective static state
@@ -988,12 +1310,16 @@ namespace Locus
                 SerializedPropertyBindingTarget staticTarget = CloneSerializedPropertyBindingTarget(bindingTarget);
                 if (staticTarget != null)
                     staticTarget.propertyPath = PropertyTreeGameObjectStaticPropertyPath;
-                semantic.Add(BuildPropertyTreeSyntheticBooleanPropertySnapshot(
+                SerializedPropertySnapshot staticProperty = BuildPropertyTreeSyntheticBooleanPropertySnapshot(
                     staticTarget,
                     PropertyTreeGameObjectStaticPropertyPath,
                     "Static",
                     go.isStatic,
-                    true));
+                    true);
+                staticProperty.prefabOverride = IsPropertyTreePrefabOverride(
+                    obj,
+                    "m_StaticEditorFlags");
+                semantic.Add(staticProperty);
 
                 string layerName = LayerMask.LayerToName(go.layer);
                 string layerDisplay = go.layer.ToString(CultureInfo.InvariantCulture);
@@ -1044,6 +1370,25 @@ namespace Locus
 
             semantic.AddRange(remaining);
             return semantic.Where(property => property != null).ToArray();
+        }
+
+        private static bool IsPropertyTreePrefabOverride(
+            UnityEngine.Object obj,
+            string propertyPath)
+        {
+            if (obj == null || string.IsNullOrWhiteSpace(propertyPath))
+                return false;
+            try
+            {
+                var serialized = new SerializedObject(obj);
+                serialized.Update();
+                SerializedProperty property = serialized.FindProperty(propertyPath);
+                return property != null && property.prefabOverride;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static SerializedPropertySnapshot TakeOrBuildPropertyTreeSemanticProperty(
@@ -1441,6 +1786,42 @@ namespace Locus
             return sections.Where(section => section != null && section.lines != null && section.lines.Length > 0).ToArray();
         }
 
+        private static void ApplyPropertyTreePrefabInstanceMetadata(
+            UnityEngine.Object obj,
+            SerializedPropertySnapshot snapshot)
+        {
+            GameObject go = obj as GameObject;
+            if (go == null || snapshot == null)
+                return;
+
+            UnityEngine.Object source = PrefabUtility.GetCorrespondingObjectFromSource(go);
+            string sourcePath = source != null
+                ? (AssetDatabase.GetAssetPath(source) ?? "").Replace('\\', '/')
+                : "";
+            bool isInstance = PrefabUtility.IsPartOfPrefabInstance(go)
+                || PrefabUtility.GetPrefabAssetType(go) == PrefabAssetType.Variant;
+            if (!isInstance || string.IsNullOrWhiteSpace(sourcePath))
+                return;
+
+            snapshot.isPrefabInstance = true;
+            snapshot.prefabSource = sourcePath;
+        }
+
+        private static string BuildPropertyTreeHierarchySummary(GameObject go)
+        {
+            if (go == null)
+                return "";
+
+            string tag = string.IsNullOrWhiteSpace(go.tag) ? "Untagged" : go.tag;
+            string layer = go.layer.ToString(CultureInfo.InvariantCulture);
+            string layerName = LayerMask.LayerToName(go.layer);
+            if (!string.IsNullOrWhiteSpace(layerName))
+                layer += " (" + layerName + ")";
+
+            return BuildComponentSuffix(go)
+                + "  [Tag:" + tag + ", Layer:" + layer + "]";
+        }
+
         private static PropertyTreeDisplaySection BuildPropertyTreeHierarchyDisplaySection(GameObject go)
         {
             var lines = new List<string>();
@@ -1559,31 +1940,46 @@ namespace Locus
                     PropertyTreeGameObjectStaticPropertyPath,
                     StringComparison.Ordinal))
                 {
-                    return BuildPropertyTreeSyntheticBooleanPropertySnapshot(
+                    SerializedPropertySnapshot staticProperty =
+                        BuildPropertyTreeSyntheticBooleanPropertySnapshot(
                         bindingTarget,
                         PropertyTreeGameObjectStaticPropertyPath,
                         "Static",
                         go.isStatic,
                         true);
+                    staticProperty.prefabOverride = IsPropertyTreePrefabOverride(
+                        obj,
+                        "m_StaticEditorFlags");
+                    return staticProperty;
                 }
-                return BuildPropertyTreeSyntheticBooleanPropertySnapshot(
+                SerializedPropertySnapshot activeProperty =
+                    BuildPropertyTreeSyntheticBooleanPropertySnapshot(
                     bindingTarget,
                     PropertyTreeGameObjectActivePropertyPath,
                     "Active",
                     go.activeSelf,
                     true);
+                activeProperty.prefabOverride = IsPropertyTreePrefabOverride(
+                    obj,
+                    PropertyTreeGameObjectActivePropertyPath);
+                return activeProperty;
             }
 
             Component component = obj as Component;
             bool enabled;
             if (component != null && TryGetPropertyTreeComponentEnabledState(component, out enabled))
             {
-                return BuildPropertyTreeSyntheticBooleanPropertySnapshot(
+                SerializedPropertySnapshot enabledProperty =
+                    BuildPropertyTreeSyntheticBooleanPropertySnapshot(
                     bindingTarget,
                     PropertyTreeComponentEnabledPropertyPath,
                     "Enabled",
                     enabled,
                     CanSetPropertyTreeComponentEnabledState(component));
+                enabledProperty.prefabOverride = IsPropertyTreePrefabOverride(
+                    obj,
+                    PropertyTreeComponentEnabledPropertyPath);
+                return enabledProperty;
             }
 
             return null;
@@ -1781,6 +2177,7 @@ namespace Locus
                 .Select(record => record.entry)
                 .ToArray();
             snapshot.displaySections = BuildPropertyTreeDisplaySections(obj);
+            ApplyPropertyTreePrefabInstanceMetadata(obj, snapshot);
 
             string rootPath = PropertyTreeExecuteRootPath(target, obj);
             var output = new StringBuilder();
