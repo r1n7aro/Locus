@@ -10,7 +10,7 @@ Locus needs a remote AI service as its reasoning engine, and the model's quality
 ## Subscription accounts
 
 - **`Claude Subscription`**: click `Sign In`, log in to your Claude account in the browser, then copy the authorization code shown after approval and paste it back into Locus. If Claude Code is installed, `Import from Claude Code` reuses its login. Once signed in, `Remaining quota` shows the `5-hour limit` and weekly windows.
-- **`ChatGPT Subscription (Device Auth)`**: click `Sign in with ChatGPT`, visit the link in your browser, and enter the code to authorize. Compatible with ChatGPT Pro / Plus plans. `Import from Codex CLI` is also available. After sign-in, quota shows the `Short window` and `Long window` remaining.
+- **`ChatGPT Subscription (Device Auth)`**: click `Sign in with ChatGPT`, visit the link in your browser, and enter the code to authorize. Compatible with ChatGPT Pro / Plus plans. `Import from Codex CLI` is also available. After sign-in, quota shows the `Short window` and `Long window` remaining. `Context window` defaults to 272K and accepts values from 16K to 1M; the automatic compaction threshold scales with it.
 - **`Claude Code CLI`**: Locus only calls the system `claude` command; Claude Code manages its own login state. If the CLI is detected but not logged in, run `claude` in a terminal and complete `/login`. `Test connection` sends a one-word probe through the CLI to verify the endpoint, credentials, and proxy a real run would use. Models from this source stay out of the model list until you turn on `Enable Claude Code CLI models` (experimental) in the `Default Models` tab.
 - **`OpenRouter`**: paste an API key. A unified gateway for Claude, GPT, Gemini, and more.
 

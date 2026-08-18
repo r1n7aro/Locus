@@ -55,7 +55,7 @@ const {
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexExtendedContext, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
+  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
@@ -304,7 +304,7 @@ watch(
           :codex-reset-credit-busy-id="codexResetCreditBusyId"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
-          :codex-extended-context="codexModelConfig.extendedContext"
+          :codex-context-window="codexModelConfig.contextWindow"
           :codex-session-title-generation="codexModelConfig.generateSessionTitles"
           :codex-auto-review="codexModelConfig.autoReview"
           :codex-prefix-cache-ttl-seconds="codexModelConfig.prefixCacheTtlSeconds"
@@ -342,7 +342,7 @@ watch(
           @consume-codex-reset-credit="consumeCodexResetCredit"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
-          @update:codex-extended-context="setCodexExtendedContext"
+          @update:codex-context-window="setCodexContextWindow"
           @update:codex-session-title-generation="setCodexSessionTitleGeneration"
           @update:codex-auto-review="setCodexAutoReview"
           @update:codex-prefix-cache-ttl-seconds="setCodexPrefixCacheTtlSeconds"

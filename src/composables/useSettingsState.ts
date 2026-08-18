@@ -81,6 +81,7 @@ import {
 } from "../services/modelCatalog";
 import { t } from "../i18n";
 import { filterVisibleProviders } from "../config/providerVisibility";
+import { normalizeCodexContextWindow } from "../config/codexContext";
 import { useCopyFeedback } from "./useCopyFeedback";
 import { setThemePreference } from "./useTheme";
 
@@ -204,7 +205,10 @@ export function useSettingsState(emit: SettingsEmit) {
     const prefixCacheTtlSeconds = Number(config?.prefixCacheTtlSeconds);
     return {
       transport: config?.transport === "http" ? "http" : "websocket",
-      extendedContext: config?.extendedContext === true,
+      contextWindow: normalizeCodexContextWindow(
+        config?.contextWindow,
+        config?.extendedContext === true,
+      ),
       generateSessionTitles: config?.generateSessionTitles === true,
       autoReview: config?.autoReview === true,
       prefixCacheTtlSeconds: Number.isFinite(prefixCacheTtlSeconds)
@@ -905,22 +909,22 @@ export function useSettingsState(emit: SettingsEmit) {
     }
   }
 
-  async function setCodexExtendedContext(enabled: boolean) {
+  async function setCodexContextWindow(value: number) {
     const next = normalizeCodexModelConfig({
       ...codexModelConfig.value,
-      extendedContext: enabled,
+      contextWindow: value,
     });
-    if (codexModelConfig.value.extendedContext === next.extendedContext) return;
+    if (codexModelConfig.value.contextWindow === next.contextWindow) return;
     const previous = codexModelConfig.value;
     codexModelConfig.value = next;
     try {
       await serviceSaveCodexModelConfig(next);
       emit("codexTransportChanged", next);
-      successMsg.value = t("settings.codex.extendedContextSaved");
+      successMsg.value = t("settings.codex.contextWindowSaved");
       setTimeout(() => { successMsg.value = ""; }, 2000);
     } catch (e) {
       const err = normalizeAppError(e);
-      useNotificationStore().addNotice("error", t("settings.codex.extendedContextSaveFailed", err.message), {
+      useNotificationStore().addNotice("error", t("settings.codex.contextWindowSaveFailed", err.message), {
         code: err.code,
         operation: "saveCodexModelConfig",
       });
@@ -1746,7 +1750,7 @@ export function useSettingsState(emit: SettingsEmit) {
     retryCodexValidation,
     copyCode,
     setCodexTransportMode,
-    setCodexExtendedContext,
+    setCodexContextWindow,
     setCodexSessionTitleGeneration,
     setCodexAutoReview,
     setCodexPrefixCacheTtlSeconds,

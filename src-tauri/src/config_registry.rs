@@ -377,15 +377,16 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
     });
 
     out.push(ConfigEntry {
-        key: "api.codex_extended_context".into(),
+        key: "api.codex_context_window".into(),
         category: "api".into(),
-        label: "Codex Extended Context".into(),
-        description: "Use the larger GPT-5.6 context window advertised by Codex and raise the automatic compaction threshold accordingly."
+        label: "Codex Context Window".into(),
+        description: "Raw GPT-5.6 context window used by Locus; defaults to 272K and supports values up to 1M."
             .into(),
-        storage: "persistent_config_dir/codex_model_config.json → extendedContext".into(),
+        storage: "persistent_config_dir/codex_model_config.json → contextWindow".into(),
         current_value: codex_model_config
             .as_ref()
-            .is_some_and(|config| config.extended_context)
+            .map(|config| config.resolved_context_window())
+            .unwrap_or(crate::commands::DEFAULT_CODEX_CONTEXT_WINDOW)
             .to_string(),
     });
 

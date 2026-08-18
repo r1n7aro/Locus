@@ -12,8 +12,8 @@ const MODELS_REFRESH_TIMEOUT_SECS: u64 = 5;
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u32 = 95;
 const CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT: u32 = 90;
-const CODEX_STANDARD_CONTEXT_WINDOW: u32 = 272_000;
-const CODEX_EXTENDED_CONTEXT_WINDOW: u32 = 372_000;
+const CODEX_MIN_CONTEXT_WINDOW: u32 = 16_000;
+const CODEX_MAX_CONTEXT_WINDOW: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodexContextLimits {
@@ -154,9 +154,8 @@ impl CodexRemoteModel {
         self.context_limits_for_window(context_window)
     }
 
-    /// Extended context is an explicit opt-in equivalent to supplying a local
-    /// model catalog whose context and maximum windows are both 372K. The
-    /// remote catalog's 272K maximum is therefore intentionally not applied.
+    /// A user-configured context window is equivalent to supplying a trusted
+    /// local model catalog override, so an older remote maximum is not applied.
     fn context_limits_with_trusted_override(
         &self,
         context_window: u32,
@@ -367,34 +366,24 @@ fn cached_context_limits_with_trusted_override(
         .and_then(|model| model.context_limits_with_trusted_override(context_window))
 }
 
-/// Applies the Locus opt-in on top of Codex model metadata. The standard mode
-/// mirrors a 272K `model_context_window` override. Extended mode is a trusted
-/// 372K catalog overlay and intentionally bypasses the remote catalog's 272K
-/// maximum, matching the known-working local Codex catalog configuration.
+/// Applies the configured GPT-5.6 raw context window on top of Codex model
+/// metadata. The explicit local value is trusted up to 1M and can therefore
+/// exceed an older remote catalog maximum.
 pub fn resolve_context_limits(
     cache_dir: Option<&Path>,
     model: &str,
-    extended_context: bool,
+    context_window: u32,
 ) -> Option<CodexContextLimits> {
     let key = normalize_model_key(model);
     if !is_gpt_5_6_model_key(&key) {
         return cache_dir.and_then(|dir| cached_context_limits(dir, &key));
     }
 
-    let cached = if extended_context {
-        cache_dir.and_then(|dir| {
-            cached_context_limits_with_trusted_override(dir, &key, CODEX_EXTENDED_CONTEXT_WINDOW)
-        })
-    } else {
-        cache_dir.and_then(|dir| {
-            cached_context_limits_with_override(dir, &key, Some(CODEX_STANDARD_CONTEXT_WINDOW))
-        })
-    };
-    let requested_context_window = if extended_context {
-        CODEX_EXTENDED_CONTEXT_WINDOW
-    } else {
-        CODEX_STANDARD_CONTEXT_WINDOW
-    };
+    let requested_context_window =
+        context_window.clamp(CODEX_MIN_CONTEXT_WINDOW, CODEX_MAX_CONTEXT_WINDOW);
+    let cached = cache_dir.and_then(|dir| {
+        cached_context_limits_with_trusted_override(dir, &key, requested_context_window)
+    });
     cached.or_else(|| {
         CodexContextLimits::from_window(
             requested_context_window,
@@ -468,15 +457,7 @@ fn remote_model_to_available(model: CodexRemoteModel, is_default: bool) -> Codex
         .filter(|value| !value.is_empty())
         .unwrap_or(slug.as_str())
         .to_string();
-    // Expose the trusted GPT-5.6 extended window to the frontend; its opt-in
-    // setting applies the standard cap while disabled.
-    let effective_context_window = if is_gpt_5_6_model_key(&normalize_model_key(&slug)) {
-        model
-            .context_limits_with_trusted_override(CODEX_EXTENDED_CONTEXT_WINDOW)
-            .map(|limits| limits.effective_context_window)
-    } else {
-        model.effective_context_window()
-    };
+    let effective_context_window = model.effective_context_window();
     let mut additional_speed_tiers = model.additional_speed_tiers.clone();
     if model.service_tiers.iter().any(|tier| {
         tier.id.eq_ignore_ascii_case("priority") || tier.name.eq_ignore_ascii_case("fast")
@@ -759,31 +740,31 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_extended_context_is_opt_in() {
+    fn gpt_5_6_context_window_is_configurable() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mut model = remote("gpt-5.6-sol", 1, "list");
         model.context_window = Some(272_000);
         model.max_context_window = Some(272_000);
         persist_cache(dir.path(), std::slice::from_ref(&model), None).expect("persist cache");
 
-        let standard = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", false)
+        let standard = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", 272_000)
             .expect("standard limits");
         assert_eq!(standard.context_window, 272_000);
         assert_eq!(standard.effective_context_window, 258_400);
         assert_eq!(standard.auto_compact_token_limit, 244_800);
 
-        let extended = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", true)
-            .expect("extended limits");
-        assert_eq!(extended.context_window, 372_000);
-        assert_eq!(extended.effective_context_window, 353_400);
-        assert_eq!(extended.auto_compact_token_limit, 334_800);
+        let custom = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", 500_000)
+            .expect("custom limits");
+        assert_eq!(custom.context_window, 500_000);
+        assert_eq!(custom.effective_context_window, 475_000);
+        assert_eq!(custom.auto_compact_token_limit, 450_000);
 
         let available = remote_models_to_available(vec![model]);
-        assert_eq!(available[0].effective_context_window, Some(353_400));
+        assert_eq!(available[0].effective_context_window, Some(258_400));
     }
 
     #[test]
-    fn gpt_5_6_extended_context_overrides_server_catalog_maximum() {
+    fn gpt_5_6_custom_context_overrides_server_catalog_maximum_and_clamps_at_1m() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mut model = remote("gpt-5.6-sol", 1, "list");
         model.context_window = Some(272_000);
@@ -791,10 +772,10 @@ mod tests {
         model.auto_compact_token_limit = Some(244_800);
         persist_cache(dir.path(), &[model], None).expect("persist cache");
 
-        let limits =
-            resolve_context_limits(Some(dir.path()), "gpt-5.6-sol", true).expect("extended limits");
-        assert_eq!(limits.context_window, 372_000);
-        assert_eq!(limits.effective_context_window, 353_400);
-        assert_eq!(limits.auto_compact_token_limit, 334_800);
+        let limits = resolve_context_limits(Some(dir.path()), "gpt-5.6-sol", 2_000_000)
+            .expect("custom limits");
+        assert_eq!(limits.context_window, 1_000_000);
+        assert_eq!(limits.effective_context_window, 950_000);
+        assert_eq!(limits.auto_compact_token_limit, 900_000);
     }
 }

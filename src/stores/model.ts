@@ -14,13 +14,16 @@ import type {
   CodexTransportMode,
 } from "../types";
 import { filterVisibleModels } from "../config/providerVisibility";
+import {
+  CODEX_DEFAULT_CONTEXT_WINDOW,
+  codexEffectiveContextWindow,
+  normalizeCodexContextWindow,
+} from "../config/codexContext";
 import { modelSupportsFastMode } from "../utils/modelDisplay";
 import { getCachedDebugMode, getDebugMode, subscribeDebugMode } from "../services/permissions";
 import { t } from "../i18n";
 
 const CLAUDE_CONTEXT_1M = 1_000_000;
-const CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW = 258_400;
-const CODEX_EXTENDED_EFFECTIVE_CONTEXT_WINDOW = 353_400;
 const CLAUDE_STANDARD_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "max"];
 const CLAUDE_XHIGH_EFFORTS: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
 
@@ -224,14 +227,9 @@ function isGpt56CodexModel(modelId: string): boolean {
   return normalized === "gpt-5.6" || normalized.startsWith("gpt-5.6-");
 }
 
-function applyCodexContextMode(model: ModelOption, extendedContext: boolean): ModelOption {
+function applyCodexContextWindow(model: ModelOption, configuredContextWindow: number): ModelOption {
   if (!isGpt56CodexModel(model.id)) return model;
-  const contextWindow = extendedContext
-    ? CODEX_EXTENDED_EFFECTIVE_CONTEXT_WINDOW
-    : Math.min(
-        model.contextWindow ?? CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
-        CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
-      );
+  const contextWindow = codexEffectiveContextWindow(configuredContextWindow);
   return contextWindow === model.contextWindow ? model : { ...model, contextWindow };
 }
 
@@ -297,7 +295,7 @@ export const useModelStore = defineStore("model", () => {
   const customProviders = ref<CustomProvider[]>([]);
   const codexRemoteModels = ref<ModelOption[]>([]);
   const codexTransport = ref<CodexTransportMode>("websocket");
-  const codexExtendedContext = ref(false);
+  const codexContextWindow = ref(CODEX_DEFAULT_CONTEXT_WINDOW);
   const codexFastMode = ref(false);
   const selectedModelId = ref("");
   const lastModelId = ref("");
@@ -319,7 +317,7 @@ export const useModelStore = defineStore("model", () => {
 
   const codexModels = computed<ModelOption[]>(() => {
     const models = codexRemoteModels.value.length > 0 ? codexRemoteModels.value : codexFallbackModels;
-    return models.map((model) => applyCodexContextMode(model, codexExtendedContext.value));
+    return models.map((model) => applyCodexContextWindow(model, codexContextWindow.value));
   });
 
   const allModels = computed<ModelOption[]>(() => {
@@ -547,10 +545,13 @@ export const useModelStore = defineStore("model", () => {
     try {
       const config = await modelService.getCodexModelConfig();
       codexTransport.value = normalizeCodexTransport(config);
-      codexExtendedContext.value = config?.extendedContext === true;
+      codexContextWindow.value = normalizeCodexContextWindow(
+        config?.contextWindow,
+        config?.extendedContext === true,
+      );
     } catch {
       codexTransport.value = "websocket";
-      codexExtendedContext.value = false;
+      codexContextWindow.value = CODEX_DEFAULT_CONTEXT_WINDOW;
     }
   }
 
@@ -683,14 +684,17 @@ export const useModelStore = defineStore("model", () => {
 
   function applyCodexModelConfig(config?: Partial<CodexModelConfig> | null) {
     codexTransport.value = normalizeCodexTransport(config);
-    codexExtendedContext.value = config?.extendedContext === true;
+    codexContextWindow.value = normalizeCodexContextWindow(
+      config?.contextWindow,
+      config?.extendedContext === true,
+    );
   }
 
   return {
     customProviders,
     codexRemoteModels,
     codexTransport,
-    codexExtendedContext,
+    codexContextWindow,
     codexFastMode,
     selectedModelId,
     lastModelId,

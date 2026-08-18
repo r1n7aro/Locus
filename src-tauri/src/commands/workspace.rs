@@ -1034,6 +1034,10 @@ pub enum CodexTransportMode {
 
 pub const DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS: u32 = 5 * 60;
 pub const DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS: u32 = 30 * 60;
+pub const DEFAULT_CODEX_CONTEXT_WINDOW: u32 = 272_000;
+pub const LEGACY_CODEX_EXTENDED_CONTEXT_WINDOW: u32 = 372_000;
+pub const MIN_CODEX_CONTEXT_WINDOW: u32 = 16_000;
+pub const MAX_CODEX_CONTEXT_WINDOW: u32 = 1_000_000;
 
 fn default_provider_prefix_cache_ttl_seconds() -> u32 {
     DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS
@@ -1054,8 +1058,11 @@ impl Default for CodexTransportMode {
 pub struct CodexModelConfig {
     #[serde(default)]
     pub transport: CodexTransportMode,
-    /// Opt in to the larger GPT-5.6 context window advertised by Codex.
-    /// Existing config files omit this field and remain on the standard window.
+    /// Raw GPT-5.6 context window requested by Locus. Missing values retain
+    /// the standard 272K default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Legacy 272K/372K switch. New saves migrate this into `context_window`.
     #[serde(default)]
     pub extended_context: bool,
     /// Generate a concise title for new chat sessions with Codex OAuth.
@@ -1074,11 +1081,33 @@ impl Default for CodexModelConfig {
     fn default() -> Self {
         Self {
             transport: CodexTransportMode::default(),
+            context_window: None,
             extended_context: false,
             generate_session_titles: false,
             auto_review: false,
             prefix_cache_ttl_seconds: default_codex_prefix_cache_ttl_seconds(),
         }
+    }
+}
+
+impl CodexModelConfig {
+    pub(crate) fn resolved_context_window(&self) -> u32 {
+        self.context_window
+            .map(|window| window.clamp(MIN_CODEX_CONTEXT_WINDOW, MAX_CODEX_CONTEXT_WINDOW))
+            .unwrap_or_else(|| {
+                if self.extended_context {
+                    LEGACY_CODEX_EXTENDED_CONTEXT_WINDOW
+                } else {
+                    DEFAULT_CODEX_CONTEXT_WINDOW
+                }
+            })
+    }
+
+    fn normalized_for_save(mut self) -> Self {
+        let context_window = self.resolved_context_window();
+        self.context_window = Some(context_window);
+        self.extended_context = false;
+        self
     }
 }
 
@@ -1151,6 +1180,7 @@ pub async fn get_codex_available_models(
 #[tauri::command]
 pub async fn save_codex_model_config(config: CodexModelConfig) -> Result<(), AppError> {
     let path = codex_model_config_path().map_err(AppError::from)?;
+    let config = config.normalized_for_save();
     let json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize codex model config: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Failed to save codex model config: {}", e))?;
@@ -3242,7 +3272,7 @@ mod tests {
         rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir, valid_custom_model_refs,
         workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
         CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel,
-        DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
+        DEFAULT_CODEX_CONTEXT_WINDOW, DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -3273,12 +3303,49 @@ mod tests {
             serde_json::from_str(r#"{"transport":"websocket"}"#).expect("codex config");
 
         assert_eq!(config.transport, CodexTransportMode::Websocket);
+        assert_eq!(config.context_window, None);
+        assert_eq!(
+            config.resolved_context_window(),
+            DEFAULT_CODEX_CONTEXT_WINDOW
+        );
         assert!(!config.extended_context);
         assert!(!config.generate_session_titles);
         assert!(!config.auto_review);
         assert_eq!(
             config.prefix_cache_ttl_seconds,
             DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
+        );
+    }
+
+    #[test]
+    fn legacy_codex_extended_context_migrates_to_372k() {
+        let config: CodexModelConfig =
+            serde_json::from_str(r#"{"transport":"websocket","extendedContext":true}"#)
+                .expect("codex config");
+
+        assert_eq!(
+            config.resolved_context_window(),
+            super::LEGACY_CODEX_EXTENDED_CONTEXT_WINDOW
+        );
+        let normalized = config.normalized_for_save();
+        assert_eq!(normalized.context_window, Some(372_000));
+        assert!(!normalized.extended_context);
+    }
+
+    #[test]
+    fn codex_context_window_is_clamped_to_supported_range() {
+        let below_minimum: CodexModelConfig =
+            serde_json::from_str(r#"{"contextWindow":1}"#).expect("codex config");
+        let above_maximum: CodexModelConfig =
+            serde_json::from_str(r#"{"contextWindow":2000000}"#).expect("codex config");
+
+        assert_eq!(
+            below_minimum.resolved_context_window(),
+            super::MIN_CODEX_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            above_maximum.resolved_context_window(),
+            super::MAX_CODEX_CONTEXT_WINDOW
         );
     }
 

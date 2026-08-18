@@ -8,8 +8,8 @@ function read(relPath: string) {
   return readFileSync(resolve(cwd, relPath), "utf8");
 }
 
-describe("Codex extended context setting", () => {
-  it("persists an opt-in switch and applies Codex-compatible context limits", () => {
+describe("Codex context window setting", () => {
+  it("persists a custom window with a 272K default and Codex-compatible limits", () => {
     const rustConfig = read("src-tauri/src/commands/workspace.rs");
     const rustModels = read("src-tauri/src/llm/codex_models.rs");
     const rustCompact = read("src-tauri/src/compact.rs");
@@ -17,27 +17,32 @@ describe("Codex extended context setting", () => {
     const settingsState = read("src/composables/useSettingsState.ts");
     const settingsView = read("src/components/SettingsView.vue");
     const apiProviders = read("src/components/settings/ApiProviders.vue");
+    const contextConfig = read("src/config/codexContext.ts");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    expect(rustConfig).toContain("pub extended_context: bool");
+    expect(rustConfig).toContain("pub context_window: Option<u32>");
+    expect(rustConfig).toContain("DEFAULT_CODEX_CONTEXT_WINDOW: u32 = 272_000");
+    expect(rustConfig).toContain("MAX_CODEX_CONTEXT_WINDOW: u32 = 1_000_000");
+    expect(rustConfig).toContain("LEGACY_CODEX_EXTENDED_CONTEXT_WINDOW");
     expect(rustConfig).toContain("#[serde(default)]");
     expect(rustModels).toContain("pub fn resolve_context_limits(");
-    expect(rustModels).toContain("CODEX_STANDARD_CONTEXT_WINDOW: u32 = 272_000");
-    expect(rustModels).toContain("CODEX_EXTENDED_CONTEXT_WINDOW: u32 = 372_000");
+    expect(rustModels).toContain("CODEX_MAX_CONTEXT_WINDOW: u32 = 1_000_000");
     expect(rustModels).toContain("context_limits_with_trusted_override");
-    expect(rustModels).toContain("intentionally bypasses the remote catalog's 272K");
+    expect(rustModels).toContain("exceed an older remote catalog maximum");
     expect(rustCompact).toContain("pub fn codex_auto_compact_token_limit(");
-    expect(rustAgent).toContain("config.extended_context");
+    expect(rustAgent).toContain("config.resolved_context_window()");
     expect(rustAgent).toContain("limits.auto_compact_token_limit");
 
-    expect(settingsState).toContain("setCodexExtendedContext");
-    expect(settingsView).toContain(":codex-extended-context=");
-    expect(settingsView).toContain("@update:codex-extended-context=");
-    expect(apiProviders).toContain("update:codexExtendedContext");
-    expect(apiProviders).toContain("<BaseSwitch");
-    expect(zh).toContain('"settings.codex.extendedContextTitle": "扩展上下文"');
-    expect(en).toContain('"settings.codex.extendedContextTitle": "Extended context"');
+    expect(contextConfig).toContain("CODEX_DEFAULT_CONTEXT_WINDOW = 272_000");
+    expect(contextConfig).toContain("CODEX_MAX_CONTEXT_WINDOW = 1_000_000");
+    expect(settingsState).toContain("setCodexContextWindow");
+    expect(settingsView).toContain(":codex-context-window=");
+    expect(settingsView).toContain("@update:codex-context-window=");
+    expect(apiProviders).toContain("update:codexContextWindow");
+    expect(apiProviders).toContain('type="number"');
+    expect(zh).toContain('"settings.codex.contextWindowTitle": "上下文窗口"');
+    expect(en).toContain('"settings.codex.contextWindowTitle": "Context window"');
   });
 
   it("keeps Codex compaction on the dedicated endpoint", () => {

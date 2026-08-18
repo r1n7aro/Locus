@@ -67,7 +67,7 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(true);
   });
 
-  it("only exposes the extended GPT-5.6 window after opt-in", () => {
+  it("applies the configured GPT-5.6 context window and migrates the legacy switch", () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     const modelStore = useModelStore();
@@ -80,12 +80,17 @@ describe("useModelStore OpenAI effort mapping", () => {
       },
     ];
 
-    expect(modelStore.codexExtendedContext).toBe(false);
+    expect(modelStore.codexContextWindow).toBe(272_000);
     expect(modelStore.codexModels[0].contextWindow).toBe(258_400);
+
+    modelStore.applyCodexModelConfig({ transport: "websocket", contextWindow: 500_000 });
+
+    expect(modelStore.codexContextWindow).toBe(500_000);
+    expect(modelStore.codexModels[0].contextWindow).toBe(475_000);
 
     modelStore.applyCodexModelConfig({ transport: "websocket", extendedContext: true });
 
-    expect(modelStore.codexExtendedContext).toBe(true);
+    expect(modelStore.codexContextWindow).toBe(372_000);
     expect(modelStore.codexModels[0].contextWindow).toBe(353_400);
   });
 

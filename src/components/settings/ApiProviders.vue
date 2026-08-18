@@ -21,6 +21,11 @@ import type {
   ProviderStatus,
 } from "../../composables/useSettingsState";
 import { visibleProviderOrder } from "../../config/providerVisibility";
+import {
+  CODEX_MAX_CONTEXT_WINDOW,
+  CODEX_MIN_CONTEXT_WINDOW,
+  normalizeCodexContextWindow,
+} from "../../config/codexContext";
 import type { DynamicToolLoadingMode } from "../../services/system";
 
 interface ModelGroup {
@@ -45,7 +50,7 @@ const props = defineProps<{
   codexResetCreditBusyId: string | null;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
-  codexExtendedContext: boolean;
+  codexContextWindow: number;
   codexSessionTitleGeneration: boolean;
   codexAutoReview: boolean;
   codexPrefixCacheTtlSeconds: number;
@@ -87,7 +92,7 @@ const emit = defineEmits<{
   consumeCodexResetCredit: [creditId: string | null];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
-  "update:codexExtendedContext": [value: boolean];
+  "update:codexContextWindow": [value: number];
   "update:codexSessionTitleGeneration": [value: boolean];
   "update:codexAutoReview": [value: boolean];
   "update:codexPrefixCacheTtlSeconds": [value: number];
@@ -115,6 +120,13 @@ function updateCodexPrefixCacheTtl(event: Event) {
   const minutes = Number((event.target as HTMLInputElement).value);
   if (!Number.isFinite(minutes)) return;
   emit("update:codexPrefixCacheTtlSeconds", Math.max(0, Math.round(minutes * 60)));
+}
+
+function updateCodexContextWindow(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const contextWindow = normalizeCodexContextWindow(input.value);
+  input.value = String(contextWindow);
+  emit("update:codexContextWindow", contextWindow);
 }
 const claudeCodeStatusLabel = computed(() => {
   if (!claudeCodeProvider.value?.hasKey) return t("settings.claudeCode.notInstalled");
@@ -798,14 +810,22 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
 
       <div v-if="codexStep !== 'waiting'" class="provider-detail">
         <div class="provider-info">
-          <span class="provider-name">{{ t("settings.codex.extendedContextTitle") }}</span>
-          <span class="provider-desc">{{ t("settings.codex.extendedContextDesc") }}</span>
+          <span class="provider-name">{{ t("settings.codex.contextWindowTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.contextWindowDesc") }}</span>
         </div>
-        <BaseSwitch
-          :model-value="codexExtendedContext"
-          :aria-label="t('settings.codex.extendedContextTitle')"
-          @update:model-value="emit('update:codexExtendedContext', $event)"
-        />
+        <label class="ttl-control">
+          <input
+            class="ttl-input context-window-input"
+            type="number"
+            :min="CODEX_MIN_CONTEXT_WINDOW"
+            :max="CODEX_MAX_CONTEXT_WINDOW"
+            step="1000"
+            :value="codexContextWindow"
+            :aria-label="t('settings.codex.contextWindowTitle')"
+            @change="updateCodexContextWindow"
+          />
+          <span>{{ t("settings.codex.contextWindowUnit") }}</span>
+        </label>
       </div>
 
       <div v-if="codexStep !== 'waiting'" class="provider-detail">
@@ -1155,6 +1175,10 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
 .ttl-input:focus {
   outline: none;
   border-color: var(--accent-border);
+}
+
+.context-window-input {
+  width: 92px;
 }
 
 .codex-detail {
