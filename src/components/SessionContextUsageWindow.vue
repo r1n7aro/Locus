@@ -32,6 +32,14 @@ let refreshTimer = 0;
 
 const numberFormatter = new Intl.NumberFormat();
 const rateFormatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+const timestampFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
 
 function formatNumber(value: number): string {
   return numberFormatter.format(Math.max(0, Math.round(value)));
@@ -48,6 +56,28 @@ function formatCost(value: number): string {
   if (value >= 1) return `$${value.toFixed(2)}`;
   if (value >= 0.01) return `$${value.toFixed(4)}`;
   return `$${value.toFixed(6)}`;
+}
+
+function formatTimestamp(value: number): string {
+  return timestampFormatter.format(new Date(value * 1000));
+}
+
+function formatMessage(value: string): string {
+  const message = value.replace(/\s+/g, " ").trim();
+  return message || t("chat.contextStats.emptyMessage");
+}
+
+function formatCacheInvalidationReason(reason: string): string {
+  switch (reason) {
+    case "model_changed":
+      return t("chat.contextStats.cacheReason.modelChanged");
+    case "provider_changed":
+      return t("chat.contextStats.cacheReason.providerChanged");
+    case "input_growth_exceeds_context_threshold":
+      return t("chat.contextStats.cacheReason.inputGrowthExceeded");
+    default:
+      return t("chat.contextStats.cacheReason.unknown");
+  }
 }
 
 function formatOutputSpeed(usage: TokenUsage): string {
@@ -272,6 +302,45 @@ onUnmounted(() => {
           </div>
         </section>
 
+        <section class="context-cache-section" :aria-label="t('chat.contextStats.cacheInvalidations')">
+          <div class="context-section-heading">
+            <h2>{{ t("chat.contextStats.cacheInvalidations") }}</h2>
+            <span class="context-section-meta">
+              {{ t("chat.contextStats.cacheInvalidationSummary", report.cacheInvalidations.length) }}
+            </span>
+          </div>
+          <div v-if="report.cacheInvalidations.length === 0" class="context-tools-empty">
+            {{ t("chat.contextStats.noCacheInvalidations") }}
+          </div>
+          <div v-else class="context-tools-table-wrap context-cache-table-wrap">
+            <table class="context-tools-table context-cache-table">
+              <thead>
+                <tr>
+                  <th>{{ t("chat.contextStats.invalidatedAt") }}</th>
+                  <th>{{ t("chat.contextStats.recentMessage") }}</th>
+                  <th>{{ t("chat.contextStats.cacheReason") }}</th>
+                  <th class="numeric">{{ t("chat.contextStats.cacheBaseline") }}</th>
+                  <th class="numeric">{{ t("chat.contextStats.cacheExcessInput") }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="event in report.cacheInvalidations" :key="event.messageId">
+                  <td class="context-cache-time">{{ formatTimestamp(event.occurredAt) }}</td>
+                  <td
+                    class="context-cache-message"
+                    :title="`${event.modelId}\n${event.message}`"
+                  >
+                    {{ formatMessage(event.message) }}
+                  </td>
+                  <td>{{ formatCacheInvalidationReason(event.reason) }}</td>
+                  <td class="numeric">{{ formatNumber(event.baselineTokens) }}</td>
+                  <td class="numeric">{{ formatNumber(event.excessInputTokens) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="context-tools-section" :aria-label="t('chat.contextStats.tools')">
           <div class="context-section-heading">
             <h2>{{ t("chat.contextStats.tools") }}</h2>
@@ -450,6 +519,7 @@ onUnmounted(() => {
 .context-overview,
 .context-token-section,
 .context-breakdown-section,
+.context-cache-section,
 .context-tools-section {
   max-width: 980px;
   margin: 0 auto;
@@ -457,6 +527,7 @@ onUnmounted(() => {
 
 .context-token-section,
 .context-breakdown-section,
+.context-cache-section,
 .context-tools-section {
   margin-top: 20px;
 }
@@ -657,6 +728,40 @@ onUnmounted(() => {
 
 .context-tool-calls {
   color: var(--text-secondary);
+}
+
+.context-cache-table-wrap {
+  max-height: 240px;
+}
+
+.context-cache-table th:first-child,
+.context-cache-table td:first-child {
+  width: 154px;
+}
+
+.context-cache-table th:nth-child(2),
+.context-cache-table td:nth-child(2) {
+  width: auto;
+}
+
+.context-cache-table th:nth-child(3),
+.context-cache-table td:nth-child(3),
+.context-cache-table th:nth-child(4),
+.context-cache-table td:nth-child(4) {
+  width: 110px;
+}
+
+.context-cache-time {
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.context-cache-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .context-tools-empty {

@@ -15,7 +15,7 @@ use crate::session::models::{
 use crate::session::store::SessionStore;
 
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 2;
+const EXPORT_FORMAT_VERSION: u32 = 5;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +86,7 @@ struct SourceMetadata {
 struct SessionExport {
     metadata: Value,
     token_usage: Value,
+    cache_invalidations: Value,
     todos: Value,
     pending_inputs: Value,
     runtime: Value,
@@ -179,6 +180,7 @@ pub fn export_session_context_yaml(
         let detail = store.load_session(session_id)?;
         let live_session = live_snapshot.and_then(|snapshot| snapshot.sessions.get(session_id));
         let usage = store.get_token_usage(session_id).ok();
+        let cache_invalidations = store.list_cache_invalidations(session_id)?;
         let todos = store.get_todos(session_id).ok();
         let mut messages = detail.messages.clone();
         expand_persisted_outputs(store, &mut messages);
@@ -227,6 +229,12 @@ pub fn export_session_context_yaml(
             "updatedAt": format_timestamp(detail.updated_at),
         });
         let token_usage = usage.map(export_token_usage).unwrap_or_else(empty_value);
+        let cache_invalidations = if cache_invalidations.is_empty() {
+            empty_value()
+        } else {
+            serde_json::to_value(cache_invalidations)
+                .map_err(|error| format!("Failed to serialize cache invalidations: {}", error))?
+        };
         let todos = todos
             .and_then(|value| serde_json::to_value(value).ok())
             .unwrap_or_else(empty_value);
@@ -246,6 +254,7 @@ pub fn export_session_context_yaml(
         sessions.push(SessionExport {
             metadata,
             token_usage,
+            cache_invalidations,
             todos,
             pending_inputs,
             runtime,
@@ -880,12 +889,85 @@ mod tests {
         let raw = std::fs::read_to_string(output).expect("read export");
         let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse yaml");
         assert_eq!(yaml["format"].as_str(), Some(EXPORT_FORMAT));
+        assert_eq!(
+            yaml["format_version"].as_u64(),
+            Some(u64::from(EXPORT_FORMAT_VERSION))
+        );
         assert_eq!(yaml["export"]["capture_quality"].as_str(), Some("full"));
         assert_eq!(
             yaml["sessions"][0]["context_attempts"].as_str(),
             Some(EMPTY)
         );
         assert_eq!(yaml["sessions"][0]["compactions"].as_str(), Some(EMPTY));
+        assert_eq!(
+            yaml["sessions"][0]["cache_invalidations"].as_str(),
+            Some(EMPTY)
+        );
+    }
+
+    #[test]
+    fn exports_server_cache_baseline_and_model_change_reason() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("create store");
+        let session_id = store
+            .create_session("Cache model switch", None, None, "chat", Some("dev"))
+            .expect("create session");
+        store
+            .add_message(&session_id, MessageRole::User, "first model")
+            .expect("add first user");
+        store
+            .record_model_usage(
+                &session_id,
+                "openai/gpt-a",
+                "OpenAI Codex",
+                "completion",
+                120,
+                1,
+                10,
+                0,
+                0,
+                0.0,
+                0,
+                None,
+                None,
+            )
+            .expect("record first model usage");
+        store
+            .add_message(&session_id, MessageRole::User, "switch model")
+            .expect("add switched user");
+        store
+            .record_model_usage(
+                &session_id,
+                "openai/gpt-b",
+                "OpenAI Codex",
+                "completion",
+                5,
+                1,
+                10,
+                120,
+                0,
+                0.0,
+                0,
+                None,
+                None,
+            )
+            .expect("record switched model usage");
+
+        let output = dir.path().join("cache-switch.yaml");
+        export_session_context_yaml(&store, &session_id, "", None, None, &output)
+            .expect("export cache switch context");
+        let raw = std::fs::read_to_string(output).expect("read cache switch export");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&raw).expect("parse cache switch export");
+        let invalidations = yaml["sessions"][0]["cache_invalidations"]
+            .as_sequence()
+            .expect("cache invalidation sequence");
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0]["baselineTokens"].as_u64(), Some(120));
+        assert_eq!(invalidations[0]["inputTokens"].as_u64(), Some(5));
+        assert_eq!(invalidations[0]["cacheReadTokens"].as_u64(), Some(120));
+        assert_eq!(invalidations[0]["excessInputTokens"].as_u64(), Some(0));
+        assert_eq!(invalidations[0]["reason"].as_str(), Some("model_changed"));
     }
 
     #[test]

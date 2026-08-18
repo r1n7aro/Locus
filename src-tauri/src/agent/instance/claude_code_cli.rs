@@ -1496,7 +1496,7 @@ impl AgentInstance {
                 + turn.cache_read_tokens
                 + turn.cache_write_tokens;
             let context_limit = super::model_context_limit(&self.effective_model);
-            match store.record_model_usage(
+            match store.record_model_usage_with_cache_check(
                 &self.session_id,
                 &self.effective_model,
                 "Claude Code CLI",
@@ -1511,7 +1511,17 @@ impl AgentInstance {
                 Some(context_tokens),
                 Some(context_limit),
             ) {
-                Ok(totals) => {
+                Ok((totals, cache_check)) => {
+                    let cache_invalidated =
+                        cache_check.as_ref().is_some_and(|check| check.invalidated);
+                    let cache_baseline_tokens = cache_check
+                        .as_ref()
+                        .map(|check| check.baseline_tokens)
+                        .unwrap_or(0);
+                    let cache_invalidation_reason = cache_check
+                        .as_ref()
+                        .filter(|check| check.invalidated)
+                        .map(|check| check.reason.clone());
                     emit_stream(
                         app_handle,
                         run_id,
@@ -1521,6 +1531,9 @@ impl AgentInstance {
                             output_tokens: turn.output_tokens,
                             cache_read_tokens: turn.cache_read_tokens,
                             cache_write_tokens: turn.cache_write_tokens,
+                            cache_invalidated,
+                            cache_baseline_tokens,
+                            cache_invalidation_reason,
                             total_input_tokens: totals.total_input_tokens,
                             total_output_tokens: totals.total_output_tokens,
                             total_cache_read_tokens: totals.total_cache_read_tokens,

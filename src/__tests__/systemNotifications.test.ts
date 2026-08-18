@@ -56,6 +56,7 @@ function createDisplayState(): DisplaySettings {
     notifyOnAskUser: true,
     notifyOnChatError: true,
     notifyOnToolConfirm: true,
+    cacheInvalidationWarningsEnabled: false,
     soundAlertsEnabled: false,
     soundAlertMode: "bright",
     soundAlertSource: "builtin",

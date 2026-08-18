@@ -2368,6 +2368,7 @@ pub async fn get_session_context_usage_report(
     let prompt_messages = store.get_messages_for_prompt(&session_id)?;
     let session_messages = store.get_messages(&session_id)?;
     let usage = store.get_token_usage(&session_id)?;
+    let cache_invalidations = store.list_cache_invalidations(&session_id)?;
 
     let mut instance = AgentInstance::new(
         Arc::new(def),
@@ -2396,6 +2397,7 @@ pub async fn get_session_context_usage_report(
             &prompt_messages,
             &session_messages,
             detail.title,
+            cache_invalidations,
             usage,
         )
         .await)

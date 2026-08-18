@@ -694,7 +694,9 @@ export type CodexTransportMode = "http" | "websocket";
 
 export interface CodexModelConfig {
   transport: CodexTransportMode;
-  extendedContext: boolean;
+  contextWindow: number;
+  /** Legacy 272K/372K switch retained while older config files migrate. */
+  extendedContext?: boolean;
   generateSessionTitles: boolean;
   autoReview: boolean;
   prefixCacheTtlSeconds: number;
@@ -914,6 +916,18 @@ export interface SessionContextToolUsage {
   resultTokens: number;
 }
 
+export interface SessionCacheInvalidation {
+  messageId: string;
+  message: string;
+  modelId: string;
+  baselineTokens: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  excessInputTokens: number;
+  reason: string;
+  occurredAt: number;
+}
+
 export interface SessionContextUsageReport {
   sessionId: string;
   sessionTitle: string;
@@ -925,6 +939,7 @@ export interface SessionContextUsageReport {
   reportedContextTokens: number;
   breakdown: SessionContextBreakdown;
   tools: SessionContextToolUsage[];
+  cacheInvalidations: SessionCacheInvalidation[];
   usage: TokenUsage;
 }
 
@@ -1148,6 +1163,9 @@ export type StreamEvent = { runId: string } & (
       outputTokens: number;
       cacheReadTokens: number;
       cacheWriteTokens: number;
+      cacheInvalidated?: boolean;
+      cacheBaselineTokens?: number;
+      cacheInvalidationReason?: string;
       totalInputTokens: number;
       totalOutputTokens: number;
       totalCacheReadTokens: number;

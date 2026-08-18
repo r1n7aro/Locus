@@ -17,15 +17,16 @@ describe("model usage statistics", () => {
     const commands = read("src-tauri/src/commands/session.rs");
     const lib = read("src-tauri/src/lib.rs");
 
-    expect(store).toContain('const SCHEMA_VERSION: i32 = 31;');
+    expect(store).toContain('const SCHEMA_VERSION: i32 = 34;');
     expect(store).toContain("CREATE TABLE IF NOT EXISTS model_usage_events");
     expect(store).toContain("pub fn record_model_usage(");
+    expect(store).toContain("record_model_usage_with_cache_check(");
     expect(store).toContain("pub fn record_model_usage_event(");
     expect(store).toContain("pub fn get_model_usage_report(");
     expect(agent).toContain("store.record_model_usage(");
     expect(agent).toContain('"compaction"');
     expect(agent).toContain('"completion"');
-    expect(claudeCode).toContain("store.record_model_usage(");
+    expect(claudeCode).toContain("store.record_model_usage_with_cache_check(");
     expect(title).toContain("store.record_model_usage_event(");
     expect(title).toContain('"session_title"');
     expect(commands).toContain("pub async fn get_model_usage_stats(");

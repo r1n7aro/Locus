@@ -97,6 +97,8 @@ export interface DisplaySettings {
   notifyOnChatError: boolean;
   /** Notify when tool approval is required */
   notifyOnToolConfirm: boolean;
+  /** Show an in-app warning when a request was expected to reuse the prompt cache but did not */
+  cacheInvalidationWarningsEnabled: boolean;
   /** Enable sound alerts for key chat events */
   soundAlertsEnabled: boolean;
   /** Sound profile used for sound alerts */
@@ -167,6 +169,7 @@ const defaults: DisplaySettings = {
   notifyOnAskUser: true,
   notifyOnChatError: true,
   notifyOnToolConfirm: true,
+  cacheInvalidationWarningsEnabled: false,
   soundAlertsEnabled: false,
   soundAlertMode: "bright",
   soundAlertSource: "builtin",

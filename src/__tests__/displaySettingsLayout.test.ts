@@ -298,6 +298,26 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"notifications.subagentDoneTitle": "Sub-agent complete"');
   });
 
+  it("adds cache invalidation warnings that default to off", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const notificationPanel = read("src/components/settings/NotificationsSettings.vue");
+    const bootstrap = read("src/composables/useAppBootstrap.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("cacheInvalidationWarningsEnabled: boolean;");
+    expect(displaySettings).toContain("cacheInvalidationWarningsEnabled: false,");
+    expect(notificationPanel).toContain("settings.notifications.cacheTitle");
+    expect(notificationPanel).toContain(':model-value="display.cacheInvalidationWarningsEnabled"');
+    expect(notificationPanel).toContain(
+      "@update:model-value=\"setDisplay('cacheInvalidationWarningsEnabled', $event)\"",
+    );
+    expect(bootstrap).toContain("isPromptCacheInvalidation(payload)");
+    expect(bootstrap).toContain('notificationStore.addNotice(\n          "warning"');
+    expect(zh).toContain('"settings.notifications.cacheInvalidationWarningsEnabled": "缓存失效警告"');
+    expect(en).toContain('"settings.notifications.cacheInvalidationWarningsEnabled": "Cache invalidation warnings"');
+  });
+
   it("adds independent sound alert toggles and selectable modes that default to off", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");

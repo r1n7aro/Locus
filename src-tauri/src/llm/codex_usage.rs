@@ -569,11 +569,8 @@ fn codex_endpoint(base_url: Option<&str>, path: &str) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_CHATGPT_BASE_URL)
         .trim_end_matches('/');
-    let chatgpt_root = matches!(
-        base_url,
-        "https://chatgpt.com" | "https://chat.openai.com"
-    )
-    .then(|| format!("{base_url}{CHATGPT_BACKEND_API_PATH}"));
+    let chatgpt_root = matches!(base_url, "https://chatgpt.com" | "https://chat.openai.com")
+        .then(|| format!("{base_url}{CHATGPT_BACKEND_API_PATH}"));
     let base_url = chatgpt_root.as_deref().unwrap_or(base_url);
     let base_url = base_url
         .strip_suffix(RESPONSES_ENDPOINT_PATH)

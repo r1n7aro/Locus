@@ -234,6 +234,12 @@ pub enum StreamEvent {
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_write_tokens: u32,
+        #[serde(default)]
+        cache_invalidated: bool,
+        #[serde(default)]
+        cache_baseline_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_invalidation_reason: Option<String>,
         total_input_tokens: u64,
         total_output_tokens: u64,
         total_cache_read_tokens: u64,
@@ -461,6 +467,20 @@ pub struct SessionContextToolUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionCacheInvalidation {
+    pub message_id: String,
+    pub message: String,
+    pub model_id: String,
+    pub baseline_tokens: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub excess_input_tokens: u64,
+    pub reason: String,
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionContextUsageReport {
     pub session_id: String,
     pub session_title: String,
@@ -472,6 +492,7 @@ pub struct SessionContextUsageReport {
     pub reported_context_tokens: u32,
     pub breakdown: SessionContextBreakdown,
     pub tools: Vec<SessionContextToolUsage>,
+    pub cache_invalidations: Vec<SessionCacheInvalidation>,
     pub usage: TokenUsage,
 }
 

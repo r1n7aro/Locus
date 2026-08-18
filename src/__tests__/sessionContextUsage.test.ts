@@ -70,6 +70,13 @@ describe("session context usage", () => {
     expect(window).toContain('t("chat.contextStats.outputSpeedHelp")');
     expect(window).toContain('class="context-breakdown-list"');
     expect(window).toContain('class="context-tools-table"');
+    expect(window).toContain('class="context-tools-table context-cache-table"');
+    expect(window).toContain("report.cacheInvalidations");
+    expect(window).toContain("event.occurredAt");
+    expect(window).toContain("event.message");
+    expect(window).toContain("event.baselineTokens");
+    expect(window).toContain("formatCacheInvalidationReason(event.reason)");
+    expect(window).toContain("event.excessInputTokens");
     expect(window).toContain("tool.resultTokens");
     expect(window).toContain("tool.callCount");
     expect(window).not.toContain("shareLabel");
@@ -96,9 +103,13 @@ describe("session context usage", () => {
     expect(commands).toContain("pub async fn get_session_context_usage_report(");
     expect(commands).toContain("store.get_messages(&session_id)");
     expect(commandTypes).toContain("pub struct SessionContextUsageReport");
+    expect(commandTypes).toContain("pub struct SessionCacheInvalidation");
     expect(commandTypes).toContain("pub result_tokens: u32");
     expect(commandTypes).toContain("pub call_count: u32");
     expect(commandTypes).toContain("pub usage: TokenUsage");
+    expect(commandTypes).toContain("pub cache_invalidations: Vec<SessionCacheInvalidation>");
+    expect(commands).toContain("store.list_cache_invalidations(&session_id)");
+    expect(agent).toContain("cache_invalidations,");
     expect(commandTypes).toContain("pub timed_output_tokens: u64");
     expect(commandTypes).toContain("pub model_active_duration_ms: u64");
     expect(lib).toContain("commands::get_session_context_usage_report");

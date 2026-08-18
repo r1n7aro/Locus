@@ -11,6 +11,7 @@ let notificationStoreMock: any;
 let loadSkillsMock: ReturnType<typeof vi.fn>;
 let maybeNotifyStreamEventMock: any;
 let resetSystemNotificationStateMock: any;
+let displaySettingsMock: any;
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
@@ -50,6 +51,10 @@ vi.mock("../stores/chat", () => ({
 
 vi.mock("../stores/notification", () => ({
   useNotificationStore: () => notificationStoreMock,
+}));
+
+vi.mock("../composables/useDisplaySettings", () => ({
+  useDisplaySettings: () => ({ state: displaySettingsMock }),
 }));
 
 vi.mock("../composables/useSkills", () => ({
@@ -152,6 +157,9 @@ describe("useAppBootstrap onboarding completion", () => {
     loadSkillsMock = vi.fn().mockResolvedValue(undefined);
     maybeNotifyStreamEventMock = vi.fn().mockResolvedValue(undefined);
     resetSystemNotificationStateMock = vi.fn();
+    displaySettingsMock = reactive({
+      cacheInvalidationWarningsEnabled: false,
+    });
 
     uiStoreMock = reactive({
       activeTab: "chat",
@@ -490,6 +498,7 @@ describe("useAppBootstrap onboarding completion", () => {
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+    expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
 
     knowledgeChangedHandler?.({
       payload: {
@@ -518,6 +527,7 @@ describe("useAppBootstrap onboarding completion", () => {
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(2);
+    expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
 
     knowledgeChangedHandler?.({
       payload: {
@@ -530,6 +540,7 @@ describe("useAppBootstrap onboarding completion", () => {
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(3);
+    expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
   });
 
   it("reloads agents and skills when installed plugins change", async () => {
@@ -556,6 +567,7 @@ describe("useAppBootstrap onboarding completion", () => {
     pluginsChangedHandler?.({ payload: undefined });
     expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
+    expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
 
     agentStoreMock.loadAgents.mockClear();
     loadSkillsMock.mockClear();
@@ -810,5 +822,91 @@ describe("useAppBootstrap onboarding completion", () => {
     });
 
     expect(maybeNotifyStreamEventMock).not.toHaveBeenCalled();
+  });
+
+  it("warns once for a server-reported cache invalidation", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+
+    chatStoreMock.sessions = [{ id: "session-1", title: "Greeting" }];
+    displaySettingsMock.cacheInvalidationWarningsEnabled = true;
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+
+    const streamHandler = handlers.get("stream-event");
+    streamHandler?.({
+      payload: {
+        type: "usageUpdate",
+        runId: "run-1",
+        sessionId: "session-1",
+        inputTokens: 900,
+        outputTokens: 10,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        cacheInvalidated: true,
+        cacheBaselineTokens: 142,
+        cacheInvalidationReason: "model_changed",
+        totalInputTokens: 900,
+        totalOutputTokens: 10,
+        totalCacheReadTokens: 0,
+        totalCacheWriteTokens: 0,
+        timedOutputTokens: 10,
+        modelActiveDurationMs: 100,
+        totalCostUsd: 0,
+        pricedRounds: 0,
+        contextTokens: 910,
+        contextLimit: 128000,
+      },
+    });
+
+    expect(notificationStoreMock.addNotice).toHaveBeenCalledWith(
+      "warning",
+      "notifications.cacheInvalidationWarning: Greeting chat.contextStats.cacheReason.modelChanged 142 142",
+      {
+        code: "prompt_cache_miss",
+        operation: "prompt-cache-miss:run-1",
+        replaceOperation: true,
+      },
+    );
+
+    notificationStoreMock.addNotice.mockClear();
+    for (const event of [
+      { cacheInvalidated: false, cacheBaselineTokens: 142, cacheReadTokens: 0 },
+      { cacheInvalidated: false, cacheBaselineTokens: 142, cacheReadTokens: 142 },
+      { cacheInvalidated: false, cacheBaselineTokens: 0, cacheReadTokens: 0 },
+    ]) {
+      streamHandler?.({
+        payload: {
+          type: "usageUpdate",
+          runId: crypto.randomUUID(),
+          sessionId: "session-1",
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheWriteTokens: 0,
+          totalInputTokens: 1,
+          totalOutputTokens: 1,
+          totalCacheReadTokens: event.cacheReadTokens,
+          totalCacheWriteTokens: 0,
+          timedOutputTokens: 1,
+          modelActiveDurationMs: 1,
+          totalCostUsd: 0,
+          pricedRounds: 0,
+          contextTokens: 2,
+          contextLimit: 128000,
+          ...event,
+        },
+      });
+    }
+    expect(notificationStoreMock.addNotice).not.toHaveBeenCalled();
   });
 });

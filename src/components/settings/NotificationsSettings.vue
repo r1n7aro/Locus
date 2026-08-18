@@ -214,6 +214,20 @@ async function previewSoundAlert() {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.notifications.cacheTitle") }}</div>
+    <p class="section-desc">{{ t("settings.notifications.cacheDesc") }}</p>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.cacheInvalidationWarningsEnabled"
+        :aria-label="t('settings.notifications.cacheInvalidationWarningsEnabled')"
+        @update:model-value="setDisplay('cacheInvalidationWarningsEnabled', $event)"
+      />
+      <span>{{ t("settings.notifications.cacheInvalidationWarningsEnabled") }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.notifications.soundTitle") }}</div>
     <p class="section-desc">{{ t("settings.notifications.soundDesc") }}</p>
 

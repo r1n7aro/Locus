@@ -6,6 +6,7 @@ import { useModelStore } from "../stores/model";
 import { useProjectStore } from "../stores/project";
 import { useChatStore } from "../stores/chat";
 import { useNotificationStore } from "../stores/notification";
+import { useDisplaySettings } from "./useDisplaySettings";
 import { useSkills } from "./useSkills";
 import { normalizeAppError } from "../services/errors";
 import {
@@ -78,6 +79,35 @@ function workspaceSwitchNowMs(): number {
     : Date.now();
 }
 
+export function isPromptCacheInvalidation(
+  event: StreamEvent,
+): event is Extract<StreamEvent, { type: "usageUpdate" }> {
+  return event.type === "usageUpdate" && event.cacheInvalidated === true;
+}
+
+function cacheInvalidationReasonLabel(reason?: string): string {
+  switch (reason) {
+    case "model_changed":
+      return t("chat.contextStats.cacheReason.modelChanged");
+    case "provider_changed":
+      return t("chat.contextStats.cacheReason.providerChanged");
+    case "input_growth_exceeds_context_threshold":
+      return t("chat.contextStats.cacheReason.inputGrowthExceeded");
+    default:
+      return t("chat.contextStats.cacheReason.unknown");
+  }
+}
+
+function cacheExcessInputTokens(
+  event: Extract<StreamEvent, { type: "usageUpdate" }>,
+): number {
+  const baselineTokens = event.cacheBaselineTokens ?? 0;
+  const effectiveContextTokens =
+    event.inputTokens + event.cacheReadTokens + event.cacheWriteTokens;
+  const contextGrowthTokens = Math.max(0, effectiveContextTokens - baselineTokens);
+  return Math.max(0, event.inputTokens - contextGrowthTokens);
+}
+
 function formatWorkspaceSwitchDetail(detail?: Record<string, unknown>): string {
   if (!detail) return "";
   const parts = Object.entries(detail)
@@ -122,6 +152,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   const { skillItems, loadSkills } = useSkills();
 
   const notificationStore = useNotificationStore();
+  const { state: displaySettings } = useDisplaySettings();
 
   let unlisten: RuntimeUnsubscribe | null = null;
   let unlistenUnity: RuntimeUnsubscribe | null = null;
@@ -250,7 +281,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function handleKnowledgeChanged(change: KnowledgeChangedEvent) {
     if (!knowledgeChangeBelongsToCurrentWorkspace(change)) return;
     if (!knowledgeChangeMayAffectSkills(change)) return;
-    void loadSkills();
+    // A knowledge event is an explicit cache invalidation. Once the initial
+    // list has loaded, a regular loadSkills() call intentionally reuses that
+    // snapshot and would leave slash commands stale until the next workspace
+    // switch or app restart.
+    void loadSkills({ force: true });
   }
 
   function handleSessionContentChanged(change: SessionContentChangedEvent) {
@@ -555,6 +590,27 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       const handled = chatStore.handleStreamEvent(payload);
       if (!handled) return;
 
+      if (
+        displaySettings.cacheInvalidationWarningsEnabled
+        && isPromptCacheInvalidation(payload)
+      ) {
+        notificationStore.addNotice(
+          "warning",
+          t(
+            "notifications.cacheInvalidationWarning",
+            sessionDiagnosticLabel(payload.sessionId),
+            cacheInvalidationReasonLabel(payload.cacheInvalidationReason),
+            payload.cacheBaselineTokens ?? 0,
+            cacheExcessInputTokens(payload),
+          ),
+          {
+            code: "prompt_cache_miss",
+            operation: `prompt-cache-miss:${payload.runId}`,
+            replaceOperation: true,
+          },
+        );
+      }
+
       const session = chatStore.sessions.find((item) => item.id === payload.sessionId);
       const notificationContext = {
         sessionTitle: session?.title ?? null,
@@ -635,7 +691,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     );
     unlistenPluginsChanged = await runtime.subscribe<void>("plugins-changed", () => {
       void agentStore.loadAgents();
-      void loadSkills();
+      void loadSkills({ force: true });
     });
     unlistenAgentsChanged = await runtime.subscribe<void>("agents-changed", () => {
       void agentStore.loadAgents();
