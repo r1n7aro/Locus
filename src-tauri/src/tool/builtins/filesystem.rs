@@ -356,9 +356,10 @@ pub(super) fn read() -> ToolDef {
                                 } else {
                                     line.to_string()
                                 };
-                                // cat -n style absolute line numbers so agents
-                                // can feed precise positions to code tools.
-                                let line_str = format!("{:>6}\t{}", start + index + 1, display);
+                                // Absolute line numbers let agents feed precise positions to
+                                // code tools. Keep the prefix compact because this output is
+                                // added to model context.
+                                let line_str = format!("{}\t{}", start + index + 1, display);
                                 bytes += line_str.len() + 1;
                                 if bytes > max_bytes {
                                     truncated_by_bytes = true;
@@ -1782,7 +1783,8 @@ mod tests {
             });
 
         assert!(!result.is_error);
-        assert!(result.output.contains("<content>\nalpha\nbeta"));
+        assert!(result.output.contains("<content>\n1\talpha\n2\tbeta"));
+        assert!(!result.output.starts_with("<content>\n "));
         assert!(!result.output.contains('\r'));
     }
 

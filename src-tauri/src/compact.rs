@@ -2051,15 +2051,15 @@ fn read_current_file_excerpt(
     let mut truncated = false;
 
     for (index, line) in selected.iter().enumerate() {
-        // +8 covers the "{:>6}\t" numbering prefix and the newline, so
-        // short-line files cannot silently overshoot the byte budget.
-        let line_len = line.len() + 8;
+        // Match the compact numbering used by the live read tool and account
+        // for the exact prefix size when enforcing the byte budget.
+        let numbered_line = format!("{}\t{}", start + index + 1, line);
+        let line_len = numbered_line.len() + 1;
         if used_bytes + line_len > max_bytes {
             truncated = true;
             break;
         }
-        // Same cat -n numbering as the live read tool output.
-        result_lines.push(format!("{:>6}\t{}", start + index + 1, line));
+        result_lines.push(numbered_line);
         used_bytes += line_len;
     }
 
@@ -4199,6 +4199,8 @@ mod tests {
 
         assert!(section.contains("src/main.ts"));
         assert!(section.contains("line two"));
+        assert!(section.contains("<content>\n2\tline two\n3\tline three"));
+        assert!(!section.contains("<content>\n "));
         assert!(section.contains("current file state"));
 
         let _ = std::fs::remove_dir_all(&temp_root);
