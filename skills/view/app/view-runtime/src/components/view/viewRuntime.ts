@@ -1082,6 +1082,15 @@ export const LOCUS_COMPONENT_MODULE = {
   ...LOCUS_COMPONENTS,
 };
 
+export function createViewSfcModuleExports(component: Component): Record<string, unknown> {
+  const moduleExports: Record<string, unknown> = { default: component };
+  // TypeScript 6 emits __importDefault for default imports compiled to
+  // CommonJS. Mark the synthetic .vue module as ESM so App.vue resolves to
+  // the component instead of being wrapped as { default: { default: ... } }.
+  Object.defineProperty(moduleExports, "__esModule", { value: true });
+  return moduleExports;
+}
+
 function createVueModule(context: RuntimeContext): ModuleExports {
   const createAppShim = (component: Component) => {
     context.entryComponent = component;
@@ -1820,9 +1829,9 @@ function createModuleLoader(context: RuntimeContext) {
       }
       compilingSfcPaths.add(file.relPath);
       try {
-        const exports = {
-          default: buildSfcComponent(context, file.content, file.relPath),
-        };
+        const exports = createViewSfcModuleExports(
+          buildSfcComponent(context, file.content, file.relPath),
+        );
         cache.set(file.relPath, exports);
         return exports;
       } finally {
