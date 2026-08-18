@@ -109,8 +109,21 @@ describe("parseAgentToolDefinition", () => {
     expect(definition.description).toContain("physical line range");
     expect(definition.description).toContain("Use `read`");
     expect(definition.description).toContain("titles are omitted");
+    expect(definition.description).toContain("<path> :: <summary>");
+    expect(definition.description).toContain("single-line");
+    expect(definition.description).toContain("| lines <start>-<end>");
+    expect(definition.description).toContain("ranking metadata is also omitted");
     expect(definition.parameters.properties.includeSummary.default).toBe(false);
+    expect(definition.parameters.properties.includeSummary.description).toContain(
+      "each document on one line",
+    );
+    expect(definition.parameters.properties.includeSummary.description).toContain(
+      "Summary whitespace is collapsed",
+    );
     expect(definition.parameters.properties.includeHitContext.default).toBe(true);
+    expect(definition.parameters.properties.includeHitContext.description).toContain(
+      "internal metadata is omitted",
+    );
     expect(definition.parameters.properties.hitContextMaxChars).toMatchObject({
       default: 220,
       minimum: 80,

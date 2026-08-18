@@ -1,5 +1,5 @@
 {
-  "description": "Search registered Design, Memory, Reference, and Skill sources. Provide at least one of `lexicalQuery` or `semanticQuery`. Returns ranked plain-text results with a directly readable real file path and 1-based physical line range. Workspace files use workspace-relative paths; registered sources outside the workspace use absolute physical paths. Frontmatter lines are part of the physical line coordinate system. Result titles are omitted because each title is identical to its file name. Use `read` with the returned path, offset, and limit.",
+  "description": "Search registered Design, Memory, Reference, and Skill sources. Provide at least one of `lexicalQuery` or `semanticQuery`. Summary results use one line per document in `<path> :: <summary>` format. Detailed results start each document with a single-line `--- <path> | lines <start>-<end> | summary <line> | body <line> ---` header followed by optional hit context. This header contains the directly readable real file path and 1-based physical line range for targeted reads. Workspace files use workspace-relative paths; registered sources outside the workspace use absolute physical paths. Frontmatter lines are part of the physical line coordinate system. Result titles are omitted because each title is identical to its file name; ranking metadata is also omitted. Use `read` with the returned path, offset, and limit.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -23,17 +23,17 @@
       },
       "includeSummary": {
         "type": "boolean",
-        "description": "Whether to include each document summary. When false, results return `summary_start_line` and `body_start_line` for targeted reads instead.",
+        "description": "Whether to return each document on one line in `<path> :: <summary>` format. Summary whitespace is collapsed so every document occupies exactly one line. Hit context, line positions, and ranking metadata are omitted. When false, each result uses a single-line document header followed by optional hit context for targeted reads.",
         "default": false
       },
       "includeHitContext": {
         "type": "boolean",
-        "description": "Whether to return a `context` block containing source text nearest to each hit so its meaning can be checked directly. Context is split on punctuation and line boundaries and capped by `hitContextMaxChars`.",
+        "description": "Whether to return source text nearest to each hit so its meaning can be checked directly. Used only when `includeSummary` is false. Frontmatter matches return only the decoded `summary` or `maintenanceRules` value; internal metadata is omitted. Context is split on punctuation and line boundaries and capped by `hitContextMaxChars`.",
         "default": true
       },
       "hitContextMaxChars": {
         "type": "integer",
-        "description": "Maximum characters of hit context to return per result (default: 220, min: 80, max: 1000). Only used when `includeHitContext` is true.",
+        "description": "Maximum characters of hit context to return per result (default: 220, min: 80, max: 1000). Used only when `includeSummary` is false and `includeHitContext` is true.",
         "default": 220,
         "minimum": 80,
         "maximum": 1000

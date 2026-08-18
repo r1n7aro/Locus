@@ -67,10 +67,11 @@ describe("knowledgeQueryProgress", () => {
     const agentSource = read("src-tauri/src/agent/instance/mod.rs");
     const indexSource = read("src-tauri/src/knowledge_index/mod.rs");
 
-    expect(indexSource).toContain("read_search_hit_context(&resolved.physical_path");
-    expect(indexSource).toContain("hit.snippet = context;");
+    expect(indexSource).toContain("read_sanitized_search_hit_context(");
+    expect(indexSource).toContain("hit.snippet = context.text;");
     expect(agentSource).toContain("knowledge_hit_context_anchor");
-    expect(agentSource).toContain('output.push_str("\\ncontext:")');
+    expect(agentSource).toContain('output.push_str(" | lines ")');
+    expect(agentSource).toContain('output.push_str(" ---")');
   });
 
   it("renders knowledge_query arguments with the standard key-value layout", async () => {
@@ -118,9 +119,12 @@ describe("knowledgeQueryProgress", () => {
     expect(agentSource).toContain("`Structure` lists registered physical directories directly");
     expect(agentSource).toContain('render_scope("Project", project_roots)');
     expect(agentSource).toContain('render_scope("App", app_roots)');
-    expect(agentSource).toContain("let skill_node = prompt_tree_node_mut(&mut tree, &skill_parts)");
-    expect(agentSource).toContain("skill_node.dirs.insert(");
-    expect(agentSource).toContain(".filter(|root| !prompt_physical_root_is_package(root))");
+    expect(agentSource).toContain("KnowledgeSourceKind::AppSkillPackage => source");
+    expect(agentSource).toContain("app_skill_packages: BTreeMap<String, PromptAppSkillPackage>");
+    expect(agentSource).toContain("relative_root: prompt_relative_physical_path(");
+    expect(agentSource).toContain("for package in root.app_skill_packages.values()");
+    expect(agentSource).toContain("package.desc.as_deref()");
+    expect(agentSource).not.toContain("package.display_root.trim_end_matches('/')");
     expect(agentSource).not.toContain('"knowledge/".to_string(),');
   });
 

@@ -3882,12 +3882,18 @@ fn enrich_search_hit_source_locations(
             &hit.snippet,
             &hit.title,
         );
-        hit.start_line = start_line;
-        hit.end_line = end_line;
-        if let Some(context) =
-            read_search_hit_context(&resolved.physical_path, start_line, end_line)
-        {
-            hit.snippet = context;
+        if let Some(context) = read_sanitized_search_hit_context(
+            &resolved.physical_path,
+            start_line,
+            end_line,
+            hit.matched_section,
+        ) {
+            hit.start_line = context.start_line;
+            hit.end_line = context.end_line;
+            hit.snippet = context.text;
+        } else {
+            hit.start_line = start_line;
+            hit.end_line = end_line;
         }
         let (summary_start_line, body_start_line) =
             locate_document_section_start_lines(&resolved.physical_path);
@@ -4030,6 +4036,129 @@ fn read_search_hit_context(
         .trim()
         .to_string();
     (!context.is_empty()).then_some(context)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SanitizedSearchHitContext {
+    text: String,
+    start_line: u32,
+    end_line: u32,
+}
+
+fn frontmatter_end_index(lines: &[&str]) -> Option<usize> {
+    lines
+        .first()
+        .is_some_and(|line| line.trim_start_matches('\u{feff}').trim() == "---")
+        .then(|| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(index, line)| (line.trim() == "---").then_some(index))
+        })
+        .flatten()
+}
+
+fn frontmatter_field_context(
+    lines: &[&str],
+    frontmatter_end: usize,
+    key: &str,
+) -> Option<SanitizedSearchHitContext> {
+    let start = lines[1..frontmatter_end].iter().position(|line| {
+        !line.chars().next().is_some_and(char::is_whitespace)
+            && line
+                .split_once(':')
+                .is_some_and(|(candidate, _)| candidate.trim() == key)
+    })? + 1;
+    let mut end = lines[start + 1..frontmatter_end]
+        .iter()
+        .position(|line| {
+            !line.trim().is_empty()
+                && !line.chars().next().is_some_and(char::is_whitespace)
+                && line.contains(':')
+        })
+        .map(|offset| start + offset)
+        .unwrap_or(frontmatter_end.saturating_sub(1));
+    while end > start && lines[end].trim().is_empty() {
+        end -= 1;
+    }
+
+    let yaml = lines[1..frontmatter_end].join("\n");
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&yaml)
+        .ok()?
+        .as_mapping()?
+        .get(&serde_yaml::Value::String(key.to_string()))?
+        .as_str()?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    Some(SanitizedSearchHitContext {
+        text: value,
+        start_line: start as u32 + 1,
+        end_line: end as u32 + 1,
+    })
+}
+
+fn read_sanitized_search_hit_context(
+    physical_path: &std::path::Path,
+    start_line: u32,
+    end_line: u32,
+    matched_section: Option<KnowledgeSearchMatchSection>,
+) -> Option<SanitizedSearchHitContext> {
+    let raw = std::fs::read_to_string(physical_path).ok()?;
+    let normalized = raw.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let Some(frontmatter_end) = frontmatter_end_index(&lines) else {
+        return read_search_hit_context(physical_path, start_line, end_line).map(|text| {
+            SanitizedSearchHitContext {
+                text,
+                start_line: start_line.max(1),
+                end_line: end_line.max(start_line).max(1),
+            }
+        });
+    };
+    let summary = frontmatter_field_context(&lines, frontmatter_end, "summary");
+    let maintenance_rules = frontmatter_field_context(&lines, frontmatter_end, "maintenanceRules");
+    let overlaps = |context: &SanitizedSearchHitContext| {
+        context.start_line <= end_line.max(start_line) && context.end_line >= start_line.max(1)
+    };
+
+    let field_context = match matched_section {
+        Some(KnowledgeSearchMatchSection::Summary) => summary,
+        Some(KnowledgeSearchMatchSection::MaintenanceRules) => maintenance_rules,
+        Some(KnowledgeSearchMatchSection::Body) => None,
+        None => summary
+            .filter(|context| overlaps(context))
+            .or_else(|| maintenance_rules.filter(|context| overlaps(context))),
+    };
+    if let Some(context) = field_context {
+        return Some(context);
+    }
+
+    let mut body_start = frontmatter_end + 1;
+    while body_start < lines.len() && lines[body_start].trim().is_empty() {
+        body_start += 1;
+    }
+    if body_start >= lines.len() {
+        return None;
+    }
+
+    let start = (start_line.max(1).saturating_sub(1) as usize).max(body_start);
+    let requested_end = end_line.max(start_line).max(1) as usize;
+    let end = requested_end.max(start + 1).min(lines.len());
+    let text = lines[start..end].join("\n").trim().to_string();
+    (!text.is_empty()).then_some(SanitizedSearchHitContext {
+        text,
+        start_line: start as u32 + 1,
+        end_line: end as u32,
+    })
 }
 
 fn locate_document_section_start_lines(physical_path: &std::path::Path) -> (Option<u32>, u32) {
@@ -6086,9 +6215,9 @@ mod tests {
         embedding_stage_progress, lexical_stage_progress, library_dir_for_working_dir,
         list_cached_documents, locate_document_section_start_lines, locate_search_hit_line_range,
         needs_embedding_backfill, plan_managed_directory_reuse, query_documents,
-        query_documents_with_progress_with_timeout, read_search_hit_context,
-        rebuild_plan_for_document, rebuild_reason_for_document, reconcile_unity_reference_import,
-        reconcile_workspace_internal, save_general_config,
+        query_documents_with_progress_with_timeout, read_sanitized_search_hit_context,
+        read_search_hit_context, rebuild_plan_for_document, rebuild_reason_for_document,
+        reconcile_unity_reference_import, reconcile_workspace_internal, save_general_config,
         text_scan_search_documents_with_progress, DirectorySearchAccess, KnowledgeGeneralConfig,
         KnowledgeIndexState, KnowledgeRuntime, RebuildReason, INDEX_VERSION,
         KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS, LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
@@ -6166,6 +6295,110 @@ mod tests {
         .expect("write knowledge file");
 
         assert_eq!(locate_document_section_start_lines(&path), (Some(3), 7));
+    }
+
+    #[test]
+    fn search_hit_context_exposes_only_inline_summary_from_frontmatter() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("knowledge.md");
+        std::fs::write(
+            &path,
+            "---\nid: kd_test\ninjectMode: inherit\nsummary: TargetDummy ECS architecture\naiEditMode: inherit\nmaintenanceRules: Keep this current\n---\n\n# Body\n",
+        )
+        .expect("write knowledge file");
+
+        let raw_range = locate_search_hit_line_range(
+            &path,
+            Some("TargetDummy ECS"),
+            None,
+            &["TargetDummy".to_string(), "ECS".to_string()],
+            "TargetDummy ECS architecture",
+            "Knowledge",
+        );
+        assert_eq!(raw_range, (1, 7));
+
+        let context = read_sanitized_search_hit_context(
+            &path,
+            raw_range.0,
+            raw_range.1,
+            Some(KnowledgeSearchMatchSection::Summary),
+        )
+        .expect("sanitized summary context");
+        assert_eq!(context.start_line, 4);
+        assert_eq!(context.end_line, 4);
+        assert_eq!(context.text, "TargetDummy ECS architecture");
+        assert!(!context.text.contains("kd_test"));
+        assert!(!context.text.contains("injectMode"));
+        assert!(!context.text.contains("maintenanceRules"));
+    }
+
+    #[test]
+    fn search_hit_context_decodes_multiline_frontmatter_fields() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("knowledge.md");
+        std::fs::write(
+            &path,
+            "---\nid: kd_test\nsummary: |-\n  First summary line\n  Second summary line\nmaintenanceRules: |-\n  First maintenance rule\n  Second maintenance rule\naiEditMode: inherit\n---\n\nBody text\n",
+        )
+        .expect("write knowledge file");
+
+        let summary = read_sanitized_search_hit_context(
+            &path,
+            1,
+            10,
+            Some(KnowledgeSearchMatchSection::Summary),
+        )
+        .expect("sanitized multiline summary");
+        assert_eq!(summary.start_line, 3);
+        assert_eq!(summary.end_line, 5);
+        assert_eq!(summary.text, "First summary line\nSecond summary line");
+
+        let rules = read_sanitized_search_hit_context(
+            &path,
+            1,
+            10,
+            Some(KnowledgeSearchMatchSection::MaintenanceRules),
+        )
+        .expect("sanitized maintenance rules");
+        assert_eq!(rules.start_line, 6);
+        assert_eq!(rules.end_line, 8);
+        assert_eq!(
+            rules.text,
+            "First maintenance rule\nSecond maintenance rule"
+        );
+        assert!(!rules.text.contains("aiEditMode"));
+    }
+
+    #[test]
+    fn search_hit_context_keeps_body_ranges_below_frontmatter() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("knowledge.md");
+        std::fs::write(
+            &path,
+            "---\nid: kd_test\nsummary: Summary text\n---\n\n# Body\n\nTargetDummy body line\nNearby body context\n",
+        )
+        .expect("write knowledge file");
+
+        let raw_range = locate_search_hit_line_range(
+            &path,
+            Some("TargetDummy"),
+            None,
+            &["TargetDummy".to_string()],
+            "TargetDummy body line",
+            "Knowledge",
+        );
+        let context = read_sanitized_search_hit_context(
+            &path,
+            raw_range.0,
+            raw_range.1,
+            Some(KnowledgeSearchMatchSection::Body),
+        )
+        .expect("sanitized body context");
+
+        assert_eq!(context.start_line, 8);
+        assert_eq!(context.end_line, 9);
+        assert_eq!(context.text, "TargetDummy body line\nNearby body context");
+        assert!(!context.text.contains("summary:"));
     }
 
     #[test]
@@ -6657,12 +6890,24 @@ mod tests {
             .search("战斗核心", 5, 2.0)
             .expect("query tantivy directly");
 
-        assert!(hits.iter().any(|hit| {
-            hit.id == "kd_test_design_doc"
-                && hit.match_kind == "grep"
-                && hit.matched_section == Some(KnowledgeSearchMatchSection::Summary)
-                && hit.matched_terms.contains(&"战斗核心".to_string())
-        }));
+        let hit = hits
+            .iter()
+            .find(|hit| hit.id == "kd_test_design_doc")
+            .expect("summary search hit");
+        assert_eq!(hit.match_kind, "grep");
+        assert_eq!(
+            hit.matched_section,
+            Some(KnowledgeSearchMatchSection::Summary)
+        );
+        assert!(hit.matched_terms.contains(&"战斗核心".to_string()));
+        assert_eq!(hit.snippet, "战斗核心循环");
+        assert_eq!(
+            hit.start_line,
+            hit.summary_start_line.expect("summary line")
+        );
+        assert_eq!(hit.end_line, hit.start_line);
+        assert!(!hit.snippet.contains("id:"));
+        assert!(!hit.snippet.contains("injectMode:"));
         assert!(indexed_hits.is_empty());
     }
 
