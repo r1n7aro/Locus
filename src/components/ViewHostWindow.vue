@@ -2194,6 +2194,8 @@ async function sendRuntimeSessionMessage(
     mode: request.mode ?? null,
     userIntent: request.userIntent ?? null,
     subagentModels: request.subagentModels ?? null,
+    subagentEfforts: request.subagentEfforts ?? null,
+    subagentFastModes: request.subagentFastModes ?? null,
     knowledgeMode: request.knowledgeMode ?? null,
   });
 

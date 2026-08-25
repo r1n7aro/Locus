@@ -49,20 +49,7 @@ impl ToolExecutionContext {
 }
 
 pub fn is_unity_yaml_candidate_path(file_path: &str) -> bool {
-    let lower = file_path.trim().to_ascii_lowercase();
-    [
-        ".unity",
-        ".prefab",
-        ".asset",
-        ".mat",
-        ".anim",
-        ".controller",
-        ".overridecontroller",
-        ".playable",
-        ".mask",
-    ]
-    .iter()
-    .any(|ext| lower.ends_with(ext))
+    crate::unity_serialized_property::property_tree::is_unity_yaml_read_asset_file(file_path)
 }
 
 pub type ToolExecuteFn = Arc<
@@ -97,6 +84,7 @@ pub enum ToolLoadMode {
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     built_in_tools: HashSet<String>,
+    vision_required_tools: HashSet<String>,
     load_modes: HashMap<String, ToolLoadMode>,
 }
 
@@ -117,7 +105,7 @@ pub fn built_in_tool_name_keys() -> BTreeSet<String> {
 pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "create_skill_package" | "skill_list" | "skill_reload" | "agent_reload" | "mcp_reload"
+        "create_skill_package" | "skill_list" | "agent_reload" | "mcp_reload"
     ) {
         return ToolLoadMode::Skill;
     }
@@ -188,7 +176,6 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     // Skill & plugin management.
     "create_skill_package",
     "skill_list",
-    "skill_reload",
     "agent_reload",
     "mcp_reload",
     "plugin_list",
@@ -246,6 +233,7 @@ impl ToolRegistry {
         ToolRegistry {
             tools: HashMap::new(),
             built_in_tools: HashSet::new(),
+            vision_required_tools: HashSet::new(),
             load_modes: HashMap::new(),
         }
     }
@@ -270,6 +258,11 @@ impl ToolRegistry {
 
     pub fn register_builtin_with_load_mode(&mut self, tool: ToolDef, load_mode: ToolLoadMode) {
         let key = normalize_tool_name_key(&tool.name);
+        if crate::prompt::builtin_tool_requires_vision(&tool.name) {
+            self.vision_required_tools.insert(key.clone());
+        } else {
+            self.vision_required_tools.remove(&key);
+        }
         self.built_in_tools.insert(key.clone());
         self.load_modes.insert(key.clone(), load_mode);
         self.tools.insert(key, tool);
@@ -300,6 +293,13 @@ impl ToolRegistry {
 
     pub fn is_built_in(&self, name: &str) -> bool {
         self.built_in_tools.contains(&normalize_tool_name_key(name))
+    }
+
+    /// Whether the built-in tool's prompt config declares that its result can
+    /// only be consumed by a model with image understanding.
+    pub fn requires_vision(&self, name: &str) -> bool {
+        self.vision_required_tools
+            .contains(&normalize_tool_name_key(name))
     }
 
     /// Whether a tool declares workspace mutations (drives undo tracking).
@@ -499,6 +499,14 @@ mod tests {
     }
 
     #[test]
+    fn registry_loads_vision_requirements_from_tool_prompt_config() {
+        let registry = ToolRegistry::with_builtins();
+        assert!(registry.requires_vision("view_capture"));
+        assert!(registry.requires_vision("UNITY_CAPTURE_VIEWPORT"));
+        assert!(!registry.requires_vision("read"));
+    }
+
+    #[test]
     fn registry_resolves_api_tools_with_canonical_name_case_insensitively() {
         let mut registry = ToolRegistry::new();
         registry.register(ToolDef {
@@ -690,10 +698,6 @@ mod tests {
             registry.default_load_mode("skill_list"),
             ToolLoadMode::Skill
         );
-        assert_eq!(
-            registry.default_load_mode("skill_reload"),
-            ToolLoadMode::Skill
-        );
     }
 
     #[test]
@@ -730,5 +734,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!connected.should_redirect_unity_asset_read("src/main.rs"));
+        assert!(!connected.should_redirect_unity_asset_read("Assets/Models/Hero.fbx"));
+        assert!(!connected.should_redirect_unity_asset_read("Assets/Shaders/Surface.shadergraph"));
     }
 }

@@ -45,7 +45,15 @@ impl AgentInstance {
             });
         }
 
-        if !Self::is_read_image_path(file_path) {
+        let is_image = Self::is_read_image_path(file_path);
+        if is_image && !self.supports_image_understanding() {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: super::no_vision_endpoint_error(),
+                is_error: true,
+            });
+        }
+
+        if !is_image {
             let tool_context = self
                 .build_tool_execution_context(app_handle, "read", args)
                 .await;
@@ -291,7 +299,7 @@ impl AgentInstance {
             }
             LazyToolRenderer::CodexNative if !referenced_tools.is_empty() => {
                 result.output.push_str(&format!(
-                    "\n\nThe Skill tools above are deferred. Call `{}` with a matching query to load their schemas before use: {}",
+                    "\n\nThe Skill tools above are deferred. Call `{}` with their exact wire names to load only the required schemas before use: {}",
                     super::CODEX_TOOL_SEARCH_TOOL_NAME,
                     referenced_tools.join(", ")
                 ));

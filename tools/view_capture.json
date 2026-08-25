@@ -1,4 +1,5 @@
 {
+  "requiresVision": true,
   "description": "Capture the currently open Locus View host window as a PNG image attachment. Use after `view_run` when visual inspection is needed.",
   "parameters": {
     "type": "object",

@@ -390,6 +390,8 @@ export interface ViewSessionChatRequest {
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
+  subagentEfforts?: Record<string, string> | null;
+  subagentFastModes?: Record<string, boolean> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
   show?: boolean | null;
   wait?: boolean | ViewSessionWaitRequest | null;
@@ -429,6 +431,8 @@ export interface ViewLlmCallRequest {
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
+  subagentEfforts?: Record<string, string> | null;
+  subagentFastModes?: Record<string, boolean> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
   show?: boolean | null;
   wait?: boolean | ViewSessionWaitRequest | null;

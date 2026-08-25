@@ -53,7 +53,6 @@ pub mod tools {
     pub const ASK: &str = include_str!("../../tools/ask.json");
     pub const KNOWLEDGE_QUERY: &str = include_str!("../../tools/knowledge_query.json");
     pub const CREATE_SKILL_PACKAGE: &str = include_str!("../../tools/create_skill_package.json");
-    pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
     pub const AGENT_RELOAD: &str = include_str!("../../tools/agent_reload.json");
     pub const MCP_RELOAD: &str = include_str!("../../tools/mcp_reload.json");
@@ -84,16 +83,94 @@ pub mod tools {
     pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
     pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
     pub const EXIT_PLAN_MODE: &str = include_str!("../../tools/exit_plan_mode.json");
+
+    /// Built-in tool prompt sources keyed by their agent-facing canonical
+    /// names. Runtime capability metadata is read from the same JSON that
+    /// provides each tool's description and parameter schema.
+    pub const DEFINITIONS: &[(&str, &str)] = &[
+        ("read", READ),
+        ("write", WRITE),
+        ("edit", EDIT),
+        ("bash", BASH),
+        ("get_task_status", GET_TASK_STATUS),
+        ("cancel_task", CANCEL_TASK),
+        ("grep", GREP),
+        ("web_fetch", WEB_FETCH),
+        ("todowrite", TODOWRITE),
+        ("unity_set_play_mode", UNITY_SET_PLAY_MODE),
+        ("unity_execute", UNITY_EXECUTE),
+        ("unity_run_states", UNITY_RUN_STATES),
+        ("unity_capture_viewport", UNITY_CAPTURE_VIEWPORT),
+        ("unity_get_console_log", UNITY_GET_CONSOLE_LOG),
+        ("unity_test_list", UNITY_TEST_LIST),
+        ("unity_test_run", UNITY_TEST_RUN),
+        ("unity_ref_search", UNITY_REF_SEARCH),
+        ("unity_asset_search", UNITY_ASSET_SEARCH),
+        ("unity_yaml_search", UNITY_YAML_SEARCH),
+        ("unity_yaml_read", UNITY_YAML_READ),
+        ("unity_recompile", UNITY_RECOMPILE),
+        ("unity_hot_reload", UNITY_HOT_RELOAD),
+        ("code_find_references", CODE_FIND_REFERENCES),
+        ("code_goto_definition", CODE_GOTO_DEFINITION),
+        ("code_symbol_search", CODE_SYMBOL_SEARCH),
+        ("code_diagnostics", CODE_DIAGNOSTICS),
+        ("code_hover", CODE_HOVER),
+        ("unity_code_usages", UNITY_CODE_USAGES),
+        ("list", LIST),
+        ("ask_user_question", ASK),
+        ("knowledge_query", KNOWLEDGE_QUERY),
+        ("create_skill_package", CREATE_SKILL_PACKAGE),
+        ("skill_list", SKILL_LIST),
+        ("agent_reload", AGENT_RELOAD),
+        ("mcp_reload", MCP_RELOAD),
+        ("plugin_list", PLUGIN_LIST),
+        ("plugin_search", PLUGIN_SEARCH),
+        ("plugin_install", PLUGIN_INSTALL),
+        ("plugin_uninstall", PLUGIN_UNINSTALL),
+        ("plugin_set_enabled", PLUGIN_SET_ENABLED),
+        ("plugin_export", PLUGIN_EXPORT),
+        ("view_create", VIEW_CREATE),
+        ("view_list", VIEW_LIST),
+        ("view_reload", VIEW_RELOAD),
+        ("view_run", VIEW_RUN),
+        ("view_compile_script", VIEW_COMPILE_SCRIPT),
+        ("view_call_script", VIEW_CALL_SCRIPT),
+        ("view_property_read", VIEW_PROPERTY_READ),
+        ("view_property_discover", VIEW_PROPERTY_DISCOVER),
+        ("view_property_write", VIEW_PROPERTY_WRITE),
+        ("view_property_apply", VIEW_PROPERTY_APPLY),
+        ("view_capture", VIEW_CAPTURE),
+        ("view_snapshot", VIEW_SNAPSHOT),
+        ("view_action", VIEW_ACTION),
+        ("view_wait", VIEW_WAIT),
+        ("view_console_read", VIEW_CONSOLE_READ),
+        ("view_debug_eval", VIEW_DEBUG_EVAL),
+        ("config_query", CONFIG_QUERY),
+        ("tool_load", TOOL_LOAD),
+        ("tool_call", TOOL_CALL),
+        ("exit_plan_mode", EXIT_PLAN_MODE),
+    ];
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolPrompt {
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(default)]
+    pub requires_vision: bool,
 }
 
 pub fn parse_tool_prompt(json_str: &str) -> ToolPrompt {
     serde_json::from_str(json_str).expect("invalid tool prompt JSON (compile-time embedded)")
+}
+
+pub fn builtin_tool_requires_vision(name: &str) -> bool {
+    let canonical = name.trim();
+    tools::DEFINITIONS
+        .iter()
+        .find(|(tool_name, _)| tool_name.eq_ignore_ascii_case(canonical))
+        .is_some_and(|(_, source)| parse_tool_prompt(source).requires_vision)
 }
 
 #[cfg(test)]
@@ -121,74 +198,18 @@ mod tests {
 
     #[test]
     fn embedded_tool_parameter_schemas_stay_openai_compatible() {
-        let tool_prompts = [
-            ("read", tools::READ),
-            ("write", tools::WRITE),
-            ("edit", tools::EDIT),
-            ("bash", tools::BASH),
-            ("get_task_status", tools::GET_TASK_STATUS),
-            ("cancel_task", tools::CANCEL_TASK),
-            ("grep", tools::GREP),
-            ("web_fetch", tools::WEB_FETCH),
-            ("todowrite", tools::TODOWRITE),
-            ("unity_set_play_mode", tools::UNITY_SET_PLAY_MODE),
-            ("unity_execute", tools::UNITY_EXECUTE),
-            ("unity_run_states", tools::UNITY_RUN_STATES),
-            ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
-            ("unity_get_console_log", tools::UNITY_GET_CONSOLE_LOG),
-            ("unity_test_list", tools::UNITY_TEST_LIST),
-            ("unity_test_run", tools::UNITY_TEST_RUN),
-            ("unity_ref_search", tools::UNITY_REF_SEARCH),
-            ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
-            ("unity_yaml_search", tools::UNITY_YAML_SEARCH),
-            ("unity_yaml_read", tools::UNITY_YAML_READ),
-            ("unity_recompile", tools::UNITY_RECOMPILE),
-            ("unity_hot_reload", tools::UNITY_HOT_RELOAD),
-            ("code_find_references", tools::CODE_FIND_REFERENCES),
-            ("code_goto_definition", tools::CODE_GOTO_DEFINITION),
-            ("code_symbol_search", tools::CODE_SYMBOL_SEARCH),
-            ("code_diagnostics", tools::CODE_DIAGNOSTICS),
-            ("code_hover", tools::CODE_HOVER),
-            ("unity_code_usages", tools::UNITY_CODE_USAGES),
-            ("list", tools::LIST),
-            ("ask", tools::ASK),
-            ("knowledge_query", tools::KNOWLEDGE_QUERY),
-            ("create_skill_package", tools::CREATE_SKILL_PACKAGE),
-            ("skill_reload", tools::SKILL_RELOAD),
-            ("skill_list", tools::SKILL_LIST),
-            ("agent_reload", tools::AGENT_RELOAD),
-            ("plugin_list", tools::PLUGIN_LIST),
-            ("plugin_search", tools::PLUGIN_SEARCH),
-            ("plugin_install", tools::PLUGIN_INSTALL),
-            ("plugin_uninstall", tools::PLUGIN_UNINSTALL),
-            ("plugin_set_enabled", tools::PLUGIN_SET_ENABLED),
-            ("plugin_export", tools::PLUGIN_EXPORT),
-            ("view_create", tools::VIEW_CREATE),
-            ("view_list", tools::VIEW_LIST),
-            ("view_reload", tools::VIEW_RELOAD),
-            ("view_run", tools::VIEW_RUN),
-            ("view_compile_script", tools::VIEW_COMPILE_SCRIPT),
-            ("view_call_script", tools::VIEW_CALL_SCRIPT),
-            ("view_property_read", tools::VIEW_PROPERTY_READ),
-            ("view_property_discover", tools::VIEW_PROPERTY_DISCOVER),
-            ("view_property_write", tools::VIEW_PROPERTY_WRITE),
-            ("view_property_apply", tools::VIEW_PROPERTY_APPLY),
-            ("view_capture", tools::VIEW_CAPTURE),
-            ("view_snapshot", tools::VIEW_SNAPSHOT),
-            ("view_action", tools::VIEW_ACTION),
-            ("view_wait", tools::VIEW_WAIT),
-            ("view_console_read", tools::VIEW_CONSOLE_READ),
-            ("view_debug_eval", tools::VIEW_DEBUG_EVAL),
-            ("config_query", tools::CONFIG_QUERY),
-            ("tool_load", tools::TOOL_LOAD),
-            ("tool_call", tools::TOOL_CALL),
-            ("exit_plan_mode", tools::EXIT_PLAN_MODE),
-        ];
-
-        for (name, json_str) in tool_prompts {
+        for (name, json_str) in tools::DEFINITIONS {
             let prompt = parse_tool_prompt(json_str);
             assert_openai_compatible_tool_parameters(name, &prompt.parameters);
         }
+    }
+
+    #[test]
+    fn embedded_tool_vision_requirements_are_loaded_from_prompt_config() {
+        assert!(builtin_tool_requires_vision("view_capture"));
+        assert!(builtin_tool_requires_vision("unity_capture_viewport"));
+        assert!(!builtin_tool_requires_vision("read"));
+        assert!(!builtin_tool_requires_vision("unknown_tool"));
     }
 
     #[test]

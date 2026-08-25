@@ -610,7 +610,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         tool_name: &str,
         args: &serde_json::Value,
     ) {
-        if !self.agent.tool_call_needs_undo_tracking(tool_name, args) {
+        if !self.agent.should_track_session_undo(tool_name, args) {
             return;
         }
 

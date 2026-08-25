@@ -360,6 +360,10 @@ struct PromptAgentParams {
     knowledge_mode: Option<String>,
     #[serde(default)]
     subagent_models: Option<HashMap<String, String>>,
+    #[serde(default)]
+    subagent_efforts: Option<HashMap<String, String>>,
+    #[serde(default)]
+    subagent_fast_modes: Option<HashMap<String, bool>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1038,6 +1042,24 @@ async fn resolve_prompt_effort(
         .and_then(|value| nonempty(Some(value)))
 }
 
+async fn resolve_prompt_fast_mode(
+    app: &AppHandle,
+    store: &SessionStore,
+    params: &PromptAgentParams,
+) -> Option<bool> {
+    if let Some(fast_mode) = params.fast_mode {
+        return Some(fast_mode);
+    }
+    if let Some(session_id) = params.session_id.as_deref() {
+        if let Ok(detail) = store.load_session(session_id) {
+            if detail.last_fast_mode.is_some() {
+                return detail.last_fast_mode;
+            }
+        }
+    }
+    crate::commands::get_codex_fast_mode(app.clone()).await.ok()
+}
+
 async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<Value, String> {
     let prompt = params.prompt.trim();
     if prompt.is_empty() {
@@ -1068,13 +1090,19 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
     let model = resolve_prompt_model(app, store.inner().as_ref(), &params).await?;
     let effort =
         resolve_prompt_effort(app, store.inner().as_ref(), &params, agent_spec.as_ref()).await;
-    let fast_mode = match params.fast_mode {
-        Some(value) => Some(value),
-        None => crate::commands::get_codex_fast_mode(app.clone()).await.ok(),
-    };
+    let fast_mode = resolve_prompt_fast_mode(app, store.inner().as_ref(), &params).await;
     let model_defaults = crate::commands::get_model_defaults(app.clone())
         .await
         .unwrap_or_default();
+    let subagent_models = params
+        .subagent_models
+        .unwrap_or(model_defaults.subagent_models);
+    let subagent_efforts = params
+        .subagent_efforts
+        .unwrap_or(model_defaults.subagent_efforts);
+    let subagent_fast_modes = params
+        .subagent_fast_modes
+        .unwrap_or(model_defaults.subagent_fast_modes);
 
     let launch = crate::commands::chat(
         nonempty(params.session_id),
@@ -1091,11 +1119,9 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
         Some(params.session_type.unwrap_or_else(|| "chat".to_string())),
         Some(params.mode.unwrap_or_else(|| "build".to_string())),
         None,
-        Some(
-            params
-                .subagent_models
-                .unwrap_or(model_defaults.subagent_models),
-        ),
+        Some(subagent_models),
+        Some(subagent_efforts),
+        Some(subagent_fast_modes),
         Some(params.knowledge_mode.unwrap_or_else(|| "full".to_string())),
         None,
         None,

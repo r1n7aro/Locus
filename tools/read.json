@@ -1,5 +1,5 @@
 {
-  "description": "Read a file.\n- Text files return file content (up to 2000 lines by default), each line prefixed with its 1-based physical line number in cat -n format (number, tab, content). The number prefix and tab are display metadata and must be removed from edit oldString/newString\n- Use offset and limit to page through large files; line numbers stay absolute\n- Set outline=true for C# (.cs) or Markdown (.md) to return a full-file structural outline with line locations instead of original file content; offset and limit are ignored, knowledge Markdown also injects its L1 summary when available, and unsupported file types return an error\n- Knowledge Markdown uses the same physical lines as every other file, including frontmatter and blank lines\n- Registered knowledge paths outside the workspace are readable when returned by knowledge_query\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories",
+  "description": "Read a file.\n- Text files return file content (up to 2000 lines by default), each line prefixed with its 1-based physical line number in cat -n format (number, tab, content). The number prefix and tab are display metadata and must be removed from edit oldString/newString\n- Use offset and limit to page through large files; line numbers stay absolute\n- Set outline=true for C# (.cs) or Markdown (.md) to return a full-file structural outline with line locations instead of original file content; offset and limit are ignored, knowledge Markdown also injects its L1 summary when available, and unsupported file types return an error\n- Knowledge Markdown uses the same physical lines as every other file, including frontmatter and blank lines\n- Registered knowledge paths outside the workspace are readable when returned by knowledge_query\n{image_read_guidance}- This tool only reads files; use list for directories",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,11 +9,11 @@
       },
       "offset": {
         "type": "integer",
-        "description": "Line number to start reading from for text files (1-indexed); ignored for images"
+        "description": "Line number to start reading from for text files (1-indexed){image_offset_behavior}"
       },
       "limit": {
         "type": "integer",
-        "description": "Max number of lines to read for text files (default 2000); ignored for images"
+        "description": "Max number of lines to read for text files (default 2000){image_offset_behavior}"
       },
       "outline": {
         "type": "boolean",
