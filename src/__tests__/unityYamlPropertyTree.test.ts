@@ -17,6 +17,31 @@ describe("Unity YAML Property Tree", () => {
       maximum: 1024,
       default: 4,
     });
+    expect(schema.parameters.properties.hierarchy_fields).toMatchObject({
+      type: "array",
+      uniqueItems: true,
+      default: ["layer", "tag", "components"],
+    });
+    expect(
+      schema.parameters.properties.hierarchy_fields.items.enum,
+    ).toEqual([
+      "active",
+      "layer",
+      "prefab_source",
+      "static",
+      "tag",
+      "rect",
+      "world_position",
+      "world_rotation",
+      "world_scale",
+      "components",
+    ]);
+    expect(
+      schema.parameters.properties.hierarchy_fields.description,
+    ).toContain("Select only fields required by the current task");
+    expect(
+      schema.parameters.properties.hierarchy_fields.description,
+    ).toContain("only for GameObjects whose Transform is a RectTransform");
     expect(schema.parameters.properties.file_path).toBeUndefined();
     expect(schema.parameters.properties.detail).toBeUndefined();
     expect(schema.description).toContain("4,000 characters");
@@ -37,6 +62,15 @@ describe("Unity YAML Property Tree", () => {
     expect(schema.description).toContain("Subasset");
     expect(schema.description).toContain("never expose `#fileID` suffixes");
     expect(schema.description).toContain("never returns a whole raw YAML file");
+    expect(schema.description).toContain("Supported extensions are");
+    expect(schema.description).toContain("`.fbx`");
+    expect(schema.description).toContain("`unity_execute`");
+    expect(schema.description).toContain(
+      "SubScene Authoring Hierarchy",
+    );
+    expect(schema.description).toContain(
+      "a closed SubScene uses its saved disk YAML",
+    );
   });
 
   it("uses the same path DSL for search results and read targets", () => {
@@ -50,6 +84,7 @@ describe("Unity YAML Property Tree", () => {
       "src-tauri/src/unity_serialized_property/property_tree.rs",
     );
     expect(implementation).toContain("pub struct PropertyTreePath");
+    expect(implementation).toContain("pub struct HierarchyFieldSelection");
     expect(implementation).toContain("AGENT_PROPERTY_TREE_ARRAY_LIMIT: usize = 4");
     expect(implementation).toContain(
       "AGENT_PROPERTY_TREE_AUTO_EXPAND_CHAR_LIMIT: usize = 4_000",
@@ -67,6 +102,10 @@ describe("Unity YAML Property Tree", () => {
       agent.indexOf("fn unity_property_tree_search_options"),
     );
     expect(readFlow).toContain("unity_property_tree_array_limit(args)");
+    expect(readFlow).toContain("unity_property_tree_hierarchy_fields(args)");
+    expect(readFlow).toContain(
+      "read_live_property_tree_with_limits_and_hierarchy_fields",
+    );
     expect(readFlow).toContain("read_live_property_tree_with_limits");
     expect(readFlow).toContain(
       "read_complete_within_budget_and_array_limit",
@@ -87,6 +126,9 @@ describe("Unity YAML Property Tree", () => {
     expect(liveDecodeFailure).toContain("is_error: true");
     expect(agent).toContain("async fn execute_unity_property_tree_search");
     expect(agent).toContain("search_live_property_tree");
+    expect(agent).toContain("append_unity_subscene_authoring_hierarchy");
+    expect(agent).toContain("read_unity_subscene_authoring_hierarchy");
+    expect(agent).toContain("subscene_authoring_scene_path(");
   });
 
   it("hosts the Unity bridge implementation in the PropertyTree file", () => {
@@ -212,5 +254,13 @@ describe("Unity YAML Property Tree", () => {
     const filesystem = read("src-tauri/src/tool/builtins/filesystem.rs");
     expect(filesystem).toContain("Direct raw reads are disabled for Unity YAML asset");
     expect(filesystem).not.toContain("repeat the same `read` call once more");
+    const toolRegistry = read("src-tauri/src/tool/mod.rs");
+    expect(toolRegistry).toContain("is_unity_yaml_read_asset_file(file_path)");
+    const propertyTree = read(
+      "src-tauri/src/unity_serialized_property/property_tree.rs",
+    );
+    expect(propertyTree).toContain("UNITY_YAML_READ_ASSET_EXTENSIONS");
+    expect(propertyTree).toContain("unity_yaml_read does not support");
+    expect(propertyTree).toContain("use `unity_execute` to load it");
   });
 });

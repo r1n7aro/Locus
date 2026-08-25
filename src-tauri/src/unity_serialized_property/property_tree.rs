@@ -20,9 +20,130 @@ pub const AGENT_PROPERTY_TREE_COMPLETE_MAX_DEPTH: usize = 16;
 pub const AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS: usize = 1_024;
 pub const AGENT_PROPERTY_TREE_SUBASSET_PREVIEW_LIMIT: usize = 32;
 
-const UNITY_ASSET_EXTENSIONS: &[&str] = &[
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchyFieldSelection {
+    pub active: bool,
+    pub layer: bool,
+    pub prefab_source: bool,
+    pub static_state: bool,
+    pub tag: bool,
+    pub rect: bool,
+    pub world_position: bool,
+    pub world_rotation: bool,
+    pub world_scale: bool,
+    pub components: bool,
+}
+
+impl Default for HierarchyFieldSelection {
+    fn default() -> Self {
+        Self {
+            active: false,
+            layer: true,
+            prefab_source: false,
+            static_state: false,
+            tag: true,
+            rect: false,
+            world_position: false,
+            world_rotation: false,
+            world_scale: false,
+            components: true,
+        }
+    }
+}
+
+impl HierarchyFieldSelection {
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut selection = Self {
+            active: false,
+            layer: false,
+            prefab_source: false,
+            static_state: false,
+            tag: false,
+            rect: false,
+            world_position: false,
+            world_rotation: false,
+            world_scale: false,
+            components: false,
+        };
+        for name in names {
+            match name
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['-', ' '], "_")
+                .as_str()
+            {
+                "active" => selection.active = true,
+                "layer" => selection.layer = true,
+                "prefab_source" => selection.prefab_source = true,
+                "static" => selection.static_state = true,
+                "tag" => selection.tag = true,
+                "rect" => selection.rect = true,
+                "world_position" => selection.world_position = true,
+                "world_rotation" => selection.world_rotation = true,
+                "world_scale" => selection.world_scale = true,
+                "components" | "component" => selection.components = true,
+                value => {
+                    return Err(format!(
+                        "Invalid hierarchy_fields value '{}'. Allowed values: active, layer, prefab_source, static, tag, rect, world_position, world_rotation, world_scale, components.",
+                        value
+                    ));
+                }
+            }
+        }
+        Ok(selection)
+    }
+
+    pub fn names(self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.active {
+            names.push("active".to_string());
+        }
+        if self.layer {
+            names.push("layer".to_string());
+        }
+        if self.prefab_source {
+            names.push("prefab_source".to_string());
+        }
+        if self.static_state {
+            names.push("static".to_string());
+        }
+        if self.tag {
+            names.push("tag".to_string());
+        }
+        if self.rect {
+            names.push("rect".to_string());
+        }
+        if self.world_position {
+            names.push("world_position".to_string());
+        }
+        if self.world_rotation {
+            names.push("world_rotation".to_string());
+        }
+        if self.world_scale {
+            names.push("world_scale".to_string());
+        }
+        if self.components {
+            names.push("components".to_string());
+        }
+        names
+    }
+
+    fn is_empty(self) -> bool {
+        !self.active
+            && !self.layer
+            && !self.prefab_source
+            && !self.static_state
+            && !self.tag
+            && !self.rect
+            && !self.world_position
+            && !self.world_rotation
+            && !self.world_scale
+            && !self.components
+    }
+}
+
+pub const UNITY_YAML_READ_ASSET_EXTENSIONS: &[&str] = &[
     "overridecontroller",
-    "shadergraph",
     "controller",
     "playable",
     "prefab",
@@ -64,15 +185,16 @@ impl PropertyTreePath {
             return Err("Property Tree path is required".to_string());
         }
 
+        let root = PathBuf::from(working_dir.trim());
         let boundaries = asset_boundaries(&normalized);
         if boundaries.is_empty() {
-            return Err(format!(
-                "Property Tree path must contain a supported Unity asset extension: {}",
-                input
+            return Err(unsupported_unity_yaml_read_asset_message(
+                &root,
+                &normalized,
+                input,
             ));
         }
 
-        let root = PathBuf::from(working_dir.trim());
         let mut chosen: Option<(usize, PathBuf)> = None;
         for boundary in boundaries.iter().copied().rev() {
             let candidate = &normalized[..boundary];
@@ -113,6 +235,13 @@ impl PropertyTreePath {
     pub fn full_path(&self) -> String {
         append_segments(&self.asset_path, self.segments.iter().map(String::as_str))
     }
+}
+
+pub fn is_unity_yaml_read_asset_file(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/");
+    asset_boundaries(&normalized)
+        .into_iter()
+        .any(|boundary| boundary == normalized.len())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,7 +322,11 @@ impl CompleteProjectionBudget {
             (tree_depth - 1).saturating_mul(3).saturating_add(3)
         };
         let line_chars = prefix_chars
-            .saturating_add(format_node(node, tree_depth == 0).chars().count())
+            .saturating_add(
+                format_node(node, tree_depth == 0, HierarchyFieldSelection::default())
+                    .chars()
+                    .count(),
+            )
             .saturating_add(1);
         if self.chars_used.saturating_add(line_chars) > self.char_limit {
             return false;
@@ -341,6 +474,23 @@ pub async fn read_live_property_tree_with_limits(
     requested_depth: usize,
     requested_array_items: usize,
 ) -> Result<UnitySerializedPropertySnapshot, String> {
+    read_live_property_tree_with_limits_and_hierarchy_fields(
+        working_dir,
+        path,
+        requested_depth,
+        requested_array_items,
+        HierarchyFieldSelection::default(),
+    )
+    .await
+}
+
+pub async fn read_live_property_tree_with_limits_and_hierarchy_fields(
+    working_dir: &str,
+    path: &PropertyTreePath,
+    requested_depth: usize,
+    requested_array_items: usize,
+    hierarchy_fields: HierarchyFieldSelection,
+) -> Result<UnitySerializedPropertySnapshot, String> {
     // Live reads intentionally start from Editor state alone.  Reading the
     // YAML file here would make an available Unity connection observe stale
     // saved values before it ever asks the Editor for unsaved state.
@@ -351,6 +501,7 @@ pub async fn read_live_property_tree_with_limits(
         requested_depth,
         requested_array_items,
         &canonical_seed,
+        hierarchy_fields,
     )
     .await
 }
@@ -649,6 +800,7 @@ pub async fn read_live_property_tree_with_limits_and_canonical_seed(
     requested_depth: usize,
     requested_array_items: usize,
     canonical_seed: &HashMap<String, String>,
+    hierarchy_fields: HierarchyFieldSelection,
 ) -> Result<UnitySerializedPropertySnapshot, String> {
     let depth = requested_depth.min(AGENT_PROPERTY_TREE_COMPLETE_MAX_DEPTH);
     let array_limit = requested_array_items
@@ -667,6 +819,7 @@ pub async fn read_live_property_tree_with_limits_and_canonical_seed(
         root_target,
         0,
         canonical_seed,
+        hierarchy_fields,
     )
     .await;
     if asset_result.is_ok() || path.segments.is_empty() || !is_hierarchical_asset(path) {
@@ -699,6 +852,7 @@ pub async fn read_live_property_tree_with_limits_and_canonical_seed(
             root_target,
             consumed_segments,
             canonical_seed,
+            hierarchy_fields,
         )
         .await
         {
@@ -713,6 +867,140 @@ fn is_hierarchical_asset(path: &PropertyTreePath) -> bool {
     lower.ends_with(".unity") || lower.ends_with(".prefab")
 }
 
+/// Returns the authoring Scene asset referenced by an explicitly selected
+/// `Unity.Scenes.SubScene` component or by a GameObject that owns one.  Live
+/// Editor snapshots carry the concrete component type. Disk YAML snapshots can
+/// lose package script schema information, so the SceneAsset + AutoLoadScene
+/// field pair is kept as a structural fallback.
+pub fn subscene_authoring_scene_path(snapshot: &UnitySerializedPropertySnapshot) -> Option<String> {
+    if snapshot_is_subscene_component(snapshot)
+        || snapshot_structurally_matches_subscene_component(snapshot)
+    {
+        return subscene_scene_asset_from_component(snapshot);
+    }
+
+    snapshot.children.iter().find_map(|child| {
+        if snapshot_is_subscene_component(child)
+            || snapshot_structurally_matches_subscene_component(child)
+        {
+            subscene_scene_asset_from_component(child)
+        } else {
+            None
+        }
+    })
+}
+
+fn snapshot_is_subscene_component(snapshot: &UnitySerializedPropertySnapshot) -> bool {
+    let mut identities = vec![
+        snapshot.property_type.as_str(),
+        snapshot.field_type_full_name.as_str(),
+        snapshot.reference_type_full_name.as_str(),
+    ];
+    if let Some(target) = snapshot.binding_target.as_ref() {
+        identities.push(target.component_type.as_deref().unwrap_or_default());
+        identities.push(target.target_type_full_name.as_deref().unwrap_or_default());
+        identities.push(target.target_type_name.as_deref().unwrap_or_default());
+    }
+    identities.into_iter().any(is_subscene_type_identity)
+}
+
+fn is_subscene_type_identity(value: &str) -> bool {
+    let normalized = value.trim().replace('+', ".");
+    normalized.eq_ignore_ascii_case("SubScene")
+        || normalized
+            .rsplit('.')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SubScene"))
+}
+
+fn snapshot_structurally_matches_subscene_component(
+    snapshot: &UnitySerializedPropertySnapshot,
+) -> bool {
+    if snapshot.node_kind.eq_ignore_ascii_case("hierarchy")
+        || snapshot
+            .field_type_full_name
+            .eq_ignore_ascii_case("UnityEngine.GameObject")
+        || snapshot
+            .binding_target
+            .as_ref()
+            .is_some_and(|target| target.kind.eq_ignore_ascii_case("gameobject"))
+    {
+        return false;
+    }
+    snapshot_tree_contains_field(snapshot, "sceneasset")
+        && snapshot_tree_contains_field(snapshot, "autoloadscene")
+}
+
+fn snapshot_tree_contains_field(
+    snapshot: &UnitySerializedPropertySnapshot,
+    expected: &str,
+) -> bool {
+    snapshot_field_matches(snapshot, expected)
+        || snapshot
+            .children
+            .iter()
+            .any(|child| snapshot_tree_contains_field(child, expected))
+}
+
+fn snapshot_field_matches(snapshot: &UnitySerializedPropertySnapshot, expected: &str) -> bool {
+    let identity = snapshot_field_identity(snapshot);
+    identity == expected || identity.strip_prefix('m') == Some(expected)
+}
+
+fn snapshot_field_identity(snapshot: &UnitySerializedPropertySnapshot) -> String {
+    let source = if !snapshot.name.trim().is_empty() {
+        snapshot.name.as_str()
+    } else if !snapshot.display_name.trim().is_empty() {
+        snapshot.display_name.as_str()
+    } else {
+        snapshot
+            .property_path
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+    };
+    source
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn subscene_scene_asset_from_component(
+    snapshot: &UnitySerializedPropertySnapshot,
+) -> Option<String> {
+    if snapshot_field_matches(snapshot, "sceneasset") {
+        if let Some(path) = snapshot_scene_asset_path(snapshot) {
+            return Some(path);
+        }
+    }
+    snapshot
+        .children
+        .iter()
+        .find_map(subscene_scene_asset_from_component)
+}
+
+fn snapshot_scene_asset_path(snapshot: &UnitySerializedPropertySnapshot) -> Option<String> {
+    let value = if snapshot.display_value.trim().is_empty() {
+        snapshot.value.as_str()?
+    } else {
+        snapshot.display_value.as_str()
+    };
+    normalize_scene_asset_reference(value)
+}
+
+fn normalize_scene_asset_reference(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_matches('"').replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    let extension = lower.find(".unity")?;
+    let end = extension + ".unity".len();
+    let candidate = normalized.get(..end)?.trim();
+    if candidate.is_empty() || candidate.to_ascii_lowercase().starts_with("guid:") {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
 async fn read_live_property_tree_from_target(
     working_dir: &str,
     path: &PropertyTreePath,
@@ -721,14 +1009,21 @@ async fn read_live_property_tree_from_target(
     root_target: UnitySerializedPropertyTarget,
     consumed_segments: usize,
     canonical_seed: &HashMap<String, String>,
+    hierarchy_fields: HierarchyFieldSelection,
 ) -> Result<UnitySerializedPropertySnapshot, String> {
     let initial_depth = if path.segments.len() == consumed_segments {
         depth
     } else {
         1
     };
-    let mut node =
-        read_live_target(working_dir, root_target.clone(), initial_depth, array_limit).await?;
+    let mut node = read_live_target(
+        working_dir,
+        root_target.clone(),
+        initial_depth,
+        array_limit,
+        hierarchy_fields,
+    )
+    .await?;
     let mut active_target = root_target;
     let mut active_subassets = node.subassets.clone();
     let mut current_path = append_segments(
@@ -748,12 +1043,26 @@ async fn read_live_property_tree_from_target(
                 canonical.entry(identity).or_insert(current_path.clone());
             }
             active_target = reference_target;
-            node = read_live_target(working_dir, active_target.clone(), 1, array_limit).await?;
+            node = read_live_target(
+                working_dir,
+                active_target.clone(),
+                1,
+                array_limit,
+                hierarchy_fields,
+            )
+            .await?;
             active_subassets = node.subassets.clone();
         } else if node.children.is_empty() && node.has_children {
             if let Some(target) = node.binding_target.clone() {
                 active_target = target;
-                node = read_live_target(working_dir, active_target.clone(), 1, array_limit).await?;
+                node = read_live_target(
+                    working_dir,
+                    active_target.clone(),
+                    1,
+                    array_limit,
+                    hierarchy_fields,
+                )
+                .await?;
                 active_subassets = node.subassets.clone();
             }
         }
@@ -766,7 +1075,14 @@ async fn read_live_property_tree_from_target(
             active_subassets = entry.children.clone();
             active_target = entry.target;
             current_path = append_path_segment(&current_path, segment);
-            node = read_live_target(working_dir, active_target.clone(), 1, array_limit).await?;
+            node = read_live_target(
+                working_dir,
+                active_target.clone(),
+                1,
+                array_limit,
+                hierarchy_fields,
+            )
+            .await?;
             node.subassets = active_subassets.clone();
             if let Some(identity) =
                 snapshot_identity(&node).or_else(|| target_identity(&active_target))
@@ -784,7 +1100,14 @@ async fn read_live_property_tree_from_target(
                 target.property_path =
                     Some(array_element_property_path(&node.property_path, index));
                 active_target = target;
-                node = read_live_target(working_dir, active_target.clone(), 1, array_limit).await?;
+                node = read_live_target(
+                    working_dir,
+                    active_target.clone(),
+                    1,
+                    array_limit,
+                    hierarchy_fields,
+                )
+                .await?;
                 active_subassets.clear();
                 current_path = append_path_segment(&current_path, segment);
                 continue;
@@ -830,7 +1153,14 @@ async fn read_live_property_tree_from_target(
 
     if let Some(target) = node.binding_target.clone() {
         active_target = target;
-        node = read_live_target(working_dir, active_target.clone(), depth, array_limit).await?;
+        node = read_live_target(
+            working_dir,
+            active_target.clone(),
+            depth,
+            array_limit,
+            hierarchy_fields,
+        )
+        .await?;
         if active_target
             .property_path
             .as_deref()
@@ -840,7 +1170,14 @@ async fn read_live_property_tree_from_target(
             node.subassets = active_subassets;
         }
     } else if path.segments.len() == consumed_segments && initial_depth != depth {
-        node = read_live_target(working_dir, active_target.clone(), depth, array_limit).await?;
+        node = read_live_target(
+            working_dir,
+            active_target.clone(),
+            depth,
+            array_limit,
+            hierarchy_fields,
+        )
+        .await?;
         node.subassets = active_subassets;
     }
 
@@ -851,6 +1188,7 @@ async fn read_live_property_tree_from_target(
         depth,
         array_limit,
         &mut canonical,
+        hierarchy_fields,
     )
     .await
 }
@@ -860,6 +1198,7 @@ async fn read_live_target(
     target: UnitySerializedPropertyTarget,
     depth: usize,
     array_limit: usize,
+    hierarchy_fields: HierarchyFieldSelection,
 ) -> Result<UnitySerializedPropertySnapshot, String> {
     let result = super::read(
         working_dir,
@@ -873,6 +1212,7 @@ async fn read_live_target(
                     .min(AGENT_PROPERTY_TREE_COMPLETE_MAX_ARRAY_ITEMS) as i32,
             ),
             auto_expand_char_limit: Some(AGENT_PROPERTY_TREE_AUTO_EXPAND_CHAR_LIMIT as i32),
+            hierarchy_fields: Some(hierarchy_fields.names()),
         },
     )
     .await?;
@@ -892,6 +1232,7 @@ fn project_live_node<'a>(
     depth: usize,
     array_limit: usize,
     canonical: &'a mut HashMap<String, String>,
+    hierarchy_fields: HierarchyFieldSelection,
 ) -> Pin<Box<dyn Future<Output = Result<UnitySerializedPropertySnapshot, String>> + Send + 'a>> {
     Box::pin(async move {
         let mut projected = source;
@@ -961,8 +1302,14 @@ fn project_live_node<'a>(
             }
 
             if depth > 0 {
-                let referenced =
-                    read_live_target(working_dir, reference_target, depth, array_limit).await?;
+                let referenced = read_live_target(
+                    working_dir,
+                    reference_target,
+                    depth,
+                    array_limit,
+                    hierarchy_fields,
+                )
+                .await?;
                 projected.node_kind = "reference".to_string();
                 projected.property_type = referenced.property_type.clone();
                 projected.value_type = referenced.value_type.clone();
@@ -1027,6 +1374,7 @@ fn project_live_node<'a>(
                     depth - 1,
                     array_limit,
                     canonical,
+                    hierarchy_fields,
                 )
                 .await?,
             );
@@ -1226,8 +1574,14 @@ impl YamlPropertyTree {
             .map(|doc| doc.file_id)
             .unwrap_or_default();
 
-        let hierarchy_root =
-            build_hierarchy_property_tree_root(asset_path, &docs, &lines, &descriptors, guid_paths);
+        let hierarchy_root = build_hierarchy_property_tree_root(
+            asset_path,
+            &docs,
+            &lines,
+            &descriptors,
+            &documents,
+            guid_paths,
+        );
         let (root_owner_file_id, root) = if let Some(root) = hierarchy_root {
             (0, root)
         } else {
@@ -2206,11 +2560,18 @@ impl SearchMatcher {
 }
 
 pub fn format_property_tree(snapshot: &UnitySerializedPropertySnapshot) -> String {
+    format_property_tree_with_hierarchy_fields(snapshot, HierarchyFieldSelection::default())
+}
+
+pub fn format_property_tree_with_hierarchy_fields(
+    snapshot: &UnitySerializedPropertySnapshot,
+    hierarchy_fields: HierarchyFieldSelection,
+) -> String {
     let mut out = String::new();
     if is_scene_property_tree_root(snapshot) {
-        out.push_str(&format_node(snapshot, true));
+        out.push_str(&format_node(snapshot, true, hierarchy_fields));
         out.push('\n');
-        format_scene_hierarchy_children(snapshot, "", &mut out);
+        format_scene_hierarchy_children(snapshot, "", &mut out, hierarchy_fields);
         return out;
     }
 
@@ -2228,10 +2589,10 @@ pub fn format_property_tree(snapshot: &UnitySerializedPropertySnapshot) -> Strin
             out.push('\n');
         }
     } else {
-        out.push_str(&format_node(snapshot, true));
+        out.push_str(&format_node(snapshot, true, hierarchy_fields));
         out.push('\n');
     }
-    format_children(snapshot, "", &mut out);
+    format_children(snapshot, "", &mut out, hierarchy_fields);
     format_subassets(snapshot, &mut out);
     format_display_sections(snapshot, &mut out, snapshot.is_prefab_instance);
     out
@@ -2256,6 +2617,7 @@ fn format_scene_hierarchy_children(
     node: &UnitySerializedPropertySnapshot,
     prefix: &str,
     out: &mut String,
+    hierarchy_fields: HierarchyFieldSelection,
 ) {
     let children = node
         .children
@@ -2279,7 +2641,7 @@ fn format_scene_hierarchy_children(
         let last = index + 1 == groups.len();
         out.push_str(prefix);
         out.push_str(if last { "└─ " } else { "├─ " });
-        out.push_str(&format_node(child, false));
+        out.push_str(&format_node(child, false, hierarchy_fields));
         if *repeated_count > 1 {
             out.push_str(" ×");
             out.push_str(&repeated_count.to_string());
@@ -2287,7 +2649,7 @@ fn format_scene_hierarchy_children(
         }
         out.push('\n');
         let next_prefix = format!("{}{}", prefix, if last { "   " } else { "│  " });
-        format_scene_hierarchy_children(child, &next_prefix, out);
+        format_scene_hierarchy_children(child, &next_prefix, out, hierarchy_fields);
     }
 }
 
@@ -2542,7 +2904,12 @@ fn property_tree_search_field_name(item: &PropertyTreeSearchMatch) -> String {
     }
 }
 
-fn format_children(node: &UnitySerializedPropertySnapshot, prefix: &str, out: &mut String) {
+fn format_children(
+    node: &UnitySerializedPropertySnapshot,
+    prefix: &str,
+    out: &mut String,
+    hierarchy_fields: HierarchyFieldSelection,
+) {
     if is_compact_unity_value(node) {
         return;
     }
@@ -2557,7 +2924,7 @@ fn format_children(node: &UnitySerializedPropertySnapshot, prefix: &str, out: &m
         let last = index + 1 == groups.len() && !has_array_omission;
         out.push_str(prefix);
         out.push_str(if last { "└─ " } else { "├─ " });
-        out.push_str(&format_node(child, false));
+        out.push_str(&format_node(child, false, hierarchy_fields));
         if *repeated_count > 1 {
             out.push_str(" ×");
             out.push_str(&repeated_count.to_string());
@@ -2566,7 +2933,7 @@ fn format_children(node: &UnitySerializedPropertySnapshot, prefix: &str, out: &m
         out.push('\n');
         let mut next_prefix = prefix.to_string();
         next_prefix.push_str(if last { "   " } else { "│  " });
-        format_children(child, &next_prefix, out);
+        format_children(child, &next_prefix, out, hierarchy_fields);
     }
     if has_array_omission {
         out.push_str(prefix);
@@ -2615,7 +2982,11 @@ fn repeated_prefab_fold_key(
     ))
 }
 
-fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
+fn format_node(
+    node: &UnitySerializedPropertySnapshot,
+    root: bool,
+    hierarchy_fields: HierarchyFieldSelection,
+) -> String {
     let mut out = if root {
         if node.semantic_path.is_empty() {
             node.display_name.clone()
@@ -2658,10 +3029,13 @@ fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
             out.push_str(&compact_scalar(&node.display_value));
         }
     } else if node.node_kind == "hierarchy" {
-        if !node.display_value.trim().is_empty() {
+        let summary = format_hierarchy_summary(node, hierarchy_fields);
+        if !summary.is_empty() {
             out.push(' ');
-            out.push_str(&compact_semantic_summary(&node.display_value));
-        } else {
+            out.push_str(&compact_semantic_summary(&summary));
+        } else if hierarchy_fields == HierarchyFieldSelection::default()
+            && !has_structured_hierarchy_metadata(node)
+        {
             out.push_str(" (GameObject)");
         }
     } else if node.has_children || !node.children.is_empty() || node.node_kind == "object" {
@@ -2683,6 +3057,82 @@ fn format_node(node: &UnitySerializedPropertySnapshot, root: bool) -> String {
         out.push_str(" (override)");
     }
     out
+}
+
+fn has_structured_hierarchy_metadata(node: &UnitySerializedPropertySnapshot) -> bool {
+    !node.hierarchy_components.is_empty()
+        || !node.hierarchy_active.is_empty()
+        || !node.hierarchy_tag.is_empty()
+        || !node.hierarchy_layer.is_empty()
+        || !node.hierarchy_prefab_source_path.is_empty()
+        || !node.hierarchy_static.is_empty()
+        || !node.hierarchy_rect.is_empty()
+        || !node.hierarchy_world_position.is_empty()
+        || !node.hierarchy_world_rotation.is_empty()
+        || !node.hierarchy_world_scale.is_empty()
+}
+
+fn format_hierarchy_summary(
+    node: &UnitySerializedPropertySnapshot,
+    fields: HierarchyFieldSelection,
+) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+    if !has_structured_hierarchy_metadata(node) {
+        // Live Editor snapshots are already filtered by the request. This
+        // fallback also keeps reads compatible with an older connected plugin
+        // that only exposes the original combined display value.
+        return node.display_value.trim().to_string();
+    }
+
+    let mut summary = String::new();
+    if fields.components && !node.hierarchy_components.is_empty() {
+        summary.push('(');
+        summary.push_str(&node.hierarchy_components.join(", "));
+        summary.push(')');
+    }
+
+    let mut annotations = Vec::new();
+    if fields.tag && !node.hierarchy_tag.is_empty() {
+        annotations.push(format!("Tag:{}", node.hierarchy_tag));
+    }
+    if fields.layer && !node.hierarchy_layer.is_empty() {
+        annotations.push(format!("Layer:{}", node.hierarchy_layer));
+    }
+    if fields.active && !node.hierarchy_active.is_empty() {
+        annotations.push(format!("Active:{}", node.hierarchy_active));
+    }
+    if fields.static_state && !node.hierarchy_static.is_empty() {
+        annotations.push(format!("Static:{}", node.hierarchy_static));
+    }
+    if fields.prefab_source && !node.hierarchy_prefab_source_path.is_empty() {
+        annotations.push(format!(
+            "Prefab Source:{}",
+            node.hierarchy_prefab_source_path
+        ));
+    }
+    if fields.world_position && !node.hierarchy_world_position.is_empty() {
+        annotations.push(format!("World Position:{}", node.hierarchy_world_position));
+    }
+    if fields.world_rotation && !node.hierarchy_world_rotation.is_empty() {
+        annotations.push(format!("World Rotation:{}", node.hierarchy_world_rotation));
+    }
+    if fields.world_scale && !node.hierarchy_world_scale.is_empty() {
+        annotations.push(format!("World Scale:{}", node.hierarchy_world_scale));
+    }
+    if fields.rect && !node.hierarchy_rect.is_empty() {
+        annotations.push(format!("Rect:{}", node.hierarchy_rect));
+    }
+    if !annotations.is_empty() {
+        if !summary.is_empty() {
+            summary.push_str("  ");
+        }
+        summary.push('[');
+        summary.push_str(&annotations.join(", "));
+        summary.push(']');
+    }
+    summary
 }
 
 fn build_children(
@@ -3357,6 +3807,7 @@ fn build_hierarchy_property_tree_root(
     docs: &[crate::unity_yaml::YamlDoc],
     lines: &[&str],
     descriptors: &HashMap<i64, DocumentDescriptor>,
+    documents: &HashMap<i64, YamlPropertyDocument>,
     guid_paths: &HashMap<String, String>,
 ) -> Option<UnitySerializedPropertySnapshot> {
     let normalized = asset_path.trim_end_matches('/');
@@ -3391,6 +3842,32 @@ fn build_hierarchy_property_tree_root(
         entries.sort_by_key(|doc| doc.doc_index);
     }
     let prefab_fold_metadata = build_hierarchy_prefab_fold_metadata(docs, lines);
+    let prefab_source_by_game_object = crate::unity_yaml::extract_prefab_instance_irs(docs, lines)
+        .into_iter()
+        .map(|instance| {
+            let guid = crate::asset_db::types::guid_to_hex(&instance.source_prefab_guid);
+            let source = guid_paths
+                .get(&guid.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| format!("guid:{}", guid));
+            (instance.local_file_id, source)
+        })
+        .collect::<HashMap<_, _>>();
+    let world_by_transform = crate::unity_yaml::build_world_transform_map(docs, lines);
+    let world_by_game_object = docs
+        .iter()
+        .filter(|doc| matches!(doc.class_id, 4 | 224))
+        .filter_map(|doc| {
+            let owner_id = doc
+                .m_game_object_id
+                .filter(|file_id| *file_id != 0)
+                .or_else(|| doc.prefab_instance_id.filter(|file_id| *file_id != 0))?;
+            world_by_transform
+                .get(&doc.file_id)
+                .copied()
+                .map(|world| (owner_id, world))
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut hierarchy_children = hierarchy
         .iter()
@@ -3399,8 +3876,11 @@ fn build_hierarchy_property_tree_root(
                 normalized,
                 node,
                 descriptors,
+                documents,
                 &component_docs,
                 &prefab_fold_metadata,
+                &prefab_source_by_game_object,
+                &world_by_game_object,
             )
         })
         .collect::<Vec<_>>();
@@ -3760,8 +4240,11 @@ fn build_hierarchy_game_object_snapshot(
     asset_path: &str,
     node: &crate::unity_yaml::HierarchyNode,
     descriptors: &HashMap<i64, DocumentDescriptor>,
+    documents: &HashMap<i64, YamlPropertyDocument>,
     component_docs: &HashMap<i64, Vec<&crate::unity_yaml::YamlDoc>>,
     prefab_fold_metadata: &HashMap<i64, HierarchyPrefabFoldMetadata>,
+    prefab_source_by_game_object: &HashMap<i64, String>,
+    world_by_game_object: &HashMap<i64, crate::unity_yaml::TransformWorldInfo>,
 ) -> UnitySerializedPropertySnapshot {
     let mut children = Vec::new();
     if let Some(descriptor) = descriptors.get(&node.file_id) {
@@ -3798,8 +4281,11 @@ fn build_hierarchy_game_object_snapshot(
             asset_path,
             child,
             descriptors,
+            documents,
             component_docs,
             prefab_fold_metadata,
+            prefab_source_by_game_object,
+            world_by_game_object,
         )
     }));
     make_sibling_names_unique(&mut children);
@@ -3827,6 +4313,29 @@ fn build_hierarchy_game_object_snapshot(
         hierarchy_component_signature: prefab_fold
             .map(|metadata| metadata.component_signature.clone())
             .unwrap_or_default(),
+        hierarchy_components: node.components.clone(),
+        hierarchy_active: node.is_active.to_string(),
+        hierarchy_tag: node.tag.clone().unwrap_or_else(|| "Untagged".to_string()),
+        hierarchy_layer: node.layer.unwrap_or(0).to_string(),
+        hierarchy_prefab_source_path: prefab_source_by_game_object
+            .get(&node.file_id)
+            .cloned()
+            .unwrap_or_default(),
+        hierarchy_static: node.is_static.to_string(),
+        hierarchy_rect: format_disk_hierarchy_rect(node.file_id, component_docs, documents)
+            .unwrap_or_default(),
+        hierarchy_world_position: world_by_game_object
+            .get(&node.file_id)
+            .map(|world| format_hierarchy_vector(world.position))
+            .unwrap_or_default(),
+        hierarchy_world_rotation: world_by_game_object
+            .get(&node.file_id)
+            .map(|world| format_hierarchy_vector(world.rotation_euler))
+            .unwrap_or_default(),
+        hierarchy_world_scale: world_by_game_object
+            .get(&node.file_id)
+            .map(|world| format_hierarchy_vector(world.scale))
+            .unwrap_or_default(),
         property_type: "GameObject".to_string(),
         value_type: "Object".to_string(),
         field_type_full_name: "UnityEngine.GameObject".to_string(),
@@ -3838,6 +4347,74 @@ fn build_hierarchy_game_object_snapshot(
         visible_child_count: children.len() as i32,
         children,
         ..Default::default()
+    }
+}
+
+fn format_disk_hierarchy_rect(
+    game_object_id: i64,
+    component_docs: &HashMap<i64, Vec<&crate::unity_yaml::YamlDoc>>,
+    documents: &HashMap<i64, YamlPropertyDocument>,
+) -> Option<String> {
+    let rect_transform = component_docs
+        .get(&game_object_id)?
+        .iter()
+        .find(|doc| doc.class_id == 224)?;
+    let root = &documents.get(&rect_transform.file_id)?.root;
+    let size = snapshot_vector2(root, "m_SizeDelta")?;
+    let pivot = snapshot_vector2(root, "m_Pivot")?;
+    if let (Some(anchor_min), Some(anchor_max)) = (
+        snapshot_vector2(root, "m_AnchorMin"),
+        snapshot_vector2(root, "m_AnchorMax"),
+    ) {
+        let stretched = (anchor_min[0] - anchor_max[0]).abs() > 0.000_000_5
+            || (anchor_min[1] - anchor_max[1]).abs() > 0.000_000_5;
+        if stretched {
+            return None;
+        }
+    }
+    Some(format!(
+        "{{x: {}, y: {}, width: {}, height: {}}}",
+        format_hierarchy_scalar(-pivot[0] * size[0]),
+        format_hierarchy_scalar(-pivot[1] * size[1]),
+        format_hierarchy_scalar(size[0]),
+        format_hierarchy_scalar(size[1]),
+    ))
+}
+
+fn snapshot_vector2(
+    root: &UnitySerializedPropertySnapshot,
+    property_path: &str,
+) -> Option<[f64; 2]> {
+    let value = &find_snapshot_by_property_path(root, property_path)?.value;
+    let object = value.as_object()?;
+    Some([json_f64(object.get("x")?)?, json_f64(object.get("y")?)?])
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn format_hierarchy_vector(value: [f64; 3]) -> String {
+    format!(
+        "{{x: {}, y: {}, z: {}}}",
+        format_hierarchy_scalar(value[0]),
+        format_hierarchy_scalar(value[1]),
+        format_hierarchy_scalar(value[2]),
+    )
+}
+
+fn format_hierarchy_scalar(value: f64) -> String {
+    let value = if value.abs() < 0.000_000_5 {
+        0.0
+    } else {
+        value
+    };
+    if value.fract().abs() < 0.000_000_5 {
+        format!("{:.0}", value)
+    } else {
+        format!("{:.2}", value)
     }
 }
 
@@ -4055,6 +4632,32 @@ fn refresh_prefab_hierarchy_snapshots(
                     }
                     node.display_value =
                         format_effective_disk_hierarchy_summary(source_node, &document.root);
+                    node.hierarchy_components = source_node.components.clone();
+                    node.hierarchy_active =
+                        find_snapshot_by_property_path(&document.root, "m_IsActive")
+                            .and_then(|snapshot| snapshot.display_value.trim().parse::<i64>().ok())
+                            .map(|value| value != 0)
+                            .unwrap_or(source_node.is_active)
+                            .to_string();
+                    node.hierarchy_tag =
+                        find_snapshot_by_property_path(&document.root, "m_TagString")
+                            .map(|snapshot| snapshot.display_value.trim())
+                            .filter(|value| !value.is_empty())
+                            .or(source_node.tag.as_deref())
+                            .unwrap_or("Untagged")
+                            .to_string();
+                    node.hierarchy_layer =
+                        find_snapshot_by_property_path(&document.root, "m_Layer")
+                            .map(|snapshot| snapshot.display_value.trim())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| source_node.layer.unwrap_or(0).to_string());
+                    node.hierarchy_static =
+                        find_snapshot_by_property_path(&document.root, "m_StaticEditorFlags")
+                            .and_then(|snapshot| snapshot.display_value.trim().parse::<i64>().ok())
+                            .map(|value| value != 0)
+                            .unwrap_or(source_node.is_static)
+                            .to_string();
                 }
             }
         }
@@ -4461,7 +5064,7 @@ fn property_leaf_name(path: &str) -> &str {
 fn asset_boundaries(path: &str) -> Vec<usize> {
     let lower = path.to_ascii_lowercase();
     let mut boundaries = Vec::new();
-    for extension in UNITY_ASSET_EXTENSIONS {
+    for extension in UNITY_YAML_READ_ASSET_EXTENSIONS {
         let marker = format!(".{}", extension);
         let mut offset = 0;
         while let Some(index) = lower[offset..].find(&marker) {
@@ -4478,6 +5081,47 @@ fn asset_boundaries(path: &str) -> Vec<usize> {
     boundaries.sort_unstable();
     boundaries.dedup();
     boundaries
+}
+
+fn unsupported_unity_yaml_read_asset_message(
+    root: &Path,
+    normalized_path: &str,
+    display_path: &str,
+) -> String {
+    let asset_type = probable_asset_extension(root, normalized_path)
+        .map(|extension| format!("'.{}' assets", extension))
+        .unwrap_or_else(|| "this asset type".to_string());
+    format!(
+        "unity_yaml_read does not support {}. If you still need to inspect '{}', use `unity_execute` to load it with a Unity Editor script.",
+        asset_type, display_path
+    )
+}
+
+fn probable_asset_extension(root: &Path, normalized_path: &str) -> Option<String> {
+    let mut prefix_ends = normalized_path
+        .match_indices('/')
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    prefix_ends.push(normalized_path.len());
+    for end in prefix_ends.into_iter().rev() {
+        let candidate = normalized_path[..end].trim_end_matches('/');
+        if candidate.is_empty() {
+            continue;
+        }
+        let absolute = resolve_asset_path(root, candidate);
+        if absolute.is_file() {
+            return absolute
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase);
+        }
+    }
+
+    normalized_path
+        .split('/')
+        .filter_map(|segment| Path::new(segment).extension()?.to_str())
+        .next_back()
+        .map(str::to_ascii_lowercase)
 }
 
 fn resolve_asset_path(root: &Path, candidate: &str) -> PathBuf {
@@ -4837,6 +5481,228 @@ MonoBehaviour:
     }
 
     #[test]
+    fn typed_subscene_component_exposes_its_authoring_scene_path() {
+        let snapshot = UnitySerializedPropertySnapshot {
+            binding_target: Some(UnitySerializedPropertyTarget {
+                kind: "gameobject".to_string(),
+                ..Default::default()
+            }),
+            field_type_full_name: "UnityEngine.GameObject".to_string(),
+            children: vec![UnitySerializedPropertySnapshot {
+                name: "SubScene".to_string(),
+                display_name: "SubScene".to_string(),
+                property_type: "SubScene".to_string(),
+                field_type_full_name: "Unity.Scenes.SubScene".to_string(),
+                children: vec![UnitySerializedPropertySnapshot {
+                    name: "m_SceneAsset".to_string(),
+                    display_name: "Scene Asset".to_string(),
+                    property_type: "ObjectReference".to_string(),
+                    display_value: "Assets/Scenes/World_SubScene.unity".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            subscene_authoring_scene_path(&snapshot).as_deref(),
+            Some("Assets/Scenes/World_SubScene.unity")
+        );
+    }
+
+    #[test]
+    fn disk_subscene_yaml_uses_sceneasset_and_autoload_structural_fallback() {
+        let yaml = r#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 2}
+  - component: {fileID: 3}
+  m_Name: ECS Content
+  m_IsActive: 1
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!114 &3
+MonoBehaviour:
+  m_GameObject: {fileID: 1}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}
+  SceneAsset: {fileID: 102900000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 3}
+  AutoLoadScene: 1
+"#;
+        let guid_paths = HashMap::from([(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "Assets/Scenes/ECS Content.unity".to_string(),
+        )]);
+        let tree = YamlPropertyTree::parse("Assets/Scenes/Main.unity", yaml, None, &guid_paths)
+            .expect("parse parent scene");
+        let snapshot = tree
+            .read(&path("Assets/Scenes/Main.unity/ECS Content"), 2)
+            .expect("read SubScene GameObject");
+
+        assert_eq!(
+            subscene_authoring_scene_path(&snapshot).as_deref(),
+            Some("Assets/Scenes/ECS Content.unity")
+        );
+    }
+
+    #[test]
+    fn ordinary_sceneasset_reference_does_not_expand_as_subscene() {
+        let snapshot = UnitySerializedPropertySnapshot {
+            name: "Scene Holder".to_string(),
+            children: vec![UnitySerializedPropertySnapshot {
+                name: "SceneAsset".to_string(),
+                property_type: "ObjectReference".to_string(),
+                display_value: "Assets/Scenes/Other.unity".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(subscene_authoring_scene_path(&snapshot), None);
+    }
+
+    #[test]
+    fn ancestor_gameobject_does_not_claim_a_nested_subscene() {
+        let nested_component = UnitySerializedPropertySnapshot {
+            property_type: "MonoBehaviour".to_string(),
+            children: vec![
+                UnitySerializedPropertySnapshot {
+                    name: "m_SceneAsset".to_string(),
+                    display_value: "Assets/Scenes/Nested.unity".to_string(),
+                    ..Default::default()
+                },
+                UnitySerializedPropertySnapshot {
+                    name: "m_AutoLoadScene".to_string(),
+                    display_value: "true".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let snapshot = UnitySerializedPropertySnapshot {
+            binding_target: Some(UnitySerializedPropertyTarget {
+                kind: "gameobject".to_string(),
+                ..Default::default()
+            }),
+            children: vec![UnitySerializedPropertySnapshot {
+                node_kind: "hierarchy".to_string(),
+                field_type_full_name: "UnityEngine.GameObject".to_string(),
+                children: vec![nested_component],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(subscene_authoring_scene_path(&snapshot), None);
+    }
+
+    #[test]
+    fn hierarchy_fields_select_disk_scene_metadata_and_world_transform() {
+        let yaml = r#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 2}
+  - component: {fileID: 3}
+  m_Layer: 5
+  m_Name: Hero
+  m_TagString: Player
+  m_StaticEditorFlags: 1
+  m_IsActive: 1
+--- !u!4 &2
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalPosition: {x: 1, y: 2, z: 3}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+--- !u!23 &3
+MeshRenderer:
+  m_GameObject: {fileID: 1}
+"#;
+        let tree =
+            YamlPropertyTree::parse("Assets/Scenes/Arena.unity", yaml, None, &HashMap::new())
+                .expect("parse scene hierarchy metadata");
+        let snapshot = tree
+            .read(&path("Assets/Scenes/Arena.unity"), 2)
+            .expect("read scene hierarchy metadata");
+
+        let default_output = format_property_tree(&snapshot);
+        assert!(default_output.contains("Hero (MeshRenderer) [Tag:Player, Layer:5]"));
+
+        let world_output = format_property_tree_with_hierarchy_fields(
+            &snapshot,
+            HierarchyFieldSelection::from_names(["world_position", "world_rotation"])
+                .expect("parse hierarchy fields"),
+        );
+        assert!(world_output.contains(
+            "Hero [World Position:{x: 1, y: 2, z: 3}, World Rotation:{x: 0, y: 0, z: 0}]"
+        ));
+        assert!(!world_output.contains("MeshRenderer"));
+        assert!(!world_output.contains("Tag:Player"));
+        assert!(!world_output.contains("Layer:5"));
+
+        let state_output = format_property_tree_with_hierarchy_fields(
+            &snapshot,
+            HierarchyFieldSelection::from_names(["active", "static", "world_scale", "rect"])
+                .expect("parse state hierarchy fields"),
+        );
+        assert!(state_output
+            .contains("Hero [Active:true, Static:true, World Scale:{x: 1, y: 1, z: 1}]"));
+        assert!(!state_output.contains("Rect:"));
+
+        let names_only = format_property_tree_with_hierarchy_fields(
+            &snapshot,
+            HierarchyFieldSelection::from_names([]).expect("parse empty hierarchy fields"),
+        );
+        assert!(names_only.contains("└─ Hero\n"));
+        assert!(!names_only.contains("(GameObject)"));
+        assert!(!names_only.contains("[Tag:"));
+    }
+
+    #[test]
+    fn rect_hierarchy_field_is_emitted_only_for_rect_transform_nodes() {
+        let yaml = r#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 2}
+  m_Layer: 0
+  m_Name: Panel
+  m_TagString: Untagged
+  m_IsActive: 1
+--- !u!224 &2
+RectTransform:
+  m_GameObject: {fileID: 1}
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_AnchorMin: {x: 0.5, y: 0.5}
+  m_AnchorMax: {x: 0.5, y: 0.5}
+  m_AnchoredPosition: {x: 0, y: 0}
+  m_SizeDelta: {x: 200, y: 80}
+  m_Pivot: {x: 0.5, y: 0.5}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+"#;
+        let tree =
+            YamlPropertyTree::parse("Assets/Scenes/Panel.unity", yaml, None, &HashMap::new())
+                .expect("parse RectTransform hierarchy metadata");
+        let snapshot = tree
+            .read(&path("Assets/Scenes/Panel.unity"), 2)
+            .expect("read RectTransform hierarchy metadata");
+        let output = format_property_tree_with_hierarchy_fields(
+            &snapshot,
+            HierarchyFieldSelection::from_names(["rect"]).expect("parse rect hierarchy field"),
+        );
+
+        assert!(output.contains("Rect:{x: -100, y: -40, width: 200, height: 80}"));
+    }
+
+    #[test]
     fn disk_prefab_instance_hides_raw_modification_tree() {
         let yaml = r#"--- !u!1001 &9000
 PrefabInstance:
@@ -5072,9 +5938,12 @@ PrefabInstance:
       addedObject: {fileID: 9904}
   m_SourcePrefab: {fileID: 100100000, guid: aabbccdd11223344aabbccdd11223344, type: 3}
 "#;
-        let tree =
-            YamlPropertyTree::parse("Assets/Scenes/Repeated.unity", yaml, None, &HashMap::new())
-                .expect("parse repeated Prefab instances");
+        let guid_paths = HashMap::from([(
+            "aabbccdd11223344aabbccdd11223344".to_string(),
+            "Assets/Prefabs/Collider.prefab".to_string(),
+        )]);
+        let tree = YamlPropertyTree::parse("Assets/Scenes/Repeated.unity", yaml, None, &guid_paths)
+            .expect("parse repeated Prefab instances");
         let snapshot = tree
             .read(&path("Assets/Scenes/Repeated.unity/Wall"), 2)
             .expect("read parent hierarchy");
@@ -5083,6 +5952,12 @@ PrefabInstance:
         assert!(output
             .contains("Collider [Tag:Untagged, Layer:0] ×3 [same Prefab, identical components]"));
         assert!(output.contains("Collider[4] [Tag:Untagged, Layer:0]"));
+        let prefab_output = format_property_tree_with_hierarchy_fields(
+            &snapshot,
+            HierarchyFieldSelection::from_names(["prefab_source"])
+                .expect("parse Prefab source hierarchy field"),
+        );
+        assert!(prefab_output.contains("Prefab Source:Assets/Prefabs/Collider.prefab"));
 
         let second = tree
             .read(&path("Assets/Scenes/Repeated.unity/Wall/Collider[2]"), 1)
@@ -5273,6 +6148,16 @@ PrefabInstance:
             parsed.full_path(),
             "Assets/Actions/LightNormalAttack1.asset/hitTrack/clips/1"
         );
+    }
+
+    #[test]
+    fn rejects_importer_assets_with_an_execute_fallback() {
+        let error = PropertyTreePath::parse("", "Assets/Models/Hero.fbx/ImportedAnimationClip")
+            .expect_err("FBX importer assets are outside Unity YAML coverage");
+
+        assert!(error.contains("does not support '.fbx' assets"));
+        assert!(error.contains("`unity_execute`"));
+        assert!(error.contains("Unity Editor script"));
     }
 
     #[test]

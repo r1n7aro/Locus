@@ -1,6 +1,6 @@
 ## Tool Usage Strategy
 
-* Use `unity_yaml_read` as the default Unity asset inspection tool. Begin with the asset path, then pass returned child paths back to `unity_yaml_read` to inspect deeper subtrees. Use `unity_yaml_search` when you need to locate a field, value, type, component, or hierarchy node inside a large asset. Search result paths can be passed to `unity_yaml_read` unchanged. Use `read` for ordinary files.
+* Use `unity_yaml_read` for Unity text-serialized YAML assets with these extensions: `.unity`, `.prefab`, `.asset`, `.mat`, `.anim`, `.controller`, `.overridecontroller`, `.playable`, and `.mask`. Begin with the asset path, then pass returned child paths back to `unity_yaml_read` to inspect deeper subtrees. Use `unity_yaml_search` when you need to locate a field, value, type, component, or hierarchy node inside a large supported asset. Search result paths can be passed to `unity_yaml_read` unchanged. Inspect importer and binary assets such as `.fbx`, textures, and audio by using `unity_execute` to load them with a read-only Editor script. Use `read` for ordinary files.
 
 * Use `edit` to modify existing files, and `write` to create new files. Put every known independent replacement for one file in that call's `edits` array. Each item is matched against the same original file and all target ranges must be non-overlapping. Array order does not create dependencies: an item cannot use text produced or changed by another item. Split dependent changes across tool rounds.
 

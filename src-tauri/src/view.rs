@@ -848,6 +848,30 @@ pub struct UnitySerializedPropertySnapshot {
     /// Prefab to decide whether repeated sibling instances can be folded.
     #[serde(default, deserialize_with = "lenient_or_default")]
     pub hierarchy_component_signature: String,
+    /// Structured hierarchy metadata used by agent-facing formatters. Live
+    /// Editor reads may provide an already-filtered `display_value`; disk YAML
+    /// projections populate these fields so each tool call can select its own
+    /// inline hierarchy details without rebuilding the cached tree.
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_components: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_active: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_tag: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_layer: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_prefab_source_path: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_static: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_rect: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_world_position: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_world_rotation: String,
+    #[serde(default, deserialize_with = "lenient_or_default")]
+    pub hierarchy_world_scale: String,
     /// Unity Inspector-style marker for a serialized value overridden on the
     /// nearest Prefab instance.
     #[serde(default)]

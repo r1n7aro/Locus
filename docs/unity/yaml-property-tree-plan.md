@@ -356,6 +356,21 @@ Assets/Assets/ECSPrototype/Scenes/EloraECSPrototype.unity/ECS Prototype/EloraECS
 Assets/Assets/ECSPrototype/Scenes/EloraECSPrototype.unity/ECS Prototype/KalanECSPrototype/TargetDummy (MeshFilter, MeshRenderer) [Layer:Friend]
 ```
 
+显式读取挂有 `Unity.Scenes.SubScene` 的 GameObject 或组件时，结果继续附带引用的
+authoring Scene 层级。打开的 SubScene 使用 Editor 实时状态，关闭的 SubScene 使用磁盘
+YAML；子树根保留真实 Scene 资产路径，后续路径可以直接交回 Read：
+
+```text
+Assets/Assets/ECSPrototype/Scenes/EloraECSPrototype.unity/ECS Prototype Entities SubScene (GameObject)
+...
+
+--- SubScene Authoring Hierarchy ---
+[source: disk YAML]
+Assets/Assets/ECSPrototype/Scenes/ECS Prototype Entities SubScene.unity (Scene)
+├─ Spawners (GameObject)
+└─ Entities (GameObject)
+```
+
 Prefab 内部共享引用回写为 canonical path：
 
 ```text

@@ -20,6 +20,8 @@ pub struct UnitySerializedPropertyReadRequest {
     pub max_array_items: Option<i32>,
     #[serde(default)]
     pub auto_expand_char_limit: Option<i32>,
+    #[serde(default)]
+    pub hierarchy_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,7 +83,8 @@ pub async fn read(
     validate_object_target(&request.target)?;
     let schema = load_schema_for_target(working_dir, &request.target).await;
     let schema_mode = if schema.is_some() { "dynamic" } else { "full" };
-    let payload = serde_json::json!({
+    let hierarchy_fields = request.hierarchy_fields.clone();
+    let mut payload = serde_json::json!({
         "bindingId": request.binding_id,
         "target": request.target,
         "maxDepth": request.max_depth.unwrap_or_default(),
@@ -89,6 +92,9 @@ pub async fn read(
         "autoExpandCharLimit": request.auto_expand_char_limit.unwrap_or_default(),
         "schemaMode": schema_mode,
     });
+    if let Some(hierarchy_fields) = hierarchy_fields {
+        payload["hierarchyFields"] = serde_json::json!(hierarchy_fields);
+    }
     let raw = crate::unity_bridge::property_tree_read(working_dir, &payload).await?;
     let mut result: UnitySerializedPropertyReadResult = serde_json::from_str(&raw)
         .map_err(|error| format!("Invalid unity_serialized_property_read response: {}", error))?;

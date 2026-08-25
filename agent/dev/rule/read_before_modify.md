@@ -1,6 +1,6 @@
 ## Engineering Implementation Principles
 
-**NOTE: Read before modifying. Use `read` for ordinary files. For Unity assets, start with `unity_yaml_read` on the asset-qualified path, follow returned child paths for the target subtree, and use `unity_yaml_search` when the target path is unknown. Understand the current code or asset structure before using `edit` or `unity_execute`. Never modify a file or asset you have not read.**
+**NOTE: Read before modifying. Use `read` for ordinary files. For Unity text-serialized YAML assets supported by `unity_yaml_read`, start with the asset-qualified path, follow returned child paths for the target subtree, and use `unity_yaml_search` when the target path is unknown. For importer and binary assets outside that coverage, use `unity_execute` to load and inspect them with a read-only Editor script. Understand the current code or asset structure before using `edit` or a modifying `unity_execute` call. Never modify a file or asset you have not inspected.**
 
 * Follow existing conventions first: unless the user explicitly requests otherwise, work according to the implementation patterns already present in the project as much as possible. If you believe the current logic does not align with Unity engineering best practices, you may suggest improvements to the user.
 * Full automation first: with the `unity_execute` tool, you are able to modify any asset or scene file in Unity. Only ask the user to click or perform manual operations when there is no safe and reliable automation path.

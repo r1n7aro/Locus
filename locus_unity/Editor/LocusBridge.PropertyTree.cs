@@ -50,7 +50,22 @@ namespace Locus
             public int maxDepth;
             public int maxArrayItems;
             public int autoExpandCharLimit;
+            public string[] hierarchyFields;
             public string schemaMode;
+        }
+
+        private sealed class PropertyTreeHierarchyFieldSet
+        {
+            public bool active;
+            public bool layer;
+            public bool prefabSource;
+            public bool staticState;
+            public bool tag;
+            public bool rect;
+            public bool worldPosition;
+            public bool worldRotation;
+            public bool worldScale;
+            public bool components;
         }
 
         [Serializable]
@@ -194,7 +209,7 @@ namespace Locus
             return await RunPropertyTreeOnMainThread(
                 requestId,
                 "property_tree_read",
-                delegate { return ReadPropertyTree(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, request.autoExpandCharLimit, IsDynamicSchemaMode(request.schemaMode)); });
+                delegate { return ReadPropertyTree(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, request.autoExpandCharLimit, request.hierarchyFields, IsDynamicSchemaMode(request.schemaMode)); });
         }
 
         private static async Task<PipeEnvelope> HandlePropertyTreeWrite(string requestId, string message)
@@ -490,14 +505,18 @@ namespace Locus
             int maxDepth = 0,
             int maxArrayItems = 0,
             int autoExpandCharLimit = 0,
+            string[] hierarchyFields = null,
             bool dynamicSchema = false)
         {
+            PropertyTreeHierarchyFieldSet hierarchyFieldSet = ParsePropertyTreeHierarchyFields(
+                hierarchyFields);
             string sceneRead = TryReadPropertyTreeScene(
                 bindingId,
                 target,
                 maxDepth,
                 maxArrayItems,
-                autoExpandCharLimit);
+                autoExpandCharLimit,
+                hierarchyFieldSet);
             if (sceneRead != null)
                 return sceneRead;
 
@@ -506,6 +525,7 @@ namespace Locus
                 target,
                 maxDepth,
                 maxArrayItems,
+                hierarchyFieldSet,
                 dynamicSchema);
             if (prefabRead != null)
                 return prefabRead;
@@ -533,7 +553,9 @@ namespace Locus
                     objectSnapshot.children)
                     .Select(record => record.entry)
                     .ToArray();
-                objectSnapshot.displaySections = BuildPropertyTreeDisplaySections(obj);
+                objectSnapshot.displaySections = BuildPropertyTreeDisplaySections(
+                    obj,
+                    hierarchyFieldSet);
                 ApplyPropertyTreePrefabInstanceMetadata(obj, objectSnapshot);
                 return BuildBindingReadJson(bindingId, target, objectSnapshot, false, properties.Length > 1 ? properties : null);
             }
@@ -570,7 +592,8 @@ namespace Locus
             PropertyTreeTarget target,
             int maxDepth,
             int maxArrayItems,
-            int autoExpandCharLimit)
+            int autoExpandCharLimit,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             if (target == null
                 || !string.Equals((target.kind ?? "").Trim(), "asset", StringComparison.OrdinalIgnoreCase)
@@ -589,7 +612,8 @@ namespace Locus
             if (autoExpandCharLimit > 0
                 && PropertyTreeSceneHierarchyFitsBudget(
                     roots,
-                    Math.Max(256, autoExpandCharLimit)))
+                    Math.Max(256, autoExpandCharLimit),
+                    hierarchyFields))
             {
                 depthLimit = 16;
             }
@@ -604,7 +628,8 @@ namespace Locus
                 scene,
                 roots,
                 depthLimit,
-                arrayLimit);
+                arrayLimit,
+                hierarchyFields);
             return BuildBindingReadJson(bindingId, target, snapshot, false);
         }
 
@@ -613,7 +638,8 @@ namespace Locus
             Scene scene,
             GameObject[] roots,
             int maxDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             SerializedPropertySnapshot[] children = maxDepth > 0
                 ? BuildPropertyTreeSceneHierarchyChildren(
@@ -621,7 +647,8 @@ namespace Locus
                     roots,
                     "",
                     maxDepth - 1,
-                    maxArrayItems)
+                    maxArrayItems,
+                    hierarchyFields)
                 : new SerializedPropertySnapshot[0];
             bool hasChildren = roots.Length > 0;
             string sceneName = !string.IsNullOrWhiteSpace(scene.name)
@@ -695,6 +722,7 @@ namespace Locus
             PropertyTreeTarget target,
             int maxDepth,
             int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields,
             bool dynamicSchema)
         {
             if (target == null
@@ -754,6 +782,7 @@ namespace Locus
                     "",
                     depthLimit - 1,
                     arrayLimit,
+                    hierarchyFields,
                     dynamicSchema));
             }
 
@@ -815,6 +844,7 @@ namespace Locus
             string parentObjectPath,
             int remainingDepth,
             int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields,
             bool dynamicSchema)
         {
             if (parent == null || remainingDepth < 0 || parent.childCount == 0)
@@ -848,6 +878,7 @@ namespace Locus
                     objectPath,
                     remainingDepth,
                     maxArrayItems,
+                    hierarchyFields,
                     dynamicSchema));
             }
             return snapshots.ToArray();
@@ -860,6 +891,7 @@ namespace Locus
             string objectPath,
             int remainingDepth,
             int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields,
             bool dynamicSchema)
         {
             var objectTarget = new PropertyTreeTarget
@@ -892,6 +924,7 @@ namespace Locus
                     objectPath,
                     remainingDepth - 1,
                     maxArrayItems,
+                    hierarchyFields,
                     dynamicSchema));
             }
 
@@ -920,7 +953,7 @@ namespace Locus
                 fieldTypeFullName = "UnityEngine.GameObject",
                 fieldTypeAssembly = typeof(GameObject).Assembly.GetName().Name,
                 value = go.name ?? "",
-                displayValue = BuildPropertyTreeHierarchySummary(go),
+                displayValue = BuildPropertyTreeHierarchySummary(go, hierarchyFields),
                 editable = false,
                 hasChildren = hasChildren,
                 isArray = false,
@@ -957,16 +990,22 @@ namespace Locus
 
         private static bool PropertyTreeSceneHierarchyFitsBudget(
             GameObject[] roots,
-            int charLimit)
+            int charLimit,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             int remaining = Math.Max(0, charLimit) - 256;
-            return ConsumePropertyTreeSceneHierarchyBudget(roots, 1, ref remaining);
+            return ConsumePropertyTreeSceneHierarchyBudget(
+                roots,
+                1,
+                ref remaining,
+                hierarchyFields);
         }
 
         private static bool ConsumePropertyTreeSceneHierarchyBudget(
             GameObject[] objects,
             int depth,
-            ref int remaining)
+            ref int remaining,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             if (depth > 16)
                 return false;
@@ -975,7 +1014,7 @@ namespace Locus
                 GameObject go = objects[i];
                 if (go == null)
                     continue;
-                string summary = BuildPropertyTreeHierarchySummary(go);
+                string summary = BuildPropertyTreeHierarchySummary(go, hierarchyFields);
                 remaining -= depth * 3
                     + (go.name ?? "GameObject").Length
                     + summary.Length
@@ -990,7 +1029,8 @@ namespace Locus
                 if (!ConsumePropertyTreeSceneHierarchyBudget(
                     children,
                     depth + 1,
-                    ref remaining))
+                    ref remaining,
+                    hierarchyFields))
                 {
                     return false;
                 }
@@ -1003,7 +1043,8 @@ namespace Locus
             GameObject[] siblings,
             string parentObjectPath,
             int remainingDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             var totals = new Dictionary<string, int>(StringComparer.Ordinal);
             for (int i = 0; i < siblings.Length; i++)
@@ -1036,7 +1077,8 @@ namespace Locus
                     segment,
                     objectPath,
                     remainingDepth,
-                    maxArrayItems));
+                    maxArrayItems,
+                    hierarchyFields));
             }
             return children.ToArray();
         }
@@ -1047,7 +1089,8 @@ namespace Locus
             string segment,
             string objectPath,
             int remainingDepth,
-            int maxArrayItems)
+            int maxArrayItems,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             var objectTarget = new PropertyTreeTarget
             {
@@ -1077,10 +1120,11 @@ namespace Locus
                     childObjects,
                     objectPath,
                     remainingDepth - 1,
-                    maxArrayItems);
+                    maxArrayItems,
+                    hierarchyFields);
             }
 
-            string summary = BuildPropertyTreeHierarchySummary(go);
+            string summary = BuildPropertyTreeHierarchySummary(go, hierarchyFields);
             bool foldablePrefabInstance = PrefabUtility.IsAnyPrefabInstanceRoot(go);
             string hierarchyPrefabSource = foldablePrefabInstance
                 ? BuildSourcePrefabPath(go)
@@ -1751,14 +1795,15 @@ namespace Locus
         }
 
         private static PropertyTreeDisplaySection[] BuildPropertyTreeDisplaySections(
-            UnityEngine.Object obj)
+            UnityEngine.Object obj,
+            PropertyTreeHierarchyFieldSet hierarchyFields = null)
         {
             var sections = new List<PropertyTreeDisplaySection>();
             GameObject go = obj as GameObject;
             Transform transform = obj as Transform;
             if (go != null)
             {
-                sections.Add(BuildPropertyTreeHierarchyDisplaySection(go));
+                sections.Add(BuildPropertyTreeHierarchyDisplaySection(go, hierarchyFields));
                 sections.Add(BuildPropertyTreeTransformDisplaySection(go.transform));
 
                 PropertyTreeDisplaySection prefab = BuildPropertyTreePrefabDisplaySection(go);
@@ -1807,34 +1852,143 @@ namespace Locus
             snapshot.prefabSource = sourcePath;
         }
 
-        private static string BuildPropertyTreeHierarchySummary(GameObject go)
+        private static PropertyTreeHierarchyFieldSet ParsePropertyTreeHierarchyFields(
+            string[] values)
+        {
+            if (values == null)
+            {
+                return new PropertyTreeHierarchyFieldSet
+                {
+                    layer = true,
+                    tag = true,
+                    components = true
+                };
+            }
+
+            var fields = new PropertyTreeHierarchyFieldSet();
+            for (int i = 0; i < values.Length; i++)
+            {
+                string value = (values[i] ?? "")
+                    .Trim()
+                    .ToLowerInvariant()
+                    .Replace('-', '_')
+                    .Replace(' ', '_');
+                switch (value)
+                {
+                    case "active":
+                        fields.active = true;
+                        break;
+                    case "layer":
+                        fields.layer = true;
+                        break;
+                    case "prefab_source":
+                        fields.prefabSource = true;
+                        break;
+                    case "static":
+                        fields.staticState = true;
+                        break;
+                    case "tag":
+                        fields.tag = true;
+                        break;
+                    case "rect":
+                        fields.rect = true;
+                        break;
+                    case "world_position":
+                        fields.worldPosition = true;
+                        break;
+                    case "world_rotation":
+                        fields.worldRotation = true;
+                        break;
+                    case "world_scale":
+                        fields.worldScale = true;
+                        break;
+                    case "component":
+                    case "components":
+                        fields.components = true;
+                        break;
+                }
+            }
+            return fields;
+        }
+
+        private static string BuildPropertyTreeHierarchySummary(
+            GameObject go,
+            PropertyTreeHierarchyFieldSet fields)
         {
             if (go == null)
                 return "";
+            if (fields == null)
+                fields = ParsePropertyTreeHierarchyFields(null);
 
-            string tag = string.IsNullOrWhiteSpace(go.tag) ? "Untagged" : go.tag;
-            string layer = go.layer.ToString(CultureInfo.InvariantCulture);
-            string layerName = LayerMask.LayerToName(go.layer);
-            if (!string.IsNullOrWhiteSpace(layerName))
-                layer += " (" + layerName + ")";
+            var annotations = new List<string>();
+            if (fields.tag)
+            {
+                string tag = string.IsNullOrWhiteSpace(go.tag) ? "Untagged" : go.tag;
+                annotations.Add("Tag:" + tag);
+            }
+            if (fields.layer)
+            {
+                string layer = go.layer.ToString(CultureInfo.InvariantCulture);
+                string layerName = LayerMask.LayerToName(go.layer);
+                if (!string.IsNullOrWhiteSpace(layerName))
+                    layer += " (" + layerName + ")";
+                annotations.Add("Layer:" + layer);
+            }
+            if (fields.active)
+                annotations.Add("Active:" + (go.activeSelf ? "true" : "false"));
+            if (fields.staticState)
+                annotations.Add("Static:" + (go.isStatic ? "true" : "false"));
+            if (fields.prefabSource)
+            {
+                string sourcePath = BuildSourcePrefabPath(go);
+                if (!string.IsNullOrWhiteSpace(sourcePath))
+                    annotations.Add("Prefab Source:" + sourcePath);
+            }
+            if (fields.worldPosition && go.transform != null)
+                annotations.Add("World Position:" + FormatVector3(go.transform.position));
+            if (fields.worldRotation && go.transform != null)
+                annotations.Add("World Rotation:" + FormatVector3(go.transform.rotation.eulerAngles));
+            if (fields.worldScale && go.transform != null)
+                annotations.Add("World Scale:" + FormatVector3(go.transform.lossyScale));
+            RectTransform rectTransform = fields.rect ? go.transform as RectTransform : null;
+            if (rectTransform != null)
+                annotations.Add("Rect:" + FormatRect(rectTransform.rect));
 
-            return BuildComponentSuffix(go)
-                + "  [Tag:" + tag + ", Layer:" + layer + "]";
+            string summary = fields.components ? BuildComponentSuffix(go) : "";
+            if (annotations.Count > 0)
+                summary += "  [" + string.Join(", ", annotations.ToArray()) + "]";
+            return summary;
         }
 
-        private static PropertyTreeDisplaySection BuildPropertyTreeHierarchyDisplaySection(GameObject go)
+        private static string FormatRect(Rect value)
+        {
+            return "{x: " + FormatFloat(value.x)
+                + ", y: " + FormatFloat(value.y)
+                + ", width: " + FormatFloat(value.width)
+                + ", height: " + FormatFloat(value.height)
+                + "}";
+        }
+
+        private static PropertyTreeDisplaySection BuildPropertyTreeHierarchyDisplaySection(
+            GameObject go,
+            PropertyTreeHierarchyFieldSet hierarchyFields)
         {
             var lines = new List<string>();
             Transform transform = go.transform;
             lines.Add(transform.parent != null
-                ? "Parent: " + FormatReadHierarchyNodeLabel(transform.parent.gameObject)
+                ? "Parent: " + transform.parent.gameObject.name
+                    + BuildPropertyTreeHierarchySummary(
+                        transform.parent.gameObject,
+                        hierarchyFields)
                 : "Parent: none");
-            lines.Add(FormatReadHierarchyNodeLabel(go));
+            lines.Add(go.name + BuildPropertyTreeHierarchySummary(go, hierarchyFields));
             for (int i = 0; i < transform.childCount; i++)
             {
                 Transform child = transform.GetChild(i);
                 bool isLast = i + 1 == transform.childCount;
-                string line = (isLast ? "└─ " : "├─ ") + FormatReadHierarchyNodeLabel(child.gameObject);
+                string line = (isLast ? "└─ " : "├─ ")
+                    + child.gameObject.name
+                    + BuildPropertyTreeHierarchySummary(child.gameObject, hierarchyFields);
                 int descendants = CountDescendants(child);
                 if (descendants > 0)
                     line += " … +" + descendants.ToString(CultureInfo.InvariantCulture) + " descendants";
