@@ -90,6 +90,14 @@ export function setToolFailureLogEnabled(value: boolean): Promise<void> {
   return ipcInvoke<void>("set_tool_failure_log_enabled", { value });
 }
 
+export function getSessionUndoEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_session_undo_enabled");
+}
+
+export function setSessionUndoEnabled(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_session_undo_enabled", { value });
+}
+
 export function getLlmRetryMaxAttempts(): Promise<number> {
   return ipcInvoke<number>("get_llm_retry_max_attempts");
 }

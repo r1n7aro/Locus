@@ -20,6 +20,8 @@ describe("useModelStore reset behavior", () => {
       mainModel: "",
       planModel: "",
       subagentModels: {},
+      subagentEfforts: {},
+      subagentFastModes: {},
     });
     modelServiceMocks.getCustomEndpoints.mockResolvedValue([]);
   });

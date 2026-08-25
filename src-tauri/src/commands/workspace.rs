@@ -1008,6 +1008,12 @@ pub struct ModelDefaults {
     pub plan_model: String,
     #[serde(default)]
     pub subagent_models: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub subagent_efforts: std::collections::HashMap<String, String>,
+    /// Missing keys inherit the current session; explicit false selects the
+    /// standard Codex service tier for that sub-agent.
+    #[serde(default)]
+    pub subagent_fast_modes: std::collections::HashMap<String, bool>,
     /// Opt-in flag: Claude Code CLI models only join the model list after the
     /// user explicitly enables them in model configuration.
     #[serde(default)]
@@ -1020,6 +1026,8 @@ impl Default for ModelDefaults {
             main_model: String::new(),
             plan_model: String::new(),
             subagent_models: std::collections::HashMap::new(),
+            subagent_efforts: std::collections::HashMap::new(),
+            subagent_fast_modes: std::collections::HashMap::new(),
             claude_code_enabled: false,
         }
     }
@@ -1935,6 +1943,24 @@ pub async fn set_tool_failure_log_enabled(
 ) -> Result<(), AppError> {
     config
         .set_tool_failure_log_enabled(value)
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_session_undo_enabled(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.session_undo_enabled())
+}
+
+#[tauri::command]
+pub async fn set_session_undo_enabled(
+    value: bool,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<(), AppError> {
+    config
+        .set_session_undo_enabled(value)
         .map_err(AppError::from)?;
     Ok(())
 }
@@ -3093,6 +3119,17 @@ pub async fn select_unity_scene_object(
 }
 
 #[tauri::command]
+pub async fn validate_unity_scene_object(
+    scene_path: String,
+    object_path: String,
+    workspace: State<'_, Arc<Workspace>>,
+) -> Result<String, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_bridge::validate_scene_object(&cwd, &scene_path, &object_path).await?;
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
 pub async fn open_unity_scene_object_inspector(
     scene_path: String,
     object_path: String,
@@ -3271,7 +3308,7 @@ mod tests {
         normalize_workspace_sub_path, resolve_workspace_dir_target,
         rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir, valid_custom_model_refs,
         workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
-        CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel,
+        CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel, ModelDefaults,
         DEFAULT_CODEX_CONTEXT_WINDOW, DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
     use std::path::Path;
@@ -3315,6 +3352,21 @@ mod tests {
             config.prefix_cache_ttl_seconds,
             DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
         );
+    }
+
+    #[test]
+    fn legacy_model_defaults_add_empty_subagent_runtime_overrides() {
+        let defaults: ModelDefaults = serde_json::from_str(
+            r#"{"mainModel":"openai/gpt-5.6-sol","subagentModels":{"explorer":"openai/gpt-5.6-luna"}}"#,
+        )
+        .expect("legacy model defaults");
+
+        assert_eq!(
+            defaults.subagent_models.get("explorer").map(String::as_str),
+            Some("openai/gpt-5.6-luna")
+        );
+        assert!(defaults.subagent_efforts.is_empty());
+        assert!(defaults.subagent_fast_modes.is_empty());
     }
 
     #[test]

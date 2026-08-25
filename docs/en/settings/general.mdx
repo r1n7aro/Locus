@@ -14,6 +14,7 @@ The `General` group in Settings collects interface and environment configuration
 - **`Close Behavior`**: closing the main window either runs `Exit App` or `Minimize to Tray`.
 - **`Local Data Storage`**: where sessions and memory files live (Knowledge content stays in the project directory). `Open Directory` or `Change Location`; a move finishes after restart.
 - **`Temporary Files`**: large tool outputs and runtime temp files. `Clear` frees space; historical sessions still open afterwards, and cleared large tool outputs show as `Full output deleted`.
+- **`Session File Undo`**: records each round of Agent file changes for review and undo. Turning it off stops automatic Git snapshots; writes with known file paths still coordinate access to the same file, and Unity execution keeps its required serialization.
 - **`Git Runtime`**: the Git that Locus uses for version control, undo, and change analysis. Choose the managed Git or one installed on your system.
 - **`Python Runtime`**: the interpreter the bash tool uses for `python` and `pip`. Managed Python installs packages into the data directory instead of your system environment.
 - **`Reset All Settings`**: clears the configuration and re-enters the onboarding flow.

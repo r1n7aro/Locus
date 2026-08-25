@@ -90,18 +90,34 @@ export function installTauriWindowDragFallback(): void {
   });
 }
 
-export function toggleTauriDevtools(): void {
+export function toggleTauriDevtools(): Promise<void> {
   const invoke = getTauriInternals()?.invoke;
-  if (typeof invoke !== "function") return;
-  void invoke("plugin:webview|internal_toggle_devtools").catch(() => {
-    /* Devtools toggle is only available in debug builds. */
-  });
+  if (typeof invoke !== "function") return Promise.resolve();
+  return invoke("plugin:webview|internal_toggle_devtools").then(() => undefined);
 }
 
-export function installTauriDevtoolsHotkeys(): void {
+type DevtoolsAccessResolver = () => boolean | Promise<boolean>;
+
+function isDevtoolsHotkey(event: KeyboardEvent): boolean {
+  if (event.key === "F12") return true;
+  if (event.code !== "KeyI") return false;
+  return (event.ctrlKey && event.shiftKey) || (event.metaKey && event.altKey);
+}
+
+export function installTauriDevtoolsHotkeys(
+  canToggleDevtools: DevtoolsAccessResolver = () => true,
+): void {
   window.addEventListener("keydown", (event) => {
-    if (event.key !== "F12") return;
+    if (!isDevtoolsHotkey(event)) return;
     event.preventDefault();
-    toggleTauriDevtools();
-  });
+    event.stopImmediatePropagation();
+    void Promise.resolve(canToggleDevtools())
+      .then((enabled) => {
+        if (!enabled) return;
+        return toggleTauriDevtools();
+      })
+      .catch(() => {
+        /* Debug mode or the release DevTools capability may be unavailable. */
+      });
+  }, true);
 }

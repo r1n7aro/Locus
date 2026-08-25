@@ -297,6 +297,7 @@ export const useModelStore = defineStore("model", () => {
   const codexTransport = ref<CodexTransportMode>("websocket");
   const codexContextWindow = ref(CODEX_DEFAULT_CONTEXT_WINDOW);
   const codexFastMode = ref(false);
+  const defaultCodexFastMode = ref(false);
   const selectedModelId = ref("");
   const lastModelId = ref("");
   const effort = ref<EffortLevel>("high");
@@ -305,7 +306,13 @@ export const useModelStore = defineStore("model", () => {
   const activeAgentId = ref("");
   const agentModelPreferences = ref<Record<string, AgentModelPreference>>({});
   const debugModeEnabled = ref(getCachedDebugMode() ?? false);
-  const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
+  const modelDefaults = ref<ModelDefaults>({
+    mainModel: "",
+    planModel: "",
+    subagentModels: {},
+    subagentEfforts: {},
+    subagentFastModes: {},
+  });
   let effortPersistenceReady = false;
   let agentPreferenceSaveQueue = Promise.resolve();
 
@@ -487,7 +494,7 @@ export const useModelStore = defineStore("model", () => {
 
   async function loadModelDefaults() {
     try {
-      modelDefaults.value = await modelService.getModelDefaults();
+      applyModelDefaults(await modelService.getModelDefaults());
     } catch { /* ignore */ }
   }
 
@@ -529,8 +536,11 @@ export const useModelStore = defineStore("model", () => {
 
   async function loadCodexFastMode() {
     try {
-      codexFastMode.value = await modelService.getCodexFastMode();
+      const saved = await modelService.getCodexFastMode();
+      defaultCodexFastMode.value = saved;
+      codexFastMode.value = saved;
     } catch {
+      defaultCodexFastMode.value = false;
       codexFastMode.value = false;
     }
   }
@@ -656,6 +666,7 @@ export const useModelStore = defineStore("model", () => {
   }
 
   function selectCodexFastMode(enabled: boolean) {
+    defaultCodexFastMode.value = enabled;
     codexFastMode.value = enabled;
     modelService.saveCodexFastMode(enabled)
       .catch((e: unknown) => console.warn("[model] save_codex_fast_mode:", e));
@@ -674,8 +685,21 @@ export const useModelStore = defineStore("model", () => {
     applyContextEffort(defaultEffort.value);
   }
 
+  function applyContextCodexFastMode(enabled: boolean | null | undefined) {
+    codexFastMode.value = enabled ?? defaultCodexFastMode.value;
+  }
+
+  function restoreDefaultCodexFastMode() {
+    applyContextCodexFastMode(defaultCodexFastMode.value);
+  }
+
   function applyModelDefaults(defaults: ModelDefaults) {
-    modelDefaults.value = defaults;
+    modelDefaults.value = {
+      ...defaults,
+      subagentModels: defaults.subagentModels ?? {},
+      subagentEfforts: defaults.subagentEfforts ?? {},
+      subagentFastModes: defaults.subagentFastModes ?? {},
+    };
   }
 
   function applyCustomProviders(providers: CustomProvider[]) {
@@ -696,6 +720,7 @@ export const useModelStore = defineStore("model", () => {
     codexTransport,
     codexContextWindow,
     codexFastMode,
+    defaultCodexFastMode,
     selectedModelId,
     lastModelId,
     effort,
@@ -733,6 +758,8 @@ export const useModelStore = defineStore("model", () => {
     codexFastModeForModel,
     applyContextEffort,
     restoreDefaultEffort,
+    applyContextCodexFastMode,
+    restoreDefaultCodexFastMode,
     applyModelDefaults,
     applyCustomProviders,
     applyCodexModelConfig,

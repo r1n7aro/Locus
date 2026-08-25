@@ -21,4 +21,25 @@ describe("general settings debug mode switch", () => {
     expect(permissions).toContain("let cachedDebugMode: boolean | null = null;");
     expect(permissions).toContain("export function getCachedDebugMode(): boolean | null");
   });
+
+  it("exposes DevTools only through debug mode in release builds", () => {
+    const source = read("src/components/settings/GeneralSettings.vue");
+    const runtime = read("src/services/tauriRuntime.ts");
+    const main = read("src/main.ts");
+    const cargo = read("src-tauri/Cargo.toml");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(source).toContain('import BaseButton from "../ui/BaseButton.vue";');
+    expect(source).toContain('v-if="debugEnabled"');
+    expect(source).toContain('@click="toggleDevtools"');
+    expect(source).toContain('t("settings.general.devtoolsToggle")');
+    expect(runtime).toContain("type DevtoolsAccessResolver");
+    expect(runtime).toContain("event.stopImmediatePropagation();");
+    expect(runtime).toContain("if (!enabled) return;");
+    expect(main).toContain("installTauriDevtoolsHotkeys(getDebugMode);");
+    expect(cargo).toContain('features = ["tray-icon", "devtools"]');
+    expect(zh).toContain('"settings.general.devtoolsToggle": "打开 / 关闭 DevTools"');
+    expect(en).toContain('"settings.general.devtoolsToggle": "Toggle DevTools"');
+  });
 });

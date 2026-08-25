@@ -32,7 +32,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 # tauri-runtime-wry 2.10.1 leaked one window DC on every DPI lookup for the
 # undecorated resize border. Tauri 2.11.5 resolves to the fixed runtime line.
-tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri = { version = "2.11.5", features = ["tray-icon", "devtools"] }
 tauri-plugin-opener = "2.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

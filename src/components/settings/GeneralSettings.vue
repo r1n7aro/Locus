@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { t } from "../../i18n";
 import type { Locale } from "../../i18n";
 import BaseDropdown from "../ui/BaseDropdown.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/permissions";
@@ -11,6 +12,7 @@ import {
   getCloseBehavior,
   getLlmRetryMaxAttempts,
   getPythonRuntimeState,
+  getSessionUndoEnabled,
   getSubagentMaxConcurrent,
   getSubagentMaxDepth,
   getToolFailureLogEnabled,
@@ -19,6 +21,7 @@ import {
   savePythonRuntimeSelection,
   setCloseBehavior,
   setLlmRetryMaxAttempts,
+  setSessionUndoEnabled,
   setSubagentMaxConcurrent,
   setSubagentMaxDepth,
   setToolFailureLogEnabled,
@@ -45,6 +48,7 @@ import type {
 } from "../../types";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../../services/errors";
+import { toggleTauriDevtools } from "../../services/tauriRuntime";
 import { useNotificationStore } from "../../stores/notification";
 
 defineProps<{
@@ -64,9 +68,13 @@ const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
 const debugBusy = ref(false);
+const devtoolsBusy = ref(false);
 const toolFailureLogEnabled = ref(false);
 const toolFailureLogReady = ref(false);
 const toolFailureLogBusy = ref(false);
+const sessionUndoEnabled = ref(true);
+const sessionUndoReady = ref(false);
+const sessionUndoBusy = ref(false);
 const closeBehavior = ref<AppCloseBehavior>("exit");
 const closeBehaviorReady = ref(false);
 const closeBehaviorBusy = ref(false);
@@ -128,6 +136,11 @@ const debugStatusLabel = computed(() => {
 const toolFailureLogStatusLabel = computed(() => {
   if (!toolFailureLogReady.value) return t("common.loading");
   return toolFailureLogEnabled.value ? t("common.enabled") : t("common.disabled");
+});
+
+const sessionUndoStatusLabel = computed(() => {
+  if (!sessionUndoReady.value) return t("common.loading");
+  return sessionUndoEnabled.value ? t("common.enabled") : t("common.disabled");
 });
 
 const llmRetryStatusLabel = computed(() => {
@@ -211,6 +224,7 @@ const hasAvailableGitOption = computed(() => gitOptions.value.some((option) => !
 onMounted(() => {
   void refreshDebugMode();
   void refreshToolFailureLogEnabled();
+  void refreshSessionUndoEnabled();
   void refreshLlmRetryMaxAttempts();
   void refreshSubagentLimits();
   void refreshUnityBackgroundHook();
@@ -253,6 +267,22 @@ async function toggleDebug() {
   }
 }
 
+async function toggleDevtools() {
+  if (!debugEnabled.value || devtoolsBusy.value) return;
+  devtoolsBusy.value = true;
+  try {
+    await toggleTauriDevtools();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleDevtools",
+    });
+  } finally {
+    devtoolsBusy.value = false;
+  }
+}
+
 async function refreshToolFailureLogEnabled() {
   try {
     toolFailureLogEnabled.value = await getToolFailureLogEnabled();
@@ -284,6 +314,40 @@ async function toggleToolFailureLog() {
     });
   } finally {
     toolFailureLogBusy.value = false;
+  }
+}
+
+async function refreshSessionUndoEnabled() {
+  try {
+    sessionUndoEnabled.value = await getSessionUndoEnabled();
+  } catch (e) {
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "loadSessionUndo",
+    });
+  } finally {
+    sessionUndoReady.value = true;
+  }
+}
+
+async function toggleSessionUndo() {
+  if (!sessionUndoReady.value || sessionUndoBusy.value) return;
+  const previous = sessionUndoEnabled.value;
+  const next = !previous;
+  sessionUndoEnabled.value = next;
+  sessionUndoBusy.value = true;
+  try {
+    await setSessionUndoEnabled(next);
+  } catch (e) {
+    sessionUndoEnabled.value = previous;
+    const err = normalizeAppError(e);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "toggleSessionUndo",
+    });
+  } finally {
+    sessionUndoBusy.value = false;
   }
 }
 
@@ -830,17 +894,26 @@ async function selectPythonRuntime(selectedId: string) {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.general.debugMode") }}</div>
     <p class="section-desc">{{ t("settings.general.debugModeDesc") }}</p>
-    <label class="debug-toggle" :aria-busy="!debugReady">
-      <BaseSwitch
-        v-if="debugReady"
-        :model-value="debugEnabled"
-        :disabled="debugBusy"
-        :aria-label="t('settings.general.debugMode')"
-        @update:model-value="toggleDebug"
-      />
-      <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
-      <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
-    </label>
+    <div class="debug-mode-controls">
+      <label class="debug-toggle" :aria-busy="!debugReady">
+        <BaseSwitch
+          v-if="debugReady"
+          :model-value="debugEnabled"
+          :disabled="debugBusy"
+          :aria-label="t('settings.general.debugMode')"
+          @update:model-value="toggleDebug"
+        />
+        <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
+        <span class="debug-toggle-label">{{ debugStatusLabel }}</span>
+      </label>
+      <BaseButton
+        v-if="debugEnabled"
+        :disabled="devtoolsBusy"
+        @click="toggleDevtools"
+      >
+        {{ t("settings.general.devtoolsToggle") }}
+      </BaseButton>
+    </div>
   </div>
 
   <div class="settings-section">
@@ -1051,6 +1124,22 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.sessionUndo") }}</div>
+    <p class="section-desc">{{ t("settings.general.sessionUndoDesc") }}</p>
+    <label class="debug-toggle" :aria-busy="!sessionUndoReady">
+      <BaseSwitch
+        v-if="sessionUndoReady"
+        :model-value="sessionUndoEnabled"
+        :disabled="sessionUndoBusy"
+        :aria-label="t('settings.general.sessionUndo')"
+        @update:model-value="toggleSessionUndo"
+      />
+      <span v-else class="debug-toggle-placeholder" aria-hidden="true" />
+      <span class="debug-toggle-label">{{ sessionUndoStatusLabel }}</span>
+    </label>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.general.gitRuntime") }}</div>
     <p class="section-desc">{{ t("settings.general.gitRuntimeDesc") }}</p>
     <div class="runtime-block">
@@ -1142,6 +1231,12 @@ async function selectPythonRuntime(selectedId: string) {
 </template>
 
 <style scoped>
+.debug-mode-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
 .debug-toggle {
   display: inline-flex;
   align-items: center;

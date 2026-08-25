@@ -12,6 +12,7 @@ import {
   installTauriDevtoolsHotkeys,
   installTauriWindowDragFallback,
 } from "./services/tauriRuntime";
+import { getDebugMode } from "./services/permissions";
 import { bootstrapPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
 
@@ -20,7 +21,7 @@ markStartupPhase("frontend_main_enter", { href: window.location.href });
 void debugConsoleReady.finally(() => {
   markStartupPhase("frontend_debug_console_ready");
 });
-installTauriDevtoolsHotkeys();
+installTauriDevtoolsHotkeys(getDebugMode);
 markStartupPhase("frontend_devtools_hotkeys_ready");
 installTauriWindowDragFallback();
 markStartupPhase("frontend_window_drag_fallback_ready");

@@ -355,7 +355,13 @@ export function useSettingsState(emit: SettingsEmit) {
   const resetConfirm = ref(false);
 
   async function handleResetOnboarding() {
-    const emptyDefaults: ModelDefaults = { mainModel: "", planModel: "", subagentModels: {} };
+    const emptyDefaults: ModelDefaults = {
+      mainModel: "",
+      planModel: "",
+      subagentModels: {},
+      subagentEfforts: {},
+      subagentFastModes: {},
+    };
     try {
       localStorage.removeItem("locus-onboarding-completed");
       localStorage.removeItem("locus-locale");
@@ -1134,12 +1140,27 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Model defaults ──────────────────────────────────────────────────
-  const modelDefaults = ref<ModelDefaults>({ mainModel: "", planModel: "", subagentModels: {} });
+  const modelDefaults = ref<ModelDefaults>({
+    mainModel: "",
+    planModel: "",
+    subagentModels: {},
+    subagentEfforts: {},
+    subagentFastModes: {},
+  });
   const modelSaveMsg = ref("");
+
+  function normalizeModelDefaults(defaults: ModelDefaults): ModelDefaults {
+    return {
+      ...defaults,
+      subagentModels: defaults.subagentModels ?? {},
+      subagentEfforts: defaults.subagentEfforts ?? {},
+      subagentFastModes: defaults.subagentFastModes ?? {},
+    };
+  }
 
   async function loadModelDefaults() {
     try {
-      modelDefaults.value = await getModelDefaults();
+      modelDefaults.value = normalizeModelDefaults(await getModelDefaults());
     } catch { /* use empty defaults */ }
   }
 
@@ -1194,7 +1215,6 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_yaml_search",  label: "unity_yaml_search",  desc: t("tool.desc.unity_yaml_search"),  defaultMode: "auto" as const },
     { name: "unity_yaml_read",    label: "unity_yaml_read",    desc: t("tool.desc.unity_yaml_read"),    defaultMode: "auto" as const },
     { name: "knowledge_query",    label: "knowledge_query",    desc: t("tool.desc.knowledge_query"),    defaultMode: "auto" as const },
-    { name: "skill_reload",       label: "skill_reload",       desc: t("tool.desc.skill_reload"),       defaultMode: "auto" as const },
     { name: "skill_list",         label: "skill_list",         desc: t("tool.desc.skill_list"),         defaultMode: "auto" as const },
   ]);
 
@@ -1655,7 +1675,7 @@ export function useSettingsState(emit: SettingsEmit) {
     }
     await loadCodexModelConfig();
 
-    if (cachedDefaults) modelDefaults.value = cachedDefaults;
+    if (cachedDefaults) modelDefaults.value = normalizeModelDefaults(cachedDefaults);
     else await loadModelDefaults();
 
     if (cachedPerms) {

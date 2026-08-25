@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { t } from "../../i18n";
-import type { ModelOption, ModelDefaults, AgentInfo } from "../../types";
+import type { ModelOption, ModelDefaults, AgentInfo, EffortLevel } from "../../types";
 import { visibleProviderOrder, isProviderVisible } from "../../config/providerVisibility";
-import { formatModelDisplayName } from "../../utils/modelDisplay";
+import { formatModelDisplayName, modelSupportsFastMode } from "../../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName } from "../../utils/modelGrouping";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
@@ -57,6 +57,57 @@ function selectedModelLabel(id: string): string {
  *  agents (default first) plus the subagent-only definitions. */
 const spawnableAgents = computed<AgentInfo[]>(() => [...props.agents, ...props.subagents]);
 
+const effortLevels: EffortLevel[] = ["none", "low", "medium", "high", "xhigh", "max"];
+const effortLabels: Record<EffortLevel, string> = {
+  none: "None",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+};
+
+function selectedSubagentModel(agentId: string): ModelOption | null {
+  const modelId = props.modelDefaults.subagentModels[agentId];
+  if (!modelId) return null;
+  return props.allModels.find((model) => model.id === modelId) ?? null;
+}
+
+function effortOptions(agentId: string): DropdownOption[] {
+  const selected = selectedSubagentModel(agentId);
+  const values = selected ? (selected.supportedEfforts ?? []) : effortLevels;
+  return [
+    { value: "", label: t("settings.models.subagentEffortDefault") },
+    ...values.map((value) => ({
+      value,
+      label: effortLabels[value],
+      hint: t(`thinking.level.${value}`),
+    })),
+  ];
+}
+
+function selectedEffortLabel(agentId: string): string {
+  const value = props.modelDefaults.subagentEfforts[agentId];
+  return value ? effortLabels[value] : "";
+}
+
+function fastModeValue(agentId: string): string {
+  const value = props.modelDefaults.subagentFastModes[agentId];
+  if (value === true) return "fast";
+  if (value === false) return "standard";
+  return "";
+}
+
+function speedOptions(agentId: string): DropdownOption[] {
+  const selected = selectedSubagentModel(agentId);
+  const fastAvailable = !selected || modelSupportsFastMode(selected);
+  return [
+    { value: "", label: t("settings.models.subagentSpeedDefault") },
+    { value: "standard", label: t("settings.models.subagentSpeedStandard") },
+    { value: "fast", label: "Fast", disabled: !fastAvailable },
+  ];
+}
+
 function updateMainModel(value: string) {
   emit("update:modelDefaults", { ...props.modelDefaults, mainModel: value });
   emit("save");
@@ -68,8 +119,27 @@ function updatePlanModel(value: string) {
 }
 
 function updateSubagentModel(agentId: string, value: string) {
-  const subagentModels = { ...props.modelDefaults.subagentModels, [agentId]: value };
+  const subagentModels = { ...props.modelDefaults.subagentModels };
+  if (value) subagentModels[agentId] = value;
+  else delete subagentModels[agentId];
   emit("update:modelDefaults", { ...props.modelDefaults, subagentModels });
+  emit("save");
+}
+
+function updateSubagentEffort(agentId: string, value: string) {
+  const subagentEfforts = { ...props.modelDefaults.subagentEfforts };
+  if (value) subagentEfforts[agentId] = value as EffortLevel;
+  else delete subagentEfforts[agentId];
+  emit("update:modelDefaults", { ...props.modelDefaults, subagentEfforts });
+  emit("save");
+}
+
+function updateSubagentSpeed(agentId: string, value: string) {
+  const subagentFastModes = { ...props.modelDefaults.subagentFastModes };
+  if (value === "fast") subagentFastModes[agentId] = true;
+  else if (value === "standard") subagentFastModes[agentId] = false;
+  else delete subagentFastModes[agentId];
+  emit("update:modelDefaults", { ...props.modelDefaults, subagentFastModes });
   emit("save");
 }
 
@@ -139,28 +209,98 @@ function updateClaudeCodeEnabled(value: boolean) {
     <div class="section-label" style="margin-top: 8px;">{{ t("settings.models.subagent") }}</div>
     <p class="section-desc">{{ t("settings.models.subagentDesc") }}</p>
 
+    <div class="subagent-default-column-header" aria-hidden="true">
+      <span>{{ t("settings.models.subagentModel") }}</span>
+      <span>{{ t("settings.models.subagentEffort") }}</span>
+      <span>{{ t("settings.models.subagentSpeed") }}</span>
+    </div>
+
     <div
       v-for="agent in spawnableAgents"
       :key="agent.id"
       class="model-default-card compact"
     >
-      <div class="model-default-row">
+      <div class="model-default-row subagent-default-row">
         <div class="model-default-agent">
           <span class="model-default-label">{{ agent.name }}</span>
           <span class="model-default-hint">{{ agent.description }}</span>
         </div>
-        <BaseDropdown
-          class="model-default-dropdown inline"
-          :model-value="modelDefaults.subagentModels[agent.id] || ''"
-          :options="optionsWithDefault(t('settings.models.subagentDefault'))"
-          :selected-label="selectedModelLabel(modelDefaults.subagentModels[agent.id] || '')"
-          size="md"
-          menu-align="end"
-          teleport
-          :aria-label="agent.name"
-          @update:model-value="updateSubagentModel(agent.id, $event)"
-        />
+        <div class="subagent-default-controls">
+          <BaseDropdown
+            class="model-default-dropdown inline subagent-model-dropdown"
+            :model-value="modelDefaults.subagentModels[agent.id] || ''"
+            :options="optionsWithDefault(t('settings.models.subagentDefault'))"
+            :selected-label="selectedModelLabel(modelDefaults.subagentModels[agent.id] || '')"
+            size="md"
+            menu-align="end"
+            teleport
+            :aria-label="`${agent.name} ${t('settings.models.subagentModel')}`"
+            @update:model-value="updateSubagentModel(agent.id, $event)"
+          />
+          <BaseDropdown
+            class="subagent-effort-dropdown"
+            :model-value="modelDefaults.subagentEfforts[agent.id] || ''"
+            :options="effortOptions(agent.id)"
+            :selected-label="selectedEffortLabel(agent.id)"
+            size="md"
+            menu-align="end"
+            teleport
+            :disabled="Boolean(modelDefaults.subagentModels[agent.id]) && effortOptions(agent.id).length === 1"
+            :aria-label="`${agent.name} ${t('settings.models.subagentEffort')}`"
+            @update:model-value="updateSubagentEffort(agent.id, $event)"
+          />
+          <BaseDropdown
+            class="subagent-speed-dropdown"
+            :model-value="fastModeValue(agent.id)"
+            :options="speedOptions(agent.id)"
+            size="md"
+            menu-align="end"
+            teleport
+            :aria-label="`${agent.name} ${t('settings.models.subagentSpeed')}`"
+            @update:model-value="updateSubagentSpeed(agent.id, $event)"
+          />
+        </div>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.subagent-default-column-header {
+  display: grid;
+  grid-template-columns: 220px 128px 112px;
+  justify-content: end;
+  gap: 8px;
+  padding: 0 14px 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.subagent-default-controls {
+  display: grid;
+  grid-template-columns: 220px 128px 112px;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.subagent-default-controls .model-default-dropdown.inline,
+.subagent-effort-dropdown,
+.subagent-speed-dropdown {
+  width: 100%;
+}
+
+@media (max-width: 980px) {
+  .subagent-default-column-header {
+    display: none;
+  }
+
+  .subagent-default-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .subagent-default-controls {
+    grid-template-columns: minmax(0, 1fr) 128px 112px;
+  }
+}
+</style>

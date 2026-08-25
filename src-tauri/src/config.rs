@@ -116,6 +116,10 @@ fn default_tool_failure_log_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_session_undo_enabled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 fn default_unity_external_editor_default_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
@@ -312,6 +316,10 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub tool_failure_log_enabled: Arc<AtomicBool>,
+    /// Capture per-round workspace snapshots so Agent changes can be reviewed
+    /// and restored from the session. Default on for backward compatibility.
+    #[serde(default = "default_session_undo_enabled", with = "serde_atomic_bool")]
+    pub session_undo_enabled: Arc<AtomicBool>,
     #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
     pub file_tool_workspace_boundary: Arc<AtomicBool>,
     /// Experimental background execution for selected long-running tools.
@@ -507,6 +515,7 @@ impl AppConfig {
             base_url,
             debug: Arc::new(AtomicBool::new(debug)),
             tool_failure_log_enabled: default_tool_failure_log_enabled(),
+            session_undo_enabled: default_session_undo_enabled(),
             file_tool_workspace_boundary: default_debug_flag(),
             async_tasks_enabled: default_async_tasks_enabled(),
             close_behavior: default_close_behavior(),
@@ -648,6 +657,15 @@ impl AppConfig {
     pub fn set_tool_failure_log_enabled(&self, value: bool) -> Result<(), String> {
         self.tool_failure_log_enabled
             .store(value, Ordering::Relaxed);
+        self.persist()
+    }
+
+    pub fn session_undo_enabled(&self) -> bool {
+        self.session_undo_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_session_undo_enabled(&self, value: bool) -> Result<(), String> {
+        self.session_undo_enabled.store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -1303,6 +1321,22 @@ mod tests {
             .expect("persist tool failure log setting");
         let reloaded = AppConfig::load_from_path(&config_path);
         assert!(reloaded.tool_failure_log_enabled());
+    }
+
+    #[test]
+    fn session_undo_defaults_to_enabled_and_persists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(&config_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(config.session_undo_enabled());
+
+        config
+            .set_session_undo_enabled(false)
+            .expect("persist session undo setting");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(!reloaded.session_undo_enabled());
     }
 
     #[test]

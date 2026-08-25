@@ -29,6 +29,8 @@ describe("useModelStore OpenAI effort mapping", () => {
       mainModel: "",
       planModel: "",
       subagentModels: {},
+      subagentEfforts: {},
+      subagentFastModes: {},
     });
     modelServiceMocks.getLastModel.mockResolvedValue("");
     modelServiceMocks.getLastEffort.mockResolvedValue("");
@@ -223,6 +225,16 @@ describe("useModelStore OpenAI effort mapping", () => {
 
     modelServiceMocks.getCodexFastMode.mockResolvedValue(true);
     await modelStore.loadCodexFastMode();
+    expect(modelStore.codexFastMode).toBe(true);
+    expect(modelStore.defaultCodexFastMode).toBe(true);
+
+    modelServiceMocks.saveCodexFastMode.mockClear();
+    modelStore.applyContextCodexFastMode(false);
+    expect(modelStore.codexFastMode).toBe(false);
+    expect(modelStore.defaultCodexFastMode).toBe(true);
+    expect(modelServiceMocks.saveCodexFastMode).not.toHaveBeenCalled();
+
+    modelStore.restoreDefaultCodexFastMode();
     expect(modelStore.codexFastMode).toBe(true);
   });
 

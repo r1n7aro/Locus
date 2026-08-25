@@ -451,6 +451,16 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
         .and_then(|v| v.get("subagentModels"))
         .cloned()
         .unwrap_or(serde_json::Value::Object(Default::default()));
+    let subagent_efforts = defaults
+        .as_ref()
+        .and_then(|v| v.get("subagentEfforts"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let subagent_fast_modes = defaults
+        .as_ref()
+        .and_then(|v| v.get("subagentFastModes"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
 
     out.push(ConfigEntry {
         key: "models.main_model".into(),
@@ -487,6 +497,24 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
         description: "Per-agent model overrides. Keys are agent IDs, values are model IDs. Empty object means sub-agents inherit the current session model.".into(),
         storage: "persistent_config_dir/model_defaults.json → subagentModels".into(),
         current_value: serde_json::to_string(&subagent_models).unwrap_or_default(),
+    });
+
+    out.push(ConfigEntry {
+        key: "models.subagent_efforts".into(),
+        category: "models".into(),
+        label: "Sub-agent Reasoning Effort Overrides".into(),
+        description: "Per-agent reasoning effort overrides. Empty object means sub-agents inherit the current session effort.".into(),
+        storage: "persistent_config_dir/model_defaults.json → subagentEfforts".into(),
+        current_value: serde_json::to_string(&subagent_efforts).unwrap_or_default(),
+    });
+
+    out.push(ConfigEntry {
+        key: "models.subagent_fast_modes".into(),
+        category: "models".into(),
+        label: "Sub-agent Fast Mode Overrides".into(),
+        description: "Per-agent Codex Fast mode overrides. Missing keys inherit the current session; true selects Fast and false selects standard speed.".into(),
+        storage: "persistent_config_dir/model_defaults.json → subagentFastModes".into(),
+        current_value: serde_json::to_string(&subagent_fast_modes).unwrap_or_default(),
     });
 
     let last_model = dir
@@ -669,8 +697,9 @@ fn collect_knowledge(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) 
         key: "knowledge.documents.root".into(),
         category: "knowledge".into(),
         label: "Knowledge Root".into(),
-        description: "Unified knowledge root for design, memory, skill, and reference documents."
-            .into(),
+        description:
+            "Unified knowledge root for design, plan, memory, skill, and reference documents."
+                .into(),
         storage: "<project>/Locus/knowledge".into(),
         current_value: knowledge_root_value,
     });

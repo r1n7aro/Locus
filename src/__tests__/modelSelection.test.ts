@@ -14,6 +14,8 @@ function defaults(partial?: Partial<ModelDefaults>): ModelDefaults {
     mainModel: "",
     planModel: "",
     subagentModels: {},
+    subagentEfforts: {},
+    subagentFastModes: {},
     ...partial,
   };
 }

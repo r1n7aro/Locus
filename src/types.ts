@@ -405,6 +405,7 @@ export interface SessionDetail {
   agentId?: string | null;
   lastModelId?: string | null;
   lastEffort?: EffortLevel | null;
+  lastFastMode?: boolean | null;
   sessionType: string;
   parentSessionId: string | null;
   latestCompletedRunId?: string | null;
@@ -496,6 +497,7 @@ export interface SessionRuntimeSnapshot {
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms: PendingToolConfirm[];
   isCompacting: boolean;
+  compactQueued?: boolean;
 }
 
 export interface ActiveSessionSelectionChanged {
@@ -686,6 +688,9 @@ export interface ModelDefaults {
   mainModel: string;
   planModel: string;
   subagentModels: Record<string, string>;
+  subagentEfforts: Record<string, EffortLevel>;
+  /** Missing keys inherit the current session; explicit false selects standard speed. */
+  subagentFastModes: Record<string, boolean>;
   /** Opt-in: Claude Code CLI models only join the model list when true. */
   claudeCodeEnabled?: boolean;
 }
@@ -1035,7 +1040,7 @@ export interface KnowledgeChangedEvent {
   workingDir: string;
   source: string;
   changedAt: number;
-  docType?: "design" | "memory" | "skill" | "reference";
+  docType?: "design" | "plan" | "memory" | "skill" | "reference";
   path?: string | null;
   parentPath?: string | null;
   targetKind?: "document" | "directory" | "type" | "workspace";
@@ -1364,6 +1369,7 @@ export interface SkillManifest {
   packageId?: string | null;
   packageVersion?: string | null;
   hasUnity?: boolean;
+  writable?: boolean;
   pluginId?: string | null;
   pluginScope?: "app" | "project" | string | null;
   /** Absolute on-disk directory of an external (generic-format) skill. */
@@ -1379,6 +1385,9 @@ export interface SkillConfig {
   description?: string;
   commandTrigger?: string;
   injectMode?: KnowledgeInjectMode;
+  readOnly?: boolean;
+  aiEditMode?: KnowledgeAiEditMode;
+  maintenanceRules?: string;
 }
 
 export type SkillUnityInstallState =
@@ -1417,6 +1426,7 @@ export interface SkillPackageArchiveResult {
 
 export interface SkillCreateInput {
   kind?: "md" | "package";
+  source?: "project" | "app";
   name: string;
   path?: string;
   packageId?: string | null;
@@ -1434,7 +1444,7 @@ export interface SkillCreateInput {
 // Unified Knowledge model
 // ---------------------------------------------------------------------------
 
-export type KnowledgeDocumentType = "design" | "memory" | "skill" | "reference";
+export type KnowledgeDocumentType = "design" | "plan" | "memory" | "skill" | "reference";
 export type KnowledgeStorageSource = "project" | "app";
 export type KnowledgeInjectMode = "none" | "path" | "excerpt" | "full" | "rule";
 export type KnowledgeInjectModeSetting = "inherit" | KnowledgeInjectMode;
