@@ -63,4 +63,15 @@ describe("tool call block interactions", () => {
     expect(actionRule).toContain("min-height: 22px;");
     expect(actionRule).not.toContain("min-height: 24px;");
   });
+
+  it("renders the loaded Skill status as secondary inline metadata", () => {
+    const block = read("src/components/ToolCallBlock.vue");
+    const noteRule = block.match(/\.tool-call-inline-note\s*\{([^}]+)\}/)?.[1] ?? "";
+
+    expect(block).toContain(':title="skillLoadedLabel"');
+    expect(block).toContain('.tool-call-inline-note::before');
+    expect(noteRule).toContain("var(--text-secondary)");
+    expect(noteRule).not.toContain("var(--status-good-bg)");
+    expect(noteRule).not.toContain("var(--status-good-border)");
+  });
 });

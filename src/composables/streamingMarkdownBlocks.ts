@@ -17,6 +17,8 @@
  * in a later block than their usage render as literal text while streaming.
  */
 
+import { isMarkdownUnityPropertyFenceLanguage } from "./markdownInject";
+
 export interface StreamingMarkdownBlock {
   /** Stable identity for keyed v-for; never reused across resets. */
   id: string;
@@ -28,6 +30,12 @@ export interface StreamingMarkdownSplit {
   blocks: StreamingMarkdownBlock[];
   /** Unfrozen suffix: the trailing completed block plus the growing block. */
   tail: string;
+  /**
+   * Offset in `tail` where an incomplete atomic block begins. Renderers keep
+   * this suffix buffered until the block closes, while `tail` continues to
+   * retain the exact streamed source.
+   */
+  deferredTailStart?: number;
 }
 
 const LIST_MARKER_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
@@ -69,6 +77,10 @@ export class StreamingMarkdownSplitter {
   private inFence = false;
   private fenceChar = "";
   private fenceLen = 0;
+  /** Opening offset of an incomplete unity_property fence. These editors
+   * perform async Unity reads when mounted, so their source is atomic during
+   * streaming instead of being rebuilt for every incoming delta. */
+  private unityPropertyFenceStart: number | null = null;
   /** A blank line was seen since the last non-blank line (outside fences). */
   private sawBlank = false;
   /** Classification of the previous non-blank line, for continuation rules. */
@@ -144,6 +156,7 @@ export class StreamingMarkdownSplitter {
     this.inFence = false;
     this.fenceChar = "";
     this.fenceLen = 0;
+    this.unityPropertyFenceStart = null;
     this.sawBlank = false;
     this.prevListy = false;
     this.prevBlockquote = false;
@@ -154,9 +167,13 @@ export class StreamingMarkdownSplitter {
   }
 
   private snapshot(): StreamingMarkdownSplit {
+    const deferredTailStart = this.unityPropertyFenceStart === null
+      ? undefined
+      : Math.max(0, this.unityPropertyFenceStart - this.frozenEnd);
     return {
       blocks: this.blocks,
       tail: this.source.slice(this.frozenEnd),
+      deferredTailStart,
     };
   }
 
@@ -166,18 +183,22 @@ export class StreamingMarkdownSplitter {
     while (true) {
       const newline = this.source.indexOf("\n", lineStart);
       if (newline < 0) break;
-      this.consumeLine(this.source.slice(lineStart, newline), lineStart);
+      this.consumeLine(this.source.slice(lineStart, newline), lineStart, newline + 1);
       lineStart = newline + 1;
     }
     this.scanned = lineStart;
   }
 
-  private consumeLine(rawLine: string, lineStart: number): void {
+  private consumeLine(rawLine: string, lineStart: number, lineEnd: number): void {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 
     if (this.inFence) {
       if (this.isFenceClose(line)) {
         this.inFence = false;
+        if (this.unityPropertyFenceStart !== null) {
+          this.unityPropertyFenceStart = null;
+          this.freezeThrough(lineEnd);
+        }
       }
       // Fence interiors never produce boundaries or continuation context.
       return;
@@ -202,6 +223,10 @@ export class StreamingMarkdownSplitter {
       this.inFence = true;
       this.fenceChar = fence[2][0];
       this.fenceLen = fence[2].length;
+      const language = fence[3].trim().split(/\s+/, 1)[0];
+      if (isMarkdownUnityPropertyFenceLanguage(language)) {
+        this.unityPropertyFenceStart = lineStart;
+      }
       // A fence opener starts a code block: not a list/quote continuation
       // context for whatever follows the fence.
       this.prevListy = false;
@@ -242,6 +267,10 @@ export class StreamingMarkdownSplitter {
   private cutAt(offset: number): void {
     if (offset <= this.frozenEnd) return;
     if (this.cuts.length > 0 && offset <= this.cuts[this.cuts.length - 1]!) return;
+    // An atomic fence can freeze immediately before a following blank line
+    // has arrived. Keep that whitespace attached to the next real block
+    // instead of creating an empty frozen MarkdownRenderer between them.
+    if (this.cuts.length === 0 && !this.source.slice(this.frozenEnd, offset).trim()) return;
     this.cuts.push(offset);
     // Trail one completed block: freeze only while two cuts are pending, so
     // the newest completed block stays in the tail until its successor is
@@ -258,5 +287,27 @@ export class StreamingMarkdownSplitter {
       this.seq += 1;
       this.frozenEnd = end;
     }
+  }
+
+  /**
+   * Commit a syntactically closed atomic block immediately. Unlike ordinary
+   * Markdown, a unity_property block is safe at its closing fence and must
+   * keep a stable component instance while later properties stream in.
+   */
+  private freezeThrough(offset: number): void {
+    if (offset <= this.frozenEnd) return;
+    const text = this.source.slice(this.frozenEnd, offset);
+    if (text) {
+      this.blocks = [
+        ...this.blocks,
+        {
+          id: `g${this.generation}-b${this.seq}`,
+          text,
+        },
+      ];
+      this.seq += 1;
+    }
+    this.frozenEnd = offset;
+    this.cuts = this.cuts.filter((cut) => cut > offset);
   }
 }

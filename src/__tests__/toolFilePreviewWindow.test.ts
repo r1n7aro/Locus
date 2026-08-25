@@ -140,4 +140,13 @@ describe("toolFilePreviewWindow", () => {
     expect(backend).toContain("FULL_PREVIEW_MAX_FILE_BYTES");
     expect(backend).toContain("let max_lines: usize = if full { 20_000 } else { 50 };");
   });
+
+  it("renders Markdown files with the shared Markdown renderer", () => {
+    const viewer = read("src/components/ToolFilePreviewWindow.vue");
+
+    expect(viewer).toContain('import MarkdownRenderer from "./MarkdownRenderer.vue";');
+    expect(viewer).toContain('preview.value.language === "markdown"');
+    expect(viewer).toContain('<MarkdownRenderer :content="preview.snippet || \'\'" />');
+    expect(viewer).toContain('<AssetTextViewer');
+  });
 });

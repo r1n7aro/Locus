@@ -499,7 +499,12 @@ const outputDisplay = computed(() => {
   return output ? persistedOutputDisplay(output) : { kind: "normal" as const, text: "" };
 });
 
-const displayOutput = computed(() => outputDisplay.value.text);
+const displayOutput = computed(() => {
+  const text = outputDisplay.value.text;
+  if (props.toolCall.name !== "read") return text;
+  const contentMatch = text.match(/^<content>\r?\n?([\s\S]*?)\r?\n?<\/content>\s*$/);
+  return contentMatch?.[1] ?? text;
+});
 const isDeletedOutput = computed(() => outputDisplay.value.kind === "deleted");
 const deletedOutputPath = computed(() => outputDisplay.value.path || "");
 const toolSearchOutput = computed(() => {
@@ -530,13 +535,15 @@ const highlightedOutput = computed(() => {
   if (!filePath) return null;
   const lang = langFromPath(filePath);
   if (!lang) return null;
+  if (
+    name === "read"
+    && lang === "markdown"
+    && /(?:^|\n)\s*\d+\t/.test(displayOutput.value)
+  ) {
+    return null;
+  }
   try {
-    let code = displayOutput.value;
-    const contentMatch = code.match(/^<content>\n?([\s\S]*?)\n?<\/content>\s*$/);
-    if (contentMatch) {
-      code = contentMatch[1];
-    }
-    return hljs.highlight(code, { language: lang }).value;
+    return hljs.highlight(displayOutput.value, { language: lang }).value;
   } catch {
     return null;
   }
@@ -585,7 +592,11 @@ const highlightedOutput = computed(() => {
           class="tool-call-summary"
           :title="headerSummaryTitle"
         >{{ headerSummary }}</span>
-        <span v-if="skillLoadedLabel" class="tool-call-inline-note">{{ skillLoadedLabel }}</span>
+        <span
+          v-if="skillLoadedLabel"
+          class="tool-call-inline-note"
+          :title="skillLoadedLabel"
+        >{{ skillLoadedLabel }}</span>
       </button>
       <button
         v-if="showViewOpenButton"
@@ -879,17 +890,19 @@ const highlightedOutput = computed(() => {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 38%;
-  padding: 1px 5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  border: 1px solid var(--status-good-border);
-  border-radius: 4px;
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
+  color: color-mix(in srgb, var(--text-secondary) 88%, var(--text-color) 12%);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 16px;
+}
+
+.tool-call-inline-note::before {
+  content: "\00b7";
+  margin-right: 6px;
+  color: var(--text-secondary);
 }
 
 .tool-call-action-button {
@@ -1041,6 +1054,7 @@ const highlightedOutput = computed(() => {
   font-family: var(--font-mono-block);
   font-size: 12px;
   line-height: 1.4;
+  color: var(--text-color);
   padding: 6px 8px;
   border-radius: 6px;
   background: var(--hover-bg);

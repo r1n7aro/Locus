@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { onBeforeUnmount, shallowRef, watch } from "vue";
+import { computed, onBeforeUnmount, shallowRef, watch } from "vue";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import {
   StreamingMarkdownSplitter,
@@ -32,6 +32,10 @@ const props = defineProps<{
   content?: string;
   stream?: StreamingTextSource | null;
   streamInitial?: string;
+  /** Full response has landed. Deferred atomic tails render from their final
+   * source even when the closing fence is the document's last unterminated
+   * line. */
+  finalized?: boolean;
   cursor?: boolean;
   enableFileRefs?: boolean;
   unityPreviewStateScope?: string | null;
@@ -56,6 +60,14 @@ const PLAIN_TAIL_PART_TARGET = 4096;
 
 const splitter = new StreamingMarkdownSplitter();
 const split = shallowRef<StreamingMarkdownSplit>({ blocks: [], tail: "" });
+function visibleTail(next: StreamingMarkdownSplit): string {
+  if (props.finalized || next.deferredTailStart === undefined) return next.tail;
+  return next.tail.slice(0, next.deferredTailStart);
+}
+
+const renderTail = computed(() => {
+  return visibleTail(split.value);
+});
 
 // Vue post-flush watchers run after this component's DOM patch and before the
 // browser paints. Let the transcript correct its viewport against the actual
@@ -107,8 +119,13 @@ function applySplit(next: StreamingMarkdownSplit) {
     resetPlainTail();
   }
   split.value = next;
-  projectPlainTail(next.tail);
+  projectPlainTail(visibleTail(next));
 }
+
+watch(
+  () => props.finalized,
+  () => projectPlainTail(renderTail.value),
+);
 
 // -- content mode --
 
@@ -211,16 +228,16 @@ function blockPreviewScope(blockId: string): string | null | undefined {
       @open-image="emit('openImage', $event)"
     />
     <pre
-      v-if="split.tail && split.tail.length > TAIL_MARKDOWN_LIMIT"
+      v-if="renderTail && renderTail.length > TAIL_MARKDOWN_LIMIT"
       class="streaming-markdown-block streaming-markdown-tail-plain ui-select-text"
     ><span
       v-for="(part, index) in plainTailParts"
       :key="index"
     >{{ part }}</span><span>{{ plainTailActive }}</span></pre>
     <MarkdownRenderer
-      v-else-if="split.tail"
+      v-else-if="renderTail"
       class="streaming-markdown-block"
-      :content="split.tail"
+      :content="renderTail"
       :cursor="cursor"
       :enable-file-refs="enableFileRefs"
       :unity-preview-state-scope="blockPreviewScope('tail')"

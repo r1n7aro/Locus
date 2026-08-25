@@ -16,6 +16,7 @@ import {
 import { previewWorkspaceFile, type WorkspaceFilePreview } from "../services/unity";
 import AssetTextViewer from "./asset/AssetTextViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
+import MarkdownRenderer from "./MarkdownRenderer.vue";
 
 const appWindow = getCurrentWindow();
 const filePath = ref("");
@@ -30,6 +31,11 @@ const fileName = computed(() => (
   filePath.value.replace(/\\/g, "/").split("/").pop() || t("tool.filePreview.title")
 ));
 const lineCount = computed(() => preview.value?.snippet?.split("\n").length ?? 0);
+const isMarkdownPreview = computed(() => (
+  preview.value?.kind === "text"
+  && preview.value.language === "markdown"
+  && preview.value.snippet !== undefined
+));
 const highlightLineRanges = computed(() => {
   const current = preview.value;
   if (current?.kind !== "text" || current.snippet === undefined) return [];
@@ -156,6 +162,9 @@ onUnmounted(() => {
       <div v-else-if="preview.kind === 'text' && !preview.snippet" class="tool-file-preview-state">
         {{ t("tool.filePreview.empty") }}
       </div>
+      <div v-else-if="isMarkdownPreview" class="tool-file-preview-markdown">
+        <MarkdownRenderer :content="preview.snippet || ''" />
+      </div>
       <AssetTextViewer
         v-else-if="preview.kind === 'text' && preview.snippet !== undefined"
         :snippet="preview.snippet"
@@ -258,6 +267,21 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   overflow: hidden;
+}
+
+.tool-file-preview-markdown {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 22px;
+}
+
+.tool-file-preview-markdown :deep(.markdown-body) {
+  max-width: 860px;
+  margin: 0 auto;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .tool-file-preview-state {

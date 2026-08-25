@@ -3088,6 +3088,7 @@ function openImage(src: string) {
                   data-chat-message-role="assistant"
                   :content="segment.content"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
+                  finalized
                   enable-file-refs
                   @open-image="openImage"
                 />

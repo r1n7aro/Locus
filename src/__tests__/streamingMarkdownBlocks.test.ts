@@ -18,6 +18,12 @@ function joined(split: StreamingMarkdownSplit): string {
   return split.blocks.map((block) => block.text).join("") + split.tail;
 }
 
+function renderTail(split: StreamingMarkdownSplit): string {
+  return split.deferredTailStart === undefined
+    ? split.tail
+    : split.tail.slice(0, split.deferredTailStart);
+}
+
 describe("StreamingMarkdownSplitter", () => {
   it("freezes paragraph blocks and keeps the trailing completed block in the tail", () => {
     // Trailing newline completes the last line: only complete lines register
@@ -190,6 +196,81 @@ describe("StreamingMarkdownSplitter", () => {
     expect(split.blocks.map((b) => b.text).join("")).toBe(
       split.blocks.length ? "intro\n\n" : "",
     );
+  });
+
+  it("defers an incomplete unity_property fence from the render tail", () => {
+    const text = [
+      "Values are loading.",
+      "",
+      "```unity_property",
+      "Assets/Data/Attack.asset#hitStopFrames",
+    ].join("\n");
+    const split = feedInSteps(text, 3);
+
+    expect(joined(split)).toBe(text);
+    expect(renderTail(split)).toBe("Values are loading.\n\n");
+    expect(split.tail.slice(split.deferredTailStart)).toContain("```unity_property");
+  });
+
+  it("freezes a unity_property fence as soon as its closing line completes", () => {
+    const source = [
+      "```unity_property",
+      "Assets/Data/Attack.asset#hitStopFrames",
+      "```",
+      "",
+    ].join("\n");
+    const splitter = new StreamingMarkdownSplitter();
+    const pending = splitter.append(source.slice(0, -5));
+    expect(pending.blocks).toEqual([]);
+    expect(renderTail(pending)).toBe("");
+
+    const complete = splitter.append(source.slice(-5));
+    expect(complete.blocks).toHaveLength(1);
+    expect(complete.blocks[0]?.text).toBe(source);
+    expect(complete.deferredTailStart).toBeUndefined();
+    expect(joined(complete)).toBe(source);
+  });
+
+  it("keeps each completed unity_property block stable while the next one streams", () => {
+    const first = [
+      "```unity_property",
+      "Assets/Data/Attack1.asset#hitStopFrames",
+      "```",
+      "",
+    ].join("\n");
+    const secondPartial = [
+      "",
+      "```unity_property",
+      "Assets/Data/Attack2.asset#hitStopFrames",
+    ].join("\n");
+    const secondClose = "\n```\n";
+    const splitter = new StreamingMarkdownSplitter();
+
+    const firstComplete = splitter.append(first);
+    const firstBlock = firstComplete.blocks[0];
+    expect(firstBlock).toBeDefined();
+
+    const secondPending = splitter.append(secondPartial);
+    expect(secondPending.blocks).toHaveLength(1);
+    expect(secondPending.blocks[0]).toBe(firstBlock);
+    expect(renderTail(secondPending).trim()).toBe("");
+
+    const secondComplete = splitter.append(secondClose);
+    expect(secondComplete.blocks).toHaveLength(2);
+    expect(secondComplete.blocks[0]).toBe(firstBlock);
+    expect(secondComplete.blocks[1]?.text).toContain("Attack2.asset#hitStopFrames");
+    expect(secondComplete.deferredTailStart).toBeUndefined();
+    expect(joined(secondComplete)).toBe(first + secondPartial + secondClose);
+  });
+
+  it("continues rendering ordinary incomplete code fences", () => {
+    const split = new StreamingMarkdownSplitter().append([
+      "```csharp",
+      "void Update() {",
+    ].join("\n"));
+
+    expect(split.deferredTailStart).toBeUndefined();
+    expect(renderTail(split)).toBe(split.tail);
   });
 
   it("keeps loose list items in one block", () => {

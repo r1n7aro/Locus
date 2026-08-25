@@ -92,3 +92,46 @@
 :root .hljs-selector-tag {
   color: var(--md-syntax-selector);
 }
+
+/*
+ * The imported GitHub theme is light-only. Keep every Markdown and diff token
+ * that it colors explicitly on Locus theme tokens so a light fallback cannot
+ * disappear into the dark tool-output surface.
+ */
+:root .hljs-code,
+:root .hljs-formula,
+:root .hljs-emphasis,
+:root .hljs-strong,
+:root .hljs-char.escape_,
+:root .hljs-link,
+:root .hljs-tag {
+  color: var(--md-code-fg);
+}
+
+:root .hljs-name,
+:root .hljs-quote,
+:root .hljs-selector-pseudo {
+  color: var(--md-syntax-builtin);
+}
+
+:root .hljs-section {
+  color: var(--md-syntax-keyword);
+}
+
+:root .hljs-bullet {
+  color: var(--md-syntax-function);
+}
+
+:root .hljs-symbol {
+  color: var(--md-syntax-builtin);
+}
+
+:root .hljs-addition {
+  color: var(--status-good-fg);
+  background-color: var(--status-good-bg);
+}
+
+:root .hljs-deletion {
+  color: var(--status-danger-fg);
+  background-color: var(--status-danger-bg);
+}

@@ -30,6 +30,7 @@ describe("streaming markdown renderer wiring", () => {
     expect(historyBlock).toContain("<MarkdownRenderer");
     expect(historyBlock).toContain("<StreamingMarkdownRenderer");
     expect(historyBlock).toContain("shouldUseStableHistoryMarkdown(segment.itemId)");
+    expect(historyBlock).toContain("finalized");
   });
 
   it("freezes prefix blocks behind stable keys and re-renders only the tail", () => {
@@ -43,7 +44,12 @@ describe("streaming markdown renderer wiring", () => {
     // Oversized tails (single uncuttable block, e.g. a giant unclosed fence)
     // degrade to plain text so per-frame cost stays bounded.
     expect(renderer).toContain("TAIL_MARKDOWN_LIMIT");
-    expect(renderer).toContain("split.tail.length > TAIL_MARKDOWN_LIMIT");
+    expect(renderer).toContain("renderTail.length > TAIL_MARKDOWN_LIMIT");
+    // Incomplete atomic editors stay outside the visible tail until their
+    // closing fence lets the splitter freeze one stable component instance.
+    expect(renderer).toContain("deferredTailStart");
+    expect(renderer).toContain(':content="renderTail"');
+    expect(renderer).toContain("if (props.finalized");
   });
 
   it("shares one Marked instance across markdown surfaces", () => {
