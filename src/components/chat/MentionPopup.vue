@@ -17,7 +17,7 @@ export interface MentionDisplayEntry {
   meta?: string;
   canNavigate?: boolean;
   isCurrentPath?: boolean;
-  entryKind?: "asset" | "knowledge";
+  entryKind?: "asset" | "knowledge" | "sceneObject";
 }
 
 const props = defineProps<{
@@ -126,6 +126,7 @@ function buildFragments(text: string, query: string): HighlightFragment[] {
 function iconNodeForEntry(entry: MentionDisplayEntry) {
   return unityAssetIconNodeForPath(entry.relPath, {
     isFolder: entry.isDir,
+    isSceneObject: entry.entryKind === "sceneObject",
     fallbackKind: entry.entryKind === "knowledge" ? "asset" : "file",
   });
 }
@@ -133,6 +134,7 @@ function iconNodeForEntry(entry: MentionDisplayEntry) {
 function iconClassForEntry(entry: MentionDisplayEntry) {
   return unityAssetIconClassForPath(entry.relPath, {
     isFolder: entry.isDir,
+    isSceneObject: entry.entryKind === "sceneObject",
     fallbackKind: entry.entryKind === "knowledge" ? "asset" : "file",
   });
 }
@@ -225,7 +227,11 @@ watch(
                 :class="{ 'is-match': fragment.matched }"
               >{{ fragment.text }}</span>
             </span>
-            <span v-if="entry.meta || entry.parentPath" class="mention-path">
+            <span
+              v-if="entry.meta || entry.parentPath"
+              class="mention-path"
+              :title="entry.meta || entry.parentPath"
+            >
               <span
                 v-for="(fragment, fragmentIdx) in buildFragments(entry.meta || entry.parentPath || '', query)"
                 :key="`${entry.relPath}-path-${fragmentIdx}`"

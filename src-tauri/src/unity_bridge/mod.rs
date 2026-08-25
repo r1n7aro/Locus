@@ -2425,6 +2425,28 @@ pub async fn select_scene_object(
     }
 }
 
+pub async fn validate_scene_object(
+    project_path: &str,
+    scene_path: &str,
+    object_path: &str,
+) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let payload = serde_json::to_string(&SceneObjectRequest {
+        scene_path,
+        object_path,
+    })
+    .map_err(|e| e.to_string())?;
+    let resp = send_message(project_path, "validate_scene_object", &payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "validate_scene_object failed".to_string()))
+    }
+}
+
 pub async fn open_scene_object_inspector(
     project_path: &str,
     scene_path: &str,

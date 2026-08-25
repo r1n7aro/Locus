@@ -265,6 +265,11 @@ namespace Locus
 
     internal static class LocusSceneObjectUtility
     {
+        public static void ValidateSceneObject(string scenePath, string objectPath)
+        {
+            ResolveSceneObject(scenePath, objectPath);
+        }
+
         public static void SelectSceneObject(string scenePath, string objectPath)
         {
             GameObject target = ResolveSceneObject(scenePath, objectPath);

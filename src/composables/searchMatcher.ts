@@ -11,7 +11,7 @@ export function splitSearchTerms(value: string): string[] {
   return withCamelBoundaries(value)
     .replace(/^[@/]+/, "")
     .toLowerCase()
-    .split(/[^a-z0-9]+/g)
+    .split(/[^\p{L}\p{N}]+/gu)
     .filter(Boolean);
 }
 

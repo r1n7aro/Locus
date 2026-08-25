@@ -12,6 +12,10 @@ describe("splitSearchTerms", () => {
       "controller",
     ]);
   });
+
+  it("keeps non-Latin search terms", () => {
+    expect(splitSearchTerms("@输入系统/设计")).toEqual(["输入系统", "设计"]);
+  });
 });
 
 describe("rankSearchResults", () => {

@@ -240,6 +240,18 @@ export function detectActiveOperator(text: string, cursor: number): ActiveOperat
   return detectMentionOperator(text, safeCursor) ?? detectSlashOperator(text, safeCursor);
 }
 
+export function shouldContinueMentionWithSpace(
+  query: string,
+  candidateNames: string[],
+): boolean {
+  if (/\s$/.test(query)) return false;
+  const trimmed = query.trim();
+  const enteredWordCount = trimmed ? trimmed.split(/\s+/).length : 0;
+  return candidateNames.some((name) =>
+    name.trim().split(/\s+/).filter(Boolean).length > enteredWordCount,
+  );
+}
+
 export function removeTextRange(text: string, start: number, end: number): string {
   let before = text.slice(0, start);
   let after = text.slice(end);

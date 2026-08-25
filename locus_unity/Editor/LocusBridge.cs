@@ -1972,6 +1972,25 @@ namespace Locus
                     case "asset_preview_render":
                         return await HandleAssetPreviewRender(reqId, msg.message).ConfigureAwait(false);
 
+                    case "validate_scene_object":
+                    {
+                        SceneObjectRequest request = ParseSceneObjectRequest(msg.message);
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                LocusSceneObjectUtility.ValidateSceneObject(request.scenePath, request.objectPath);
+                                tcs.SetResult(OkResponse(reqId, "ok"));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
                     case "select_scene_object":
                     {
                         SceneObjectRequest request = ParseSceneObjectRequest(msg.message);

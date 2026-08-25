@@ -3,10 +3,15 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from
 import type { ComponentPublicInstance } from "vue";
 import { FileText, Layers, LoaderCircle, X } from "lucide";
 import { t } from "../../i18n";
-import { searchWorkspaceAssets } from "../../services/asset";
+import {
+  searchWorkspaceAssets,
+  searchWorkspaceSceneObjects,
+  type WorkspaceSceneObjectSearchResult,
+} from "../../services/asset";
 import { knowledgeQuery } from "../../services/knowledge";
 import {
   listDirEntriesPage,
+  searchWorkspaceEntries,
   type DirEntry,
 } from "../../services/project";
 import { useChatStore } from "../../stores/chat";
@@ -32,6 +37,7 @@ import {
   normalizeComposerText,
   parseInlineIntentCommands,
   removeTextRange,
+  shouldContinueMentionWithSpace,
   type ActiveOperator,
   type CommandDef,
   type ComposerIntentState,
@@ -58,6 +64,7 @@ import {
 } from "../../composables/useChatInputSettings";
 import {
   checkUnityConnectionStatus,
+  classifyUnitySceneObjectError,
   filterUnityConsoleErrorPayload,
   getUnityConsoleText,
   isUnityConsoleErrorLevel,
@@ -68,6 +75,7 @@ import {
   type LocusFileDragStatePayload,
   type LocusFileDropRef,
   type UnityEmbedTextDropEntry,
+  validateUnitySceneObject,
 } from "../../services/unity";
 import {
   getCachedFileToolWorkspaceBoundary,
@@ -79,6 +87,8 @@ import LucideIcon from "../icons/LucideIcon.vue";
 import MentionPopup from "./MentionPopup.vue";
 import ChatComposer from "./ChatComposer.vue";
 import ChatInputShell from "./ChatInputShell.vue";
+import { mapWorkspaceFolderMentionResults } from "./mentionFolderSearch";
+import { rankMentionSearchResults } from "./mentionSearchRanking";
 
 interface MentionSearchResult {
   relPath: string;
@@ -87,7 +97,7 @@ interface MentionSearchResult {
   isDir: boolean;
   matchScore: number;
   meta?: string;
-  entryKind: "asset" | "knowledge";
+  entryKind: "asset" | "knowledge" | "sceneObject";
 }
 
 interface MentionDisplayEntry {
@@ -98,7 +108,7 @@ interface MentionDisplayEntry {
   meta?: string;
   canNavigate?: boolean;
   isCurrentPath?: boolean;
-  entryKind?: "asset" | "knowledge";
+  entryKind?: "asset" | "knowledge" | "sceneObject";
 }
 
 const PASTE_THRESHOLD = 500;
@@ -108,9 +118,11 @@ const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
 const RECENT_ASSET_REF_REMOVAL_SUPPRESS_MS = 100;
 const LOCAL_FILE_BOUNDARY_WARNING_OPERATION = "local-file-boundary-warning";
 const LOCAL_FILE_DRAG_STATE_TTL_MS = 1200;
+const MAX_SCENE_OBJECT_MENTION_RESULTS = 160;
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
-const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
-const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "memory", "skill", "reference"];
+const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|plan|memory|skill|reference)\/.+\.md$/i;
+const MENTION_SPACE_CONTINUATION_BOUNDARY_RE = /[,，。！？!?:：;；()[\]{}<>《》「」『』"“”'‘’\r\n]/;
+const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "plan", "memory", "skill", "reference"];
 
 interface AssetRefSyncMessage {
   kind: "assetRefs";
@@ -160,6 +172,7 @@ const props = withDefaults(defineProps<{
   maxImages?: number;
   showTopPlanBadge?: boolean;
   showSkillBadges?: boolean;
+  allowRuntimeCompact?: boolean;
   compact?: boolean;
   showAction?: boolean;
   assetRefSyncKey?: string;
@@ -179,6 +192,7 @@ const props = withDefaults(defineProps<{
   maxImages: 5,
   showTopPlanBadge: true,
   showSkillBadges: true,
+  allowRuntimeCompact: false,
   compact: false,
   showAction: true,
   assetRefSyncKey: "",
@@ -230,6 +244,7 @@ const previewImageIndex = ref<number | null>(null);
 const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
 const activeOperator = ref<ActiveOperator | null>(null);
 const dismissedOperatorKey = ref<string | null>(null);
+const escapedMentionAnchor = ref<number | null>(null);
 const showCommandPopup = ref(false);
 const commandHighlightIndex = ref(0);
 const commandPopupRef = ref<HTMLElement | null>(null);
@@ -251,6 +266,8 @@ const mentionTokenEnd = ref(-1);
 const mentionSubPath = ref("");
 const mentionLoading = ref(false);
 const mentionSearchSettledQuery = ref("");
+const mentionSelectionPending = ref(false);
+const mentionAllowsSpaces = ref(false);
 const assetRefDrafts = new Map<string, AssetRefAttachment[]>();
 const recentlyRemovedAssetRefKeys = new Map<string, number>();
 
@@ -343,6 +360,11 @@ const RUNTIME_SAFE_ACTION_COMMANDS: readonly IntentCommandType[] = [
   "export-context",
   "review-context",
 ];
+const runtimeSafeActionCommands = computed<readonly IntentCommandType[]>(() => (
+  props.allowRuntimeCompact
+    ? ["compact", ...RUNTIME_SAFE_ACTION_COMMANDS]
+    : RUNTIME_SAFE_ACTION_COMMANDS
+));
 
 const allowActionCommands = computed(() =>
   !!activeOperator.value
@@ -353,7 +375,7 @@ const allowActionCommands = computed(() =>
 const actionCommandFilterOptions = computed(() => ({
   includeActions: allowActionCommands.value && !props.isStreaming,
   allowedActionTypes: allowActionCommands.value && props.isStreaming
-    ? RUNTIME_SAFE_ACTION_COMMANDS
+    ? runtimeSafeActionCommands.value
     : undefined,
 }));
 
@@ -452,23 +474,21 @@ function mapKnowledgeSearchResult(result: KnowledgeSearchResult): MentionSearchR
   };
 }
 
+function mapSceneObjectSearchResult(result: WorkspaceSceneObjectSearchResult): MentionSearchResult {
+  const relPath = `${result.scenePath}/${result.objectPath}`;
+  return {
+    relPath,
+    name: result.name,
+    parentPath: relPath,
+    isDir: false,
+    matchScore: result.matchScore,
+    meta: relPath,
+    entryKind: "sceneObject",
+  };
+}
+
 const rankedMentionSearchResults = computed(() =>
-  rankSearchResults(mentionSearchResults.value, mentionQuery.value, (result) => [
-    {
-      text: result.name,
-      weight: result.entryKind === "knowledge"
-        ? 165 + Math.min(Math.floor(result.matchScore / 12), 60)
-        : 180 + Math.min(Math.floor(result.matchScore / 12), 90),
-    },
-    {
-      text: result.relPath,
-      weight: result.entryKind === "knowledge"
-        ? 120 + Math.min(Math.floor(result.matchScore / 24), 35)
-        : 90 + Math.min(Math.floor(result.matchScore / 24), 45),
-    },
-    { text: result.parentPath, weight: 30 },
-    { text: result.meta || "", weight: 50 },
-  ]),
+  rankMentionSearchResults(mentionSearchResults.value, mentionQuery.value),
 );
 
 const mentionCurrentFolderEntry = computed<MentionDisplayEntry | null>(() => {
@@ -695,38 +715,79 @@ async function searchAssets(query: string) {
   lastSearchQuery = query;
   const requestSeq = ++mentionRequestSeq;
   mentionLoading.value = true;
+  let assetResults: MentionSearchResult[] = [];
+  let folderResults: MentionSearchResult[] = [];
+  let knowledgeResults: MentionSearchResult[] = [];
+  let sceneObjectResults: MentionSearchResult[] = [];
+
+  function requestIsCurrent() {
+    return requestSeq === mentionRequestSeq
+      && showMentionPopup.value
+      && mentionMode.value === "search"
+      && mentionQuery.value === query;
+  }
+
+  function publishResults() {
+    if (!requestIsCurrent()) return;
+    mentionSearchResults.value = [
+      ...assetResults,
+      ...folderResults,
+      ...sceneObjectResults,
+      ...knowledgeResults,
+    ];
+  }
+
+  async function searchSceneObjectsFromDisk() {
+    const scenePath = projectStore.unityConnectionStatus?.scenePath?.trim();
+    if (!projectStore.unityConnected || !scenePath) return;
+    const results = await searchWorkspaceSceneObjects(
+      scenePath,
+      query,
+      MAX_SCENE_OBJECT_MENTION_RESULTS,
+    );
+    if (!requestIsCurrent()) return;
+    sceneObjectResults = results.map(mapSceneObjectSearchResult);
+    publishResults();
+  }
+
   try {
-    const [assetSearch, knowledgeSearch] = await Promise.allSettled([
-      searchWorkspaceAssets(query, [
-        "Assets",
-        "Packages",
-        "ProjectSettings",
-      ]),
-      knowledgeQuery({
-        query,
-        limit: 16,
-        types: KNOWLEDGE_MENTION_TYPES,
-      }),
+    const assetSearchPromise = searchWorkspaceAssets(query, [
+      "Assets",
+      "Packages",
+      "ProjectSettings",
+    ])
+      .then((results) => {
+        assetResults = results.map(mapAssetSearchResult);
+        publishResults();
+        return results;
+      });
+    const folderSearchPromise = searchWorkspaceEntries(query)
+      .then((results) => {
+        folderResults = mapWorkspaceFolderMentionResults(results);
+        publishResults();
+        return results;
+      });
+    const knowledgeSearchPromise = knowledgeQuery({
+      query,
+      limit: 16,
+      types: KNOWLEDGE_MENTION_TYPES,
+    })
+      .then((results) => {
+        knowledgeResults = results
+          .filter((result) => (result.storageSource ?? "project") === "project")
+          .map(mapKnowledgeSearchResult);
+        publishResults();
+        return results;
+      });
+    const [assetSearch] = await Promise.allSettled([
+      assetSearchPromise,
+      folderSearchPromise,
+      knowledgeSearchPromise,
+      searchSceneObjectsFromDisk(),
     ]);
-    if (
-      requestSeq !== mentionRequestSeq
-      || !showMentionPopup.value
-      || mentionMode.value !== "search"
-      || mentionQuery.value !== query
-    ) {
-      return;
-    }
+    if (!requestIsCurrent()) return;
 
-    const assetResults = assetSearch.status === "fulfilled"
-      ? assetSearch.value.map(mapAssetSearchResult)
-      : [];
-    const knowledgeResults = knowledgeSearch.status === "fulfilled"
-      ? knowledgeSearch.value
-        .filter((result) => (result.storageSource ?? "project") === "project")
-        .map(mapKnowledgeSearchResult)
-      : [];
-
-    mentionSearchResults.value = [...assetResults, ...knowledgeResults];
+    publishResults();
     mentionSearchSettledQuery.value = query;
 
     if (assetSearch.status === "rejected" && mentionSearchResults.value.length === 0) {
@@ -767,6 +828,7 @@ function closeMentionPopup() {
   mentionSearchSettledQuery.value = "";
   mentionHighlightIndex.value = 0;
   mentionMode.value = "search";
+  mentionAllowsSpaces.value = false;
   lastSearchQuery = "";
   pendingMentionCursor = null;
 }
@@ -817,6 +879,31 @@ function getOperatorKey(operator: ActiveOperator | null | undefined): string | n
   return `${operator.kind}:${operator.start}:${operator.end}:${operator.token}`;
 }
 
+function detectComposerOperator(text: string, cursor: number): ActiveOperator | null {
+  const detected = detectActiveOperator(text, cursor);
+  if (detected || !mentionAllowsSpaces.value || mentionAnchor.value < 0) {
+    return detected;
+  }
+
+  const start = mentionAnchor.value;
+  if (cursor < start + 1) return null;
+  const safeCursor = Math.min(cursor, text.length);
+  const token = text.slice(start, safeCursor);
+  if (
+    text[start] !== "@"
+    || MENTION_SPACE_CONTINUATION_BOUNDARY_RE.test(token.slice(1))
+    || token.slice(1).includes("@")
+  ) return null;
+
+  return {
+    kind: "mention",
+    start,
+    end: safeCursor,
+    token,
+    query: token.slice(1),
+  };
+}
+
 function dismissActiveOperatorPopup() {
   dismissedOperatorKey.value = getOperatorKey(activeOperator.value);
   showCommandPopup.value = false;
@@ -833,15 +920,27 @@ function syncOperatorState() {
   if (!textarea) return;
 
   const cursor = pendingMentionCursor ?? textarea.selectionStart ?? props.modelValue.length;
-  const operator = detectActiveOperator(props.modelValue, cursor);
+  const operator = detectComposerOperator(props.modelValue, cursor);
   activeOperator.value = operator;
   const operatorKey = getOperatorKey(operator);
 
   if (!operator) {
     dismissedOperatorKey.value = null;
+    escapedMentionAnchor.value = null;
     showCommandPopup.value = false;
     closeMentionPopup();
     return;
+  }
+
+  if (operator.kind === "mention") {
+    if (escapedMentionAnchor.value === operator.start) {
+      showCommandPopup.value = false;
+      closeMentionPopup();
+      return;
+    }
+    escapedMentionAnchor.value = null;
+  } else {
+    escapedMentionAnchor.value = null;
   }
 
   if (dismissedOperatorKey.value && dismissedOperatorKey.value !== operatorKey) {
@@ -952,10 +1051,62 @@ function browseMentionDirectory(entry: MentionDisplayEntry) {
   replaceMentionToken(nextPath ? `${nextPath}/` : "");
 }
 
-function selectMentionEntry(entry: MentionDisplayEntry) {
+function sceneObjectMentionTarget(path: string) {
+  const normalized = normalizeUnityAssetRefPath(path);
+  const match = normalized.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+  if (!match) return null;
+  return { scenePath: match[1], objectPath: match[2] };
+}
+
+function notifySceneObjectMentionValidationError(
+  error: unknown,
+  scenePath: string,
+  objectPath: string,
+) {
+  const kind = classifyUnitySceneObjectError(error);
+  const message = kind === "sceneNotLoaded"
+    ? t("chat.sceneObject.sceneNotLoaded", scenePath)
+    : kind === "objectMissing"
+      ? t("chat.sceneObject.objectMissing", objectPath)
+      : t("chat.sceneObject.openFailed", `${scenePath}/${objectPath}`);
+  notificationStore.addNotice("warning", message, { operation: "sceneObjectMentionValidation" });
+}
+
+async function selectMentionEntry(entry: MentionDisplayEntry) {
+  if (mentionSelectionPending.value) return;
   const mentionPath = entry.isDir && !entry.relPath.endsWith("/")
     ? `${entry.relPath}/`
     : entry.relPath;
+
+  if (entry.entryKind === "sceneObject") {
+    const target = sceneObjectMentionTarget(mentionPath);
+    if (!target) return;
+    const expectedText = props.modelValue;
+    const expectedAnchor = mentionAnchor.value;
+    const expectedTokenEnd = mentionTokenEnd.value;
+    mentionSelectionPending.value = true;
+    try {
+      await validateUnitySceneObject(target.scenePath, target.objectPath);
+    } catch (error) {
+      mentionSearchResults.value = mentionSearchResults.value.filter(
+        (result) => result.relPath !== entry.relPath,
+      );
+      mentionHighlightIndex.value = Math.min(
+        mentionHighlightIndex.value,
+        Math.max(mentionDisplayList.value.length - 1, 0),
+      );
+      notifySceneObjectMentionValidationError(error, target.scenePath, target.objectPath);
+      return;
+    } finally {
+      mentionSelectionPending.value = false;
+    }
+
+    if (
+      props.modelValue !== expectedText
+      || mentionAnchor.value !== expectedAnchor
+      || mentionTokenEnd.value !== expectedTokenEnd
+    ) return;
+  }
 
   const assetRef = buildManualAssetRef(mentionPath);
   if (assetRef) {
@@ -1805,7 +1956,7 @@ function executeActionCommand(command: CommandDef): boolean {
   if (command.commandKind !== "action" || !canExecuteActionCommand()) return false;
   if (
     props.isStreaming
-    && !RUNTIME_SAFE_ACTION_COMMANDS.includes(command.commandType)
+    && !runtimeSafeActionCommands.value.includes(command.commandType)
   ) return false;
 
   if (command.commandType === "clear") {
@@ -1955,7 +2106,28 @@ function tryNavigateMessageHistory(event: KeyboardEvent): boolean {
   return true;
 }
 
+function mentionCanContinueWithSpace() {
+  if (mentionMode.value !== "search") return false;
+  return shouldContinueMentionWithSpace(
+    mentionQuery.value,
+    mentionDisplayList.value.filter((entry) => !entry.isDir).map((entry) => entry.name),
+  );
+}
+
 function handleKeydown(event: KeyboardEvent) {
+  if (
+    event.key === "Escape"
+    && (showMentionPopup.value || activeOperator.value?.kind === "mention")
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    escapedMentionAnchor.value = activeOperator.value?.kind === "mention"
+      ? activeOperator.value.start
+      : mentionAnchor.value;
+    dismissActiveOperatorPopup();
+    return;
+  }
+
   if (showMentionPopup.value) {
     const items = mentionDisplayList.value;
     if (event.key === "ArrowDown") {
@@ -1970,6 +2142,22 @@ function handleKeydown(event: KeyboardEvent) {
       event.preventDefault();
       event.stopPropagation();
       mentionHighlightIndex.value = (mentionHighlightIndex.value - 1 + items.length) % items.length;
+      return;
+    }
+    if (
+      event.key === " "
+      && !event.ctrlKey
+      && !event.metaKey
+      && !event.altKey
+    ) {
+      if (mentionCanContinueWithSpace()) {
+        event.preventDefault();
+        event.stopPropagation();
+        mentionAllowsSpaces.value = true;
+        replaceMentionToken(`${mentionQuery.value} `);
+        return;
+      }
+      dismissActiveOperatorPopup();
       return;
     }
     if (shouldSelectPopupOnEnter(event, chatInputSettings.submitMode)) {
@@ -2004,12 +2192,6 @@ function handleKeydown(event: KeyboardEvent) {
       event.preventDefault();
       event.stopPropagation();
       mentionNavigateParent();
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      dismissActiveOperatorPopup();
       return;
     }
   }

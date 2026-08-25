@@ -33,7 +33,8 @@
 //!   - `ScanPhaseState` is process-only; the most recent successful scan
 //!     snapshot is persisted per-workspace under `Library/Locus/`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1543,6 +1544,27 @@ pub struct WorkspacePreviewSession {
 /// trivial; we deliberately don't pull in the `lru` crate.
 pub struct WorkspacePreviewCache {
     inner: Mutex<VecDeque<(String, Arc<WorkspacePreviewSession>)>>,
+    scene_hierarchies: Mutex<VecDeque<SceneHierarchyCacheEntry>>,
+    scene_hierarchy_build_lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SceneHierarchyFingerprint {
+    len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+struct SceneHierarchyObject {
+    scene_path: String,
+    object_path: String,
+    name: String,
+}
+
+struct SceneHierarchyCacheEntry {
+    cache_key: String,
+    fingerprint: SceneHierarchyFingerprint,
+    objects: Arc<Vec<SceneHierarchyObject>>,
 }
 
 impl WorkspacePreviewCache {
@@ -1551,6 +1573,8 @@ impl WorkspacePreviewCache {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(Self::CAP + 1)),
+            scene_hierarchies: Mutex::new(VecDeque::with_capacity(Self::CAP + 1)),
+            scene_hierarchy_build_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1578,11 +1602,48 @@ impl WorkspacePreviewCache {
         Some(session)
     }
 
+    fn get_scene_hierarchy(
+        &self,
+        cache_key: &str,
+        fingerprint: SceneHierarchyFingerprint,
+    ) -> Option<Arc<Vec<SceneHierarchyObject>>> {
+        let mut q = self.scene_hierarchies.lock().ok()?;
+        let pos = q
+            .iter()
+            .position(|entry| entry.cache_key == cache_key && entry.fingerprint == fingerprint)?;
+        let entry = q.remove(pos)?;
+        let objects = entry.objects.clone();
+        q.push_back(entry);
+        Some(objects)
+    }
+
+    fn insert_scene_hierarchy(
+        &self,
+        cache_key: String,
+        fingerprint: SceneHierarchyFingerprint,
+        objects: Arc<Vec<SceneHierarchyObject>>,
+    ) {
+        if let Ok(mut q) = self.scene_hierarchies.lock() {
+            q.retain(|entry| entry.cache_key != cache_key);
+            while q.len() >= Self::CAP {
+                q.pop_front();
+            }
+            q.push_back(SceneHierarchyCacheEntry {
+                cache_key,
+                fingerprint,
+                objects,
+            });
+        }
+    }
+
     /// Drop every cached session. Called on real workspace switches so a
     /// stale session from project A can never be paired with project B's
     /// `AssetDb` / GuidResolver in `preview_workspace_asset_target`.
     pub fn clear(&self) {
         if let Ok(mut q) = self.inner.lock() {
+            q.clear();
+        }
+        if let Ok(mut q) = self.scene_hierarchies.lock() {
             q.clear();
         }
     }
@@ -1592,6 +1653,235 @@ impl Default for WorkspacePreviewCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+const SCENE_OBJECT_SEARCH_DEFAULT_LIMIT: usize = 160;
+const SCENE_OBJECT_SEARCH_MAX_LIMIT: usize = 500;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSceneObjectSearchResult {
+    pub scene_path: String,
+    pub object_path: String,
+    pub name: String,
+    pub match_score: i32,
+}
+
+fn scene_hierarchy_fingerprint(path: &Path) -> Result<SceneHierarchyFingerprint, AppError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        AppError::new(
+            "asset.scene_hierarchy.metadata",
+            format!("Failed to read scene metadata: {error}"),
+        )
+    })?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Ok(SceneHierarchyFingerprint {
+        len: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn build_scene_hierarchy_objects(
+    scene_path: &str,
+    canonical: &Path,
+) -> Result<Vec<SceneHierarchyObject>, AppError> {
+    let bytes = std::fs::read(canonical).map_err(|error| {
+        AppError::new(
+            "asset.scene_hierarchy.read",
+            format!("Failed to read scene hierarchy: {error}"),
+        )
+    })?;
+    Ok(parse_scene_hierarchy_objects(scene_path, &bytes))
+}
+
+fn parse_scene_hierarchy_objects(scene_path: &str, bytes: &[u8]) -> Vec<SceneHierarchyObject> {
+    let docs = crate::unity_yaml::parse_yaml_docs(bytes);
+    let roots = crate::unity_yaml::build_go_tree(&docs);
+    let paths = crate::unity_yaml::build_hierarchy_path_map(&roots);
+    let mut objects = Vec::with_capacity(paths.len());
+    let mut stack: Vec<&crate::unity_yaml::HierarchyNode> = roots.iter().rev().collect();
+
+    while let Some(node) = stack.pop() {
+        if let Some(object_path) = paths.get(&node.file_id) {
+            objects.push(SceneHierarchyObject {
+                scene_path: scene_path.to_string(),
+                object_path: object_path.clone(),
+                name: node.name.clone(),
+            });
+        }
+        stack.extend(node.children.iter().rev());
+    }
+
+    objects
+}
+
+fn compact_scene_object_search(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_scene_object_search_subsequence(query: &str, candidate: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut query_chars = query.chars();
+    let mut current = query_chars.next();
+    for character in candidate.chars() {
+        if current == Some(character) {
+            current = query_chars.next();
+            if current.is_none() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn scene_object_search_score(query: &str, name: &str, full_path: &str) -> Option<i32> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let name_lower = name.to_lowercase();
+    let path_lower = full_path.to_lowercase();
+    let compact_query = compact_scene_object_search(&query);
+    let compact_name = compact_scene_object_search(&name_lower);
+    let compact_path = compact_scene_object_search(&path_lower);
+
+    let mut score = if name_lower == query {
+        1240
+    } else if name_lower.starts_with(&query) {
+        1140 - name_lower.len().min(48) as i32
+    } else if let Some(index) = name_lower.find(&query) {
+        1040 - index.min(80) as i32 * 6
+    } else if let Some(index) = path_lower.find(&query) {
+        960 - index.min(120) as i32 * 3
+    } else if !compact_query.is_empty() && compact_name.starts_with(&compact_query) {
+        900 - compact_name.len().min(48) as i32
+    } else if !compact_query.is_empty() && compact_path.contains(&compact_query) {
+        820 - compact_path.find(&compact_query).unwrap_or(0).min(120) as i32 * 2
+    } else if !compact_query.is_empty()
+        && (is_scene_object_search_subsequence(&compact_query, &compact_name)
+            || is_scene_object_search_subsequence(&compact_query, &compact_path))
+    {
+        520
+    } else {
+        return None;
+    };
+
+    score -= full_path.matches('/').count().min(80) as i32 * 2;
+    Some(score)
+}
+
+#[tauri::command]
+pub async fn search_workspace_scene_objects(
+    scene_path: String,
+    query: String,
+    limit: Option<usize>,
+    workspace: State<'_, Arc<Workspace>>,
+    preview_cache: State<'_, WorkspacePreviewCache>,
+) -> Result<Vec<WorkspaceSceneObjectSearchResult>, AppError> {
+    let scene_path = scene_path.trim().replace('\\', "/");
+    if !scene_path.to_ascii_lowercase().ends_with(".unity") {
+        return Ok(Vec::new());
+    }
+
+    let cwd = workspace.path.read().await.clone();
+    if cwd.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workspace_root = PathBuf::from(cwd);
+    let (canonical, rel_path) = resolve_workspace_path(&workspace_root, &scene_path)?;
+    let cache_key = format!("{}\0{}", canonical.display(), rel_path);
+    let fingerprint = scene_hierarchy_fingerprint(&canonical)?;
+
+    let objects = if let Some(cached) = preview_cache.get_scene_hierarchy(&cache_key, fingerprint) {
+        cached
+    } else {
+        let _build_guard = preview_cache.scene_hierarchy_build_lock.lock().await;
+        if let Some(cached) = preview_cache.get_scene_hierarchy(&cache_key, fingerprint) {
+            cached
+        } else {
+            let build_scene_path = rel_path.clone();
+            let build_canonical = canonical.clone();
+            let built = tauri::async_runtime::spawn_blocking(move || {
+                build_scene_hierarchy_objects(&build_scene_path, &build_canonical)
+            })
+            .await
+            .map_err(|error| {
+                AppError::new(
+                    "asset.scene_hierarchy.join",
+                    format!("Scene hierarchy worker failed: {error}"),
+                )
+            })??;
+            let cached = Arc::new(built);
+            preview_cache.insert_scene_hierarchy(cache_key, fingerprint, cached.clone());
+            cached
+        }
+    };
+
+    let query = query.trim().to_string();
+    let result_limit = limit
+        .unwrap_or(SCENE_OBJECT_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SCENE_OBJECT_SEARCH_MAX_LIMIT);
+    let search_objects = objects.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut best_matches: BinaryHeap<Reverse<(i32, usize)>> =
+            BinaryHeap::with_capacity(result_limit + 1);
+        for (index, object) in search_objects.iter().enumerate() {
+            let full_path = format!("{}/{}", object.scene_path, object.object_path);
+            let Some(match_score) = scene_object_search_score(&query, &object.name, &full_path)
+            else {
+                continue;
+            };
+            let candidate = (match_score, usize::MAX - index);
+            if best_matches.len() < result_limit {
+                best_matches.push(Reverse(candidate));
+            } else if best_matches
+                .peek()
+                .is_some_and(|current| candidate > current.0)
+            {
+                best_matches.pop();
+                best_matches.push(Reverse(candidate));
+            }
+        }
+
+        let mut results: Vec<WorkspaceSceneObjectSearchResult> = best_matches
+            .into_iter()
+            .map(|Reverse((match_score, reverse_index))| {
+                let index = usize::MAX - reverse_index;
+                let object = &search_objects[index];
+                WorkspaceSceneObjectSearchResult {
+                    scene_path: object.scene_path.clone(),
+                    object_path: object.object_path.clone(),
+                    name: object.name.clone(),
+                    match_score,
+                }
+            })
+            .collect();
+        results.sort_by(|left, right| {
+            right
+                .match_score
+                .cmp(&left.match_score)
+                .then_with(|| left.object_path.cmp(&right.object_path))
+        });
+        results
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "asset.scene_hierarchy.search_join",
+            format!("Scene hierarchy search worker failed: {error}"),
+        )
+    })
 }
 
 /// Extension classifier. Returns the language identifier for known text
@@ -3106,6 +3396,59 @@ mod tests {
         assert!(results
             .iter()
             .any(|result| result.path == "Assets/Linked/Hero.prefab"));
+    }
+
+    #[test]
+    fn scene_object_search_index_keeps_full_paths_and_duplicate_ordinals() {
+        let yaml = br#"--- !u!1 &1
+GameObject:
+  m_Component:
+  - component: {fileID: 11}
+  m_Name: Root
+  m_IsActive: 1
+--- !u!4 &11
+Transform:
+  m_GameObject: {fileID: 1}
+  m_Father: {fileID: 0}
+  m_Children:
+  - {fileID: 12}
+  - {fileID: 13}
+  m_RootOrder: 0
+--- !u!1 &2
+GameObject:
+  m_Component:
+  - component: {fileID: 12}
+  m_Name: Target
+  m_IsActive: 1
+--- !u!4 &12
+Transform:
+  m_GameObject: {fileID: 2}
+  m_Father: {fileID: 11}
+  m_Children: []
+--- !u!1 &3
+GameObject:
+  m_Component:
+  - component: {fileID: 13}
+  m_Name: Target
+  m_IsActive: 0
+--- !u!4 &13
+Transform:
+  m_GameObject: {fileID: 3}
+  m_Father: {fileID: 11}
+  m_Children: []
+"#;
+
+        let objects = parse_scene_hierarchy_objects("Assets/Scenes/Main.unity", yaml);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(objects[0].object_path, "Root");
+        assert_eq!(objects[1].object_path, "Root/Target[1]");
+        assert_eq!(objects[2].object_path, "Root/Target[2]");
+        assert!(scene_object_search_score(
+            "target",
+            &objects[2].name,
+            &format!("{}/{}", objects[2].scene_path, objects[2].object_path),
+        )
+        .is_some());
     }
 
     #[test]

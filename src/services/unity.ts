@@ -75,6 +75,13 @@ export function selectUnitySceneObject(
   return ipcInvoke("select_unity_scene_object", { scenePath, objectPath });
 }
 
+export function validateUnitySceneObject(
+  scenePath: string,
+  objectPath: string,
+): Promise<void> {
+  return ipcInvoke("validate_unity_scene_object", { scenePath, objectPath });
+}
+
 export function openUnitySceneObjectInspector(
   scenePath: string,
   objectPath: string,

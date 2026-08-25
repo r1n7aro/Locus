@@ -4,6 +4,7 @@ import {
   insertInlineMention,
   parseInlineIntentCommands,
   parseUserIntentMeta,
+  shouldContinueMentionWithSpace,
   type CommandDef,
 } from "../composables/chatInputIntents";
 
@@ -118,6 +119,19 @@ describe("detectActiveOperator", () => {
     const text = "mail foo@bar.com for details";
     const operator = detectActiveOperator(text, text.indexOf("@bar") + 2);
     expect(operator).toBeNull();
+  });
+});
+
+describe("shouldContinueMentionWithSpace", () => {
+  it("continues when a visible candidate has another name segment", () => {
+    expect(shouldContinueMentionWithSpace("Main", ["Player", "Main Camera"])).toBe(true);
+    expect(shouldContinueMentionWithSpace("Main Camera", ["Main Camera Rig"])).toBe(true);
+  });
+
+  it("ends when no candidate has a remaining space", () => {
+    expect(shouldContinueMentionWithSpace("Player", ["Player", "PlayerRoot"])).toBe(false);
+    expect(shouldContinueMentionWithSpace("Main Camera", ["Main Camera"])).toBe(false);
+    expect(shouldContinueMentionWithSpace("Main ", ["Main Camera"])).toBe(false);
   });
 });
 

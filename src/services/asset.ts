@@ -49,6 +49,25 @@ export function searchWorkspaceAssets(
   return ipcInvoke<AssetSearchResult[]>("search_workspace_assets", payload);
 }
 
+export interface WorkspaceSceneObjectSearchResult {
+  scenePath: string;
+  objectPath: string;
+  name: string;
+  matchScore: number;
+}
+
+export function searchWorkspaceSceneObjects(
+  scenePath: string,
+  query: string,
+  limit = 160,
+): Promise<WorkspaceSceneObjectSearchResult[]> {
+  return ipcInvoke<WorkspaceSceneObjectSearchResult[]>("search_workspace_scene_objects", {
+    scenePath,
+    query,
+    limit,
+  });
+}
+
 export function previewWorkspaceAsset(
   filePath: string,
   focusLine?: number,
