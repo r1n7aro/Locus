@@ -297,15 +297,15 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 262965
+      "bytes": 263939
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 256431
+      "bytes": 257358
     },
     {
       "path": "src/services/asset.ts",
-      "bytes": 4247
+      "bytes": 4664
     },
     {
       "path": "src/services/diff.ts",
@@ -317,11 +317,11 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 19677
+      "bytes": 19881
     },
     {
       "path": "src/services/unity.ts",
-      "bytes": 13560
+      "bytes": 13737
     },
     {
       "path": "src/services/unitySerializedProperty.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 82835
+      "bytes": 83213
     }
   ]
 }
