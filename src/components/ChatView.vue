@@ -93,6 +93,7 @@ import {
   buildUserMessageDraft,
   writeChatMessageClipboard,
 } from "../composables/chatMessageDraft";
+import { isMessageFromActiveStream } from "../composables/chatMessageFork";
 import { selectionTextAtPoint } from "../composables/chatSelectionContext";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
@@ -125,7 +126,10 @@ const isViewingSubagent = computed(() => {
 });
 const activeQueuedFollowUp = computed(() => chatStore.activeQueuedFollowUp);
 const showQueuedFollowUp = computed(() =>
-  !!activeQueuedFollowUp.value && props.isStreaming && !isViewingSubagent.value,
+  !!activeQueuedFollowUp.value && props.isStreaming,
+);
+const showCompactQueued = computed(() =>
+  chatStore.isCompactQueued && props.isStreaming && !isViewingSubagent.value,
 );
 const diffProgress = useDiffProgress();
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
@@ -136,7 +140,7 @@ const chatInputPlaceholder = computed(() => {
   return t("chat.input.placeholder");
 });
 const runningSendLabel = computed(() =>
-  chatInputSettings.runningSendMode === "insert"
+  isViewingSubagent.value || chatInputSettings.runningSendMode === "insert"
     ? t("chat.input.queuedFollowUpInsert")
     : t("chat.input.queue"),
 );
@@ -304,6 +308,9 @@ function handleInsertQueuedFollowUp() {
 function handleDeleteQueuedFollowUp() {
   void chatStore.deleteActiveQueuedFollowUp();
 }
+function handleReEditQueuedFollowUp() {
+  void chatStore.reEditActiveQueuedFollowUp();
+}
 function closeLightbox() {
   lightboxSrc.value = "";
 }
@@ -347,8 +354,8 @@ type MessageContextMenuState = {
   selectionText: string;
 };
 
-const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
-const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|memory|skill|reference)\/(.+\.md)$/i;
+const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|plan|memory|skill|reference)\/(.+\.md)$/i;
+const KNOWLEDGE_DOCUMENT_FILE_RE = /^Locus\/knowledge\/(design|plan|memory|skill|reference)\/(.+\.md)$/i;
 const assetRefCtxMenu = ref<AssetRefContextMenuState | null>(null);
 const messageCtxMenu = ref<MessageContextMenuState | null>(null);
 
@@ -1060,6 +1067,17 @@ const messageContextCanAct = computed(() =>
   && messageContextMessage.value.role !== "tool",
 );
 
+const messageContextCanFork = computed(() =>
+  !!props.activeSessionId
+  && !!messageContextMessage.value
+  && messageContextMessage.value.role !== "tool"
+  && !isMessageFromActiveStream(
+    messageContextMessage.value,
+    chatStore.currentRunId,
+    props.isStreaming,
+  ),
+);
+
 function lastRenderableMessage() {
   for (let index = props.messages.length - 1; index >= 0; index -= 1) {
     const message = props.messages[index];
@@ -1152,7 +1170,7 @@ async function doMessageRollback() {
 
 async function doMessageFork() {
   const messageId = messageCtxMenu.value?.messageId ?? null;
-  if (!messageId || !messageContextCanAct.value) return;
+  if (!messageId || !messageContextCanFork.value) return;
   closeMessageContextMenu();
   await chatStore.forkSessionFromMessage(messageId);
 }
@@ -3041,7 +3059,7 @@ onUnmounted(() => {
       </div>
 
     <div
-      v-if="(pendingQuestion && !isViewingSubagent) || showBatchToolConfirmCard || showSingleToolConfirmCard || showQueuedFollowUp || (planModeActive && !isViewingSubagent)"
+      v-if="(pendingQuestion && !isViewingSubagent) || showBatchToolConfirmCard || showSingleToolConfirmCard || showQueuedFollowUp || showCompactQueued || (planModeActive && !isViewingSubagent)"
       class="chat-pending-stack"
       @wheel="handleBottomPanelWheel"
     >
@@ -3049,7 +3067,7 @@ onUnmounted(() => {
         <span class="queued-follow-up-label">
           {{ activeQueuedFollowUp?.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
         </span>
-        <span class="queued-follow-up-text">{{ activeQueuedFollowUp?.displayText }}</span>
+        <span class="queued-follow-up-text ui-select-text">{{ activeQueuedFollowUp?.displayText }}</span>
         <BaseButton
           v-if="activeQueuedFollowUp?.canInsert"
           class="queued-follow-up-insert"
@@ -3061,6 +3079,15 @@ onUnmounted(() => {
           {{ t('chat.input.queuedFollowUpInsert') }}
         </BaseButton>
         <BaseButton
+          class="queued-follow-up-re-edit"
+          size="sm"
+          variant="neutral"
+          type="button"
+          @click="handleReEditQueuedFollowUp"
+        >
+          {{ t('chat.messageMenu.reEditUserMessage') }}
+        </BaseButton>
+        <BaseButton
           class="queued-follow-up-delete"
           size="sm"
           variant="neutral"
@@ -3069,6 +3096,9 @@ onUnmounted(() => {
         >
           {{ t('common.delete') }}
         </BaseButton>
+      </div>
+      <div v-if="showCompactQueued" class="queued-follow-up-bar">
+        <span class="queued-follow-up-label">{{ t('chat.input.compactQueued') }}</span>
       </div>
 
       <AskUserCard
@@ -3109,7 +3139,6 @@ onUnmounted(() => {
     </div>
 
     <div
-      v-if="!isViewingSubagent"
       class="input-area"
       :class="{
         'is-controls-collapsed': inputControlsCollapsed,
@@ -3203,6 +3232,7 @@ onUnmounted(() => {
           :is-streaming="isStreaming"
           :cancelling="isCancelling"
           :can-resume="canResumeInterrupted"
+          :allow-runtime-compact="!isViewingSubagent"
           :send-label="isStreaming ? runningSendLabel : t('common.send')"
           :cancel-label="t('common.cancel')"
           :resume-label="t('chat.input.resume')"
@@ -3389,7 +3419,7 @@ onUnmounted(() => {
               type="button"
               class="asset-ref-ctx-item ui-select-none"
               role="menuitem"
-              :disabled="!messageContextCanAct"
+              :disabled="!messageContextCanFork"
               @click="doMessageFork"
             >
               <LucideIcon :icon="GitFork" :size="13" />
@@ -4022,6 +4052,7 @@ onUnmounted(() => {
 }
 
 .queued-follow-up-insert,
+.queued-follow-up-re-edit,
 .queued-follow-up-delete {
   flex: 0 0 auto;
 }

@@ -244,6 +244,14 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     modelStore.applyContextEffort(agent?.defaultEffort ?? "none");
   }
 
+  function syncFastModeForChatContext() {
+    if (chatStore.activeSessionId && chatStore.sessionFastMode !== null) {
+      modelStore.applyContextCodexFastMode(chatStore.sessionFastMode);
+      return;
+    }
+    modelStore.restoreDefaultCodexFastMode();
+  }
+
   function normalizeWorkspacePath(path: string | null | undefined): string {
     return (path ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
   }
@@ -633,6 +641,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           payload.sessionId,
           payload.modelId,
           payload.effort,
+          payload.fastMode,
         );
       },
     );
@@ -839,6 +848,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     ]);
     await modelStore.loadLastEffort();
     syncEffortForChatContext();
+    syncFastModeForChatContext();
   }
 
   return {

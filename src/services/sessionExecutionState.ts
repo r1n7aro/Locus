@@ -8,6 +8,7 @@ export interface SessionExecutionStateChanged {
   sessionId: string;
   modelId: string;
   effort: EffortLevel;
+  fastMode: boolean;
 }
 
 export async function broadcastSessionExecutionState(
@@ -18,5 +19,6 @@ export async function broadcastSessionExecutionState(
     sessionId: payload.sessionId.trim(),
     modelId: payload.modelId.trim(),
     effort: payload.effort,
+    fastMode: payload.fastMode,
   });
 }

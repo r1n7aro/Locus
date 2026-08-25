@@ -220,6 +220,7 @@ pub fn export_session_context_yaml(
             "agentId": non_empty_value(detail.agent_id.as_deref()),
             "lastModelId": non_empty_value(detail.last_model_id.as_deref()),
             "lastEffort": non_empty_value(detail.last_effort.as_deref()),
+            "lastFastMode": detail.last_fast_mode.map(Value::Bool).unwrap_or_else(empty_value),
             "sessionType": non_empty_value(Some(&detail.session_type)),
             "parentSessionId": non_empty_value(detail.parent_session_id.as_deref()),
             "latestCompletedRunId": non_empty_value(detail.latest_completed_run_id.as_deref()),
@@ -1100,6 +1101,7 @@ mod tests {
             pending_question: None,
             pending_tool_confirms: Vec::new(),
             is_compacting: false,
+            compact_queued: false,
         };
         let live = ContextExportLiveSnapshot {
             captured_at: 102,

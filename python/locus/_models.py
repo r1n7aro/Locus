@@ -257,6 +257,8 @@ class Agent:
         session_type: str = "chat",
         knowledge_mode: str = "full",
         subagent_models: dict[str, str] | None = None,
+        subagent_efforts: dict[str, str] | None = None,
+        subagent_fast_modes: dict[str, bool] | None = None,
     ) -> "Run":
         if new_session and session_id is not None:
             raise ValueError("new_session and session_id cannot be used together")
@@ -277,6 +279,8 @@ class Agent:
                 session_type=session_type,
                 knowledge_mode=knowledge_mode,
                 subagent_models=subagent_models,
+                subagent_efforts=subagent_efforts,
+                subagent_fast_modes=subagent_fast_modes,
             )
             self.session_id = run.session_id
             return run
@@ -373,6 +377,7 @@ class Session:
     agent_id: str | None
     last_model_id: str | None
     last_effort: str | None
+    last_fast_mode: bool | None
     session_type: str
     parent_session_id: str | None
     latest_completed_run_id: str | None
@@ -391,6 +396,7 @@ class Session:
             agent_id=payload.get("agentId"),
             last_model_id=payload.get("lastModelId"),
             last_effort=payload.get("lastEffort"),
+            last_fast_mode=payload.get("lastFastMode"),
             session_type=payload.get("sessionType", "chat"),
             parent_session_id=payload.get("parentSessionId"),
             latest_completed_run_id=payload.get("latestCompletedRunId"),

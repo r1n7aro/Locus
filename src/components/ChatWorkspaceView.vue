@@ -3,7 +3,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
-import { createSession, exportSessionContext as exportContext } from "../services/session";
+import {
+  createSession,
+  exportSessionContext as exportContext,
+  saveSessionExecutionState,
+} from "../services/session";
 import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type {
   EffortLevel,
@@ -141,13 +145,17 @@ function connectAssistantSidebarResizeObserver(shell: HTMLElement) {
 
 function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
 
-function selectWorkspaceSession(sessionId: string) {
-  void chatStore.selectSession(sessionId, {
+let sessionExecutionStateSaveQueue = Promise.resolve();
+
+async function selectWorkspaceSession(sessionId: string) {
+  await sessionExecutionStateSaveQueue;
+  await chatStore.selectSession(sessionId, {
     persist: props.persistSessionSelection,
   });
 }
 
-function createWorkspaceSession() {
+async function createWorkspaceSession() {
+  await sessionExecutionStateSaveQueue;
   chatStore.newChat({
     persistSelection: props.persistSessionSelection,
   });
@@ -156,16 +164,32 @@ function createWorkspaceSession() {
 function publishSessionExecutionState() {
   const sessionId = chatStore.activeSessionId;
   if (!sessionId) return;
+  const modelId = modelStore.selectedModelId;
+  const effort = modelStore.effort;
+  const fastMode = modelStore.effectiveCodexFastMode;
   chatStore.applyActiveSessionExecutionState(
     sessionId,
-    modelStore.selectedModelId,
-    modelStore.effort,
+    modelId,
+    effort,
+    fastMode,
   );
   void broadcastSessionExecutionState({
     sessionId,
-    modelId: modelStore.selectedModelId,
-    effort: modelStore.effort,
+    modelId,
+    effort,
+    fastMode,
   });
+  sessionExecutionStateSaveQueue = sessionExecutionStateSaveQueue
+    .catch(() => undefined)
+    .then(() => saveSessionExecutionState(
+      sessionId,
+      modelId,
+      effort,
+      fastMode,
+    ))
+    .catch((error: unknown) => {
+      console.warn("save_session_execution_state failed:", error);
+    });
 }
 
 async function selectWorkspaceModel(modelId: string) {
@@ -176,6 +200,11 @@ async function selectWorkspaceModel(modelId: string) {
 
 function selectWorkspaceEffort(effort: EffortLevel) {
   modelStore.selectEffort(effort);
+  publishSessionExecutionState();
+}
+
+function selectWorkspaceFastMode(enabled: boolean) {
+  modelStore.selectCodexFastMode(enabled);
   publishSessionExecutionState();
 }
 
@@ -677,7 +706,7 @@ onUnmounted(() => {
       @select-agent="(id: string) => agentStore.selectAgent(id)"
       @select-model="selectWorkspaceModel"
       @select-effort="selectWorkspaceEffort"
-      @select-fast-mode="(enabled: boolean) => modelStore.selectCodexFastMode(enabled)"
+      @select-fast-mode="selectWorkspaceFastMode"
       @export-session-context="exportSessionContext"
       @review-session-context="reviewSessionContext"
       @remove-managed-composer-file="removeManagedComposerFile"

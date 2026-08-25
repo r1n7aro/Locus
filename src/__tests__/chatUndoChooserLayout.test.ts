@@ -46,6 +46,8 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain("userMessage: null");
     expect(chatView).toContain("chatStore.rollbackToMessage(targetMessageId");
     expect(chatView).toContain("chatStore.forkSessionFromMessage(messageId)");
+    expect(chatView).toContain("const messageContextCanFork = computed");
+    expect(chatView).toContain(':disabled="!messageContextCanFork"');
     expect(chatView).toContain("messageContextShouldShowReEdit");
     expect(chatView).toContain("isLastUserMessageWithoutAssistantAfter");
     expect(chatView).toContain("lastRenderableMessage()?.id !== message.id");

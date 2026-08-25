@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../types";
 import {
   buildChatMessageClipboardPayload,
+  buildPendingSessionInputDraft,
   buildUserMessageDraft,
   copyableChatMessageText,
   LOCUS_CHAT_MESSAGE_DRAFT_MIME,
   readUserMessageDraftFromClipboardData,
 } from "../composables/chatMessageDraft";
+import type { PendingSessionInput } from "../types";
 
 describe("chatMessageDraft", () => {
   const userMessage: ChatMessage = {
@@ -90,6 +92,37 @@ describe("chatMessageDraft", () => {
     expect(draft?.assetRefs.map((ref) => ref.path)).toContain("Locus/knowledge/skill/ui.md");
     expect(draft?.images).toHaveLength(1);
     expect(draft?.intent.skills[0]?.dirName).toBe("view");
+  });
+
+  it("builds an editable draft from queued inputs using the full prompt payload", () => {
+    const pending: PendingSessionInput = {
+      id: "pending-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      mergeGroupId: "group-1",
+      status: "queued",
+      delivery: "after_run",
+      text: userMessage.content,
+      displayText: "使用图片向我展示 store\n\nstore.png",
+      images: userMessage.images,
+      assetRefs: userMessage.assetRefs,
+      mode: "plan",
+      userIntent: {
+        kind: "user_intent_v1",
+        mode: "plan",
+        skills: [{ source: "app", dirName: "view", name: "View" }],
+      },
+      createdAt: 1,
+      updatedAt: 1,
+    };
+
+    const draft = buildPendingSessionInputDraft([pending]);
+
+    expect(draft.text).toBe("使用图片向我展示 store");
+    expect(draft.localFiles[0]?.path).toBe("E:/cache/store.png");
+    expect(draft.consoleTexts[0]?.text).toBe("[Warning] Slow call");
+    expect(draft.assetRefs.map((ref) => ref.path)).toContain("Assets/UI/Store.prefab");
+    expect(draft.intent).toMatchObject({ mode: "plan" });
   });
 
   it("copies visible user text and raw assistant text", () => {

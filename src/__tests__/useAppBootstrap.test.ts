@@ -183,6 +183,8 @@ describe("useAppBootstrap onboarding completion", () => {
     modelStoreMock = reactive({
       effort: "none",
       defaultEffort: "none",
+      codexFastMode: false,
+      defaultCodexFastMode: false,
       hasUserDefaultEffort: false,
       loadDebugMode: vi.fn().mockResolvedValue(undefined),
       loadModelDefaults: vi.fn().mockResolvedValue(undefined),
@@ -203,6 +205,12 @@ describe("useAppBootstrap onboarding completion", () => {
       restoreDefaultEffort: vi.fn(() => {
         modelStoreMock.effort = modelStoreMock.defaultEffort;
       }),
+      applyContextCodexFastMode: vi.fn((enabled: boolean | null | undefined) => {
+        modelStoreMock.codexFastMode = enabled ?? modelStoreMock.defaultCodexFastMode;
+      }),
+      restoreDefaultCodexFastMode: vi.fn(() => {
+        modelStoreMock.codexFastMode = modelStoreMock.defaultCodexFastMode;
+      }),
     });
 
     projectStoreMock = reactive({
@@ -219,6 +227,7 @@ describe("useAppBootstrap onboarding completion", () => {
     chatStoreMock = reactive({
       activeSessionId: null,
       sessionEffort: null,
+      sessionFastMode: null,
       sessions: [],
       refreshSessions: vi.fn().mockResolvedValue(undefined),
       loadToolPermissionMode: vi.fn().mockResolvedValue(undefined),
@@ -622,6 +631,7 @@ describe("useAppBootstrap onboarding completion", () => {
         sessionId: "session-1",
         modelId: "openai/gpt-5.6-sol",
         effort: "xhigh",
+        fastMode: true,
       },
     });
 
@@ -629,6 +639,7 @@ describe("useAppBootstrap onboarding completion", () => {
       "session-1",
       "openai/gpt-5.6-sol",
       "xhigh",
+      true,
     );
   });
 

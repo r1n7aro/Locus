@@ -889,7 +889,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 34;
+    const SCHEMA_VERSION: i32 = 35;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1313,7 +1313,16 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 34, "add a new migration block above");
+        if current < 35 {
+            Self::migrate(conn, 35, "persist the latest session Fast mode", |conn| {
+                if !Self::table_has_column(conn, "sessions", "last_fast_mode")? {
+                    conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_fast_mode INTEGER;")?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 35, "add a new migration block above");
         Ok(())
     }
 
@@ -1570,6 +1579,7 @@ impl SessionStore {
                 agent_id TEXT,
                 last_model_id TEXT,
                 last_effort TEXT,
+                last_fast_mode INTEGER,
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
                 latest_todo_run_id TEXT,
@@ -2319,11 +2329,12 @@ impl SessionStore {
                 agent_id,
                 last_model_id,
                 last_effort,
+                last_fast_mode,
                 latest_completed_run_id,
                 latest_todo_run_id,
             ) = conn
                 .query_row(
-                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, latest_completed_run_id, latest_todo_run_id
+                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, last_fast_mode, latest_completed_run_id, latest_todo_run_id
                      FROM sessions WHERE id = ?1",
                     params![source_id],
                     |row| {
@@ -2335,8 +2346,9 @@ impl SessionStore {
                             row.get::<_, Option<String>>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<bool>>(7)?,
                             row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(9)?,
                         ))
                     },
                 )
@@ -2378,13 +2390,14 @@ impl SessionStore {
                     agent_id,
                     last_model_id,
                     last_effort,
+                    last_fast_mode,
                     archived_at,
                     latest_completed_run_id,
                     latest_todo_run_id,
                     created_at,
                     updated_at
                  )
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?11)",
                 params![
                     new_id,
                     resolved_title,
@@ -2393,6 +2406,7 @@ impl SessionStore {
                     agent_id,
                     last_model_id,
                     last_effort,
+                    last_fast_mode,
                     if cutoff_rowid.is_some() {
                         Option::<String>::None
                     } else {
@@ -2631,6 +2645,7 @@ impl SessionStore {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<bool>,
             Option<String>,
             Option<String>,
         );
@@ -2642,7 +2657,7 @@ impl SessionStore {
             let conn = snapshot.conn.lock().map_err(|e| e.to_string())?;
             let session = conn
                 .query_row(
-                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, latest_completed_run_id, latest_todo_run_id
+                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, last_fast_mode, latest_completed_run_id, latest_todo_run_id
                      FROM sessions WHERE id = ?1",
                     params![source_id],
                     |row| {
@@ -2656,6 +2671,7 @@ impl SessionStore {
                             row.get(6)?,
                             row.get(7)?,
                             row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
@@ -2808,9 +2824,9 @@ impl SessionStore {
             conn.execute(
                 "INSERT INTO sessions (
                     id, title, parent_session_id, workspace_id, session_type, agent_id,
-                    last_model_id, last_effort, archived_at, latest_completed_run_id,
+                    last_model_id, last_effort, last_fast_mode, archived_at, latest_completed_run_id,
                     latest_todo_run_id, created_at, updated_at
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?11)",
                 params![
                     new_id,
                     resolved_title,
@@ -2821,6 +2837,7 @@ impl SessionStore {
                     session.6,
                     session.7,
                     session.8,
+                    session.9,
                     now,
                 ],
             )
@@ -3778,6 +3795,7 @@ impl SessionStore {
             agent_id,
             last_model_id,
             last_effort,
+            last_fast_mode,
             session_type,
             parent_session_id,
             latest_completed_run_id,
@@ -3785,7 +3803,7 @@ impl SessionStore {
             updated_at,
         ) = conn
             .query_row(
-                "SELECT title, agent_id, last_model_id, last_effort, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -3793,11 +3811,12 @@ impl SessionStore {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<bool>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -3816,6 +3835,7 @@ impl SessionStore {
             agent_id,
             last_model_id,
             last_effort,
+            last_fast_mode,
             session_type,
             parent_session_id,
             latest_completed_run_id,
@@ -3838,6 +3858,7 @@ impl SessionStore {
             agent_id,
             last_model_id,
             last_effort,
+            last_fast_mode,
             session_type,
             parent_session_id,
             latest_completed_run_id,
@@ -3845,7 +3866,7 @@ impl SessionStore {
             updated_at,
         ) = conn
             .query_row(
-                "SELECT title, agent_id, last_model_id, last_effort, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -3853,11 +3874,12 @@ impl SessionStore {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<bool>>(4)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -3877,6 +3899,7 @@ impl SessionStore {
                 agent_id,
                 last_model_id,
                 last_effort,
+                last_fast_mode,
                 session_type,
                 parent_session_id,
                 latest_completed_run_id,
@@ -4056,6 +4079,51 @@ impl SessionStore {
                 params![effort, session_id],
             )
             .map_err(|e| format!("Failed to update session effort: {}", e))?;
+        if updated == 0 {
+            return Err(format!("Session not found: {}", session_id));
+        }
+        Ok(())
+    }
+
+    pub fn set_session_last_fast_mode(
+        &self,
+        session_id: &str,
+        fast_mode: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET last_fast_mode = ?1 WHERE id = ?2",
+                params![fast_mode, session_id],
+            )
+            .map_err(|e| format!("Failed to update session Fast mode: {}", e))?;
+        if updated == 0 {
+            return Err(format!("Session not found: {}", session_id));
+        }
+        Ok(())
+    }
+
+    pub fn set_session_execution_state(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        effort: Option<&str>,
+        fast_mode: bool,
+    ) -> Result<(), String> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return Err("Session model id cannot be empty".to_string());
+        }
+        let effort = effort.map(str::trim).filter(|value| !value.is_empty());
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions
+                 SET last_model_id = ?1, last_effort = ?2, last_fast_mode = ?3
+                 WHERE id = ?4",
+                params![model_id, effort, fast_mode, session_id],
+            )
+            .map_err(|e| format!("Failed to update session execution state: {}", e))?;
         if updated == 0 {
             return Err(format!("Session not found: {}", session_id));
         }
@@ -7410,6 +7478,7 @@ mod tests {
         );
         assert!(SessionStore::table_has_column(&conn, "sessions", "last_model_id").unwrap());
         assert!(SessionStore::table_has_column(&conn, "sessions", "last_effort").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_fast_mode").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "metadata_json").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_prefix").unwrap());
         assert!(SessionStore::table_has_column(&conn, "messages", "prompt_suffix").unwrap());
@@ -7591,6 +7660,73 @@ mod tests {
             .expect("read schema version");
         assert_eq!(version, SessionStore::SCHEMA_VERSION);
         assert!(SessionStore::table_has_column(&conn, "sessions", "last_effort").unwrap());
+    }
+
+    #[test]
+    fn v34_database_migrates_session_fast_mode_and_exports_legacy_value_as_empty() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v34 db");
+        SessionStore::create_latest_schema(&conn).expect("create schema");
+        conn.execute_batch(
+            "ALTER TABLE sessions DROP COLUMN last_fast_mode;
+             INSERT INTO sessions (id, title, session_type, created_at, updated_at)
+             VALUES ('session-fast', 'Migrated Fast mode', 'chat', 100, 100);
+             PRAGMA user_version = 34;",
+        )
+        .expect("create v34 session schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v34 store");
+        let detail = store
+            .load_session("session-fast")
+            .expect("load migrated session");
+        assert_eq!(detail.last_fast_mode, None);
+
+        let output = dir.path().join("migrated-fast-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-fast",
+            "",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated session");
+        let raw = std::fs::read_to_string(output).expect("read migrated export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse migrated export");
+        assert_eq!(
+            yaml["sessions"][0]["metadata"]["lastFastMode"].as_str(),
+            Some("empty")
+        );
+
+        store
+            .set_session_execution_state("session-fast", "openai/gpt-5.6-sol", Some("xhigh"), false)
+            .expect("persist session execution state");
+        let detail = store
+            .load_session("session-fast")
+            .expect("reload session execution state");
+        assert_eq!(detail.last_model_id.as_deref(), Some("openai/gpt-5.6-sol"));
+        assert_eq!(detail.last_effort.as_deref(), Some("xhigh"));
+        assert_eq!(detail.last_fast_mode, Some(false));
+
+        store
+            .set_session_last_fast_mode("session-fast", true)
+            .expect("update session Fast mode");
+        assert_eq!(
+            store
+                .load_session("session-fast")
+                .expect("reload session Fast mode")
+                .last_fast_mode,
+            Some(true)
+        );
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        assert!(SessionStore::table_has_column(&conn, "sessions", "last_fast_mode").unwrap());
     }
 
     #[test]

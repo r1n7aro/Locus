@@ -36,6 +36,8 @@ export interface ChatParams {
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
+  subagentEfforts?: Record<string, string> | null;
+  subagentFastModes?: Record<string, boolean> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
   knowledgeDocType?: KnowledgeDocumentType | null;
   knowledgeDocPath?: string | null;
@@ -73,6 +75,10 @@ export function chat(params: ChatParams): Promise<ChatLaunchResult> {
 
 export function queueChatInput(params: QueueChatInputParams): Promise<PendingSessionInput> {
   return ipcInvoke<PendingSessionInput>("queue_chat_input", { ...params });
+}
+
+export function queueSessionCompact(sessionId: string, runId: string): Promise<boolean> {
+  return ipcInvoke<boolean>("queue_session_compact", { sessionId, runId });
 }
 
 export function insertPendingChatInput(
@@ -159,6 +165,20 @@ export function saveActiveSessionSelection(sessionId: string | null): Promise<vo
 
 export function loadSession(sessionId: string): Promise<SessionDetail> {
   return ipcInvoke<SessionDetail>("load_session", { sessionId });
+}
+
+export function saveSessionExecutionState(
+  sessionId: string,
+  modelId: string,
+  effort: string | null,
+  fastMode: boolean,
+): Promise<void> {
+  return ipcInvoke("save_session_execution_state", {
+    sessionId,
+    modelId,
+    effort,
+    fastMode,
+  });
 }
 
 export function loadSessionView(

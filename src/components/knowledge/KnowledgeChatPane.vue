@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { t } from "../../i18n";
 import type { KnowledgeDocument } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
@@ -64,6 +64,7 @@ const {
   sendComposerPayload,
   insertQueuedFollowUp,
   deleteQueuedFollowUp,
+  reEditQueuedFollowUp,
   cancel,
   answerQuestion,
   answerToolConfirm,
@@ -94,6 +95,15 @@ const {
   },
 });
 
+const embeddedChatPaneRef = ref<InstanceType<typeof EmbeddedChatPane> | null>(null);
+
+async function handleReEditQueuedFollowUp() {
+  const draft = await reEditQueuedFollowUp();
+  if (!draft) return;
+  await nextTick();
+  await embeddedChatPaneRef.value?.applyDraftPrefill(draft);
+}
+
 function handleSelectAgent(agentId: string) {
   manualKnowledgeAgentId.value = agentId;
   const agent = agentStore.agents.find((item) => item.id === agentId);
@@ -106,6 +116,7 @@ function handleSelectAgent(agentId: string) {
 
 <template>
   <EmbeddedChatPane
+    ref="embeddedChatPaneRef"
     :messages="messages"
     :streaming-text="streamingText"
     :streaming-text-order="streamingTextOrder"
@@ -144,6 +155,7 @@ function handleSelectAgent(agentId: string) {
     @update:input-value="inputText = $event"
     @send="sendComposerPayload"
     @insert-queued-follow-up="insertQueuedFollowUp"
+    @re-edit-queued-follow-up="handleReEditQueuedFollowUp"
     @delete-queued-follow-up="deleteQueuedFollowUp"
     @cancel="cancel"
     @clear="resetSession"

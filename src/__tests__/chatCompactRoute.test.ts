@@ -25,7 +25,7 @@ describe("chat compact route", () => {
   it("starts compact as a dedicated session run without adding a pending user message", () => {
     const chatStore = read("src/stores/chat.ts");
 
-    const compactStart = chatStore.indexOf("async function compactSession()");
+    const compactStart = chatStore.indexOf("async function compactSession(");
     const sendStart = chatStore.indexOf("async function sendMessage(");
     const cancelStart = chatStore.indexOf("async function cancelSession(");
     const compactBody = chatStore.slice(compactStart, cancelStart);
@@ -34,6 +34,26 @@ describe("chat compact route", () => {
     expect(compactBody).toContain('mode: "compact"');
     expect(compactBody).toContain('text: ""');
     expect(compactBody).not.toContain("messages.value.push");
+  });
+
+  it("queues compact during an active run and executes it before queued follow-up input", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+    const chatStore = read("src/stores/chat.ts");
+    const sessionService = read("src/services/session.ts");
+    const sessionCommands = read("src-tauri/src/commands/session.rs");
+    const pendingInputs = read("src-tauri/src/session/pending_inputs.rs");
+
+    expect(richInput).toContain("const RUNTIME_SAFE_ACTION_COMMANDS: readonly IntentCommandType[] = [");
+    expect(richInput).toContain('["compact", ...RUNTIME_SAFE_ACTION_COMMANDS]');
+    expect(read("src/components/ChatView.vue")).toContain("allow-runtime-compact");
+    expect(chatStore).toContain("sessionService.queueSessionCompact(sessionId, runId)");
+    expect(chatStore).toContain("runtime.compactQueued === true");
+    expect(sessionService).toContain('ipcInvoke<boolean>("queue_session_compact"');
+    expect(sessionCommands).toContain("queue.claim_compact(&sid_clone, &current_run_id)");
+    expect(sessionCommands).toContain('next_mode = "compact".to_string();');
+    expect(sessionCommands).toContain("queue.rebind_input_run(");
+    expect(pendingInputs).toContain("compact_requests_are_idempotent_and_claimed_once");
+    expect(pendingInputs).toContain("queued_input_can_follow_a_compact_run");
   });
 
   it("uses the backend compact path for manual compact mode", () => {

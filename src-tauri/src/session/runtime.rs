@@ -178,6 +178,7 @@ fn empty_snapshot(
         pending_question: None,
         pending_tool_confirms: Vec::new(),
         is_compacting: false,
+        compact_queued: false,
     }
 }
 

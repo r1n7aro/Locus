@@ -32,6 +32,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   queueChatInput: vi.fn(),
   renameSession: vi.fn(),
   saveActiveSessionSelection: vi.fn(),
+  saveSessionExecutionState: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
   rollbackSessionToMessage: vi.fn(),
   undoLatestConversationTurn: vi.fn(),
@@ -82,14 +83,20 @@ const modelStoreMocks = vi.hoisted(() => ({
     mainModel: "model-a",
     planModel: "",
     subagentModels: {},
+    subagentEfforts: {},
+    subagentFastModes: {},
   },
   selectedModelId: "model-a",
   effort: "none" as const,
   defaultEffort: "none" as const,
+  defaultCodexFastMode: false,
+  codexFastMode: false,
   effortSupported: false,
   codexFastModeForModel: vi.fn(() => false),
   applySessionModel: vi.fn(),
   applyContextEffort: vi.fn(),
+  applyContextCodexFastMode: vi.fn(),
+  restoreDefaultCodexFastMode: vi.fn(),
   loadLastEffort: vi.fn().mockResolvedValue(undefined),
   resolveSelectedModel: vi.fn(),
 }));
@@ -183,6 +190,8 @@ describe("chat session panel state", () => {
     vi.resetAllMocks();
 
     modelStoreMocks.selectedModelId = "model-a";
+    modelStoreMocks.codexFastMode = false;
+    modelStoreMocks.defaultCodexFastMode = false;
     modelStoreMocks.applySessionModel.mockImplementation((modelId: string | null | undefined) => {
       if (modelId && modelStoreMocks.availableModels.some((model) => model.id === modelId)) {
         modelStoreMocks.selectedModelId = modelId;
@@ -190,6 +199,12 @@ describe("chat session panel state", () => {
     });
     modelStoreMocks.applyContextEffort.mockImplementation((effort: typeof modelStoreMocks.effort) => {
       modelStoreMocks.effort = effort;
+    });
+    modelStoreMocks.applyContextCodexFastMode.mockImplementation((enabled: boolean) => {
+      modelStoreMocks.codexFastMode = enabled;
+    });
+    modelStoreMocks.restoreDefaultCodexFastMode.mockImplementation(() => {
+      modelStoreMocks.codexFastMode = modelStoreMocks.defaultCodexFastMode;
     });
     modelStoreMocks.resolveSelectedModel.mockImplementation(() => {
       modelStoreMocks.selectedModelId = modelStoreMocks.modelDefaults.mainModel;
@@ -685,6 +700,29 @@ describe("chat session panel state", () => {
 
     expect(modelStoreMocks.applyContextEffort).toHaveBeenCalledWith("xhigh");
     expect(chatStore.sessionEffort).toBe("xhigh");
+  });
+
+  it("restores the last Fast mode for an existing session", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1",
+      title: "Session s1",
+      messages: [],
+      agentId: null,
+      lastModelId: "model-b",
+      lastEffort: "xhigh",
+      lastFastMode: true,
+      sessionType: "chat",
+      parentSessionId: null,
+      latestCompletedRunId: null,
+      createdAt: 0,
+      updatedAt: 0,
+    });
+
+    await chatStore.selectSession("s1");
+
+    expect(modelStoreMocks.applyContextCodexFastMode).toHaveBeenCalledWith(true);
+    expect(chatStore.sessionFastMode).toBe(true);
   });
 
   it("restores the persisted active session after refreshing sessions", async () => {
@@ -2491,6 +2529,43 @@ describe("chat session panel state", () => {
     expect(chatStore.activeQueuedFollowUp).toBeNull();
   });
 
+  it("inserts messages into an active subagent and cancels that child session", async () => {
+    const chatStore = useChatStore();
+    chatStore.sessions = [
+      {
+        id: "root-1",
+        title: "Parent",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+      {
+        id: "child-1",
+        title: "sub:inspect",
+        agentId: "explorer",
+        sessionType: "chat",
+        parentSessionId: "root-1",
+        updatedAt: 2,
+      },
+    ];
+    chatStore.activeSessionId = "child-1";
+    chatStore.currentRunId = "child-run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage("check this edge case");
+    await chatStore.cancelChat();
+
+    expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "child-1",
+        runId: "child-run-1",
+        delivery: "immediate",
+      }),
+    );
+    expect(sessionServiceMocks.cancelChat).toHaveBeenCalledWith("child-1");
+  });
+
   it("deletes a queued follow-up while a run is active", async () => {
     const chatStore = useChatStore();
 
@@ -2510,6 +2585,80 @@ describe("chat session panel state", () => {
       "pending-1",
     );
     expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("withdraws a queued follow-up and restores its full draft for editing", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    const queuedText = [
+      "adjust the prefab",
+      "",
+      "<locus-local-files>",
+      "These are local paths supplied by drag and drop.",
+      "- file: `E:/cache/prefab-notes.txt`; type: txt",
+      "</locus-local-files>",
+    ].join("\n");
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage(
+      queuedText,
+      [{ data: "image-data", mimeType: "image/png" }],
+      [{ kind: "asset", path: "Assets/Queued.prefab" }],
+      {
+        displayText: "adjust the prefab\n\nprefab-notes.txt",
+        mode: "plan",
+        userIntent: {
+          kind: "user_intent_v1",
+          mode: "plan",
+          skills: [{ source: "app", dirName: "view", name: "View" }],
+        },
+      },
+    );
+
+    const restored = await chatStore.reEditActiveQueuedFollowUp();
+
+    expect(restored).toBe(true);
+    expect(sessionServiceMocks.deletePendingChatInput).toHaveBeenCalledWith(
+      "s1",
+      "run-1",
+      "pending-1",
+    );
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.draft).toMatchObject({
+      text: "adjust the prefab",
+      images: [{ data: "image-data", mimeType: "image/png" }],
+      assetRefs: [{ kind: "asset", path: "Assets/Queued.prefab" }],
+      localFiles: [{
+        path: "E:/cache/prefab-notes.txt",
+        isDir: false,
+        typeLabel: "txt",
+      }],
+      intent: {
+        mode: "plan",
+        skills: [{ source: "app", dirName: "view", name: "View" }],
+      },
+    });
+  });
+
+  it("does not restore a queued follow-up that was already accepted", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.deletePendingChatInput.mockResolvedValueOnce(false);
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    await chatStore.sendMessage("accepted while withdrawing");
+
+    const restored = await chatStore.reEditActiveQueuedFollowUp();
+
+    expect(restored).toBe(false);
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+    expect(uiStore.pendingChatPrefill).toBeNull();
   });
 
   it("deletes an inserted follow-up before it is accepted", async () => {
@@ -3001,6 +3150,98 @@ describe("chat session panel state", () => {
       "Root session",
     );
     expect(chatStore.activeSessionId).toBe("s-copy");
+  });
+
+  it("forks from a historical message while the source session is streaming", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Root session",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-current";
+    chatStore.isStreaming = true;
+    chatStore.messages = [
+      {
+        id: "assistant-history",
+        role: "assistant",
+        content: "Earlier response",
+        createdAt: 1,
+        renderParts: [
+          {
+            kind: "text",
+            id: "assistant-history:text",
+            order: { runId: "run-previous", seq: 1 },
+            content: "Earlier response",
+          },
+        ],
+      },
+    ] as any;
+    sessionServiceMocks.forkSessionFromMessage.mockResolvedValueOnce("s-copy");
+    sessionServiceMocks.listSessions.mockResolvedValueOnce([
+      {
+        id: "s-copy",
+        title: "Root session copy",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 2,
+      },
+    ]);
+
+    await chatStore.forkSessionFromMessage("assistant-history");
+
+    expect(sessionServiceMocks.forkSessionFromMessage).toHaveBeenCalledWith(
+      "s1",
+      "assistant-history",
+      "Root session",
+    );
+    expect(chatStore.activeSessionId).toBe("s-copy");
+  });
+
+  it("blocks forks from an assistant message that belongs to the active stream", async () => {
+    const chatStore = useChatStore();
+
+    chatStore.sessions = [
+      {
+        id: "s1",
+        title: "Root session",
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        updatedAt: 1,
+      },
+    ] as any;
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-current";
+    chatStore.isStreaming = true;
+    chatStore.messages = [
+      {
+        id: "assistant-current",
+        role: "assistant",
+        content: "Partial response",
+        createdAt: 2,
+        renderParts: [
+          {
+            kind: "text",
+            id: "assistant-current:text",
+            order: { runId: "run-current", seq: 1 },
+            content: "Partial response",
+          },
+        ],
+      },
+    ] as any;
+
+    await chatStore.forkSessionFromMessage("assistant-current");
+
+    expect(sessionServiceMocks.forkSessionFromMessage).not.toHaveBeenCalled();
   });
 
   it("blocks child session forks before calling the backend", async () => {

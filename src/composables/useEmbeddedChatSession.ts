@@ -18,6 +18,8 @@ import { StreamingTextChunks } from "./streamingTextChunks";
 import { useThrottledStreamingText } from "./streamingRenderThrottle";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import { useChatInputSettings } from "./useChatInputSettings";
+import { buildPendingSessionInputDraft } from "./chatMessageDraft";
+import { useModelStore } from "../stores/model";
 import {
   buildToolResultMessages,
   mergeUserMessage,
@@ -696,6 +698,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
 }
 
 export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
+  const modelStore = useModelStore();
   const statesByKey = new Map<string, EmbeddedChatState>();
   const sessionIdToKey = new Map<string, string>();
   const activeState = shallowRef<EmbeddedChatState>(createState(toValue(options.sessionKey)));
@@ -1027,6 +1030,15 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         sessionType: options.sessionType ?? "chat",
         mode: request.mode ?? null,
         userIntent,
+        subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0
+          ? modelStore.modelDefaults.subagentModels
+          : null,
+        subagentEfforts: Object.keys(modelStore.modelDefaults.subagentEfforts).length > 0
+          ? modelStore.modelDefaults.subagentEfforts
+          : null,
+        subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0
+          ? modelStore.modelDefaults.subagentFastModes
+          : null,
         knowledgeDocType: knowledgeFocus?.docType ?? null,
         knowledgeDocPath: knowledgeFocus?.path ?? null,
       });
@@ -1100,7 +1112,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     if (!state.sessionId || targets.length === 0) return false;
 
     try {
-      await Promise.all(
+      const deleteResults = await Promise.all(
         targets.map((input) =>
           sessionService.deletePendingChatInput(
             input.sessionId,
@@ -1108,6 +1120,10 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
             input.id,
           )),
       );
+      const allWithdrawn = targets.every((input, index) => (
+        deleteResults[index] === true
+        || input.mergeGroupId === state.localFallbackMergeGroupId
+      ));
       const targetIds = new Set(targets.map((input) => input.id));
       state.pendingInputs = state.pendingInputs.filter((input) => !targetIds.has(input.id));
       for (const input of targets) {
@@ -1118,11 +1134,24 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
           state.localFallbackMergeGroupId = null;
         }
       }
-      return true;
+      return allWithdrawn;
     } catch (error) {
       state.error = normalizeAppError(error).message;
       return false;
     }
+  }
+
+  async function reEditQueuedFollowUp() {
+    const state = activeState.value;
+    const targets = visiblePendingInputs(state.pendingInputs);
+    if (!state.sessionId || targets.length === 0) return null;
+
+    const draft = buildPendingSessionInputDraft(targets);
+    const deleted = await deleteQueuedFollowUp();
+    if (!deleted) return null;
+
+    state.inputText = draft.text;
+    return draft;
   }
 
   async function cancel() {
@@ -1292,6 +1321,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sendComposerPayload,
     insertQueuedFollowUp,
     deleteQueuedFollowUp,
+    reEditQueuedFollowUp,
     cancel,
     resetSession,
     answerQuestion,

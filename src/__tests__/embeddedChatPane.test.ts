@@ -51,11 +51,14 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
     expect(embeddedSession).toContain("sessionService.queueChatInput");
     expect(embeddedSession).toContain("sessionService.deletePendingChatInput");
+    expect(embeddedSession).toContain("async function reEditQueuedFollowUp()");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
     expect(pane).toContain('queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;');
     expect(pane).toContain('@click="emit(\'insertQueuedFollowUp\')"');
+    expect(pane).toContain('@click="emit(\'reEditQueuedFollowUp\')"');
     expect(pane).toContain('@click="emit(\'deleteQueuedFollowUp\')"');
+    expect(pane).toContain('class="embedded-queued-text ui-select-text"');
     expect(pane).toContain('class="embedded-queued-follow-up"');
     expect(pane).toContain('class="embedded-chat-pane"');
     expect(knowledgePane).toContain("<ModelEffortSelector");
@@ -67,9 +70,12 @@ describe("EmbeddedChatPane contract", () => {
     expect(knowledgePane).toContain(':tool-confirm-layout-key="sessionKey"');
     expect(knowledgePane).toContain(':queued-follow-up="queuedFollowUp"');
     expect(knowledgePane).toContain('@delete-queued-follow-up="deleteQueuedFollowUp"');
+    expect(knowledgePane).toContain('@re-edit-queued-follow-up="handleReEditQueuedFollowUp"');
     expect(knowledgePane).toContain(":waiting-label=\"t('chat.transcript.waiting')\"");
     expect(chatView).toContain("<RichChatInput");
     expect(chatView).toContain("<ChatTranscript");
+    expect(chatView).toContain('class="queued-follow-up-text ui-select-text"');
+    expect(chatView).toContain("chatStore.reEditActiveQueuedFollowUp()");
     expect(transcript).toContain("const isWaitingForResponse = computed(");
     expect(transcript).toContain("shouldShowAssistantContinuation");
   });

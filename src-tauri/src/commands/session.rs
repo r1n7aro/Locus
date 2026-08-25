@@ -243,6 +243,7 @@ fn fallback_runtime_snapshot(session_id: &str, run_id: &str) -> SessionRuntimeSn
         pending_question: None,
         pending_tool_confirms: Vec::new(),
         is_compacting: false,
+        compact_queued: false,
     }
 }
 
@@ -316,7 +317,8 @@ async fn capture_context_export_live_snapshot(
     pending_input_queue: &PendingInputQueueHandle,
     active_tasks: &ActiveTasks,
 ) -> Result<crate::session::context_export::ContextExportLiveSnapshot, AppError> {
-    let pending_inputs = {
+    let active = capture_active_session_copy_states(session_ids, active_tasks).await;
+    let (pending_inputs, compact_queued_sessions) = {
         let queue = pending_input_queue.lock().map_err(|error| {
             AppError::new(
                 "session.export_runtime_lock_failed",
@@ -325,18 +327,26 @@ async fn capture_context_export_live_snapshot(
             .detail(error.to_string())
             .operation("exportSessionContext")
         })?;
-        session_ids
+        let pending_inputs = session_ids
             .iter()
             .map(|session_id| (session_id.clone(), queue.list_session(session_id)))
-            .collect::<HashMap<_, _>>()
+            .collect::<HashMap<_, _>>();
+        let compact_queued_sessions = active
+            .iter()
+            .filter(|(session_id, state)| queue.has_compact(session_id, &state.run_id))
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<HashSet<_>>();
+        (pending_inputs, compact_queued_sessions)
     };
-    let active = capture_active_session_copy_states(session_ids, active_tasks).await;
     let sessions = session_ids
         .iter()
         .map(|session_id| {
-            let runtime = active
-                .get(session_id)
-                .map(|active| runtime_snapshot_with_partial_assistant(store, session_id, active));
+            let runtime = active.get(session_id).map(|active| {
+                let mut runtime =
+                    runtime_snapshot_with_partial_assistant(store, session_id, active);
+                runtime.compact_queued = compact_queued_sessions.contains(session_id);
+                runtime
+            });
             (
                 session_id.clone(),
                 crate::session::context_export::ContextExportLiveSession {
@@ -379,7 +389,7 @@ fn knowledge_title_from_path(path: &str) -> String {
 
 fn knowledge_default_inject_mode(doc_type: KnowledgeType) -> KnowledgeInjectMode {
     match doc_type {
-        KnowledgeType::Design => KnowledgeInjectMode::Path,
+        KnowledgeType::Design | KnowledgeType::Plan => KnowledgeInjectMode::Path,
         KnowledgeType::Memory => KnowledgeInjectMode::Full,
         KnowledgeType::Skill | KnowledgeType::Reference => KnowledgeInjectMode::None,
     }
@@ -1060,6 +1070,8 @@ pub async fn chat(
     mode: Option<String>,
     user_intent: Option<UserIntentPayload>,
     subagent_models: Option<HashMap<String, String>>,
+    subagent_efforts: Option<HashMap<String, String>>,
+    subagent_fast_modes: Option<HashMap<String, bool>>,
     knowledge_mode: Option<String>,
     knowledge_doc_type: Option<crate::knowledge_store::KnowledgeType>,
     knowledge_doc_path: Option<String>,
@@ -1347,7 +1359,13 @@ pub async fn chat(
         subagent_models.unwrap_or_default(),
         cancel_rx,
     );
-    instance.set_codex_fast_mode(fast_mode.unwrap_or(false));
+    let effective_fast_mode = fast_mode.unwrap_or(false);
+    instance.set_codex_fast_mode(effective_fast_mode);
+    instance.set_session_undo_enabled(config.session_undo_enabled());
+    instance.set_subagent_runtime_overrides(
+        subagent_efforts.unwrap_or_default(),
+        subagent_fast_modes.unwrap_or_default(),
+    );
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
     let knowledge_focus = match (knowledge_doc_type, knowledge_doc_path) {
         (Some(doc_type), Some(path)) if !path.trim().is_empty() => {
@@ -1381,20 +1399,16 @@ pub async fn chat(
                 .operation("chat")
         }
     })?;
-    if let Err(error) = store.set_session_last_model_id(&sid, &selected_model) {
+    if let Err(error) = store.set_session_execution_state(
+        &sid,
+        &selected_model,
+        effort.as_deref(),
+        effective_fast_mode,
+    ) {
         let _ = store.update_run_status(&run_id, "error", Some(&error));
         return Err(AppError::new(
-            "session.model_persist_failed",
-            "Failed to save the session model.",
-        )
-        .detail(error)
-        .operation("chat"));
-    }
-    if let Err(error) = store.set_session_last_effort(&sid, effort.as_deref()) {
-        let _ = store.update_run_status(&run_id, "error", Some(&error));
-        return Err(AppError::new(
-            "session.effort_persist_failed",
-            "Failed to save the session effort.",
+            "session.execution_state_persist_failed",
+            "Failed to save the session execution state.",
         )
         .detail(error)
         .operation("chat"));
@@ -1483,22 +1497,33 @@ pub async fn chat(
             }
 
             let mut async_reminder: Option<String> = None;
+            let mut compact_requested = false;
             let follow_up = loop {
-                let claimed = {
+                let (claimed_compact, claimed) = {
                     let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                         handle.state();
-                    let claimed = match queue_state.lock() {
-                        Ok(mut queue) => queue.claim_after_run(&sid_clone, &current_run_id),
+                    let result = match queue_state.lock() {
+                        Ok(mut queue) => {
+                            if queue.claim_compact(&sid_clone, &current_run_id) {
+                                (true, None)
+                            } else {
+                                (false, queue.claim_after_run(&sid_clone, &current_run_id))
+                            }
+                        }
                         Err(error) => {
                             eprintln!(
                                 "[Locus] failed to lock pending input queue for session {} run {}: {}",
                                 sid_clone, current_run_id, error
                             );
-                            None
+                            (false, None)
                         }
                     };
-                    claimed
+                    result
                 };
+                if claimed_compact {
+                    compact_requested = true;
+                    break None;
+                }
                 if claimed.is_some() {
                     break claimed;
                 }
@@ -1520,13 +1545,19 @@ pub async fn chat(
                     _ = idle_cancel_rx.changed() => {}
                 }
             };
-            if follow_up.is_none() && async_reminder.is_none() {
+            if !compact_requested && follow_up.is_none() && async_reminder.is_none() {
                 break;
             }
 
             let next_run_id = generate_chat_run_id(&sid_clone);
             if let Err(error) = store_for_task.try_start_run(&sid_clone, &next_run_id) {
-                if let Some(follow_up) = follow_up {
+                if compact_requested {
+                    let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                        handle.state();
+                    if let Ok(mut queue) = queue_state.lock() {
+                        queue.restore_compact(&sid_clone, &current_run_id);
+                    };
+                } else if let Some(follow_up) = follow_up {
                     let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                         handle.state();
                     if let Ok(mut queue) = queue_state.lock() {
@@ -1551,7 +1582,13 @@ pub async fn chat(
                         task.run_id = next_run_id.clone();
                     }
                     _ => {
-                        if let Some(follow_up) = follow_up {
+                        if compact_requested {
+                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                                handle.state();
+                            if let Ok(mut queue) = queue_state.lock() {
+                                queue.restore_compact(&sid_clone, &current_run_id);
+                            };
+                        } else if let Some(follow_up) = follow_up {
                             let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                                 handle.state();
                             if let Ok(mut queue) = queue_state.lock() {
@@ -1579,7 +1616,43 @@ pub async fn chat(
                 }
             }
 
-            if let Some(follow_up) = follow_up {
+            if compact_requested {
+                let rebound_input = {
+                    let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                        handle.state();
+                    let result = match queue_state.lock() {
+                        Ok(mut queue) => {
+                            queue.rebind_input_run(&sid_clone, &current_run_id, &next_run_id)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[Locus] failed to rebind pending input after queued compact for session {} run {}: {}",
+                                sid_clone, current_run_id, error
+                            );
+                            None
+                        }
+                    };
+                    result
+                };
+                if let Some(input) = rebound_input {
+                    emit_session_stream_with_run_id(
+                        &handle,
+                        store_for_task.as_ref(),
+                        next_run_id.clone(),
+                        StreamEvent::PendingInputQueued {
+                            session_id: sid_clone.clone(),
+                            input,
+                        },
+                    );
+                }
+                accepted_pending_input_id = None;
+                next_text.clear();
+                next_images.clear();
+                next_asset_refs.clear();
+                next_mode = "compact".to_string();
+                next_user_intent = None;
+                next_internal_system_reminder = None;
+            } else if let Some(follow_up) = follow_up {
                 accepted_pending_input_id = Some(follow_up.id);
                 next_text = follow_up.text;
                 next_images = follow_up.images.unwrap_or_default();
@@ -1793,6 +1866,66 @@ pub async fn queue_chat_input(
 }
 
 #[tauri::command]
+pub async fn queue_session_compact(
+    session_id: String,
+    run_id: String,
+    store: State<'_, Arc<SessionStore>>,
+    pending_input_queue: State<'_, PendingInputQueueHandle>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<bool, AppError> {
+    {
+        let tasks = active_tasks.lock().await;
+        let Some(task) = tasks.get(&session_id) else {
+            return Err(AppError::new(
+                "session.pending_compact.no_active_run",
+                "Session has no active run for queued compaction.",
+            )
+            .operation("compact")
+            .retryable(true));
+        };
+        if task.run_id != run_id {
+            return Err(AppError::new(
+                "session.pending_compact.run_mismatch",
+                "Queued compaction targets a stale run.",
+            )
+            .detail(format!(
+                "expected active run {}, got {}",
+                task.run_id, run_id
+            ))
+            .operation("compact")
+            .retryable(true));
+        }
+    }
+
+    let run =
+        runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id).active_run;
+    if !matches!(
+        run.status.as_str(),
+        "queued" | "starting" | "running" | "waiting_input" | "finishing"
+    ) {
+        return Err(AppError::new(
+            "session.pending_compact.run_closed",
+            "The active run is no longer accepting queued compaction.",
+        )
+        .detail(format!("run {} status {}", run_id, run.status))
+        .operation("compact")
+        .retryable(true));
+    }
+
+    let mut queue = pending_input_queue.lock().map_err(|error| {
+        AppError::new(
+            "session.pending_compact.lock_failed",
+            "Pending compaction queue is unavailable.",
+        )
+        .detail(error.to_string())
+        .operation("compact")
+        .retryable(true)
+    })?;
+    queue.queue_compact(&session_id, &run_id);
+    Ok(true)
+}
+
+#[tauri::command]
 pub async fn insert_pending_chat_input(
     session_id: String,
     run_id: String,
@@ -1915,6 +2048,26 @@ pub async fn delete_pending_chat_input(
 }
 
 #[tauri::command]
+pub async fn save_session_execution_state(
+    session_id: String,
+    model_id: String,
+    effort: Option<String>,
+    fast_mode: bool,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<(), AppError> {
+    store
+        .set_session_execution_state(&session_id, &model_id, effort.as_deref(), fast_mode)
+        .map_err(|error| {
+            AppError::new(
+                "session.execution_state_persist_failed",
+                "Failed to save the session execution state.",
+            )
+            .detail(error)
+            .operation("saveSessionExecutionState")
+        })
+}
+
+#[tauri::command]
 pub async fn load_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
@@ -1944,11 +2097,20 @@ pub async fn load_session(
         })?
         .list_session(&session_id);
     if let Some(run_id) = active_task_run_id(active_tasks.inner(), &session_id).await {
-        detail.runtime = Some(runtime_snapshot_for_active_task(
-            store.inner().as_ref(),
-            &session_id,
-            &run_id,
-        ));
+        let mut runtime =
+            runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id);
+        runtime.compact_queued = pending_input_queue
+            .lock()
+            .map_err(|error| {
+                AppError::new(
+                    "session.pending_compact.lock_failed",
+                    "Pending compaction queue is unavailable.",
+                )
+                .detail(error.to_string())
+                .operation("loadSession")
+            })?
+            .has_compact(&session_id, &run_id);
+        detail.runtime = Some(runtime);
     } else {
         store.clear_runtime_session(&session_id);
     }
@@ -1992,11 +2154,20 @@ pub async fn load_session_view(
         })?
         .list_session(&session_id);
     if let Some(run_id) = active_task_run_id(active_tasks.inner(), &session_id).await {
-        snapshot.session.runtime = Some(runtime_snapshot_for_active_task(
-            store.inner().as_ref(),
-            &session_id,
-            &run_id,
-        ));
+        let mut runtime =
+            runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id);
+        runtime.compact_queued = pending_input_queue
+            .lock()
+            .map_err(|error| {
+                AppError::new(
+                    "session.pending_compact.lock_failed",
+                    "Pending compaction queue is unavailable.",
+                )
+                .detail(error.to_string())
+                .operation("loadSessionView")
+            })?
+            .has_compact(&session_id, &run_id);
+        snapshot.session.runtime = Some(runtime);
     } else {
         store.clear_runtime_session(&session_id);
     }

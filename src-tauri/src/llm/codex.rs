@@ -200,12 +200,13 @@ impl CodexStreamOptions {
     }
 
     /// Codex main's stable remote-compaction path: send the current prompt to
-    /// `/responses` with a terminal `compaction_trigger` request item and
-    /// expect exactly one encrypted compaction output item.
+    /// `/responses` with a terminal `compaction_trigger` request item, retaining
+    /// the session cache key and WebSocket continuation state used by normal
+    /// requests, and expect exactly one encrypted compaction output item.
     pub fn remote_compaction_v2() -> Self {
         Self {
             include_web_search: true,
-            use_session_continuation: false,
+            use_session_continuation: true,
             fast_mode: false,
             remote_compaction_v2: true,
             structured_output: None,
@@ -284,6 +285,16 @@ pub async fn reset_cached_session_window(session_id: &str) {
     };
     let mut state = shared.lock().await;
     state.connection = None;
+    state.last_response = None;
+}
+
+/// Clears the cached continuation baseline while preserving the reusable
+/// WebSocket connection and its session-scoped fallback state.
+async fn clear_cached_previous_response(session_id: &str) {
+    let Some(shared) = existing_cached_websocket_session(session_id) else {
+        return;
+    };
+    let mut state = shared.lock().await;
     state.last_response = None;
 }
 
@@ -1354,18 +1365,28 @@ pub async fn compact_conversation_history_v2(
     .await
     .map_err(|error| CodexRemoteCompactError::new(error, "", ""))?;
 
-    let compaction_item =
-        validate_remote_compaction_v2_output(&response.response_items, response.response_completed)
-            .map_err(|error| {
-                CodexRemoteCompactError::new(
-                    error,
-                    response.raw_request.clone(),
-                    response.raw_response.clone(),
-                )
-            })?;
+    let compaction_item = match validate_remote_compaction_v2_output(
+        &response.response_items,
+        response.response_completed,
+    ) {
+        Ok(compaction_item) => compaction_item,
+        Err(error) => {
+            if let Some(session_id) = session_id {
+                clear_cached_previous_response(session_id).await;
+            }
+            return Err(CodexRemoteCompactError::new(
+                error,
+                response.raw_request,
+                response.raw_response,
+            ));
+        }
+    };
     let output =
         retained_remote_compaction_v2_window(history, response_request_metadata, compaction_item);
     let encrypted_content = extract_compaction_encrypted_content(&output);
+    if let Some(session_id) = session_id {
+        clear_cached_previous_response(session_id).await;
+    }
     Ok(CodexRemoteCompactOutcome {
         output,
         encrypted_content,
@@ -3770,7 +3791,8 @@ mod tests {
         build_codex_websocket_handshake_request, build_compact_request_body,
         build_history_transport_request, build_input, build_input_with_metadata,
         build_request_body, build_request_body_with_tool_search, build_websocket_transport_request,
-        cached_websocket_http_fallback_enabled, codex_responses_endpoint, codex_routing_hint,
+        cached_websocket_http_fallback_enabled, cached_websocket_session,
+        clear_cached_previous_response, codex_responses_endpoint, codex_routing_hint,
         codex_websocket_url, collect_complete_tool_calls, drain_sse_buffer,
         enable_cached_websocket_http_fallback, extract_compaction_encrypted_content,
         parse_compact_response, process_sse_event_block, request_without_input,
@@ -4792,6 +4814,7 @@ mod tests {
 
     #[test]
     fn remote_compaction_v2_uses_responses_with_terminal_trigger() {
+        let options = CodexStreamOptions::remote_compaction_v2();
         let body = build_request_body(
             "gpt-5.6-sol",
             "You are Codex",
@@ -4800,10 +4823,11 @@ mod tests {
             Some("high"),
             Some("session-1"),
             None,
-            CodexStreamOptions::remote_compaction_v2(),
+            options.clone(),
         );
         let input = body["input"].as_array().expect("responses input array");
 
+        assert!(options.use_session_continuation);
         assert_eq!(
             codex_responses_endpoint(None),
             "https://chatgpt.com/backend-api/codex/responses"
@@ -4813,6 +4837,7 @@ mod tests {
             Some("compaction_trigger")
         );
         assert_eq!(body["stream"].as_bool(), Some(true));
+        assert_eq!(body["prompt_cache_key"].as_str(), Some("session-1"));
         assert!(body.get("previous_response_id").is_none());
     }
 
@@ -5336,6 +5361,32 @@ mod tests {
         super::invalidate_cached_session(&session_id);
     }
 
+    #[tokio::test]
+    async fn clearing_cached_previous_response_preserves_transport_state() {
+        let session_id = format!("continuation-test-{}", uuid::Uuid::new_v4());
+        let shared = cached_websocket_session(&session_id);
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "prompt_cache_key": session_id.clone(),
+        });
+        {
+            let mut state = shared.lock().await;
+            state.last_response = Some(websocket_last_response(&body, "resp_prev", &[]));
+            state.disable_websockets = true;
+            state.connection_key = Some("connection-key".to_string());
+        }
+
+        clear_cached_previous_response(&session_id).await;
+
+        let state = shared.lock().await;
+        assert!(state.last_response.is_none());
+        assert!(state.disable_websockets);
+        assert_eq!(state.connection_key.as_deref(), Some("connection-key"));
+        drop(state);
+        super::invalidate_cached_session(&session_id);
+    }
+
     #[test]
     fn history_transport_request_uses_previous_response_id_when_request_signature_matches() {
         let body = serde_json::json!({
@@ -5577,6 +5628,63 @@ mod tests {
                 .and_then(|value| value.as_array())
                 .map(|items| items.len()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn remote_compaction_v2_reuses_cached_websocket_response() {
+        let user = user_message_with_images("compact this context", vec![]);
+        let previous_body = build_request_body(
+            "gpt-5.6-sol",
+            "You are Codex",
+            std::slice::from_ref(&user),
+            &[],
+            Some("high"),
+            Some("session-1"),
+            None,
+            CodexStreamOptions::default(),
+        );
+        let assistant_response_item = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "assistant output",
+                "annotations": [],
+                "logprobs": [],
+            }],
+        });
+        let compact_body = build_request_body(
+            "gpt-5.6-sol",
+            "You are Codex",
+            &[
+                user,
+                assistant_message("assistant-1", "assistant output", Some("resp_prev")),
+            ],
+            &[],
+            Some("high"),
+            Some("session-1"),
+            None,
+            CodexStreamOptions::remote_compaction_v2(),
+        );
+
+        let request = build_websocket_transport_request(
+            &compact_body,
+            Some(&websocket_last_response(
+                &previous_body,
+                "resp_prev",
+                std::slice::from_ref(&assistant_response_item),
+            )),
+            /*include_type_field*/ true,
+        );
+
+        assert_eq!(request["prompt_cache_key"].as_str(), Some("session-1"));
+        assert_eq!(request["previous_response_id"].as_str(), Some("resp_prev"));
+        assert_eq!(
+            request["input"],
+            serde_json::json!([{ "type": "compaction_trigger" }])
         );
     }
 

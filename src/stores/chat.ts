@@ -29,7 +29,11 @@ import {
   applyAsyncTaskUpdateToMessages,
   asyncTaskDisplayStatus,
 } from "../composables/asyncTaskUpdates";
-import { buildUserMessageDraft } from "../composables/chatMessageDraft";
+import {
+  buildPendingSessionInputDraft,
+  buildUserMessageDraft,
+} from "../composables/chatMessageDraft";
+import { isMessageFromActiveStream } from "../composables/chatMessageFork";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
@@ -374,6 +378,7 @@ export const useChatStore = defineStore("chat", () => {
   const liveRenderParts = ref<AssistantRenderPart[]>([]);
   const isStreaming = ref(false);
   const isCompacting = ref(false);
+  const compactQueuedRuns = ref(new Map<string, string>());
   const currentRunId = ref<string | null>(null);
   const isThinking = ref(false);
   const thinkingStartTime = ref(0);
@@ -407,6 +412,7 @@ export const useChatStore = defineStore("chat", () => {
   const sessionUserMessageIds = ref<string[]>([]);
   const sessionAgentId = ref<string | null>(null);
   const sessionEffort = ref<EffortLevel | null>(null);
+  const sessionFastMode = ref<boolean | null>(null);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
   const sessionAgentLocked = computed(() => !!activeSessionId.value && !!sessionAgentId.value);
   const canResumeInterrupted = computed(() => {
@@ -473,6 +479,20 @@ export const useChatStore = defineStore("chat", () => {
       assetRefCount: inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
     };
   });
+  const isCompactQueued = computed(() => {
+    const sessionId = activeSessionId.value;
+    return !!sessionId && compactQueuedRuns.value.has(sessionId);
+  });
+
+  function setCompactQueued(sessionId: string, runId: string | null) {
+    const next = new Map(compactQueuedRuns.value);
+    if (runId) {
+      next.set(sessionId, runId);
+    } else {
+      next.delete(sessionId);
+    }
+    compactQueuedRuns.value = next;
+  }
 
   // Sticky Claude Code-style plan mode per session. The backend session
   // store is the source of truth; this map mirrors it for badges and is
@@ -522,6 +542,7 @@ export const useChatStore = defineStore("chat", () => {
   // A cancel clicked while the chat launch is still in flight (no run id yet)
   // is remembered here and re-fired once the run is registered.
   const pendingLaunchCancelRequested = ref(false);
+  const pendingLaunchCompactRequested = ref(false);
   const isCancelling = computed(() => {
     if (pendingLaunchCancelRequested.value) return true;
     if (!activeSessionId.value || !currentRunId.value) return false;
@@ -645,12 +666,15 @@ export const useChatStore = defineStore("chat", () => {
     sessionId: string,
     modelId: string,
     effort: EffortLevel,
+    fastMode: boolean,
   ) {
     if (!sessionId || activeSessionId.value !== sessionId) return;
     const modelStore = useModelStore();
     modelStore.applySessionModel(modelId);
     modelStore.applyContextEffort(effort);
+    modelStore.applyContextCodexFastMode(fastMode);
     sessionEffort.value = effort;
+    sessionFastMode.value = fastMode;
   }
 
   async function restoreActiveSessionSelection(nextSessions: SessionSummary[]) {
@@ -724,7 +748,9 @@ export const useChatStore = defineStore("chat", () => {
     const modelStore = useModelStore();
     modelStore.applySessionModel(detail.lastModelId);
     sessionEffort.value = detail.lastEffort ?? modelStore.defaultEffort;
+    sessionFastMode.value = detail.lastFastMode ?? modelStore.defaultCodexFastMode;
     modelStore.applyContextEffort(sessionEffort.value);
+    modelStore.applyContextCodexFastMode(sessionFastMode.value);
     if (detail.agentId) {
       useAgentStore().selectAgent(detail.agentId);
     } else {
@@ -779,6 +805,7 @@ export const useChatStore = defineStore("chat", () => {
   function applySessionRuntimeSnapshot(detail: SessionDetail) {
     const runtime = detail.runtime;
     if (!runtime || !isActiveRunStatus(runtime.activeRun.status)) {
+      setCompactQueued(detail.id, null);
       const previousRunId = sessionRunIds.value.get(detail.id);
       clearTrackedRun(detail.id, previousRunId);
       if (activeSessionId.value === detail.id) {
@@ -845,6 +872,10 @@ export const useChatStore = defineStore("chat", () => {
       : null;
     pendingToolConfirms.value = cloneRuntimeJson(runtime.pendingToolConfirms ?? []);
     isCompacting.value = runtime.isCompacting === true;
+    setCompactQueued(
+      detail.id,
+      runtime.compactQueued === true ? runtime.activeRun.runId : null,
+    );
   }
 
   function clearDeferredUserMessagesForSession(sessionId: string) {
@@ -870,6 +901,21 @@ export const useChatStore = defineStore("chat", () => {
     if (acceptedPendingInputIds.has(input.id)) return;
     const next = new Map(pendingInputsBySession.value);
     const list = visiblePendingInputs(next.get(input.sessionId));
+    const previous = list.find((item) => item.id === input.id);
+    if (previous && previous.runId !== input.runId) {
+      const previousKey = pendingInputMergeKey(
+        previous.sessionId,
+        previous.runId,
+        previous.mergeGroupId,
+      );
+      const nextKey = pendingInputMergeKey(input.sessionId, input.runId, input.mergeGroupId);
+      if (localPendingInputGroups.delete(previousKey)) {
+        localPendingInputGroups.add(nextKey);
+      }
+      if (localFallbackPendingInputGroups.delete(previousKey)) {
+        localFallbackPendingInputGroups.add(nextKey);
+      }
+    }
     const merged = visiblePendingInputs(mergePendingInputList(list, input));
     if (merged.length === 0) {
       next.delete(input.sessionId);
@@ -1808,6 +1854,7 @@ export const useChatStore = defineStore("chat", () => {
     ];
 
     if (event.type === "runStart") {
+      const compactSourceRunId = compactQueuedRuns.value.get(event.sessionId) ?? null;
       const closedRunId = closedRunIds.get(event.sessionId);
       if (closedRunId && closedRunId === event.runId) {
         logChatStreamDebug("ignoring runStart for already-closed run", {
@@ -1830,6 +1877,21 @@ export const useChatStore = defineStore("chat", () => {
 
       closedRunIds.delete(event.sessionId);
       cancelRequestedRunIds.delete(event.sessionId);
+      if (compactSourceRunId && compactSourceRunId !== event.runId) {
+        const fallbackInputs = visiblePendingInputs(pendingInputsBySession.value.get(event.sessionId))
+          .filter((input) => input.runId === compactSourceRunId)
+          .filter((input) => localFallbackPendingInputGroups.has(
+            pendingInputMergeKey(input.sessionId, input.runId, input.mergeGroupId),
+          ));
+        for (const input of fallbackInputs) {
+          upsertPendingInput({
+            ...input,
+            runId: event.runId,
+            updatedAt: Date.now() / 1000,
+          });
+        }
+        setCompactQueued(event.sessionId, event.runId);
+      }
       setSessionResumeAvailable(event.sessionId, false);
       streamingSessionIds.value.add(event.sessionId);
       sessionRunIds.value.set(event.sessionId, event.runId);
@@ -1981,6 +2043,9 @@ export const useChatStore = defineStore("chat", () => {
       if (event.sessionId === activeSessionId.value) {
         currentRunId.value = null;
       }
+      if (event.type === "error" || event.type === "cancelled") {
+        setCompactQueued(event.sessionId, null);
+      }
       logChatStreamDebug("processed terminal stream event", {
         sessionId: event.sessionId,
         runId: event.runId,
@@ -2063,6 +2128,9 @@ export const useChatStore = defineStore("chat", () => {
         code: "reactive_compact",
         operation: "chat",
       });
+    }
+    if (event.type === "compactStart") {
+      setCompactQueued(event.sessionId, null);
     }
 
     // Build current state snapshot for reducer
@@ -2159,7 +2227,7 @@ export const useChatStore = defineStore("chat", () => {
         event.runId,
         event.type === "cancelled",
       );
-      if (queued.length > 0) {
+      if (queued.length > 0 && !compactQueuedRuns.value.has(event.sessionId)) {
         clearRunPendingInputs(event.sessionId, event.runId);
         const next = queued[0]!;
         globalThis.setTimeout(() => {
@@ -2313,12 +2381,15 @@ export const useChatStore = defineStore("chat", () => {
     undoableMessageIds.value = new Set();
     sessionAgentId.value = null;
     sessionEffort.value = null;
+    sessionFastMode.value = null;
     sessionHistoryHasMore.value = false;
     sessionHistoryOldestRowId.value = null;
     sessionHistoryLoading.value = false;
     sessionUserMessageIds.value = [];
     useAgentStore().resetToDefault();
-    useModelStore().resolveSelectedModel(true);
+    const modelStore = useModelStore();
+    modelStore.resolveSelectedModel(true);
+    modelStore.restoreDefaultCodexFastMode();
 
     // Clear chat changes for the old session
     useChatChangesStore().clear(oldSessionId);
@@ -2368,8 +2439,11 @@ export const useChatStore = defineStore("chat", () => {
     thinkingPanelContent.value = "";
     sessionAgentId.value = null;
     sessionEffort.value = null;
+    sessionFastMode.value = null;
     useAgentStore().resetToDefault();
-    useModelStore().resolveSelectedModel(true);
+    const modelStore = useModelStore();
+    modelStore.resolveSelectedModel(true);
+    modelStore.restoreDefaultCodexFastMode();
     const chatChangesStore = useChatChangesStore();
     chatChangesStore.clear(oldSessionId);
     chatChangesStore.closeInlineDiff();
@@ -2460,7 +2534,12 @@ export const useChatStore = defineStore("chat", () => {
     const runId = currentRunId.value;
     if (!sessionId || !runId) return false;
     const { state: chatInputSettings } = useChatInputSettings();
-    const delivery = chatInputSettings.runningSendMode === "insert" ? "immediate" : "after_run";
+    const activeSessionIsSubagent = !!sessions.value.find(
+      (session) => session.id === sessionId && !!session.parentSessionId,
+    );
+    const delivery = activeSessionIsSubagent || chatInputSettings.runningSendMode === "insert"
+      ? "immediate"
+      : "after_run";
 
     let mergeGroupId = localPendingGroupForRun(sessionId, runId);
     if (!mergeGroupId) {
@@ -2602,7 +2681,7 @@ export const useChatStore = defineStore("chat", () => {
     if (!sessionId || targets.length === 0) return false;
 
     try {
-      await Promise.all(
+      const deleteResults = await Promise.all(
         targets.map((input) =>
           sessionService.deletePendingChatInput(
             input.sessionId,
@@ -2610,10 +2689,16 @@ export const useChatStore = defineStore("chat", () => {
             input.id,
           )),
       );
+      const allWithdrawn = targets.every((input, index) => (
+        deleteResults[index] === true
+        || localFallbackPendingInputGroups.has(
+          pendingInputMergeKey(input.sessionId, input.runId, input.mergeGroupId),
+        )
+      ));
       for (const input of targets) {
         markPendingInputDeleted(input.sessionId, input.id);
       }
-      return true;
+      return allWithdrawn;
     } catch (e) {
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
@@ -2623,6 +2708,19 @@ export const useChatStore = defineStore("chat", () => {
       });
       return false;
     }
+  }
+
+  async function reEditActiveQueuedFollowUp(): Promise<boolean> {
+    const sessionId = activeSessionId.value;
+    const targets = [...activeQueuedFollowUps.value];
+    if (!sessionId || targets.length === 0) return false;
+
+    const draft = buildPendingSessionInputDraft(targets);
+    const deleted = await deleteActiveQueuedFollowUp();
+    if (!deleted) return false;
+
+    useUiStore().stageChatDraftPrefill(draft, { sessionId });
+    return true;
   }
 
   async function sendMessage(
@@ -2658,6 +2756,7 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     pendingLaunchCancelRequested.value = false;
+    pendingLaunchCompactRequested.value = false;
     const pendingMessageId = nextPendingMessageId();
     const userIntent = withClientMessageId(overrides?.userIntent, pendingMessageId);
     const userIntentSignature = JSON.stringify(userIntent);
@@ -2699,6 +2798,7 @@ export const useChatStore = defineStore("chat", () => {
         model = planModel;
       }
     }
+    const fastMode = model ? modelStore.codexFastModeForModel(model) : false;
 
     logChatStreamDebug("chat request start", {
       sessionId: activeSessionId.value,
@@ -2717,12 +2817,14 @@ export const useChatStore = defineStore("chat", () => {
         agentId: agentStore.selectedAgentId || null,
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
-        fastMode: model ? modelStore.codexFastModeForModel(model) : false,
+        fastMode,
         images: images.length > 0 ? images : null,
         assetRefs: assetRefs.length > 0 ? assetRefs : null,
         mode: overrides?.mode || null,
         userIntent,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
+        subagentEfforts: Object.keys(modelStore.modelDefaults.subagentEfforts).length > 0 ? modelStore.modelDefaults.subagentEfforts : null,
+        subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
       modelStore.applySessionModel(model);
@@ -2753,15 +2855,21 @@ export const useChatStore = defineStore("chat", () => {
         currentRunId.value = runId;
         sessionAgentId.value = agentStore.selectedAgentId || null;
         sessionEffort.value = modelStore.effort;
+        sessionFastMode.value = fastMode;
         await refreshSessions();
       }
       if (pendingLaunchCancelRequested.value) {
         pendingLaunchCancelRequested.value = false;
+        pendingLaunchCompactRequested.value = false;
         void cancelSession(sid);
+      } else if (pendingLaunchCompactRequested.value) {
+        pendingLaunchCompactRequested.value = false;
+        globalThis.setTimeout(() => void compactSession(), 0);
       }
     } catch (e) {
       console.error("chat failed:", e);
       pendingLaunchCancelRequested.value = false;
+      pendingLaunchCompactRequested.value = false;
       logChatStreamDebug("chat request failed", {
         sessionId: activeSessionId.value,
         error: e instanceof Error ? e.message : String(e),
@@ -2807,6 +2915,7 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     pendingLaunchCancelRequested.value = false;
+    pendingLaunchCompactRequested.value = false;
     resetStreamRuntimeState();
     isStreaming.value = true;
     pendingManagedSessionId = sessionId;
@@ -2814,6 +2923,7 @@ export const useChatStore = defineStore("chat", () => {
     managedStreamingSessionIds.add(sessionId);
 
     const model = modelStore.selectedModelId || null;
+    const fastMode = model ? modelStore.codexFastModeForModel(model) : false;
     const interruptedToolResultMessages = buildInterruptedTrailingToolResultMessages(messages.value);
     logChatStreamDebug("resume interrupted request start", {
       sessionId,
@@ -2829,13 +2939,19 @@ export const useChatStore = defineStore("chat", () => {
         agentId: agentStore.selectedAgentId || null,
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
-        fastMode: model ? modelStore.codexFastModeForModel(model) : false,
+        fastMode,
         images: null,
         assetRefs: null,
         mode: "build",
         userIntent: null,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0
           ? modelStore.modelDefaults.subagentModels
+          : null,
+        subagentEfforts: Object.keys(modelStore.modelDefaults.subagentEfforts).length > 0
+          ? modelStore.modelDefaults.subagentEfforts
+          : null,
+        subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0
+          ? modelStore.modelDefaults.subagentFastModes
           : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
@@ -2859,15 +2975,21 @@ export const useChatStore = defineStore("chat", () => {
         currentRunId.value = runId;
         sessionAgentId.value = agentStore.selectedAgentId || null;
         sessionEffort.value = modelStore.effort;
+        sessionFastMode.value = fastMode;
       }
       await refreshSessions();
       if (pendingLaunchCancelRequested.value) {
         pendingLaunchCancelRequested.value = false;
+        pendingLaunchCompactRequested.value = false;
         void cancelSession(sid);
+      } else if (pendingLaunchCompactRequested.value) {
+        pendingLaunchCompactRequested.value = false;
+        globalThis.setTimeout(() => void compactSession(), 0);
       }
     } catch (e) {
       console.error("resume interrupted chat failed:", e);
       pendingLaunchCancelRequested.value = false;
+      pendingLaunchCompactRequested.value = false;
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
         code: err.code,
@@ -2883,8 +3005,42 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  async function compactSession() {
-    if (!activeSessionId.value || isStreaming.value) return;
+  async function compactSession(retryQueueRace = true) {
+    if (isStreaming.value && (!activeSessionId.value || !currentRunId.value)) {
+      pendingLaunchCompactRequested.value = true;
+      return;
+    }
+    if (!activeSessionId.value) return;
+
+    if (isStreaming.value && currentRunId.value) {
+      const sessionId = activeSessionId.value;
+      const runId = currentRunId.value;
+      if (compactQueuedRuns.value.get(sessionId) === runId) return;
+      try {
+        await sessionService.queueSessionCompact(sessionId, runId);
+        setCompactQueued(sessionId, runId);
+      } catch (e) {
+        const err = normalizeAppError(e);
+        const runClosed = err.code === "session.pending_compact.no_active_run"
+          || err.code === "session.pending_compact.run_mismatch"
+          || err.code === "session.pending_compact.run_closed";
+        if (runClosed && retryQueueRace) {
+          await loadSessionState(sessionId);
+          if (activeSessionId.value === sessionId) {
+            await compactSession(false);
+          }
+          return;
+        }
+        useNotificationStore().addNotice("error", t("app.sendFailed", err.message), {
+          code: err.code,
+          operation: "compact",
+          skipConsoleLog: true,
+        });
+      }
+      return;
+    }
+
+    if (isStreaming.value) return;
 
     const modelStore = useModelStore();
     const agentStore = useAgentStore();
@@ -2897,6 +3053,8 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     pendingLaunchCancelRequested.value = false;
+    pendingLaunchCompactRequested.value = false;
+    setCompactQueued(sessionId, null);
     resetStreamRuntimeState();
     isStreaming.value = true;
     pendingManagedSessionId = sessionId;
@@ -2904,6 +3062,7 @@ export const useChatStore = defineStore("chat", () => {
     managedStreamingSessionIds.add(sessionId);
 
     const model = modelStore.selectedModelId || null;
+    const fastMode = model ? modelStore.codexFastModeForModel(model) : false;
 
     logChatStreamDebug("compact request start", {
       sessionId,
@@ -2918,12 +3077,14 @@ export const useChatStore = defineStore("chat", () => {
         agentId: agentStore.selectedAgentId || null,
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
-        fastMode: model ? modelStore.codexFastModeForModel(model) : false,
+        fastMode,
         images: null,
         assetRefs: null,
         mode: "compact",
         userIntent: null,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
+        subagentEfforts: Object.keys(modelStore.modelDefaults.subagentEfforts).length > 0 ? modelStore.modelDefaults.subagentEfforts : null,
+        subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
 
@@ -2946,6 +3107,7 @@ export const useChatStore = defineStore("chat", () => {
       currentRunId.value = runId;
       sessionAgentId.value = agentStore.selectedAgentId || null;
       sessionEffort.value = modelStore.effort;
+      sessionFastMode.value = fastMode;
       await refreshSessions();
       if (pendingLaunchCancelRequested.value) {
         pendingLaunchCancelRequested.value = false;
@@ -3019,7 +3181,10 @@ export const useChatStore = defineStore("chat", () => {
 
   async function forkSessionFromMessage(messageId: string) {
     const sourceSessionId = activeSessionId.value;
-    if (!sourceSessionId || isStreaming.value || !messageId) return;
+    if (!sourceSessionId || !messageId) return;
+
+    const targetMessage = messages.value.find((message) => message.id === messageId);
+    if (isMessageFromActiveStream(targetMessage, currentRunId.value, isStreaming.value)) return;
 
     const sourceSession = sessions.value.find((session) => session.id === sourceSessionId);
     if (sourceSession?.parentSessionId) {
@@ -3058,6 +3223,7 @@ export const useChatStore = defineStore("chat", () => {
 
   async function cancelSession(sessionId: string) {
     if (!sessionId) return;
+    pendingLaunchCompactRequested.value = false;
     const trackedRunId = sessionRunIds.value.get(sessionId)
       ?? (activeSessionId.value === sessionId ? currentRunId.value : null);
     if (!trackedRunId && pendingManagedSessionId === sessionId) {
@@ -3090,6 +3256,7 @@ export const useChatStore = defineStore("chat", () => {
 
   async function cancelChat() {
     if (!isStreaming.value) return;
+    pendingLaunchCompactRequested.value = false;
     if (!activeSessionId.value) {
       // First message of a brand-new session: no session id exists until the
       // chat command resolves, so just flag the cancel for the launch hook.
@@ -3353,6 +3520,7 @@ export const useChatStore = defineStore("chat", () => {
     isStreaming,
     canResumeInterrupted,
     isCompacting,
+    isCompactQueued,
     currentRunId,
     isCancelling,
     isThinking,
@@ -3381,6 +3549,7 @@ export const useChatStore = defineStore("chat", () => {
     activeQueuedFollowUp,
     insertActiveQueuedFollowUp,
     deleteActiveQueuedFollowUp,
+    reEditActiveQueuedFollowUp,
     streamingSessionIds,
     undoableMessageIds,
     rememberSessionScrollState,
@@ -3394,6 +3563,7 @@ export const useChatStore = defineStore("chat", () => {
     loadSessionTurnPreview,
     sessionAgentId,
     sessionEffort,
+    sessionFastMode,
     toolPermissionMode,
     sessionAgentLocked,
     sessionPlanModes,

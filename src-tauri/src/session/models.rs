@@ -43,6 +43,8 @@ pub struct SessionDetail {
     pub last_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fast_mode: Option<bool>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +222,8 @@ pub struct SessionRuntimeSnapshot {
     pub pending_tool_confirms: Vec<PendingToolConfirm>,
     #[serde(default)]
     pub is_compacting: bool,
+    #[serde(default)]
+    pub compact_queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -15,6 +15,7 @@ import ToolConfirmBatchCard from "./ToolConfirmBatchCard.vue";
 import ChatTranscript from "./ChatTranscript.vue";
 import RichChatInput from "./RichChatInput.vue";
 import BaseButton from "../ui/BaseButton.vue";
+import type { UserMessageDraft } from "../../composables/chatMessageDraft";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
 import { useThrottledStreamingText } from "../../composables/streamingRenderThrottle";
 import type { StreamingTextSource } from "../../composables/streamingTextChunks";
@@ -135,6 +136,7 @@ const emit = defineEmits<{
   (e: "answerToolConfirm", questionId: string, answer: string): void;
   (e: "answerAllToolConfirms", questionIds: string[], answer: string): void;
   (e: "insertQueuedFollowUp"): void;
+  (e: "reEditQueuedFollowUp"): void;
   (e: "deleteQueuedFollowUp"): void;
   (e: "applyKnowledgeProposal", proposalId: string): void;
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
@@ -142,6 +144,7 @@ const emit = defineEmits<{
 
 const slots = useSlots();
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
+const composerRef = ref<InstanceType<typeof RichChatInput> | null>(null);
 // Same trailing throttle ChatView applies to the session transcript, so the
 // embedded transcript repaints streamed text at the shared cadence too.
 const { text: displayedStreamingText } = useThrottledStreamingText(() => props.streamingText);
@@ -173,6 +176,12 @@ const STREAM_END_SCROLL_SETTLE_MS = 320;
 function updateInput(value: string) {
   emit("update:inputValue", value);
 }
+
+async function applyDraftPrefill(draft: UserMessageDraft) {
+  await composerRef.value?.applyDraftPrefill(draft);
+}
+
+defineExpose({ applyDraftPrefill });
 
 function getViewportStateKey(key = props.toolConfirmLayoutKey) {
   return key?.trim() || "__embedded__";
@@ -689,7 +698,7 @@ onUnmounted(() => {
           <span class="embedded-queued-label">
             {{ queuedFollowUp.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
           </span>
-          <span class="embedded-queued-text">{{ queuedFollowUp.displayText }}</span>
+          <span class="embedded-queued-text ui-select-text">{{ queuedFollowUp.displayText }}</span>
           <BaseButton
             v-if="queuedFollowUp.canInsert"
             class="embedded-queued-insert"
@@ -699,6 +708,15 @@ onUnmounted(() => {
             @click="emit('insertQueuedFollowUp')"
           >
             {{ t('chat.input.queuedFollowUpInsert') }}
+          </BaseButton>
+          <BaseButton
+            class="embedded-queued-re-edit"
+            size="sm"
+            variant="neutral"
+            type="button"
+            @click="emit('reEditQueuedFollowUp')"
+          >
+            {{ t('chat.messageMenu.reEditUserMessage') }}
           </BaseButton>
           <BaseButton
             class="embedded-queued-delete"
@@ -729,6 +747,7 @@ onUnmounted(() => {
       </div>
 
       <RichChatInput
+        ref="composerRef"
         :model-value="inputValue"
         :selected-agent-id="selectedAgentId"
         :skills="skills"
@@ -884,6 +903,7 @@ onUnmounted(() => {
 }
 
 .embedded-queued-insert,
+.embedded-queued-re-edit,
 .embedded-queued-delete {
   flex: 0 0 auto;
 }

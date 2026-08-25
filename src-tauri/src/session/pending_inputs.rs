@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -15,6 +15,7 @@ pub const DELIVERY_IMMEDIATE: &str = "immediate";
 #[derive(Default)]
 pub struct PendingInputQueue {
     inputs: HashMap<(String, String), PendingSessionInput>,
+    compact_runs: HashSet<(String, String)>,
 }
 
 impl PendingInputQueue {
@@ -106,6 +107,43 @@ impl PendingInputQueue {
         }
     }
 
+    pub fn queue_compact(&mut self, session_id: &str, run_id: &str) -> bool {
+        self.compact_runs
+            .insert((session_id.to_string(), run_id.to_string()))
+    }
+
+    pub fn claim_compact(&mut self, session_id: &str, run_id: &str) -> bool {
+        self.compact_runs
+            .remove(&(session_id.to_string(), run_id.to_string()))
+    }
+
+    pub fn restore_compact(&mut self, session_id: &str, run_id: &str) {
+        self.compact_runs
+            .insert((session_id.to_string(), run_id.to_string()));
+    }
+
+    pub fn has_compact(&self, session_id: &str, run_id: &str) -> bool {
+        self.compact_runs
+            .contains(&(session_id.to_string(), run_id.to_string()))
+    }
+
+    pub fn rebind_input_run(
+        &mut self,
+        session_id: &str,
+        from_run_id: &str,
+        to_run_id: &str,
+    ) -> Option<PendingSessionInput> {
+        let from_key = (session_id.to_string(), from_run_id.to_string());
+        let mut input = self.inputs.remove(&from_key)?;
+        input.run_id = to_run_id.to_string();
+        input.updated_at = now_ts();
+        self.inputs.insert(
+            (session_id.to_string(), to_run_id.to_string()),
+            input.clone(),
+        );
+        Some(input)
+    }
+
     pub fn promote_to_immediate(
         &mut self,
         session_id: &str,
@@ -151,8 +189,9 @@ impl PendingInputQueue {
     }
 
     pub fn clear_run(&mut self, session_id: &str, run_id: &str) {
-        self.inputs
-            .remove(&(session_id.to_string(), run_id.to_string()));
+        let key = (session_id.to_string(), run_id.to_string());
+        self.inputs.remove(&key);
+        self.compact_runs.remove(&key);
     }
 
     pub fn list_session(&self, session_id: &str) -> Vec<PendingSessionInput> {
@@ -386,5 +425,37 @@ mod tests {
             .expect("delete promoted input");
         assert_eq!(deleted.delivery, DELIVERY_IMMEDIATE);
         assert!(queue.claim_immediate("session-1", "run-1").is_empty());
+    }
+
+    #[test]
+    fn compact_requests_are_idempotent_and_claimed_once() {
+        let mut queue = PendingInputQueue::default();
+
+        assert!(queue.queue_compact("session-1", "run-1"));
+        assert!(!queue.queue_compact("session-1", "run-1"));
+        assert!(queue.has_compact("session-1", "run-1"));
+        assert!(queue.claim_compact("session-1", "run-1"));
+        assert!(!queue.claim_compact("session-1", "run-1"));
+    }
+
+    #[test]
+    fn queued_input_can_follow_a_compact_run() {
+        let mut queue = PendingInputQueue::default();
+        let first = queue.queue_input(request("run-1", "group-a", "first"));
+
+        let rebound = queue
+            .rebind_input_run("session-1", "run-1", "run-compact")
+            .expect("rebind pending input");
+
+        assert_eq!(rebound.id, first.id);
+        assert_eq!(rebound.run_id, "run-compact");
+        assert!(queue.claim_after_run("session-1", "run-1").is_none());
+        assert_eq!(
+            queue
+                .claim_after_run("session-1", "run-compact")
+                .expect("claim rebound input")
+                .id,
+            first.id
+        );
     }
 }

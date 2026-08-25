@@ -87,6 +87,7 @@ class _SdkSurfaceClient(locus.Client):
                 "agentId": "reviewer",
                 "lastModelId": "openai/gpt-test",
                 "lastEffort": "high",
+                "lastFastMode": True,
                 "sessionType": "chat",
                 "parentSessionId": None,
                 "latestCompletedRunId": "run-1",

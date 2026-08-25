@@ -2,6 +2,7 @@ import type {
   AssetRefAttachment,
   ChatMessage,
   ImageAttachment,
+  PendingSessionInput,
   SkillIntentItem,
 } from "../types";
 import { extractChatAssetRefs } from "./chatAssetRefs";
@@ -24,7 +25,7 @@ const CLIPBOARD_HTML_MARKER_RE =
 const SERIALIZED_KIND = "locus_user_message_draft_v1";
 const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 const UNITY_SCENE_OBJECT_REF_RE = /^((?:Assets|Packages)\/.+?\.unity)\/.+/i;
-const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:Locus\/knowledge\/)?(?:design|memory|skill|reference)\/.+\.md$/i;
+const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:Locus\/knowledge\/)?(?:design|plan|memory|skill|reference)\/.+\.md$/i;
 
 export interface UserMessageDraftLocalFile {
   path: string;
@@ -412,6 +413,33 @@ export function buildUserMessageDraft(message: ChatMessage): UserMessageDraft {
     })),
     intent: userMessageIntent(message),
   };
+}
+
+export function buildPendingSessionInputDraft(inputs: PendingSessionInput[]): UserMessageDraft {
+  const content = inputs
+    .map((input) => input.text)
+    .filter((text) => text.trim().length > 0)
+    .join("\n");
+  const mode = inputs.some((input) => (
+    input.mode === "plan" || input.userIntent?.mode === "plan"
+  )) ? "plan" : "build";
+  const skills = dedupeSkillIntents(
+    inputs.flatMap((input) => input.userIntent?.skills ?? []),
+  );
+
+  return buildUserMessageDraft({
+    id: inputs[0]?.id ?? "pending-input",
+    role: "user",
+    content,
+    createdAt: inputs[0]?.createdAt ?? Date.now() / 1000,
+    images: inputs.flatMap((input) => input.images ?? []),
+    assetRefs: inputs.flatMap((input) => input.assetRefs ?? []),
+    intentMeta: {
+      kind: "user_intent_v1",
+      mode,
+      skills,
+    },
+  });
 }
 
 export function copyableChatMessageText(message: ChatMessage) {

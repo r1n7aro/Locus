@@ -6,10 +6,10 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v34 with explicit context, cache, and repair migrations", () => {
+  it("uses schema v35 with explicit context, cache, repair, and session execution migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 34;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 35;");
     expect(store).toContain('Self::migrate(conn, 26, "persist session context attempts"');
     expect(store).toContain('27,\n                "persist structured conversation checkpoints"');
     expect(store).toContain("migrate_conversation_checkpoints");
@@ -22,6 +22,8 @@ describe("structured session context export", () => {
     expect(store).toContain('Self::migrate(conn, 32, "persist prompt cache checks"');
     expect(store).toContain('33,\n                "use server usage baselines for prompt cache checks"');
     expect(store).toContain('34,\n                "detect prompt cache invalidation from server input growth"');
+    expect(store).toContain('Self::migrate(conn, 35, "persist the latest session Fast mode"');
+    expect(store).toContain("v34_database_migrates_session_fast_mode_and_exports_legacy_value_as_empty");
     expect(store).toContain("baseline_tokens INTEGER NOT NULL");
     expect(store).toContain("input_tokens INTEGER NOT NULL");
     expect(store).toContain("excess_input_tokens INTEGER NOT NULL");
@@ -59,6 +61,21 @@ describe("structured session context export", () => {
     expect(commands).not.toContain("format_rounds_as_markdown");
     expect(commands).not.toContain("save_raw_context");
     expect(lib).not.toContain("commands::save_raw_context");
+  });
+
+  it("persists and restores model, effort, and Fast mode as one session execution state", () => {
+    const store = read("src-tauri/src/session/store.rs");
+    const commands = read("src-tauri/src/commands/session.rs");
+    const service = read("src/services/session.ts");
+    const workspace = read("src/components/ChatWorkspaceView.vue");
+    const chatStore = read("src/stores/chat.ts");
+
+    expect(store).toContain("pub fn set_session_execution_state(");
+    expect(commands).toContain("pub async fn save_session_execution_state(");
+    expect(service).toContain('ipcInvoke("save_session_execution_state"');
+    expect(workspace).toContain("saveSessionExecutionState(");
+    expect(workspace).toContain("function selectWorkspaceFastMode(enabled: boolean)");
+    expect(chatStore).toContain("detail.lastFastMode ?? modelStore.defaultCodexFastMode");
   });
 
   it("exposes the review workflow as a selected builtin skill", () => {
