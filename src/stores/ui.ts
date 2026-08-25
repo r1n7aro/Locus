@@ -42,7 +42,7 @@ export const useUiStore = defineStore("ui", () => {
   const pendingChatPrefill = ref<PendingChatPrefill | null>(null);
   const pendingKnowledgeSelection = ref<{
     id: number;
-    dashboard: "design" | "memory" | "skill" | "reference";
+    dashboard: "design" | "plan" | "memory" | "skill" | "reference";
     path: string;
   } | null>(null);
   const pendingAssetOpen = ref<{

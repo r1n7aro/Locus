@@ -5,6 +5,7 @@ import { t } from "../../i18n";
 import type {
   KnowledgeDocumentPatch,
   KnowledgeDocumentSummary,
+  KnowledgeEditMode,
   KnowledgeInjectMode,
   SkillManifest,
   SkillSurface,
@@ -23,8 +24,14 @@ import {
 } from "../../composables/skillCommands";
 import { useNotificationStore } from "../../stores/notification";
 import {
+  buildKnowledgeEditModePatch,
+  getKnowledgeEditMode,
+} from "./knowledgeEditMode";
+import {
   hintForInjectMode,
+  hintForKnowledgeEditMode,
   labelForInjectMode,
+  labelForKnowledgeEditMode,
 } from "./knowledgeMetaLabels";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
@@ -81,6 +88,29 @@ const injectModeOptions = computed(() => [
     value: "excerpt",
     label: labelForInjectMode("excerpt"),
     hint: hintForInjectMode("excerpt"),
+  },
+]);
+
+const editModeOptions = computed(() => [
+  {
+    value: "inherit_parent",
+    label: labelForKnowledgeEditMode("inherit_parent"),
+    hint: hintForKnowledgeEditMode("inherit_parent"),
+  },
+  {
+    value: "disabled",
+    label: labelForKnowledgeEditMode("disabled"),
+    hint: hintForKnowledgeEditMode("disabled"),
+  },
+  {
+    value: "proposal",
+    label: labelForKnowledgeEditMode("proposal"),
+    hint: hintForKnowledgeEditMode("proposal"),
+  },
+  {
+    value: "auto",
+    label: labelForKnowledgeEditMode("auto"),
+    hint: hintForKnowledgeEditMode("auto"),
   },
 ]);
 
@@ -205,6 +235,10 @@ const enabledLabel = computed(() => {
 const packageEnabled = computed(
   () => props.packageDocument.skillEnabled ?? manifest.value?.skillEnabled ?? true,
 );
+const sourceWritable = computed(() => manifest.value?.writable === true && !isExternalSkill.value);
+const packageReadOnly = computed(() => props.packageDocument.readOnly);
+const packageEditMode = computed(() => getKnowledgeEditMode(props.packageDocument));
+const packageEditModeLabel = computed(() => labelForKnowledgeEditMode(packageEditMode.value));
 const packageSurface = computed<SkillSurface>(
   () => props.packageDocument.skillSurface ?? manifest.value?.skillSurface ?? "command",
 );
@@ -382,6 +416,16 @@ function showSkillCommandError(message: string) {
 function onEnabledChange(value: boolean) {
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
   emit("updateConfig", { skillEnabled: value });
+}
+
+function onReadOnlyChange(value: boolean) {
+  if (!sourceWritable.value) return;
+  emit("updateConfig", { readOnly: value });
+}
+
+function onEditModeChange(value: string) {
+  if (!sourceWritable.value || packageReadOnly.value) return;
+  emit("updateConfig", buildKnowledgeEditModePatch(value as KnowledgeEditMode));
 }
 
 // The inject-mode dropdown drives the auto channel, so it also derives the
@@ -573,6 +617,33 @@ async function onRescanExternalSkills() {
               :options="injectModeOptions"
               :aria-label="t('knowledge.meta.injectMode')"
               @update:model-value="onInjectModeChange"
+            />
+          </div>
+          <div class="skill-package-config-row">
+            <span class="skill-package-config-label">
+              {{ t("knowledge.meta.readOnly") }}
+            </span>
+            <span class="skill-package-config-value">
+              <BaseSwitch
+                :model-value="packageReadOnly"
+                :disabled="!sourceWritable"
+                :aria-label="t('knowledge.meta.readOnly')"
+                @update:model-value="onReadOnlyChange"
+              />
+            </span>
+          </div>
+          <div class="skill-package-config-row">
+            <span class="skill-package-config-label">
+              {{ t("knowledge.meta.editMode") }}
+            </span>
+            <BaseDropdown
+              class="skill-package-dropdown"
+              :model-value="packageEditMode"
+              :selected-label="packageEditModeLabel"
+              :options="editModeOptions"
+              :disabled="!sourceWritable || packageReadOnly"
+              :aria-label="t('knowledge.meta.editMode')"
+              @update:model-value="onEditModeChange"
             />
           </div>
           <div class="skill-package-config-row">

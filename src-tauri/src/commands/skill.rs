@@ -13,7 +13,8 @@ use walkdir::WalkDir;
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::{
-    self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType, SkillSurface,
+    self, KnowledgeDocument, KnowledgeDocumentPatch, KnowledgeInjectMode, KnowledgeType,
+    SkillSurface,
 };
 use crate::process_util::{async_command, augment_path_with_git, spawn_managed, ProcessOwner};
 use crate::tool::{ToolDef, ToolExecutionContext, ToolRegistry, ToolResult};
@@ -50,6 +51,8 @@ pub struct SkillManifest {
     pub package_version: Option<String>,
     #[serde(default)]
     pub has_unity: bool,
+    #[serde(default)]
+    pub writable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,11 +319,30 @@ impl Default for SkillCreateKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillCreateSource {
+    Project,
+    #[default]
+    App,
+}
+
+impl SkillCreateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::App => "app",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillCreateRequest {
     #[serde(default)]
     pub kind: SkillCreateKind,
+    #[serde(default)]
+    pub source: SkillCreateSource,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -347,6 +369,7 @@ pub struct SkillCreateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillPackageCreateRequest {
+    pub source: SkillCreateSource,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_id: Option<String>,
@@ -370,6 +393,7 @@ impl From<SkillPackageCreateRequest> for SkillCreateRequest {
     fn from(request: SkillPackageCreateRequest) -> Self {
         Self {
             kind: SkillCreateKind::Package,
+            source: request.source,
             name: request.name,
             path: None,
             package_id: request.package_id,
@@ -385,19 +409,12 @@ impl From<SkillPackageCreateRequest> for SkillCreateRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SkillReloadRequest {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
 // ── Config key helpers ───────────────────────────────────────
 
 const SKILL_DIR_NAME: &str = "skill";
 const SKILL_PACKAGE_MANIFEST_FILE_NAME: &str = "skill.json";
 const SKILL_PACKAGE_ROOT_DOC_FILE_NAME: &str = "SKILL.md";
+const PROJECT_SKILL_PACKAGES_RELATIVE: &str = "Locus/skills";
 
 /// Build the canonical config key for a skill document.
 fn config_key(source: &str, dir_name: &str) -> String {
@@ -707,6 +724,7 @@ fn build_skill_manifest(
         package_id: None,
         package_version: None,
         has_unity: false,
+        writable: true,
         plugin_id: None,
         plugin_scope: None,
         origin_path: None,
@@ -1012,6 +1030,39 @@ pub(crate) fn writable_app_skill_package_dir() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&path)
         .map_err(|e| format!("Failed to create app Skill package directory: {}", e))?;
     Ok(path)
+}
+
+fn project_skill_package_dir(working_dir: &str) -> Result<PathBuf, String> {
+    let trimmed = working_dir.trim();
+    if trimmed.is_empty() {
+        return Err("Project Skill packages require a selected working directory".to_string());
+    }
+    Ok(Path::new(trimmed).join(PROJECT_SKILL_PACKAGES_RELATIVE))
+}
+
+fn writable_project_skill_package_dir(working_dir: &str) -> Result<PathBuf, String> {
+    let path = project_skill_package_dir(working_dir)?;
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("Failed to create project Skill package directory: {}", e))?;
+    Ok(path)
+}
+
+pub(crate) fn skill_package_record_is_writable(record: &SkillPackageRecord) -> bool {
+    if record.plugin_id.is_some() {
+        return false;
+    }
+    if record.source == "project" {
+        return true;
+    }
+    if record.source != "app" {
+        return false;
+    }
+
+    let Ok(config_dir) = super::persistent_config_dir() else {
+        return false;
+    };
+    let writable_root = config_dir.join("skills");
+    record.root.starts_with(writable_root)
 }
 
 fn normalize_package_manifest(
@@ -1416,6 +1467,21 @@ fn split_optional_package_frontmatter(
     split_optional_frontmatter::<SkillPackageDocumentFrontmatter>(content)
 }
 
+fn render_package_document(
+    frontmatter: &SkillPackageDocumentFrontmatter,
+    body: &str,
+) -> Result<String, String> {
+    let has_frontmatter = frontmatter.title.is_some()
+        || frontmatter.summary.is_some()
+        || !frontmatter.tools.is_empty();
+    if !has_frontmatter {
+        return Ok(body.to_string());
+    }
+    let yaml = serde_yaml::to_string(frontmatter)
+        .map_err(|error| format!("Failed to render Skill document frontmatter: {}", error))?;
+    Ok(format!("---\n{}---\n{}", yaml, body))
+}
+
 fn normalize_package_document_tool_names(
     record: &SkillPackageRecord,
     values: &[String],
@@ -1479,7 +1545,10 @@ fn package_document_tool_names(
     names
 }
 
-fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> {
+fn load_skill_package_record_for_source(
+    root: &Path,
+    source: &str,
+) -> Result<SkillPackageRecord, String> {
     let manifest_path = package_manifest_path(root);
     let raw_manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("Failed to read {}: {}", manifest_path.display(), e))?;
@@ -1506,10 +1575,14 @@ fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> 
         updated_at,
         root_summary,
         manifest,
-        source: "app".to_string(),
+        source: source.to_string(),
         plugin_id: None,
         plugin_scope: None,
     })
+}
+
+fn load_skill_package_record(root: &Path) -> Result<SkillPackageRecord, String> {
+    load_skill_package_record_for_source(root, "app")
 }
 
 fn load_plugin_skill_package_record(
@@ -1638,6 +1711,31 @@ pub(crate) fn list_skill_packages_sync_for_working_dir(
             }
         };
         push_skill_package_record(&mut records, record, true);
+    }
+
+    if let Ok(package_dir) = project_skill_package_dir(working_dir) {
+        if let Ok(entries) = std::fs::read_dir(&package_dir) {
+            for entry in entries.flatten() {
+                let root = entry.path();
+                if !is_skill_package_root(&root) {
+                    continue;
+                }
+                let record = match load_skill_package_record_for_source(&root, "project") {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::error!(
+                            log_module = "Skill",
+                            workspace = working_dir,
+                            package_root = %root.display(),
+                            error = %error,
+                            "failed to load project Skill package"
+                        );
+                        continue;
+                    }
+                };
+                push_skill_package_record(&mut records, record, true);
+            }
+        }
     }
     records.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
     records
@@ -3075,6 +3173,45 @@ fn configured_package_inject_mode(
         .unwrap_or(KnowledgeInjectMode::Excerpt)
 }
 
+fn configured_package_read_only(
+    record: &SkillPackageRecord,
+    override_config: Option<&SkillConfig>,
+) -> bool {
+    !skill_package_record_is_writable(record)
+        || override_config
+            .map(|config| config.read_only)
+            .unwrap_or(false)
+}
+
+fn configured_package_ai_edit_mode(
+    record: &SkillPackageRecord,
+    override_config: Option<&SkillConfig>,
+) -> knowledge_store::KnowledgeAiEditMode {
+    if !skill_package_record_is_writable(record) {
+        return knowledge_store::KnowledgeAiEditMode::Disabled;
+    }
+    override_config
+        .map(|config| config.ai_edit_mode)
+        .unwrap_or(knowledge_store::KnowledgeAiEditMode::Inherit)
+}
+
+fn configured_package_maintenance_rules(override_config: Option<&SkillConfig>) -> Option<String> {
+    override_config
+        .map(|config| config.maintenance_rules.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn package_storage_source(record: &SkillPackageRecord) -> knowledge_store::KnowledgeStorageSource {
+    if record.source == "project"
+        || record.plugin_scope == Some(crate::plugin::PluginInstallScope::Project)
+    {
+        knowledge_store::KnowledgeStorageSource::Project
+    } else {
+        knowledge_store::KnowledgeStorageSource::App
+    }
+}
+
 fn package_argument_hint(manifest: &SkillPackageManifestFile) -> Option<String> {
     manifest
         .command
@@ -3117,8 +3254,12 @@ fn package_to_document(
     let summary = if is_root {
         configured_package_summary(override_config, &record.root_summary)
     } else {
-        String::new()
+        frontmatter.summary.clone().unwrap_or_default()
     };
+    let read_only = configured_package_read_only(record, override_config);
+    let ai_edit_mode = configured_package_ai_edit_mode(record, override_config);
+    let maintenance_rules = configured_package_maintenance_rules(override_config);
+    let inherit_ai_config = ai_edit_mode == knowledge_store::KnowledgeAiEditMode::Inherit;
     let file_path = package_file_path(&record.root, doc_rel_path).ok();
     let updated_at = file_path
         .as_ref()
@@ -3142,19 +3283,22 @@ fn package_to_document(
         },
         inherit_inject_mode: false,
         inject_mode_source: Default::default(),
-        summary_enabled: is_root,
+        summary_enabled: !summary.trim().is_empty(),
         command_enabled,
-        read_only: true,
-        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Disabled,
-        ai_maintained: false,
-        storage_source: if record.plugin_scope == Some(crate::plugin::PluginInstallScope::Project) {
-            knowledge_store::KnowledgeStorageSource::Project
+        read_only,
+        ai_edit_mode,
+        ai_maintained: ai_edit_mode == knowledge_store::KnowledgeAiEditMode::Auto,
+        storage_source: package_storage_source(record),
+        inherit_ai_config,
+        ai_config_source: if inherit_ai_config {
+            knowledge_store::KnowledgeConfigSource {
+                kind: knowledge_store::KnowledgeConfigSourceKind::TypeDefault,
+                path: None,
+            }
         } else {
-            knowledge_store::KnowledgeStorageSource::App
+            Default::default()
         },
-        inherit_ai_config: false,
-        ai_config_source: Default::default(),
-        explicit_maintenance_rules: false,
+        explicit_maintenance_rules: maintenance_rules.is_some(),
         external_source: package_source_summary(record),
         skill_enabled: Some(skill_enabled),
         skill_surface: Some(skill_surface),
@@ -3164,7 +3308,7 @@ fn package_to_document(
         tools: package_document_tool_names(record, doc_rel_path, &frontmatter),
         summary: (!summary.trim().is_empty()).then_some(summary),
         body,
-        maintenance_rules: None,
+        maintenance_rules,
         created_at: updated_at,
         updated_at,
     })
@@ -3278,6 +3422,223 @@ pub(crate) fn read_skill_package_document_sync(
             part: normalized_part.to_string(),
             file_metadata: None,
         }));
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn edit_skill_package_document_sync(
+    working_dir: &str,
+    virtual_path: &str,
+    patch: KnowledgeDocumentPatch,
+) -> Result<Option<KnowledgeDocument>, String> {
+    if super::skill_external::external_skill_virtual_path_in_namespace(virtual_path) {
+        return Err(format!(
+            "External skill content is read-only in Locus: {}",
+            virtual_path
+        ));
+    }
+
+    let mut configs = load_skill_config(working_dir);
+    for record in list_skill_packages_sync_for_working_dir(working_dir) {
+        let Some(doc_rel_path) =
+            package_doc_rel_path_for_virtual_path(&record.manifest, virtual_path)?
+        else {
+            continue;
+        };
+        if !skill_package_record_is_writable(&record) {
+            return Err(format!(
+                "Skill package '{}' is managed by a read-only source: {}",
+                record.manifest.id, virtual_path
+            ));
+        }
+        if patch.new_path.is_some() {
+            return Err("Skill package documents cannot be renamed from Knowledge".to_string());
+        }
+        if patch
+            .doc_type
+            .is_some_and(|doc_type| doc_type != KnowledgeType::Skill)
+        {
+            return Err("Skill package documents cannot change knowledge type".to_string());
+        }
+        if patch.external_source.is_some() {
+            return Err(
+                "Skill package document source metadata is managed by its package".to_string(),
+            );
+        }
+
+        let file_path = package_file_path(&record.root, &doc_rel_path)?;
+        let original_document = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("Failed to read skill package document: {}", e))?;
+        let config_key = config_key(&record.source, &record.manifest.id);
+        let existing_config = configs.get(&config_key).cloned();
+        let mut config = existing_config.clone().unwrap_or_else(|| SkillConfig {
+            enabled: package_skill_enabled(&record.manifest),
+            surface: package_skill_surface(&record.manifest),
+            ..Default::default()
+        });
+        let current = package_to_document(
+            &record,
+            &doc_rel_path,
+            strip_utf8_bom(&original_document).to_string(),
+            existing_config.as_ref(),
+        )?;
+        if current.read_only && patch.read_only != Some(false) {
+            return Err("Cannot update a read-only Skill package document".to_string());
+        }
+
+        let mut next = current;
+        if let Some(read_only) = patch.read_only {
+            config.read_only = read_only;
+            next.read_only = read_only;
+        }
+        if let Some(ai_edit_mode) = patch.ai_edit_mode {
+            config.ai_edit_mode = ai_edit_mode;
+        } else if let Some(ai_maintained) = patch.ai_maintained {
+            config.ai_edit_mode = if ai_maintained {
+                knowledge_store::KnowledgeAiEditMode::Auto
+            } else {
+                knowledge_store::KnowledgeAiEditMode::Confirm
+            };
+        } else if patch.inherit_ai_config == Some(true) {
+            config.ai_edit_mode = knowledge_store::KnowledgeAiEditMode::Inherit;
+        }
+        if let Some(skill_enabled) = patch.skill_enabled {
+            config.enabled = skill_enabled;
+        }
+        if let Some(skill_surface) = patch.skill_surface {
+            config.surface = skill_surface;
+        }
+        if let Some(command_trigger) = patch.command_trigger.as_ref() {
+            config.command_trigger = command_trigger.clone().unwrap_or_default();
+        }
+        if let Some(inject_mode) = patch.inject_mode {
+            config.inject_mode = Some(inject_mode);
+        }
+        if let Some(maintenance_rules) = patch.maintenance_rules.as_ref() {
+            config.maintenance_rules = maintenance_rules.clone().unwrap_or_default();
+        }
+        if patch.explicit_maintenance_rules == Some(false) {
+            config.maintenance_rules.clear();
+        }
+        if config.ai_edit_mode == knowledge_store::KnowledgeAiEditMode::Auto
+            && config.maintenance_rules.trim().is_empty()
+        {
+            config.maintenance_rules =
+                knowledge_store::default_maintenance_rules_for_type(KnowledgeType::Skill)
+                    .unwrap_or_default()
+                    .to_string();
+        }
+
+        if let Some(summary) = patch.summary.as_ref() {
+            next.summary = summary.clone();
+        }
+        if let Some(body) = patch.body.as_ref() {
+            next.body = body
+                .clone()
+                .ok_or_else(|| "Skill package document body cannot be null".to_string())?;
+        }
+        if let Some(maintenance_rules) = patch.maintenance_rules.as_ref() {
+            next.maintenance_rules = maintenance_rules.clone();
+        }
+        if !patch.edits.is_empty() {
+            knowledge_store::apply_document_content_edits(&mut next, &patch.edits)?;
+            config.maintenance_rules = next.maintenance_rules.clone().unwrap_or_default();
+        }
+
+        let is_root = package_doc_is_root(&record.manifest, &doc_rel_path);
+        let (mut frontmatter, _) = split_optional_package_frontmatter(&original_document)?;
+        if let Some(title) = patch.title.as_ref() {
+            frontmatter.title = optional_trimmed(Some(title.clone()));
+        }
+        let summary_changed = patch.summary.is_some()
+            || patch
+                .edits
+                .iter()
+                .any(|edit| edit.section == knowledge_store::KnowledgeDocumentEditSection::Summary);
+        if summary_changed {
+            frontmatter.summary = next
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+        if is_root && frontmatter.summary.is_none() {
+            return Err("Skill package root SKILL.md requires a non-empty summary".to_string());
+        }
+
+        let content_changed = patch.title.is_some()
+            || patch.summary.is_some()
+            || patch.body.is_some()
+            || patch.edits.iter().any(|edit| {
+                edit.section != knowledge_store::KnowledgeDocumentEditSection::MaintenanceRules
+            });
+        let next_document = render_package_document(&frontmatter, &next.body)?;
+
+        let manifest_path = package_manifest_path(&record.root);
+        let original_manifest = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read {}: {}", manifest_path.display(), e))?;
+        let mut next_manifest = record.manifest.clone();
+        let mut manifest_changed = false;
+        if is_root && summary_changed {
+            if let Some(summary) = frontmatter.summary.as_ref() {
+                next_manifest.description = summary.clone();
+                config.description.clear();
+                manifest_changed = true;
+            }
+        }
+        if let Some(argument_hint) = patch.argument_hint.as_ref() {
+            let argument_hint = argument_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            next_manifest.argument_hint = argument_hint.clone();
+            if let Some(command) = next_manifest.command.as_mut() {
+                command.argument_hint = argument_hint;
+            }
+            manifest_changed = true;
+        }
+
+        let next_manifest_json = serde_json::to_string_pretty(&next_manifest)
+            .map(|json| format!("{}\n", json))
+            .map_err(|e| format!("Failed to render Skill package manifest: {}", e))?;
+        let write_result = (|| {
+            if content_changed {
+                std::fs::write(&file_path, &next_document)
+                    .map_err(|e| format!("Failed to write {}: {}", file_path.display(), e))?;
+            }
+            if manifest_changed {
+                std::fs::write(&manifest_path, &next_manifest_json)
+                    .map_err(|e| format!("Failed to write {}: {}", manifest_path.display(), e))?;
+            }
+            load_skill_package_record_for_source(&record.root, &record.source)?;
+            configs.insert(config_key.clone(), config.clone());
+            save_skill_config(working_dir, &configs)?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = write_result {
+            if content_changed {
+                let _ = std::fs::write(&file_path, &original_document);
+            }
+            if manifest_changed {
+                let _ = std::fs::write(&manifest_path, &original_manifest);
+            }
+            return Err(error);
+        }
+
+        let updated_record = load_skill_package_record_for_source(&record.root, &record.source)?;
+        let updated_config = configs.get(&config_key);
+        let updated_raw = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("Failed to read updated skill package document: {}", e))?;
+        return package_to_document(
+            &updated_record,
+            &doc_rel_path,
+            strip_utf8_bom(&updated_raw).to_string(),
+            updated_config,
+        )
+        .map(Some);
     }
 
     Ok(None)
@@ -3847,8 +4208,10 @@ fn package_to_list_item(
     let summary = if is_root {
         configured_package_summary(override_config, &record.root_summary)
     } else {
-        String::new()
+        frontmatter.summary.clone().unwrap_or_default()
     };
+    let read_only = configured_package_read_only(record, override_config);
+    let ai_edit_mode = configured_package_ai_edit_mode(record, override_config);
     let updated_at = file_path
         .as_ref()
         .map(|path| package_file_modified_at(path, record.updated_at))
@@ -3869,17 +4232,13 @@ fn package_to_list_item(
         } else {
             KnowledgeInjectMode::None
         },
-        summary_enabled: is_root,
+        summary_enabled: !summary.trim().is_empty(),
         command_enabled,
-        read_only: true,
-        ai_edit_mode: knowledge_store::KnowledgeAiEditMode::Disabled,
-        ai_maintained: false,
-        explicit_maintenance_rules: false,
-        storage_source: if record.plugin_scope == Some(crate::plugin::PluginInstallScope::Project) {
-            knowledge_store::KnowledgeStorageSource::Project
-        } else {
-            knowledge_store::KnowledgeStorageSource::App
-        },
+        read_only,
+        ai_edit_mode,
+        ai_maintained: ai_edit_mode == knowledge_store::KnowledgeAiEditMode::Auto,
+        explicit_maintenance_rules: configured_package_maintenance_rules(override_config).is_some(),
+        storage_source: package_storage_source(record),
         external_source: package_source_summary(record),
         skill_enabled: Some(skill_enabled),
         skill_surface: Some(skill_surface),
@@ -4225,6 +4584,7 @@ fn build_package_skill_manifest(
         package_id: Some(package_id.to_string()),
         package_version: (!manifest.version.trim().is_empty()).then(|| manifest.version.clone()),
         has_unity: !manifest.capabilities.unity.is_empty(),
+        writable: skill_package_record_is_writable(record),
         plugin_id: record.plugin_id.clone(),
         plugin_scope: record.plugin_scope.map(|scope| scope.as_str().to_string()),
         origin_path: None,
@@ -4602,10 +4962,11 @@ pub fn create_skill_document_sync(
     ))
 }
 
-fn create_skill_package_in_parent_sync_with_default_namespace(
+fn create_skill_package_in_parent_sync_for_source_with_default_namespace(
     package_parent: &Path,
     request: SkillCreateRequest,
     default_namespace: Option<&str>,
+    source: SkillCreateSource,
 ) -> Result<SkillManifest, String> {
     if request.kind != SkillCreateKind::Package {
         return Err("Use kind='package' for app Skill packages".to_string());
@@ -4673,14 +5034,27 @@ fn create_skill_package_in_parent_sync_with_default_namespace(
         let root_doc = package_skill_body(&name, &manifest.description, request.body)?;
         std::fs::write(&root_doc_path, root_doc)
             .map_err(|e| format!("Failed to write {}: {}", root_doc_path.display(), e))?;
-        let record = load_skill_package_record(&package_root)?;
-        Ok(build_package_skill_manifest(&record, "app", None))
+        let record = load_skill_package_record_for_source(&package_root, source.as_str())?;
+        Ok(build_package_skill_manifest(&record, source.as_str(), None))
     })();
 
     if write_result.is_err() {
         let _ = std::fs::remove_dir_all(&package_root);
     }
     write_result
+}
+
+fn create_skill_package_in_parent_sync_with_default_namespace(
+    package_parent: &Path,
+    request: SkillCreateRequest,
+    default_namespace: Option<&str>,
+) -> Result<SkillManifest, String> {
+    create_skill_package_in_parent_sync_for_source_with_default_namespace(
+        package_parent,
+        request,
+        default_namespace,
+        SkillCreateSource::App,
+    )
 }
 
 fn create_skill_package_in_parent_sync(
@@ -4702,6 +5076,24 @@ pub fn create_skill_package_sync_with_default_namespace(
     )
 }
 
+pub fn create_skill_package_for_source_sync_with_default_namespace(
+    working_dir: &str,
+    request: SkillCreateRequest,
+    default_namespace: Option<&str>,
+) -> Result<SkillManifest, String> {
+    let source = request.source;
+    let package_parent = match source {
+        SkillCreateSource::Project => writable_project_skill_package_dir(working_dir)?,
+        SkillCreateSource::App => writable_app_skill_package_dir()?,
+    };
+    create_skill_package_in_parent_sync_for_source_with_default_namespace(
+        &package_parent,
+        request,
+        default_namespace,
+        source,
+    )
+}
+
 pub fn create_skill_package_sync(request: SkillCreateRequest) -> Result<SkillManifest, String> {
     create_skill_package_sync_with_default_namespace(request, None)
 }
@@ -4713,9 +5105,11 @@ pub fn create_skill_sync_with_default_package_namespace(
 ) -> Result<SkillManifest, String> {
     match request.kind {
         SkillCreateKind::Md => create_skill_document_sync(working_dir, request),
-        SkillCreateKind::Package => {
-            create_skill_package_sync_with_default_namespace(request, default_namespace)
-        }
+        SkillCreateKind::Package => create_skill_package_for_source_sync_with_default_namespace(
+            working_dir,
+            request,
+            default_namespace,
+        ),
     }
 }
 
@@ -4749,6 +5143,20 @@ fn delete_skill_package_copy_from_parent_sync(
     package_parent: &Path,
     package_id: &str,
 ) -> Result<String, String> {
+    delete_skill_package_copy_from_parent_for_source_sync(
+        working_dir,
+        package_parent,
+        package_id,
+        "app",
+    )
+}
+
+fn delete_skill_package_copy_from_parent_for_source_sync(
+    working_dir: &str,
+    package_parent: &Path,
+    package_id: &str,
+    source: &str,
+) -> Result<String, String> {
     let record = find_skill_package_in_parent(package_parent, package_id)?;
     let canonical_parent = dunce::canonicalize(package_parent).map_err(|e| {
         format!(
@@ -4780,7 +5188,7 @@ fn delete_skill_package_copy_from_parent_sync(
 
     let mut configs = load_skill_config(working_dir);
     if configs
-        .remove(&config_key("app", &record.manifest.id))
+        .remove(&config_key(source, &record.manifest.id))
         .is_some()
     {
         save_skill_config(working_dir, &configs)?;
@@ -4790,8 +5198,31 @@ fn delete_skill_package_copy_from_parent_sync(
 }
 
 pub fn delete_skill_package_sync(working_dir: &str, package_id: &str) -> Result<String, String> {
-    let package_parent = writable_app_skill_package_dir()?;
-    delete_skill_package_from_parent_sync(working_dir, &package_parent, package_id)
+    let record = find_skill_package_for_working_dir(working_dir, package_id)?;
+    if record.plugin_id.is_some() {
+        return Err(format!(
+            "Skill package '{}' is managed by plugin '{}'. Uninstall the plugin to remove it.",
+            record.manifest.id,
+            record.plugin_id.unwrap_or_default()
+        ));
+    }
+    if !skill_package_record_is_writable(&record) {
+        return Err(format!(
+            "Skill package '{}' is managed by a read-only source",
+            record.manifest.id
+        ));
+    }
+    let package_parent = record
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Skill package root has no parent directory".to_string())?;
+    delete_skill_package_copy_from_parent_for_source_sync(
+        working_dir,
+        &package_parent,
+        &record.manifest.id,
+        &record.source,
+    )
 }
 
 // Validates against the package copy at `source_root` itself (like the View
@@ -5273,109 +5704,12 @@ fn normalize_skill_source(source: Option<&str>) -> Result<String, String> {
         Some("app") => Ok("app".to_string()),
         Some("pluginApp") => Ok("pluginApp".to_string()),
         Some("pluginProject") => Ok("pluginProject".to_string()),
-        // Read-only sources: valid for reload/list, never for create paths
+        // Read-only sources are valid for list filters and never for create paths
         // (skill creation resolves its own source independently).
         Some("externalUser") => Ok("externalUser".to_string()),
         Some("externalProject") => Ok("externalProject".to_string()),
         Some(other) => Err(format!("Invalid skill source: {}", other)),
     }
-}
-
-pub fn reload_skill_manifest_sync(
-    working_dir: &str,
-    app_knowledge_dir: Option<&std::path::PathBuf>,
-    request: SkillReloadRequest,
-) -> Result<SkillManifest, String> {
-    let source = normalize_skill_source(request.source.as_deref())?;
-    if super::skill_external::source_is_external_skill(&source) {
-        return super::skill_external::reload_external_skill_manifest(
-            working_dir,
-            &request.name,
-            Some(&source),
-        );
-    }
-    // A dir name inside the external namespace targets an external skill
-    // even when the model omitted the source.
-    if request.source.is_none()
-        && super::skill_external::external_skill_virtual_path_in_namespace(&request.name)
-    {
-        return super::skill_external::reload_external_skill_manifest(
-            working_dir,
-            &request.name,
-            None,
-        );
-    }
-    if source == "app" {
-        if let Ok(record) = find_skill_package(&request.name) {
-            let configs = load_skill_config(working_dir);
-            let fallback = default_package_command_name(&record.manifest.id);
-            let cfg =
-                validated_skill_config_override(&configs, "app", &record.manifest.id, &fallback)?;
-            return Ok(build_package_skill_manifest(&record, "app", cfg.as_ref()));
-        }
-    } else if source.starts_with("plugin") {
-        let record = find_skill_package_for_source(working_dir, &request.name, Some(&source))?;
-        let configs = load_skill_config(working_dir);
-        let fallback = default_package_command_name(&record.manifest.id);
-        let cfg =
-            validated_skill_config_override(&configs, &source, &record.manifest.id, &fallback)?;
-        return Ok(build_package_skill_manifest(&record, &source, cfg.as_ref()));
-    }
-
-    let normalized_dir_name = normalize_skill_manifest_name(&request.name)?;
-    let knowledge_dir = if source == "app" {
-        app_knowledge_dir
-            .cloned()
-            .ok_or_else(|| "App knowledge directory not found".to_string())?
-    } else {
-        std::path::Path::new(working_dir)
-            .join("Locus")
-            .join("knowledge")
-    };
-    let skill_dir = knowledge_dir.join(SKILL_DIR_NAME);
-
-    let mut document_path = format!("{}.md", normalized_dir_name);
-    let mut manifest_path = skill_dir.join(&document_path);
-    if source == "app" && !manifest_path.is_file() && !normalized_dir_name.contains('/') {
-        document_path = format!("builtin/{}.md", normalized_dir_name);
-        manifest_path = skill_dir.join(&document_path);
-    }
-    if !manifest_path.is_file() {
-        return Err(format!("Skill not found: {}", normalized_dir_name));
-    }
-
-    let document = knowledge_store::load_document_by_root(
-        &knowledge_dir,
-        KnowledgeType::Skill,
-        &document_path,
-    )?;
-    if document.path != document_path {
-        return Err(format!(
-            "Skill frontmatter path '{}' does not match '{}'",
-            document.path, document_path
-        ));
-    }
-    validate_skill_document_config(&document, document_path.trim_end_matches(".md"))?;
-
-    let configs = load_skill_config(working_dir);
-    let cfg = if source == "app" {
-        validated_skill_config_override(
-            &configs,
-            &source,
-            &normalized_dir_name,
-            document_path.trim_end_matches(".md"),
-        )?
-    } else {
-        None
-    };
-    Ok(build_skill_manifest(
-        &document,
-        document_path.trim_end_matches(".md"),
-        &source,
-        &format!("{}/{}", SKILL_DIR_NAME, document_path),
-        get_updated_at(&manifest_path),
-        cfg.as_ref(),
-    ))
 }
 
 pub fn list_skills_filtered_sync(
@@ -5419,6 +5753,7 @@ pub fn set_default_skill_package_namespace(
 #[tauri::command]
 pub async fn create_skill_scaffold(
     kind: Option<SkillCreateKind>,
+    source: Option<SkillCreateSource>,
     name: String,
     path: Option<String>,
     package_id: Option<String>,
@@ -5448,6 +5783,13 @@ pub async fn create_skill_scaffold(
         &working_dir,
         SkillCreateRequest {
             kind,
+            source: source.unwrap_or_else(|| {
+                if kind == SkillCreateKind::Md {
+                    SkillCreateSource::Project
+                } else {
+                    SkillCreateSource::App
+                }
+            }),
             name,
             path,
             package_id,
@@ -6515,6 +6857,7 @@ Use Feishu safely.
                 description: "Workspace override.".to_string(),
                 command_trigger: "/lark".to_string(),
                 inject_mode: Some(KnowledgeInjectMode::Path),
+                ..Default::default()
             }),
         );
 
@@ -7088,10 +7431,7 @@ Use Feishu safely.
                 kind: super::SkillCreateKind::Md,
                 name: "asset-audit".to_string(),
                 summary: Some("Audit Unity assets.".to_string()),
-                tools: vec![
-                    "create_skill_package".to_string(),
-                    "skill_reload".to_string(),
-                ],
+                tools: vec!["create_skill_package".to_string(), "skill_list".to_string()],
                 ..Default::default()
             },
         )
@@ -7099,7 +7439,7 @@ Use Feishu safely.
         assert_eq!(manifest.dir_name, "asset-audit");
         assert_eq!(manifest.command_trigger, "/asset-audit");
         assert_eq!(manifest.description, "Audit Unity assets.");
-        assert_eq!(manifest.tools, vec!["create_skill_package", "skill_reload"]);
+        assert_eq!(manifest.tools, vec!["create_skill_package", "skill_list"]);
 
         let saved = crate::knowledge_store::read_document(
             &working_dir,
@@ -7111,7 +7451,7 @@ Use Feishu safely.
         assert_eq!(saved.document.body, "## Instructions");
         assert_eq!(
             saved.document.tools,
-            vec!["create_skill_package", "skill_reload"]
+            vec!["create_skill_package", "skill_list"]
         );
         let raw = std::fs::read_to_string(
             crate::knowledge_store::document_path(
@@ -7321,6 +7661,163 @@ Use Feishu safely.
     }
 
     #[test]
+    fn create_project_skill_package_uses_project_locus_root() {
+        let project = TempDir::new().unwrap();
+        let working_dir = project.path().to_string_lossy().to_string();
+        let manifest = super::create_skill_package_for_source_sync_with_default_namespace(
+            &working_dir,
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                source: super::SkillCreateSource::Project,
+                name: "Project Audit".to_string(),
+                package_id: Some("project-audit".to_string()),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Audit the current project.".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("create project package");
+
+        let package_root = project
+            .path()
+            .join("Locus")
+            .join("skills")
+            .join("project-audit");
+        assert!(package_root.join("skill.json").is_file());
+        assert!(package_root.join("SKILL.md").is_file());
+        assert_eq!(manifest.source, "project");
+        assert!(manifest.writable);
+
+        let record = super::find_skill_package_for_working_dir(&working_dir, "project-audit")
+            .expect("discover project package");
+        assert_eq!(record.source, "project");
+        assert!(super::skill_package_record_is_writable(&record));
+
+        let registry =
+            crate::knowledge_source_registry::KnowledgeSourceRegistry::build(&working_dir, None);
+        let resolved = registry
+            .resolve_logical(
+                crate::knowledge_store::KnowledgeType::Skill,
+                "project-audit/SKILL.md",
+            )
+            .expect("resolve project package document");
+        assert_eq!(
+            resolved.kind,
+            crate::knowledge_source_registry::KnowledgeSourceKind::ProjectSkillPackage
+        );
+        assert!(resolved.mutability.is_writable());
+        assert_eq!(
+            resolved.storage_source,
+            crate::knowledge_store::KnowledgeStorageSource::Project
+        );
+    }
+
+    #[test]
+    fn writable_package_keeps_read_only_independent_from_ai_edit_mode() {
+        let project = TempDir::new().unwrap();
+        let working_dir = project.path().to_string_lossy().to_string();
+        super::create_skill_package_for_source_sync_with_default_namespace(
+            &working_dir,
+            super::SkillCreateRequest {
+                kind: super::SkillCreateKind::Package,
+                source: super::SkillCreateSource::Project,
+                name: "Editable Audit".to_string(),
+                package_id: Some("editable-audit".to_string()),
+                version: Some("0.1.0".to_string()),
+                summary: Some("Maintain project audit steps.".to_string()),
+                body: Some("## Instructions\nAudit the project.".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("create editable package");
+
+        let initial = super::read_skill_package_document_sync(
+            &working_dir,
+            "editable-audit/SKILL.md",
+            "full",
+        )
+        .expect("read package")
+        .expect("package document")
+        .document;
+        assert!(!initial.read_only);
+        assert_eq!(
+            initial.ai_edit_mode,
+            crate::knowledge_store::KnowledgeAiEditMode::Inherit
+        );
+
+        let edited = crate::commands::execute_knowledge_edit_request(
+            &working_dir,
+            crate::knowledge_store::KnowledgeEditRequest {
+                kind: crate::knowledge_store::KnowledgeTargetKind::Document,
+                path: "skill/editable-audit/SKILL.md".to_string(),
+                doc_type: None,
+                document: Some(crate::knowledge_store::KnowledgeDocumentPatch {
+                    body: Some(Some(
+                        "# Editable Audit\n\n## Instructions\nRun the updated audit.\n".to_string(),
+                    )),
+                    ai_edit_mode: Some(crate::knowledge_store::KnowledgeAiEditMode::Auto),
+                    ..Default::default()
+                }),
+                config: None,
+            },
+        )
+        .expect("edit package")
+        .document
+        .expect("edited document");
+        assert!(edited.body.contains("updated audit"));
+        assert_eq!(
+            edited.ai_edit_mode,
+            crate::knowledge_store::KnowledgeAiEditMode::Auto
+        );
+        assert!(edited.explicit_maintenance_rules);
+
+        let locked = super::edit_skill_package_document_sync(
+            &working_dir,
+            "editable-audit/SKILL.md",
+            crate::knowledge_store::KnowledgeDocumentPatch {
+                read_only: Some(true),
+                ..Default::default()
+            },
+        )
+        .expect("lock package")
+        .expect("locked document");
+        assert!(locked.read_only);
+        assert_eq!(
+            locked.ai_edit_mode,
+            crate::knowledge_store::KnowledgeAiEditMode::Auto
+        );
+
+        let error = super::edit_skill_package_document_sync(
+            &working_dir,
+            "editable-audit/SKILL.md",
+            crate::knowledge_store::KnowledgeDocumentPatch {
+                body: Some(Some("Blocked".to_string())),
+                ..Default::default()
+            },
+        )
+        .expect_err("read-only package should reject content edits");
+        assert!(error.contains("read-only"));
+
+        let unlocked = super::edit_skill_package_document_sync(
+            &working_dir,
+            "editable-audit/SKILL.md",
+            crate::knowledge_store::KnowledgeDocumentPatch {
+                read_only: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("unlock package")
+        .expect("unlocked document");
+        assert!(!unlocked.read_only);
+        assert_eq!(
+            unlocked.ai_edit_mode,
+            crate::knowledge_store::KnowledgeAiEditMode::Auto
+        );
+    }
+
+    #[test]
     fn create_skill_package_derives_short_id_from_name() {
         let temp = TempDir::new().unwrap();
         let manifest = super::create_skill_package_in_parent_sync_with_default_namespace(
@@ -7396,6 +7893,7 @@ Use Feishu safely.
                 description: "override".to_string(),
                 command_trigger: "/audit".to_string(),
                 inject_mode: Some(KnowledgeInjectMode::Path),
+                ..Default::default()
             },
         );
         crate::commands::knowledge::save_skill_config(&working_dir, &configs).expect("save config");
@@ -7493,85 +7991,6 @@ Use Feishu safely.
         let item = super::package_to_list_item(&record, "SKILL.md", None);
 
         assert_eq!(item.command_trigger.as_deref(), Some("/cli"));
-    }
-
-    #[test]
-    fn reload_skill_manifest_rejects_invalid_command_trigger() {
-        let temp = TempDir::new().unwrap();
-        let working_dir = temp.path().to_string_lossy().to_string();
-        let skill_dir = temp.path().join("Locus").join("knowledge").join("skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("bad-skill.md"),
-            r#"---
-id: kd_skill_bad_skill
-injectMode: none
-summary: Reject an invalid command trigger.
-aiMaintained: false
-skillEnabled: true
-skillSurface: command
-commandTrigger: /bad skill
----
-
-# Bad Skill
-
-## Instructions
-Do the work.
-"#,
-        )
-        .unwrap();
-
-        let err = super::reload_skill_manifest_sync(
-            &working_dir,
-            None,
-            super::SkillReloadRequest {
-                name: "bad-skill".to_string(),
-                source: None,
-            },
-        )
-        .expect_err("invalid command trigger should fail reload");
-
-        assert!(err.contains("Command trigger must be a single / command token"));
-    }
-
-    #[test]
-    fn reload_skill_manifest_rejects_legacy_body_summary() {
-        let temp = TempDir::new().unwrap();
-        let working_dir = temp.path().to_string_lossy().to_string();
-        let skill_dir = temp.path().join("Locus").join("knowledge").join("skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("legacy-skill.md"),
-            r#"---
-id: kd_skill_legacy
-injectMode: excerpt
-aiMaintained: false
-skillEnabled: true
-skillSurface: auto
----
-
-# Legacy Skill
-
-## Summary
-Legacy body summary.
-
-## Instructions
-Do the work.
-"#,
-        )
-        .unwrap();
-
-        let error = super::reload_skill_manifest_sync(
-            &working_dir,
-            None,
-            super::SkillReloadRequest {
-                name: "legacy-skill".to_string(),
-                source: None,
-            },
-        )
-        .expect_err("body heading must not supply Skill summary metadata");
-
-        assert!(error.contains("requires a non-empty frontmatter summary"));
     }
 
     #[test]

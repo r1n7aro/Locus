@@ -34,10 +34,6 @@ pub(super) fn create_skill_package_tool() -> ToolDef {
     )
 }
 
-pub(super) fn skill_reload_tool() -> ToolDef {
-    intercepted_skill_tool("skill_reload", crate::prompt::tools::SKILL_RELOAD, false)
-}
-
 pub(super) fn skill_list_tool() -> ToolDef {
     intercepted_skill_tool("skill_list", crate::prompt::tools::SKILL_LIST, false)
 }

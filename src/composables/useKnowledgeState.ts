@@ -132,11 +132,12 @@ type BranchNode = FolderNode | PackageNode;
 
 const DEFAULT_TYPE_ORDER: KnowledgeDocumentType[] = [
   "design",
+  "plan",
   "memory",
   "skill",
   "reference",
 ];
-const TYPE_PREFIX_RE = /^(design|memory|skill|reference)\//;
+const TYPE_PREFIX_RE = /^(design|plan|memory|skill|reference)\//;
 const FEISHU_REFERENCE_MANAGED_DIR = "feishu-knowledge-base";
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
 const ROOT_DIRECTORY_PAGE_KEY = "__root__";
@@ -145,6 +146,7 @@ const REFERENCE_DOCUMENT_PAGE_SIZE = 160;
 function emptyTypeStats(): Record<KnowledgeDocumentType, number> {
   return {
     design: 0,
+    plan: 0,
     memory: 0,
     skill: 0,
     reference: 0,
@@ -161,6 +163,7 @@ function emptyStorageSourceStats(): Record<KnowledgeStorageSource, number> {
 function emptyDirectoryGroups(): Record<KnowledgeDocumentType, string[]> {
   return {
     design: [],
+    plan: [],
     memory: [],
     skill: [],
     reference: [],
@@ -173,6 +176,7 @@ function emptyRootDirectoryConfigs(): Record<
 > {
   return {
     design: {},
+    plan: {},
     memory: {},
     skill: {},
     reference: {},
@@ -185,6 +189,7 @@ function emptyLoadedDirectoryDocumentPaths(): Record<
 > {
   return {
     design: new Set<string>(),
+    plan: new Set<string>(),
     memory: new Set<string>(),
     skill: new Set<string>(),
     reference: new Set<string>(),
@@ -197,6 +202,7 @@ function emptyDirectoryPageCursorState(): Record<
 > {
   return {
     design: {},
+    plan: {},
     memory: {},
     skill: {},
     reference: {},
@@ -209,6 +215,7 @@ function emptyDirectoryPageLoadingState(): Record<
 > {
   return {
     design: {},
+    plan: {},
     memory: {},
     skill: {},
     reference: {},
@@ -501,7 +508,7 @@ function skillPackageConfigSource(
   if (locator.startsWith("plugin://project/")) return "pluginProject";
   if (locator.startsWith("external://project/")) return "externalProject";
   if (locator.startsWith("external://")) return "externalUser";
-  return "app";
+  return document.storageSource === "project" ? "project" : "app";
 }
 
 function isPluginManagedExplorerNode(node: ExplorerNode): boolean {
@@ -629,6 +636,7 @@ function buildExplorerTree(
 function buildUnifiedExplorerTree(typeRoots: FolderNode[]): ExplorerNode[] {
   const rootNames: Record<KnowledgeDocumentType, string> = {
     design: "Design",
+    plan: "Plan",
     memory: "Memory",
     skill: "Skill",
     reference: "Reference",
@@ -725,6 +733,7 @@ export function buildSearchExplorerTree(
 
   const grouped: Record<KnowledgeDocumentType, KnowledgeDocumentSummary[]> = {
     design: [],
+    plan: [],
     memory: [],
     skill: [],
     reference: [],
@@ -909,6 +918,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   >(() => {
     const grouped: Record<KnowledgeDocumentType, KnowledgeDocumentSummary[]> = {
       design: [],
+      plan: [],
       memory: [],
       skill: [],
       reference: [],
@@ -1000,7 +1010,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       if (doc.effectiveAiMaintained) aiMaintained += 1;
       if (
-        (doc.type === "design" || doc.type === "memory") &&
+        (doc.type === "design" || doc.type === "plan" || doc.type === "memory") &&
         doc.effectiveInjectMode === "full"
       ) {
         fullInjectable += 1;
@@ -3508,6 +3518,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
           ? current.commandTrigger ?? ""
           : meta.commandTrigger ?? "",
       injectMode: meta.injectMode === "inherit" ? undefined : meta.injectMode,
+      ...(meta.readOnly === undefined ? {} : { readOnly: meta.readOnly }),
+      ...(meta.aiEditMode === undefined ? {} : { aiEditMode: meta.aiEditMode }),
+      ...(meta.maintenanceRules === undefined
+        ? {}
+        : { maintenanceRules: meta.maintenanceRules ?? "" }),
     };
 
     // Optimistic flip before the IPC round trip so the switch responds on
@@ -3522,6 +3537,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
       skillEnabled: nextConfig.enabled,
       skillSurface: nextConfig.surface,
       commandTrigger: nextConfig.commandTrigger,
+      ...(nextConfig.readOnly === undefined ? {} : { readOnly: nextConfig.readOnly }),
+      ...(nextConfig.aiEditMode === undefined ? {} : {
+        aiEditMode: nextConfig.aiEditMode,
+        aiMaintained: nextConfig.aiEditMode === "inherit"
+          ? "inherit"
+          : nextConfig.aiEditMode === "auto",
+        effectiveAiMaintained: nextConfig.aiEditMode === "auto",
+      }),
     };
     const previousSummary = patchDocumentSummary(current.id, optimisticPatch);
     const optimistic: KnowledgeDocumentSummary = {

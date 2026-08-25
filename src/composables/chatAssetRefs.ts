@@ -14,14 +14,14 @@ export interface ExtractedChatAssetRefs {
   refs: string[];
 }
 
-const REFERENCE_ROOT = "(?:Assets|Packages|ProjectSettings|Locus/knowledge/(?:design|memory|skill|reference)|design|memory|skill|reference)";
+const REFERENCE_ROOT = "(?:Assets|Packages|ProjectSettings|Locus/knowledge/(?:design|plan|memory|skill|reference)|design|plan|memory|skill|reference)";
 const UNITY_ASSET_REF_START_RE = new RegExp(
   `\`@?${REFERENCE_ROOT}/|\\{@${REFERENCE_ROOT}/|@${REFERENCE_ROOT}/`,
   "gi",
 );
 const UNITY_ASSET_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)\//i;
-const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:Locus\/knowledge\/)?(?:design|memory|skill|reference)\/.+\.md$/i;
-const PROJECT_KNOWLEDGE_TYPE_PREFIX_RE = /^(?:design|memory|skill|reference)\//i;
+const PROJECT_KNOWLEDGE_ROOT_RE = /^(?:Locus\/knowledge\/)?(?:design|plan|memory|skill|reference)\/.+\.md$/i;
+const PROJECT_KNOWLEDGE_TYPE_PREFIX_RE = /^(?:design|plan|memory|skill|reference)\//i;
 
 export function buildProjectKnowledgeRefPath(
   type: KnowledgeDocumentType,

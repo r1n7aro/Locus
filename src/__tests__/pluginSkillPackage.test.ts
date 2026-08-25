@@ -117,7 +117,6 @@ describe("plugin Skill package", () => {
     const setEnabledTool = readJson<{ parameters: { required: string[] } }>("tools/plugin_set_enabled.json");
     const setEnabledToolText = read("tools/plugin_set_enabled.json");
     const uninstallTool = readJson<{ parameters: { required: string[] } }>("tools/plugin_uninstall.json");
-    const skillReloadTool = read("tools/skill_reload.json");
     const viewListTool = read("tools/view_list.json");
 
     expect(exportTool).toContain("/plugin workflow");
@@ -136,8 +135,6 @@ describe("plugin Skill package", () => {
     expect(setEnabledTool.parameters.required).toEqual(["pluginId", "enabled"]);
     expect(setEnabledToolText).toContain("remain installed and listed");
     expect(uninstallTool.parameters.required).toEqual(["pluginId"]);
-    expect(skillReloadTool).toContain("pluginApp");
-    expect(skillReloadTool).toContain("pluginProject");
     expect(viewListTool).toContain("installed plugin Views");
   });
 });

@@ -3168,6 +3168,7 @@ pub async fn build_overview(
         total_document_count += 1;
         let doc_type = match row.doc_type.as_str() {
             "design" => KnowledgeType::Design,
+            "plan" => KnowledgeType::Plan,
             "memory" => KnowledgeType::Memory,
             "skill" => KnowledgeType::Skill,
             "reference" => KnowledgeType::Reference,
@@ -4858,6 +4859,7 @@ fn build_embedding_backend_state_marker(
 fn knowledge_type_from_str(value: &str) -> Result<KnowledgeType, String> {
     match value {
         "design" => Ok(KnowledgeType::Design),
+        "plan" => Ok(KnowledgeType::Plan),
         "memory" => Ok(KnowledgeType::Memory),
         "skill" => Ok(KnowledgeType::Skill),
         "reference" => Ok(KnowledgeType::Reference),
@@ -5394,6 +5396,7 @@ fn normalize_text_scan_path_prefix(path_prefix: Option<&str>) -> Result<Option<S
         .unwrap_or(&normalized);
     let normalized = normalized
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))

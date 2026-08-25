@@ -188,7 +188,7 @@ function resolveKnowledgeDocumentPath(
   if (!normalized) {
     throw new Error("knowledge_read requires path");
   }
-  if (/^(design|memory|skill|reference)\//.test(normalized)) {
+  if (/^(design|plan|memory|skill|reference)\//.test(normalized)) {
     return normalized;
   }
   if (!type) {
@@ -210,7 +210,13 @@ function resolveKnowledgeDirectoryPath(
   if (!normalized) {
     throw new Error("knowledge_read requires path");
   }
-  if (/^(design|memory|skill|reference)\//.test(normalized)) {
+  if (/^(design|plan|memory|skill|reference)\//.test(normalized)) {
+    return normalized;
+  }
+  if (type && normalized === type) {
+    return normalized;
+  }
+  if (/^(design|plan|memory|skill|reference)$/.test(normalized) && !type) {
     return normalized;
   }
   if (!type) {
@@ -1030,6 +1036,9 @@ export function setSkillConfig(
     description: config.description,
     commandTrigger: config.commandTrigger,
     injectMode: config.injectMode,
+    readOnly: config.readOnly,
+    aiEditMode: config.aiEditMode,
+    maintenanceRules: config.maintenanceRules,
   });
 }
 
@@ -1064,6 +1073,7 @@ export function setDefaultSkillPackageNamespace(value: string): Promise<string> 
 export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManifest> {
   return ipcInvoke<SkillManifest>("create_skill_scaffold", {
     kind: input.kind ?? "md",
+    source: input.source,
     name: input.name,
     path: input.path,
     packageId: input.packageId,

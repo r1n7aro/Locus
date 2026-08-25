@@ -1,16 +1,21 @@
 {
-  "description": "Create an app Skill package with validated package metadata. The package is installed under the Locus app Skill directory, such as `%APPDATA%/locus/skills/<package-id>/` on Windows, and starts with `skill.json` plus `SKILL.md`. Returns the created Skill path, command trigger, and packageRoot for later filesystem edits. Omit `packageId` to derive a short kebab-case id from `name`; provide it for distributed packages or a specific namespace.",
+  "description": "Create a Locus Skill package with validated package metadata. Ask the user to choose the current Project or the local Locus installation before calling this tool unless the request already states the scope. Project packages are created under `<project>/Locus/skills/<package-id>/`; app packages are created under the Locus package root such as `%APPDATA%/locus/skills/<package-id>/` on Windows. Never create packages in external or system Agent skill directories such as `.codex/skills` or `.claude/skills`. Returns the created Skill path, command trigger, and packageRoot for later filesystem edits.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "source": {
+        "type": "string",
+        "enum": ["project", "app"],
+        "description": "Required creation scope selected by the user: `project` for the current Project, or `app` for the local Locus installation."
+      },
       "name": {
         "type": "string",
         "description": "Display-oriented package name."
       },
       "packageId": {
         "type": ["string", "null"],
-        "description": "Optional app Skill package id, for example `asset-audit`, `studio.tools.asset-audit`, or `io.github.user.asset-audit`. When omitted, Locus derives a short `<name-slug>` package id."
+        "description": "Optional Locus Skill package id, for example `asset-audit`, `studio.tools.asset-audit`, or `io.github.user.asset-audit`. When omitted, Locus derives a short kebab-case id from `name`."
       },
       "version": {
         "type": "string",
@@ -41,6 +46,6 @@
         "description": "Whether the package can be selected automatically by the model. Defaults to true."
       }
     },
-    "required": ["name", "version", "summary"]
+    "required": ["source", "name", "version", "summary"]
   }
 }

@@ -7,6 +7,8 @@ Plan mode is active. The user indicated that they do not want you to execute yet
 {plan_file_info}
 Build your plan incrementally by writing to and editing this file with the write/edit tools. It is the ONLY file you are allowed to modify — every other action must be read-only.
 
+Plans that should remain part of the project's long-term knowledge belong under `Locus/knowledge/plan/`. During plan mode, keep writing only to the session plan file above; when persistence is needed, include creating or updating the corresponding `Locus/knowledge/plan/*.md` document as a post-approval implementation step.
+
 ## Available Capabilities
 - Read-only exploration is fully available: read, grep, list, the code_* language tools, unity_code_usages, unity_asset_search, unity_ref_search, unity_yaml_*, knowledge_*, and web_fetch.
 - unity_recompile is allowed: it validates feasibility via compile diagnostics without modifying sources.

@@ -2,7 +2,6 @@
 title: Unity YAML Read Extensions
 tools:
   - skill_list
-  - skill_reload
   - unity_yaml_read
 ---
 
@@ -46,7 +45,7 @@ Declare extensions in `skill.json` at the top level, next to `tools`:
 - `path` is required: a package-relative `.cs` file.
 - `match` requires at least one of `scriptGuids` (32-char lowercase hex, validated) or `classIds` (Unity class ids).
 - `name` defaults to the file stem of `path`; `entryType` defaults to the file stem; `method` defaults to `Read`.
-- Manifest validation runs on package load; a bad entry fails the whole package, so confirm with `skill_reload` after edits.
+- Manifest validation runs on package load; a bad entry fails the whole package, so confirm the refreshed package with `skill_list` after edits.
 
 ## Choosing the matcher
 
@@ -122,6 +121,6 @@ public static class DialogueAssetReader
 
 1. Pick the target type. For a ScriptableObject, copy the script GUID from its `.cs.meta`; for a built-in type, find its class id.
 2. Add the `unityYamlReadExtensions` entry to `skill.json` and the reader `.cs` under `unity/Editor/` in the Skill package.
-3. Validate with `skill_reload`; fix any manifest errors it reports.
+3. Confirm the automatically refreshed package with `skill_list`; fix the manifest when the package is absent or its metadata is stale.
 4. Test with `unity_yaml_read` on a matching asset while the Unity Editor is connected. Confirm the output starts with the `[unity_yaml_read extension ...]` header; if a `Note:` fallback appears instead, fix the reported compile or invoke error.
 5. Package and publish as usual — the extension travels inside the Skill package. During the portability audit, record any project types the reader depends on in `dependencies.project`.

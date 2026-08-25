@@ -46,8 +46,12 @@ describe("skill package namespace settings", () => {
 
     expect(createSkillPackageTool).toContain("short kebab-case id");
     expect(createSkillPackageTool).toContain("studio.tools.asset-audit");
+    expect(createSkillPackageTool).toContain('"enum": ["project", "app"]');
+    expect(createSkillPackageTool).toContain("<project>/Locus/skills/<package-id>/");
     expect(createSkillDoc).toContain("  - create_skill_package");
     expect(createSkillDoc).toContain("call `create_skill_package`");
+    expect(createSkillDoc).toContain("ask the user to choose the current Project");
+    expect(createSkillDoc).toContain("Never create a Locus Skill in external or system Agent skill directories");
     expect(createSkillDoc).toContain("short kebab-case package ids");
     expect(createSkillDoc).toContain("studio.tools.asset-audit");
     expect(zh).not.toContain('"settings.tab.knowledge"');

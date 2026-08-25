@@ -10,7 +10,6 @@ commandTrigger: /create-skill
 argumentHint: <skill-name> [--package]
 tools:
   - create_skill_package
-  - skill_reload
   - skill_list
   - read
   - write
@@ -24,6 +23,9 @@ tools:
 Command arguments: `<skill-name>` names the skill to create or edit; `--package` forces the package storage model. Ask for a name only when the request does not provide or imply one.
 
 1. Scope the workflow before creating anything.
+   - Before creating files, ask the user to choose the current Project or the local Locus installation unless the request already states the scope. Treat this as a required choice, independent from the storage model.
+   - Project scope stores packages under `<project>/Locus/skills/<package-id>/`. Locus installation scope stores packages under the writable Locus package root, `%APPDATA%/locus/skills/<package-id>/` on Windows.
+   - Keep creation inside those Locus-owned roots. Never create a Locus Skill in external or system Agent skill directories such as `.codex/skills`, `.claude/skills`, `.agents/skills`, or their equivalents.
    - Ask what repeated task this skill standardizes, what output it must produce, and which checks must always happen.
    - Create a skill only when the workflow has stable steps, reusable judgment rules, or a consistent deliverable. Keep skills focused on SOPs: execution order, checks, and output requirements.
    - Keep the full workflow under agent control through the skill body: sequencing, branching, project inspection, retries, validation, and final reporting belong in instructions, not in tools. Executable capabilities stay subordinate; step 6 defines when a package tool is justified.
@@ -32,6 +34,7 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
 
 2. Choose the storage model.
    - Use a single Markdown document (`kind: "md"`) only for a project-local SOP that needs instructions and no local runtime assets.
+   - Use a package for every Skill created in the local Locus installation; single Markdown skills remain Project-scoped.
    - You MUST use a package (`kind: "package"`) when the skill depends on anything beyond one Markdown file: a CLI or compiled binary, Python or shell helpers, Unity C# files, package-local reference docs, multiple documents, distribution, or app installation — even when the initial instructions look short. Do not create an md skill that merely tells the user to install the dependency unless the user explicitly asks for docs-only guidance.
    - Honor `--package` from the command arguments as an explicit package request.
    - Use short kebab-case package ids like `asset-audit` by default. Use an author-owned namespace like `studio.tools.asset-audit` or `io.github.user.asset-audit` for distributed packages.
@@ -40,11 +43,11 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
    - Run `skill_list` first when a name or command-trigger conflict is likely.
    - Markdown document: use `write` to create `Locus/knowledge/skill/<path>.md` with ordinary Markdown body content. Use a nested path such as `unity/<slug>.md` only when topic grouping materially improves retrieval. `write` generates and reports the frontmatter.
    - After `write`, use the reported frontmatter in one exact `edit` to add the required one-line `summary`. Add `tools`, `argumentHint`, `commandTrigger`, or a different `skillSurface` in the same edit only when the workflow needs them. The default surface is command-only and the default command trigger comes from the file name.
-   - Package: call `create_skill_package` with `name: <display name>`, `version: <semver>`, `summary: <one line>`, plus optional `packageId`, `commandTrigger`, `argumentHint`, `commandEnabled`, and `modelInvocationEnabled`. When `packageId` is omitted, Locus derives a short kebab-case id from `name`; if the derived id already exists, ask the user for an exact package id before calling `create_skill_package` again.
+   - Package: call `create_skill_package` with the user-selected `source: project|app`, `name: <display name>`, `version: <semver>`, `summary: <one line>`, plus optional `packageId`, `commandTrigger`, `argumentHint`, `commandEnabled`, and `modelInvocationEnabled`. When `packageId` is omitted, Locus derives a short kebab-case id from `name`; if the derived id already exists, ask the user for an exact package id before calling `create_skill_package` again.
    - Seed `summary` and `body` in `create_skill_package` so the package is usable immediately. Its default command trigger comes from the final package-id segment.
-   - Storage locations: project skill documents live under the project knowledge root; built-in skills live at the root of `skill/` in the app knowledge root and are user-level workflows; new app packages are created under the app skill package root, `%APPDATA%/locus/skills/<package-id>/` on Windows. The package result includes `packageRoot` — use it for all later file edits.
+   - Storage locations: project skill documents live under the project knowledge root; Project packages live under `<project>/Locus/skills/<package-id>/`; built-in skills live at the root of `skill/` in the app knowledge root; new app packages live under `%APPDATA%/locus/skills/<package-id>/` on Windows. The package result includes `packageRoot` — use it for all later file edits.
    - For an existing Markdown skill, update its physical file with `edit`. For an existing package, edit files under its package root with filesystem tools.
-   - `create_skill_package` validates and reloads the new package before returning. Run `skill_reload` after later content edits, and after creating or editing a Markdown document. Use `source: project` for project documents, `source: app` for app packages, `pluginApp` or `pluginProject` for plugin packages, and `externalUser` or `externalProject` for generic external Skills.
+   - `create_skill_package` validates the new package before returning. Locus automatically refreshes Skill manifests after later file edits. Use `source: project` for Project documents and Project packages, `source: app` for packages installed in Locus, `pluginApp` or `pluginProject` for plugin packages, and `externalUser` or `externalProject` for generic external Skills.
 
 4. Author the body to match the trigger surface.
    - Declare the Locus tool names the skill needs on its first turn in frontmatter `tools`, for both Markdown documents and package `SKILL.md` files. Mentioning tool names in the body does not register them; Locus loads the declared tools when the user invokes the slash command.
@@ -53,7 +56,7 @@ Command arguments: `<skill-name>` names the skill to create or edit; `--package`
    - For auto-recalled skills, keep selection guidance in frontmatter `summary`; the body begins with instructions or the first domain section. Recall uses that summary, so make it discriminating.
    - Every package root `SKILL.md` requires a non-empty frontmatter `summary`. At the `excerpt` level a workspace override takes precedence over the root summary. `create_skill_package` seeds frontmatter `summary` and writes `"injectMode": "excerpt"` into `skill.json`.
    - Keep root frontmatter `summary` aligned with manifest `description`. `## L1`, `## Summary`, and `## Content` are ordinary body headings and do not define Skill metadata.
-   - To create or repair a command-only Markdown skill file by hand, write ordinary Markdown to its designated project Skill directory, add the summary to the generated frontmatter with `edit`, then run `skill_reload`. The `write` execution layer reports the generated metadata and first content line. Existing files retain their frontmatter when edited.
+   - To create or repair a command-only Markdown skill file by hand, write ordinary Markdown to its designated project Skill directory, then add the summary to the generated frontmatter with `edit`. The `write` execution layer reports the generated metadata and first content line. Existing files retain their frontmatter when edited.
 
 ```markdown
 ---
@@ -183,7 +186,7 @@ tools:
    - If the legacy skill has bundled files or references, migrate it into a package and link detailed docs from the root `SKILL.md`.
 
 9. Validate, then report.
-   - For a Markdown document or an edited package, run `skill_reload` and confirm it returns the manifest without errors. A newly created package is already validated by `create_skill_package`.
+   - For a Markdown document or an edited package, run `skill_list` after the automatic refresh and confirm the expected manifest, source, command trigger, and package root. A newly created package is already validated by `create_skill_package`.
    - For a document: report the knowledge path, repo file path, and slash command trigger.
    - For a package: report the package id, `packageRoot`, root document path, command trigger, and any Unity C# install target.
    - Cite package child documents by full knowledge path, such as `skill/external-layout/references/workflow.md`; package-relative paths belong only inside package docs.

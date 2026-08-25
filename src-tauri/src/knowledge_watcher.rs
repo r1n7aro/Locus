@@ -552,6 +552,7 @@ fn path_components_to_slash<'a>(components: impl Iterator<Item = Component<'a>>)
 fn parse_knowledge_type(value: &str) -> Option<KnowledgeType> {
     match value {
         "design" => Some(KnowledgeType::Design),
+        "plan" => Some(KnowledgeType::Plan),
         "memory" => Some(KnowledgeType::Memory),
         "skill" => Some(KnowledgeType::Skill),
         "reference" => Some(KnowledgeType::Reference),
@@ -746,6 +747,7 @@ mod tests {
     #[test]
     fn parses_knowledge_type_from_root_segment() {
         assert_eq!(parse_knowledge_type("design"), Some(KnowledgeType::Design));
+        assert_eq!(parse_knowledge_type("plan"), Some(KnowledgeType::Plan));
         assert_eq!(parse_knowledge_type("memory"), Some(KnowledgeType::Memory));
         assert_eq!(parse_knowledge_type("skill"), Some(KnowledgeType::Skill));
         assert_eq!(

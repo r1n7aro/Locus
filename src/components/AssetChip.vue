@@ -37,7 +37,7 @@ const emit = defineEmits<{
 
 const notificationStore = useNotificationStore();
 const { openDocument: openKnowledgeDocument } = useKnowledgeDocumentOpen();
-const KNOWLEDGE_REF_ROOT_RE = /^(design|memory|skill|reference)\/.+\.md$/i;
+const KNOWLEDGE_REF_ROOT_RE = /^(design|plan|memory|skill|reference)\/.+\.md$/i;
 
 const normalizedPath = computed(() =>
   props.path.trim().replace(/\\/g, "/").replace(/\/+$/, ""),

@@ -16,6 +16,7 @@ static KNOWLEDGE_LAYOUT_MIGRATION_LOCK: Mutex<()> = Mutex::new(());
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeType {
     Design,
+    Plan,
     Memory,
     Skill,
     Reference,
@@ -25,14 +26,21 @@ impl KnowledgeType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Design => "design",
+            Self::Plan => "plan",
             Self::Memory => "memory",
             Self::Skill => "skill",
             Self::Reference => "reference",
         }
     }
 
-    pub fn all() -> [Self; 4] {
-        [Self::Design, Self::Memory, Self::Skill, Self::Reference]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Design,
+            Self::Plan,
+            Self::Memory,
+            Self::Skill,
+            Self::Reference,
+        ]
     }
 }
 
@@ -1063,7 +1071,7 @@ pub fn default_summary_enabled_for_type(doc_type: KnowledgeType) -> bool {
 
 pub fn default_document_inject_mode_for_type(doc_type: KnowledgeType) -> KnowledgeInjectMode {
     match doc_type {
-        KnowledgeType::Design => KnowledgeInjectMode::Path,
+        KnowledgeType::Design | KnowledgeType::Plan => KnowledgeInjectMode::Path,
         // Skills default to L1 so the knowledge tree carries their load guidance.
         KnowledgeType::Skill => KnowledgeInjectMode::Excerpt,
         KnowledgeType::Memory | KnowledgeType::Reference => KnowledgeInjectMode::None,
@@ -1102,6 +1110,9 @@ pub fn default_maintenance_rules_for_type(doc_type: KnowledgeType) -> Option<&'s
     Some(match doc_type {
         KnowledgeType::Design => {
             "- Record confirmed design decisions and constraints\n- Keep open questions current and remove outdated approaches\n- Preserve the existing document structure while updating details"
+        }
+        KnowledgeType::Plan => {
+            "- Keep objectives, steps, dependencies, and completion criteria explicit\n- Update progress and blockers as execution advances\n- Archive or remove plans that are completed or no longer applicable"
         }
         KnowledgeType::Memory => {
             "- Keep only durable and reusable project memory\n- Consolidate duplicates or conflicts into the latest conclusion\n- Remove temporary context, one-off tasks, and unsupported guesses"
@@ -2313,6 +2324,7 @@ fn normalize_relative_path(path: &str) -> Result<String, String> {
         .unwrap_or(&normalized);
     let normalized = normalized
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))
@@ -2340,6 +2352,7 @@ fn normalize_relative_prefix(path: &str) -> Result<String, String> {
         .unwrap_or(&normalized);
     let normalized = normalized
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))
@@ -3693,6 +3706,8 @@ pub fn guess_type_from_path(path: &str) -> Option<KnowledgeType> {
     let normalized = path.replace('\\', "/");
     if normalized.starts_with("design/") {
         Some(KnowledgeType::Design)
+    } else if normalized.starts_with("plan/") {
+        Some(KnowledgeType::Plan)
     } else if normalized.starts_with("memory/") {
         Some(KnowledgeType::Memory)
     } else if normalized.starts_with("skill/") {
@@ -6664,6 +6679,24 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn plan_is_a_builtin_knowledge_root_with_path_injection() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        ensure_knowledge_roots(&working_dir).expect("knowledge roots");
+
+        assert!(knowledge_root(&working_dir).join("plan").is_dir());
+        assert_eq!(
+            guess_type_from_path("plan/release.md"),
+            Some(KnowledgeType::Plan)
+        );
+        assert_eq!(
+            default_document_inject_mode_for_type(KnowledgeType::Plan),
+            KnowledgeInjectMode::Path
+        );
+    }
+
     fn sample_doc() -> KnowledgeDocument {
         KnowledgeDocument {
             id: "kd_test".to_string(),
@@ -7699,10 +7732,7 @@ updatedAt: 2
             skill_surface: Some(SkillSurface::Both),
             command_trigger: Some("/create-skill".to_string()),
             argument_hint: Some("<skill-name>".to_string()),
-            tools: vec![
-                "create_skill_package".to_string(),
-                "skill_reload".to_string(),
-            ],
+            tools: vec!["create_skill_package".to_string(), "skill_list".to_string()],
             summary: Some("Create a new Skill.".to_string()),
             body: "## Instructions\n\n1. Do the work.".to_string(),
             maintenance_rules: None,
@@ -7721,7 +7751,7 @@ updatedAt: 2
         assert_eq!(parsed.skill_surface, Some(SkillSurface::Both));
         assert_eq!(parsed.command_trigger.as_deref(), Some("/create-skill"));
         assert_eq!(parsed.argument_hint.as_deref(), Some("<skill-name>"));
-        assert_eq!(parsed.tools, vec!["create_skill_package", "skill_reload"]);
+        assert_eq!(parsed.tools, vec!["create_skill_package", "skill_list"]);
         assert_eq!(parsed.summary.as_deref(), Some("Create a new Skill."));
     }
 

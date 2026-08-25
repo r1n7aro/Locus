@@ -56,7 +56,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(knowledge::knowledge_query_tool());
     registry
         .register_builtin_with_load_mode(skill::create_skill_package_tool(), ToolLoadMode::Skill);
-    registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
     registry.register_builtin_with_load_mode(agent::agent_reload(), ToolLoadMode::Skill);
     registry.register_builtin(mcp::mcp_reload_tool());

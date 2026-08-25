@@ -18,6 +18,8 @@ function labelForType(type: KnowledgeSearchResult["type"]): string {
   switch (type) {
     case "design":
       return t("knowledge.type.design");
+    case "plan":
+      return t("knowledge.type.plan");
     case "memory":
       return t("knowledge.type.memory");
     case "skill":

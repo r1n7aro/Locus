@@ -45,7 +45,7 @@ describe("knowledgeEditMode", () => {
     expect(isKnowledgeEditModeLocked(makeEditModeDocument({ readOnly: true }))).toBe(true);
   });
 
-  it("locks the edit mode selector for managed external sources", () => {
+  it("locks managed external sources while writable packages follow readOnly", () => {
     expect(
       isKnowledgeEditModeLocked(makeEditModeDocument({ storageSource: "app" })),
     ).toBe(true);
@@ -62,6 +62,14 @@ describe("knowledgeEditMode", () => {
     expect(
       isKnowledgeEditModeLocked(
         makeEditModeDocument({ externalSource: { provider: "package" } }),
+      ),
+    ).toBe(false);
+    expect(
+      isKnowledgeEditModeLocked(
+        makeEditModeDocument({
+          readOnly: true,
+          externalSource: { provider: "package" },
+        }),
       ),
     ).toBe(true);
   });

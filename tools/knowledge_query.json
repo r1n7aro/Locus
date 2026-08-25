@@ -1,5 +1,5 @@
 {
-  "description": "Search registered Design, Memory, Reference, and Skill sources. Provide at least one of `lexicalQuery` or `semanticQuery`. Summary results use one line per document in `<path> :: <summary>` format. Detailed results start each document with a single-line `--- <path> | lines <start>-<end> | summary <line> | body <line> ---` header followed by optional hit context. This header contains the directly readable real file path and 1-based physical line range for targeted reads. Workspace files use workspace-relative paths; registered sources outside the workspace use absolute physical paths. Frontmatter lines are part of the physical line coordinate system. Result titles are omitted because each title is identical to its file name; ranking metadata is also omitted. Use `read` with the returned path, offset, and limit.",
+  "description": "Search registered Design, Plan, Memory, Reference, and Skill sources. Provide at least one of `lexicalQuery` or `semanticQuery`. Summary results use one line per document in `<path> :: <summary>` format. Detailed results start each document with a single-line `--- <path> | lines <start>-<end> | summary <line> | body <line> ---` header followed by optional hit context. This header contains the directly readable real file path and 1-based physical line range for targeted reads. Workspace files use workspace-relative paths; registered sources outside the workspace use absolute physical paths. Frontmatter lines are part of the physical line coordinate system. Result titles are omitted because each title is identical to its file name; ranking metadata is also omitted. Use `read` with the returned path, offset, and limit.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -19,7 +19,7 @@
       },
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed directory path prefix. Valid roots: `design/`, `memory/`, `skill/`, and `reference/`. Use `skill/` for workflows, SOPs, slash-command skills, tool/package instructions, and reusable execution procedures. Examples: `skill/`, `skill/unity/`, `memory/`, `design/`, `reference/unity/`. Directory prefixes do not end with `.md`."
+        "description": "Optional type-prefixed directory path prefix. Valid roots: `design/`, `plan/`, `memory/`, `skill/`, and `reference/`. Use `skill/` for workflows, SOPs, slash-command skills, tool/package instructions, and reusable execution procedures. Examples: `skill/`, `skill/unity/`, `plan/`, `memory/`, `design/`, `reference/unity/`. Directory prefixes do not end with `.md`."
       },
       "includeSummary": {
         "type": "boolean",

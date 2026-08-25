@@ -141,8 +141,20 @@ function packageIdForSkillDocument(document: KnowledgeDocument | null | undefine
 }
 
 const isReadOnly = computed(() => !!props.document?.readOnly);
-const isEditModeLocked = computed(() => isKnowledgeEditModeLocked(props.document));
+const isPackageDocument = computed(() => props.document?.externalSource?.provider === "package");
 const documentPath = computed(() => props.document?.path?.trim() || "");
+const isPackageRootDocument = computed(() => {
+  if (!isPackageDocument.value) return false;
+  const segments = documentPath.value.replace(/\\/g, "/").split("/").filter(Boolean);
+  return segments.length === 2 && segments[1]?.toLowerCase() === "skill.md";
+});
+const packageDocumentConfigLocked = computed(() =>
+  isPackageDocument.value && !isPackageRootDocument.value,
+);
+const documentMetaDisabled = computed(() => isReadOnly.value || packageDocumentConfigLocked.value);
+const isEditModeLocked = computed(() =>
+  isKnowledgeEditModeLocked(props.document) || packageDocumentConfigLocked.value,
+);
 const documentContentKey = computed(() =>
   `${props.document?.type ?? ""}:${props.document?.id ?? ""}:${documentPath.value}`
 );
@@ -241,7 +253,7 @@ const editModeDropdownLabel = computed(() => {
     : labelForKnowledgeEditMode(editMode.value);
 });
 const usesInheritedMaintenanceRules = computed(() => props.document?.aiEditMode === "inherit");
-const rulesEditorDisabled = computed(() => isReadOnly.value);
+const rulesEditorDisabled = computed(() => documentMetaDisabled.value);
 const rulesHint = computed(() => t("knowledge.preview.rulesHint"));
 const rulesPropertyValue = computed(() => rulesDraft.value);
 
@@ -350,7 +362,7 @@ const currentSkillCommandTrigger = computed(() => {
 // Saving no longer disables the skill config controls: meta updates are
 // optimistic and serialized upstream, so no disabled-dim flash per toggle.
 const skillCommandInputDisabled = computed(() =>
-  isReadOnly.value || !skillCommandChannelOn.value,
+  documentMetaDisabled.value || !skillCommandChannelOn.value,
 );
 const showSkillCommandFields = computed(() => skillCommandChannelOn.value);
 const skillPackageId = computed(() => {
@@ -855,7 +867,13 @@ function hasInvalidDocumentFileStem(value: string): boolean {
 }
 
 function buildPendingDocumentNamePatch(): KnowledgeDocumentPatch | null {
-  if (!props.document || isReadOnly.value || props.saveLoading || !fileNameDirty.value) return null;
+  if (
+    !props.document
+    || isReadOnly.value
+    || isPackageDocument.value
+    || props.saveLoading
+    || !fileNameDirty.value
+  ) return null;
   const nextStem = normalizeDocumentFileStemValue(fileNameDraft.value);
   const currentStem = normalizeDocumentFileStemValue(currentDocumentFileStem.value);
   if (!nextStem) {
@@ -1189,6 +1207,8 @@ function labelForType(type?: KnowledgeDocumentType | null): string {
   switch (type) {
     case "design":
       return t("knowledge.type.design");
+    case "plan":
+      return t("knowledge.type.plan");
     case "memory":
       return t("knowledge.type.memory");
     case "skill":
@@ -1253,7 +1273,7 @@ function labelForProvider(provider?: string | null): string {
           <article v-else class="document-page">
             <header class="document-heading">
               <span
-                v-if="!isReadOnly"
+                v-if="!isReadOnly && !isPackageDocument"
                 class="document-title-input-shell"
                 :data-value="titleMeasureText"
               >
@@ -1297,7 +1317,7 @@ function labelForProvider(provider?: string | null): string {
                   :selected-label="injectModeDropdownLabel"
                   :options="injectModeOptions"
                   teleport
-                  :disabled="isReadOnly"
+                  :disabled="documentMetaDisabled"
                   :aria-label="t('knowledge.meta.injectMode')"
                   @update:model-value="onInjectModeChange"
                 />
@@ -1321,7 +1341,7 @@ function labelForProvider(provider?: string | null): string {
                   <span class="document-property-label">{{ t("knowledge.skill.enabledLabel") }}</span>
                   <BaseSwitch
                     :model-value="skillEnabled"
-                    :disabled="isReadOnly"
+                    :disabled="documentMetaDisabled"
                     :aria-label="t('knowledge.skill.enabledLabel')"
                     @update:model-value="onSkillEnabledChange"
                   />
@@ -1330,7 +1350,7 @@ function labelForProvider(provider?: string | null): string {
                   <span class="document-property-label">{{ t("knowledge.skill.commandChannelLabel") }}</span>
                   <BaseSwitch
                     :model-value="skillCommandChannelOn"
-                    :disabled="isReadOnly"
+                    :disabled="documentMetaDisabled"
                     :aria-label="t('knowledge.skill.commandChannelLabel')"
                     @update:model-value="onSkillCommandChannelChange"
                   />
@@ -1353,7 +1373,7 @@ function labelForProvider(provider?: string | null): string {
                     v-model="skillArgumentHintDraft"
                     class="document-property-input"
                     type="text"
-                    :disabled="isReadOnly"
+                    :disabled="documentMetaDisabled"
                     @blur="persistSkillArgumentHint"
                     @keydown="onSkillArgumentHintKeydown"
                   />

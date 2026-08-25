@@ -15,6 +15,7 @@ import { labelForInjectMode } from "./knowledgeMetaLabels";
 
 const KNOWLEDGE_TYPES: KnowledgeDocumentType[] = [
   "design",
+  "plan",
   "memory",
   "skill",
   "reference",
@@ -67,6 +68,8 @@ function promptTypeLabel(type: KnowledgeDocumentType): string {
   switch (type) {
     case "design":
       return "design/ :: Project design direction discussed with the user";
+    case "plan":
+      return "plan/ :: Execution plans, milestones, dependencies, and progress";
     case "memory":
       return "memory/ :: All of your memory";
     case "skill":

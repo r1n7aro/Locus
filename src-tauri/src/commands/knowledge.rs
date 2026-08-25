@@ -20,12 +20,12 @@ use crate::knowledge_index::{
     KnowledgeGeneralConfig, KnowledgeIndexState, KnowledgeOverview, LexicalRebuildStatus,
 };
 use crate::knowledge_store::{
-    self, KnowledgeCreateRequest, KnowledgeDeleteRequest, KnowledgeDirectoryConfig,
-    KnowledgeDirectoryConfigPatch, KnowledgeDirectoryConfigRecord, KnowledgeDocumentPatch,
-    KnowledgeEditRequest, KnowledgeExternalDirectoryBinding, KnowledgeInjectMode,
-    KnowledgeListItem, KnowledgeMoveRequest, KnowledgeMutationResponse, KnowledgeReadRequest,
-    KnowledgeReadResponse, KnowledgeSearchHit, KnowledgeSourceProvider, KnowledgeTargetKind,
-    KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
+    self, KnowledgeAiEditMode, KnowledgeCreateRequest, KnowledgeDeleteRequest,
+    KnowledgeDirectoryConfig, KnowledgeDirectoryConfigPatch, KnowledgeDirectoryConfigRecord,
+    KnowledgeDocumentPatch, KnowledgeEditRequest, KnowledgeExternalDirectoryBinding,
+    KnowledgeInjectMode, KnowledgeListItem, KnowledgeMoveRequest, KnowledgeMutationResponse,
+    KnowledgeReadRequest, KnowledgeReadResponse, KnowledgeSearchHit, KnowledgeSourceProvider,
+    KnowledgeTargetKind, KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
 use crate::local_docs::{
     self, LocalReferenceImportRequest, LocalReferenceImportState, LocalReferenceImportStatus,
@@ -334,6 +334,12 @@ pub struct SkillConfig {
     /// `None` means no workspace override: the manifest or document value stays in effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub ai_edit_mode: KnowledgeAiEditMode,
+    #[serde(default)]
+    pub maintenance_rules: String,
 }
 
 fn default_true() -> bool {
@@ -348,6 +354,9 @@ impl Default for SkillConfig {
             description: String::new(),
             command_trigger: String::new(),
             inject_mode: None,
+            read_only: false,
+            ai_edit_mode: KnowledgeAiEditMode::Inherit,
+            maintenance_rules: String::new(),
         }
     }
 }
@@ -438,6 +447,9 @@ pub async fn set_skill_config(
     description: Option<String>,
     command_trigger: Option<String>,
     inject_mode: Option<KnowledgeInjectMode>,
+    read_only: Option<bool>,
+    ai_edit_mode: Option<KnowledgeAiEditMode>,
+    maintenance_rules: Option<String>,
     app_handle: AppHandle,
     workspace: State<'_, Arc<Workspace>>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
@@ -449,7 +461,7 @@ pub async fn set_skill_config(
     let existing = map.get(&key).cloned().unwrap_or_default();
     // Omitted fields keep their stored override state instead of pinning the
     // currently effective manifest value into the workspace config.
-    let config = SkillConfig {
+    let mut config = SkillConfig {
         enabled,
         surface,
         description: description.unwrap_or(existing.description),
@@ -457,7 +469,18 @@ pub async fn set_skill_config(
             .map(|value| value.trim().to_string())
             .unwrap_or(existing.command_trigger),
         inject_mode: inject_mode.or(existing.inject_mode),
+        read_only: read_only.unwrap_or(existing.read_only),
+        ai_edit_mode: ai_edit_mode.unwrap_or(existing.ai_edit_mode),
+        maintenance_rules: maintenance_rules.unwrap_or(existing.maintenance_rules),
     };
+    if config.ai_edit_mode == KnowledgeAiEditMode::Auto
+        && config.maintenance_rules.trim().is_empty()
+    {
+        config.maintenance_rules =
+            knowledge_store::default_maintenance_rules_for_type(KnowledgeType::Skill)
+                .unwrap_or_default()
+                .to_string();
+    }
     let fallback = super::skill::fallback_command_name_for_skill_ref(&key);
     let config = super::skill::normalize_and_validate_skill_config(&config, &fallback)?;
     map.insert(key, config);
@@ -504,6 +527,7 @@ pub async fn get_all_skill_configs(
 fn parse_knowledge_type(value: &str) -> Result<KnowledgeType, String> {
     match value.trim() {
         "design" => Ok(KnowledgeType::Design),
+        "plan" => Ok(KnowledgeType::Plan),
         "memory" => Ok(KnowledgeType::Memory),
         "skill" => Ok(KnowledgeType::Skill),
         "reference" => Ok(KnowledgeType::Reference),
@@ -518,6 +542,8 @@ fn parse_knowledge_type_from_path(path: &str) -> Option<KnowledgeType> {
         .unwrap_or(&normalized);
     if normalized.starts_with("design/") {
         Some(KnowledgeType::Design)
+    } else if normalized.starts_with("plan/") {
+        Some(KnowledgeType::Plan)
     } else if normalized.starts_with("memory/") {
         Some(KnowledgeType::Memory)
     } else if normalized.starts_with("skill/") {
@@ -540,6 +566,7 @@ fn parse_knowledge_type_from_prefix(path: &str) -> Option<KnowledgeType> {
 
     match normalized.split('/').next() {
         Some("design") => Some(KnowledgeType::Design),
+        Some("plan") => Some(KnowledgeType::Plan),
         Some("memory") => Some(KnowledgeType::Memory),
         Some("skill") => Some(KnowledgeType::Skill),
         Some("reference") => Some(KnowledgeType::Reference),
@@ -553,6 +580,7 @@ fn normalize_knowledge_path(path: &str) -> Result<String, String> {
         .strip_prefix("Locus/knowledge/")
         .unwrap_or(&normalized)
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))
@@ -569,6 +597,7 @@ pub(crate) fn require_knowledge_document_path_suffix(path: &str) -> Result<(), S
         .trim_matches('/');
     let stripped = normalized
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))
@@ -595,6 +624,7 @@ fn normalize_knowledge_directory_path(path: &str) -> Result<String, String> {
         .trim_matches('/');
     let stripped = stripped
         .strip_prefix("design/")
+        .or_else(|| stripped.strip_prefix("plan/"))
         .or_else(|| stripped.strip_prefix("memory/"))
         .or_else(|| stripped.strip_prefix("skill/"))
         .or_else(|| stripped.strip_prefix("reference/"))
@@ -625,11 +655,15 @@ fn normalize_knowledge_path_prefix(path: &str) -> Result<String, String> {
         .strip_prefix("Locus/knowledge/")
         .unwrap_or(&normalized)
         .trim_matches('/');
-    if matches!(normalized, "design" | "memory" | "skill" | "reference") {
+    if matches!(
+        normalized,
+        "design" | "plan" | "memory" | "skill" | "reference"
+    ) {
         return Ok(String::new());
     }
     let normalized = normalized
         .strip_prefix("design/")
+        .or_else(|| normalized.strip_prefix("plan/"))
         .or_else(|| normalized.strip_prefix("memory/"))
         .or_else(|| normalized.strip_prefix("skill/"))
         .or_else(|| normalized.strip_prefix("reference/"))
@@ -1102,6 +1136,22 @@ pub(crate) fn execute_knowledge_edit_request(
                 .ok_or_else(|| "knowledge_edit document requires 'document'.".to_string())?;
             let (doc_type, normalized_path) =
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
+            if doc_type == KnowledgeType::Skill {
+                if let Some(document) = super::skill::edit_skill_package_document_sync(
+                    working_dir,
+                    &normalized_path,
+                    document_patch.clone(),
+                )? {
+                    return Ok(KnowledgeMutationResponse {
+                        kind: KnowledgeTargetKind::Document,
+                        doc_type: document.doc_type,
+                        path: normalized_path,
+                        result_path: Some(document.path.clone()),
+                        document: Some(document),
+                        directory: None,
+                    });
+                }
+            }
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
             let document = knowledge_store::edit_document(

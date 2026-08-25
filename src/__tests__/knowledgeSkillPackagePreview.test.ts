@@ -23,6 +23,10 @@ describe("knowledge skill package preview wiring", () => {
     expect(preview).toContain("(e: \"updateConfig\"");
     expect(preview).toContain("(e: \"exportPackage\"");
     expect(preview).toContain("BaseDropdown");
+    expect(preview).toContain("packageReadOnly");
+    expect(preview).toContain("packageEditMode");
+    expect(preview).toContain("buildKnowledgeEditModePatch");
+    expect(preview).toContain(':disabled="!sourceWritable || packageReadOnly"');
     expect(preview).toContain("BaseButton");
     expect(preview).toContain("knowledge.skillPackage.export");
     expect(preview).toContain("knowledge.skillPackage.version");

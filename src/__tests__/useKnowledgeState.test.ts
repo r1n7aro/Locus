@@ -210,7 +210,7 @@ async function flushPromises(rounds = 4) {
 
 function findSpecialRoot(
   state: ReturnType<typeof useKnowledgeState>,
-  type: "design" | "memory" | "skill" | "reference",
+  type: "design" | "plan" | "memory" | "skill" | "reference",
 ): Extract<ExplorerNode, { kind: "folder" }> | undefined {
   return state.visibleExplorerTree.value.find(
     (node): node is Extract<ExplorerNode, { kind: "folder" }> =>
@@ -974,7 +974,7 @@ describe("useKnowledgeState", () => {
     expect(state.documents.value.map((doc) => doc.path)).toEqual([
       "repo-b.md",
     ]);
-    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(6);
+    expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(8);
   });
 
   it("drops queued external knowledge changes after the workspace changes", async () => {
@@ -2754,6 +2754,8 @@ describe("useKnowledgeState", () => {
       skillEnabled: true,
       skillSurface: "auto",
       commandTrigger: "/lark",
+      readOnly: false,
+      aiEditMode: "auto",
     });
 
     expect(knowledgeMocks.setSkillConfig).toHaveBeenCalledWith(
@@ -2764,6 +2766,8 @@ describe("useKnowledgeState", () => {
         surface: "auto",
         commandTrigger: "/lark",
         injectMode: "path",
+        readOnly: false,
+        aiEditMode: "auto",
       },
     );
 

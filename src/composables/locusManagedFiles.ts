@@ -3,7 +3,7 @@ export interface LocusManagedFileLike {
   oldPath?: string;
 }
 
-export type LocusManagedTagKind = "locus" | "design" | "memory" | "skill" | "reference";
+export type LocusManagedTagKind = "locus" | "design" | "plan" | "memory" | "skill" | "reference";
 
 const LOCUS_PATH_PREFIXES = [
   "Locus",
@@ -15,6 +15,7 @@ const LOCUS_PATH_PREFIXES = [
 
 const KNOWLEDGE_TYPE_TAGS: Record<string, LocusManagedTagKind> = {
   design: "design",
+  plan: "plan",
   memory: "memory",
   skill: "skill",
   reference: "reference",

@@ -91,6 +91,55 @@ fn has_complete_frontmatter(content: &str) -> bool {
     content.starts_with("---\n") && content[4..].contains("\n---\n")
 }
 
+fn is_skill_package_source_kind(
+    kind: crate::knowledge_source_registry::KnowledgeSourceKind,
+) -> bool {
+    matches!(
+        kind,
+        crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
+            | crate::knowledge_source_registry::KnowledgeSourceKind::ProjectSkillPackage
+    )
+}
+
+fn load_knowledge_policy_document(
+    ctx: &crate::tool::ToolExecutionContext,
+    target: &crate::knowledge_source_registry::ResolvedKnowledgePath,
+    use_package_root: bool,
+) -> Result<Option<crate::knowledge_store::KnowledgeDocument>, String> {
+    let Some(working_dir) = ctx.working_dir.as_deref() else {
+        return Ok(None);
+    };
+    if target.kind == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge {
+        return crate::knowledge_store::load_document_by_path(
+            working_dir,
+            target.doc_type,
+            &target.logical_path,
+        )
+        .map(Some);
+    }
+    if !is_skill_package_source_kind(target.kind) {
+        return Ok(None);
+    }
+    let package_id = target
+        .logical_path
+        .split('/')
+        .find(|segment| !segment.is_empty())
+        .ok_or_else(|| "Skill package path is missing its package id".to_string())?;
+    let package_root_path = format!("{}/SKILL.md", package_id);
+    if !use_package_root {
+        let direct = crate::commands::read_skill_package_document_sync(
+            working_dir,
+            &target.logical_path,
+            "full",
+        )?;
+        if direct.is_some() {
+            return Ok(direct.map(|value| value.document));
+        }
+    }
+    crate::commands::read_skill_package_document_sync(working_dir, &package_root_path, "full")
+        .map(|result| result.map(|value| value.document))
+}
+
 fn prepare_missing_knowledge_frontmatter(
     ctx: &crate::tool::ToolExecutionContext,
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
@@ -618,6 +667,37 @@ pub(super) fn write() -> ToolDef {
                             is_error: true,
                         };
                     }
+                    if is_skill_package_source_kind(target.kind) {
+                        match load_knowledge_policy_document(&ctx, target, true) {
+                            Ok(Some(document)) if document.read_only => {
+                                return ToolResult {
+                                    output: format!(
+                                        "Skill package is read-only and cannot receive new files: {}",
+                                        target.display_path
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                            Ok(Some(document))
+                                if !crate::knowledge_store::document_allows_ai_edit(&document) =>
+                            {
+                                return ToolResult {
+                                    output: format!(
+                                        "AI editing is disabled for Skill package: {}",
+                                        target.display_path
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                return ToolResult {
+                                    output: error,
+                                    is_error: true,
+                                };
+                            }
+                        }
+                    }
                 }
 
                 let prepared_knowledge = match (
@@ -803,34 +883,33 @@ pub(super) fn edit() -> ToolDef {
                             is_error: true,
                         };
                     }
-                    if target.kind
-                        == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-                    {
-                        if let Some(working_dir) = ctx.working_dir.as_deref() {
-                            if let Ok(document) = crate::knowledge_store::load_document_by_path(
-                                working_dir,
-                                target.doc_type,
-                                &target.logical_path,
-                            ) {
-                                if document.read_only {
-                                    return ToolResult {
-                                        output: format!(
-                                            "Knowledge document is read-only and cannot be edited: {}",
-                                            target.display_path
-                                        ),
-                                        is_error: true,
-                                    };
-                                }
-                                if !crate::knowledge_store::document_allows_ai_edit(&document) {
-                                    return ToolResult {
-                                        output: format!(
-                                            "AI editing is disabled for knowledge document: {}",
-                                            target.display_path
-                                        ),
-                                        is_error: true,
-                                    };
-                                }
-                            }
+                    match load_knowledge_policy_document(&ctx, target, false) {
+                        Ok(Some(document)) if document.read_only => {
+                            return ToolResult {
+                                output: format!(
+                                    "Knowledge document is read-only and cannot be edited: {}",
+                                    target.display_path
+                                ),
+                                is_error: true,
+                            };
+                        }
+                        Ok(Some(document))
+                            if !crate::knowledge_store::document_allows_ai_edit(&document) =>
+                        {
+                            return ToolResult {
+                                output: format!(
+                                    "AI editing is disabled for knowledge document: {}",
+                                    target.display_path
+                                ),
+                                is_error: true,
+                            };
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            return ToolResult {
+                                output: error,
+                                is_error: true,
+                            };
                         }
                     }
                 }

@@ -9,7 +9,6 @@ tools:
   - plugin_uninstall
   - plugin_export
   - skill_list
-  - skill_reload
   - view_list
   - view_reload
   - knowledge_query
@@ -27,7 +26,7 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - Discovery: `plugin_search` for the registries configured in Locus, `plugin_list` for installed plugins.
    - Install, enable, disable, uninstall: resolve the target with step 2, then call the matching tool.
    - Creation or packaging: locate source components with `skill_list` and `view_list`, then follow steps 8-10.
-   - Editing: locate plugin-managed components with `plugin_list`, `skill_list`, and `view_list`; validate edits with `skill_reload` or `view_reload`.
+   - Editing: locate plugin-managed components with `plugin_list`, `skill_list`, and `view_list`; Skill edits refresh automatically, and View edits are validated with `view_reload`.
    - Publishing beyond a local zip archive: follow step 11.
 
 2. Resolve the target before any state change.
@@ -60,8 +59,8 @@ Treat `/plugin <request>` as the only command entry. Interpret words such as sea
    - After the change, report the affected id and scope.
 
 7. Work with editable plugin components.
-   - Local path/source installs are suitable for iterative local plugin work. Edit files inside the returned plugin root, then validate with `skill_reload` or `view_reload`.
-   - `skill_reload` source may be `pluginApp` or `pluginProject` for plugin Skill packages. `view_list` and `view_reload` include plugin Views by id; use the returned `packageRoot` for edits.
+   - Local path/source installs are suitable for iterative local plugin work. Edit files inside the returned plugin root, confirm Skill changes with `skill_list`, and validate View changes with `view_reload`.
+   - `skill_list` includes plugin Skill packages with `pluginApp` or `pluginProject` sources. `view_list` and `view_reload` include plugin Views by id; use the returned `packageRoot` for edits.
    - Optional plugin Rules live under the plugin root, usually `rules/<rule-name>.md`, and are declared in `locus.plugin.json` under `components.rules`. They are enabled by default while the plugin is enabled.
    - Registry-installed plugins are treated as managed components. Ask before replacing, forking, or editing them in place.
 

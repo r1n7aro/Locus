@@ -681,6 +681,7 @@ pub(crate) fn build_external_skill_manifest(
         package_id: None,
         package_version: record.version.clone(),
         has_unity: false,
+        writable: false,
         plugin_id: None,
         plugin_scope: None,
         origin_path: Some(record.root.to_string_lossy().replace('\\', "/")),
@@ -1094,79 +1095,6 @@ pub(crate) fn external_skill_origin_root_for_virtual_path(
     let records = list_external_skills_cached(working_dir);
     external_record_and_doc_rel_path_for_virtual_path(&records, virtual_path)
         .map(|(record, _)| record.root.to_string_lossy().replace('\\', "/"))
-}
-
-/// Reload an external skill by its `external/<provider>/<slug>` dir name (a
-/// bare slug resolves when unambiguous). Forces a fresh scan so frontmatter
-/// edits and newly installed skills are picked up, making `skill_reload` the
-/// model-side rescan entry point.
-/// Resolve a skill_reload name against the external record set: the full
-/// `external/<provider>/<slug>` dir name, or a bare slug when unambiguous.
-fn resolve_external_record_by_name(
-    records: &[ExternalSkillRecord],
-    name: &str,
-    expected_source: Option<&str>,
-) -> Result<ExternalSkillRecord, String> {
-    let normalized = name.trim().replace('\\', "/");
-    let normalized = normalized.trim_matches('/');
-    let normalized = normalized.strip_prefix("skill/").unwrap_or(normalized);
-
-    let record = if let Some(record) = external_record_for_dir_name(records, normalized) {
-        Some(record)
-    } else if !normalized.contains('/') {
-        let matches: Vec<&ExternalSkillRecord> = records
-            .iter()
-            .filter(|record| record.slug == normalized)
-            .collect();
-        match matches.len() {
-            0 => None,
-            1 => Some(matches[0].clone()),
-            _ => {
-                return Err(format!(
-                    "External skill name '{}' is ambiguous; use the full dir name: {}",
-                    normalized,
-                    matches
-                        .iter()
-                        .map(|record| record.dir_name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            }
-        }
-    } else {
-        None
-    };
-    let Some(record) = record else {
-        return Err(format!("External skill not found: {}", normalized));
-    };
-    if let Some(expected) = expected_source {
-        if record.scope.source() != expected {
-            return Err(format!(
-                "External skill '{}' has source '{}', not '{}'",
-                record.dir_name(),
-                record.scope.source(),
-                expected
-            ));
-        }
-    }
-    Ok(record)
-}
-
-pub(crate) fn reload_external_skill_manifest(
-    working_dir: &str,
-    name: &str,
-    expected_source: Option<&str>,
-) -> Result<SkillManifest, String> {
-    invalidate_external_skill_cache();
-    let records = list_external_skills_cached(working_dir);
-    let record = resolve_external_record_by_name(&records, name, expected_source)?;
-    let configs = super::knowledge::load_skill_config(working_dir);
-    let config = super::skill::lookup_skill_config_override(
-        &configs,
-        record.scope.source(),
-        &record.dir_name(),
-    );
-    Ok(build_external_skill_manifest(&record, config))
 }
 
 // ── Commands ─────────────────────────────────────────────────
@@ -1750,58 +1678,5 @@ mod tests {
             records[0].virtual_path(),
             "external/claude-plugin/code-toolkit--docx/SKILL.md"
         );
-    }
-
-    #[test]
-    fn reload_resolves_full_dir_name_and_unambiguous_slug() {
-        let temp = tempfile::tempdir().unwrap();
-        let claude_root = temp.path().join("claude");
-        let agents_root = temp.path().join("agents");
-        write_skill(&claude_root, "grill-me", "description: c", "Body");
-        write_skill(&agents_root, "grill-me", "description: a", "Body");
-        write_skill(&claude_root, "solo", "description: s", "Body");
-        let records = scan_external_skills_from_roots(&[
-            scan_root(
-                ExternalSkillProvider::Claude,
-                ExternalSkillScope::User,
-                &claude_root,
-            ),
-            scan_root(
-                ExternalSkillProvider::Agents,
-                ExternalSkillScope::User,
-                &agents_root,
-            ),
-        ]);
-        assert_eq!(records.len(), 3);
-
-        let by_dir =
-            resolve_external_record_by_name(&records, "external/claude/grill-me", None).unwrap();
-        assert_eq!(by_dir.provider, ExternalSkillProvider::Claude);
-        let with_prefix =
-            resolve_external_record_by_name(&records, "skill/external/agents/grill-me", None)
-                .unwrap();
-        assert_eq!(with_prefix.provider, ExternalSkillProvider::Agents);
-
-        let solo = resolve_external_record_by_name(&records, "solo", None).unwrap();
-        assert_eq!(solo.dir_name(), "external/claude/solo");
-
-        let ambiguous = resolve_external_record_by_name(&records, "grill-me", None);
-        assert!(ambiguous.unwrap_err().contains("ambiguous"));
-
-        let missing = resolve_external_record_by_name(&records, "nope", None);
-        assert!(missing.unwrap_err().contains("not found"));
-
-        let wrong_source = resolve_external_record_by_name(
-            &records,
-            "external/claude/solo",
-            Some("externalProject"),
-        );
-        assert!(wrong_source.unwrap_err().contains("externalUser"));
-        assert!(resolve_external_record_by_name(
-            &records,
-            "external/claude/solo",
-            Some("externalUser")
-        )
-        .is_ok());
     }
 }

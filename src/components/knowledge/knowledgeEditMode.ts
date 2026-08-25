@@ -62,15 +62,19 @@ export function defaultSummaryEnabledForType(type: KnowledgeDocumentType): boole
 }
 
 export function isKnowledgeEditModeLocked(document: EditModeDocument | null | undefined): boolean {
-  if (document?.readOnly || document?.storageSource === "app") return true;
+  if (document?.readOnly) return true;
   const provider = document?.externalSource?.provider;
-  return provider === "local_folder" || provider === "feishu" || provider === "package";
+  if (provider === "package") return false;
+  if (document?.storageSource === "app") return true;
+  return provider === "local_folder" || provider === "feishu";
 }
 
 export function defaultMaintenanceRulesForType(type: KnowledgeDocumentType): string | null {
   switch (type) {
     case "design":
       return t("knowledge.defaults.rules.design");
+    case "plan":
+      return t("knowledge.defaults.rules.plan");
     case "memory":
       return t("knowledge.defaults.rules.memory");
     case "skill":

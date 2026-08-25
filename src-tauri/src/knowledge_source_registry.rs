@@ -8,6 +8,7 @@ pub enum KnowledgeSourceKind {
     WorkspaceKnowledge,
     AppKnowledge,
     AppSkillPackage,
+    ProjectSkillPackage,
     PluginSkillPackage,
     ExternalSkill,
     ManagedReference,
@@ -126,16 +127,11 @@ impl KnowledgeSourceRegistry {
             }
         }
 
-        let writable_app_package_root = crate::commands::persistent_config_dir()
-            .ok()
-            .map(|path| normalize_absolute_path(&path.join("skills")));
         for package in crate::commands::list_skill_packages_sync_for_working_dir(working_dir) {
             let root = normalize_absolute_path(&package.root);
             let is_plugin = package.plugin_id.is_some();
-            let writable = !is_plugin
-                && writable_app_package_root
-                    .as_ref()
-                    .is_some_and(|candidate| path_is_within(&root, candidate));
+            let is_project = package.source == "project";
+            let writable = crate::commands::skill_package_record_is_writable(&package);
             sources.push(KnowledgeSource {
                 source_id: if is_plugin {
                     format!(
@@ -143,18 +139,26 @@ impl KnowledgeSourceRegistry {
                         package.plugin_id.as_deref().unwrap_or("unknown"),
                         package.manifest.id
                     )
+                } else if is_project {
+                    format!("project-skill:{}", package.manifest.id)
                 } else {
                     format!("app-skill:{}", package.manifest.id)
                 },
                 kind: if is_plugin {
                     KnowledgeSourceKind::PluginSkillPackage
+                } else if is_project {
+                    KnowledgeSourceKind::ProjectSkillPackage
                 } else {
                     KnowledgeSourceKind::AppSkillPackage
                 },
                 doc_type: KnowledgeType::Skill,
                 physical_root: root,
                 logical_prefix: package.manifest.id,
-                storage_source: KnowledgeStorageSource::App,
+                storage_source: if is_project {
+                    KnowledgeStorageSource::Project
+                } else {
+                    KnowledgeStorageSource::App
+                },
                 mutability: if writable {
                     KnowledgeSourceMutability::Writable
                 } else {
@@ -197,6 +201,7 @@ impl KnowledgeSourceRegistry {
                     matches!(
                         source.kind,
                         KnowledgeSourceKind::AppSkillPackage
+                            | KnowledgeSourceKind::ProjectSkillPackage
                             | KnowledgeSourceKind::PluginSkillPackage
                             | KnowledgeSourceKind::ExternalSkill
                     )

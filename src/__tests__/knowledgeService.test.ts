@@ -5,7 +5,12 @@ vi.mock("../services/ipc", () => ({
 }));
 
 import { ipcInvoke } from "../services/ipc";
-import { knowledgeEdit, knowledgeList, knowledgeQuery } from "../services/knowledge";
+import {
+  knowledgeEdit,
+  knowledgeList,
+  knowledgeQuery,
+  knowledgeRead,
+} from "../services/knowledge";
 
 const mockedInvoke = vi.mocked(ipcInvoke);
 
@@ -44,6 +49,96 @@ describe("knowledge service visibility defaults", () => {
       "knowledge_query",
       expect.objectContaining({ includeHidden: true }),
     );
+  });
+
+  it.each(["design", "plan", "memory", "skill", "reference"] as const)(
+    "keeps the %s type root path stable when reading its directory config",
+    async (type) => {
+      mockedInvoke.mockResolvedValueOnce({
+        kind: "directory",
+        document: null,
+        directory: {
+          type,
+          path: "",
+        },
+      });
+
+      await knowledgeRead({
+        kind: "directory",
+        type,
+        path: type,
+      });
+
+      expect(mockedInvoke).toHaveBeenCalledWith("knowledge_read", {
+        request: {
+          kind: "directory",
+          path: type,
+          type,
+          part: "full",
+          includeHistory: false,
+        },
+      });
+    },
+  );
+
+  it("keeps a type-named child directory relative to its explicit parent type", async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: "directory",
+      document: null,
+      directory: {
+        type: "design",
+        path: "memory",
+      },
+    });
+
+    await knowledgeRead({
+      kind: "directory",
+      type: "design",
+      path: "memory",
+    });
+
+    expect(mockedInvoke).toHaveBeenCalledWith(
+      "knowledge_read",
+      expect.objectContaining({
+        request: expect.objectContaining({
+          path: "design/memory",
+          type: "design",
+        }),
+      }),
+    );
+  });
+
+  it("keeps the memory type root path stable when saving its directory config", async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: "directory",
+      type: "memory",
+      path: "",
+      directory: {
+        type: "memory",
+        path: "",
+      },
+    });
+
+    await knowledgeEdit({
+      kind: "directory",
+      type: "memory",
+      path: "memory",
+      config: {
+        summary: "Memory 根规则",
+      },
+    });
+
+    expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", {
+      request: {
+        kind: "directory",
+        path: "memory",
+        type: "memory",
+        document: undefined,
+        config: {
+          summary: "Memory 根规则",
+        },
+      },
+    });
   });
 
   it("omits local maintenance rules when a directory inherits its edit config", async () => {

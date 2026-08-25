@@ -138,6 +138,7 @@ fn strip_workspace_knowledge_prefix(path: &str) -> Option<String> {
 fn knowledge_type_from_segment(segment: &str) -> Option<KnowledgeType> {
     match segment.to_ascii_lowercase().as_str() {
         "design" => Some(KnowledgeType::Design),
+        "plan" => Some(KnowledgeType::Plan),
         "memory" => Some(KnowledgeType::Memory),
         "skill" => Some(KnowledgeType::Skill),
         "reference" => Some(KnowledgeType::Reference),
